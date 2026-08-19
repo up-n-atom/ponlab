@@ -1,0 +1,386 @@
+#!/bin/bash
+#
+# COPYRIGHT (c) International Business Machines Corp. 2008-2017
+#
+# This program is provided under the terms of the Common Public License,
+# version 1.0 (CPL-1.0). Any use, reproduction or distribution for this software
+# constitutes recipient's acceptance of CPL-1.0 terms which can be found
+# in the file LICENSE file or at https://opensource.org/licenses/cpl1.0.php
+#
+#
+# NAME
+#	ocktests.sh
+#
+# DESCRIPTION
+#	Simple Bash script that checks the environment in which the ock-tests will run
+#	and starts them.
+#
+# ALGORITHM
+#	None.
+#
+# USAGE
+#
+# HISTORY
+#	Rajiv Andrade <srajiv@linux.vnet.ibm.com>
+#
+# RESTRICTIONS
+#	None.
+##
+
+LOGGING=0
+TESTDIR=`dirname $0`
+LOGFILE="$TESTDIR/ock-tests.log"
+ERR_SUMMARY="$TESTDIR/ock-tests.err"
+PKCONF="@sysconfdir@/opencryptoki/opencryptoki.conf"
+PKCSCONFBIN="@sbindir@/pkcsconf"
+TESTCONF="$TESTDIR/ock-tests.config"
+TOKTYPE=""
+NONEED_TOKEN_INIT=0
+PLATFORM=$(uname)
+LSFLAGS="-U"
+
+if [ $PLATFORM = "AIX" ]; then
+    unset LSFLAGS
+    function pgrep {
+        local progname="$1"
+        if [ -z "$progname" ]; then
+                echo "No program name specified."
+                return 1
+        fi
+
+        ps -eo pid,comm | grep -w $progname | awk '{print $1}'
+    }
+fi
+
+#
+# This is the list of the tests we'll be running once everything is initialized
+#
+# The order of these tests matters. login/login leaves the token with its USER
+# PIN locked, leaving the token unusable until someone manually deletes
+# $OCKDIR/$TOKEN/*. Manually deleting this dir is pre-req for starting the
+# automated tests anyway, so this is OK.
+#
+# login/login MUST come last if it appears in this list
+#
+OCK_TESTS="crypto/*tests"
+OCK_TESTS+=" pkcs11/attribute pkcs11/copyobjects pkcs11/destroyobjects"
+OCK_TESTS+=" pkcs11/findobjects pkcs11/generate_keypair"
+OCK_TESTS+=" pkcs11/get_interface pkcs11/getobjectsize pkcs11/sess_opstate"
+OCK_TESTS+=" misc_tests/fork misc_tests/obj_mgmt_tests" 
+OCK_TESTS+=" misc_tests/obj_mgmt_lock_tests misc_tests/reencrypt"
+OCK_TESTS+=" misc_tests/events misc_tests/cca_export_import_test"
+OCK_TESTS+=" misc_tests/dual_functions misc_tests/always_auth"
+OCK_TEST=""
+OCK_BENCHS="pkcs11/*bench"
+
+usage()
+{
+    echo -e " usage: ./ock_tests.sh [-s <slot>] [-f <testfile>]" \
+            "[-l <logfile>] [-n] [-h]"
+    echo -e "     -l <logfile>   redirect output to logfile" \
+            "(default is command line)"
+    echo -e "     -h             display this help"
+    echo -e "     -q             run quietly - display only total number" \
+            "of tests passed/failed"
+    echo -e "     -s <slot>      slot against which the testcases will run" \
+            "(omit it to test all available tokens)"
+    echo -e "     -f <testfile>  path to test that will be run"
+    echo -e "     -n             don't stop in case one of the testcases fail"
+    echo -e "     -b             also run benchmarks or performance tests"
+    exit -1
+}
+
+###
+## check_tpmtok() - Check if stuff needed by tpm token are
+##                  present
+###
+check_tpmtok()
+{
+    # Check for tpmtoken_init
+    if ! which tpmtoken_init; then
+        echo "Error: tpmtoken_init could not be found on PATH"
+        return 1
+    fi
+
+    # Check if tcsd is running
+    if ! pgrep tcsd; then
+        echo "Error: TCSD daemon not running"
+        return 1
+    fi
+}
+
+###
+## init_slot() - Initialize a specific slot
+## $1 - The slot number to initialize
+##
+###
+init_slot()
+{
+    case $TOKTYPE in
+        TPM)
+            echo "Initializing TPM token using init_tpmtoken.sh"
+            if ! $TESTDIR/init_tpmtoken.sh; then
+                echo "Error initializing TPM token"
+                return 1
+            fi
+            ;;
+        CCA | EP11 | ICA | Software)
+            echo "Initializing $TOKTYPE using init_token.sh"
+            if ! $TESTDIR/init_token.sh $1; then
+                echo "Error initializing $TOKTYPE token"
+                return 1
+            fi
+            ;;
+        *)
+            echo "FATAL: Token type not recognized: $TOKTYPE"
+            exit 1
+    esac
+}
+
+
+###
+## check_slot() - Checks if we have everything needed to test
+##                this specific slot number
+## $1 - The slot number to check
+###
+check_slot()
+{
+    # Check if the Slot exists, and what it actually is
+    TOKDESCR=`$PKCSCONFBIN -c $1 -t`
+    TOKMODEL=`echo "$TOKDESCR" | grep "Model:"`
+
+    case $TOKMODEL in
+        *TPM*)
+            echo "TPM Token type detected"
+            check_tpmtok || return
+            TOKTYPE="TPM"
+            ;;
+        *CCA*)
+            echo "CCA Token type detected"
+            TOKTYPE="CCA"
+            ;;
+        *ICA*)
+            echo "ICA Token type detected"
+            TOKTYPE="ICA"
+            ;;
+        *Soft*)
+            echo "Software Token type detected"
+            TOKTYPE="Software"
+            ;;
+        *EP11*)
+            echo "EP11 Token type detected"
+            TOKTYPE="EP11"
+            ;;
+        *)
+            echo "Error: unsupported or undetermined token type"
+            echo "       wrong Slot $1?"
+            return 1
+        esac
+
+        # Check if token is initialized and set $NONEED_TOKEN_INIT if so
+        NONEED_TOKEN_INIT=`echo "$TOKDESCR" | grep "Flags:" | grep TOKEN_INITIALIZED | wc -l`
+}
+
+##
+## check_env() - Check if we have everything we need
+##
+check_env()
+{
+    ## Check env vars first
+    if [ -z $PKCS11_SO_PIN ]; then
+        echo "FATAL: Must set PKCS11_SO_PIN"
+        exit 1
+    fi
+
+    if [ -z $PKCS11_USER_PIN ]; then
+        echo "FATAL: Must set PKCS11_USER_PIN"
+        exit 1
+    fi
+
+    if [ -z $PKCSLIB ]; then
+        echo "FATAL: Must set PKCSLIB"
+        exit 1
+    fi
+
+    if [ ! $PLATFORM = "AIX" -a ! -f $PKCSLIB ]; then
+        echo "FATAL: PKCSLIB=$PKCSLIB is invalid"
+        exit 1
+    fi
+
+    if [ ! -f $PKCONF ]; then
+        echo "FATAL: Can't find configuration data ($PKCONF)"
+        exit 1
+    fi
+
+    # if user is not root
+    if [ $EUID -ne 0 ]; then
+        ## Check if the pkcs11 group 'exists'
+        P11GROUP=`getent group pkcs11 | cut -d ":" -f 3`
+        if [ -z $P11GROUP ]; then
+            echo "FATAL: Can't find pkcs11 group"
+            exit 1
+        fi
+        ## Check if we're part of it
+        if ! id -G | grep $P11GROUP; then
+            echo "FATAL: Must be part of the pkcs11 group"
+            exit 1
+        fi
+    fi
+
+    ## Make sure we have the slot daemon running
+    if ! pgrep pkcsslotd; then
+        echo "FATAL: The slot daemon (pkcsslotd) must be running"
+        exit 1
+    fi
+
+    ## We also need pkcsconf
+    if [ ! -x $PKCSCONFBIN ]; then
+        echo "FATAL: Invalid pkcsconf utility ($PKCSCONFBIN)"
+        exit 1
+    fi
+}
+
+###
+## run_tests() - run tests for a specific slot,
+##               following $OCK_TEST order
+## $1 - the slot
+###
+run_tests()
+{
+    if [ -n "$OCK_TEST" ]; then
+        OCK_TESTS="$OCK_TEST"
+    fi
+    echo "***** Will run the following tests for slot $1: $(ls $LSFLAGS $OCK_TESTS)"
+    ALLRES=0
+    COMBINED_EXTRACT=""
+    for item in "$(cat test_combined_extract.slots 2>/dev/null)"; do
+        if [[ "$1" == "$item" ]]; then
+            COMBINED_EXTRACT="-combined-extract"
+        fi
+    done
+    for j in $( ls $LSFLAGS $OCK_TESTS ); do
+        echo "** Now executing '$j -slot $1 $NO_STOP $COMBINED_EXTRACT'"
+        $j -slot $1 $NO_STOP $COMBINED_EXTRACT 2>&1
+        RES=$?
+        if [ $RES -ne 0 ]; then
+            ALLRES=$RES
+            echo "ERROR: Testcase $j failed to execute, rc: $RES"
+            echo "ERROR: Testcase $j failed to execute for slot $1, rc: $RES" >> error_file.$1
+        fi
+    done
+    return $ALLRES
+}
+
+###
+## run_benchs() - run benchmarks for a specific slot,
+##                following $OCK_BENCH order
+## $1 - the slot
+###
+run_benchs()
+{
+    echo "***** Will run the following benchmarks for slot $1: $(ls $LSFLAGS $OCK_BENCHS)"
+    ALLRES=0
+    for i in $( ls $LSFLAGS $OCK_BENCHS ); do
+        echo "** Now executing '$i"
+        $i -slot $1 $NO_STOP 2>&1
+        RES=$?
+        if [ $RES -ne 0 ]; then
+            ALLRES=$RES
+            echo "ERROR: Benchmark $i failed to execute, rc: $RES"
+            echo "ERROR: Benchmark $i failed to execute for slot $1, rc: $RES" >> error_file.$1
+        fi
+    done
+    return $ALLRES
+}
+
+
+main_script()
+{
+    LOGFILE=0
+
+    # check generic stuff first
+    check_env
+
+    # where to run
+    if [ -z $SLOT ]; then
+        SLOT="`awk '/^slot (.*)/ { print $2; }' $PKCONF`"
+        LOGFILE=1
+    fi
+
+    rm -f error_file.*
+
+    for i in $SLOT; do (
+        echo "********** Testing Slot $i **********"
+        check_slot $i || { echo "SKIPPING slot $i"; exit; }
+        if [ $NONEED_TOKEN_INIT -eq 0 ]; then
+            init_slot $i || { echo "SKIPPING slot $i"; exit; }
+        fi
+        for item in $OCK_TRACE_TOKENS; do
+            [[ "$i" == "$item" ]] && export OPENCRYPTOKI_TRACE_LEVEL="${OCK_TRACE_LEVEL:-4}"
+        done
+        if [ "$LOGFILE" = "1" ]; then
+            echo "test output for slot $i stored in log-slot_$i.txt"
+            run_tests $i > "log-slot_$i.txt" 2>&1
+        else
+            run_tests $i
+        fi
+        RC=$?
+        if [ -n "$BENCHMARK" ]; then
+            run_benchs $i
+            RC2=$?
+            if [ $RC2 -ne 0 ]; then
+                RC=RC2
+            fi
+        fi
+        echo "********** Finished Testing Slot $i with RC=$RC **********"
+        ) &
+    done
+    wait
+    ls error_file.* &>/dev/null
+    if [ $? -eq 0 ]; then
+        echo "********** At least one slot finished with error **********"
+        cat error_file.*
+        rm -f error_file.*
+        exit 1
+    fi
+}
+
+while getopts s:f:l:hc:n arg; do
+    case $arg in
+        h)
+            usage
+            ;;
+        l)
+            LOGGING=1
+            if [ -n $OPTARG ]; then
+                LOGFILE="$OPTARG"
+            fi
+            touch $LOGFILE
+            ;;
+        c)
+            TESTCONF="$OPTARG"
+            touch $TESTCONF
+            ;;
+        n)
+            NO_STOP="-nostop"
+            ;;
+        s)
+            SLOT="$OPTARG"
+            ;;
+        f)
+            OCK_TEST="$OPTARG"
+            ;;
+        b)
+            BENCHMARK="yes"
+            ;;
+    esac
+done
+
+
+if [ "$LOGGING" = "1" ]; then
+    main_script >>$LOGFILE 2>&1
+else
+    main_script
+fi
+
+exit 0

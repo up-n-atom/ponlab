@@ -1,0 +1,1511 @@
+/*
+ * COPYRIGHT (c) International Business Machines Corp. 2005-2017
+ *
+ * This program is provided under the terms of the Common Public License,
+ * version 1.0 (CPL-1.0). Any use, reproduction or distribution for this
+ * software constitutes recipient's acceptance of CPL-1.0 terms which can be
+ * found in the file LICENSE file or at
+ * https://opensource.org/licenses/cpl1.0.php
+ */
+
+/* File: sess_mgmt.c */
+
+#include <windows.h>
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <memory.h>
+
+#include "pkcs11types.h"
+#include "regress.h"
+#include "mech_to_str.h"
+#include "common.c"
+
+void dump_session_info(CK_SESSION_INFO * info)
+{
+    printf("   CK_SESSION_INFO:\n");
+    printf("      slotID:         %lu\n", info->slotID);
+    printf("      state:          ");
+    switch (info->state) {
+    case CKS_RO_PUBLIC_SESSION:
+        printf("CKS_RO_PUBLIC_SESSION\n");
+        break;
+    case CKS_RW_PUBLIC_SESSION:
+        printf("CKS_RW_PUBLIC_SESSION\n");
+        break;
+    case CKS_RO_USER_FUNCTIONS:
+        printf("CKS_RO_USER_FUNCTIONS\n");
+        break;
+    case CKS_RW_USER_FUNCTIONS:
+        printf("CKS_RW_USER_FUNCTIONS\n");
+        break;
+    case CKS_RW_SO_FUNCTIONS:
+        printf("CKS_RW_SO_FUNCTIONS\n");
+        break;
+    }
+    printf("      flags:          0x%lx\n", info->flags);
+    printf("      ulDeviceError:  %lu\n", info->ulDeviceError);
+}
+
+CK_RV do_OpenSession(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_FLAGS flags;
+    CK_SESSION_HANDLE handle;
+    CK_RV rc;
+
+    testcase_begin("do_OpenSession");
+    testcase_new_assertion();
+
+    slot_id = SLOT_ID;
+    flags = CKF_SERIAL_SESSION; // read-only session
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &handle);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(handle);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_OpenSession passed");
+
+    return rc;
+}
+
+CK_RV do_OpenSession2(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_FLAGS flags;
+    CK_SESSION_HANDLE h1, h2;
+    CK_RV rc;
+
+    testcase_begin("do_OpenSession2");
+    testcase_new_assertion();
+
+    slot_id = SLOT_ID;
+    flags = CKF_SERIAL_SESSION; // read-only session
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(h2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_OpenSession2 passed");
+
+    return rc;
+}
+
+CK_RV do_CloseAllSessions(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_FLAGS flags;
+    CK_SESSION_HANDLE h1, h2, h3;
+    CK_RV rc;
+
+    testcase_begin("do_CloseAllSessions");
+    testcase_new_assertion();
+
+    slot_id = SLOT_ID;
+    flags = CKF_SERIAL_SESSION; // read-only session
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseAllSessions(slot_id);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseAllSessions, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_CloseAllSessions passed");
+
+    return rc;
+}
+
+CK_RV do_GetSessionInfo(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_FLAGS flags;
+    CK_SESSION_HANDLE h1, h2, h3;
+    CK_SESSION_INFO info;
+    CK_RV rc;
+
+    testcase_begin("do_GetSessionInfo");
+    testcase_new_assertion();
+
+    slot_id = SLOT_ID;
+    flags = CKF_SERIAL_SESSION; // read-only session
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_GetSessionInfo(h1, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    rc = funcs->C_GetSessionInfo(h2, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    rc = funcs->C_GetSessionInfo(h2, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    rc = funcs->C_CloseAllSessions(slot_id);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseAllSessions, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_GetSessionInfo passed");
+
+    return rc;
+}
+
+// This is a messy function but it does alot of tests:
+//
+//  1) Create 1 RO session and 2 RW sessions
+//  2) Log the USER into session #1.  Verify that all 3 become USER sessions.
+//  3) Try to login again, this time to session #2.  Verify that it fails
+//  4) Logout session #1
+//  5) Try to logout from session #2.  Verify that this fails.
+//  6) Try to log the SO into session #1.  Verify that it fails (RO session exists)
+//  7) Try to log the SO into session #2.  Verify that it fails (RO session exists)
+//  8) Close all sessions
+//  9) Creaate 2 RW sessions
+//  A) Log the SO into one.  Verify that both are now SO sessions.
+//  B) Create a 3rd RW session.  Verify that it immediately becomes an SO session
+//  C) Try to create a RO session.  Verify that it fails (SO session exists)
+//  D) Close all sessions and return
+//
+CK_RV do_LoginLogout(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_FLAGS flags;
+    CK_SESSION_HANDLE h1, h2, h3, h4;
+    CK_SESSION_INFO info;
+    CK_RV rc;
+    CK_BYTE user_pin[PKCS11_MAX_PIN_LEN];
+    CK_ULONG user_pin_len;
+    CK_BYTE so_pin[PKCS11_MAX_PIN_LEN];
+    CK_ULONG so_pin_len;
+
+    testcase_begin("do_LoginLogout");
+    testcase_new_assertion();
+
+    if (get_user_pin(user_pin))
+        return CKR_FUNCTION_FAILED;
+
+    user_pin_len = (CK_ULONG) strlen((char *) user_pin);
+
+    if (get_so_pin(so_pin))
+        return CKR_FUNCTION_FAILED;
+
+    so_pin_len = (CK_ULONG) strlen((char *) so_pin);
+
+    slot_id = SLOT_ID;
+    flags = CKF_SERIAL_SESSION; // read-only session
+
+    // create 3 sessions.  1 RO, two RW
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // log the first session in.  all sessions should become USER sessions
+    rc = funcs->C_Login(h1, CKU_USER, user_pin, user_pin_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Login #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_GetSessionInfo(h1, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    rc = funcs->C_GetSessionInfo(h2, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    rc = funcs->C_GetSessionInfo(h2, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    // now, try to log in session #2.  this should fail (already logged in)
+    rc = funcs->C_Login(h2, CKU_USER, user_pin, user_pin_len);
+    if (rc != CKR_USER_ALREADY_LOGGED_IN) {
+        testcase_fail("C_Login #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        PRINT_ERR("   Expected CKR_USER_ALREADY_LOGGED_IN\n");
+        return -1;
+    }
+
+    // now, try to logout twice
+    rc = funcs->C_Logout(h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Logout #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_Logout(h2);
+    if (rc != CKR_USER_NOT_LOGGED_IN) {
+        testcase_fail("C_Logout #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        PRINT_ERR("   Expected CKR_USER_NOT_LOGGED_IN\n");
+        return rc;
+    }
+
+    // now, try to log the SO in.  this should fail since H1 is a RO session
+    rc = funcs->C_Login(h1, CKU_SO, so_pin, so_pin_len);
+    if (rc != CKR_SESSION_READ_ONLY_EXISTS) {
+        testcase_fail("C_Login #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        PRINT_ERR("   Expected CKR_SESSION_READ_ONLY_EXISTS\n");
+        return -1;
+    }
+
+    rc = funcs->C_Login(h2, CKU_SO, so_pin, so_pin_len);
+    if (rc != CKR_SESSION_READ_ONLY_EXISTS) {
+        testcase_fail("C_Login #5, rc=%lx, %s", rc, p11_get_ckr(rc));
+        PRINT_ERR("   Expected CKR_SESSION_READ_ONLY_EXISTS\n");
+        return -1;
+    }
+
+    // log completely out
+    rc = funcs->C_CloseAllSessions(slot_id);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseAllSessions #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, start two RW sessions
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #5, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, try to log the SO in.  this should work
+    rc = funcs->C_Login(h1, CKU_SO, so_pin, so_pin_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Login #6, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_GetSessionInfo(h1, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    rc = funcs->C_GetSessionInfo(h2, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #5, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    // now, create a 3rd RW session.
+    // verify that it is automatically an SO session
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #6, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_GetSessionInfo(h3, &info);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetSessionInfo #6, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    dump_session_info(&info);
+
+    // now, try to create a 4th session.  RO this time.  Should fail
+    flags = CKF_SERIAL_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &h4);
+    if (rc != CKR_SESSION_READ_WRITE_SO_EXISTS) {
+        testcase_fail("C_OpenSession #6, rc=%lx, %s", rc, p11_get_ckr(rc));
+        PRINT_ERR("   Expected CKR_SESSION_READ_WRITE_SO_EXISTS\n");
+        return -1;
+    }
+
+    // we're done...close all sessions
+    rc = funcs->C_CloseAllSessions(slot_id);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseAllSessions #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_LoginLogout passed");
+
+    return rc;
+}
+
+CK_RV do_OperationState1(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_SESSION_HANDLE session1, session2;
+    CK_FLAGS flags;
+    CK_BYTE user_pin[PKCS11_MAX_PIN_LEN];
+    CK_ULONG user_pin_len;
+    CK_RV rc;
+
+    CK_BYTE original[1024];
+    CK_BYTE crypt1[1024];
+    CK_BYTE crypt2[1024];
+    CK_BYTE trash1[8];
+    CK_BYTE trash2[8];
+
+    CK_BYTE *op_state = NULL;
+    CK_ULONG op_state_len;
+
+    CK_ULONG orig_len, crypt1_len, crypt2_len, trash1_len, trash2_len;
+    CK_ULONG i;
+
+    CK_ULONG key_len = 16;
+    CK_ATTRIBUTE key_gen_tmpl[] = {
+        {CKA_VALUE_LEN, &key_len, sizeof(CK_ULONG)}
+    };
+
+    CK_MECHANISM mech;
+    CK_OBJECT_HANDLE h_key;
+
+
+    testcase_begin("do_OperationState1");
+    testcase_new_assertion();
+    slot_id = SLOT_ID;
+
+    //
+    // here's the goal:
+    //
+    //  All the hash values should be the same
+    //    1) session #1 starts a multi-part encryption
+    //    2) save session #1 operation state
+    //    3) session #1 passes garbage to encrypt update
+    //    4) session #2's operation state is set to what we saved
+    //    5) sessoin #2 finishes the encryption operation
+    //
+    //  Session #2's results should be the same as the single-part version
+    //
+
+    // create two USER RW sessions
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (get_user_pin(user_pin))
+        return CKR_FUNCTION_FAILED;
+
+    user_pin_len = (CK_ULONG) strlen((char *) user_pin);
+
+    rc = funcs->C_Login(session1, CKU_USER, user_pin, user_pin_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Login #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    orig_len = sizeof(original);
+    for (i = 0; i < orig_len; i++)
+        original[i] = i % 255;
+
+    trash1_len = sizeof(trash1);
+    memcpy(trash1, "asdflkjasdlkjadslkj", trash1_len);
+
+    // first generate a AES key
+    mech.mechanism = CKM_AES_KEY_GEN;
+    mech.ulParameterLen = 0;
+    mech.pParameter = NULL;
+
+    if (!mech_supported(slot_id, mech.mechanism)) {
+        testcase_skip("Mechanism %s not supported. (skipped)",
+               mech_to_str(mech.mechanism));
+        funcs->C_CloseSession(session1);
+        funcs->C_CloseSession(session2);
+        return 0;
+    }
+
+    rc = funcs->C_GenerateKey(session1, &mech, key_gen_tmpl, 1, &h_key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GenerateKey #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    // now encrypt the original data all at once using CBC
+    mech.mechanism = CKM_AES_CBC;
+    mech.ulParameterLen = 16;
+    mech.pParameter = "1234qwerasdfyxcv";
+
+    rc = funcs->C_EncryptInit(session1, &mech, h_key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptInit #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    crypt1_len = sizeof(crypt1);
+    rc = funcs->C_Encrypt(session1, original, orig_len, crypt1, &crypt1_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Encrypt #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, begin encrypting multipart
+    rc = funcs->C_EncryptInit(session1, &mech, h_key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptInit #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    crypt2_len = sizeof(crypt2);
+    rc = funcs->C_EncryptUpdate(session1, original, orig_len / 2,
+                                crypt2, &crypt2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptUpdate #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // save session #1's operation state
+    rc = funcs->C_GetOperationState(session1, NULL, &op_state_len);
+    if (rc != CKR_OK) {
+        if (rc == CKR_STATE_UNSAVEABLE) {
+            testcase_skip("Session state not savable for mechanism %s. (skipped)",
+                   mech_to_str(mech.mechanism));
+            funcs->C_CloseSession(session1);
+            funcs->C_CloseSession(session2);
+            return 0;
+        }
+        testcase_fail("C_GetOperationState #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    op_state = (CK_BYTE *) malloc(op_state_len);
+    if (!op_state) {
+        testcase_fail("HOST MEMORY ERROR");
+        return -1;
+    }
+
+    rc = funcs->C_GetOperationState(session1, op_state, &op_state_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetOperationState #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, encrypt some garbage.  this will affect the CBC even if
+    // we throw the encrypted garbage away
+    trash2_len = sizeof(trash2);
+    rc = funcs->C_EncryptUpdate(session1, trash1, trash1_len,
+                                trash2, &trash2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptUpdate #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // restore session #1's operation state that we just saved back
+    // into session #2 and continue with the encryption
+    rc = funcs->C_SetOperationState(session2, op_state, op_state_len, h_key, 0);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SetOperationState #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    free(op_state);
+
+    // now, encrypt the rest of the original data
+    i = crypt2_len;
+    crypt2_len = sizeof(crypt2) - crypt2_len;
+    rc = funcs->C_EncryptUpdate(session2,
+                                original + orig_len / 2, orig_len / 2,
+                                crypt2 + i, &crypt2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptUpdate #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    crypt2_len += i;
+
+    trash2_len = sizeof(trash2);
+    rc = funcs->C_EncryptFinal(session2, trash2, &trash2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptFinal #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (crypt2_len != crypt1_len) {
+        testcase_error("ERROR:  Lengths don't match");
+        return -1;
+    }
+
+    if (memcmp(crypt1, crypt2, crypt1_len) != 0) {
+        testcase_error("ERROR:  crypt1 != crypt2");
+        return -1;
+    }
+
+    rc = funcs->C_CloseSession(session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(session2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_OperationState1 passed");
+
+    return rc;
+}
+
+CK_RV do_OperationState2(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_SESSION_HANDLE session1, session2, session3;
+    CK_FLAGS flags;
+    CK_BYTE user_pin[PKCS11_MAX_PIN_LEN];
+    CK_ULONG user_pin_len;
+    CK_RV rc;
+
+    CK_BYTE original[1024];
+    CK_BYTE digest1[32];
+    CK_BYTE digest2[32];
+    CK_BYTE digest3[32];
+
+    CK_ULONG orig_len;
+    CK_ULONG digest1_len, digest2_len, digest3_len;
+
+    CK_BYTE *op_state1 = NULL;
+    CK_BYTE *op_state2 = NULL;
+    CK_ULONG op_state1_len;
+    CK_ULONG op_state2_len;
+
+    CK_ULONG i;
+
+    CK_MECHANISM mech;
+
+    testcase_begin("do_OperationState2");
+    testcase_new_assertion();
+    slot_id = SLOT_ID;
+
+    //
+    // here's the goal:
+    //  1) session #1 digests the first 499 bytes
+    //  2) session #2 digests the first 27 bytes
+    //  3) session #3 digests the whole thing
+    //  3) we save both operation states
+    //  4) we set the operation states to the 'other' session thereby
+    //     switching sessions.  Session #2 picks up where session #1 was
+    //     saved, session #1 picks up where session #2 was saved.
+    //  5) session #1 digests the final (1024 - 27) bytes
+    //  6) session #2 digests the final (1024 - 499) bytes
+    //
+    //  All the hash values should be the same
+    //
+
+    // create three USER RW sessions
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (get_user_pin(user_pin))
+        return CKR_FUNCTION_FAILED;
+
+    user_pin_len = (CK_ULONG) strlen((char *) user_pin);
+
+    rc = funcs->C_Login(session1, CKU_USER, user_pin, user_pin_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Login #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    orig_len = sizeof(original);
+    for (i = 0; i < orig_len; i++)
+        original[i] = i % 255;
+
+    mech.mechanism = CKM_SHA256;
+    mech.pParameter = NULL;
+    mech.ulParameterLen = 0;
+
+    if (!mech_supported(slot_id, mech.mechanism)) {
+        testcase_skip("Mechanism %s not supported. (skipped)",
+               mech_to_str(mech.mechanism));
+        funcs->C_CloseSession(session1);
+        funcs->C_CloseSession(session2);
+        funcs->C_CloseSession(session3);
+        return 0;
+    }
+
+    rc = funcs->C_DigestInit(session1, &mech);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestInit #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestInit(session2, &mech);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestInit #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestInit(session3, &mech);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestInit #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestUpdate(session1, original, 499);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestUpdate(session2, original, 27);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    orig_len = sizeof(original);
+    digest3_len = sizeof(digest3);
+    rc = funcs->C_Digest(session3, original, orig_len, digest3, &digest3_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Digest #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // save the operation states of sessions 1 and 2
+    rc = funcs->C_GetOperationState(session1, NULL, &op_state1_len);
+    if (rc != CKR_OK) {
+        if (rc == CKR_STATE_UNSAVEABLE) {
+            testcase_skip("Session state not savable for mechanism %s. (skipped)",
+                   mech_to_str(mech.mechanism));
+            funcs->C_CloseSession(session1);
+            funcs->C_CloseSession(session2);
+            funcs->C_CloseSession(session3);
+            return 0;
+        }
+        testcase_fail("C_GetOperationState #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    op_state1 = (CK_BYTE *) malloc(op_state1_len);
+    if (!op_state1) {
+        testcase_fail("HOST MEMORY ERROR");
+        return -1;
+    }
+
+    rc = funcs->C_GetOperationState(session1, op_state1, &op_state1_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetOperationState #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_GetOperationState(session2, NULL, &op_state2_len);
+    if (rc != CKR_OK) {
+        if (rc == CKR_STATE_UNSAVEABLE) {
+            testcase_skip("Session state not savable for mechanism %s. (skipped)",
+                   mech_to_str(mech.mechanism));
+            funcs->C_CloseSession(session1);
+            funcs->C_CloseSession(session2);
+            funcs->C_CloseSession(session3);
+            return 0;
+        }
+        testcase_fail("C_GetOperationState #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    op_state2 = (CK_BYTE *) malloc(op_state2_len);
+    if (!op_state2) {
+        testcase_fail("HOST MEMORY ERROR");
+        return -1;
+    }
+
+    rc = funcs->C_GetOperationState(session2, op_state2, &op_state2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetOperationState #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // switch the states
+    rc = funcs->C_SetOperationState(session1, op_state2, op_state2_len, 0, 0);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SetOperationState #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_SetOperationState(session2, op_state1, op_state1_len, 0, 0);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SetOperationState #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, finish the digest operations
+    rc = funcs->C_DigestUpdate(session2, original + 499, (orig_len - 499));
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestUpdate(session1, original + 27, orig_len - 27);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    digest1_len = sizeof(digest1);
+    rc = funcs->C_DigestFinal(session1, digest1, &digest1_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestFinal #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    digest2_len = sizeof(digest2);
+    rc = funcs->C_DigestFinal(session2, digest2, &digest2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestFinal #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (digest1_len != digest2_len || digest1_len != digest3_len) {
+        PRINT_ERR("   ERROR:  digested lengths don't match\n");
+        return -1;
+    }
+
+    if (memcmp(digest1, digest2, digest1_len) != 0) {
+        PRINT_ERR("   ERROR:  digest1 != digest2\n");
+        return -1;
+    }
+
+    if (memcmp(digest1, digest3, digest1_len) != 0) {
+        PRINT_ERR("   ERROR:  digest1 != digest3\n");
+        return -1;
+    }
+
+    rc = funcs->C_CloseSession(session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(session2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(session3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #5, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_OperationState2 passed");
+
+    free(op_state1);
+    free(op_state2);
+    return rc;
+}
+
+CK_RV do_OperationState3(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_SESSION_HANDLE session1, session2, session3;
+    CK_FLAGS flags;
+    CK_BYTE user_pin[PKCS11_MAX_PIN_LEN];
+    CK_ULONG user_pin_len;
+    CK_RV rc;
+
+    CK_BYTE original[1024];
+    CK_BYTE digest1[32];
+    CK_BYTE digest2[32];
+    CK_BYTE digest3[32];
+    CK_BYTE junk[1024];
+
+    CK_ULONG orig_len, junk_len;
+    CK_ULONG digest1_len, digest2_len, digest3_len;
+
+    CK_BYTE *op_state2 = NULL;
+    CK_ULONG op_state2_len;
+
+    CK_ULONG i;
+
+    CK_ULONG key_len = 16;
+    CK_ATTRIBUTE key_gen_tmpl[] = {
+        {CKA_VALUE_LEN, &key_len, sizeof(CK_ULONG)}
+    };
+
+    CK_MECHANISM mech1, mech2;
+    CK_OBJECT_HANDLE key;
+
+
+    testcase_begin("do_OperationState3");
+    testcase_new_assertion();
+    slot_id = SLOT_ID;
+
+    //
+    // here's the goal:
+    //  1) session #1 starts a multi-part encrypt
+    //  2) session #2 starts a multi-part digest
+    //  3) session #3 digests the whole thing
+    //  4) assign session #2's operating state to session #1
+    //  5) session #1 tries C_EncryptUpdate.  Should fail.
+    //  6) session #1 finishes the multi-part digest
+    //  7) session #2 finishes the multi-part digest
+    //
+    //  All the hash values should be the same
+    //
+
+    // create three USER RW sessions
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (get_user_pin(user_pin))
+        return CKR_FUNCTION_FAILED;
+
+    user_pin_len = (CK_ULONG) strlen((char *) user_pin);
+
+    rc = funcs->C_Login(session1, CKU_USER, user_pin, user_pin_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Login #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    orig_len = sizeof(original);
+    for (i = 0; i < orig_len; i++)
+        original[i] = i % 255;
+
+    mech1.mechanism = CKM_AES_KEY_GEN;
+    mech1.pParameter = NULL;
+    mech1.ulParameterLen = 0;
+
+    if (!mech_supported(slot_id, mech1.mechanism)) {
+        testcase_skip("Mechanism %s not supported. (skipped)",
+               mech_to_str(mech1.mechanism));
+        funcs->C_CloseSession(session1);
+        funcs->C_CloseSession(session2);
+        funcs->C_CloseSession(session3);
+        return 0;
+    }
+
+    rc = funcs->C_GenerateKey(session1, &mech1, key_gen_tmpl, 1, &key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GenerateKey #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    mech1.mechanism = CKM_AES_ECB;
+    mech1.pParameter = NULL;
+    mech1.ulParameterLen = 0;
+
+    if (!mech_supported(slot_id, mech1.mechanism)) {
+        testcase_skip("Mechanism %s not supported. (skipped)",
+               mech_to_str(mech1.mechanism));
+        funcs->C_CloseSession(session1);
+        funcs->C_CloseSession(session2);
+        funcs->C_CloseSession(session3);
+        return 0;
+    }
+
+    rc = funcs->C_EncryptInit(session1, &mech1, key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptInit #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    mech2.mechanism = CKM_SHA256;
+    mech2.pParameter = NULL;
+    mech2.ulParameterLen = 0;
+
+    if (!mech_supported(slot_id, mech2.mechanism)) {
+        testcase_skip("Mechanism %s not supported. (skipped)",
+               mech_to_str(mech2.mechanism));
+        funcs->C_CloseSession(session1);
+        funcs->C_CloseSession(session2);
+        funcs->C_CloseSession(session3);
+        return 0;
+    }
+
+    rc = funcs->C_DigestInit(session2, &mech2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestInit #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestInit(session3, &mech2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestInit #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestUpdate(session2, original, 499);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    orig_len = sizeof(original);
+    digest3_len = sizeof(digest3);
+    rc = funcs->C_Digest(session3, original, orig_len, digest3, &digest3_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Digest #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_GetOperationState(session2, NULL, &op_state2_len);
+    if (rc != CKR_OK) {
+        if (rc == CKR_STATE_UNSAVEABLE) {
+            testcase_skip("Session state not savable for mechanism %s. (skipped)",
+                   mech_to_str(mech2.mechanism));
+            funcs->C_CloseSession(session1);
+            funcs->C_CloseSession(session2);
+            funcs->C_CloseSession(session3);
+            return 0;
+        }
+        testcase_fail("C_GetOperationState #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    op_state2 = (CK_BYTE *) malloc(op_state2_len);
+    if (!op_state2) {
+        testcase_error("HOST MEMORY ERROR #1");
+        return -1;
+    }
+
+    rc = funcs->C_GetOperationState(session2, op_state2, &op_state2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GetOperationState #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_SetOperationState(session1, op_state2, op_state2_len, 0, 0);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SetOperationState #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // session #1 should not be set to do digest not encryption
+    junk_len = sizeof(junk);
+    rc = funcs->C_EncryptUpdate(session1, original, 499, junk, &junk_len);
+    if (rc != CKR_OPERATION_NOT_INITIALIZED) {
+        testcase_fail("C_EncryptUpdate #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        testcase_error("Expected CKR_OPERATION_NOT_INITIALIZED");
+        return -1;
+    }
+
+    // now, finish the digest operations
+    rc = funcs->C_DigestUpdate(session1, original + 499, (orig_len - 499));
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_DigestUpdate(session2, original + 499, (orig_len - 499));
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestUpdate #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    digest1_len = sizeof(digest1);
+    rc = funcs->C_DigestFinal(session1, digest1, &digest1_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestFinal #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    digest2_len = sizeof(digest2);
+    rc = funcs->C_DigestFinal(session2, digest2, &digest2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_DigestFinal #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (digest1_len != digest2_len || digest1_len != digest3_len) {
+        testcase_error("ERROR: digested lengths don't match");
+        return -1;
+    }
+
+    if (memcmp(digest1, digest2, digest1_len) != 0) {
+        testcase_error("ERROR: digest1 != digest2");
+        return -1;
+    }
+
+    if (memcmp(digest1, digest3, digest1_len) != 0) {
+        testcase_error("ERROR: digest1 != digest3");
+        return -1;
+    }
+
+    rc = funcs->C_CloseSession(session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(session2);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #4, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(session3);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #5, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_OperationState3 passed");
+
+    free(op_state2);
+    return rc;
+}
+
+CK_RV do_SessionCancel(void)
+{
+    CK_SLOT_ID slot_id;
+    CK_SESSION_HANDLE session1;
+    CK_FLAGS flags;
+    CK_BYTE user_pin[PKCS11_MAX_PIN_LEN];
+    CK_ULONG user_pin_len;
+    CK_RV rc;
+
+    CK_BYTE original[1024];
+    CK_BYTE crypt1[1024];
+    CK_BYTE crypt2[1024];
+    CK_BYTE trash1[8];
+    CK_BYTE trash2[8];
+
+    CK_ULONG orig_len, crypt1_len, crypt2_len, trash1_len, trash2_len;
+    CK_ULONG i;
+
+    CK_ULONG key_len = 16;
+    CK_ATTRIBUTE key_gen_tmpl[] = {
+        {CKA_VALUE_LEN, &key_len, sizeof(CK_ULONG)}
+    };
+
+    CK_MECHANISM mech;
+    CK_OBJECT_HANDLE h_key;
+
+    testcase_begin("do_SessionCancel");
+    testcase_new_assertion();
+    slot_id = SLOT_ID;
+
+    // create two USER RW sessions
+    flags = CKF_SERIAL_SESSION | CKF_RW_SESSION;
+    rc = funcs->C_OpenSession(slot_id, flags, NULL, NULL, &session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_OpenSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    if (get_user_pin(user_pin))
+        return CKR_FUNCTION_FAILED;
+
+    user_pin_len = (CK_ULONG) strlen((char *) user_pin);
+
+    rc = funcs->C_Login(session1, CKU_USER, user_pin, user_pin_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_Login #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    orig_len = sizeof(original);
+    for (i = 0; i < orig_len; i++)
+        original[i] = i % 255;
+
+    trash1_len = sizeof(trash1);
+    memcpy(trash1, "asdflkjasdlkjadslkj", trash1_len);
+
+    // first generate a AES key
+    mech.mechanism = CKM_AES_KEY_GEN;
+    mech.ulParameterLen = 0;
+    mech.pParameter = NULL;
+
+    if (!mech_supported(slot_id, mech.mechanism)) {
+        testcase_skip("Mechanism %s not supported. (skipped)",
+               mech_to_str(mech.mechanism));
+        funcs->C_CloseSession(session1);
+        return 0;
+    }
+
+    rc = funcs->C_GenerateKey(session1, &mech, key_gen_tmpl, 1, &h_key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_GenerateKey #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    // now encrypt the original data all at once using CBC
+    mech.mechanism = CKM_AES_CBC;
+    mech.ulParameterLen = 16;
+    mech.pParameter = "1234qwerasdfyxcv";
+
+    rc = funcs->C_EncryptInit(session1, &mech, h_key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptInit #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // cancel the encrypt session
+    rc = funcs3->C_SessionCancel(session1, CKF_ENCRYPT);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SessionCancel #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    crypt1_len = sizeof(crypt1);
+    rc = funcs->C_Encrypt(session1, original, orig_len, crypt1, &crypt1_len);
+    if (rc != CKR_OPERATION_NOT_INITIALIZED) {
+        testcase_fail("C_Encrypt #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, begin encrypting multipart
+    rc = funcs->C_EncryptInit(session1, &mech, h_key);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptInit #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // cancel non existing sign session (no effect expected)
+    rc = funcs3->C_SessionCancel(session1, CKF_SIGN);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SessionCancel #2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    crypt2_len = sizeof(crypt2);
+    rc = funcs->C_EncryptUpdate(session1, original, orig_len / 2,
+                                crypt2, &crypt2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptUpdate #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // cancel non existing decrypt session (no effect expected)
+    rc = funcs3->C_SessionCancel(session1, CKF_DECRYPT);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SessionCancel #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    // now, encrypt the rest of the original data
+    i = crypt2_len;
+    crypt2_len = sizeof(crypt2) - crypt2_len;
+    rc = funcs->C_EncryptUpdate(session1,
+                                original + orig_len / 2, orig_len / 2,
+                                crypt2 + i, &crypt2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptUpdate #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    crypt2_len += i;
+
+    // cancel non existing find session (no effect expected)
+    rc = funcs3->C_SessionCancel(session1, CKF_FIND_OBJECTS);
+    if (rc != CKR_OK) {
+        testcase_fail("C_SessionCancel #3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    trash2_len = sizeof(trash2);
+    rc = funcs->C_EncryptFinal(session1, trash2, &trash2_len);
+    if (rc != CKR_OK) {
+        testcase_fail("C_EncryptFinal #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    rc = funcs->C_CloseSession(session1);
+    if (rc != CKR_OK) {
+        testcase_fail("C_CloseSession #1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+
+    testcase_pass("do_SessionCancel passed");
+
+    return rc;
+}
+
+CK_RV sess_mgmt_functions(void)
+{
+    SYSTEMTIME t1, t2;
+    CK_RV rc;
+
+    testcase_begin("sess_mgmt_functions");
+    testcase_new_assertion();
+
+    GetSystemTime(&t1);
+    rc = do_OpenSession();
+    if (rc && !no_stop) {
+        testcase_fail("do_OpenSession, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_OpenSession2();
+    if (rc && !no_stop) {
+        testcase_fail("do_OpenSession2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_CloseAllSessions();
+    if (rc && !no_stop) {
+        testcase_fail("do_CloseAllSessions, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_GetSessionInfo();
+    if (rc && !no_stop) {
+        testcase_fail("do_GetSessionInfo, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_LoginLogout();
+    if (rc && !no_stop) {
+        testcase_fail("do_LoginLogout, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_OperationState1();
+    if (rc && !no_stop) {
+        testcase_fail("do_OperationState1, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_OperationState2();
+    if (rc && !no_stop) {
+        testcase_fail("do_OperationState2, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_OperationState3();
+    if (rc && !no_stop) {
+        testcase_fail("do_OperationState3, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    GetSystemTime(&t1);
+    rc = do_SessionCancel();
+    if (rc && !no_stop) {
+        testcase_fail("do_SessionCancel, rc=%lx, %s", rc, p11_get_ckr(rc));
+        return rc;
+    }
+    GetSystemTime(&t2);
+    process_time(t1, t2);
+
+    testcase_pass("sess_mgmt_functions passed");
+
+    return rc;
+}
+
+int main(int argc, char **argv)
+{
+    CK_C_INITIALIZE_ARGS cinit_args;
+    int rc;
+    CK_RV rv;
+
+    rc = do_ParseArgs(argc, argv);
+    if (rc != 1)
+        return rc;
+
+    printf("Using slot #%lu...\n\n", SLOT_ID);
+    printf("With option: no_init: %d\n", no_init);
+
+    rc = do_GetFunctionList();
+    if (!rc) {
+        PRINT_ERR("ERROR do_GetFunctionList() Failed , rc = 0x%0x\n", rc);
+        return rc;
+    }
+
+    memset(&cinit_args, 0x0, sizeof(cinit_args));
+    cinit_args.flags = CKF_OS_LOCKING_OK;
+
+    // SAB Add calls to ALL functions before the C_Initialize gets hit
+
+    funcs->C_Initialize(&cinit_args);
+
+    {
+        CK_SESSION_HANDLE hsess = 0;
+
+        rc = funcs->C_GetFunctionStatus(hsess);
+        if (rc != CKR_FUNCTION_NOT_PARALLEL)
+            return rc;
+
+        rc = funcs->C_CancelFunction(hsess);
+        if (rc != CKR_FUNCTION_NOT_PARALLEL)
+            return rc;
+    }
+
+    testcase_setup();
+    rv = sess_mgmt_functions();
+    testcase_print_result();
+
+    /* make sure we return non-zero if rv is non-zero */
+    return ((rv == 0) || (rv % 256) ? (int)rv : -1);
+}
