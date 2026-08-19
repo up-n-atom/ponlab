@@ -1,0 +1,272 @@
+// SPDX-License-Identifier: (GPL-2.0 OR MIT)
+// Generated from Workbook version: 3.0.32_dyn on 9/27/2024 3:54:49 PM 
+#ifndef __LGM_MXL_NOC_FW_DEFS_H
+#define __LGM_MXL_NOC_FW_DEFS_H
+
+// NoC FW Permissions - shift left by 1 to write to FW H/w
+#define NOC_FW_F_NONE       (0 >> 1)      // No access
+#define NOC_FW_F_R          (2 >> 1)      // Read access
+#define NOC_FW_F_W          (4 >> 1)      // Write access
+#define NOC_FW_F_RW         (0xE >> 1)      // Read-Write access
+#define NOC_FW_F_L          (256 >> 1)    // IED Length align & size check - 16B
+#define NOC_FW_F_RL         (NOC_FW_F_R  | NOC_FW_F_L)
+#define NOC_FW_F_WL         (NOC_FW_F_W  | NOC_FW_F_L)
+#define NOC_FW_F_RWL        (NOC_FW_F_RW | NOC_FW_F_L)
+
+// IA defines
+#define SECURITY_TOP_BASE   0xE00C0000//  SECURITY_TOP Base
+#define SAI_IA_OFFSET       0x30// SAI_IA offset
+#define CONFIG_TEP_DEBUG       1
+#define CONFIG_ATOM_DEBUG      1
+// NoC FW Operations at Linux driver
+//SPLIT and INDEPENDENT are mutually exclusive and qualify Add, Modify or Delete operations
+#define NOC_FW_OP_ADD                  0x1     // Add Operation
+#define NOC_FW_OP_MODIFY               0x2     // Modify Operation
+#define NOC_FW_OP_DEL                  0x4     // Delete Operation
+#define NOC_FW_OP_SPLIT                0x8     // Split matched rule
+#define NOC_FW_OP_INDEPENDENT          0x10    // Don't match against existing rules
+#define NOC_FW_OP_ADD_INDEPENDENT      0x11    // Add Independent Operation
+#define NOC_FW_OP_ADD_SPLIT            0x09    // Add Split Operation
+#define NOC_FW_OP_MODIFY_INDEPENDENT   0x12    // Modify Independent Operation
+#define NOC_FW_OP_MODIFY_SPLIT         0x0A    // Modify Split operation
+#define NOC_FW_OP_DEL_INDEPENDENT      0x14    // Delete Split operation
+#define NOC_FW_OP_DEL_SPLIT            0x0C    // Delete Split operation
+
+// Special Address Regions handling
+#define NOC_FW_SPECIAL_REGION        0x80000000
+#define NOC_FW_SPECIAL_REGION_DYN    0x40000000
+#define NOC_FW_NONCOHERENT           0x20000000
+#define NOC_FW_PLUS1                 0x10000000
+#define NOC_FW_MINUS1                0x08000000
+// Special Address Regions
+#define NOC_FW_KERNEL_START         1
+#define NOC_FW_KERNEL_ROEND         2
+#define NOC_FW_ROOTFS_START         3
+#define NOC_FW_ROOTFS_END           4
+#define NOC_FW_ROPOOL_START         5
+#define NOC_FW_ROPOOL_END           6
+#define NOC_FW_SYSPOOL_START        7
+#define NOC_FW_SYSPOOL_END          8
+#define NOC_FW_CPUPOOL_START        9
+#define NOC_FW_CPUPOOL_END          10
+#define NOC_FW_RWPOOL_START         11
+#define NOC_FW_RWPOOL_END           12
+#define NOC_FW_ICCPOOL_START        13
+#define NOC_FW_ICCPOOL_END          14
+#define NOC_FW_DDR_GENERIC_RW_START 15
+#define NOC_FW_DDR_GENERIC_RW_END   16
+#define NOC_FW_KERNEL_END           NOC_FW_KERNEL_ROEND
+
+// Dynamic Ranges
+#define NOC_FW_DYN_CPUBUFRET_START                 0x1000
+#define NOC_FW_DYN_CPUBUFRET_END                   0x1001
+#define NOC_FW_DYN_DDR_GATHERBUF_START             0x2000
+#define NOC_FW_DYN_DDR_GATHERBUF_END               0x2001
+
+#define NOC_FW_DYN_VPNFW_START                     0x3000
+#define NOC_FW_DYN_VPNFW_END                       0x3001
+#define NOC_FW_DYN_VPN_ATOM_START                  0x3002
+#define NOC_FW_DYN_VPN_ATOM_END                    0x3003
+#define NOC_FW_DYN_VPN_CRYPTO_START                0x3004
+#define NOC_FW_DYN_VPN_CRYPTO_END                  0x3005
+
+#define NOC_FW_DYN_VOICE_BUFPOOL_START             0x5000
+#define NOC_FW_DYN_VOICE_BUFPOOL_END               0x5001
+#define NOC_FW_DYN_VOICE_C55_RO_START              0x5002
+#define NOC_FW_DYN_VOICE_C55_RO_END                0x5003
+#define NOC_FW_DYN_VOICE_C55_RW_START              0x5004
+#define NOC_FW_DYN_VOICE_C55_RW_END                0x5005
+#define NOC_FW_DYN_VOICE_ATOM_RW_START             0x5006
+#define NOC_FW_DYN_VOICE_ATOM_RW_END               0x5007
+#define NOC_FW_DYN_VOICE_ATOM_RO_START             0x5008
+#define NOC_FW_DYN_VOICE_ATOM_RO_END               0x5009
+#define NOC_FW_DYN_VOICE_DQM_START                 0x5010
+#define NOC_FW_DYN_VOICE_DQM_END                   0x5011
+#define NOC_FW_DYN_VOICE_EQM_START                 0x5012
+#define NOC_FW_DYN_VOICE_EQM_END                   0x5013
+#define NOC_FW_DYN_VOICEPOOL_START                 0x5014
+#define NOC_FW_DYN_VOICEPOOL_END                   0x5015
+
+// PCIe RC Identifiers
+#define NOC_FW_DYN_PCIE10_PREFIX                   0x10
+#define NOC_FW_DYN_PCIE11_PREFIX                   0x11
+#define NOC_FW_DYN_PCIE20_PREFIX                   0x20
+#define NOC_FW_DYN_PCIE21_PREFIX                   0x21
+#define NOC_FW_DYN_PCIE30_PREFIX                   0x30
+#define NOC_FW_DYN_PCIE31_PREFIX                   0x31
+#define NOC_FW_DYN_PCIE40_PREFIX                   0x40
+#define NOC_FW_DYN_PCIE41_PREFIX                   0x41
+
+// Macros for Dynamic Range Ids for PCIe RC
+#define NOC_FW_DYN_PCIE_PREFIX_OFFSET              16
+#define NOC_FW_GET_PCIERC(IdVal)                   ((IdVal) & (0xFF << NOC_FW_DYN_PCIE_PREFIX_OFFSET))
+#define NOC_FW_SET_PCIERC_ID(PCIeRC_Id, VarId)     (((PCIeRC_Id) << NOC_FW_DYN_PCIE_PREFIX_OFFSET)|(VarId))
+#define NOC_FW_IS_PCIE_DYN_VAR(IdVal)              NOC_FW_GET_PCIERC(IdVal)
+
+// ADP Dynamic Variables
+
+#define CQM_DCDQ_PORT_START                        0x01
+#define CQM_DCDQ_PORT_END                          0x02
+#define CQM_DCEQ_PORT_START                        0x03
+#define CQM_DCEQ_PORT_END                          0x04
+#define PERI_UMT_START                             0x05
+#define PERI_UMT_END                               0x06
+#define BM_START                                   0x07
+#define BM_END                                     0x08
+#define QOS_START                                  0x09
+#define QOS_END                                    0x0A
+
+// PCIe ADP Dynamic Variables
+
+#define NOC_FW_DYN_PCIE10_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, CQM_DCDQ_PORT_START) // 0x1000001
+#define NOC_FW_DYN_PCIE10_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, CQM_DCDQ_PORT_END)   // 0x1000002
+#define NOC_FW_DYN_PCIE11_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, CQM_DCDQ_PORT_START) // 0x1100001
+#define NOC_FW_DYN_PCIE11_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, CQM_DCDQ_PORT_END)   // 0x1100002
+#define NOC_FW_DYN_PCIE20_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, CQM_DCDQ_PORT_START) // 0x2000001
+#define NOC_FW_DYN_PCIE20_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, CQM_DCDQ_PORT_END)   // 0x2000002
+#define NOC_FW_DYN_PCIE21_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, CQM_DCDQ_PORT_START) // 0x2100001
+#define NOC_FW_DYN_PCIE21_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, CQM_DCDQ_PORT_END)   // 0x2100002
+#define NOC_FW_DYN_PCIE30_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, CQM_DCDQ_PORT_START) // 0x3000001
+#define NOC_FW_DYN_PCIE30_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, CQM_DCDQ_PORT_END)   // 0x3000002
+#define NOC_FW_DYN_PCIE31_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, CQM_DCDQ_PORT_START) // 0x3100001
+#define NOC_FW_DYN_PCIE31_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, CQM_DCDQ_PORT_END)   // 0x3100002
+#define NOC_FW_DYN_PCIE40_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, CQM_DCDQ_PORT_START) // 0x4000001
+#define NOC_FW_DYN_PCIE40_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, CQM_DCDQ_PORT_END)   // 0x4000002
+#define NOC_FW_DYN_PCIE41_CQM_DCDQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, CQM_DCDQ_PORT_START) // 0x4100001
+#define NOC_FW_DYN_PCIE41_CQM_DCDQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, CQM_DCDQ_PORT_END)   // 0x4100002
+#define NOC_FW_DYN_PCIE10_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, CQM_DCEQ_PORT_START) // 0x1000003
+#define NOC_FW_DYN_PCIE10_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, CQM_DCEQ_PORT_END)   // 0x1000004
+#define NOC_FW_DYN_PCIE11_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, CQM_DCEQ_PORT_START) // 0x1100003
+#define NOC_FW_DYN_PCIE11_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, CQM_DCEQ_PORT_END)   // 0x1100004
+#define NOC_FW_DYN_PCIE20_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, CQM_DCEQ_PORT_START) // 0x2000003
+#define NOC_FW_DYN_PCIE20_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, CQM_DCEQ_PORT_END)   // 0x2000004
+#define NOC_FW_DYN_PCIE21_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, CQM_DCEQ_PORT_START) // 0x2100003
+#define NOC_FW_DYN_PCIE21_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, CQM_DCEQ_PORT_END)   // 0x2100004
+#define NOC_FW_DYN_PCIE30_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, CQM_DCEQ_PORT_START) // 0x3000003
+#define NOC_FW_DYN_PCIE30_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, CQM_DCEQ_PORT_END)   // 0x3000004
+#define NOC_FW_DYN_PCIE31_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, CQM_DCEQ_PORT_START) // 0x3100003
+#define NOC_FW_DYN_PCIE31_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, CQM_DCEQ_PORT_END)   // 0x3100004
+#define NOC_FW_DYN_PCIE40_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, CQM_DCEQ_PORT_START) // 0x4000003
+#define NOC_FW_DYN_PCIE40_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, CQM_DCEQ_PORT_END)   // 0x4000004
+#define NOC_FW_DYN_PCIE41_CQM_DCEQ_PORT_START      NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, CQM_DCEQ_PORT_START) // 0x4100003
+#define NOC_FW_DYN_PCIE41_CQM_DCEQ_PORT_END        NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, CQM_DCEQ_PORT_END)   // 0x4100004
+#define NOC_FW_DYN_PCIE10_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, PERI_UMT_START)      // 0x1000005
+#define NOC_FW_DYN_PCIE10_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, PERI_UMT_END)        // 0x1000006
+#define NOC_FW_DYN_PCIE11_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, PERI_UMT_START)      // 0x1100005
+#define NOC_FW_DYN_PCIE11_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, PERI_UMT_END)        // 0x1100006
+#define NOC_FW_DYN_PCIE20_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, PERI_UMT_START)      // 0x2000005
+#define NOC_FW_DYN_PCIE20_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, PERI_UMT_END)        // 0x2000006
+#define NOC_FW_DYN_PCIE21_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, PERI_UMT_START)      // 0x2100005
+#define NOC_FW_DYN_PCIE21_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, PERI_UMT_END)        // 0x2100006
+#define NOC_FW_DYN_PCIE30_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, PERI_UMT_START)      // 0x3000005
+#define NOC_FW_DYN_PCIE30_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, PERI_UMT_END)        // 0x3000006
+#define NOC_FW_DYN_PCIE31_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, PERI_UMT_START)      // 0x3100005
+#define NOC_FW_DYN_PCIE31_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, PERI_UMT_END)        // 0x3100006
+#define NOC_FW_DYN_PCIE40_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, PERI_UMT_START)      // 0x4000005
+#define NOC_FW_DYN_PCIE40_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, PERI_UMT_END)        // 0x4000006
+#define NOC_FW_DYN_PCIE41_PERI_UMT_START           NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, PERI_UMT_START)      // 0x4100005
+#define NOC_FW_DYN_PCIE41_PERI_UMT_END             NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, PERI_UMT_END)        // 0x4100006
+#define NOC_FW_DYN_PCIE10_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, BM_START)            // 0x1000007
+#define NOC_FW_DYN_PCIE10_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, BM_END)              // 0x1000008
+#define NOC_FW_DYN_PCIE11_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, BM_START)            // 0x1100007
+#define NOC_FW_DYN_PCIE11_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, BM_END)              // 0x1100008
+#define NOC_FW_DYN_PCIE20_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, BM_START)            // 0x2000007
+#define NOC_FW_DYN_PCIE20_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, BM_END)              // 0x2000008
+#define NOC_FW_DYN_PCIE21_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, BM_START)            // 0x2100007
+#define NOC_FW_DYN_PCIE21_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, BM_END)              // 0x2100008
+#define NOC_FW_DYN_PCIE30_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, BM_START)            // 0x3000007
+#define NOC_FW_DYN_PCIE30_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, BM_END)              // 0x3000008
+#define NOC_FW_DYN_PCIE31_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, BM_START)            // 0x3100007
+#define NOC_FW_DYN_PCIE31_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, BM_END)              // 0x3100008
+#define NOC_FW_DYN_PCIE40_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, BM_START)            // 0x4000007
+#define NOC_FW_DYN_PCIE40_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, BM_END)              // 0x4000008
+#define NOC_FW_DYN_PCIE41_BM_START                 NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, BM_START)            // 0x4100007
+#define NOC_FW_DYN_PCIE41_BM_END                   NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, BM_END)              // 0x4100008
+#define NOC_FW_DYN_PCIE10_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, QOS_START)           // 0x1000009
+#define NOC_FW_DYN_PCIE10_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE10_PREFIX, QOS_END)             // 0x100000A
+#define NOC_FW_DYN_PCIE11_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, QOS_START)           // 0x1100009
+#define NOC_FW_DYN_PCIE11_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE11_PREFIX, QOS_END)             // 0x110000A
+#define NOC_FW_DYN_PCIE20_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, QOS_START)           // 0x2000009
+#define NOC_FW_DYN_PCIE20_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE20_PREFIX, QOS_END)             // 0x200000A
+#define NOC_FW_DYN_PCIE21_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, QOS_START)           // 0x2100009
+#define NOC_FW_DYN_PCIE21_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE21_PREFIX, QOS_END)             // 0x210000A
+#define NOC_FW_DYN_PCIE30_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, QOS_START)           // 0x3000009
+#define NOC_FW_DYN_PCIE30_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE30_PREFIX, QOS_END)             // 0x300000A
+#define NOC_FW_DYN_PCIE31_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, QOS_START)           // 0x3100009
+#define NOC_FW_DYN_PCIE31_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE31_PREFIX, QOS_END)             // 0x310000A
+#define NOC_FW_DYN_PCIE40_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, QOS_START)           // 0x4000009
+#define NOC_FW_DYN_PCIE40_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE40_PREFIX, QOS_END)             // 0x400000A
+#define NOC_FW_DYN_PCIE41_QOS_START                NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, QOS_START)           // 0x4100009
+#define NOC_FW_DYN_PCIE41_QOS_END                  NOC_FW_SET_PCIERC_ID(NOC_FW_DYN_PCIE41_PREFIX, QOS_END)             // 0x410000A
+
+	// Peripheral_SAI
+#define SAI_IA_PCI_0_VAL        			0x2C	// PCI3Lane0/3.0
+#define SAI_IA_PCI_1_VAL        			0x2E	// PCI3Lane1/3.0
+#define SAI_IA_PCI_2_VAL        			0x30	// PCI1Lane0/4.0
+#define SAI_IA_PCI_3_VAL        			0x32	// PCI1Lane1/4.0
+#define SAI_IA_PCI_4_VAL        			0x34	// PCI4Lane0/3.0
+#define SAI_IA_PCI_5_VAL        			0x36	// PCI4Lane1/3.0
+#define SAI_IA_PCI_6_VAL        			0x38	// PCI2Lane0/4.0
+#define SAI_IA_PCI_7_VAL        			0x3A	// PCI2Lane1/4.0
+#define SAI_IA_SATA_0_VAL       			0x02	// SATA0
+#define SAI_IA_SATA_1_VAL       			0x12	// SATA1
+#define SAI_IA_SATA_2_VAL       			0x42	// SATA2
+#define SAI_IA_SATA_3_VAL       			0x52	// SATA3
+#define SAI_IA_USB_0_VAL        			0x3C	// USB0
+#define SAI_IA_USB_1_VAL        			0x3E	// USB1
+#define SAI_IA_DMA0_VAL         			0x60	// PeriDMA0
+#define SAI_IA_DBGSPI_VAL       			0x62	// SPI Debug
+#define SAI_IA_TOE_VAL          			0x64	// TOE
+#define SAI_IA_TOER_VAL         			0x66	// TOEDMAR
+#define SAI_IA_TOET_VAL         			0x66	// TOEDMAW
+#define SAI_IA_SOCMSIGEN_VAL    			0x68	// SOC_MSIGEN
+#define SAI_IA_DMA3_VAL         			0x6A	// MCPY DMA3
+#define SAI_IA_VOICE_VAL        			0x6C	// Voice
+#define SAI_IA_V130_VAL         			0x10	// Vault130
+#define SAI_IA_E197_VAL         			0x6E	// EIP197
+#define SAI_IA_TEP_VAL          			0x40	// TEP
+#define SAI_IA_SDXC_VAL         			0x70	// SDXC
+#define SAI_IA_EMMC_VAL         			0x72	// EMMC Master
+#define SAI_IA_PP_VAL           			0x74	// PPv4
+#define SAI_IA_EPU_VAL          			0x76	// EPU
+#define SAI_IA_ARCVPN_VAL       			0x78	// VPNA
+#define SAI_IA_DMAR_VAL         			0x7A	// DMARX
+#define SAI_IA_DMAT_VAL         			0x24	// DMATX1/2/3
+#define SAI_IA_DEQ_VAL          			0x26	// CQM_DEQ
+#define SAI_IA_ENQ_VAL          			0x28	// CQM_ENQ
+#define SAI_IA_PON_VAL          			0x2A	// PON
+
+	// CPU_SAI
+#define SAI_IA_VM2_0_VAL        			0x01	// IA_VM2
+#define SAI_IA_VM2_1_VAL        			0x11	// IA_VM2
+#define SAI_IA_VM2_2_VAL        			0x41	// IA_VM2
+#define SAI_IA_VM2_3_VAL        			0x51	// IA_VM2
+#define SAI_IA_VM0_0_VAL        			0x05	// IA_VM0
+#define SAI_IA_VM0_1_VAL        			0x15	// IA_VM0
+#define SAI_IA_VM0_2_VAL        			0x45	// IA_VM0
+#define SAI_IA_VM0_3_VAL        			0x55	// IA_VM0
+#define SAI_IA_VM1_VAL          			0x07	// IA_VM1
+#define SAI_IA_VM1_1_VAL        			0x17	// IA_VM1
+#define SAI_IA_VM1_2_VAL        			0x47	// IA_VM1
+#define SAI_IA_VM1_3_VAL        			0x57	// IA_VM1
+#define SAI_IA_BOOT_0_VAL       			0x09	// IA_BOOT
+#define SAI_IA_BOOT_1_VAL       			0x19	// IA_BOOT
+#define SAI_IA_BOOT_2_VAL       			0x49	// IA_BOOT
+#define SAI_IA_BOOT_3_VAL       			0x59	// IA_BOOT
+#define SAI_IA_VMM_VAL          			0x0B	// IA_VMM
+#define SAI_IA_VMM_1_VAL        			0x1B	// IA_VMM
+#define SAI_IA_VMM_2_VAL        			0x4B	// IA_VMM
+#define SAI_IA_VMM_3_VAL        			0x5B	// IA_VMM
+#define SAI_IA_VM3_0_VAL        			0x0D	// IA_VM3
+#define SAI_IA_VM3_1_VAL        			0x1D	// IA_VM3
+#define SAI_IA_VM3_2_VAL        			0x4D	// IA_VM3
+#define SAI_IA_VM3_3_VAL        			0x5D	// IA_VM3
+#define SAI_IA_VM4_0_VAL        			0x0F	// IA_VM4
+#define SAI_IA_VM4_1_VAL        			0x1F	// IA_VM4
+#define SAI_IA_VM4_2_VAL        			0x4F	// IA_VM4
+#define SAI_IA_VM4_3_VAL        			0x5F	// IA_VM4
+#define SAI_IA_MEMAXI_VAL       			0x7F	// IA_MEMAXI
+
+#define ALL_SAI_IA_VMM_VAL              SAI_IA_VMM_3_VAL   // CPU0 works fine
+#define ALL_SAI_IA_HSIO_VAL             SAI_IA_PCI_0_VAL // All HSIO peripherals
+#endif // __LGM_MXL,NOC_FW_DEFS_H
