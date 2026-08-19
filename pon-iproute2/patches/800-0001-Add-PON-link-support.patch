@@ -1,0 +1,1211 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Maxlinear <nobody@maxlinear.com>
+Date: Fri, 18 Feb 2022 09:46:41 +0100
+Subject: Add PON link support
+
+This adds support for PON links with the MaxLinear PON ethernet driver.
+
+This allows to create, modify and delete GEM ports, T-Conts, pmappers,
+llids and ip host interfaces.
+
+Get the help like this:
+ip link add gem1123 type gem help
+Usage: ... type gem id <id> traffic_type <eth|omci|ethm> dir <dis|us|ds|bi> enc <dis|uc|bc|dsen> max_size <value> mc <en|dis>
+
+This is one example configuration sequence:
+ip link add link pon0 tcont1033 type tcont id 1033
+ip link add link pon0 gem1123 type gem id 1123 traffic_type eth dir ds enc dis
+ip link set gem1123 type gem tcont tcont1033 dir bi
+ip link add link pon0 pmapper1 type pmapper
+ip link set pmapper1 type pmapper pcp 0 gem1123 pcp 1 gem1123 pcpdef 1
+
+root@prx321-sfu-qspi-pon:/# ip -d link show
+....
+14: pon0: <BROADCAST,MULTICAST> mtu 1500 qdisc prio state DOWN mode DEFAULT group default qlen 1000
+    link/ether 00:00:00:00:00:00 brd ff:ff:ff:ff:ff:ff promiscuity 0
+    pon queue_lookup_mode: 1 addrgenmode eui64 numtxqueues 8 numrxqueues 8 gso_max_size 65536 gso_max_segs 65535
+....
+18: tcont1033@pon0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether d6:39:da:14:e8:d6 brd ff:ff:ff:ff:ff:ff promiscuity 0
+    tcont idx: 1 id: 1033 addrgenmode eui64 numtxqueues 8 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535
+19: gem1123@pon0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether 3e:74:be:cf:7f:70 brd ff:ff:ff:ff:ff:ff promiscuity 0
+    gem idx: 1 id: 1123 traffic type: 0 dir: 3 enc: 0 max size: 0 tcont: tcont1033 mc: 0 addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535
+20: pmapper1@pon0: <BROADCAST,MULTICAST,M-DOWN> mtu 1500 qdisc noop state DOWN mode DEFAULT group default qlen 1000
+    link/ether d6:8d:e1:a1:34:5b brd ff:ff:ff:ff:ff:ff promiscuity 0
+    pmapper pcp 0: gem1123 pcp 1: gem1123 pcpdef: 1 addrgenmode eui64 numtxqueues 1 numrxqueues 1 gso_max_size 65536 gso_max_segs 65535
+---
+ ip/Makefile         |   4 +-
+ ip/iplink_gem.c     | 286 ++++++++++++++++++++++++++++++++++
+ ip/iplink_iphost.c  |  64 ++++++++
+ ip/iplink_llid.c    | 184 ++++++++++++++++++++++
+ ip/iplink_pmapper.c | 364 ++++++++++++++++++++++++++++++++++++++++++++
+ ip/iplink_pon.c     |  98 ++++++++++++
+ ip/iplink_tcont.c   | 112 ++++++++++++++
+ 7 files changed, 1111 insertions(+), 1 deletion(-)
+ create mode 100644 ip/iplink_gem.c
+ create mode 100644 ip/iplink_iphost.c
+ create mode 100644 ip/iplink_llid.c
+ create mode 100644 ip/iplink_pmapper.c
+ create mode 100644 ip/iplink_pon.c
+ create mode 100644 ip/iplink_tcont.c
+
+diff --git a/ip/Makefile b/ip/Makefile
+index 31449077..93e82452 100644
+--- a/ip/Makefile
++++ b/ip/Makefile
+@@ -11,7 +11,9 @@ IPOBJ=ip.o ipaddress.o ipaddrlabel.o iproute.o iprule.o ipnetns.o \
+     iplink_bridge.o iplink_bridge_slave.o ipfou.o iplink_ipvlan.o \
+     iplink_geneve.o iplink_vrf.o iproute_lwtunnel.o ipmacsec.o ipila.o \
+     ipvrf.o iplink_xstats.o ipseg6.o iplink_netdevsim.o iplink_rmnet.o \
+-    ipnexthop.o ipmptcp.o iplink_bareudp.o iplink_wwan.o ipioam6.o
++    ipnexthop.o ipmptcp.o iplink_bareudp.o iplink_wwan.o ipioam6.o \
++    iplink_pmapper.o iplink_gem.o iplink_tcont.o iplink_iphost.o iplink_llid.o \
++    iplink_pon.o
+ 
+ RTMONOBJ=rtmon.o
+ 
+diff --git a/ip/iplink_gem.c b/ip/iplink_gem.c
+new file mode 100644
+index 00000000..6051da92
+--- /dev/null
++++ b/ip/iplink_gem.c
+@@ -0,0 +1,286 @@
++/* iplink_gpon.c	GPON device support
++ *
++ *              This program is free software; you can redistribute it and/or
++ *              modify it under the terms of the GNU General Public License
++ *              as published by the Free Software Foundation; either version
++ *              2 of the License, or (at your option) any later version.
++ *
++ *
++ * Authors:     2017 Intel Corporation
++ *              Based on iplink_vrf.c from
++ *                      Shrijeet Mukherjee <shm@cumulusnetworks.com>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <net/if.h>
++#include <linux/if_link.h>
++#include <errno.h>
++
++#include "rt_names.h"
++#include "utils.h"
++#include "ip_common.h"
++
++/* Ethernet (G.989), Ethernet unicast (G.984) */
++#define GEM_TRAFFIC_TYPE_ETH 0
++/* OMCI (G.984, G.989) */
++#define GEM_TRAFFIC_TYPE_OMCI 1
++/* Ethernet multicast (G.984 only) */
++#define GEM_TRAFFIC_TYPE_ETHM 2
++/* Encryption disabled (G.984, G989) */
++#define GEM_ENC_DIS 0
++/* Unicast payload encryption in both directions (G.989 only) or encrypted
++ * (G.984)
++ */
++#define GEM_ENC_UC 1
++/* Broadcast encryption (G.989 only) */
++#define GEM_ENC_BC 2
++/* Unicast encryption in downstream only (G.984, G.989) */
++#define GEM_ENC_DSEN 3
++/* Disabled (GEM port not used) */
++#define GEM_DIR_DIS 0
++/* Upstream (UNI-to-ANI) */
++#define GEM_DIR_US 1
++/* Downstream (ANI-to-UNI) */
++#define GEM_DIR_DS 2
++/* Bidirectional */
++#define GEM_DIR_BI 3
++/* Mark non-multicast GEM */
++#define GEM_MC_DIS 0
++/* Mark multicast GEM */
++#define GEM_MC_EN 1
++
++/* Netlink messages for the GEM configuration */
++enum {
++	IFLA_PON_GEM_UNSPEC,
++	IFLA_PON_GEM_IDX,
++	IFLA_PON_GEM_ID,
++	IFLA_PON_GEM_TCONT,
++	IFLA_PON_GEM_TRAFFIC_TYPE,
++	IFLA_PON_GEM_MAX_SIZE,
++	IFLA_PON_GEM_DIR,
++	IFLA_PON_GEM_ENC,
++	IFLA_PON_GEM_MC,
++	IFLA_PON_GEM_BP,
++	IFLA_PON_GEM_CTP,
++	IFLA_PON_GEM_MAX
++};
++
++static void gem_explain(FILE *f)
++{
++	fprintf(f, "Usage: ... type gem id <id> traffic_type <eth|omci|ethm> dir <dis|us|ds|bi> enc <dis|uc|bc|dsen> max_size <value> mc <en|dis>\n");
++}
++
++static void explain(void)
++{
++	gem_explain(stderr);
++}
++
++static int gem_parse_opt(struct link_util *lu, int argc, char **argv,
++			 struct nlmsghdr *n)
++{
++	while (argc > 0) {
++		if (matches(*argv, "id") == 0) {
++			__u32 gem_id;
++
++			NEXT_ARG();
++			if (get_u32(&gem_id, *argv, 0))
++				invarg("invalid gpon gem_id\n", *argv);
++
++			addattr32(n, 1024, IFLA_PON_GEM_ID, gem_id);
++		} else if (matches(*argv, "idx") == 0) {
++			__u16 gem_idx;
++
++			NEXT_ARG();
++			if (get_u16(&gem_idx, *argv, 0))
++				invarg("invalid gpon gem_idx\n", *argv);
++
++			addattr16(n, 1024, IFLA_PON_GEM_IDX, gem_idx);
++		} else if (matches(*argv, "traffic_type") == 0) {
++			__u8 gem_traffic_type;
++
++			NEXT_ARG();
++			if (strcmp(*argv, "eth") == 0) {
++				gem_traffic_type = GEM_TRAFFIC_TYPE_ETH;
++			} else if (strcmp(*argv, "omci") == 0) {
++				gem_traffic_type = GEM_TRAFFIC_TYPE_OMCI;
++			} else if (strcmp(*argv, "ethm") == 0) {
++				gem_traffic_type = GEM_TRAFFIC_TYPE_ETHM;
++			} else {
++				invarg("invalid gpon gem_traffic_type\n", *argv);
++				return -1;
++			}
++
++			addattr8(n, 1024, IFLA_PON_GEM_TRAFFIC_TYPE, gem_traffic_type);
++		} else if (matches(*argv, "dir") == 0) {
++			__u8 gem_dir;
++
++			NEXT_ARG();
++			if (strcmp(*argv, "dis") == 0) {
++				gem_dir = GEM_DIR_DIS;
++			} else if (strcmp(*argv, "us") == 0) {
++				gem_dir = GEM_DIR_US;
++			} else if (strcmp(*argv, "ds") == 0) {
++				gem_dir = GEM_DIR_DS;
++			} else if (strcmp(*argv, "bi") == 0) {
++				gem_dir = GEM_DIR_BI;
++			} else {
++				invarg("invalid gpon gem_dir\n", *argv);
++				return -1;
++			}
++
++			addattr8(n, 1024, IFLA_PON_GEM_DIR, gem_dir);
++		} else if (matches(*argv, "enc") == 0) {
++			__u8 gem_enc;
++
++			NEXT_ARG();
++			if (strcmp(*argv, "dis") == 0) {
++				gem_enc = GEM_ENC_DIS;
++			} else if (strcmp(*argv, "uc") == 0) {
++				gem_enc = GEM_ENC_UC;
++			} else if (strcmp(*argv, "bc") == 0) {
++				gem_enc = GEM_ENC_BC;
++			} else if (strcmp(*argv, "dsen") == 0) {
++				gem_enc = GEM_ENC_DSEN;
++			} else {
++				invarg("invalid gpon gem_enc\n", *argv);
++				return -1;
++			}
++
++			addattr8(n, 1024, IFLA_PON_GEM_ENC, gem_enc);
++		} else if (matches(*argv, "max_size") == 0) {
++			__u16 gem_max_size;
++
++			NEXT_ARG();
++			if (get_u16(&gem_max_size, *argv, 0))
++				invarg("invalid gpon gem_max_size\n", *argv);
++
++			addattr16(n, 1024, IFLA_PON_GEM_MAX_SIZE, gem_max_size);
++		} else if (matches(*argv, "tcont") == 0) {
++			__u32 tcont_idx;
++
++			NEXT_ARG();
++			tcont_idx = if_nametoindex(*argv);
++			if (tcont_idx == 0) {
++				fprintf(stderr, "Cannot find device \"%s\"\n",
++					*argv);
++				exit(-1);
++			}
++
++			addattr32(n, 1024, IFLA_PON_GEM_TCONT, tcont_idx);
++		} else if (matches(*argv, "dsonly") == 0) {
++			addattr32(n, 1024, IFLA_PON_GEM_TCONT, 0);
++		} else if (matches(*argv, "help") == 0) {
++			explain();
++			return -1;
++		} else if (matches(*argv, "mc") == 0) {
++			__u8 gem_mc;
++
++			NEXT_ARG();
++			if (strcmp(*argv, "en") == 0) {
++				gem_mc = GEM_MC_EN;
++			} else if (strcmp(*argv, "dis") == 0) {
++				gem_mc = GEM_MC_DIS;
++			} else {
++				invarg("invalid gpon gem_mc\n", *argv);
++				return -1;
++			}
++
++			addattr8(n, 1024, IFLA_PON_GEM_MC, gem_mc);
++		} else {
++			fprintf(stderr, "gem: unknown option \"%s\"?\n",
++				*argv);
++			explain();
++			return -1;
++		}
++		argc--, argv++;
++	}
++
++	return 0;
++}
++
++static void gem_print_opt(struct link_util *lu, FILE *f, struct rtattr *tb[])
++{
++	__u16 gem_idx;
++	__u32 gem_id;
++	__u8 gem_traffic_type;
++	__u8 gem_dir;
++	__u8 gem_enc;
++	__u16 gem_max_size;
++	__u32 tcont_idx;
++	__u8 gem_mc;
++	__u32 gem_ctp;
++	char tcont_name[IF_NAMESIZE];
++
++	if (!tb)
++		return;
++
++	if (tb[IFLA_PON_GEM_IDX]) {
++		gem_idx = rta_getattr_u16(tb[IFLA_PON_GEM_IDX]);
++		fprintf(f, "idx: %u ", gem_idx);
++	}
++	if (tb[IFLA_PON_GEM_ID]) {
++		gem_id = rta_getattr_u32(tb[IFLA_PON_GEM_ID]);
++		fprintf(f, "id: %u ", gem_id);
++	}
++	if (tb[IFLA_PON_GEM_TRAFFIC_TYPE]) {
++		gem_traffic_type = rta_getattr_u8(tb[IFLA_PON_GEM_TRAFFIC_TYPE]);
++		fprintf(f, "traffic type: %u ", gem_traffic_type);
++	}
++	if (tb[IFLA_PON_GEM_DIR]) {
++		gem_dir = rta_getattr_u8(tb[IFLA_PON_GEM_DIR]);
++		fprintf(f, "dir: %u ", gem_dir);
++	}
++	if (tb[IFLA_PON_GEM_ENC]) {
++		gem_enc = rta_getattr_u8(tb[IFLA_PON_GEM_ENC]);
++		fprintf(f, "enc: %u ", gem_enc);
++	}
++	if (tb[IFLA_PON_GEM_MAX_SIZE]) {
++		gem_max_size = rta_getattr_u16(tb[IFLA_PON_GEM_MAX_SIZE]);
++		fprintf(f, "max size: %u ", gem_max_size);
++	}
++	if (tb[IFLA_PON_GEM_TCONT]) {
++		const char *name;
++
++		tcont_idx = rta_getattr_u32(tb[IFLA_PON_GEM_TCONT]);
++		if (tcont_idx == 0) {
++			fprintf(f, "dsonly ");
++		} else {
++			name = if_indextoname(tcont_idx, tcont_name);
++
++			if (name)
++				fprintf(f, "tcont: %s ", name);
++			else
++				fprintf(f, "tcont: %u ", tcont_idx);
++		}
++	}
++	if (tb[IFLA_PON_GEM_MC]) {
++		gem_mc = rta_getattr_u8(tb[IFLA_PON_GEM_MC]);
++		fprintf(f, "mc: %u ", gem_mc);
++	}
++	if (tb[IFLA_PON_GEM_BP]) {
++		gem_mc = rta_getattr_u16(tb[IFLA_PON_GEM_BP]);
++		fprintf(f, "bp: %u ", gem_mc);
++	}
++
++	if (tb[IFLA_PON_GEM_CTP]) {
++		gem_ctp = rta_getattr_u32(tb[IFLA_PON_GEM_CTP]);
++		fprintf(f, "ctp: %u ", gem_ctp);
++	}
++}
++
++static void gem_print_help(struct link_util *lu, int argc, char **argv,
++			   FILE *f)
++{
++	gem_explain(f);
++}
++
++struct link_util gem_link_util = {
++	.id		= "gem",
++	.maxattr	= IFLA_PON_GEM_MAX,
++	.parse_opt	= gem_parse_opt,
++	.print_opt	= gem_print_opt,
++	.print_help	= gem_print_help,
++};
+diff --git a/ip/iplink_iphost.c b/ip/iplink_iphost.c
+new file mode 100644
+index 00000000..a4730959
+--- /dev/null
++++ b/ip/iplink_iphost.c
+@@ -0,0 +1,64 @@
++/* iplink_iphost.c      GPON device support
++ *
++ *	      This program is free software; you can redistribute it and/or
++ *	      modify it under the terms of the GNU General Public License
++ *	      as published by the Free Software Foundation; either version
++ *	      2 of the License, or (at your option) any later version.
++ *
++ *
++ * Authors:     2020 Intel Corporation
++ *	      Based on iplink_vrf.c from
++ *		      Shrijeet Mukherjee <shm@cumulusnetworks.com>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <linux/if_link.h>
++#include <errno.h>
++
++#include "rt_names.h"
++#include "utils.h"
++#include "ip_common.h"
++
++static void iphost_explain(FILE *f)
++{
++	fprintf(f, "Usage: ... iphost\n");
++}
++
++static void explain(void)
++{
++	iphost_explain(stderr);
++}
++
++static int iphost_parse_opt(struct link_util *lu, int argc, char **argv,
++			    struct nlmsghdr *n)
++{
++	while (argc > 0) {
++		if (matches(*argv, "help") == 0) {
++			explain();
++			return -1;
++		} else {
++			fprintf(stderr, "iphost: unknown option \"%s\"?\n",
++				*argv);
++			explain();
++			return -1;
++		}
++		argc--, argv++;
++	}
++
++	return 0;
++}
++
++static void iphost_print_help(struct link_util *lu, int argc, char **argv,
++			      FILE *f)
++{
++	iphost_explain(f);
++}
++
++struct link_util iphost_link_util = {
++	.id		= "iphost",
++	.parse_opt	= iphost_parse_opt,
++	.print_help	= iphost_print_help,
++};
+diff --git a/ip/iplink_llid.c b/ip/iplink_llid.c
+new file mode 100644
+index 00000000..d8de9b85
+--- /dev/null
++++ b/ip/iplink_llid.c
+@@ -0,0 +1,184 @@
++/*		 EPON device support
++ *
++ *              This program is free software; you can redistribute it and/or
++ *              modify it under the terms of the GNU General Public License
++ *              as published by the Free Software Foundation; either version
++ *              2 of the License, or (at your option) any later version.
++ *
++ *
++ * Authors:     2019 Intel Corporation
++ *              Based on iplink_vrf.c from
++ *                      Shrijeet Mukherjee <shm@cumulusnetworks.com>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <linux/if_link.h>
++#include <errno.h>
++
++#include "rt_names.h"
++#include "utils.h"
++#include "ip_common.h"
++
++/* The NetLink messages for EPON and type llid to add new netdev and
++ * to configure pmapper.
++ */
++enum {
++	IFLA_PON_LLID_UNSPEC,
++	IFLA_PON_LLID_IDX,
++	IFLA_PON_LLID_PMAP_PCP_DEF,
++	IFLA_PON_LLID_PMAP_PCP_0,
++	IFLA_PON_LLID_PMAP_PCP_1,
++	IFLA_PON_LLID_PMAP_PCP_2,
++	IFLA_PON_LLID_PMAP_PCP_3,
++	IFLA_PON_LLID_PMAP_PCP_4,
++	IFLA_PON_LLID_PMAP_PCP_5,
++	IFLA_PON_LLID_PMAP_PCP_6,
++	IFLA_PON_LLID_PMAP_PCP_7,
++	IFLA_PON_LLID_NUM_OF_QUEUES,
++	IFLA_PON_LLID_MAX
++};
++
++static void llid_explain(FILE *f)
++{
++	fprintf(f, "Usage: ... llid <idx> <num_of_q [4,8]> \n");
++	fprintf(f, "Usage: ... [pcp <VALUE> <QUEUE>] [pcpdef <pcp num>]\n");
++}
++
++static void explain(void)
++{
++	llid_explain(stderr);
++}
++
++static int llid_parse_opt(struct link_util *lu, int argc, char **argv,
++			   struct nlmsghdr *n)
++{
++	while (argc > 0) {
++		if (matches(*argv, "idx") == 0) {
++			__u8 idx;
++
++			NEXT_ARG();
++			if (get_u8(&idx, *argv, 0))
++				invarg("invalid epon llid index\n", *argv);
++
++			addattr8(n, 1024, IFLA_PON_LLID_IDX, idx);
++
++		} else if (matches(*argv, "pcp") == 0) {
++			__u16 pcp;
++			__u16 queue;
++
++			NEXT_ARG();
++			if (get_u16(&pcp, *argv, 0))
++				invarg("invalid pmapper pcp\n", *argv);
++
++			if (pcp >= 8) {
++				fprintf(stderr, "pcp value too big: %u\n", pcp);
++				exit(-1);
++			}
++
++			NEXT_ARG();
++			if (get_u16(&queue, *argv, 0))
++				invarg("invalid pmapper queue\n", *argv);
++
++			if (queue >= 64) {
++				fprintf(stderr, "queue value too big: %u\n", queue);
++				exit(-1);
++			}
++
++			addattr16(n, 1024, IFLA_PON_LLID_PMAP_PCP_0 + pcp,
++				  queue);
++		} else if (matches(*argv, "pcpdef") == 0) {
++			__u16 pcpdef;
++
++			NEXT_ARG();
++			if (get_u16(&pcpdef, *argv, 0))
++				invarg("invalid pmapper pcpdef\n", *argv);
++
++			if (pcpdef >= 64) {
++				fprintf(stderr, "pcpdef value too big: %u\n",
++					pcpdef);
++				exit(-1);
++			}
++
++			addattr16(n, 1024, IFLA_PON_LLID_PMAP_PCP_DEF, pcpdef);
++
++		} else if (matches(*argv, "numofqueues") == 0) {
++			__u8 num_of_queues;
++
++			NEXT_ARG();
++			if (get_u8(&num_of_queues, *argv, 0))
++				invarg("invalid epon num_of_queues\n", *argv);
++
++			if (num_of_queues > 8) {
++				fprintf(stderr, "Invalid num_of_queues value: %u\n",
++					num_of_queues);
++				exit(-1);
++			}
++
++			addattr8(n, 1024, IFLA_PON_LLID_NUM_OF_QUEUES, num_of_queues);
++
++		} else if (matches(*argv, "help") == 0) {
++			explain();
++			return -1;
++		} else {
++			fprintf(stderr, "llid: unknown option \"%s\"?\n",
++				*argv);
++			explain();
++			return -1;
++		}
++		argc--, argv++;
++	}
++
++	return 0;
++}
++
++static void llid_print_opt(struct link_util *lu, FILE *f, struct rtattr *tb[])
++{
++	__u8 idx;
++	__u8 num_of_queues;
++	__u16 pcpdef;
++	__u16 queue;
++	int i;
++
++	if (!tb)
++		return;
++
++	if (tb[IFLA_PON_LLID_IDX]) {
++		idx = rta_getattr_u8(tb[IFLA_PON_LLID_IDX]);
++		fprintf(f, "idx: %u ", idx);
++	}
++
++	if (tb[IFLA_PON_LLID_NUM_OF_QUEUES]) {
++		num_of_queues = rta_getattr_u8(tb[IFLA_PON_LLID_NUM_OF_QUEUES]);
++		fprintf(f, "num_of_queues: %u ", num_of_queues);
++	}
++
++	for (i = 0; i < 8; i++) {
++		if (tb[IFLA_PON_LLID_PMAP_PCP_0 + i]) {
++
++			queue = rta_getattr_u16(tb[IFLA_PON_LLID_PMAP_PCP_0 + i]);
++			fprintf(f, "pcp %i: %u ", i, queue);
++		}
++	}
++
++	if (tb[IFLA_PON_LLID_PMAP_PCP_DEF]) {
++		pcpdef = rta_getattr_u16(tb[IFLA_PON_LLID_PMAP_PCP_DEF]);
++		fprintf(f, "pcpdef: %u ", pcpdef);
++	}
++}
++
++static void llid_print_help(struct link_util *lu, int argc, char **argv,
++			     FILE *f)
++{
++	llid_explain(f);
++}
++
++struct link_util llid_link_util = {
++	.id		= "llid",
++	.maxattr	= IFLA_PON_LLID_MAX,
++	.parse_opt	= llid_parse_opt,
++	.print_opt	= llid_print_opt,
++	.print_help	= llid_print_help,
++};
+diff --git a/ip/iplink_pmapper.c b/ip/iplink_pmapper.c
+new file mode 100644
+index 00000000..4d5fed99
+--- /dev/null
++++ b/ip/iplink_pmapper.c
+@@ -0,0 +1,364 @@
++/* iplink_pmapper.c	pmapper device support
++ *
++ *              This program is free software; you can redistribute it and/or
++ *              modify it under the terms of the GNU General Public License
++ *              as published by the Free Software Foundation; either version
++ *              2 of the License, or (at your option) any later version.
++ *
++ *
++ * Authors:     2018 Intel Corporation
++ *              Based on iplink_vrf.c from
++ *                      Shrijeet Mukherjee <shm@cumulusnetworks.com>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <net/if.h>
++#include <linux/if_link.h>
++#include <errno.h>
++
++#include "rt_names.h"
++#include "utils.h"
++#include "ip_common.h"
++
++/* Use default PCP value for DSCP bit */
++#define PON_PMAPPER_DSCP_DEFAULT 0xff
++
++#define DP_PMAP_PCP 1
++#define DP_PMAP_DSCP 2
++#define DP_PMAP_DSCP_ONLY 3
++
++/** The NetLink messages the IEEE 802.1p mapper configuration. */
++enum {
++	IFLA_PON_PMAPPER_UNSPEC,
++	IFLA_PON_PMAPPER_PCP_DEF,
++	IFLA_PON_PMAPPER_PCP_0,
++	IFLA_PON_PMAPPER_PCP_1,
++	IFLA_PON_PMAPPER_PCP_2,
++	IFLA_PON_PMAPPER_PCP_3,
++	IFLA_PON_PMAPPER_PCP_4,
++	IFLA_PON_PMAPPER_PCP_5,
++	IFLA_PON_PMAPPER_PCP_6,
++	IFLA_PON_PMAPPER_PCP_7,
++	IFLA_PON_PMAPPER_MODE,
++	IFLA_PON_PMAPPER_DSCP,
++	IFLA_PON_PMAPPER_BP,
++	IFLA_PON_GEM_CTP_0,
++	IFLA_PON_GEM_CTP_1,
++	IFLA_PON_GEM_CTP_2,
++	IFLA_PON_GEM_CTP_3,
++	IFLA_PON_GEM_CTP_4,
++	IFLA_PON_GEM_CTP_5,
++	IFLA_PON_GEM_CTP_6,
++	IFLA_PON_GEM_CTP_7,
++	IFLA_PON_PMAPPER_MAX
++};
++
++enum {
++	IFLA_PON_PMAPPER_DSCP_UNSPEC,
++	IFLA_PON_PMAPPER_DSCP_0,
++	IFLA_PON_PMAPPER_DSCP_1,
++	IFLA_PON_PMAPPER_DSCP_2,
++	IFLA_PON_PMAPPER_DSCP_3,
++	IFLA_PON_PMAPPER_DSCP_4,
++	IFLA_PON_PMAPPER_DSCP_5,
++	IFLA_PON_PMAPPER_DSCP_6,
++	IFLA_PON_PMAPPER_DSCP_7,
++	IFLA_PON_PMAPPER_DSCP_8,
++	IFLA_PON_PMAPPER_DSCP_9,
++	IFLA_PON_PMAPPER_DSCP_10,
++	IFLA_PON_PMAPPER_DSCP_11,
++	IFLA_PON_PMAPPER_DSCP_12,
++	IFLA_PON_PMAPPER_DSCP_13,
++	IFLA_PON_PMAPPER_DSCP_14,
++	IFLA_PON_PMAPPER_DSCP_15,
++	IFLA_PON_PMAPPER_DSCP_16,
++	IFLA_PON_PMAPPER_DSCP_17,
++	IFLA_PON_PMAPPER_DSCP_18,
++	IFLA_PON_PMAPPER_DSCP_19,
++	IFLA_PON_PMAPPER_DSCP_20,
++	IFLA_PON_PMAPPER_DSCP_21,
++	IFLA_PON_PMAPPER_DSCP_22,
++	IFLA_PON_PMAPPER_DSCP_23,
++	IFLA_PON_PMAPPER_DSCP_24,
++	IFLA_PON_PMAPPER_DSCP_25,
++	IFLA_PON_PMAPPER_DSCP_26,
++	IFLA_PON_PMAPPER_DSCP_27,
++	IFLA_PON_PMAPPER_DSCP_28,
++	IFLA_PON_PMAPPER_DSCP_29,
++	IFLA_PON_PMAPPER_DSCP_30,
++	IFLA_PON_PMAPPER_DSCP_31,
++	IFLA_PON_PMAPPER_DSCP_32,
++	IFLA_PON_PMAPPER_DSCP_33,
++	IFLA_PON_PMAPPER_DSCP_34,
++	IFLA_PON_PMAPPER_DSCP_35,
++	IFLA_PON_PMAPPER_DSCP_36,
++	IFLA_PON_PMAPPER_DSCP_37,
++	IFLA_PON_PMAPPER_DSCP_38,
++	IFLA_PON_PMAPPER_DSCP_39,
++	IFLA_PON_PMAPPER_DSCP_40,
++	IFLA_PON_PMAPPER_DSCP_41,
++	IFLA_PON_PMAPPER_DSCP_42,
++	IFLA_PON_PMAPPER_DSCP_43,
++	IFLA_PON_PMAPPER_DSCP_44,
++	IFLA_PON_PMAPPER_DSCP_45,
++	IFLA_PON_PMAPPER_DSCP_46,
++	IFLA_PON_PMAPPER_DSCP_47,
++	IFLA_PON_PMAPPER_DSCP_48,
++	IFLA_PON_PMAPPER_DSCP_49,
++	IFLA_PON_PMAPPER_DSCP_50,
++	IFLA_PON_PMAPPER_DSCP_51,
++	IFLA_PON_PMAPPER_DSCP_52,
++	IFLA_PON_PMAPPER_DSCP_53,
++	IFLA_PON_PMAPPER_DSCP_54,
++	IFLA_PON_PMAPPER_DSCP_55,
++	IFLA_PON_PMAPPER_DSCP_56,
++	IFLA_PON_PMAPPER_DSCP_57,
++	IFLA_PON_PMAPPER_DSCP_58,
++	IFLA_PON_PMAPPER_DSCP_59,
++	IFLA_PON_PMAPPER_DSCP_60,
++	IFLA_PON_PMAPPER_DSCP_61,
++	IFLA_PON_PMAPPER_DSCP_62,
++	IFLA_PON_PMAPPER_DSCP_63,
++	IFLA_PON_PMAPPER_DSCP_MAX
++};
++
++static void pmapper_explain(FILE *f)
++{
++	fprintf(f, "Usage: ... pmapper [pcp <VALUE> <DEVICE> ] [pcpdef <pcp num>] [mode <pcp|dscp|dscp_only] [dscp <DSCP> <PCP>]\n");
++}
++
++static void explain(void)
++{
++	pmapper_explain(stderr);
++}
++
++struct dscp_values {
++	bool used;
++	__u8 dscp;
++	__u8 pcp;
++};
++
++static int pmapper_parse_opt(struct link_util *lu, int argc, char **argv,
++			     struct nlmsghdr *n)
++{
++	struct dscp_values dscp_map[64] = {0,};
++	struct rtattr *nest;
++	int i;
++
++	while (argc > 0) {
++		if (matches(*argv, "pcp") == 0) {
++			__u8 pcp;
++			__u32 gem_if_idx;
++
++			NEXT_ARG();
++			if (get_u8(&pcp, *argv, 0))
++				invarg("invalid pmapper pcp\n", *argv);
++
++			if (pcp >= 8) {
++				fprintf(stderr, "pcp value too big: %u\n", pcp);
++				exit(-1);
++			}
++
++			NEXT_ARG();
++			if (strcmp(*argv, "drop") == 0) {
++				gem_if_idx = 0;
++			} else {
++				gem_if_idx = if_nametoindex(*argv);
++				if (gem_if_idx == 0) {
++					fprintf(stderr, "Cannot find device \"%s\"\n",
++						*argv);
++					exit(-1);
++				}
++			}
++
++			addattr32(n, 1024, IFLA_PON_PMAPPER_PCP_0 + pcp,
++				  gem_if_idx);
++		} else if (matches(*argv, "dscp") == 0) {
++			__u8 dscp;
++			__u8 dscp_value;
++
++			NEXT_ARG();
++			if (get_u8(&dscp, *argv, 0))
++				invarg("invalid pmapper dscp\n", *argv);
++
++			if (dscp >= 64) {
++				fprintf(stderr, "dscp value too big: %u\n",
++					dscp);
++				exit(-1);
++			}
++
++			NEXT_ARG();
++			if (strcmp(*argv, "def") == 0) {
++				dscp_value = PON_PMAPPER_DSCP_DEFAULT;
++			} else {
++				if (get_u8(&dscp_value, *argv, 0))
++					invarg("invalid pmapper dscp_map\n",
++						*argv);
++			}
++			for (i = 0; i < ARRAY_SIZE(dscp_map); i++) {
++				if (dscp_map[i].used)
++					continue;
++				dscp_map[i].dscp = dscp;
++				dscp_map[i].pcp = dscp_value;
++				dscp_map[i].used = true;
++				break;
++			}
++		} else if (matches(*argv, "pcpdef") == 0) {
++			__u8 pcpdef;
++
++			NEXT_ARG();
++			if (get_u8(&pcpdef, *argv, 0))
++				invarg("invalid pmapper pcp\n", *argv);
++
++			if (pcpdef >= 8) {
++				fprintf(stderr, "pcp value too big: %u\n",
++					pcpdef);
++				exit(-1);
++			}
++
++			addattr8(n, 1024, IFLA_PON_PMAPPER_PCP_DEF, pcpdef);
++		} else if (matches(*argv, "mode") == 0) {
++			__u8 mode;
++
++			NEXT_ARG();
++			if (strcmp(*argv, "pcp") == 0)
++				mode = DP_PMAP_PCP;
++			else if (strcmp(*argv, "dscp") == 0)
++				mode = DP_PMAP_DSCP;
++			else if (strcmp(*argv, "dscp_only") == 0)
++				mode = DP_PMAP_DSCP_ONLY;
++			else
++				invarg("invalid pmapper mode\n", *argv);
++
++			addattr8(n, 1024, IFLA_PON_PMAPPER_MODE, mode);
++		} else if (matches(*argv, "help") == 0) {
++			explain();
++			return -1;
++		} else {
++			fprintf(stderr, "pmapper: unknown option \"%s\"?\n",
++				*argv);
++			explain();
++			return -1;
++		}
++		argc--, argv++;
++	}
++
++	if (dscp_map[0].used) {
++		nest = addattr_nest(n, 1024,
++				    IFLA_PON_PMAPPER_DSCP | NLA_F_NESTED);
++
++		for (i = 0; i < ARRAY_SIZE(dscp_map); i++) {
++			if (!dscp_map[i].used)
++				continue;
++
++			addattr8(n, 1024,
++				 IFLA_PON_PMAPPER_DSCP_0 + dscp_map[i].dscp,
++				 dscp_map[i].pcp);
++		}
++		addattr_nest_end(n, nest);
++	}
++
++	return 0;
++}
++
++static void pmapper_print_opt(struct link_util *lu, FILE *f, struct rtattr *tb[])
++{
++	__u32 gem_if_idx;
++	int i;
++	__u8 pcpdef;
++	__u8 mode = DP_PMAP_PCP;
++	char gem_name[IF_NAMESIZE];
++	struct rtattr *nest;
++	__u16 bp;
++	__u32 gem_ctp;
++
++	if (!tb)
++		return;
++
++	if (tb[IFLA_PON_PMAPPER_MODE])
++		mode = rta_getattr_u8(tb[IFLA_PON_PMAPPER_MODE]);
++
++	switch (mode) {
++	case DP_PMAP_PCP:
++		fprintf(f, "mode: pcp ");
++		break;
++	case DP_PMAP_DSCP:
++		fprintf(f, "mode: dscp ");
++		break;
++	case DP_PMAP_DSCP_ONLY:
++		fprintf(f, "mode: dscp_only ");
++		break;
++	}
++
++	for (i = 0; i < 8; i++) {
++		if (tb[IFLA_PON_PMAPPER_PCP_0 + i]) {
++			const char *name;
++
++			gem_if_idx = rta_getattr_u32(tb[IFLA_PON_PMAPPER_PCP_0 + i]);
++			name = if_indextoname(gem_if_idx, gem_name);
++
++			if (name)
++				fprintf(f, "pcp %i: %s ", i, name);
++			else
++				fprintf(f, "pcp %i: %u ", i, gem_if_idx);
++		}
++
++		if (tb[IFLA_PON_GEM_CTP_0 + i]) {
++			gem_ctp = rta_getattr_u32(tb[IFLA_PON_GEM_CTP_0 + i]);
++			fprintf(f, "ctp: %u ", gem_ctp);
++		}
++	}
++
++	if (tb[IFLA_PON_PMAPPER_PCP_DEF]) {
++		pcpdef = rta_getattr_u8(tb[IFLA_PON_PMAPPER_PCP_DEF]);
++		fprintf(f, "pcpdef: %u ", pcpdef);
++	}
++
++	if (tb[IFLA_PON_PMAPPER_BP]) {
++		bp = rta_getattr_u16(tb[IFLA_PON_PMAPPER_BP]);
++		fprintf(f, "bp: %u ", bp);
++	}
++
++	nest = tb[IFLA_PON_PMAPPER_DSCP];
++	if ((mode == DP_PMAP_DSCP || mode == DP_PMAP_DSCP_ONLY) && nest) {
++		struct rtattr *dscp[IFLA_PON_PMAPPER_DSCP_MAX + 1];
++
++		parse_rtattr_nested(dscp, IFLA_PON_PMAPPER_DSCP_MAX, nest);
++
++		fprintf(f, "\n    dscp [ ");
++		for (i = 0; i < 64; i++) {
++			__u8 dscp_map;
++
++			if (!dscp[IFLA_PON_PMAPPER_DSCP_0 + i]) {
++				fprintf(f, "-, ");
++				continue;
++			}
++
++			dscp_map = rta_getattr_u8(dscp[IFLA_PON_PMAPPER_DSCP_0 + i]);
++
++			if (dscp_map == PON_PMAPPER_DSCP_DEFAULT)
++				fprintf(f, "def, ");
++			else
++				fprintf(f, "%hhu, ", dscp_map);
++		}
++		fprintf(f, "] ");
++	}
++	fprintf(f, "\n    ");
++}
++
++static void pmapper_print_help(struct link_util *lu, int argc, char **argv,
++			   FILE *f)
++{
++	pmapper_explain(f);
++}
++
++struct link_util pmapper_link_util = {
++	.id		= "pmapper",
++	.maxattr	= IFLA_PON_PMAPPER_MAX,
++	.parse_opt	= pmapper_parse_opt,
++	.print_opt	= pmapper_print_opt,
++	.print_help	= pmapper_print_help,
++};
+diff --git a/ip/iplink_pon.c b/ip/iplink_pon.c
+new file mode 100644
+index 00000000..08a0724c
+--- /dev/null
++++ b/ip/iplink_pon.c
+@@ -0,0 +1,98 @@
++/* iplink_pon.c		PON device support
++ *
++ *              This program is free software; you can redistribute it and/or
++ *              modify it under the terms of the GNU General Public License
++ *              as published by the Free Software Foundation; either version
++ *              2 of the License, or (at your option) any later version.
++ *
++ *
++ * Authors:     2020, MaxLinear, Inc.
++ *              Based on iplink_vrf.c from
++ *                      Shrijeet Mukherjee <shm@cumulusnetworks.com>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <net/if.h>
++#include <linux/if_link.h>
++#include <errno.h>
++
++#include "rt_names.h"
++#include "utils.h"
++#include "ip_common.h"
++
++/* Netlink messages for the PON device configuration */
++enum {
++	IFLA_PON_UNSPEC,
++	IFLA_PON_QUEUE_LOOKUP_MODE,
++	IFLA_PON_MAX
++};
++
++static void pon_explain(FILE *f)
++{
++	fprintf(f, "Usage: ip link set dev <pon_dev_name> queue_lookup_mode <value>\n");
++}
++
++static void explain(void)
++{
++	pon_explain(stderr);
++}
++
++static int pon_parse_opt(struct link_util *lu, int argc, char **argv,
++			 struct nlmsghdr *n)
++{
++	while (argc > 0) {
++		if (matches(*argv, "queue_lookup_mode") == 0) {
++			__u8 queue_lookup_mode;
++
++			NEXT_ARG();
++			if (get_u8(&queue_lookup_mode, *argv, 0))
++				invarg("invalid pon queue_lookup_mode\n",
++				       *argv);
++
++			addattr8(n, 1024, IFLA_PON_QUEUE_LOOKUP_MODE,
++				 queue_lookup_mode);
++		} else if (matches(*argv, "help") == 0) {
++			explain();
++			return -1;
++		} else {
++			fprintf(stderr, "pon: unknown option \"%s\"?\n",
++				*argv);
++			explain();
++			return -1;
++		}
++		argc--, argv++;
++	}
++
++	return 0;
++}
++
++static void pon_print_opt(struct link_util *lu, FILE *f, struct rtattr *tb[])
++{
++	__u8 queue_lookup_mode;
++
++	if (!tb)
++		return;
++
++	if (tb[IFLA_PON_QUEUE_LOOKUP_MODE]) {
++		queue_lookup_mode
++			= rta_getattr_u8(tb[IFLA_PON_QUEUE_LOOKUP_MODE]);
++		fprintf(f, "queue_lookup_mode: %u ", queue_lookup_mode);
++	}
++}
++
++static void pon_print_help(struct link_util *lu, int argc, char **argv,
++			   FILE *f)
++{
++	pon_explain(f);
++}
++
++struct link_util pon_link_util = {
++	.id		= "pon",
++	.maxattr	= IFLA_PON_MAX,
++	.parse_opt	= pon_parse_opt,
++	.print_opt	= pon_print_opt,
++	.print_help	= pon_print_help,
++};
+diff --git a/ip/iplink_tcont.c b/ip/iplink_tcont.c
+new file mode 100644
+index 00000000..b2d344f6
+--- /dev/null
++++ b/ip/iplink_tcont.c
+@@ -0,0 +1,112 @@
++/* iplink_gpon.c	GPON device support
++ *
++ *              This program is free software; you can redistribute it and/or
++ *              modify it under the terms of the GNU General Public License
++ *              as published by the Free Software Foundation; either version
++ *              2 of the License, or (at your option) any later version.
++ *
++ *
++ * Authors:     2017 Intel Corporation
++ *              Based on iplink_vrf.c from
++ *                      Shrijeet Mukherjee <shm@cumulusnetworks.com>
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <linux/if_link.h>
++#include <errno.h>
++
++#include "rt_names.h"
++#include "utils.h"
++#include "ip_common.h"
++
++#define GPON_BUFLEN 1024
++
++/* The NetLink messages the GEM and scheduler configuration for only entry on
++ * the Bridge Port.
++ */
++enum {
++	IFLA_PON_TCONT_UNSPEC,
++	IFLA_PON_TCONT_IDX,
++	IFLA_PON_TCONT_ID,
++	IFLA_PON_TCONT_MAX
++};
++
++static void tcont_explain(FILE *f)
++{
++	fprintf(f, "Usage: ... tcont idx <tcont index>\n");
++}
++
++static void explain(void)
++{
++	tcont_explain(stderr);
++}
++
++static int tcont_parse_opt(struct link_util *lu, int argc, char **argv,
++			   struct nlmsghdr *n)
++{
++	while (argc > 0) {
++		if (matches(*argv, "id") == 0) {
++			__u32 tcont_id;
++
++			NEXT_ARG();
++			if (get_u32(&tcont_id, *argv, 0))
++				invarg("invalid gpon tcont_id\n", *argv);
++
++			addattr32(n, 1024, IFLA_PON_TCONT_ID, tcont_id);
++		} else if (matches(*argv, "idx") == 0) {
++			__u16 tcont_idx;
++
++			NEXT_ARG();
++			if (get_u16(&tcont_idx, *argv, 0))
++				invarg("invalid gpon tcont_idx\n", *argv);
++
++			addattr16(n, 1024, IFLA_PON_TCONT_IDX, tcont_idx);
++		} else if (matches(*argv, "help") == 0) {
++			explain();
++			return -1;
++		} else {
++			fprintf(stderr, "tcont: unknown option \"%s\"?\n",
++				*argv);
++			explain();
++			return -1;
++		}
++		argc--, argv++;
++	}
++
++	return 0;
++}
++
++static void tcont_print_opt(struct link_util *lu, FILE *f, struct rtattr *tb[])
++{
++	__u16 tcont_idx;
++	__u32 tcont_id;
++
++	if (!tb)
++		return;
++
++	if (tb[IFLA_PON_TCONT_IDX]) {
++		tcont_idx = rta_getattr_u16(tb[IFLA_PON_TCONT_IDX]);
++		fprintf(f, "idx: %u ", tcont_idx);
++	}
++	if (tb[IFLA_PON_TCONT_ID]) {
++		tcont_id = rta_getattr_u32(tb[IFLA_PON_TCONT_ID]);
++		fprintf(f, "id: %u ", tcont_id);
++	}
++}
++
++static void tcont_print_help(struct link_util *lu, int argc, char **argv,
++			     FILE *f)
++{
++	tcont_explain(f);
++}
++
++struct link_util tcont_link_util = {
++	.id		= "tcont",
++	.maxattr	= IFLA_PON_TCONT_MAX,
++	.parse_opt	= tcont_parse_opt,
++	.print_opt	= tcont_print_opt,
++	.print_help	= tcont_print_help,
++};

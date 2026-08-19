@@ -1,0 +1,173 @@
+From d4986a363c61a997cc83bca4dcfd51c3754c9143 Mon Sep 17 00:00:00 2001
+From: Jan Dominiak <janx.dominiak@intel.com>
+Date: Thu, 6 Feb 2020 16:09:04 +0100
+Subject: add mac learning limit
+
+---
+ include/linux-private/linux/if_link.h |  1 +
+ include/netlink/route/link/bridge.h   |  6 +++
+ lib/route/link/bridge.c               | 60 +++++++++++++++++++++++++++
+ libnl-route-3.sym                     |  1 +
+ 4 files changed, 68 insertions(+)
+
+diff --git a/include/linux-private/linux/if_link.h b/include/linux-private/linux/if_link.h
+index f4a9715..f1c5496 100644
+--- a/include/linux-private/linux/if_link.h
++++ b/include/linux-private/linux/if_link.h
+@@ -335,6 +335,7 @@ enum {
+ 	IFLA_BRPORT_NEIGH_SUPPRESS,
+ 	IFLA_BRPORT_ISOLATED,
+ 	IFLA_BRPORT_BACKUP_PORT,
++	IFLA_BRPORT_LEARNING_LIMIT,
+ 	__IFLA_BRPORT_MAX
+ };
+ #define IFLA_BRPORT_MAX (__IFLA_BRPORT_MAX - 1)
+diff --git a/include/netlink/route/link/bridge.h b/include/netlink/route/link/bridge.h
+index f2e16e3..8b86702 100644
+--- a/include/netlink/route/link/bridge.h
++++ b/include/netlink/route/link/bridge.h
+@@ -7,6 +7,7 @@
+  *	of the License.
+  *
+  * Copyright (c) 2013 Thomas Graf <tgraf@suug.ch>
++ * Copyright (c) 2020 MaxLinear, Inc.
+  */
+ 
+ #ifndef NETLINK_LINK_BRIDGE_H_
+@@ -85,6 +86,11 @@ extern int	rtnl_link_bridge_add(struct nl_sock *sk, const char *name);
+ extern int	rtnl_link_bridge_pvid(struct rtnl_link *link);
+ extern int	rtnl_link_bridge_has_vlan(struct rtnl_link *link);
+ 
++extern int	rtnl_link_bridge_set_learning_limit(struct rtnl_link *link,
++						    int32_t mll);
++extern int	rtnl_link_bridge_get_learning_limit(struct rtnl_link *link,
++						    int32_t *p_mll);
++
+ extern struct rtnl_link_bridge_vlan *rtnl_link_bridge_get_port_vlan(struct rtnl_link *link);
+ #ifdef __cplusplus
+ }
+diff --git a/lib/route/link/bridge.c b/lib/route/link/bridge.c
+index 2d95faf..0aa9df7 100644
+--- a/lib/route/link/bridge.c
++++ b/lib/route/link/bridge.c
+@@ -7,6 +7,7 @@
+  *	of the License.
+  *
+  * Copyright (c) 2010-2013 Thomas Graf <tgraf@suug.ch>
++ * Copyright (c) 2020 MaxLinear, Inc.
+  */
+ 
+ /**
+@@ -35,6 +36,7 @@
+ #define BRIDGE_ATTR_PORT_VLAN           (1 << 4)
+ #define BRIDGE_ATTR_HWMODE		(1 << 5)
+ #define BRIDGE_ATTR_SELF		(1 << 6)
++#define BRIDGE_ATTR_LEARNING_LIMIT	(1 << 7)
+ 
+ #define PRIV_FLAG_NEW_ATTRS		(1 << 0)
+ 
+@@ -46,6 +48,7 @@ struct bridge_data
+ 	uint16_t		b_priority;
+ 	uint16_t		b_self; /* here for comparison reasons */
+ 	uint32_t		b_cost;
++	int32_t			b_learning_limit; /* limit of MAC learning */
+ 	uint32_t		b_flags;
+ 	uint32_t		b_flags_mask;
+ 	uint32_t                ce_mask; /* HACK to support attr macros */
+@@ -117,6 +120,7 @@ static struct nla_policy br_attrs_policy[IFLA_BRPORT_MAX+1] = {
+ 	[IFLA_BRPORT_FAST_LEAVE]	= { .type = NLA_U8 },
+ 	[IFLA_BRPORT_LEARNING]		= { .type = NLA_U8 },
+ 	[IFLA_BRPORT_LEARNING_SYNC]	= { .type = NLA_U8 },
++	[IFLA_BRPORT_LEARNING_LIMIT]	= { .type = NLA_S32 },
+ 	[IFLA_BRPORT_UNICAST_FLOOD]	= { .type = NLA_U8 },
+ };
+ 
+@@ -166,6 +170,12 @@ static int bridge_parse_protinfo(struct rtnl_link *link, struct nlattr *attr,
+ 		bd->ce_mask |= BRIDGE_ATTR_COST;
+ 	}
+ 
++	if (br_attrs[IFLA_BRPORT_LEARNING_LIMIT]) {
++		bd->b_learning_limit =
++		    nla_get_s32(br_attrs[IFLA_BRPORT_LEARNING_LIMIT]);
++		bd->ce_mask |= BRIDGE_ATTR_LEARNING_LIMIT;
++	}
++
+ 	check_flag(link, br_attrs, IFLA_BRPORT_MODE, RTNL_BRIDGE_HAIRPIN_MODE);
+ 	check_flag(link, br_attrs, IFLA_BRPORT_GUARD, RTNL_BRIDGE_BPDU_GUARD);
+ 	check_flag(link, br_attrs, IFLA_BRPORT_PROTECT, RTNL_BRIDGE_ROOT_BLOCK);
+@@ -301,6 +311,10 @@ static int bridge_fill_pi(struct rtnl_link *link, struct nl_msg *msg,
+ 	if (bd->ce_mask & BRIDGE_ATTR_PORT_STATE)
+ 		NLA_PUT_U8(msg, IFLA_BRPORT_STATE, bd->b_port_state);
+ 
++	if (bd->ce_mask & BRIDGE_ATTR_LEARNING_LIMIT)
++		NLA_PUT_S32(msg, IFLA_BRPORT_LEARNING_LIMIT,
++			    bd->b_learning_limit);
++
+ 	return 0;
+ 
+ nla_put_failure:
+@@ -962,6 +976,52 @@ struct rtnl_link_bridge_vlan *rtnl_link_bridge_get_port_vlan(struct rtnl_link *l
+ 	return NULL;
+ }
+ 
++/**
++ * Set MAC learning limits
++ * @arg link		Link object of type bridge
++ * @arg mll		MAC learning limit to set
++ *
++ * @see rtnl_link_bridge_get_learning_limit()
++ *
++ * @return Zero on success, otherwise a negative error code.
++ * @retval -NLE_OPNOTSUPP Link is not a bridge
++ */
++int rtnl_link_bridge_set_learning_limit(struct rtnl_link *link, int32_t mll)
++{
++	struct bridge_data *bd = bridge_data(link);
++
++	IS_BRIDGE_LINK_ASSERT(link);
++
++	bd->b_learning_limit = mll;
++	bd->ce_mask |= BRIDGE_ATTR_LEARNING_LIMIT;
++
++	return 0;
++}
++
++/**
++ * Get MAC learning limits
++ * @arg link		Link object of type bridge
++ * @arg p_mll		MAC learning limit to get (pointer)
++ *
++ * @see rtnl_link_bridge_set_learning_limit()
++ *
++ * @return Zero on success, otherwise a negative error code.
++ * @retval -NLE_OPNOTSUPP Link is not a bridge
++ */
++int rtnl_link_bridge_get_learning_limit(struct rtnl_link *link, int32_t *p_mll)
++{
++	struct bridge_data *bd = bridge_data(link);
++
++	IS_BRIDGE_LINK_ASSERT(link);
++
++	if (!p_mll)
++		return -NLE_INVAL;
++
++	*p_mll = bd->b_learning_limit;
++
++	return 0;
++}
++
+ static struct rtnl_link_af_ops bridge_ops = {
+ 	.ao_family			= AF_BRIDGE,
+ 	.ao_alloc			= &bridge_alloc,
+diff --git a/libnl-route-3.sym b/libnl-route-3.sym
+index fd9830d..19aa66c 100644
+--- a/libnl-route-3.sym
++++ b/libnl-route-3.sym
+@@ -255,6 +255,7 @@ global:
+ 	rtnl_link_bridge_has_ext_info;
+ 	rtnl_link_bridge_set_cost;
+ 	rtnl_link_bridge_set_flags;
++	rtnl_link_bridge_set_learning_limit;
+ 	rtnl_link_bridge_set_port_state;
+ 	rtnl_link_bridge_set_priority;
+ 	rtnl_link_bridge_str2flags;

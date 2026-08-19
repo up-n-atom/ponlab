@@ -1,0 +1,571 @@
+From e1b3a207e4579b905f91c98031059b439eef5bfd Mon Sep 17 00:00:00 2001
+From: "Krystoforski, RafalX" <rafalx.krystoforski@intel.com>
+Date: Wed, 15 May 2019 10:23:49 +0200
+Subject: tc-drr in libnl
+
+---
+ Makefile.am                       |   5 +
+ include/netlink-private/types.h   |   6 +
+ include/netlink/route/qdisc/drr.h |  29 ++++
+ lib/route/qdisc/drr.c             | 164 ++++++++++++++++++
+ libnl-route-3.sym                 |   2 +
+ tests/test-create-qdisc-drr.c     | 276 ++++++++++++++++++++++++++++++
+ 6 files changed, 482 insertions(+)
+ create mode 100644 include/netlink/route/qdisc/drr.h
+ create mode 100644 lib/route/qdisc/drr.c
+ create mode 100644 tests/test-create-qdisc-drr.c
+
+diff --git a/Makefile.am b/Makefile.am
+index 1af6ac6..a62c7bd 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -177,6 +177,7 @@ libnlinclude_netlink_route_qdiscdir = $(libnlincludedir)/netlink/route/qdisc
+ libnlinclude_netlink_route_qdisc_HEADERS = \
+ 	include/netlink/route/qdisc/cbq.h \
+ 	include/netlink/route/qdisc/dsmark.h \
++	include/netlink/route/qdisc/drr.h \
+ 	include/netlink/route/qdisc/fifo.h \
+ 	include/netlink/route/qdisc/fq_codel.h \
+ 	include/netlink/route/qdisc/hfsc.h \
+@@ -443,6 +444,7 @@ lib_libnl_route_3_la_SOURCES = \
+ 	lib/route/qdisc/htb.c \
+ 	lib/route/qdisc/ingress.c \
+ 	lib/route/qdisc/clsact.c \
++	lib/route/qdisc/drr.c \
+ 	lib/route/qdisc/mqprio.c \
+ 	lib/route/qdisc/netem.c \
+ 	lib/route/qdisc/plug.c \
+@@ -862,6 +864,7 @@ check_PROGRAMS += \
+ 	tests/test-create-macsec \
+ 	tests/test-create-macvlan \
+ 	tests/test-create-macvtap \
++	tests/test-create-qdisc-drr \
+ 	tests/test-create-qdisc-red \
+ 	tests/test-create-sit \
+ 	tests/test-create-veth \
+@@ -928,6 +931,8 @@ tests_test_flower_filter_with_actions_CPPFLAGS    = $(tests_cppflags)
+ tests_test_flower_filter_with_actions_LDADD       = $(tests_ldadd)
+ tests_test_create_qdisc_red_CPPFLAGS              = $(tests_cppflags)
+ tests_test_create_qdisc_red_LDADD                 = $(tests_ldadd)
++tests_test_create_qdisc_drr_CPPFLAGS              = $(tests_cppflags)
++tests_test_create_qdisc_drr_LDADD                 = $(tests_ldadd)
+ 
+ check_PROGRAMS += \
+ 	tests/test-cache-mngr \
+diff --git a/include/netlink-private/types.h b/include/netlink-private/types.h
+index 450c88f..0891e4d 100644
+--- a/include/netlink-private/types.h
++++ b/include/netlink-private/types.h
+@@ -728,6 +728,12 @@ struct rtnl_mqprio
+         uint32_t        qm_mask;
+ };
+ 
++struct rtnl_drr
++{
++	uint32_t qdr_quantum;
++	uint32_t qdr_mask;
++};
++
+ struct rtnl_tbf
+ {
+ 	uint32_t		qt_limit;
+diff --git a/include/netlink/route/qdisc/drr.h b/include/netlink/route/qdisc/drr.h
+new file mode 100644
+index 0000000..c08e43c
+--- /dev/null
++++ b/include/netlink/route/qdisc/drr.h
+@@ -0,0 +1,29 @@
++/*
++ * netlink/route/sch/drr.h	DRR
++ *
++ *	This library is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU Lesser General Public
++ *	License as published by the Free Software Foundation version 2.1
++ *	of the License.
++ *
++ * Copyright (c) 2019 Intel Corporation
++ */
++
++#ifndef NETLINK_DSMARK_H_
++#define NETLINK_DSMARK_H_
++
++#include <netlink/netlink.h>
++#include <netlink/route/qdisc.h>
++#include <netlink/route/class.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern int rtnl_drr_set_quantum(struct rtnl_class *, uint32_t);
++extern int rtnl_drr_get_quantum(struct rtnl_class *, uint32_t *);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/lib/route/qdisc/drr.c b/lib/route/qdisc/drr.c
+new file mode 100644
+index 0000000..baf897d
+--- /dev/null
++++ b/lib/route/qdisc/drr.c
+@@ -0,0 +1,164 @@
++/*
++ * lib/route/qdisc/drr.c	Deficit Round Robin scheduler
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * Copyright (c) 2019 Intel Corporation
++ */
++
++#include <netlink-private/netlink.h>
++#include <netlink-private/tc.h>
++#include <netlink/netlink.h>
++#include <netlink-private/route/tc-api.h>
++#include <netlink/route/qdisc.h>
++#include <netlink/utils.h>
++#include <netlink/route/qdisc/drr.h>
++
++#define SCH_DRR_ATTR_QUANTUM 1
++
++struct dumb {
++	uint32_t foo;
++};
++
++static struct nla_policy drr_policy[TCA_DRR_MAX + 1] = {
++	[TCA_DRR_QUANTUM] = {.type = NLA_U32},
++};
++
++static int drr_msg_parser(struct rtnl_tc *tc, void *data)
++{
++	struct rtnl_drr *drr = data;
++	struct nlattr *tb[TCA_DRR_MAX + 1];
++	int err;
++
++	err = tca_parse(tb, TCA_DRR_MAX, tc, drr_policy);
++	if (err < 0)
++		return err;
++
++	if (tb[TCA_DRR_QUANTUM]) {
++		drr->qdr_quantum = nla_get_u32(tb[TCA_DRR_QUANTUM]);
++		drr->qdr_mask = SCH_DRR_ATTR_QUANTUM;
++	}
++
++	return 0;
++}
++
++static void drr_dump_line(struct rtnl_tc *tc, void *data,
++			  struct nl_dump_params *p)
++{
++	struct rtnl_drr *drr = data;
++
++	if (drr && (drr->qdr_mask & SCH_DRR_ATTR_QUANTUM))
++		nl_dump(p, " quantum %u ", drr->qdr_quantum);
++}
++
++static int drr_msg_fill(struct rtnl_tc *tc, void *data, struct nl_msg *msg)
++{
++	struct rtnl_drr *drr = data;
++
++	if (!drr)
++		return 0;
++
++	if (drr->qdr_mask & SCH_DRR_ATTR_QUANTUM)
++		NLA_PUT_U32(msg, TCA_DRR_QUANTUM, drr->qdr_quantum);
++
++	return 0;
++
++nla_put_failure:
++	return -NLE_MSGSIZE;
++}
++
++static void drr_dump_stats(struct rtnl_tc *tc, void *data,
++			   struct nl_dump_params *p)
++{
++	struct tc_drr_stats *x;
++
++	x = tca_xstats(tc);
++	if (!x)
++		return;
++
++	nl_dump_line(p, "       deficit\n");
++	nl_dump_line(p, "       %10u\n", x->deficit);
++}
++
++/**
++ * Set quantum of DRR qdisc.
++ * @arg class		DRR class to be modified.
++ * @arg quantum		New quantum in bytes.
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_drr_set_quantum(struct rtnl_class *class, uint32_t quantum)
++{
++	struct rtnl_drr *drr;
++
++	drr = rtnl_tc_data(TC_CAST(class));
++	if (!drr)
++		return -NLE_NOMEM;
++
++	if (!quantum)
++		return -NLE_INVAL;
++
++	drr->qdr_quantum = quantum;
++
++	drr->qdr_mask |= SCH_DRR_ATTR_QUANTUM;
++
++	return 0;
++}
++
++/**
++ * Get quantum of DRR qdisc.
++ * @arg class		DRR class.
++ * @arg quantum		quantum
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_drr_get_quantum(struct rtnl_class *class, uint32_t *quantum)
++{
++	struct rtnl_drr *drr;
++
++	drr = rtnl_tc_data(TC_CAST(class));
++	if (!drr)
++		return -NLE_NOMEM;
++
++	if (!(drr->qdr_mask & SCH_DRR_ATTR_QUANTUM))
++		return -NLE_NOATTR;
++
++	if (!quantum)
++		return -NLE_INVAL;
++
++	*quantum = drr->qdr_quantum;
++
++	return 0;
++}
++
++/** @} */
++
++static struct rtnl_tc_ops drr_qdisc_ops = {
++	.to_kind		= "drr",
++	.to_type		= RTNL_TC_TYPE_QDISC,
++	.to_size		= sizeof(struct dumb),
++};
++
++static struct rtnl_tc_ops drr_class_ops = {
++	.to_kind		= "drr",
++	.to_type		= RTNL_TC_TYPE_CLASS,
++	.to_size		= sizeof(struct rtnl_drr),
++	.to_msg_parser		= drr_msg_parser,
++	.to_dump = {
++		[NL_DUMP_LINE]	= drr_dump_line,
++		[NL_DUMP_STATS]	= drr_dump_stats,
++		},
++	.to_msg_fill		= drr_msg_fill,
++};
++
++static void __init drr_init(void)
++{
++	rtnl_tc_register(&drr_qdisc_ops);
++	rtnl_tc_register(&drr_class_ops);
++}
++
++static void __exit drr_exit(void)
++{
++	rtnl_tc_unregister(&drr_qdisc_ops);
++	rtnl_tc_unregister(&drr_class_ops);
++}
+diff --git a/libnl-route-3.sym b/libnl-route-3.sym
+index e61cbc8..d161824 100644
+--- a/libnl-route-3.sym
++++ b/libnl-route-3.sym
+@@ -167,6 +167,8 @@ global:
+ 	rtnl_colmark_set_drop_precedence;
+ 	rtnl_colmark_set_meter_type;
+ 	rtnl_colmark_set_mode;
++	rtnl_drr_set_quantum;
++	rtnl_drr_get_quantum;
+ 	rtnl_ematch_add_child;
+ 	rtnl_ematch_alloc;
+ 	rtnl_ematch_cmp_get;
+diff --git a/tests/test-create-qdisc-drr.c b/tests/test-create-qdisc-drr.c
+new file mode 100644
+index 0000000..cf3bab4
+--- /dev/null
++++ b/tests/test-create-qdisc-drr.c
+@@ -0,0 +1,276 @@
++
++#include <netlink/route/qdisc/drr.h>
++#include <netlink/route/link.h>
++#include <netlink/route/tc.h>
++#include <netlink/route/qdisc.h>
++#include <netlink/route/classifier.h>
++#include <netlink/route/action.h>
++#include <netlink/route/act/gact.h>
++#include <netlink/route/class.h>
++#include <netlink/attr.h>
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++
++#include <linux/if_ether.h>
++#include <linux/tc_act/tc_mirred.h>
++#include <linux/netlink.h>
++
++char *run_command(const char *cmd)
++{
++	char *output = NULL;
++	int output_size = 1;
++	char buffer[256] = { 0 };
++	int size = 0;
++	void *tmp;
++	FILE *pipe = popen(cmd, "r");
++
++	if (!pipe) {
++		printf("Failed to open pipe\n");
++		return NULL;
++	}
++
++	while ((size =
++		fread(buffer, sizeof(*buffer),
++		      sizeof(buffer) / sizeof(*buffer) - 1, pipe))) {
++		unsigned int string_len = strlen(buffer);
++
++		tmp = realloc(output, output_size + string_len);
++		if (!tmp)
++			break;
++
++		output = tmp;
++		memcpy(output + output_size - 1, buffer, string_len + 1);
++		output_size += string_len;
++		memset(buffer, 0, sizeof(buffer));
++	}
++
++	pclose(pipe);
++
++	if (output == NULL)
++		return calloc(1, sizeof(char));
++
++	return output;
++}
++
++static
++int qdisc_add_drr(struct nl_sock *sock, struct rtnl_link *rtnlLink)
++{
++	struct rtnl_qdisc *qdisc;
++	int err;
++
++	/* Allocation of a qdisc object */
++	qdisc = rtnl_qdisc_alloc();
++	if (!qdisc) {
++		printf("Can not allocate qdisc\n");
++		return -1;
++	}
++
++	rtnl_tc_set_link(TC_CAST(qdisc), rtnlLink);
++	rtnl_tc_set_parent(TC_CAST(qdisc), TC_H_ROOT);
++
++	rtnl_qdisc_delete(sock, qdisc);
++
++	rtnl_tc_set_handle(TC_CAST(qdisc), TC_HANDLE(1, 0));
++
++	err = rtnl_tc_set_kind(TC_CAST(qdisc), "drr");
++	if (err) {
++		printf("Can not allocate drr\n");
++		return -1;
++	}
++
++	/* Submit request to kernel and wait for response */
++	err = rtnl_qdisc_add(sock, qdisc, NLM_F_CREATE);
++	if (err) {
++		printf("Can not allocate drr qdisc\n");
++		return -1;
++	}
++
++	/* Return the qdisc object to free memory resources */
++	rtnl_qdisc_put(qdisc);
++
++	return 0;
++}
++
++static
++int class_drr_add(struct nl_sock *sock, struct rtnl_link *rtnllink)
++{
++	int err;
++	struct rtnl_class *class;
++
++	class = rtnl_class_alloc();
++	if (!class) {
++		printf("Can not allocate class object\n");
++		return 1;
++	}
++
++	rtnl_tc_set_link(TC_CAST(class), rtnllink);
++
++	rtnl_tc_set_parent(TC_CAST(class), TC_HANDLE(1, 0));
++	rtnl_tc_set_handle(TC_CAST(class), TC_HANDLE(1, 1));
++
++	err = rtnl_tc_set_kind(TC_CAST(class), "drr");
++	if (err) {
++		printf("Can not set DRR to class\n");
++		return 1;
++	}
++
++	rtnl_drr_set_quantum(class, 600);
++
++	err = rtnl_class_add(sock, class, NLM_F_CREATE);
++	if (err) {
++		printf("Can not allocate drr class\n");
++		return 1;
++	}
++
++	rtnl_class_put(class);
++
++	return 0;
++}
++
++static int test_check_qdisc_drr_output(void)
++{
++	char *output = NULL;
++	int ret = 0;
++
++	printf("Qdisc drr test:\n");
++
++	output = run_command("tc qdisc show dev d0");
++
++	if (!strstr(output, "qdisc drr")) {
++		printf("Qdisc drr is missing\n");
++		ret = -1;
++		goto err;
++	}
++
++	printf(output);
++err:
++	if (ret)
++		printf("Test failed\n");
++	else
++		printf("Test succes\n");
++
++	free(output);
++
++	return ret;
++}
++
++static int test_check_quantum_drr_output(void)
++{
++	char *output = NULL;
++	int ret = 0;
++
++	printf("DRR quantum test:\n");
++
++	output = run_command("tc class show dev d0");
++
++	if (!strstr(output, "quantum 600b")) {
++		printf("Quantum is missing\n");
++		ret = -1;
++		goto err;
++	}
++
++	printf(output);
++
++err:
++	if (ret)
++		printf("Test failed\n");
++	else
++		printf("Test succes\n");
++
++	free(output);
++
++	return ret;
++}
++
++int main(void)
++{
++	struct nl_sock *sock;
++	struct nl_cache *link_cache;
++	struct rtnl_link *dummy, *created;
++	int err = 0;
++
++	sock = nl_socket_alloc();
++	if (!sock) {
++		printf("Unable to allocate netlink socket\n");
++		goto err_sock_alloc;
++	}
++
++	err = nl_connect(sock, NETLINK_ROUTE);
++	if (err < 0) {
++		printf("Nu s-a putut conecta la NETLINK!\n");
++		goto err_sock_alloc;
++	}
++
++	err = rtnl_link_alloc_cache(sock, AF_UNSPEC, &link_cache);
++	if (err < 0) {
++		printf("Unable to allocate link cache: %s\n", nl_geterror(err));
++		goto err_alloc_cache;
++	}
++
++	dummy = rtnl_link_alloc();
++	if (!dummy) {
++		printf("Unable to allocate dummy link\n");
++		err = -1;
++		goto err_link_alloc;
++	}
++
++	err = rtnl_link_set_type(dummy, "dummy");
++	if (err) {
++		printf("Unable to set link type to dummy\n");
++		goto err_link_type;
++	}
++
++	rtnl_link_set_name(dummy, "d0");
++
++	err = rtnl_link_add(sock, dummy, NLM_F_CREATE);
++	if (err) {
++		printf("Unable to add link\n");
++		goto err_link_add;
++	}
++
++	err = nl_cache_refill(sock, link_cache);
++	if (err) {
++		printf("Unable to fill cache\n");
++		goto err_cache;
++	}
++
++	created = rtnl_link_get_by_name(link_cache, "d0");
++	if (!created) {
++		printf("Unable to get dummy interface\n");
++		goto err_get_link;
++	}
++
++	qdisc_add_drr(sock, created);
++	class_drr_add(sock, created);
++
++	err = test_check_qdisc_drr_output();
++
++	if (err) {
++		printf("Qdisc drr is not created correctly\n");
++		goto err_test_failed;
++	}
++
++	err = test_check_quantum_drr_output();
++
++	if (err) {
++		printf("DRR quantum is not set correctly\n");
++		goto err_test_failed;
++	}
++
++err_test_failed:
++	rtnl_link_put(created);
++err_get_link:
++err_cache:
++	rtnl_link_delete(sock, dummy);
++err_link_add:
++err_link_type:
++	rtnl_link_put(dummy);
++err_link_alloc:
++	nl_cache_free(link_cache);
++err_alloc_cache:
++	nl_socket_free(sock);
++err_sock_alloc:
++	return err;
++}

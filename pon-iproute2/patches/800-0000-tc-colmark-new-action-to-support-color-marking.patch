@@ -1,0 +1,337 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Fri, 18 Feb 2022 09:43:19 +0100
+Subject: tc colmark: new action to support color marking
+
+This is the user space part needed to setup color marking in the offload path.
+---
+ include/linux/tc_act/tc_colmark.h |  45 ++++++
+ tc/Makefile                       |   1 +
+ tc/m_colmark.c                    | 227 ++++++++++++++++++++++++++++++
+ tc/tc_util.c                      |   2 +-
+ tc/tc_util.h                      |   1 +
+ 5 files changed, 275 insertions(+), 1 deletion(-)
+ create mode 100644 include/linux/tc_act/tc_colmark.h
+ create mode 100644 tc/m_colmark.c
+
+diff --git a/include/linux/tc_act/tc_colmark.h b/include/linux/tc_act/tc_colmark.h
+new file mode 100644
+index 00000000..1b75f775
+--- /dev/null
++++ b/include/linux/tc_act/tc_colmark.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef __LINUX_TC_COLMARK_H
++#define __LINUX_TC_COLMARK_H
++
++#include <linux/pkt_cls.h>
++
++#define TCA_ACT_COLMARK			27
++
++#define COLMARK_F_MODE			0x1
++#define COLMARK_F_DROP_PRECEDENCE	0x2
++#define COLMARK_F_METER_TYPE		0x4
++
++enum tc_drop_precedence {
++	TC_COLMARK_NO_MARKING,
++	TC_COLMARK_INTERNAL = 1,
++	TC_COLMARK_DEI = 2,
++	TC_COLMARK_PCP_8P0D = 3,
++	TC_COLMARK_PCP_7P1D = 4,
++	TC_COLMARK_PCP_6P2D = 5,
++	TC_COLMARK_PCP_5P3D = 6,
++	TC_COLMARK_DSCP_AF = 7,
++};
++
++enum tc_meter_type {
++	TC_COLMARK_SRTCM,
++	TC_COLMARK_TRTCM,
++};
++
++struct tc_colmark {
++	tc_gen;
++};
++
++enum {
++	TCA_COLMARK_UNSPEC,
++	TCA_COLMARK_TM,
++	TCA_COLMARK_PARMS,
++	TCA_COLMARK_MODE,
++	TCA_COLMARK_DROP_PRECEDENCE,
++	TCA_COLMARK_METER_TYPE,
++	TCA_COLMARK_PAD,
++	__TCA_COLMARK_MAX
++};
++#define TCA_COLMARK_MAX (__TCA_COLMARK_MAX - 1)
++
++#endif
+diff --git a/tc/Makefile b/tc/Makefile
+index a3959b0d..f4c90597 100644
+--- a/tc/Makefile
++++ b/tc/Makefile
+@@ -82,6 +82,7 @@ TCMODULES += q_etf.o
+ TCMODULES += q_taprio.o
+ TCMODULES += q_plug.o
+ TCMODULES += q_ets.o
++TCMODULES += m_colmark.o
+ 
+ TCSO :=
+ ifeq ($(TC_CONFIG_ATM),y)
+diff --git a/tc/m_colmark.c b/tc/m_colmark.c
+new file mode 100644
+index 00000000..4be5c860
+--- /dev/null
++++ b/tc/m_colmark.c
+@@ -0,0 +1,227 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include "utils.h"
++#include "tc_util.h"
++#include <linux/tc_act/tc_colmark.h>
++#include <linux/if_packet.h>
++
++static const struct colmark_m2n {
++	const char *m;
++	__u8 n;
++} m2n[] = {
++	{"none", TC_COLMARK_NO_MARKING},
++	{"internal", TC_COLMARK_INTERNAL},
++	{"dei", TC_COLMARK_DEI},
++	{"pcp_8p0d", TC_COLMARK_PCP_8P0D},
++	{"pcp_7p1d", TC_COLMARK_PCP_7P1D},
++	{"pcp_6p2d", TC_COLMARK_PCP_6P2D},
++	{"pcp_5p3d", TC_COLMARK_PCP_5P3D},
++	{"dscp_af", TC_COLMARK_DSCP_AF},
++	{ NULL },
++};
++
++static int marker_m2n(char *arg, __u8 *res)
++{
++	const struct colmark_m2n *iter;
++
++	for (iter = m2n; iter->m; iter++) {
++		if (matches(arg, iter->m) != 0)
++			continue;
++		*res = iter->n;
++		return 0;
++	}
++
++	return -1;
++}
++
++static const char *marker_n2m(__u8 drop_p)
++{
++	const struct colmark_m2n *iter;
++
++	for (iter = m2n; iter->m; iter++) {
++		if (iter->n != drop_p)
++			continue;
++		return iter->m;
++	}
++
++	return "";
++}
++
++static void print_drop_p_alg(void)
++{
++	const struct colmark_m2n *iter;
++
++	for (iter = m2n; iter->m; iter++)
++		fprintf(stderr,"\t\"%s\"\n", iter->m);
++	fprintf(stderr, "\n");
++}
++
++static void explain(void)
++{
++	fprintf(stderr,
++		"Usage:\tcolmark [ blind ] [ marker DROP_P ] [ mtype TYPE ]\n"
++		"\t'blind' enables color blind mode\n"
++		"\tTYPE is one of srTCM or trTCM\n"
++		"\tDROP_P(drop_precedence) is:\n");
++	print_drop_p_alg();
++}
++
++static void
++usage(void)
++{
++	explain();
++	exit(-1);
++}
++
++static int
++parse_colmark(struct action_util *a, int *argc_p, char ***argv_p, int tca_id,
++	      struct nlmsghdr *n)
++{
++	int argc = *argc_p;
++	char **argv = *argv_p;
++	int ok = 0;
++	struct rtattr *tail;
++	__u8 mode = 0, marker = 0, mtype = 0;
++	__u32 flags = 0;
++	struct tc_colmark sel = { 0 };
++
++	if (matches(*argv, "colmark") != 0)
++		return -1;
++
++	NEXT_ARG();
++
++	while (argc > 0) {
++		if (matches(*argv, "blind") == 0) {
++			mode = 1;
++			ok++;
++		} else if (matches(*argv, "marker") == 0) {
++			flags |= COLMARK_F_DROP_PRECEDENCE;
++			NEXT_ARG();
++			if (marker_m2n(*argv, &marker)) {
++				fprintf(stderr,"drop precedence is one of:\n");
++				print_drop_p_alg();
++				return -1;
++			}
++			ok++;
++		} else if (matches(*argv, "mtype") == 0) {
++			flags |= COLMARK_F_METER_TYPE;
++			NEXT_ARG();
++			if (matches(*argv, "srTCM") == 0)
++				mtype = TC_COLMARK_SRTCM;
++			else if (matches(*argv, "trTCM") == 0)
++				mtype = TC_COLMARK_TRTCM;
++			else {
++				fprintf(stderr,
++				        "meter type should be srTCM/trTCM\n");
++				return -1;
++			}
++			ok++;
++		} else if (matches(*argv, "help") == 0) {
++			usage();
++		} else {
++			break;
++		}
++		argc--;
++		argv++;
++	}
++
++	sel.action = TC_ACT_PIPE;
++	if (argc && !action_a2n(*argv, &sel.action, false))
++		NEXT_ARG();
++
++	if (argc) {
++		if (matches(*argv, "index") == 0) {
++			NEXT_ARG();
++			if (get_u32(&sel.index, *argv, 10)) {
++				fprintf(stderr, "colmark: Illegal \"index\"\n");
++				return -1;
++			}
++			argc--;
++			argv++;
++			ok++;
++		}
++	}
++
++	if (!ok) {
++		explain();
++		return -1;
++	}
++
++	tail = NLMSG_TAIL(n);
++	addattr_l(n, MAX_MSG, tca_id, NULL, 0);
++	addattr_l(n, MAX_MSG, TCA_COLMARK_PARMS, &sel, sizeof(sel));
++	addattr8(n, MAX_MSG, TCA_COLMARK_MODE, mode);
++	if (flags & COLMARK_F_DROP_PRECEDENCE)
++		addattr8(n, MAX_MSG, TCA_COLMARK_DROP_PRECEDENCE, marker);
++	if (flags & COLMARK_F_METER_TYPE)
++		addattr8(n, MAX_MSG, TCA_COLMARK_METER_TYPE, mtype);
++	tail->rta_len = (char *)NLMSG_TAIL(n) - (char *)tail;
++
++	*argc_p = argc;
++	*argv_p = argv;
++	return 0;
++}
++
++static int print_colmark(struct action_util *au, FILE *f, struct rtattr *arg)
++{
++	struct rtattr *tb[TCA_COLMARK_MAX + 1];
++	__u8 *mode = NULL, *marker = NULL, *mtype = NULL;
++	struct tc_colmark *p = NULL;
++
++	if (arg == NULL)
++		return -1;
++
++	parse_rtattr_nested(tb, TCA_COLMARK_MAX, arg);
++
++	if (tb[TCA_COLMARK_PARMS] == NULL) {
++		fprintf(stderr, "Missing colmark parameters\n");
++		return -1;
++	}
++	p = RTA_DATA(tb[TCA_COLMARK_PARMS]);
++
++	print_string(PRINT_ANY, "kind", "%s ", "colmark");
++
++	if (tb[TCA_COLMARK_MODE] != NULL) {
++		mode = RTA_DATA(tb[TCA_COLMARK_MODE]);
++		print_string(PRINT_ANY, "mode", " mode %s",
++			     *mode ? "blind" : "color-aware");
++	}
++	if (tb[TCA_COLMARK_DROP_PRECEDENCE] != NULL) {
++		marker = RTA_DATA(tb[TCA_COLMARK_DROP_PRECEDENCE]);
++		print_string(PRINT_ANY, "marker", " marker %s",
++			     marker_n2m(*marker));
++	}
++	if (tb[TCA_COLMARK_METER_TYPE] != NULL) {
++		mtype = RTA_DATA(tb[TCA_COLMARK_METER_TYPE]);
++		print_string(PRINT_ANY, "type", " type %s",
++			     *mtype == TC_COLMARK_SRTCM ? "srTCM" : "trTCM");
++	}
++
++	print_action_control(f, " ", p->action, "");
++
++	print_nl();
++	print_uint(PRINT_ANY, "index", "\t index %u", p->index);
++	print_int(PRINT_ANY, "ref", " ref %d", p->refcnt);
++	print_int(PRINT_ANY, "bind", " bind %d", p->bindcnt);
++
++	if (show_stats) {
++		if (tb[TCA_COLMARK_TM]) {
++			struct tcf_t *tm = RTA_DATA(tb[TCA_COLMARK_TM]);
++
++			print_tm(f, tm);
++		}
++	}
++
++	print_nl();
++
++	return 0;
++}
++
++struct action_util colmark_action_util = {
++	.id = "colmark",
++	.parse_aopt = parse_colmark,
++	.print_aopt = print_colmark,
++};
+diff --git a/tc/tc_util.c b/tc/tc_util.c
+index 48065897..be057029 100644
+--- a/tc/tc_util.c
++++ b/tc/tc_util.c
+@@ -298,7 +298,7 @@ void print_devname(enum output_type type, int ifindex)
+ 			   "dev", "%s ", ifname);
+ }
+ 
+-static const char *action_n2a(int action)
++const char *action_n2a(int action)
+ {
+ 	static char buf[64];
+ 
+diff --git a/tc/tc_util.h b/tc/tc_util.h
+index b197bcdd..8d25b660 100644
+--- a/tc/tc_util.h
++++ b/tc/tc_util.h
+@@ -121,6 +121,7 @@ int prio_print_opt(struct qdisc_util *qu, FILE *f, struct rtattr *opt);
+ int cls_names_init(char *path);
+ void cls_names_uninit(void);
+ 
++const char *action_n2a(int action);
+ int action_a2n(char *arg, int *result, bool allow_num);
+ 
+ bool tc_qdisc_block_exists(__u32 block_index);

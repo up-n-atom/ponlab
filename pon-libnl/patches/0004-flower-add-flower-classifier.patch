@@ -1,0 +1,541 @@
+From 06412f0a2d82044bf3814cf5eb1a8866279bc397 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <przemyslawx.czarnota@intel.com>
+Date: Thu, 24 May 2018 15:40:07 +0200
+Subject: flower: add flower classifier
+
+Adds support for the flower classifier
+---
+ Makefile.am                        |   2 +
+ include/netlink-private/types.h    |  10 +
+ include/netlink/route/cls/flower.h |  39 +++
+ lib/route/cls/flower.c             | 411 +++++++++++++++++++++++++++++
+ libnl-route-3.sym                  |  11 +
+ 5 files changed, 473 insertions(+)
+ create mode 100644 include/netlink/route/cls/flower.h
+ create mode 100644 lib/route/cls/flower.c
+
+diff --git a/Makefile.am b/Makefile.am
+index 96318d5..5f8f166 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -133,6 +133,7 @@ libnlinclude_netlink_route_cls_HEADERS = \
+ 	include/netlink/route/cls/matchall.h \
+ 	include/netlink/route/cls/police.h \
+ 	include/netlink/route/cls/u32.h \
++	include/netlink/route/cls/flower.h \
+ 	$(NULL)
+ libnlinclude_netlink_route_cls_ematchdir = $(libnlincludedir)/netlink/route/cls/ematch
+ libnlinclude_netlink_route_cls_ematch_HEADERS = \
+@@ -392,6 +393,7 @@ lib_libnl_route_3_la_SOURCES = \
+ 	lib/route/cls/mall.c \
+ 	lib/route/cls/police.c \
+ 	lib/route/cls/u32.c \
++	lib/route/cls/flower.c \
+ 	lib/route/link.c \
+ 	lib/route/link/api.c \
+ 	lib/route/link/bonding.c \
+diff --git a/include/netlink-private/types.h b/include/netlink-private/types.h
+index 97af3e5..fe8cd2d 100644
+--- a/include/netlink-private/types.h
++++ b/include/netlink-private/types.h
+@@ -616,6 +616,16 @@ struct rtnl_mall
+ 	int              m_mask;
+ };
+ 
++struct rtnl_flower
++{
++	uint16_t		fl_vlan_id;
++	uint8_t			fl_vlan_prio;
++	char			fl_indev[IFNAMSIZ];
++	struct rtnl_act*	fl_act;
++	uint32_t		fl_flags;
++	int			fl_mask;
++};
++
+ struct rtnl_cgroup
+ {
+ 	struct rtnl_ematch_tree *cg_ematch;
+diff --git a/include/netlink/route/cls/flower.h b/include/netlink/route/cls/flower.h
+new file mode 100644
+index 0000000..6f037ae
+--- /dev/null
++++ b/include/netlink/route/cls/flower.h
+@@ -0,0 +1,39 @@
++/*
++ * netlink/route/cls/flower.h	flower classifier
++ *
++ *	This library is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU Lesser General Public
++ *	License as published by the Free Software Foundation version 2.1
++ *	of the License.
++ *
++ * Copyright (c) 2003-2006 Thomas Graf <tgraf@suug.ch>
++ */
++
++#ifndef NETLINK_FLOWER_H_
++#define NETLINK_FLOWER_H_
++
++#include <netlink/netlink.h>
++#include <netlink/cache.h>
++#include <netlink/route/classifier.h>
++#include <netlink/route/action.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern int rtnl_flower_set_indev(struct rtnl_cls *, const char *);
++extern int rtnl_flower_get_indev(struct rtnl_cls *, char *, unsigned int);
++extern int rtnl_flower_set_flags(struct rtnl_cls *, uint32_t);
++extern int rtnl_flower_get_flags(struct rtnl_cls *, uint32_t *);
++extern int rtnl_flower_set_vlan_id(struct rtnl_cls *, uint32_t);
++extern int rtnl_flower_get_vlan_id(struct rtnl_cls *, uint32_t *);
++extern int rtnl_flower_set_vlan_prio(struct rtnl_cls *, uint32_t);
++extern int rtnl_flower_get_vlan_prio(struct rtnl_cls *, uint32_t *);
++extern int rtnl_flower_add_action(struct rtnl_cls *, struct rtnl_act *);
++extern int rtnl_flower_del_action(struct rtnl_cls *, struct rtnl_act *);
++extern struct rtnl_act *rtnl_flower_get_action(struct rtnl_cls *);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/lib/route/cls/flower.c b/lib/route/cls/flower.c
+new file mode 100644
+index 0000000..324397e
+--- /dev/null
++++ b/lib/route/cls/flower.c
+@@ -0,0 +1,411 @@
++/*
++ * lib/route/cls/flower.c		flower classifier
++ *
++ *	This library is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU Lesser General Public
++ *	License as published by the Free Software Foundation version 2.1
++ *	of the License.
++ *
++ * Copyright (c) 2003-2013 Thomas Graf <tgraf@suug.ch>
++ * Copyright (c) 2005-2006 Petr Gotthard <petr.gotthard@siemens.com>
++ * Copyright (c) 2005-2006 Siemens AG Oesterreich
++ */
++
++/**
++ * @ingroup cls
++ * @defgroup cls_flower Flower Classifier
++ *
++ * @{
++ */
++
++#include <netlink-private/netlink.h>
++#include <netlink-private/tc.h>
++#include <netlink/netlink.h>
++#include <netlink/attr.h>
++#include <netlink/utils.h>
++#include <netlink-private/route/tc-api.h>
++#include <netlink/route/classifier.h>
++#include <netlink/route/cls/flower.h>
++#include <netlink/route/action.h>
++
++/** @cond SKIP */
++#define FLOWER_ATTR_KEY_VLAN_ID   0x001
++#define FLOWER_ATTR_KEY_VLAN_PRIO 0x002
++#define FLOWER_ATTR_INDEV         0x004
++#define FLOWER_ATTR_ACTION        0x008
++#define FLOWER_ATTR_FLAGS         0x010
++/** @endcond */
++
++static struct nla_policy flower_policy[TCA_FLOWER_MAX + 1] = {
++	[TCA_FLOWER_INDEV] = {.type = NLA_STRING, .maxlen = IFNAMSIZ},
++	[TCA_FLOWER_KEY_VLAN_ID] = {.type = NLA_U16},
++	[TCA_FLOWER_KEY_VLAN_PRIO] = {.type = NLA_U8},
++	[TCA_FLOWER_KEY_ETH_TYPE] = {.type = NLA_U16},
++	[TCA_FLOWER_FLAGS] = {.type = NLA_U32}
++};
++
++static int flower_msg_parser(struct rtnl_tc *tc, void *data)
++{
++	struct rtnl_flower *f = data;
++	struct nlattr *tb[TCA_FLOWER_MAX + 1];
++	int err;
++
++	err = tca_parse(tb, TCA_FLOWER_MAX, tc, flower_policy);
++	if (err < 0)
++		return err;
++
++	if (tb[TCA_FLOWER_KEY_VLAN_ID]) {
++		f->fl_vlan_id = nla_get_u16(tb[TCA_FLOWER_KEY_VLAN_ID]);
++		f->fl_mask |= FLOWER_ATTR_KEY_VLAN_ID;
++	}
++
++	if (tb[TCA_FLOWER_KEY_VLAN_PRIO]) {
++		f->fl_vlan_prio = nla_get_u8(tb[TCA_FLOWER_KEY_VLAN_PRIO]);
++		f->fl_mask |= FLOWER_ATTR_KEY_VLAN_PRIO;
++	}
++
++	if (tb[TCA_FLOWER_INDEV]) {
++		nla_strlcpy(f->fl_indev, tb[TCA_FLOWER_INDEV], IFNAMSIZ);
++		f->fl_mask |= FLOWER_ATTR_INDEV;
++	}
++
++	if (tb[TCA_FLOWER_FLAGS]) {
++		f->fl_flags = nla_get_u32(tb[TCA_FLOWER_FLAGS]);
++		f->fl_mask |= FLOWER_ATTR_FLAGS;
++	}
++
++	if (tb[TCA_FLOWER_ACT]) {
++		f->fl_mask |= FLOWER_ATTR_ACTION;
++		err = rtnl_act_parse(&f->fl_act, tb[TCA_FLOWER_ACT]);
++		if (err)
++			return err;
++	}
++
++	return 0;
++}
++
++static void flower_free_data(struct rtnl_tc *tc, void *data)
++{
++	struct rtnl_flower *f = data;
++
++	if (f->fl_act)
++		rtnl_act_put_all(&f->fl_act);
++}
++
++static int flower_clone(void *_dst, void *_src)
++{
++	struct rtnl_flower *dst = _dst, *src = _src;
++
++	if (src->fl_act) {
++		dst->fl_act = rtnl_act_alloc();
++		if (!(dst->fl_act))
++			return -NLE_NOMEM;
++
++		memcpy(dst->fl_act, src->fl_act, sizeof(struct rtnl_act));
++	}
++
++	return 0;
++}
++
++static void flower_dump_line(struct rtnl_tc *tc, void *data,
++			     struct nl_dump_params *p)
++{
++	struct rtnl_flower *f = data;
++
++	if (!f)
++		return;
++
++	if (f->fl_mask & FLOWER_ATTR_KEY_VLAN_ID)
++		nl_dump(p, " vlan_id %u", f->fl_vlan_id);
++}
++
++static void flower_dump_details(struct rtnl_tc *tc, void *data,
++				struct nl_dump_params *p)
++{
++	struct rtnl_flower *f = data;
++
++	if (!f)
++		return;
++
++	if (f->fl_mask & FLOWER_ATTR_KEY_VLAN_ID)
++		nl_dump(p, " vlan_id %u", f->fl_vlan_id);
++
++	if (f->fl_mask & FLOWER_ATTR_KEY_VLAN_PRIO)
++		nl_dump(p, " vlan_prio %u", f->fl_vlan_prio);
++
++	if (f->fl_mask & FLOWER_ATTR_INDEV)
++		nl_dump(p, " indev %s", f->fl_indev);
++
++	if (f->fl_mask & FLOWER_ATTR_FLAGS)
++		nl_dump(p, " flags 0x%08X", f->fl_flags);
++
++	nl_dump(p, "\n");
++}
++
++static int flower_msg_fill(struct rtnl_tc *tc, void *data, struct nl_msg *msg)
++{
++	struct rtnl_flower *f = data;
++	uint16_t proto;
++
++	if (!f)
++		return 0;
++
++	if (f->fl_mask & FLOWER_ATTR_INDEV)
++		NLA_PUT_STRING(msg, TCA_FLOWER_INDEV, f->fl_indev);
++
++	if (f->fl_mask & FLOWER_ATTR_KEY_VLAN_ID)
++		NLA_PUT_U16(msg, TCA_FLOWER_KEY_VLAN_ID, f->fl_vlan_id);
++
++	if (f->fl_mask & FLOWER_ATTR_KEY_VLAN_PRIO)
++		NLA_PUT_U8(msg, TCA_FLOWER_KEY_VLAN_PRIO, f->fl_vlan_prio);
++
++	if (f->fl_mask & FLOWER_ATTR_FLAGS)
++		NLA_PUT_U32(msg, TCA_FLOWER_FLAGS, f->fl_flags);
++
++	if (f->fl_mask & FLOWER_ATTR_ACTION) {
++		int err;
++
++		err = rtnl_act_fill(msg, TCA_FLOWER_ACT, f->fl_act);
++		if (err)
++			return err;
++	}
++
++	proto = rtnl_cls_get_protocol((struct rtnl_cls *) tc);
++	if (proto != ETH_P_ALL)
++		NLA_PUT_U16(msg, TCA_FLOWER_KEY_ETH_TYPE, htons(proto));
++
++	return 0;
++
++nla_put_failure:
++	return -NLE_NOMEM;
++}
++
++/**
++ * @name Attribute Modifications
++ * @{
++ */
++
++int rtnl_flower_set_indev(struct rtnl_cls *cls, const char *indev)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	if (!indev)
++		return -NLE_INVAL;
++
++	if (strlen(indev) + 1 > IFNAMSIZ)
++		return -NLE_INVAL;
++
++	snprintf(f->fl_indev, sizeof(f->fl_indev), "%s", indev);
++	f->fl_mask |= FLOWER_ATTR_INDEV;
++
++	return 0;
++}
++
++int rtnl_flower_get_indev(struct rtnl_cls *cls, char *indev, unsigned int size)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	if (!(f->fl_mask & FLOWER_ATTR_INDEV))
++		return -NLE_INVAL;
++
++	if (!indev)
++		return -NLE_INVAL;
++
++	if (strlen(f->fl_indev) + 1 > size)
++		return -NLE_INVAL;
++
++	snprintf(indev, size, "%s", f->fl_indev);
++
++	return 0;
++}
++
++int rtnl_flower_set_flags(struct rtnl_cls *cls, uint32_t flags)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	f->fl_flags = flags;
++	f->fl_mask |= FLOWER_ATTR_FLAGS;
++	return 0;
++}
++
++int rtnl_flower_get_flags(struct rtnl_cls *cls, uint32_t *flags)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	if (!(f->fl_mask & FLOWER_ATTR_FLAGS))
++		return -NLE_INVAL;
++
++	if (!flags)
++		return -NLE_INVAL;
++
++	*flags = f->fl_flags;
++
++	return 0;
++}
++
++int rtnl_flower_set_vlan_id(struct rtnl_cls *cls, uint32_t vlan_id)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	f->fl_vlan_id = vlan_id;
++	f->fl_mask |= FLOWER_ATTR_KEY_VLAN_ID;
++
++	return 0;
++}
++
++int rtnl_flower_get_vlan_id(struct rtnl_cls *cls, uint32_t *id)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	if (!(f->fl_mask & FLOWER_ATTR_KEY_VLAN_ID))
++		return -NLE_INVAL;
++
++	if (!id)
++		return -NLE_INVAL;
++
++	*id = f->fl_vlan_id;
++
++	return 0;
++}
++
++int rtnl_flower_set_vlan_prio(struct rtnl_cls *cls, uint32_t prio)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	f->fl_vlan_prio = prio;
++	f->fl_mask |= FLOWER_ATTR_KEY_VLAN_PRIO;
++
++	return 0;
++}
++
++int rtnl_flower_get_vlan_prio(struct rtnl_cls *cls, uint32_t *prio)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	if (!(f->fl_mask & FLOWER_ATTR_KEY_VLAN_PRIO))
++		return -NLE_INVAL;
++
++	if (!prio)
++		return -NLE_INVAL;
++
++	*prio = f->fl_vlan_prio;
++
++	return 0;
++}
++
++int rtnl_flower_add_action(struct rtnl_cls *cls, struct rtnl_act *act)
++{
++	struct rtnl_flower *f;
++
++	if (!act)
++		return 0;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	f->fl_mask |= FLOWER_ATTR_ACTION;
++	/* In case user frees it */
++	rtnl_act_get(act);
++	return rtnl_act_append(&f->fl_act, act);
++}
++
++struct rtnl_act *rtnl_flower_get_action(struct rtnl_cls *cls)
++{
++	struct rtnl_flower *f;
++
++	f = rtnl_tc_data_peek(TC_CAST(cls));
++	if (!f)
++		return NULL;
++
++	if (!(f->fl_mask & FLOWER_ATTR_ACTION))
++		return NULL;
++
++	return f->fl_act;
++}
++
++int rtnl_flower_del_action(struct rtnl_cls *cls, struct rtnl_act *act)
++{
++	struct rtnl_flower *f;
++	int ret;
++
++	if (!act)
++		return 0;
++
++	f = rtnl_tc_data(TC_CAST(cls));
++	if (!f)
++		return -NLE_NOMEM;
++
++	if (!(f->fl_mask & FLOWER_ATTR_ACTION))
++		return -NLE_INVAL;
++
++	ret = rtnl_act_remove(&f->fl_act, act);
++	if (ret)
++		return ret;
++
++	if (!f->fl_act)
++		f->fl_mask &= ~FLOWER_ATTR_ACTION;
++	rtnl_act_put(act);
++	return 0;
++}
++
++
++/** @} */
++
++static struct rtnl_tc_ops flower_ops = {
++	.to_kind		= "flower",
++	.to_type		= RTNL_TC_TYPE_CLS,
++	.to_size		= sizeof(struct rtnl_flower),
++	.to_msg_parser		= flower_msg_parser,
++	.to_free_data		= flower_free_data,
++	.to_clone		= flower_clone,
++	.to_msg_fill		= flower_msg_fill,
++	.to_dump = {
++		    [NL_DUMP_LINE] = flower_dump_line,
++		    [NL_DUMP_DETAILS] = flower_dump_details,
++		    },
++};
++
++static void __init flower_init(void)
++{
++	rtnl_tc_register(&flower_ops);
++}
++
++static void __exit flower_exit(void)
++{
++	rtnl_tc_unregister(&flower_ops);
++}
++
++/** @} */
+diff --git a/libnl-route-3.sym b/libnl-route-3.sym
+index 02cbf2b..2fc8746 100644
+--- a/libnl-route-3.sym
++++ b/libnl-route-3.sym
+@@ -852,6 +852,17 @@ global:
+ 	rtnl_u32_set_hashmask;
+ 	rtnl_u32_set_hashtable;
+ 	rtnl_u32_set_link;
++	rtnl_flower_set_indev;
++	rtnl_flower_get_indev;
++	rtnl_flower_set_flags;
++	rtnl_flower_get_flags;
++	rtnl_flower_set_vlan_id;
++	rtnl_flower_get_vlan_id;
++	rtnl_flower_set_vlan_prio;
++	rtnl_flower_get_vlan_prio;
++	rtnl_flower_add_action;
++	rtnl_flower_del_action;
++	rtnl_flower_get_action;
+ 
+ 	# The following symbols were added during the development of 3.2.26.
+ 	# Keep them in libnl_3 to avoid breaking users.

@@ -1,0 +1,59 @@
+#
+# Copyright (C) 2007-2014 OpenWrt.org
+#
+# This is free software, licensed under the GNU General Public License v2.
+# See /LICENSE for more information.
+#
+
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=argp-standalone-shared
+PKG_VERSION:=1.3
+PKG_RELEASE:=2
+PKG_BASE_NAME:=argp-standalone
+
+PKG_SOURCE:=$(PKG_BASE_NAME)-$(PKG_VERSION).tar.gz
+PKG_SOURCE_URL:=http://www.lysator.liu.se/~nisse/misc/
+PKG_HASH:=dec79694da1319acd2238ce95df57f3680fea2482096e483323fddf3d818d8be
+PKG_MAINTAINER:=Ted Hess <thess@kitschensync.net>
+
+PKG_BUILD_DIR:=$(BUILD_DIR)/$(PKG_NAME)/$(PKG_BASE_NAME)-$(PKG_VERSION)
+
+
+PKG_FIXUP:=patch-libtool autoreconf
+PKG_INSTALL=1
+
+PKG_LICENSE:=LGPL-2.1
+PKG_LICENSE:=Makefile.am
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/argp-standalone-shared
+  SECTION:=libs
+  CATEGORY:=Libraries
+  TITLE:=Hierarchial argument parsing broken out from glibc
+  URL:=http://www.lysator.liu.se/~nisse/misc/
+  DEPENDS:=@!USE_GLIBC
+endef
+
+define Package/argp-standalone-shared/description
+  GNU libc hierarchial argument parsing library broken out from glibc.
+  This package provides this as shared library.
+endef
+
+MAKE_FLAGS += \
+	CFLAGS="$(TARGET_CFLAGS) $(FPIC)"
+
+define Build/InstallDev
+	$(INSTALL_DIR) $(1)/usr/include
+	$(CP)   $(PKG_BUILD_DIR)/argp.h \
+		$(1)/usr/include/
+	$(call Package/argp-standalone-shared/install,$(1))
+endef
+
+define Package/argp-standalone-shared/install
+	$(INSTALL_DIR) $(1)/usr/lib
+	$(CP) $(PKG_INSTALL_DIR)/usr/lib/*.so* $(1)/usr/lib
+endef
+
+$(eval $(call BuildPackage,argp-standalone-shared))
