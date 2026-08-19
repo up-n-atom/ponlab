@@ -1,0 +1,354 @@
+
+/***********************************************************************************
+File:				ProtDbRegs.h
+Module:				protDb
+SOC Revision:		latest
+Generated at:       2024-06-26 12:55:09
+Purpose:
+Description:		This File was auto generated using SOC Online
+
+************************************************************************************/
+#ifndef _PROT_DB_REGS_H_
+#define _PROT_DB_REGS_H_
+
+/*---------------------------------------------------------------------------------
+/						Registers Addresses													 
+/----------------------------------------------------------------------------------*/
+#include "HwMemoryMap.h"
+
+#define PROT_DB_BASE_ADDRESS                                MEMORY_MAP_UNIT_46_BASE_ADDRESS
+#define	REG_PROT_DB_ENTITY0_PROT_SHADOW_MEM_16B_OFFSET    (PROT_DB_BASE_ADDRESS + 0x0)
+#define	REG_PROT_DB_ENTITY0_PROT_START_COMMAND            (PROT_DB_BASE_ADDRESS + 0x4)
+#define	REG_PROT_DB_ENTITY0_PROT_IRQ                      (PROT_DB_BASE_ADDRESS + 0x8)
+#define	REG_PROT_DB_ENTITY0_PROT_CLEAR_IRQ                (PROT_DB_BASE_ADDRESS + 0xC)
+#define	REG_PROT_DB_ENTITY0_PROT_BUSY                     (PROT_DB_BASE_ADDRESS + 0x10)
+#define	REG_PROT_DB_ENTITY1_PROT_SHADOW_MEM_16B_OFFSET    (PROT_DB_BASE_ADDRESS + 0x20)
+#define	REG_PROT_DB_ENTITY1_PROT_START_COMMAND            (PROT_DB_BASE_ADDRESS + 0x24)
+#define	REG_PROT_DB_ENTITY1_PROT_IRQ                      (PROT_DB_BASE_ADDRESS + 0x28)
+#define	REG_PROT_DB_ENTITY1_PROT_CLEAR_IRQ                (PROT_DB_BASE_ADDRESS + 0x2C)
+#define	REG_PROT_DB_ENTITY1_PROT_BUSY                     (PROT_DB_BASE_ADDRESS + 0x30)
+#define	REG_PROT_DB_ENTITY2_PROT_SHADOW_MEM_16B_OFFSET    (PROT_DB_BASE_ADDRESS + 0x40)
+#define	REG_PROT_DB_ENTITY2_PROT_START_COMMAND            (PROT_DB_BASE_ADDRESS + 0x44)
+#define	REG_PROT_DB_ENTITY2_PROT_IRQ                      (PROT_DB_BASE_ADDRESS + 0x48)
+#define	REG_PROT_DB_ENTITY2_PROT_CLEAR_IRQ                (PROT_DB_BASE_ADDRESS + 0x4C)
+#define	REG_PROT_DB_ENTITY2_PROT_BUSY                     (PROT_DB_BASE_ADDRESS + 0x50)
+#define	REG_PROT_DB_ENTITY3_PROT_SHADOW_MEM_16B_OFFSET    (PROT_DB_BASE_ADDRESS + 0x60)
+#define	REG_PROT_DB_ENTITY3_PROT_START_COMMAND            (PROT_DB_BASE_ADDRESS + 0x64)
+#define	REG_PROT_DB_ENTITY3_PROT_IRQ                      (PROT_DB_BASE_ADDRESS + 0x68)
+#define	REG_PROT_DB_ENTITY3_PROT_CLEAR_IRQ                (PROT_DB_BASE_ADDRESS + 0x6C)
+#define	REG_PROT_DB_ENTITY3_PROT_BUSY                     (PROT_DB_BASE_ADDRESS + 0x70)
+#define	REG_PROT_DB_PROT_DB_DEBUG                         (PROT_DB_BASE_ADDRESS + 0x7C)
+/*---------------------------------------------------------------------------------
+/						Data Type Definition										
+/----------------------------------------------------------------------------------*/
+/*REG_PROT_DB_ENTITY0_PROT_SHADOW_MEM_16B_OFFSET 0x0 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity0ProtShadowMem16BOffset : 5; //entity0 prot shadow mem 16Bytes offset, reset value: 0x0, access type: RW
+		uint32 reserved0 : 27;
+	} bitFields;
+} RegProtDbEntity0ProtShadowMem16BOffset_u;
+
+/*REG_PROT_DB_ENTITY0_PROT_START_COMMAND 0x4 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 reserved0 : 2;
+		uint32 entity0ProtDestBaseAddr : 20; //entity0 prot destination base address, reset value: 0x0, access type: RW
+		uint32 reserved1 : 2;
+		uint32 entity0ProtWordsNum : 8; //entity0 prot words num, reset value: 0x0, access type: RW
+	} bitFields;
+} RegProtDbEntity0ProtStartCommand_u;
+
+/*REG_PROT_DB_ENTITY0_PROT_IRQ 0x8 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity0ProtIrq : 1; //entity0 prot interrupt, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity0ProtIrq_u;
+
+/*REG_PROT_DB_ENTITY0_PROT_CLEAR_IRQ 0xC */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity0ProtClearIrqStb : 1; //entity0 prot clear interrupt, reset value: 0x0, access type: WO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity0ProtClearIrq_u;
+
+/*REG_PROT_DB_ENTITY0_PROT_BUSY 0x10 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity0ProtBusy : 1; //entity0 prot busy indication, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity0ProtBusy_u;
+
+/*REG_PROT_DB_ENTITY1_PROT_SHADOW_MEM_16B_OFFSET 0x20 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity1ProtShadowMem16BOffset : 5; //entity1 prot shadow mem 16Bytes offset, reset value: 0x8, access type: RW
+		uint32 reserved0 : 27;
+	} bitFields;
+} RegProtDbEntity1ProtShadowMem16BOffset_u;
+
+/*REG_PROT_DB_ENTITY1_PROT_START_COMMAND 0x24 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 reserved0 : 2;
+		uint32 entity1ProtDestBaseAddr : 20; //entity1 prot destination base address, reset value: 0x0, access type: RW
+		uint32 reserved1 : 2;
+		uint32 entity1ProtWordsNum : 8; //entity1 prot words num, reset value: 0x0, access type: RW
+	} bitFields;
+} RegProtDbEntity1ProtStartCommand_u;
+
+/*REG_PROT_DB_ENTITY1_PROT_IRQ 0x28 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity1ProtIrq : 1; //entity1 prot interrupt, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity1ProtIrq_u;
+
+/*REG_PROT_DB_ENTITY1_PROT_CLEAR_IRQ 0x2C */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity1ProtClearIrqStb : 1; //entity1 prot clear interrupt, reset value: 0x0, access type: WO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity1ProtClearIrq_u;
+
+/*REG_PROT_DB_ENTITY1_PROT_BUSY 0x30 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity1ProtBusy : 1; //entity1 prot busy indication, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity1ProtBusy_u;
+
+/*REG_PROT_DB_ENTITY2_PROT_SHADOW_MEM_16B_OFFSET 0x40 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity2ProtShadowMem16BOffset : 5; //entity2 prot shadow mem 16Bytes offset, reset value: 0x10, access type: RW
+		uint32 reserved0 : 27;
+	} bitFields;
+} RegProtDbEntity2ProtShadowMem16BOffset_u;
+
+/*REG_PROT_DB_ENTITY2_PROT_START_COMMAND 0x44 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 reserved0 : 2;
+		uint32 entity2ProtDestBaseAddr : 20; //entity2 prot destination base address, reset value: 0x0, access type: RW
+		uint32 reserved1 : 2;
+		uint32 entity2ProtWordsNum : 8; //entity2 prot words num, reset value: 0x0, access type: RW
+	} bitFields;
+} RegProtDbEntity2ProtStartCommand_u;
+
+/*REG_PROT_DB_ENTITY2_PROT_IRQ 0x48 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity2ProtIrq : 1; //entity2 prot interrupt, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity2ProtIrq_u;
+
+/*REG_PROT_DB_ENTITY2_PROT_CLEAR_IRQ 0x4C */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity2ProtClearIrqStb : 1; //entity2 prot clear interrupt, reset value: 0x0, access type: WO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity2ProtClearIrq_u;
+
+/*REG_PROT_DB_ENTITY2_PROT_BUSY 0x50 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity2ProtBusy : 1; //entity2 prot busy indication, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity2ProtBusy_u;
+
+/*REG_PROT_DB_ENTITY3_PROT_SHADOW_MEM_16B_OFFSET 0x60 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity3ProtShadowMem16BOffset : 5; //entity3 prot shadow mem 16Bytes offset, reset value: 0x10, access type: RW
+		uint32 reserved0 : 27;
+	} bitFields;
+} RegProtDbEntity3ProtShadowMem16BOffset_u;
+
+/*REG_PROT_DB_ENTITY3_PROT_START_COMMAND 0x64 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 reserved0 : 2;
+		uint32 entity3ProtDestBaseAddr : 20; //entity3 prot destination base address, reset value: 0x0, access type: RW
+		uint32 reserved1 : 2;
+		uint32 entity3ProtWordsNum : 8; //entity3 prot words num, reset value: 0x0, access type: RW
+	} bitFields;
+} RegProtDbEntity3ProtStartCommand_u;
+
+/*REG_PROT_DB_ENTITY3_PROT_IRQ 0x68 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity3ProtIrq : 1; //entity3 prot interrupt, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity3ProtIrq_u;
+
+/*REG_PROT_DB_ENTITY3_PROT_CLEAR_IRQ 0x6C */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity3ProtClearIrqStb : 1; //entity3 prot clear interrupt, reset value: 0x0, access type: WO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity3ProtClearIrq_u;
+
+/*REG_PROT_DB_ENTITY3_PROT_BUSY 0x70 */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 entity3ProtBusy : 1; //entity3 prot busy indication, reset value: 0x0, access type: RO
+		uint32 reserved0 : 31;
+	} bitFields;
+} RegProtDbEntity3ProtBusy_u;
+
+/*REG_PROT_DB_PROT_DB_DEBUG 0x7C */
+typedef union
+{
+	uint32 val;
+	struct
+	{
+		uint32 protWrSmcWordsCount : 8; //prot wr smc words count, reset value: 0x0, access type: RO
+		uint32 protDbSm : 3; //Protected DB state machine, reset value: 0x0, access type: RO
+		uint32 reserved0 : 21;
+	} bitFields;
+} RegProtDbProtDbDebug_u;
+
+//========================================
+/* REG_PROT_DB_ENTITY0_PROT_SHADOW_MEM_16B_OFFSET 0x0 */
+#define PROT_DB_ENTITY0_PROT_SHADOW_MEM_16B_OFFSET_FIELD_ENTITY0_PROT_SHADOW_MEM_16B_OFFSET_MASK                  0x0000001F
+//========================================
+/* REG_PROT_DB_ENTITY0_PROT_START_COMMAND 0x4 */
+#define PROT_DB_ENTITY0_PROT_START_COMMAND_FIELD_ENTITY0_PROT_DEST_BASE_ADDR_MASK                                 0x003FFFFC
+#define PROT_DB_ENTITY0_PROT_START_COMMAND_FIELD_ENTITY0_PROT_WORDS_NUM_MASK                                      0xFF000000
+//========================================
+/* REG_PROT_DB_ENTITY0_PROT_IRQ 0x8 */
+#define PROT_DB_ENTITY0_PROT_IRQ_FIELD_ENTITY0_PROT_IRQ_MASK                                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY0_PROT_CLEAR_IRQ 0xC */
+#define PROT_DB_ENTITY0_PROT_CLEAR_IRQ_FIELD_ENTITY0_PROT_CLEAR_IRQ_STB_MASK                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY0_PROT_BUSY 0x10 */
+#define PROT_DB_ENTITY0_PROT_BUSY_FIELD_ENTITY0_PROT_BUSY_MASK                                                    0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY1_PROT_SHADOW_MEM_16B_OFFSET 0x20 */
+#define PROT_DB_ENTITY1_PROT_SHADOW_MEM_16B_OFFSET_FIELD_ENTITY1_PROT_SHADOW_MEM_16B_OFFSET_MASK                  0x0000001F
+//========================================
+/* REG_PROT_DB_ENTITY1_PROT_START_COMMAND 0x24 */
+#define PROT_DB_ENTITY1_PROT_START_COMMAND_FIELD_ENTITY1_PROT_DEST_BASE_ADDR_MASK                                 0x003FFFFC
+#define PROT_DB_ENTITY1_PROT_START_COMMAND_FIELD_ENTITY1_PROT_WORDS_NUM_MASK                                      0xFF000000
+//========================================
+/* REG_PROT_DB_ENTITY1_PROT_IRQ 0x28 */
+#define PROT_DB_ENTITY1_PROT_IRQ_FIELD_ENTITY1_PROT_IRQ_MASK                                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY1_PROT_CLEAR_IRQ 0x2C */
+#define PROT_DB_ENTITY1_PROT_CLEAR_IRQ_FIELD_ENTITY1_PROT_CLEAR_IRQ_STB_MASK                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY1_PROT_BUSY 0x30 */
+#define PROT_DB_ENTITY1_PROT_BUSY_FIELD_ENTITY1_PROT_BUSY_MASK                                                    0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY2_PROT_SHADOW_MEM_16B_OFFSET 0x40 */
+#define PROT_DB_ENTITY2_PROT_SHADOW_MEM_16B_OFFSET_FIELD_ENTITY2_PROT_SHADOW_MEM_16B_OFFSET_MASK                  0x0000001F
+//========================================
+/* REG_PROT_DB_ENTITY2_PROT_START_COMMAND 0x44 */
+#define PROT_DB_ENTITY2_PROT_START_COMMAND_FIELD_ENTITY2_PROT_DEST_BASE_ADDR_MASK                                 0x003FFFFC
+#define PROT_DB_ENTITY2_PROT_START_COMMAND_FIELD_ENTITY2_PROT_WORDS_NUM_MASK                                      0xFF000000
+//========================================
+/* REG_PROT_DB_ENTITY2_PROT_IRQ 0x48 */
+#define PROT_DB_ENTITY2_PROT_IRQ_FIELD_ENTITY2_PROT_IRQ_MASK                                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY2_PROT_CLEAR_IRQ 0x4C */
+#define PROT_DB_ENTITY2_PROT_CLEAR_IRQ_FIELD_ENTITY2_PROT_CLEAR_IRQ_STB_MASK                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY2_PROT_BUSY 0x50 */
+#define PROT_DB_ENTITY2_PROT_BUSY_FIELD_ENTITY2_PROT_BUSY_MASK                                                    0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY3_PROT_SHADOW_MEM_16B_OFFSET 0x60 */
+#define PROT_DB_ENTITY3_PROT_SHADOW_MEM_16B_OFFSET_FIELD_ENTITY3_PROT_SHADOW_MEM_16B_OFFSET_MASK                  0x0000001F
+//========================================
+/* REG_PROT_DB_ENTITY3_PROT_START_COMMAND 0x64 */
+#define PROT_DB_ENTITY3_PROT_START_COMMAND_FIELD_ENTITY3_PROT_DEST_BASE_ADDR_MASK                                 0x003FFFFC
+#define PROT_DB_ENTITY3_PROT_START_COMMAND_FIELD_ENTITY3_PROT_WORDS_NUM_MASK                                      0xFF000000
+//========================================
+/* REG_PROT_DB_ENTITY3_PROT_IRQ 0x68 */
+#define PROT_DB_ENTITY3_PROT_IRQ_FIELD_ENTITY3_PROT_IRQ_MASK                                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY3_PROT_CLEAR_IRQ 0x6C */
+#define PROT_DB_ENTITY3_PROT_CLEAR_IRQ_FIELD_ENTITY3_PROT_CLEAR_IRQ_STB_MASK                                      0x00000001
+//========================================
+/* REG_PROT_DB_ENTITY3_PROT_BUSY 0x70 */
+#define PROT_DB_ENTITY3_PROT_BUSY_FIELD_ENTITY3_PROT_BUSY_MASK                                                    0x00000001
+//========================================
+/* REG_PROT_DB_PROT_DB_DEBUG 0x7C */
+#define PROT_DB_PROT_DB_DEBUG_FIELD_PROT_WR_SMC_WORDS_COUNT_MASK                                                  0x000000FF
+#define PROT_DB_PROT_DB_DEBUG_FIELD_PROT_DB_SM_MASK                                                               0x00000700
+
+
+#endif // _PROT_DB_REGS_H_
