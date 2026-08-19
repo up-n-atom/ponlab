@@ -1,0 +1,1768 @@
+# HG changeset patch
+# Parent  202fcc0069801e84bee49cdf0c27ecf14d23eb0d
+
+diff --git a/cmd/mxl/upgrade.c b/cmd/mxl/upgrade.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/upgrade.c
+@@ -0,0 +1,532 @@
++/*
++ * (C) Copyright 2000
++ * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++/*
++ * Cache support: switch on or off, get status
++ */
++#include <common.h>
++#include <command.h>
++#include <cmd_upgrade.h>
++#include <linux/libfdt.h>
++#include "image.h"
++#include <configs/maxlinear/udt.h>
++
++#ifdef CONFIG_BOOT_FROM_EMMC
++#define EMMC_UPGRADE_SUPPORT
++#include <memalign.h>
++#endif
++
++static void update_env_filesize(char *name, u32 size);
++
++/* TODO: Will not work with a standalone dtb image
++ * either the image has to be tweaked or need to
++ * find a way to support both dtb updates from
++ * fullimage and standalone dtb (both format differs
++ */
++static int upgrade_fitimage(const void *addr)
++{
++	const void *data;
++	int noffset, depth = 0;
++	int len = 0;
++
++	/* Look for dtb within fit image, which is in
++	 * the node below parent.
++	 */
++	noffset = fdt_path_offset(addr, FIT_IMAGES_PATH);
++	do {
++		noffset = fdt_next_node(addr, noffset, &depth);
++		printf("noffset %d depth %d name %s\n", noffset, depth,
++		      fdt_get_name(addr, noffset, NULL));
++		if (depth == 1)
++			break;
++	} while (noffset >= 0);
++
++	if (noffset < 0) {
++		error("Unable to find images node within fit image\n");
++		return fdt_totalsize(addr);
++	}
++
++	data = fdt_getprop(addr, noffset, FIT_DATA_PROP, &len);
++	if (!len) {
++		error("Unable to find image data\n");
++		return fdt_totalsize(addr);
++	}
++
++	printf("Found device tree image at %px len %zu\n", data, len);
++
++#ifdef EMMC_UPGRADE_SUPPORT
++	uint8_t image_type;
++	char *filename;
++	int fitimage_size = fdt_totalsize(addr);
++
++#ifdef CONFIG_FIT
++	if (fit_image_get_type(addr, noffset, &image_type))
++		return 0;
++#else
++	image_type = IH_TYPE_FLATDT;
++#endif
++
++	printf("image type %d fitimage_size %d data_len %d\n", image_type,
++		fitimage_size, len);
++
++	if (image_type == IH_TYPE_RAMDISK || image_type == IH_TYPE_FILESYSTEM) {
++		filename = env_get("rootfs");
++		if (upgrade_img((ulong)addr, fitimage_size, "extended_boot", filename))
++			error("failed to upgrade rootfs\n");
++		update_env_filesize("rootfs", fdt_totalsize(addr));
++	} else if (image_type == IH_TYPE_KERNEL) {
++		filename = env_get("bootfile");
++		if (upgrade_img((ulong)addr, fitimage_size, "extended_boot", filename))
++			error("failed to upgrade kernel\n");
++		update_env_filesize("kernel", fdt_totalsize(addr));
++	} else if (image_type == IH_TYPE_FLATDT) {
++		if (upgrade_img((ulong)data, len, "dtb", NULL))
++			error("failed to upgrade dtb\n");
++		update_env_filesize("dtb", fdt_totalsize(addr));
++	}
++#else
++	if (upgrade_img((ulong)data, len, "dtb", 0, 0))
++		error("failed to upgrade dtb\n");
++#endif /* EMMC_UPGRADE_SUPPORT */
++	return fdt_totalsize(addr);
++}
++
++static int check_args(int argc)
++{
++#ifndef EMMC_UPGRADE_SUPPORT
++	if (argc != 3)
++		return 1;
++#else
++	if (argc < 3 || argc > 4)
++		return 1;
++#endif
++	return 0;
++} /* EMMC_UPGRADE_SUPPORT */
++
++#ifdef EMMC_UPGRADE_SUPPORT
++static char *get_filename_from_env(char *env_var)
++{
++	printf("getting %s from the env\n", env_var);
++	if (!strncmp(env_var, "kernel", sizeof(env_var)))
++		return env_get("bootfile");
++	else if (!strncmp(env_var, "rbe", sizeof(env_var)))
++		return env_get("rbe");
++	else if (!strncmp(env_var, "uboot", sizeof(env_var)))
++		return env_get("u-boot");
++	else if (!strncmp(env_var, "tep_firmware", sizeof(env_var)))
++		return env_get("tep_firmware");
++	else
++		return env_get(env_var);
++}
++#endif
++
++static int get_partition_selection(char *env_name, char *partition)
++{
++	char *select_part = NULL;
++
++	select_part = env_get(ENV_SWITCH_PART_NAME);
++	if (!strncmp(select_part, "primary", 7))
++		snprintf(partition, strlen(env_name) + 3,
++				"%s_a", env_name);
++	else if (!strncmp(select_part, "secondary", 9))
++		snprintf(partition, strlen(env_name) + 3,
++				"%s_b", env_name);
++	else
++		return 1;
++
++	return 0;
++}
++
++/* Update the file size to ensure that we can re-use this info for
++ * authentication later on.
++ */
++static void update_env_filesize(char *name, u32 size)
++{
++	char env_name[48], env_size[32];
++	char selected_partition[32];
++	int ret, len, inc_ih_size = 0;
++	u32 rootfs_size, ddr_top;
++	u32 rootfs_loadaddr, rootfsload_addr_end, align = 0;
++	u32 aligned_boundary = ROOTFS_SIZE_ALIGN_VAL;
++	char *select_part = NULL;
++
++	/* ENV save requirement is not for mips platform */
++	if (!CONFIG_IS_ENABLED(LIGHTNING_MOUNTAIN_SOC))
++		return;
++
++	/* check if size incl. mkimage header size */
++	if (!strncmp(name, "kernel", 6) ||
++		!strncmp(name, "uboot", 5))
++		inc_ih_size = 1;
++
++	/* get xxx_a or xxx_b (pri or sec partition/vol) */
++	ret = get_partition_selection(name, selected_partition);
++	if (ret)
++		return;
++
++	len = strlen(selected_partition);
++	/* buffer overflow check */
++	if (len > 32)
++		return;
++
++	/* strlen returns actual len - 1, 5 -> '_size' */
++	snprintf(env_name, len + 1 + 9, "%s_filesize", selected_partition);
++	/* Kernel incl mkimage header */
++	if (inc_ih_size)
++		size += sizeof(image_header_t);
++
++	debug("selected partition: %s, len: %d\n", selected_partition, len);
++	debug("env_set %s %s\n", env_name, env_size);
++
++	snprintf(env_size, 32, "%08x", size);
++	env_set(env_name, env_size);
++
++	/* Get the filesize of the boot partiton rootfs.
++	 * If for some reason the rootfs size is not found,
++	 * default to a known rootfs size.
++	*/
++	if (!strncmp(name, "rootfs", 6)) {
++		select_part = env_get(ENV_SWITCH_PART_NAME);
++		if (!strncmp(select_part, "primary", 7))
++			rootfs_size = env_get_ulong("rootfs_a_filesize", 16, 0);
++		else if (!strncmp(select_part, "secondary", 9))
++			rootfs_size = env_get_ulong("rootfs_b_filesize", 16, 0);
++		else
++			rootfs_size = 0;
++
++		if (rootfs_size == 0) {
++			printf("rootfs_a_filesize not found, using default size\n");
++			rootfs_size = LGM_ROOTFS_SIZE;
++		}
++
++		/* Alignment is needed to allow proper mounting of rootFS
++		 * onto DDR.
++		 */
++		if (rootfs_size & (aligned_boundary - 1))
++			align = aligned_boundary -
++					(rootfs_size & (aligned_boundary - 1));
++
++		/* Align RootFS size to boundary */
++		rootfs_size += align;
++		env_set_hex("filesystem_size", rootfs_size);
++
++		/* RootFS DDR location also has to be aligned. */
++		ddr_top = (CONFIG_LGM_MEM_SIZE << 20);
++		/* RootFS load address */
++		rootfs_loadaddr = ddr_top - rootfs_size;
++		env_set_hex("rootfs_loadaddr", rootfs_loadaddr);
++
++		/* rootfs start alignment boundary */
++		env_set_hex("rootfs_alignment", aligned_boundary);
++
++		rootfsload_addr_end = ddr_top - 1;
++		env_set_hex("rootfs_loadaddr_end", rootfsload_addr_end);
++
++		debug("calculated filesystem_size: 0x%08x ", rootfs_size);
++		debug("rootfs_loadaddr: 0x%08x\n", rootfs_loadaddr);
++	}
++}
++
++int do_upgrade(struct cmd_tbl *cmdtp, int flag, int argc,
++			char * const argv[]) {
++	int image_hcrc_pass,image_dcrc_pass;
++	ulong srcAddr = 0;
++	int srcLen, ret = 1;
++	ulong srcHeader = 0;
++	int64_t curParSize = 0, pad;
++	unsigned long is_early_boot_img = 0;
++#ifndef EMMC_UPGRADE_SUPPORT
++	int64_t dir;
++#endif
++	image_header_t *pimg_header = NULL;
++	char name[32], strimg_crc[32], buf[32];
++#ifdef CONFIG_CMD_UBI
++	int ubi = 0;
++#endif /* CONFIG_CMD_UBI */
++
++	if (check_args(argc)) {
++		printf("Usage :\n%s\n", cmdtp->usage);
++		return 1;
++	}
++
++	srcAddr = simple_strtoul(argv[1], NULL, 16);
++	srcLen = simple_strtoul(argv[2], NULL, 16);
++
++	do {
++		srcHeader = (!srcHeader ? srcAddr : srcHeader + curParSize);
++
++		/* dtb image needs special handling as it does not use legacy
++		 * header
++		 */
++		if (genimg_get_format((void *)srcHeader) == IMAGE_FORMAT_FIT) {
++			curParSize = upgrade_fitimage((void *)srcHeader);
++			continue;
++		}
++
++		pimg_header = (image_header_t *)srcHeader;
++		curParSize = sizeof(image_header_t) + ntohl(pimg_header->ih_size);
++		pad = (16 - (curParSize % 16)) % 16;
++
++		image_hcrc_pass = image_check_hcrc (pimg_header);
++		image_dcrc_pass = image_check_dcrc (pimg_header);
++		if (!image_hcrc_pass || !image_dcrc_pass) {
++			if (image_hcrc_pass == 0)
++				printf ("image upgrade header checksum bad.\n");
++			if (image_dcrc_pass == 0)
++				printf ("image upgrade data checksum bad.\n");
++
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			return 1;
++		}
++
++		switch(pimg_header->ih_type) {
++		case IH_TYPE_MULTI:
++			#ifdef CONFIG_CMD_ICC
++			if (strncmp((char *)pimg_header->ih_name,
++				MXL_MD_IH_MULTI_NAME,
++				sizeof(pimg_header->ih_name)) == 0) {
++				printf("[MULTI] metadata + kernel found\n");
++				/* multi kernel + metadata , mark it as kernel */
++				sprintf(name, "kernel");
++				break;
++			}
++			#endif /* CONFIG_CMD_ICC */
++			/* multi image structure is:
++			 * header + image-0 size + image-1 size + ...
++			 * + null terminator
++			 */
++			curParSize = sizeof(image_header_t) +
++				     sizeof(uint32_t) *
++					(image_multi_count(pimg_header)
++					 + 1 /* null terminator */);
++			continue;
++		case IH_TYPE_FILESYSTEM:
++		#ifdef CONFIG_CMD_UBI
++			if (strncmp((char *)pimg_header->ih_name,
++				"LTQCPE UBI_RootFS",
++				sizeof(pimg_header->ih_name)) == 0)
++				ubi=1;
++		#endif
++			sprintf(name, "rootfs");
++		#ifndef EMMC_UPGRADE_SUPPORT
++			dir = 0;
++		#endif
++			break;
++		case IH_TYPE_KERNEL:
++		#ifdef CONFIG_CMD_UBI
++			if (strncmp((char *)pimg_header->ih_name,
++				"LTQCPE UBI_Kernel",
++				sizeof(pimg_header->ih_name)) == 0)
++				ubi=1;
++		#endif
++			if (strncmp((char *) pimg_header->ih_name, "MIPS 4Kec Bootcore",
++					sizeof(pimg_header->ih_name)) == 0)
++				sprintf(name, "bootcore");
++			else
++				sprintf(name, "kernel");
++		#ifndef EMMC_UPGRADE_SUPPORT
++			dir = 1;
++		#endif
++			break;
++		case IH_TYPE_FIRMWARE:
++		#ifdef CONFIG_CMD_UBI
++			if (strncmp((char *)pimg_header->ih_name,
++				"LTQCPE UBI_Firmware",
++				sizeof(pimg_header->ih_name)) == 0)
++				ubi=1;
++		#endif
++			if (!strncmp((char *) pimg_header->ih_name,
++					"TEP firmware", 12))
++				sprintf(name, "tep_firmware");
++			else if (!strncmp((char *) pimg_header->ih_name,
++					"RBE", 3))
++				sprintf(name, "rbe");
++			else
++				sprintf(name, "firmware");
++		#ifndef EMMC_UPGRADE_SUPPORT
++			dir = 0;
++		#endif
++			break;
++		case IH_TYPE_UBOOT:
++			sprintf(name, "uboot");
++		#ifndef EMMC_UPGRADE_SUPPORT
++			dir = 0;
++		#endif
++			break;
++		case IH_TYPE_STANDALONE:
++			sprintf(name, "ddr_binary");
++			break;
++		default:
++			printf("Unknown image type!!\n");
++			curParSize = curParSize + pad + 8;
++			continue;
++		}
++
++		if (!strncmp(name, "tep_firmware", 12) ||
++			!strncmp(name, "uboot", 5) ||
++			!strncmp(name, "rbe", 3) ||
++			!strncmp(name, "ddr_binary", 10))
++			is_early_boot_img = 1;
++
++		update_env_filesize(name, ntohl(pimg_header->ih_size));
++
++	#ifdef EMMC_UPGRADE_SUPPORT
++		char *filename;
++		unsigned char *emmc_buf = NULL;
++		/* it is possible that filename is
++		 * not given, if we are updating from
++		 * a fullimage binary. Then try to get
++		 * the image filename from the environment.
++		 */
++		if (argv[3] == NULL || argc == 3)
++			filename = get_filename_from_env(name);
++		else
++			filename = argv[3];
++
++		/* rootfs & kernel belongs to extended partition */
++		if (!strncmp(name, "kernel", 6) ||
++			!strncmp(name, "rootfs", 6)) {
++			snprintf(name, 14, "extended_boot");
++		}
++
++		emmc_buf = (unsigned char *)srcHeader;
++		ret = upgrade_img((ulong)emmc_buf, curParSize, name, filename);
++	#else
++		ret = upgrade_img(srcHeader, curParSize, name, dir, 0);
++	#endif /* EMMC_UPGRADE_SUPPORT */
++		if (ret) {
++			printf("Can not upgrade the image %s\n", name);
++		} else {
++			snprintf(strimg_crc, 25, "f_%s_crc", name);
++			snprintf(buf, sizeof(buf) / sizeof(char),
++					"%08x", ntohl(pimg_header->ih_dcrc));
++			env_set(strimg_crc, buf);
++		}
++
++		curParSize = curParSize + pad;
++#ifdef CONFIG_CMD_UBI
++		if (ubi == 1)
++			debug("Image with %s metadata updated\n",
++					pimg_header->ih_name);
++		ubi = 0;
++#endif
++	} while(srcLen > (srcHeader - srcAddr) + curParSize);
++
++	/* tell U-boot that early boot components were updated */
++	env_set_ulong("early_boot_upgraded", is_early_boot_img);
++
++/* save the environment at the end of the upgrade */
++#if defined(CONFIG_CMD_SAVEENV) && (defined(CONFIG_CMD_NAND) \
++	|| defined(CONFIG_CMD_MMC)  || defined(CONFIG_CMD_FLASH))
++	env_save();
++#endif
++#ifdef UBOOT_ENV_COPY
++	env_save_copy();
++#endif
++
++	return 0;
++}
++
++/* no support for this */
++#ifndef EMMC_UPGRADE_SUPPORT
++int http_upgrade(ulong srcAddr, int srcLen) {
++	ulong srcHeader=0;
++	int curParSize=0, dir, pad;
++	image_header_t *pimg_header = NULL;
++	char name[16], strimg_crc[32], buf[32];;
++
++	printf("srcAddr=%lx\n", srcAddr);
++	printf("srcLen=%d\n",srcLen);
++	do {
++		srcHeader = (!srcHeader ? srcAddr : srcHeader + curParSize);
++		printf("srcHeader=0x%lx\n",srcHeader);
++		pimg_header = (image_header_t *)srcHeader;
++		curParSize = sizeof(image_header_t) + ntohl(pimg_header->ih_size);
++		printf("curParSize=0x%x\n",curParSize);
++
++		pad = (16 - (curParSize % 16)) % 16;
++		printf("pad=0x%x\n",pad);
++		switch(pimg_header->ih_type) {
++			case IH_TYPE_MULTI:
++				curParSize = sizeof(image_header_t) + 8;
++				continue;
++			case IH_TYPE_FILESYSTEM:
++				sprintf(name, "rootfs");
++				dir = 0;
++				break;
++			case IH_TYPE_KERNEL:
++				sprintf(name, "kernel");
++				dir = 1;
++				break;
++			case IH_TYPE_FIRMWARE:
++				sprintf(name, "firmware");
++				dir = 0;
++				break;
++			default:
++				printf("Unknown image type!!\n");
++				continue;
++		}
++		printf("upgrade now!\n");
++		if(upgrade_img(srcHeader, curParSize, name, dir, 0)) {
++			printf("Can not upgrade the image %s\n", name);
++		} else {
++			snprintf(strimg_crc, 25, "f_%s_crc", name);
++			snprintf(buf, sizeof(buf) / sizeof(char),
++				"%08x", ntohl(pimg_header->ih_dcrc));
++			env_set(strimg_crc, buf);
++#if defined(CONFIG_CMD_SAVEENV) && (defined(CONFIG_CMD_NAND) \
++	|| defined(CONFIG_CMD_MMC)  || defined(CONFIG_CMD_FLASH))
++			env_save();
++#endif
++		}
++		printf("upgrade_img done!!\n");
++		curParSize = curParSize + pad;
++	} while(srcLen > (srcHeader - srcAddr) + curParSize);
++	printf("http_upgrade done!\n");
++	return 0;
++}
++#endif /* EMMC_UPGRADE_SUPPORT */
++
++#ifndef EMMC_UPGRADE_SUPPORT
++#ifdef CONFIG_SYS_LONGHELP
++static char upgrade_help_txt[] =
++	"upgrade <source addr> <size> \n"
++	"\t- upgrade image to pre-define partition.\n";
++#endif
++
++U_BOOT_CMD(upgrade, 3, 1, do_upgrade,
++	"upgrade - forward/backward copy memory to pre-defined flash location",
++	upgrade_help_txt
++);
++#else
++#ifdef CONFIG_SYS_LONGHELP
++static char upgrade_help_txt[] =
++	"upgrade <source addr> <size> <filenname> \n"
++	"\t- upgrade image to a FS in a partition.\n";
++#endif
++
++U_BOOT_CMD(upgrade, 4, 1, do_upgrade,
++	"upgrade - forward/backward copy image from memory to fs partition",
++	upgrade_help_txt
++);
++#endif /* EMMC_UPGRADE_SUPPORT */
+diff --git a/common/img_upgrade.c b/common/img_upgrade.c
+new file mode 100644
+--- /dev/null
++++ b/common/img_upgrade.c
+@@ -0,0 +1,748 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include "common.h"
++#include "command.h"
++#include "cmd_upgrade.h"
++#include "image.h"
++#include <configs/maxlinear/udt.h>
++
++#if defined(CONFIG_BOOT_FROM_NAND)
++#include <nand.h>
++#include "../cmd/legacy-mtd-utils.h"
++#endif
++
++#if defined(CONFIG_BOOT_FROM_QSPI_NAND)
++#include <flash.h>
++#include <mtd.h>
++#endif
++
++#if defined(CONFIG_CMD_UBI)
++#include <ubi_uboot.h>
++#include <jffs2/load_kernel.h>
++
++extern int ubi_remove_vol(char *volume);
++extern int ubi_create_vol(char *volume, int64_t size, int dynamic, int vol_id,
++			  bool skipcheck);
++#endif
++
++#if defined(CONFIG_BOOT_FROM_QSPI_NAND)
++static uint mtd_len_to_pages(struct mtd_info *mtd, u64 len)
++{
++	do_div(len, mtd->writesize);
++
++	return len;
++}
++
++static bool mtd_is_aligned_with_min_io_size(struct mtd_info *mtd, u64 size)
++{
++	return !do_div(size, mtd->writesize);
++}
++
++static bool mtd_is_aligned_with_block_size(struct mtd_info *mtd, u64 size)
++{
++	return !do_div(size, mtd->erasesize);
++}
++
++static bool mtd_oob_write_is_empty(struct mtd_oob_ops *op)
++{
++	int i;
++
++	for (i = 0; i < op->len; i++)
++		if (op->datbuf[i] != 0xff)
++			return false;
++
++	for (i = 0; i < op->ooblen; i++)
++		if (op->oobbuf[i] != 0xff)
++			return false;
++
++	return true;
++}
++
++static int mtd_special_write_oob(struct mtd_info *mtd, u64 off,
++				 struct mtd_oob_ops *io_op,
++				 bool write_empty_pages, bool woob)
++{
++	int ret = 0;
++
++	/*
++	 * By default, do not write an empty page.
++	 * Skip it by simulating a successful write.
++	 */
++	if (!write_empty_pages && mtd_oob_write_is_empty(io_op)) {
++		io_op->retlen = mtd->writesize;
++		io_op->oobretlen = woob ? mtd->oobsize : 0;
++	} else {
++		ret = mtd_write_oob(mtd, off, io_op);
++	}
++
++	return ret;
++}
++
++static int erase_partition(char *partName)
++{
++	struct erase_info erase_op = {};
++	struct mtd_info *mtd = get_mtd_device_nm(partName);
++	u64 off = 0;
++	u64 len = mtd->size;
++
++	printf("Erasing  <%s> at partition 0x%08llx ... 0x%08llx (%d eraseblock(s))\n",
++	       partName, off, off + len - 1, mtd_div_by_eb(len, mtd));
++
++	erase_op.addr = off;
++	erase_op.mtd  = mtd;
++	erase_op.len  = mtd->erasesize;
++
++	while (len) {
++		mtd_erase(mtd, &erase_op);
++		len -= mtd->erasesize;
++		erase_op.addr += mtd->erasesize;
++	}
++	return 0;
++}
++#endif /* CONFIG_BOOT_FROM_QSPI_NAND */
++
++#if defined(CONFIG_BOOT_FROM_NAND)
++int program_img(ulong srcAddr, uint64_t srcLen, ulong destAddr)
++{
++	struct mtd_info *mtd_data = get_nand_dev_by_index(nand_curr_device);
++	u64 retlen;
++
++	pr_debug("updating image @ 0x%08lx with size %llu to nand offs 0x%08lx\n",
++			srcAddr, srcLen, destAddr);
++
++	if (!mtd_data) {
++		printf("cannot find mtd data\n");
++	}
++
++	nand_write_partial(mtd_data, (loff_t) destAddr, srcLen,
++				&retlen, (u_char*)srcAddr);
++
++	return 0;
++}
++#elif defined(CONFIG_BOOT_FROM_QSPI_NAND)
++int program_img(ulong srcAddr, uint64_t srcLen, ulong destAddr)
++{
++	bool dump, read, raw, woob, write_empty_pages, has_pages = false;
++	u64 start_off, off, len, remaining, default_len;
++	struct mtd_oob_ops io_op = {};
++	uint npages;
++	struct mtd_info *mtd = get_mtd_device_nm("spi-nand0");
++	u32 oob_len;
++	u8 *buf = (u8*)srcAddr ;
++	int ret;
++
++	pr_debug("Writing image from 0x%08lx with size %llu bytes to offset 0x%08lx\n",
++			srcAddr, srcLen, destAddr);
++
++	if (mtd->type == MTD_NANDFLASH || mtd->type == MTD_MLCNANDFLASH)
++		has_pages = true;
++
++	dump = 0;
++	read = 0;
++	raw  = 0;
++	woob = 0;
++	write_empty_pages = 0;
++
++	start_off = destAddr;
++	if (!mtd_is_aligned_with_min_io_size(mtd, start_off)) {
++		printf("Offset not aligned with a page (0x%x)\n",
++		       mtd->writesize);
++		return 1;
++	}
++
++	default_len = mtd->size;
++	len = srcLen;
++	if (!mtd_is_aligned_with_min_io_size(mtd, len)) {
++		len = round_up(len, mtd->writesize);
++		printf("Size not on a page boundary (0x%x), rounding to 0x%llx\n",
++		       mtd->writesize, len);
++	}
++
++	remaining = len;
++	npages = mtd_len_to_pages(mtd, len);
++	oob_len = woob ? npages * mtd->oobsize : 0;
++
++	if (has_pages)
++		printf("%s %lld byte(s) (%d page(s)) at offset 0x%08llx%s%s%s\n",
++		       read ? "Reading" : "Writing", len, npages, start_off,
++		       raw ? " [raw]" : "", woob ? " [oob]" : "",
++		       !read && write_empty_pages ? " [dontskipff]" : "");
++	else
++		printf("%s %lld byte(s) at offset 0x%08llx\n",
++		       read ? "Reading" : "Writing", len, start_off);
++
++	io_op.mode = raw ? MTD_OPS_RAW : MTD_OPS_AUTO_OOB;
++	io_op.len = has_pages ? mtd->writesize : len;
++	io_op.ooblen = woob ? mtd->oobsize : 0;
++	io_op.datbuf = buf;
++	io_op.oobbuf = woob ? &buf[len] : NULL;
++
++	/* Search for the first good block after the given offset */
++	off = start_off;
++	while (mtd_block_isbad(mtd, off))
++		off += mtd->erasesize;
++
++	/* Loop over the pages to do the actual read/write */
++	while (remaining) {
++		/* Skip the block if it is bad */
++		if (mtd_is_aligned_with_block_size(mtd, off) &&
++		    mtd_block_isbad(mtd, off)) {
++			off += mtd->erasesize;
++			continue;
++		}
++
++		if (read)
++			ret = mtd_read_oob(mtd, off, &io_op);
++		else
++			ret = mtd_special_write_oob(mtd, off, &io_op,
++						    write_empty_pages, woob);
++
++		if (ret) {
++			printf("Failure while %s at offset 0x%llx\n",
++			       read ? "reading" : "writing", off);
++			break;
++		}
++
++		off += io_op.retlen;
++		remaining -= io_op.retlen;
++		io_op.datbuf += io_op.retlen;
++		io_op.oobbuf += io_op.oobretlen;
++	}
++
++	return 0;
++}
++#endif /* CONFIG_BOOT_FROM_X_NAND */
++
++int FindPartBoundary(ulong img_addr,ulong *curpart_begin,ulong *nextpart_begin)
++{
++	char strPartName[16];
++	char *tmp_string = NULL;
++	ulong part_begin_addr[MAX_PARTITION];
++	int nPartNo,i;
++
++	tmp_string = (char *)env_get("total_part");
++	if (tmp_string) {
++		nPartNo = simple_strtoul(tmp_string, NULL, 10);
++	} else {
++		printf("%d: env variable total_part not found\n", __LINE__);
++		return 1;
++	}
++	if(nPartNo <= 0 || nPartNo >= MAX_PARTITION){
++		printf("Total no. of current partitions [%d] is out of limit (0,%d)\n", nPartNo, MAX_PARTITION);
++		return 1;
++	}
++
++	for(i = 0; i < nPartNo; i++){
++		memset(strPartName,0x00,sizeof(strPartName));
++		snprintf(strPartName, sizeof(strPartName) / sizeof(char),
++				"part%d_begin", i);
++		tmp_string = (char *)env_get(strPartName);
++		if (tmp_string) {
++			part_begin_addr[i] = simple_strtoul(tmp_string, NULL, 16);
++		} else {
++			printf("%d: env variable %s not found\n", __LINE__, strPartName);
++			return 1;
++		}
++	}
++
++	tmp_string = (char *)env_get("flash_end");
++	if (tmp_string) {
++		part_begin_addr[i] = simple_strtoul(tmp_string, NULL, 16) + 1;
++	} else {
++		printf("%d: env variable flash_end not found\n", __LINE__);
++		return 1;
++	}
++
++	for(i = 0; i < nPartNo; i++){
++		if(img_addr >= part_begin_addr[i] && img_addr < part_begin_addr[i+1]){
++			*curpart_begin = part_begin_addr[i];
++			*nextpart_begin = part_begin_addr[i+1];
++			return 0;
++		}
++	}
++
++	printf("The begining of the image to be programmed [0x%08lx] is not within current patition boundary\n",img_addr);
++	return 1;
++}
++
++#if defined(CONFIG_CMD_UBI) && defined(CONFIG_BOOT_FROM_NAND)
++static int update_early_boot_components(ulong srcAddr,
++				int srcLen, char *imgName)
++{
++	int ret;
++	char partition_name[32];
++	unsigned long destAddr = 0;
++	loff_t off, size, maxsize;
++	int dev = nand_curr_device;
++	struct mtd_info *nand_info = get_nand_dev_by_index(dev);
++	int i, boot_partitions = 1;
++	u32 *rom_tail_len;
++	unsigned long rbe_wr_len, pad;
++
++#if defined(CONFIG_EARLYBOOT_STRICT_UPGRADE)
++	/* for strict earlyboot upgrade, we upgrade both A & B */
++	boot_partitions = 2;
++#endif /* CONFIG_EARLYBOOT_STRICT_UPGRADE */
++
++	/* This is to de-couple the amt of RBE data we write to
++	 * the NAND flash, with the value of CONFIG_SPL_PAD_SIZE.
++	 * The latter may be much larger than the former and the size could
++	 * span all the blocks in the RBE partition. This is not
++	 * recommended (junk bytes)
++	 * RBE Size = ibrh tail size + nand page size + pad to nand writesize
++	*/
++	if (!strncmp(imgName, "rbe", 3)) {
++		rom_tail_len = (u32 *)(srcAddr + nand_info->writesize + 4);
++		rbe_wr_len = *rom_tail_len + nand_info->writesize;
++		pad = nand_info->writesize -
++			(rbe_wr_len & (nand_info->writesize - 1));
++		srcLen = rbe_wr_len + pad;
++#if CONFIG_COPIES_OF_RBE > 1
++		boot_partitions = CONFIG_COPIES_OF_RBE;
++#endif
++	}
++
++	for (i = 0; i < boot_partitions; i++) {
++		snprintf(partition_name, sizeof(partition_name) - 2, imgName);
++		strncat(partition_name, (i == 0) ? "_a" : "_b", 2);
++		if (mtd_arg_off(partition_name, &dev, &off,
++				&size, &maxsize,
++				MTD_DEV_TYPE_NAND, nand_info->size))
++			return -1;
++
++		destAddr = (unsigned long)off;
++
++		ret = program_img(srcAddr, srcLen, destAddr);
++		if (ret) {
++			printf("Error writing to %s at off: 0x%08lx length: %d\n",
++					partition_name, destAddr, srcLen);
++			return -EINVAL;
++		}
++	}
++	return 0;
++}
++#elif defined(CONFIG_CMD_UBI) && defined(CONFIG_BOOT_FROM_QSPI_NAND)
++static int update_early_boot_components(ulong srcAddr,
++				int srcLen, char *imgName)
++{
++	int ret;
++	char partition_name[32];
++	unsigned long destAddr = 0;
++	struct mtd_device *dev;
++	struct part_info *part;
++	char *select_part;
++	u8 pnum;
++
++	if (mtdparts_init())
++		return ret;
++
++	/* write to primary or secondary partition accordingly.*/
++	select_part = env_get(ENV_SWITCH_PART_NAME);
++	if (select_part == NULL) {
++		printf("No partition selected\n");
++		return -EINVAL;
++	} else if (!strncmp(select_part, "primary", 7)) {
++		snprintf(partition_name, sizeof(partition_name) - 2, imgName);
++		strncat(partition_name, "_a", 2);
++	} else if ((!strncmp(select_part, "secondary", 9))) {
++		snprintf(partition_name, sizeof(partition_name) - 2, imgName);
++		strncat(partition_name, "_b", 2);
++	} else {
++		printf("wrong partition %s selected\n", select_part);
++		return -EINVAL;
++	}
++
++	/* get the image partiton info by name */
++	if (find_dev_and_part(partition_name, &dev, &pnum, &part))
++		return ret;
++
++	destAddr = (unsigned long)part->offset;
++
++	printf("Updating <%s> at flash 0x%08lx\n", partition_name, destAddr);
++
++	/* erase partition */
++	erase_partition(partition_name);
++
++	ret = program_img(srcAddr, srcLen, destAddr);
++	if (ret) {
++		printf("Error writing to %s at off: 0x%08lx length: %d\n",
++				partition_name, destAddr, srcLen);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++#else
++static int update_early_boot_components(ulong srcAddr,
++				int srcLen, char *imgName)
++{
++	int ret;
++	unsigned long destAddr = 0;
++	char *tmp_string = NULL;
++
++	if (strncmp(imgName, "uboot", 5))
++		tmp_string = (char *)env_get("f_uboot_addr");
++	else if (strncmp(imgName, "rbe", 3))
++		tmp_string = (char *)env_get("f_rbe_addr");
++	else if (strncmp(imgName, "tep_firmware", 12))
++		tmp_string = (char *)env_get("f_rbe_addr");
++	else
++		return -1;
++
++	if (tmp_string) {
++		destAddr = simple_strtoul(tmp_string, NULL, 16);
++	} else {
++		printf("%d: env. variable f_uboot_addr not found\n", __LINE__);
++		return -1;
++	}
++
++	pr_debug("%s: destAddr is 0x%016lx\n", __func__, destAddr);
++
++	ret = program_img(srcAddr, srcLen, destAddr);
++	if (ret) {
++		printf("Error writing to %s at off: 0x%08x length: %ld\n",
++				imgName, destAddr, srcLen);
++		return -EINVAL;
++	}
++	return 0;
++}
++#endif /* CONFIG_CMD_UBI */
++
++int FindNPImgLoc(ulong img_addr,ulong *nextStartAddr,ulong *preEndAddr)
++{
++	ulong Img_startAddr[MAX_DATABLOCK];
++	ulong Img_size[MAX_DATABLOCK];
++	ulong nDBNo;
++	char strDBName[MAX_DATABLOCK][32];
++	char strTemp[32];
++	char *strT;
++	char *tmp_string;
++	ulong curpart_begin,nextpart_begin;
++	int i;
++
++	tmp_string = (char *)env_get("total_db");
++	if (tmp_string) {
++		nDBNo = simple_strtoul(tmp_string, NULL, 10);
++	} else {
++		printf("%d: env variable total_db not found\n", __LINE__);
++		return 1;
++	}
++
++	if(nDBNo <= 0 || nDBNo >= MAX_DATABLOCK){
++		printf("Total no. of current data blocks [%ld] is out of limit (0,%d)\n", nDBNo, MAX_PARTITION);
++		return 1;
++	}
++
++	if(FindPartBoundary(img_addr,&curpart_begin,&nextpart_begin))
++		return 1;
++
++	pr_debug("For the image address 0x%08lx, partition boundary is found as [0x%08lx,0x%08lx]\n",img_addr,curpart_begin,nextpart_begin);
++	*nextStartAddr = nextpart_begin;
++	*preEndAddr = curpart_begin;
++
++	for(i = 0; i < nDBNo; i++){
++		memset(strDBName[i],0x00,sizeof(strDBName[i]));
++		memset(strTemp,0x00,sizeof(strTemp));
++		snprintf(strTemp, sizeof(strTemp) / sizeof(char),
++				"data_block%d", i);
++		tmp_string = (char *)env_get(strTemp);
++		if (tmp_string) {
++			if (strlen(tmp_string) < 32)
++				strncpy(strDBName[i], tmp_string, 32);
++		} else {
++			printf("%d: error processing env. variable %s\n", __LINE__, strTemp);
++			return 1;
++		}
++
++		if (strcmp(strDBName[i],"") == 0) {
++			printf("Variable %s is not set\n",strTemp);
++			return 1;
++		}
++	}
++
++	for(i = 0; i < nDBNo; i++){
++		memset(strTemp,0x00,sizeof(strTemp));
++		strT = NULL;
++		snprintf(strTemp, 25, "f_%s_addr", strDBName[i]);
++		strT = (char *)env_get(strTemp);
++		if(strT == NULL){
++			printf("Variable %s is not set\n",strTemp);
++			return 1;
++		}
++		Img_startAddr[i] = simple_strtoul((char *)strT,NULL,16);
++
++		memset(strTemp,0x00,sizeof(strTemp));
++		strT = NULL;
++		snprintf(strTemp, 25, "f_%s_size", strDBName[i]);
++		strT = (char *)env_get(strTemp);
++		if(strT == NULL){
++			printf("Variable %s is not set\n",strTemp);
++			return 1;
++		}
++		Img_size[i] = simple_strtoul((char *)strT,NULL,16);
++	}
++
++	for(i = 0; i < nDBNo; i++){
++		if(Img_startAddr[i] > img_addr && Img_startAddr[i] < *nextStartAddr)
++			*nextStartAddr = Img_startAddr[i];
++		if(Img_startAddr[i] + Img_size[i] < img_addr && Img_startAddr[i] + Img_size[i] > *preEndAddr)
++			*preEndAddr = Img_startAddr[i] + Img_size[i];
++	}
++	pr_debug("For img_addr 0x%08lx, nextStartAddr 0x%08lx and preEndAddr 0x%08lx\n",img_addr,*nextStartAddr,*preEndAddr);
++	return 0;
++}
++
++#ifdef CONFIG_CMD_UBI
++uint64_t get_ubi_partition_size(char* imgName)
++{
++	char *env_value = NULL;
++
++	if (!strncmp(imgName, "kernel", 6))
++		env_value = env_get("kernel_vol_size");
++	else if (!strncmp(imgName, "rootfs", 6))
++		env_value = env_get("rootfs_vol_size");
++	else if (!strncmp(imgName, "dtb", 3))
++		env_value = env_get("dtb_vol_size");
++	else if (!strncmp(imgName, "env", 3))
++		env_value = env_get("env_size");
++	else
++		return 0;
++	return simple_strtoul(env_value, NULL, 16);
++}
++
++int upgrade_img(ulong srcAddr, uint64_t srcLen,
++		char *imgName, enum ExpandDir dir, int bSaveEnv)
++{
++	char strimg_vol[32], strimg_vol_id[32];
++	char *tmp_string;
++	unsigned long  destAddr = 0;
++	uint64_t fixsrcLen = 0;
++	int ret = 0;
++	image_header_t *pimg_header = NULL;
++
++	pr_debug("%s: srcAddr is 0x%08lx, srcLen is %llu,\n", __func__, srcAddr, srcLen);
++
++	/* header is only valid for legacy format, and not dtb/fit image */
++	if (genimg_get_format((void *)srcAddr) == IMAGE_FORMAT_LEGACY)
++		pimg_header = (image_header_t *)srcAddr;
++
++	if (pimg_header && ntohl(pimg_header->ih_magic) == IH_MAGIC) {
++		printf("Image contains header with name [%s]\n",pimg_header->ih_name);
++		if (pimg_header->ih_type != IH_TYPE_KERNEL &&
++			 pimg_header->ih_type != IH_TYPE_UBOOT) {
++			printf("This is not uboot/kernel image and so removing header\n");
++			srcAddr += sizeof(*pimg_header);
++			srcLen -= sizeof(*pimg_header);
++		}
++	}
++
++	/* uboot, tep and rbe not in ubi volume */
++	if (strncmp(imgName, "uboot", 5) &&
++		strncmp(imgName, "rbe", 3) &&
++		strncmp(imgName, "tep_firmware", 12)) {
++		/* set and find volume where img should be
++		 * located
++		 */
++		memset(strimg_vol, 0x00,sizeof(strimg_vol));
++		memset(strimg_vol_id, 0x00,sizeof(strimg_vol_id));
++		snprintf(strimg_vol, sizeof(strimg_vol) / sizeof(char),
++				"%s_vol", imgName);
++
++		tmp_string = env_get(strimg_vol);
++		if (tmp_string) {
++			snprintf(strimg_vol_id, sizeof(strimg_vol_id) / sizeof(char),
++					"%s_id", tmp_string);
++		} else {
++			printf("%d: Error processing env. variable %s\n",
++					__LINE__, strimg_vol);
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			return 1;
++		}
++	}
++
++	if (pimg_header && pimg_header->ih_type == IH_TYPE_UBOOT) {
++		/* U-boot image */
++		ret = update_early_boot_components(srcAddr, srcLen, imgName);
++		if (ret) {
++			update_udt_failure(UDT_UPGRADE_FAILED,
++				UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			return ret;
++		}
++	} else if (pimg_header &&
++			!strncmp((char *)pimg_header->ih_name, "RBE", 3)) {
++		ret = update_early_boot_components(srcAddr, srcLen, imgName);
++		if (ret) {
++			update_udt_failure(UDT_UPGRADE_FAILED,
++				UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			return ret;
++		}
++	} else if (pimg_header &&
++			!strncmp((char *)pimg_header->ih_name,
++				  "TEP firmware", 12)) {
++		ret = update_early_boot_components(srcAddr, srcLen, imgName);
++		if (ret) {
++			update_udt_failure(UDT_UPGRADE_FAILED,
++				UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			return ret;
++		}
++	} else if (pimg_header &&
++		   !strncmp((char *)pimg_header->ih_name, "gphyfw", 6)) {
++		/* GPHY FW */
++		tmp_string = (char *)env_get("gphy_fw_addr");
++		if (tmp_string) {
++			destAddr = simple_strtoul(tmp_string, NULL, 16);
++		} else {
++			printf("%d: env. variable gphy_fw_addr not found\n", __LINE__);
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			return 1;
++		}
++		program_img(srcAddr, srcLen, destAddr);
++	} else {
++		ubi_remove_vol(env_get(strimg_vol));
++               fixsrcLen = get_ubi_partition_size(env_get(strimg_vol));
++               if (fixsrcLen) {
++			ret = ubi_create_vol(env_get(strimg_vol), fixsrcLen, 1,
++					UBI_VOL_NUM_AUTO, 1);
++		} else {
++			ret = ubi_create_vol(env_get(strimg_vol), srcLen, 1,
++				UBI_VOL_NUM_AUTO, 1);
++		}
++		if (ret) {
++			printf("Error %d creating volume\n", ret);
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++			return 1;
++		}
++		ret = ubi_volume_write(env_get(strimg_vol), (void *)srcAddr, (size_t)srcLen);
++		if (ret) {
++			printf("Error %d writing to volume\n", ret);
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++			return 1;
++		}
++	}
++	return 0;
++}
++#else /* CONFIG_CMD_UBI */
++int upgrade_img(ulong srcAddr, uint64_t srcLen,
++		char *imgName, enum ExpandDir dir, int bSaveEnv)
++{
++	ulong img_addr,img_size,img_endaddr;
++	char newimg_para[32];
++	char strimg_addr[32],strimg_size[32];
++	ulong nextStartAddr,preEndAddr;
++	image_header_t *pimg_header = NULL;
++	char *srcData_Copy=NULL;
++
++	memset(strimg_addr,0x00,sizeof(strimg_addr));
++	snprintf(strimg_addr, sizeof(strimg_addr) / sizeof(char),
++				"f_%s_addr", imgName);
++	snprintf(strimg_size, sizeof(strimg_size) / sizeof(char),
++				"f_%s_size", imgName);
++	img_addr = simple_strtoul((char *)env_get(strimg_addr),NULL,16);
++
++	if (FindNPImgLoc(img_addr,&nextStartAddr,&preEndAddr)) {
++		update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++		return 1;
++	}
++	pimg_header = (image_header_t *)srcAddr;
++	if (ntohl(pimg_header->ih_magic) == IH_MAGIC) {
++		printf("Image contains header with name [%s]\n",pimg_header->ih_name);
++		if(pimg_header->ih_type != IH_TYPE_KERNEL) {
++			pr_debug("This is not kernel image and so removing header\n");
++			srcAddr += sizeof(*pimg_header);
++			srcLen -= sizeof(*pimg_header);
++		}
++		img_size = simple_strtoul((char *)env_get(strimg_size),NULL,16); //509061:tc.chen
++	} else if (!strcmp(imgName,"uboot")) {
++		img_size = simple_strtoul((char *)env_get(strimg_size),NULL,16); //509061:tc.chen
++	} else {
++		struct conf_header *header;
++
++		srcData_Copy = (char *)srcAddr;
++		memmove(srcData_Copy + sizeof(struct conf_header) ,(void *)srcAddr,srcLen);
++		header = (struct conf_header *)srcData_Copy;
++		header->size = srcLen;
++		header->crc = 0;
++		header->crc = crc32(header->crc,
++						(const unsigned char *) srcData_Copy + sizeof(struct conf_header),
++						srcLen);
++	}
++
++	if (dir == FORWARD) {
++		if (img_addr + srcLen > nextStartAddr) {
++			printf("Cannot upgrade image %s.\n Error "
++				": From start address 0x%08lx, the new size %lld is bigger"
++				"than begining of next image/end of the partition 0x%08lx\n",
++				strimg_addr, img_addr, srcLen, nextStartAddr);
++			return 1;
++		}
++		pr_debug("Programming for FORWARD direction\n");
++	} else if (dir == BACKWARD) {
++		img_endaddr = nextStartAddr - 1;
++		if(img_endaddr - srcLen < preEndAddr) {
++			printf("Cannot upgrade image %s.\n"
++					"Error : From end address 0x%08lx, the new size %lld "
++					"is bigger than end of previous image/begining of the partition 0x%08lx\n",
++					strimg_addr, img_endaddr, srcLen, preEndAddr);
++			return 1;
++		}
++
++		img_addr = img_endaddr - srcLen + 1;
++		img_addr = (img_addr/16)*16;
++		pr_debug("Programming for BACKWARD direction\n");
++	} else {
++		printf("The expansion direction [%d] is invalid\n",dir);
++		return 1;
++	}
++	if (srcData_Copy) {
++		if (program_img((ulong)srcData_Copy,srcLen+sizeof(struct conf_header),img_addr)) {
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++			return 1;
++		}
++	} else {
++		if (program_img(srcAddr,srcLen,img_addr)) {
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++			return 1;
++		}
++	}
++
++	memset(newimg_para,0x00,sizeof(newimg_para));
++	snprintf(newimg_para, sizeof(newimg_para) / sizeof(char),
++				"0x%08llx",srcLen);
++	setenv(strimg_size,newimg_para);
++	pr_debug("New variables %s = %s set\n",strimg_size,newimg_para);
++
++	memset(newimg_para,0x00,sizeof(newimg_para));
++	snprintf(newimg_para, sizeof(newimg_para) / sizeof(char),
++				"0x%08lx", img_addr);
++	setenv(strimg_addr,newimg_para);
++	pr_debug("New variables %s = %s set\n",strimg_addr,newimg_para);
++
++	if (strcmp(strimg_addr,"f_kernel_addr") == 0) {
++		setenv("kernel_addr",newimg_para);
++		pr_debug("New variables kernel_addr = %s set\n",newimg_para);
++	}
++
++	if (strcmp(strimg_addr,"f_rootfs_addr") == 0) {
++		memset(newimg_para,0x00,sizeof(newimg_para));
++		snprintf(newimg_para, sizeof(newimg_para) / sizeof(char),
++				"0x%08llx", img_addr + srcLen);
++		setenv("f_rootfs_end",newimg_para);
++		pr_debug("New variables kernel_addr = %s set\n",newimg_para);
++	}
++
++	if (bSaveEnv) {
++#ifdef CMD_SAVEENV
++		saveenv();
++#endif
++#ifdef UBOOT_ENV_COPY
++		saveenv_copy();
++#endif
++	}
++	pr_debug("img_size: %lx\n", img_size);
++	return 0;
++}
++
++#endif //CONFIG_CMD_UBI
+diff --git a/common/img_upgrade_emmc.c b/common/img_upgrade_emmc.c
+new file mode 100644
+--- /dev/null
++++ b/common/img_upgrade_emmc.c
+@@ -0,0 +1,410 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include <common.h>
++#include <command.h>
++#include <cmd_upgrade.h>
++#include <image.h>
++#include <mmc.h>
++#include <part.h>
++#include <div64.h>
++#include <mapmem.h>
++#include <fs.h>
++#include <configs/maxlinear/udt.h>
++
++#define MMC_DEV "mmc"
++#define MAX_PART_NAME_LEN	32
++
++static int update_raw_partition(struct mmc *mmc, lbaint_t start,
++			ulong blkcnt, ulong src_addr)
++{
++	unsigned long count;
++
++	count = blk_dwrite(mmc_get_blk_desc(mmc),
++			start, blkcnt,
++			(u_char *)src_addr);
++
++	return (count == blkcnt) ? 0 : 1;
++}
++
++static int update_fs_partition(unsigned long buffer, const char *filename,
++				unsigned long count)
++{
++	int ret = 0;
++	loff_t size;
++
++	ret = fs_write(filename, buffer, 0, count, &size);
++
++	return ret;
++}
++
++static struct blk_desc *select_user_part(struct mmc *mmc, char *fs_part,
++				char *partition_name, char *img_name)
++{
++	int ret;
++	char *select_part;
++	struct blk_desc *mmc_blk;
++
++	/* Depending on the image upgrade process, write to
++	 * primary or secondary partition accordingly.
++	*/
++	select_part = env_get(ENV_SWITCH_PART_NAME);
++	if (select_part == NULL) {
++		printf("No partition selected\n");
++		goto err;
++	} else if (!strncmp(select_part, "primary", 7)) {
++		snprintf(partition_name, (MAX_PART_NAME_LEN-2), img_name);
++		strncat(partition_name, "_a", 2);
++		snprintf(fs_part, MAX_PART_NAME_LEN,
++			 "0#%s", CONFIG_FILESYSTEM_PART_A);
++	} else if ((!strncmp(select_part, "secondary", 9))) {
++		snprintf(partition_name, (MAX_PART_NAME_LEN-2), img_name);
++		strncat(partition_name, "_b", 2);
++		snprintf(fs_part, MAX_PART_NAME_LEN,
++			  "0#%s", CONFIG_FILESYSTEM_PART_B);
++	} else {
++		printf("wrong partition %s selected\n", select_part);
++		goto err;
++	}
++
++	mmc_blk = mmc_get_blk_desc(mmc);
++	if (!mmc_blk) {
++		printf("failed to obtain block descriptor\n");
++		goto err;
++	}
++
++	/* start with getting partitioning info via gpt table */
++	ret = blk_dselect_hwpart(mmc_blk, 0);
++	if (ret) {
++		printf("failed to select user partition\n");
++		goto err;
++	}
++
++	return mmc_blk;
++
++err:
++	return NULL;
++
++}
++
++/* For EMMC boot partition update */
++int update_boot_part(char *image_name, ulong src_addr, int64_t src_len)
++{
++	int ret, dev = mmc_get_env_dev();
++	int hw_part;
++	struct mmc *mmc = find_mmc_device(dev);
++	unsigned long count = 0;
++	ulong blkcnt;
++	ulong blksize = 0x200;
++	unsigned long start;
++	int boot_partitions = 1;
++
++	/* RBE start from start of boot partition */
++	if (!strncmp(image_name, "rbe", 3))
++		start = 0;
++	else
++		start = (CONFIG_SPL_PAD_SIZE * CONFIG_COPIES_OF_RBE) / blksize;
++
++#ifdef CONFIG_DDR_TUNING_SEPARATE
++	/* In the case of ddr tuning binary, the start address will
++	 * be overwritten here. Do not want to define the MACRO
++	 * where the feature is not enabled.
++	*/
++	if (!strncmp(image_name, "ddr_binary", 10))
++		start = DDR_TUNING_BIN_FLASH_OFFSET;
++#endif /* CONFIG_DDR_TUNING_SEPARATE */
++
++#if defined(CONFIG_EARLYBOOT_STRICT_UPGRADE)
++	/* for strict earlyboot upgrade, we upgrade both A & B */
++	boot_partitions = 2;
++#endif /* CONFIG_EARLYBOOT_STRICT_UPGRADE */
++
++	printf("Upgrading %s at offset %lu\n", image_name, start);
++	for (hw_part = 0; hw_part < boot_partitions; hw_part++) {
++		/* select which boot partition,
++		 * hw_part should be boot(1) or boot(2) */
++		ret = blk_select_hwpart_devnum(IF_TYPE_MMC, 0, hw_part + 1);
++		if (ret) {
++			printf("error selecting blk\n");
++			return 1;
++		}
++
++		/* write blkcnt of data to start of boot part */
++		blkcnt = lldiv(src_len, blksize);
++		if (src_len % 0x200) blkcnt++;
++		count += blk_dwrite(mmc_get_blk_desc(mmc),
++				start, blkcnt,
++				(u_char *)src_addr);
++	}
++
++	if (count == (boot_partitions * blkcnt))
++		return 0;
++
++	update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++	return -EINVAL;
++}
++
++static int update_early_boot_components(struct mmc *mmc,
++					struct blk_desc *mmc_blk,
++					char *image_name,
++					unsigned long src_addr,
++					int64_t src_len)
++{
++	int ret, partition;
++	int boot_partitions = 1;
++	ulong blksize, blkcnt;
++	char partition_name[MAX_PART_NAME_LEN];
++	struct disk_partition part;
++
++	if (!CONFIG_IS_ENABLED(UBOOT_IN_USER_PART)) {
++		if (!strncmp(image_name, "uboot", 6)) {
++			ret = update_boot_part(image_name, src_addr, src_len);
++			return ret;
++		}
++	}
++
++#if defined(CONFIG_EARLYBOOT_STRICT_UPGRADE)
++	/* for strict earlyboot upgrade, we upgrade both A & B */
++	boot_partitions = 2;
++#endif /* CONFIG_EARLYBOOT_STRICT_UPGRADE */
++
++	for (partition = 0; partition < boot_partitions; partition++) {
++		snprintf(partition_name, (sizeof(partition_name)-2), image_name);
++		strncat(partition_name,
++			((partition == 0) ? "_a" : "_b"), 2);
++
++		/* get the image partiton info by name */
++		ret = part_get_info_by_name(mmc_blk, partition_name, &part);
++		if (ret < 0) {
++			printf("Cannot find partition name %s\n",
++				partition_name);
++			return ret;
++		}
++
++		if (part.blksz)
++			blksize = 0x200;
++		else
++			blksize = part.blksz;
++
++		blkcnt = lldiv(src_len, blksize);
++
++		if (src_len % 0x200)
++			blkcnt++;
++
++		printf("blksize: %ld, src_len: %lld, part size: %ld, blkcnt: %ld\n",
++			blksize, src_len, part.size, blkcnt);
++
++		if (blkcnt > part.size) {
++			printf("%s is larger than partition size %lu\n",
++				image_name, (ulong)(part.size * blksize));
++			return ret;
++		}
++
++		printf("Updating %s at partition %s\n",
++			image_name, partition_name);
++
++		/* Handle U-boot binary update */
++		ret = update_raw_partition(mmc, part.start,
++					blkcnt, src_addr);
++		if (ret)
++			return ret;
++	}
++	return 0;
++}
++
++static int update_late_boot_components(struct mmc *mmc,
++					struct blk_desc *mmc_blk,
++					char *img_name,
++					char *partition_name, char *fs_part,
++					unsigned long src_addr,
++					int64_t src_len, char *filename)
++{
++	int ret, dev;
++	int partnum = 1;
++	ulong blksize, blkcnt;
++	struct disk_partition part;
++	struct blk_desc *dev_desc = NULL;
++
++	printf("Upgrading lateboot software\n");
++
++	/* get the image partiton info by name */
++	ret = part_get_info_by_name(mmc_blk, partition_name, &part);
++	if (ret < 0) {
++		printf("cannot find partition name %s\n", partition_name);
++		goto err;
++	}
++
++	if (part.blksz)
++		blksize = 0x200;
++	else
++		blksize = part.blksz;
++
++	blkcnt = lldiv(src_len, blksize);
++
++	if (src_len % 0x200)
++		blkcnt++;
++
++	printf("blksize: %ld, src_len: %lld, part size: %ld, blkcnt: %ld\n",
++		blksize, src_len, part.size, blkcnt);
++
++	if (blkcnt > part.size) {
++		printf("%s is larger than partition size %lu\n",
++			img_name, (ulong)(part.size * blksize));
++		goto err;
++	}
++
++	if (!(strncmp(img_name, "dtb", 4))) {
++		printf("Updating %s partition from %ld size: %lld, cnt: %ld\n",
++			img_name, part.start, src_len, blkcnt);
++		/* Handle U-boot binary update */
++		ret = update_raw_partition(mmc, part.start,
++					blkcnt, src_addr);
++		if (ret)
++			goto err;
++	} else {
++		/* check if filename is given for FS updates */
++		if (filename == NULL) {
++			printf("Error: set the bootfile/rootfs env var filename\n");
++			goto err;
++		}
++
++		/* Get partition number by name */
++		partnum = part_get_info_by_dev_and_name_or_num(MMC_DEV, fs_part,
++								&dev_desc,
++								&part, 1);
++		if (partnum < 0) {
++			printf("error getting partition info\n");
++			goto err;
++		}
++
++		dev = dev_desc->devnum;
++
++		/* check fs avaiable in partition*/
++		ret = fs_set_blk_dev(MMC_DEV, fs_part, FS_TYPE_ANY);
++		if (ret) {
++			printf("\n** Unable to write to %s %d:%d **\n",
++			MMC_DEV, dev, partnum);
++			goto err;
++		}
++
++		/* write file to partition */
++		ret = update_fs_partition(src_addr, filename,
++					src_len);
++		if (ret < 0) {
++			printf("Unable to write %s to partition %s\n",
++				filename, fs_part);
++			goto err;
++		}
++	}
++
++	return 0;
++err:
++	update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++	return -EINVAL;
++}
++
++static bool is_preserve_header(image_header_t *pimg_header)
++{
++	int preserve = 1;
++
++	#ifdef CONFIG_CMD_ICC
++	if (pimg_header->ih_type != IH_TYPE_UBOOT &&
++		(strncmp((char *)pimg_header->ih_name,
++			MXL_MD_IH_MULTI_NAME,
++			sizeof(pimg_header->ih_name)) != 0))
++		preserve = 0;
++	#else
++	if (pimg_header->ih_type != IH_TYPE_UBOOT)
++		preserve = 0;
++	#endif /* CONFIG_CMD_ICC */
++
++	if (pimg_header->ih_type != IH_TYPE_KERNEL &&
++		pimg_header->ih_type != IH_TYPE_STANDALONE &&
++		preserve == 0) {
++		return false;
++	}
++	return true;
++}
++
++
++int upgrade_img(ulong src_addr, int64_t src_len,
++	char *img_name, char *filename)
++{
++	int ret = 0;
++	int dev = mmc_get_env_dev();
++	char partition_name[MAX_PART_NAME_LEN], fs_part[MAX_PART_NAME_LEN];
++	image_header_t *pimg_header = NULL;
++	struct mmc *mmc = find_mmc_device(dev);
++	struct blk_desc *mmc_blk;
++
++	if (!mmc) {
++		printf("mmc device not found\n");
++		update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++		return -EINVAL;
++	}
++
++	ret = mmc_init(mmc);
++	if (ret) {
++		printf("Error initializing emmc flash\n");
++		goto err;
++	}
++
++	/* header is only valid for legacy format, and not dtb/fit image */
++	if (genimg_get_format((void *)src_addr) == IMAGE_FORMAT_LEGACY)
++		pimg_header = (image_header_t *)src_addr;
++
++	if (pimg_header && ntohl(pimg_header->ih_magic) == IH_MAGIC) {
++		printf("Image contains header with name [%.*s]\n", IH_NMLEN, pimg_header->ih_name); 
++		if (!is_preserve_header(pimg_header)) {
++			printf("This is not kernel image and so removing header\n");
++			src_addr += sizeof(*pimg_header);
++			src_len -= sizeof(*pimg_header);
++		}
++	}
++
++	/* handle rbe differently because it is not in user partition */
++	if (!strncmp(img_name, "rbe", 3) ||
++		!strncmp(img_name, "ddr_binary", 10)) {
++		ret = update_boot_part(img_name, src_addr, src_len);
++		if (ret)
++			goto err_raw;
++
++		return 0;
++	}
++
++	/* From here henceforth, all partitions accessed are user partition */
++	mmc_blk = select_user_part(mmc, &fs_part[0],
++				&partition_name[0], img_name);
++	if (!mmc_blk)
++		goto err_raw;
++
++	printf("writing %s to partition %s in %s\n",
++			filename, partition_name, fs_part);
++
++	/* Early boot components are handled separately */
++	if (!(strncmp(img_name, "uboot", 6)) ||
++		!(strncmp(img_name, "tep_firmware", 13))) {
++		ret = update_early_boot_components(mmc, mmc_blk, img_name,
++						src_addr, src_len);
++		if (ret)
++			goto err_raw;
++	} else {
++		ret = update_late_boot_components(mmc, mmc_blk, img_name,
++					partition_name,	fs_part,
++					src_addr, src_len, filename);
++		if (ret)
++			goto err;
++	}
++
++	return 0;
++
++err_raw:
++	printf("Error updating image %s\n", img_name);
++	update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_WRITE_FAIL);
++err:
++	return ret;
++
++}
++
+diff --git a/include/cmd_upgrade.h b/include/cmd_upgrade.h
+new file mode 100644
+--- /dev/null
++++ b/include/cmd_upgrade.h
+@@ -0,0 +1,55 @@
++/*
++ * (C) Copyright 2000
++ * Wolfgang Denk, DENX Software Engineering, wd@denx.de.
++ *
++ * See file CREDITS for list of people who contributed to this
++ * project.
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License as
++ * published by the Free Software Foundation; either version 2 of
++ * the License, or (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program; if not, write to the Free Software
++ * Foundation, Inc., 59 Temple Place, Suite 330, Boston,
++ * MA 02111-1307 USA
++ */
++
++// 509071:tc.che 2005/09/07 Reduced flash writing time.
++
++//509071:tc.chen start
++// the header of configuration data.
++struct conf_header {
++	unsigned long size;
++	unsigned long crc;
++};
++//509061:tc.chen end
++
++enum ExpandDir { FORWARD = 0, BACKWARD = 1 };
++#define MAX_PARTITION	10
++#define MAX_DATABLOCK	16
++
++#define UBOOTCONFIG_COPY_HEADER	"123456789ABCDEF"
++
++#ifndef BUILD_FOR_KERNEL
++
++struct cmd_tbl;
++
++int do_upgrade(struct cmd_tbl *cmdtp, int flag, int argc, char * const argv[]);
++
++#ifdef CONFIG_BOOT_FROM_EMMC
++int upgrade_img(ulong src_addr, int64_t src_len,
++	char *img_name, char *filename);
++#else
++int upgrade_img(ulong srcAddr, uint64_t srcLen,char *imgName,
++			enum ExpandDir dir,int bSaveEnv); /* 000001:Nirav */
++#endif
++int saveenv_copy(void);
++
++#endif

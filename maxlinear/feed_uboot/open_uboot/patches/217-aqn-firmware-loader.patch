@@ -1,0 +1,374 @@
+# HG changeset patch
+# Parent  23338dabb44616bc62b9c552d1a6a67ad8787a61
+
+diff --git a/cmd/mxl/aquantia.c b/cmd/mxl/aquantia.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/aquantia.c
+@@ -0,0 +1,225 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Aquantia PHY Firmware Upload via MDIO on Maxlinear board.
++ *
++ * Modified from drivers/net/phy/aquantia.c
++ * 
++ * Copyright 2014 Freescale Semiconductor, Inc.
++ * Copyright 2018, 2021 NXP
++ * Copyright 2022 MaxLinear, Inc.
++ */
++#include <config.h>
++#include <common.h>
++#include <net.h>
++#include <phy.h>
++#include <miiphy.h>
++#include <linux/bitops.h>
++#include <linux/delay.h>
++#include <u-boot/crc.h>
++#include <malloc.h>
++#include <asm/byteorder.h>
++#include "cmd_aqn.h"
++
++static u32 aquantia_phy_addr_on_board = 0;
++
++static int slim_phy_read(struct mii_dev *bus,
++			 u32 devad,
++			 u32 reg)
++{
++	return bus->read(bus, aquantia_phy_addr_on_board, devad, reg);
++}
++
++static void slim_phy_write(struct mii_dev *bus,
++			 u32 devad,
++			 u32 reg,
++			 u32 data)
++{
++	bus->write(bus, aquantia_phy_addr_on_board, devad, reg, data);
++}
++
++const unsigned char PHY_DEVICE_NAME[] = "Aquantia";
++
++static void display_current_phy_addr(void)
++{
++	printf("%s current phy addr = %d\n", PHY_DEVICE_NAME, aquantia_phy_addr_on_board);
++}
++
++void change_current_phy_addr(u32 new_val)
++{
++	display_current_phy_addr();
++	
++	aquantia_phy_addr_on_board = new_val;
++	
++	printf("After change\n");
++
++	display_current_phy_addr();	
++}
++
++/* load data into the phy's memory */
++static int aquantia_load_memory(struct mii_dev *bus, u32 addr,
++				const u8 *data, size_t len)
++{
++	size_t pos;
++	u16 crc = 0, up_crc;
++
++	slim_phy_write(bus, MDIO_MMD_VEND1, MAILBOX_CONTROL, MAILBOX_RESET_CRC);
++	slim_phy_write(bus, MDIO_MMD_VEND1, MAILBOX_ADDR_MSW, addr >> 16);
++	slim_phy_write(bus, MDIO_MMD_VEND1, MAILBOX_ADDR_LSW, addr & 0xfffc);
++
++	for (pos = 0; pos < len; pos += min(sizeof(u32), len - pos)) {
++		u32 word = 0;
++
++		memcpy(&word, &data[pos], min(sizeof(u32), len - pos));
++
++		slim_phy_write(bus, MDIO_MMD_VEND1, MAILBOX_DATA_MSW,
++			  (word >> 16));
++		slim_phy_write(bus, MDIO_MMD_VEND1, MAILBOX_DATA_LSW,
++			  word & 0xffff);
++
++		slim_phy_write(bus, MDIO_MMD_VEND1, MAILBOX_CONTROL,
++			  MAILBOX_EXECUTE | MAILBOX_WRITE);
++
++		/* keep a big endian CRC to match the phy processor */
++		word = cpu_to_be32(word);
++		crc = crc16_ccitt(crc, (u8 *)&word, sizeof(word));
++	}
++
++	up_crc = slim_phy_read(bus, MDIO_MMD_VEND1, MAILBOX_CRC);
++	if (crc != up_crc) {
++		printf("%s crc mismatch: calculated 0x%04hx phy 0x%04hx\n",
++		       PHY_DEVICE_NAME, crc, up_crc);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static u32 unpack_u24(const u8 *data)
++{
++	return (data[2] << 16) + (data[1] << 8) + data[0];
++}
++
++static int aquantia_upload_firmware(struct mii_dev *bus, u8 *addr, size_t fw_length)
++{
++	int ret;
++	u16 calculated_crc, read_crc;
++	char version[VERSION_STRING_SIZE];
++	u32 primary_offset, iram_offset, iram_size, dram_offset, dram_size;
++	const struct fw_header *header;
++
++	printf("%s firmare loading start.\n", PHY_DEVICE_NAME);
++
++	read_crc = (addr[fw_length - 2] << 8)  | addr[fw_length - 1];
++	calculated_crc = crc16_ccitt(0, addr, fw_length - 2);
++	if (read_crc != calculated_crc) {
++		printf("%s bad firmware crc: file 0x%04x calculated 0x%04x\n",
++		       PHY_DEVICE_NAME, read_crc, calculated_crc);
++		ret = -EINVAL;
++		goto done;
++	}
++
++	/* Find the DRAM and IRAM sections within the firmware file. */
++	primary_offset = ((addr[9] & 0xf) << 8 | addr[8]) << 12;
++
++	header = (struct fw_header *)&addr[primary_offset + HEADER_OFFSET];
++
++	iram_offset = primary_offset + unpack_u24(header->iram_offset);
++	iram_size = unpack_u24(header->iram_size);
++
++	dram_offset = primary_offset + unpack_u24(header->dram_offset);
++	dram_size = unpack_u24(header->dram_size);
++
++	debug("primary %d iram offset=%d size=%d dram offset=%d size=%d\n",
++	      primary_offset, iram_offset, iram_size, dram_offset, dram_size);
++
++	strlcpy(version, (char *)&addr[dram_offset + VERSION_STRING_OFFSET],
++		VERSION_STRING_SIZE);
++	printf("%s loading firmare version '%s'\n", PHY_DEVICE_NAME, version);
++
++	/* stall the microcprocessor */
++	slim_phy_write(bus, MDIO_MMD_VEND1, UP_CONTROL,
++		  UP_RUN_STALL | UP_RUN_STALL_OVERRIDE);
++
++	debug("loading dram 0x%08x from offset=%d size=%d\n",
++	      DRAM_BASE_ADDR, dram_offset, dram_size);
++	ret = aquantia_load_memory(bus, DRAM_BASE_ADDR, &addr[dram_offset],
++				   dram_size);
++	if (ret != 0)
++		goto done;
++
++	debug("loading iram 0x%08x from offset=%d size=%d\n",
++	      IRAM_BASE_ADDR, iram_offset, iram_size);
++	ret = aquantia_load_memory(bus, IRAM_BASE_ADDR, &addr[iram_offset],
++				   iram_size);
++	if (ret != 0)
++		goto done;
++
++	/* make sure soft reset and low power mode are clear */
++	slim_phy_write(bus, MDIO_MMD_VEND1, GLOBAL_STANDARD_CONTROL, 0);
++
++	/* Release the microprocessor. UP_RESET must be held for 100 usec. */
++	slim_phy_write(bus, MDIO_MMD_VEND1, UP_CONTROL,
++		  UP_RUN_STALL | UP_RUN_STALL_OVERRIDE | UP_RESET);
++
++	udelay(100);
++
++	slim_phy_write(bus, MDIO_MMD_VEND1, UP_CONTROL, UP_RUN_STALL_OVERRIDE);
++
++	printf("%s firmare loading done.\n", PHY_DEVICE_NAME);
++done:
++	free(addr);
++	return ret;
++}
++
++void display_aquantia_fw_ver(void)
++{
++	u32 id, rstatus;
++	struct mii_dev *bus;
++	  
++	bus = mdio_get_current_dev();	
++	
++	id = slim_phy_read(bus, MDIO_MMD_VEND1, GLOBAL_FIRMWARE_ID);	
++	rstatus = slim_phy_read(bus, MDIO_MMD_VEND1, GLOBAL_RSTATUS_1);
++
++	if (id != 0)
++		printf("%s running firmware version %X.%X.%X\n",
++		      PHY_DEVICE_NAME, (id >> 8), id & 0xff,
++		      (rstatus >> 4) & 0xf);
++	else
++		printf("%s not running any firmware\n", PHY_DEVICE_NAME);
++}
++
++void slim_aquantia_config(u8 *fw_addr, size_t fw_length)
++{
++	u32 id, rstatus, fault;
++	int num_retries = 5;
++	struct mii_dev *bus;
++	  
++	bus = mdio_get_current_dev();
++
++	display_current_phy_addr();
++
++	/*
++	 * check if the system is out of reset and init sequence completed.
++	 * chip-wide reset for gen1 quad phys takes longer
++	 */
++	while (--num_retries) {
++		rstatus = slim_phy_read(bus, MDIO_MMD_VEND1, GLOBAL_ALARM_1);
++		if (rstatus & SYSTEM_READY_BIT)
++			break;
++		mdelay(10);
++	}
++
++	id = slim_phy_read(bus, MDIO_MMD_VEND1, GLOBAL_FIRMWARE_ID);
++	rstatus = slim_phy_read(bus, MDIO_MMD_VEND1, GLOBAL_RSTATUS_1);
++	fault = slim_phy_read(bus, MDIO_MMD_VEND1, GLOBAL_FAULT);
++
++	if (id != 0)
++		printf("%s running firmware version %X.%X.%X\n",
++		      PHY_DEVICE_NAME, (id >> 8), id & 0xff,
++		      (rstatus >> 4) & 0xf);
++
++	if (fault != 0)
++		printf("%s fault 0x%04x detected\n", PHY_DEVICE_NAME, fault);
++
++	aquantia_upload_firmware(bus, fw_addr, fw_length);
++}
+diff --git a/cmd/mxl/cmd_aqn.c b/cmd/mxl/cmd_aqn.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_aqn.c
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright 2022 MaxLinear, Inc.
++ *
++ */
++
++#include <common.h>
++#include <command.h>
++
++#include "cmd_aqn.h"
++
++static int do_aquantia_load(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	u32 fw_addr = 0;
++	u32 fw_length = 0;
++
++	if (argc != 3)
++		return CMD_RET_USAGE;
++
++	fw_addr = simple_strtoul(argv[1], NULL, 16);
++	fw_length = simple_strtoul(argv[2], NULL, 16);
++
++	slim_aquantia_config((u8 *)fw_addr, fw_length);
++
++	return 0;
++}
++
++static int do_display_aquantia_fw_ver(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	display_aquantia_fw_ver();
++
++	return 0;
++}
++
++static int do_change_current_phy_addr(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	u32 phy_addr;
++
++	if (argc != 2)
++		return CMD_RET_USAGE;
++
++	phy_addr = simple_strtoul(argv[1], NULL, 16);
++
++	change_current_phy_addr(phy_addr);
++
++	return 0;
++}
++
++static char aqn_help_text[] =
++	"load <load_addr> <fw_length>\n"
++	"aqn ver - display current firmware version\n"
++	"aqn addr <phy_addr>\n";
++
++U_BOOT_CMD_WITH_SUBCMDS(aqn, "Aquantia PHY sub-system", aqn_help_text,
++	U_BOOT_SUBCMD_MKENT(ver, 1, 1, do_display_aquantia_fw_ver),
++	U_BOOT_SUBCMD_MKENT(addr, 2, 1, do_change_current_phy_addr),
++	U_BOOT_SUBCMD_MKENT(load, 3, 1, do_aquantia_load));
+diff --git a/cmd/mxl/cmd_aqn.h b/cmd/mxl/cmd_aqn.h
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_aqn.h
+@@ -0,0 +1,71 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Aquantia PHY Firmware Upload via MDIO on Maxlinear board.
++ *
++ * Modified from drivers/net/phy/aquantia.c
++ * 
++ * Copyright 2014 Freescale Semiconductor, Inc.
++ * Copyright 2018, 2021 NXP
++ * Copyright 2022 MaxLinear, Inc.
++ */
++
++#ifndef INCLUDE_CMD_AQN_H
++#define INCLUDE_CMD_AQN_H
++
++#define GLOBAL_FIRMWARE_ID 0x20
++#define GLOBAL_FAULT 0xc850
++#define GLOBAL_RSTATUS_1 0xc885
++
++#define GLOBAL_ALARM_1 0xcc00
++#define SYSTEM_READY_BIT 0x40
++
++#define GLOBAL_STANDARD_CONTROL 0x0
++#define SOFT_RESET BIT(15)
++#define LOW_POWER BIT(11)
++
++#define MAILBOX_CONTROL 0x0200
++#define MAILBOX_EXECUTE BIT(15)
++#define MAILBOX_WRITE BIT(14)
++#define MAILBOX_RESET_CRC BIT(12)
++#define MAILBOX_BUSY BIT(8)
++
++#define MAILBOX_CRC 0x0201
++
++#define MAILBOX_ADDR_MSW 0x0202
++#define MAILBOX_ADDR_LSW 0x0203
++
++#define MAILBOX_DATA_MSW 0x0204
++#define MAILBOX_DATA_LSW 0x0205
++
++#define UP_CONTROL 0xc001
++#define UP_RESET BIT(15)
++#define UP_RUN_STALL_OVERRIDE BIT(6)
++#define UP_RUN_STALL BIT(0)
++
++/* addresses of memory segments in the phy */
++#define DRAM_BASE_ADDR 0x3FFE0000
++#define IRAM_BASE_ADDR 0x40000000
++
++/* firmware image format constants */
++#define VERSION_STRING_SIZE 0x40
++#define VERSION_STRING_OFFSET 0x0200
++#define HEADER_OFFSET 0x300
++
++#pragma pack(1)
++struct fw_header {
++	u8 padding[4];
++	u8 iram_offset[3];
++	u8 iram_size[3];
++	u8 dram_offset[3];
++	u8 dram_size[3];
++};
++
++#pragma pack()
++
++extern const unsigned char PHY_DEVICE_NAME[];
++
++void change_current_phy_addr(u32 new_val);
++void display_aquantia_fw_ver(void);
++void slim_aquantia_config(u8 *fw_addr, size_t fw_length);
++
++#endif /* INCLUDE_CMD_AQN_H */

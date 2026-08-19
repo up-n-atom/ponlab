@@ -1,0 +1,370 @@
+# HG changeset patch
+# Parent  b8d5993457b9be5b08147391eafdff003d52f36b
+
+diff --git a/cmd/mmc.c b/cmd/mmc.c
+--- a/cmd/mmc.c
++++ b/cmd/mmc.c
+@@ -13,6 +13,7 @@
+ #include <part.h>
+ #include <sparse_format.h>
+ #include <image-sparse.h>
++#include <linux/math64.h>
+ 
+ static int curr_device = -1;
+ 
+@@ -356,7 +357,21 @@ static int do_mmc_read(struct cmd_tbl *c
+ 	printf("\nMMC read: dev # %d, block # %d, count %d ... ",
+ 	       curr_device, blk, cnt);
+ 
++#if CONFIG_IS_ENABLED(MMC_VERBOSE)
++	unsigned long time = get_timer(0);
+ 	n = blk_dread(mmc_get_blk_desc(mmc), blk, cnt, addr);
++	time = get_timer(time);
++
++	printf("%d bytes read in %lu ms", cnt*512, time);
++	if (time > 0) {
++		puts(" (");
++		print_size(div_u64(cnt*512, time) * 1000, "/s");
++		puts(")");
++	}
++	puts("\n");
++#else
++	n = blk_dread(mmc_get_blk_desc(mmc), blk, cnt, addr);
++#endif
+ 	printf("%d blocks read: %s\n", n, (n == cnt) ? "OK" : "ERROR");
+ 
+ 	return (n == cnt) ? CMD_RET_SUCCESS : CMD_RET_FAILURE;
+@@ -453,7 +468,22 @@ static int do_mmc_write(struct cmd_tbl *
+ 		printf("Error: card is write protected!\n");
+ 		return CMD_RET_FAILURE;
+ 	}
++
++#if CONFIG_IS_ENABLED(MMC_VERBOSE)
++	unsigned long time = get_timer(0);
+ 	n = blk_dwrite(mmc_get_blk_desc(mmc), blk, cnt, addr);
++	time = get_timer(time);
++
++	printf("%d bytes write in %lu ms", cnt*512, time);
++	if (time > 0) {
++		puts(" (");
++		print_size(div_u64(cnt*512, time) * 1000, "/s");
++		puts(")");
++	}
++	puts("\n");
++#else
++	n = blk_dwrite(mmc_get_blk_desc(mmc), blk, cnt, addr);
++#endif
+ 	printf("%d blocks written: %s\n", n, (n == cnt) ? "OK" : "ERROR");
+ 
+ 	return (n == cnt) ? CMD_RET_SUCCESS : CMD_RET_FAILURE;
+diff --git a/drivers/mmc/mmc.c b/drivers/mmc/mmc.c
+--- a/drivers/mmc/mmc.c
++++ b/drivers/mmc/mmc.c
+@@ -456,11 +456,16 @@ ulong mmc_bread(struct blk_desc *block_d
+ #if CONFIG_IS_ENABLED(BLK)
+ 	struct blk_desc *block_dev = dev_get_uclass_plat(dev);
+ #endif
+-	int dev_num = block_dev->devnum;
++	int dev_num;
+ 	int err;
+ 	lbaint_t cur, blocks_todo = blkcnt;
+ 	uint b_max;
+ 
++	if (!block_dev)
++		return 0;
++
++	dev_num = block_dev->devnum;
++
+ 	if (blkcnt == 0)
+ 		return 0;
+ 
+@@ -1461,7 +1466,7 @@ static int sd_select_bus_width(struct mm
+ #endif
+ 
+ #if CONFIG_IS_ENABLED(MMC_WRITE)
+-static int sd_read_ssr(struct mmc *mmc)
++int sd_read_ssr(struct mmc *mmc)
+ {
+ 	static const unsigned int sd_au_size[] = {
+ 		0,		SZ_16K / 512,		SZ_32K / 512,
+@@ -2827,6 +2832,20 @@ retry:
+ 	/* The internal partition reset to user partition(0) at every CMD0 */
+ 	mmc_get_blk_desc(mmc)->hwpart = 0;
+ 
++#if defined(CONFIG_IS_HAPS)
++	/* One particular eMMC card incorrectly responds to sd_send_op cmd,
++	 * which makes u-boot eventually treats it as SD card instead of eMMC.
++	 * To workaround this, we check for emmc card first rather than SD
++	 * card. This needs to be revisited when we are able to test SD card.
++	 */
++	debug("%s early check for eMMC card\n", __func__);
++	err = mmc_send_op_cond(mmc);
++	if (!err) {
++		mmc->init_in_progress = 1;
++		return 0;
++	}
++#endif
++
+ 	/* Test for SD version 2 */
+ 	err = mmc_send_if_cond(mmc);
+ 
+@@ -2935,6 +2954,9 @@ int mmc_init(struct mmc *mmc)
+ #if CONFIG_IS_ENABLED(DM_MMC)
+ 	struct mmc_uclass_priv *upriv = dev_get_uclass_priv(mmc->dev);
+ 
++	if (!upriv)
++		return 1;
++	
+ 	upriv->mmc = mmc;
+ #endif
+ 	if (mmc->has_init)
+@@ -3080,10 +3102,11 @@ int mmc_init_device(int num)
+ 	}
+ 
+ 	m = mmc_get_mmc_dev(dev);
+-	m->user_speed_mode = MMC_MODES_END; /* Initialising user set speed mode */
+-
+ 	if (!m)
+ 		return 0;
++
++	m->user_speed_mode = MMC_MODES_END; /* Initialising user set speed mode */
++
+ 	if (m->preinit)
+ 		mmc_start_init(m);
+ 
+diff --git a/drivers/mmc/mxl_sdhci.c b/drivers/mmc/mxl_sdhci.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/mmc/mxl_sdhci.c
+@@ -0,0 +1,210 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2022 Maxlinear Corporation
++ *
++ * Maxlinear SD Host Controller Interface
++ *
++ */
++
++#include <common.h>
++#include <dm.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <malloc.h>
++#include "mmc_private.h"
++#include <sdhci.h>
++#include <asm/arch/project.h>
++
++#if CONFIG_IS_ENABLED(MMC_HS200_SUPPORT)
++#define MXL_EMMC_MAX_FREQ			(200 * MHz)
++#else
++#define MXL_EMMC_MAX_FREQ			(52 * MHz)
++#endif
++#define MXL_EMMC_MIN_FREQ			(400 * KHz)
++#define KHz							(1000)
++#define MHz							(1000 * KHz)
++#define SDHCI_TUNING_LOOP_COUNT		40
++
++struct mxl_sdhci_plat {
++	struct mmc_config cfg;
++	struct mmc mmc;
++};
++
++struct mxl_emmc_phy {
++	u32 emmc_phy_con[7];
++	u32 emmc_phy_status;
++};
++
++struct mxl_sdhci {
++	struct sdhci_host *host;
++	struct udevice *dev;
++	void *base;
++	struct mxl_emmc_phy *phy;
++};
++
++struct sdhci_data {
++	int (*emmc_set_clock)(struct sdhci_host *host, unsigned int clock);
++	int (*emmc_phy_init)(struct udevice *dev);
++	int (*get_phy)(struct udevice *dev);
++};
++
++static int mxl_emmc_phy_init(struct udevice *dev)
++{
++	return 0;
++}
++
++#if CONFIG_IS_ENABLED(MMC_HS200_SUPPORT)
++static void mxl_emmc_phy_power_on(struct mxl_emmc_phy *phy, u32 clock)
++{
++}
++
++static void mxl_emmc_phy_power_off(struct mxl_emmc_phy *phy)
++{
++}
++#endif
++
++static int mxl_emmc_get_phy(struct udevice *dev)
++{
++	return 0;
++}
++
++static int mxl_emmc_set_clock(struct sdhci_host *host, unsigned int clock)
++{
++	return 0;
++}
++
++static int mxl_sdhci_set_ios_post(struct sdhci_host *host)
++{
++	return 0;
++}
++
++static int mxl_sdhci_execute_tuning(struct mmc *mmc, u8 opcode)
++{
++	return 0;
++}
++
++static struct sdhci_ops mxl_sdhci_ops = {
++	.set_ios_post = mxl_sdhci_set_ios_post,
++	.platform_execute_tuning = &mxl_sdhci_execute_tuning,
++};
++
++static int mxl_sdhci_probe(struct udevice *dev)
++{
++	struct sdhci_data *data = (struct sdhci_data *)dev_get_driver_data(dev);
++	struct mmc_uclass_priv *upriv = dev_get_uclass_priv(dev);
++	struct mxl_sdhci_plat *plat = dev_get_plat(dev);
++	struct mxl_sdhci *prv = dev_get_priv(dev);
++	struct mmc_config *cfg = &plat->cfg;
++	struct sdhci_host *host = prv->host;
++	int ret = 0;
++
++#if defined(CONFIG_MXL_SD_CARD)
++	/* call to board init for gpio setup */
++	sdmmc_gpio_init();
++	/* Enable SDXC clock */
++	writel((readl(CGU_CGU_CLKGCR0_A) | CGU_CLKGCR0_A_SDXC_MASK),
++		CGU_CGU_CLKGCR0_A);
++#endif
++
++#if CONFIG_IS_ENABLED(MMC_HS200_SUPPORT)
++	setbits_le32(CGU_CGU_IF_CLK1, CGU_IF_CLK1_EMMC_5_4_SEL_MASK);
++	debug("\n MXL_MMC: CGU_CGU_IF_CLK1: 0x%08x\n", readl(CGU_CGU_IF_CLK1));
++#endif
++
++	/* clock gating */
++	writel((readl(CGU_CGU_CLKGCR0_A) | CGU_CLKGCR0_A_EMMC_MASK),
++		CGU_CGU_CLKGCR0_A);
++
++	host->max_clk = cfg->f_max;
++	prv->dev = dev;
++
++	if (data->get_phy) {
++		ret = data->get_phy(dev);
++		if (ret)
++			return ret;
++	}
++
++	if (data->emmc_phy_init) {
++		ret = data->emmc_phy_init(dev);
++		if (ret)
++			return ret;
++	}
++
++	/* Set quirks */
++	host->quirks = SDHCI_QUIRK_32BIT_DMA_ADDR |
++					SDHCI_QUIRK_WAIT_SEND_CMD |
++					SDHCI_QUIRK_USE_WIDE8;
++
++	host->ops = &mxl_sdhci_ops;
++	host->mmc = &plat->mmc;
++	host->mmc->dev = dev;
++
++	ret = sdhci_setup_cfg(cfg, host, cfg->f_max, MXL_EMMC_MIN_FREQ);
++	if (ret)
++		return ret;
++
++	upriv->mmc = host->mmc;
++	host->mmc->priv = host;
++
++	ret = sdhci_probe(dev);
++	if (ret)
++		printf("%s: mmc probe failed\n", __func__);
++
++	return 0;
++}
++
++static int mxl_sdhci_of_to_plat(struct udevice *dev)
++{
++	struct mxl_sdhci_plat *plat = dev_get_plat(dev);
++	struct mxl_sdhci *prv = dev_get_priv(dev);
++	struct sdhci_host *host = dev_get_priv(dev);
++	struct mmc_config *cfg = &plat->cfg;
++	int ret;
++
++	host = (struct sdhci_host *)calloc(1, sizeof(struct sdhci_host));
++
++	host->name = dev->name;
++	host->ioaddr = dev_read_addr_ptr(dev);
++	debug("\n MXL_MMC: ioaddr: 0x%08x\n", (u32)host->ioaddr);
++
++	prv->host = host;
++
++	ret = mmc_of_parse(dev, cfg);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++static int mxl_sdhci_bind(struct udevice *dev)
++{
++	struct mxl_sdhci_plat *plat = dev_get_plat(dev);
++
++	return sdhci_bind(dev, &plat->mmc, &plat->cfg);
++}
++
++static const struct sdhci_data mxl_data = {
++	.emmc_set_clock = mxl_emmc_set_clock,
++	.get_phy 		= mxl_emmc_get_phy,
++	.emmc_phy_init 	= mxl_emmc_phy_init,
++};
++
++static const struct udevice_id mxl_sdhci_ids[] = {
++	{
++		.compatible = "mxl,sdhci-5.1",
++		.data 		= (ulong)&mxl_data,
++	},
++	{ }
++};
++
++U_BOOT_DRIVER(mxl_sdhci_drv) = {
++	.name 		= "mxl_sdhci",
++	.id 		= UCLASS_MMC,
++	.of_match 	= mxl_sdhci_ids,
++	.of_to_plat = mxl_sdhci_of_to_plat,
++	.ops 		= &sdhci_ops,
++	.bind 		= mxl_sdhci_bind,
++	.probe 		= mxl_sdhci_probe,
++	.priv_auto 	= sizeof(struct mxl_sdhci),
++	.plat_auto 	= sizeof(struct mxl_sdhci_plat),
++};
+diff --git a/drivers/mmc/sdhci.c b/drivers/mmc/sdhci.c
+--- a/drivers/mmc/sdhci.c
++++ b/drivers/mmc/sdhci.c
+@@ -350,8 +350,6 @@ static int sdhci_execute_tuning(struct u
+ 	struct mmc *mmc = mmc_get_mmc_dev(dev);
+ 	struct sdhci_host *host = mmc->priv;
+ 
+-	debug("%s\n", __func__);
+-
+ 	if (host->ops && host->ops->platform_execute_tuning) {
+ 		err = host->ops->platform_execute_tuning(mmc, opcode);
+ 		if (err)
+@@ -846,7 +844,7 @@ int sdhci_setup_cfg(struct mmc_config *c
+ #endif
+ #if CONFIG_IS_ENABLED(MMC_SDHCI_ADMA)
+ 	if (!(caps & SDHCI_CAN_DO_ADMA2)) {
+-		printf("%s: Your controller doesn't support SDMA!!\n",
++		debug("%s: Your controller doesn't support ADMA!!\n",
+ 		       __func__);
+ 		return -EINVAL;
+ 	}

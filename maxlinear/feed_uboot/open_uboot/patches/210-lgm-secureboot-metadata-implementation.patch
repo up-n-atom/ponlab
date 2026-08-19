@@ -1,0 +1,195 @@
+# HG changeset patch
+# Parent  998865cb3009fb5f624f11449101fe81917534d5
+
+diff --git a/cmd/mxl/cmd_mxl-md.c b/cmd/mxl/cmd_mxl-md.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_mxl-md.c
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include <common.h>
++#include <command.h>
++#include <image.h>
++
++static int do_parse_md(struct cmd_tbl *cmdtp, int flag, int argc, char * const argv[])
++{
++	unsigned long src, dst;
++	ulong rd_start, rd_end;
++	ulong kimg_data, kimg_len;
++	image_header_t	*hdr;
++	int res = 0;
++
++	if (argc != 3)
++		return 1;
++
++	src = simple_strtoul(argv[1], NULL, 16);
++	dst = simple_strtoul(argv[2], NULL, 16);
++
++	/* for img check, arch, crc etc*/
++	hdr = (image_header_t *)src;
++	if (!image_check_hcrc(hdr))
++		return 2;
++
++	if (!image_check_type(hdr, IH_TYPE_MULTI)) {
++		printf("Image does not contain meta-data blob\n");
++		return 3;
++	}
++
++	/* advance argc & argv by 1 */
++	argc--; argv++;
++
++	res = boot_get_mxl_md(argc, argv, NULL, 0, &rd_start, &rd_end);
++	if (res != 0)
++		return 4;
++
++	/* move kernel image to dst */
++	image_multi_getimg(hdr, 1, &kimg_data, &kimg_len);
++	hdr = (image_header_t *)kimg_data;
++	/* final check , is indeed kernel image */
++	if (!image_check_type(hdr, IH_TYPE_KERNEL))
++		return 5;
++	memmove((void *)dst, (const void *)kimg_data, (size_t)kimg_len);
++
++	return 0;
++}
++
++U_BOOT_CMD(
++	parsemd,	3,	1,	do_parse_md,
++	"parse metadata in linux multi img [name: Metadata], move kernel to dst",
++	"<src> <dst>\n"
++	"  <src> - linux multi img\n"
++	"    Image Type:   Intel x86 Linux Multi-File Image (uncompressed)\n"
++	"    Contents:\n"
++	"      Image 0: name = Metadata\n"
++	"        - metadata blob (uboot env_t) with additional mkimage header\n"
++	"          created with command:\n"
++	"          mkimage -A x86_64 -O u-boot -T x86_setup -C none -n Metadata\n"
++	"      Image 1: name = X86_64 LEDE Linux-4.19\n"
++	"        - openwrt normal linux image\n\n"
++	"  <dst> - copy Image 1 (linux) in <src> to destination address\n"
++);
+diff --git a/common/image-mxl-md.c b/common/image-mxl-md.c
+new file mode 100644
+--- /dev/null
++++ b/common/image-mxl-md.c
+@@ -0,0 +1,116 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++// #define DEBUG
++
++#include <common.h>
++#include <image.h>
++#include <env.h>
++#include <env_internal.h>
++#include <mapmem.h>
++
++/* config def, tweak as needed */
++#define MXL_MD_IH_MULTI_IDX	0
++#define MXL_MD_IH_NAME		"Metadata"
++
++/**
++ * boot_get_mxl_md - uImage metadata in uboot env format
++ * @argc: command argument count
++ * @argv: command argument list
++ * @images: pointer to the bootm images structure
++ * @arch: expected image architecture
++ * @ro_start: pointer to a ulong variable, will hold kernel ro start address
++ * @ro_end: pointer to a ulong variable, will hold kernel ro end
++ *
++ * boot_get_mxl_md() is responsible for finding a valid env_t image within multi image.
++ *
++ * returns:
++ *     0, if env_t image was found and valid, or skiped
++ *     ro_start and ro_end are set to kernel ro start/end addresses if
++ *     env_t image is found and valid
++ *
++ *     1~5, if env_t image is found but corrupted, or invalid
++ *     ro_start and ro_end are set to 0 if no ramdisk exists
++ */
++int boot_get_mxl_md(int argc, char * const argv[], bootm_headers_t *images,
++		uint8_t arch, ulong *rd_start, ulong *rd_end)
++{
++#if defined(CONFIG_LEGACY_IMAGE_FORMAT)
++	image_header_t	*hdr, *md_hdr;
++#endif
++	ulong		img_addr;
++	const void *buf;
++	ulong		env_data, env_len;
++	env_t		*env_ptr;
++	int		res;
++
++	img_addr = genimg_get_kernel_addr(argc < 1 ? NULL : argv[0]);
++
++	/* check image type */
++	buf = map_sysmem(img_addr, 0);
++	switch (genimg_get_format(buf)) {
++#if defined(CONFIG_LEGACY_IMAGE_FORMAT)
++	case IMAGE_FORMAT_LEGACY:
++		/* assuming this func is call after boot_find_os this mean  */
++		/* the image check before for crc type etc so we skip check */
++		hdr = (image_header_t *)buf;
++		if (!hdr)
++			return 1;
++
++		/* find the multi type, rest mean not wad we want */
++		switch (image_get_type(hdr)) {
++			case IH_TYPE_MULTI:
++				printf("## [MXL_MD] multi type\n");
++				image_multi_getimg(hdr, MXL_MD_IH_MULTI_IDX, &env_data, &env_len);
++				md_hdr = (image_header_t *)env_data;
++				/* check name */
++				printf("## [MXL_MD] idx %d, %s\n", MXL_MD_IH_MULTI_IDX, md_hdr->ih_name);
++				if (strncmp((const char *)md_hdr->ih_name,
++					MXL_MD_IH_NAME,
++					sizeof(md_hdr->ih_name)) != 0) {
++					printf("## Wrong name for metadata env: %s", md_hdr->ih_name);
++					return 2;
++				}
++
++				env_ptr = (env_t *)image_get_data(md_hdr);
++				env_len = image_get_data_size(md_hdr);
++				printf("## [MXL_MD] env_t : 0x%08X, len:%lu\n", (uint)env_ptr, env_len);
++
++				res = env_import_ext((const char *)env_ptr, 1, H_NOCLEAR);
++				if (res != 1) {
++					printf("## [MXL_MD] import env fail\n");
++					return 3;
++				}
++				/* TODO: set ro_start & ro_end ? skip for now. */
++				/* will be retrieve directly by getenv later on */
++
++				break;
++			case IH_TYPE_KERNEL:
++			case IH_TYPE_KERNEL_NOLOAD:
++			case IH_TYPE_STANDALONE:
++			default:
++				printf("## [MXL_MD] Not multi type\n");
++				return 4;
++		}
++
++		break;
++#endif /* defined(CONFIG_LEGACY_IMAGE_FORMAT) */
++#if IMAGE_ENABLE_FIT
++	case IMAGE_FORMAT_FIT:
++		printf("## [MXL_MD] Skip metadata env for FIT\n");
++		break;
++#endif /* IMAGE_ENABLE_FIT */
++#ifdef CONFIG_ANDROID_BOOT_IMAGE
++	case IMAGE_FORMAT_ANDROID:
++		prtinf("## [MXL_MD] Skip metadata env for Android Boot Image\n");
++		break;
++#endif /* CONFIG_ANDROID_BOOT_IMAGE */
++	default:
++		printf("## Unknown Image Type\n");
++		return 5;
++	}
++
++	return 0;
++}
