@@ -1,0 +1,403 @@
+#!/bin/sh /etc/rc.common
+
+START=70
+USE_PROCD=1
+
+uci_container_list=""
+default_privileged_container_path="/srv/lxc/"
+default_unprivileged_container_path=""
+net_count=0
+
+status_write()
+{
+	[ -f /tmp/lxc-status ] && {
+		sed -i '/^<'$1'>/d' /tmp/lxc-status
+	}
+	[ -n "$2" -a "$2" = "start" ] && {
+		echo "<$1> Started" >> /tmp/lxc-status
+	}
+}
+
+kill_container(){
+	local timeout=0
+	if [ $2 -ge $timeout ]; then
+		timeout=$2
+	fi
+	echo "Killing $1 in $timeout seconds"
+	lxc-stop -n $1 -P $3 -k
+	status_write "$1" stop
+}
+
+start_lxc()
+{
+	local _USER="$3"
+	local _HOME="$4"
+	if [ -n "$_USER" ]; then
+		procd_open_instance 
+		procd_set_param command /sbin/lxc_user_start $1 $2 $3
+		procd_set_param env HOME=$_HOME
+		procd_set_param user $_USER
+		procd_set_param stdout 1
+		procd_set_param stderr 1
+		procd_close_instance
+	else
+		ubus -t 30 wait_for servd
+		lxc-start -n $1 -P $2
+	fi
+}
+
+start_container(){
+	local _USER="$3"
+	local _HOME="$4"
+	echo "Starting the container: $1"
+	start_lxc $1 $2 $_USER $_HOME && {
+		status_write "$1" start
+	}
+}
+
+download_rootfs()
+{
+	local url_proto url_host tarpath tarname rootfs_targz_url="$1" container_name="$2"
+	error_msg()
+	{
+		echo "Error: Failed to find or download '$container_name' tarball from: $1"
+		return 1
+	}
+	extract_tar()
+	{
+		echo "Extracting rootfs '$1' for '${container_name}' .."
+		tar -xzf "$1" || {
+			echo "Error: Failed to extract tarball '$1' for '$container_name'"
+			return 1
+		}
+		rm -f "$1"
+	}
+	if [ -n "$rootfs_targz_url" ]; then
+		if [ -f "$rootfs_targz_url" ]; then
+			extract_tar "$rootfs_targz_url" || return 1
+		else
+			url_proto=${rootfs_targz_url/:*}
+			url_host=${rootfs_targz_url/*\/\/}
+			url_host=${url_host/\/*}
+			if [ "$url_proto" = "file" ]; then
+				tarpath=${rootfs_targz_url/*:\/\/}
+				if [ -f "$tarpath" ]; then
+					extract_tar "$tarpath" || return 1
+				else
+					error_msg "$tarpath" || return 1
+				fi
+			elif [ "$url_proto" = "tftp" ]; then
+				tarpath="$(echo $rootfs_targz_url|cut -d'/' -f4-)"
+				tarname=${rootfs_targz_url/*\/}
+				echo "Downloading rootfs tarball for '$container_name' from '${rootfs_targz_url}' .."
+				tftp -g -r $tarpath $url_host || {
+					error_msg $rootfs_targz_url || return 1
+				}
+				extract_tar "$tarname" || return 1
+			else
+				tarname=${rootfs_targz_url/*\/}
+				echo "Downloading rootfs tarball for '$container_name' from '${rootfs_targz_url}' .."
+				wget $rootfs_targz_url || {
+					error_msg $rootfs_targz_url || return 1
+				}
+				extract_tar "$tarname" || return 1
+			fi
+		fi
+	fi
+}
+
+container_add() {
+	local rootfs_targz_url
+	local arch
+	local container_path
+	local utsname
+	local network_type
+	local network_flags
+	local network_link
+	local network_hwaddr
+	local network_name
+	local network_mtu
+	local network_ipv4
+	local network_ipv4_gw
+	local mount_auto
+	local mount_entry
+	local container_name
+	local container_path
+	local config_file
+	local container_state
+	local freeze
+	local container_privilege
+	local lxcuser
+	local lxcuser_home
+	local uid_rootmap
+	local gid_rootmap
+	local uid_range
+	local gid_range
+	local cap_bounding
+	local cap_permitted
+	local cap_effective
+	local cap_ambient
+	local cap_inheritable
+
+	config_get container_name $1 container_name
+	config_get rootfs_targz_url $1 rootfs_targz_url
+	config_get arch $1 arch
+	config_get utsname $1 utsname 
+	config_get network_ipv4_gw $1 network_ipv4_gw
+	config_get mount_auto $1 mount_auto
+	config_get mount_entry $1 mount_entry
+	config_get container_command $1 container_command
+	config_get kill_timeout $1 kill_timeout
+	config_get container_path $1 container_path
+	config_get freeze $1 freeze
+	config_get container_privilege $1 container_privilege
+	config_get lxcuser $1 lxcuser
+	config_get lxcuser_home $1 lxcuser_home
+	config_get uid_rootmap $1 uid_rootmap
+	config_get gid_rootmap $1 gid_rootmap
+	config_get uid_range $1 uid_range
+	config_get gid_range $1 gid_range
+	config_get cap_bounding $1 cap_bounding
+	config_get cap_permitted $1 cap_permitted
+	config_get cap_effective $1 cap_effective
+	config_get cap_ambient $1 cap_ambient
+	config_get cap_inheritable $1 cap_inheritable
+
+	if [ "$rootfs_targz_url" = "NULL" ]; then
+		echo "Error: Failed to create container $container_name, rootfs_targz_url path is NULL in config"
+		echo "Please mentioned rootfs_targz_url path as tftp://<server ip>/<tar file name>, Example - tftp://192.168.1.22/openwrt-x86-64-rootfs.tar.gz"
+		return 1
+	fi
+	if [ "$container_privilege" = "unprivileged" ];then
+		for d in /sys/fs/cgroup/*; do
+			f=$(basename $d)
+			mkdir -p $d/$lxcuser
+			chown -R $lxcuser $d/$lxcuser 
+		done
+	fi
+
+	[ -z "$container_privilege" ] && echo "Warning: Privilege level not specified for '$container_name' - Configuring default 'privileged' mode"
+	if [ "$container_path" = "default" -o -z "$container_path" ];then
+		container_path=$default_privileged_container_path
+	fi
+
+	rootfs_path=$container_path/$container_name/rootfs/
+	config_file=$container_path/$container_name/config
+
+	LXC_STATE=$(lxc-info -n $container_name -P $container_path 2>/dev/null|grep State:) 
+	container_state=${LXC_STATE/* /}
+
+	mkdir -p $container_path/$container_name
+
+	if [ ! -d "$rootfs_path" ]; then
+		if [ "$container_command" = "up" -a "$container_state" != "RUNNING" ]; then
+			mkdir -p $rootfs_path
+			cd $rootfs_path
+			download_rootfs "$rootfs_targz_url" "$container_name"
+			cd -
+			if [ ! -d "$rootfs_path/etc" ]; then
+				echo "Failed to create container $container_name due to tarball download failed from: $download_url"
+				rm -rf $rootfs_path
+				return 1
+			fi
+		fi
+	fi
+
+	if [ "$container_command" = "down" ] && [ "$container_state" = "RUNNING" -o "$container_state" = "FROZEN" ]; then
+		kill_container $container_name $kill_timeout $container_path
+	fi
+
+	rm -f $config_file
+	touch $config_file
+
+	echo -e "#-----------Container configuration file----------#" >> $config_file
+	config_list_foreach "$1" include_path handle_include_paths $config_file $rootfs_path
+	[ -n "$arch" ] && echo -e "lxc.arch = $arch" >> $config_file
+	echo -e "\n#--------Container Specific Configurations--------#" >> $config_file
+	[ -n "$rootfs_path" ] && echo -e "lxc.rootfs.path = $rootfs_path" >> $config_file
+	[ -n "$utsname" ] && echo -e "lxc.uts.name = $utsname" >> $config_file
+	echo -e "\n#--------------Network Configurations-------------#" >> $config_file
+	config_list_foreach "$1" interfaces handle_interfaces $config_file
+#       [ -n "$network_ipv4_gw" ] && echo -e "lxc.network.0.ipv4.gateway = $network_ipv4_gw" >> $config_file
+	echo -e "\n#--------------CGroups Configurations-------------#" >> $config_file
+	config_list_foreach "$1" cgroup handle_groups $config_file
+	echo -e "\n#--------------Additional Configurations----------#" >> $config_file
+	config_list_foreach "$1" mount_auto handle_mount_auto $config_file
+	config_list_foreach "$1" mount_entry handle_mount_paths $config_file $rootfs_path
+	config_list_foreach "$1" custom_config handle_custom_configs $config_file $rootfs_path
+	if [ -n "$cap_bounding" -a -n "$cap_permitted" -a -n "$cap_effective" \
+			-a -n "$cap_ambient" -a -n "$cap_inheritable" ]; then
+		echo "Error: Cannot specify 'cap_bounding', 'cap_permitted', \
+			'cap_effective', 'cap_ambient' and 'cap_inheritable' for '$container_name'"
+		return 1
+	else
+		[ -n "$cap_bounding" ] && echo -e "lxc.bounding = $cap_bounding" >> $config_file
+		[ -n "$cap_permitted" ] && echo -e "lxc.permitted. = $cap_permitted" >> $config_file
+		[ -n "$cap_effective" ] && echo -e "lxc.effective = $cap_effective" >> $config_file
+		[ -n "$cap_ambient" ] && echo -e "lxc.ambient = $cap_ambient" >> $config_file
+		[ -n "$cap_inheritable" ] && echo -e "lxc.inheritable = $cap_inheritable" >> $config_file
+	fi
+
+	if [ "$container_privilege" = "unprivileged" ]; then
+		[ -n "$uid_rootmap" -a -n "$uid_range" ] && echo -e "lxc.idmap = u 0 $uid_rootmap $uid_range" >> $config_file
+		[ -n "$gid_rootmap" -a -n "$gid_range" ] && echo -e "lxc.idmap = g 0 $gid_rootmap $gid_range" >> $config_file
+	fi
+	if [ "$container_command" = "up" ]; then
+		if [ "$container_state" = "STOPPED" -o -z "$container_state" ]; then
+			if [ "$container_privilege" = "unprivileged" ]; then
+				chown -R $uid_rootmap:$gid_rootmap $rootfs_path 2>/dev/null
+				start_container $container_name $container_path $lxcuser $lxcuser_home
+			else
+				start_container $container_name $container_path
+			fi
+		fi
+	fi
+
+	if [ "$freeze" = "1" ]; then
+		if [ "$container_state" = "RUNNING" ]; then
+			echo "$container_name : Freezing container processes"
+			lxc-freeze -n $container_name $container_path
+		fi
+	fi
+
+	if [ "$freeze" = "0" ]; then 
+		if [ "$container_state" = "FROZEN" ]; then
+			echo "$container_name : Thawing container processes"
+			lxc-unfreeze -n $container_name $container_path
+		fi
+	fi
+
+	if [ "$container_command" = "destroy" -a -d $rootfs_path ]; then
+		echo "Destroying the container: $container_name"
+		lxc-destroy -n $container_name -f -P $container_path
+		rm -rf $container_path
+		echo "$container_name destroyed successfully"
+	fi
+	net_count=0
+}
+
+handle_network_params(){
+	local type
+	local flags
+	local link
+	local hwaddr
+	local name
+	local mtu
+	local ipv4
+	local vlan_id
+	local macvlan_mode
+
+	if [ "$1" = "$3" ]; then
+		config_get type $1 type
+		config_get flags $1 flags
+		config_get link $1 link
+		config_get hwaddr $1 hwaddr
+		config_get name $1 name
+		config_get mtu $1 mtu
+		config_get ipv4 $1 ipv4
+		config_get vlan_id $1 vlan_id
+		config_get macvlan_mode $1 macvlan_mode
+
+		[ -n "$type" ] && echo -e "lxc.net.$net_count.type = $type" >> $2
+		[ -n "$flags" ] && echo -e "lxc.net.$net_count.flags = $flags" >> $2
+		if [ "$type" != "none" -a "$type" != "empty" ];then
+			[ -n "$link" ] && echo -e "lxc.net.$net_count.link = $link" >> $2
+			[ -n "$name" ] && echo -e "lxc.net.$net_count.name = $name" >> $2
+		fi
+		if [ "$type" = "vlan" ];then
+			if [ -n "$vlan_id" ];then
+				echo -e "lxc.net.$net_count.vlan.id = $vlan_id" >> $2
+			else
+				echo "Error: Provide vlan ID for interface: $3"
+				return 1
+			fi
+		elif [  "$type" = "macvlan" ];then
+			if [ -n "$macvlan_mode" ];then
+				echo -e "lxc.net.$net_count.macvlan.mode = $macvlan_mode" >> $2
+			else
+				echo "Error: Provide macvlan mode for interface: $3"
+			fi
+		fi
+		[ -n "$hwaddr" ] && echo -e "lxc.net.$net_count.hwaddr = $hwaddr" >> $2
+		[ -n "$mtu" ] && echo -e "lxc.net.$net_count.mtu = $mtu" >> $2
+		[ -n "$ipv4" ] && echo -e "lxc.net.$net_count.ipv4.address = $ipv4" >> $2
+
+		# Will add few more configurations here for other network modes
+
+		echo -e "" >> $2
+		net_count=$(( $net_count + 1 ))
+	fi
+}
+
+handle_interfaces(){
+	local config_file="$2"
+	local iface="$1"
+	config_foreach handle_network_params network $config_file $iface
+
+}
+
+handle_groups(){
+	[ -n "$1" ] && echo -e "lxc.cgroup.$1" >> $2
+}
+
+handle_mount_auto(){
+	[ -n "$1" ] && echo -e "lxc.mount.auto = $1" >> $2
+}
+
+handle_mount_paths(){
+	local a=0
+	local i=0
+	for i in $1; do
+		if [ $a -eq 0 ];then
+			[ -n "$1" -a -d "$i" ] && echo -e "lxc.mount.entry = $1" >> $2
+			ls $1 > /dev/null 2>/dev/null # Probe the USB dir and trigger mountd to mount USB drive
+		fi
+		if [ $a -eq 1 ];then
+			mkdir -p $3$i
+			break
+		fi
+		a=$(( $a + 1 ))
+	done
+}
+
+handle_custom_configs(){
+	[ -n "$1" ] && echo -e "$1" >> $2
+}
+
+handle_include_paths(){
+	[ -n "$1" ] && echo -e "lxc.include = $1" >> $2
+}
+init_config() {
+	config_load lxc-auto
+	config_foreach container_add container
+}
+
+stop_service() {
+	# Use config file to stop and call reload.
+	echo -n
+	#verify_containers kill_all
+}
+
+env_setup(){
+	echo 1 > /sys/fs/cgroup/memory/memory.use_hierarchy 2>/dev/null
+	echo 1 > /sys/fs/cgroup/cpuacct/cgroup.clone_children 2>/dev/null
+	grep -q "fusectl.*/sys/fs/fuse/connections" /proc/mounts || {
+		grep -q fusectl /proc/filesystems && mount -t fusectl fusectl /sys/fs/fuse/connections/
+	}
+}
+
+service_triggers()
+{
+	procd_add_reload_trigger "lxc-auto"
+}
+
+start_service() {
+	env_setup
+	init_config
+}
+
+reload_service() {
+	stop_service
+	start_service
+}
+
