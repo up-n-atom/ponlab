@@ -1,0 +1,570 @@
+/******************************************************************************
+ *
+ * Copyright (c) 2020 - 2025 MaxLinear, Inc.
+ * Copyright (c) 2017 - 2020 Intel Corporation
+ * Copyright (c) 2016 Lantiq Beteiligungs-GmbH & Co. KG
+ *
+ * For licensing information, see the file 'LICENSE' in the root folder of
+ * this software module.
+ *
+ ******************************************************************************/
+
+/**
+ * \file pon_mbox.h
+ *
+ */
+
+#ifndef __PON_MBOX_H
+#define __PON_MBOX_H
+
+/** \defgroup PON_MBOX PON Mailbox Driver
+ *  This chapter provides the API reference to the PON mailbox driver.
+ *  The driver is used to communicated with the PON IP firmware through
+ *  a hardware mailbox, using PON IP firmware messages.
+ *  @{
+ */
+
+/** \defgroup PON_MBOX_REFERENCE Driver Reference for PON Mailbox
+ *  This chapter describes the functional API interface and structures
+ *  used by the PON mailbox driver to access the PON IP hardware module.
+ *  @{
+ */
+
+#if defined(WIN32)
+#include <stdint.h>
+#define __u32 uint32_t
+#else
+#include <linux/types.h>
+#endif
+
+/* SW should not answer this message */
+#define PON_MBOX_FLAG_FAKE_EVENT BIT(0)
+
+#define PON_MBOX_FAMILY		"pon_mbox"
+
+enum {
+	PON_MBOX_A_UNSPEC,
+	PON_MBOX_A_READ_WRITE,
+	PON_MBOX_A_COMMAND,
+	PON_MBOX_A_ACK,
+	PON_MBOX_A_DATA,
+	PON_MBOX_A_REG,
+	PON_MBOX_A_REG_VAL,
+	PON_MBOX_A_FLAGS,
+	PON_MBOX_A_MODE,
+	PON_MBOX_A_CNT, /* Nested */
+	PON_MBOX_A_SRDS_READ, /* Nested */
+	PON_MBOX_A_DP_CONFIG,  /* Nested */
+	__PON_MBOX_A_MAX,
+};
+
+#define PON_MBOX_A_MAX (__PON_MBOX_A_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_GTC_BIP_ERRORS,
+	PON_MBOX_A_CNT_GTC_DISC_GEM_FRAMES,
+	PON_MBOX_A_CNT_GTC_GEM_HEC_ERRORS_CORR,
+	PON_MBOX_A_CNT_GTC_GEM_HEC_ERRORS_UNCORR,
+	PON_MBOX_A_CNT_GTC_BWMAP_HEC_ERRORS_CORR,
+	PON_MBOX_A_CNT_GTC_PAD,
+	PON_MBOX_A_CNT_GTC_BYTES_CORR,
+	PON_MBOX_A_CNT_GTC_FEC_CODEWORDS_CORR,
+	PON_MBOX_A_CNT_GTC_FEC_COREWORDS_UNCORR,
+	PON_MBOX_A_CNT_GTC_TOTAL_FRAMES,
+	PON_MBOX_A_CNT_GTC_FEC_SEC,
+	PON_MBOX_A_CNT_GTC_GEM_IDLE,
+	PON_MBOX_A_CNT_GTC_LODS_EVENTS,
+	PON_MBOX_A_CNT_GTC_DG_TIME,
+	PON_MBOX_A_CNT_GTC_PLOAM_CRC_ERRORS,
+	__PON_MBOX_A_CNT_GTC_MAX,
+};
+
+#define PON_MBOX_A_CNT_GTC_MAX (__PON_MBOX_A_CNT_GTC_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_XGTC_PSBD_HEC_ERR_UNCORR,
+	PON_MBOX_A_CNT_XGTC_PSBD_HEC_ERR_CORR,
+	PON_MBOX_A_CNT_XGTC_FS_HEC_ERR_UNCORR,
+	PON_MBOX_A_CNT_XGTC_FS_HEC_ERR_CORR,
+	PON_MBOX_A_CNT_XGTC_LOST_WORDS,
+	PON_MBOX_A_CNT_XGTC_PLOAM_MIC_ERR,
+	PON_MBOX_A_CNT_XGTC_PAD,
+	__PON_MBOX_A_CNT_XGTC_MAX,
+};
+
+#define PON_MBOX_A_CNT_XGTC_MAX (__PON_MBOX_A_CNT_XGTC_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_GEM_PORT_GEM_PORT_ID,
+	PON_MBOX_A_CNT_GEM_PORT_TX_FRAMES,
+	PON_MBOX_A_CNT_GEM_PORT_TX_FRAGMENTS,
+	PON_MBOX_A_CNT_GEM_PORT_TX_BYTES,
+	PON_MBOX_A_CNT_GEM_PORT_RX_FRAMES,
+	PON_MBOX_A_CNT_GEM_PORT_RX_FRAGMENTS,
+	PON_MBOX_A_CNT_GEM_PORT_RX_BYTES,
+	PON_MBOX_A_CNT_GEM_PORT_KEY_ERRORS,
+	PON_MBOX_A_CNT_GEM_PORT_PAD,
+	__PON_MBOX_A_CNT_GEM_PORT_MAX,
+};
+
+#define PON_MBOX_A_CNT_GEM_PORT_MAX (__PON_MBOX_A_CNT_GEM_PORT_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_ALLOC_ALLOCATIONS,
+	PON_MBOX_A_CNT_ALLOC_IDLE,
+	PON_MBOX_A_CNT_ALLOC_US_BW,
+	PON_MBOX_A_CNT_ALLOC_PAD,
+	__PON_MBOX_A_CNT_ALLOC_MAX
+};
+
+#define PON_MBOX_A_CNT_ALLOC_MAX (__PON_MBOX_A_CNT_ALLOC_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_ALLOC_DISCARD_DISCS, /* Nested array */
+	PON_MBOX_A_CNT_ALLOC_DISCARD_RULES, /* Nested array */
+	PON_MBOX_A_CNT_ALLOC_DISCARD_PAD,
+	__PON_MBOX_A_CNT_ALLOC_DISCARD_MAX
+};
+
+#define PON_MBOX_A_CNT_ALLOC_DISCARD_MAX \
+	(__PON_MBOX_A_CNT_ALLOC_DISCARD_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_ALLOC_DISCARD_ITEM,
+	PON_MBOX_A_CNT_ALLOC_DISCARD_ITEM_PAD,
+	__PON_MBOX_A_CNT_ALLOC_DISCARD_ITEM_MAX
+};
+
+#define PON_MBOX_A_CNT_ALLOC_DISCARD_ITEM_MAX \
+	(__PON_MBOX_A_CNT_ALLOC_DISCARD_ITEM_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_ETH_BYTES,
+	PON_MBOX_A_CNT_ETH_FRAMES_LT_64,
+	PON_MBOX_A_CNT_ETH_FRAMES_64,
+	PON_MBOX_A_CNT_ETH_FRAMES_65_127,
+	PON_MBOX_A_CNT_ETH_FRAMES_128_255,
+	PON_MBOX_A_CNT_ETH_FRAMES_256_511,
+	PON_MBOX_A_CNT_ETH_FRAMES_512_1023,
+	PON_MBOX_A_CNT_ETH_FRAMES_1024_1518,
+	PON_MBOX_A_CNT_ETH_FRAMES_GT_1518,
+	PON_MBOX_A_CNT_ETH_FRAMES_FCS_ERR,
+	PON_MBOX_A_CNT_ETH_BYTES_FCS_ERR,
+	PON_MBOX_A_CNT_ETH_FRAMES_TOO_LONG,
+	PON_MBOX_A_CNT_ETH_PAD,
+	__PON_MBOX_A_CNT_ETH_MAX
+};
+
+#define PON_MBOX_A_CNT_ETH_MAX \
+	(__PON_MBOX_A_CNT_ETH_MAX - 1)
+
+enum {
+	PON_MBOX_C_UNSPEC,
+	PON_MBOX_C_MSG,
+	PON_MBOX_C_RESET,
+	PON_MBOX_C_REG_READ,
+	PON_MBOX_C_REG_WRITE,
+	PON_MBOX_C_RESET_FULL,
+	PON_MBOX_C_LINK_DISABLE,
+	PON_MBOX_C_FW_INIT_COMPLETE,
+	PON_MBOX_C_ALLOC_ID_COUNTERS,
+	PON_MBOX_C_ALLOC_LOST_COUNTERS,
+	PON_MBOX_C_GEM_PORT_COUNTERS,
+	PON_MBOX_C_GEM_ALL_COUNTERS,
+	PON_MBOX_C_GTC_COUNTERS,
+	PON_MBOX_C_XGTC_COUNTERS,
+	PON_MBOX_C_ETH_RX_COUNTERS,
+	PON_MBOX_C_ETH_TX_COUNTERS,
+	PON_MBOX_C_LT_CONFIG,
+	PON_MBOX_C_SRDS_CONFIG,
+	PON_MBOX_C_SRDS_CONFIG_READ,
+	PON_MBOX_C_IOP_CONFIG,
+	PON_MBOX_C_PIN_CONFIG,
+	PON_MBOX_C_UART_CONFIG,
+	PON_MBOX_C_USER_MNGMT,
+	PON_MBOX_C_BITERR_START,
+	PON_MBOX_C_BITERR_STOP,
+	PON_MBOX_C_BITERR_READ,
+	PON_MBOX_C_MODE_READ,
+	PON_MBOX_C_DP_CONFIG,
+	PON_MBOX_C_CNT_TWDM_WLCHID,
+	PON_MBOX_C_TWDM_LODS_COUNTERS,
+	PON_MBOX_C_TWDM_OPTIC_PL_COUNTERS,
+	PON_MBOX_C_TWDM_TC_COUNTERS,
+	PON_MBOX_C_TC_PLOAM_DS_COUNTERS,
+	PON_MBOX_C_TC_PLOAM_US_COUNTERS,
+	__PON_MBOX_C_MAX,
+};
+
+#define PON_MBOX_C_MAX (__PON_MBOX_C_MAX - 1)
+
+/* DS Wavelength Channel ID: selects the accumulated values */
+#define PON_MBOX_D_DSWLCH_ID_ACC       0xFE
+/* DS Wavelength Channel ID: selects the current channel ID */
+#define PON_MBOX_D_DSWLCH_ID_CURR      0xFF
+
+enum {
+	PON_MBOX_D_UNSPEC,
+	PON_MBOX_D_ALLOC_IDX,
+	PON_MBOX_D_GEM_IDX,
+	PON_MBOX_D_DSWLCH_ID,
+};
+
+enum {
+	PON_MBOX_LR_UNSPEC,
+	PON_MBOX_LR_ACTION,
+	PON_MBOX_LR_MACSA,
+};
+
+enum {
+	PON_MBOX_IOP_UNSPEC,
+	PON_MBOX_IOP_MSK,
+};
+
+enum {
+	PON_MBOX_SRDS_UNSPEC,
+	PON_MBOX_SRDS_TX_EQ_MAIN,
+	PON_MBOX_SRDS_TX_EQ_POST,
+	PON_MBOX_SRDS_TX_EQ_PRE,
+	PON_MBOX_SRDS_VBOOST_EN,
+	PON_MBOX_SRDS_VBOOST_LVL,
+	PON_MBOX_SRDS_IBOOST_LVL,
+	PON_MBOX_SRDS_RX_ADAPT_AFE_EN,
+	PON_MBOX_SRDS_RX_ADAPT_DFE_EN,
+	PON_MBOX_SRDS_RX_ADAPT_CONT,
+	PON_MBOX_SRDS_RX_ADAPT_EN,
+	PON_MBOX_SRDS_RX_EQ_ATT_LVL,
+	PON_MBOX_SRDS_RX_EQ_ADAPT_MODE,
+	PON_MBOX_SRDS_RX_EQ_ADAPT_SEL,
+	PON_MBOX_SRDS_RX_EQ_CTLE_BOOST,
+	PON_MBOX_SRDS_RX_VCO_TEMP_COMP_EN,
+	PON_MBOX_SRDS_RX_VCO_STEP_CTRL,
+	PON_MBOX_SRDS_RX_VCO_FRQBAND,
+	PON_MBOX_SRDS_RX_MISC,
+	PON_MBOX_SRDS_RX_DELTA_IQ,
+	PON_MBOX_SRDS_RX_MARGIN_IQ,
+	PON_MBOX_SRDS_EQ_CTLE_POLE,
+	PON_MBOX_SRDS_EQ_DFE_TAP1,
+	PON_MBOX_SRDS_EQ_DFE_BYPASS,
+	PON_MBOX_SRDS_EQ_VGA1_GAIN,
+	PON_MBOX_SRDS_EQ_VGA2_GAIN,
+	__PON_MBOX_SRDS_MAX
+};
+
+#define PON_MBOX_SRDS_MAX (__PON_MBOX_SRDS_MAX - 1)
+
+/**
+ * Maximum number of netlink attributes
+ */
+#define PON_MBOX_ATTR_MAX PON_MBOX_SRDS_MAX
+
+enum {
+	PON_MBOX_LT_UNSPEC,
+	PON_MBOX_LT_MODE, /* no longer supported */
+	PON_MBOX_LT_POWER_SAVE,
+};
+
+/**
+ * @brief User management netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_A_USER_MNGMT_UNSPEC,
+	/** Revoke or grant access command */
+	PON_MBOX_A_USER_MNGMT_REVOKE_GRANT,
+	/** Command group applied */
+	PON_MBOX_A_USER_MNGMT_CMD_GROUP,
+	/** User UID value */
+	PON_MBOX_A_USER_MNGMT_USER,
+};
+
+/**
+ * @brief User management revoke/grant commands
+ */
+enum pon_mbox_perm_revoke_grant {
+	/** Revoke user access from command group */
+	PON_MBOX_PERM_REVOKE = 0,
+	/** Grant user access for command group */
+	PON_MBOX_PERM_GRANT = 1
+};
+
+/**
+ * @brief Command groups for permission list
+ */
+enum pon_mbox_perm_command_group {
+	/** Group for SYNCE related commands */
+	PON_MBOX_PERM_SYNCE = 0,
+	/** Group for broadcast key handling commands */
+	PON_MBOX_PERM_BC_KEY = 1,
+	__PON_MBOX_PERM_MAX
+};
+
+#define PON_MBOX_PERM_MAX (__PON_MBOX_PERM_MAX - 1)
+
+/**
+ * @brief Pin control netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_A_PIN_UNSPEC,
+	/** Number of pin to change */
+	PON_MBOX_A_PIN_ID,
+	/** State to set */
+	PON_MBOX_A_PIN_STATUS
+};
+
+/**
+ * @brief GPIO pin status
+ */
+enum pon_mbox_gpio_pin_status {
+	/** Set pin to default state */
+	PON_MBOX_GPIO_PIN_STATUS_DEFAULT = 0,
+	/** Set pin to disable state */
+	PON_MBOX_GPIO_PIN_STATUS_DISABLE = 1,
+	/** Set pin to enable state */
+	PON_MBOX_GPIO_PIN_STATUS_ENABLE = 2
+};
+
+/**
+ * @brief GPIO pin id
+ */
+enum pon_mbox_gpio_pin_id {
+	/** RX_LOS pin */
+	PON_MBOX_GPIO_PIN_ID_RX_LOS = 0,
+	/** 1PPS pin */
+	PON_MBOX_GPIO_PIN_ID_1PPS = 1,
+	/** NTR pin */
+	PON_MBOX_GPIO_PIN_ID_NTR = 2
+};
+
+/**
+ * UART config netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_UART_UNSPEC,
+	/** UART mode selection */
+	PON_MBOX_UART_MODE
+};
+
+/**
+ * UART mode
+ */
+enum pon_mbox_uart_mode {
+	/** UART off */
+	PON_MBOX_UART_OFF = 0,
+	/** UART pins to ASC0 */
+	PON_MBOX_UART_ASC0 = 1,
+	/** UART pins to ASC1 */
+	PON_MBOX_UART_ASC1 = 2
+};
+
+/**
+ * Biterror counter netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_A_BITERR_UNSPEC,
+	/** Counter value, 64bit */
+	PON_MBOX_A_BITERR_CNT,
+	/** Time since start in ms */
+	PON_MBOX_A_BITERR_TIME,
+	/** for 64bit padding */
+	PON_MBOX_A_BITERR_PAD,
+	/** BITERR counter status */
+	PON_MBOX_A_BITERR_STATUS,
+};
+
+/**
+ * PON mode netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_A_PON_MODE_UNSPEC,
+	/** PON mode */
+	PON_MBOX_A_PON_MODE
+};
+
+/**
+ * PON datapath config netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_A_DP_CONFIG_UNSPEC,
+	/** Datapath expects the FCS in rx packets */
+	PON_MBOX_A_DP_CONFIG_WITH_RX_FCS,
+	/** Datapath expects the FCS in tx packets */
+	PON_MBOX_A_DP_CONFIG_WITH_TX_FCS,
+	/** Datapath expects no timestamp in rx packets */
+	PON_MBOX_A_DP_CONFIG_WITHOUT_TIMESTAMP,
+	__PON_MBOX_A_DP_CONFIG_MAX
+};
+
+#define PON_MBOX_DPCFG_MAX (__PON_MBOX_A_DP_CONFIG_MAX - 1)
+
+/**
+ * TWDM Wavelength Channel ID set netlink attributes
+ */
+enum {
+	/** Reserved by netlink */
+	PON_MBOX_CNT_TWDM_WLCHID_UNSPEC,
+	/** TWDM Wavelength Channel ID - DS */
+	PON_MBOX_CNT_TWDM_WLCHID_DS,
+	/** TWDM Wavelength Channel ID - US */
+	PON_MBOX_CNT_TWDM_WLCHID_US,
+	__PON_MBOX_CNT_TWDM_WLCHID_MAX
+};
+
+#define PON_MBOX_CNT_TWDM_WLCHID_MAX (__PON_MBOX_CNT_TWDM_WLCHID_MAX - 1)
+
+/**
+ * PON TWDM LODS counter netlink attributes
+ */
+enum {
+	PON_MBOX_A_CNT_TWDM_LODS_EVENTS_ALL,
+	PON_MBOX_A_CNT_TWDM_LODS_REACTIVATION_OPER,
+	PON_MBOX_A_CNT_TWDM_LODS_REACTIVATION_PROT,
+	PON_MBOX_A_CNT_TWDM_LODS_REACTIVATION_DISC,
+	PON_MBOX_A_CNT_TWDM_LODS_RESTORED_OPER,
+	PON_MBOX_A_CNT_TWDM_LODS_RESTORED_PROT,
+	PON_MBOX_A_CNT_TWDM_LODS_RESTORED_DISK,
+	PON_MBOX_A_CNT_TWDM_LODS_PAD,
+	__PON_MBOX_A_CNT_TWDM_LODS_MAX
+};
+
+#define PON_MBOX_A_CNT_TWDM_LODS_MAX (__PON_MBOX_A_CNT_TWDM_LODS_MAX - 1)
+
+/**
+ * PON (X)GTC PLOAM DS counter netlink attributes
+ */
+enum {
+	PON_MBOX_A_CNT_TC_PLOAM_DS_US_OVERHEAD,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_ENC_PORT_ID,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_REQ_PW,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_NO_MESSAGE,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_POPUP,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_REQ_KEY,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_CONFIG_PORT_ID,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_PEE,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_PST,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_BER_INTERVAL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_KEY_SWITCHING,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_EXT_BURST,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_PON_ID,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_SWIFT_POPUP,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_RANGING_ADJ,
+
+	PON_MBOX_A_CNT_TC_PLOAM_DS_BST_PROFILE,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_ASS_ONU,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_RNG_TIME,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_DEACT_ONU,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_DIS_SER,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_REQ_REG,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_ASS_ALLOC,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_KEY_CTRL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_SLP_ALLOW,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_CALIB_REQ,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_ADJ_TX_WL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_TUNE_CTRL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_SYS_PROFILE,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_CH_PROFILE,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_PROT_CONTROL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_CHG_PW_LVL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_PW_CONS,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_RATE_CTRL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_REBOOT_ONU,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_UNKNOWN,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_ADJ_TX_WL_FAIL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_TUNE_REQ,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_TUNE_COMPL,
+	PON_MBOX_A_CNT_TC_PLOAM_DS_PAD,
+	__PON_MBOX_A_CNT_TC_PLOAM_DS_MAX
+};
+
+#define PON_MBOX_A_CNT_TC_PLOAM_DS_MAX (__PON_MBOX_A_CNT_TC_PLOAM_DS_MAX - 1)
+
+/**
+ * PON (X)GTC PLOAM US counter netlink attributes
+ */
+enum {
+	PON_MBOX_A_CNT_TC_PLOAM_US_SER_ONU,
+	PON_MBOX_A_CNT_TC_PLOAM_US_PASSWORD,
+	PON_MBOX_A_CNT_TC_PLOAM_US_DYG_GASP,
+	PON_MBOX_A_CNT_TC_PLOAM_US_NO_MSG,
+	PON_MBOX_A_CNT_TC_PLOAM_US_ENC_KEY,
+	PON_MBOX_A_CNT_TC_PLOAM_US_PHY_EE,
+	PON_MBOX_A_CNT_TC_PLOAM_US_PST_MSG,
+	PON_MBOX_A_CNT_TC_PLOAM_US_REM_ERR,
+	PON_MBOX_A_CNT_TC_PLOAM_US_ACK,
+	PON_MBOX_A_CNT_TC_PLOAM_US_SLP_REQ,
+	PON_MBOX_A_CNT_TC_PLOAM_US_REG,
+	PON_MBOX_A_CNT_TC_PLOAM_US_KEY_REP,
+	PON_MBOX_A_CNT_TC_PLOAM_US_TUN_RES,
+	PON_MBOX_A_CNT_TC_PLOAM_US_PW_CONS,
+	PON_MBOX_A_CNT_TC_PLOAM_US_RATE_RESP,
+	PON_MBOX_A_CNT_TC_PLOAM_US_CPL_ERR,
+	PON_MBOX_A_CNT_TC_PLOAM_US_TUN_RES_AN,
+	PON_MBOX_A_CNT_TC_PLOAM_US_TUN_RES_CRB,
+	PON_MBOX_A_CNT_TC_PLOAM_US_PAD,
+	__PON_MBOX_A_CNT_TC_PLOAM_US_MAX
+};
+
+#define PON_MBOX_A_CNT_TC_PLOAM_US_MAX (__PON_MBOX_A_CNT_TC_PLOAM_US_MAX - 1)
+
+/**
+ * PON TWDM Optic Power Level counter netlink attributes
+ */
+enum {
+	PON_MBOX_A_CNT_TWDM_OPTIC_PL_REJECTED,
+	PON_MBOX_A_CNT_TWDM_OPTIC_PL_INCOMPLETE,
+	PON_MBOX_A_CNT_TWDM_OPTIC_PL_COMPLETE,
+	PON_MBOX_A_CNT_TWDM_OPTIC_PL_PAD,
+	__PON_MBOX_A_CNT_TWDM_OPTIC_PL_MAX
+};
+
+#define PON_MBOX_A_CNT_TWDM_OPTIC_PL_MAX \
+		(__PON_MBOX_A_CNT_TWDM_OPTIC_PL_MAX - 1)
+
+/**
+ * PON TWDM Tuning Control counter netlink attributes
+ */
+enum {
+	PON_MBOX_A_CNT_TWDM_TC, /* nested array */
+	PON_MBOX_A_CNT_TWDM_TC_PAD,
+	__PON_MBOX_A_CNT_TWDM_TC_MAX
+};
+
+#define PON_MBOX_A_CNT_TWDM_TC_MAX \
+		(__PON_MBOX_A_CNT_TWDM_TC_MAX - 1)
+
+enum {
+	PON_MBOX_A_CNT_TWDM_TC_ITEM,
+	PON_MBOX_A_CNT_TWDM_TC_ITEM_PAD,
+	__PON_MBOX_A_CNT_TWDM_TC_ITEM_MAX
+};
+
+#define PON_MBOX_A_CNT_TWDM_TC_ITEM_MAX \
+	(__PON_MBOX_A_CNT_TWDM_TC_ITEM_MAX - 1)
+
+#define PON_FEVT_CMD_GET(FAKE_EVENT) \
+	(unsigned short)(((FAKE_EVENT).cmd_len >> 16) & 0x0000FFFF)
+#define PON_FEVT_CMD_SET(FAKE_EVENT, CMD) \
+	(FAKE_EVENT).cmd_len = ((FAKE_EVENT).cmd_len & 0x0000FFFF) | \
+			       (((__u32)(CMD) << 16) & 0xFFFF0000)
+#define PON_FEVT_LEN_GET(FAKE_EVENT) \
+	(unsigned short)((FAKE_EVENT).cmd_len & 0x0000FFFF)
+#define PON_FEVT_LEN_SET(FAKE_EVENT, LEN) \
+	(FAKE_EVENT).cmd_len = ((FAKE_EVENT).cmd_len & 0xFFFF0000) | \
+			       ((__u32)(LEN) & 0x0000FFFF)
+
+/** Header structure fake event */
+struct pon_fake_event {
+	/** Hi-Word: Command ID, LO-Word: Length of the following data */
+	__u32 cmd_len;
+};
+
+/** @} */ /* PON_MBOX_REFERENCE */
+
+/** @} */ /* PON_MBOX */
+
+#endif /* __PON_MBOX_H */
