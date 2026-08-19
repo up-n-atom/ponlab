@@ -1,0 +1,263 @@
+diff -Naur a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2025-09-19 15:26:16.639858241 +0530
++++ b/CMakeLists.txt	2025-09-19 15:27:12.558638293 +0530
+@@ -82,6 +82,7 @@
+ OPTION(SUPP_INVPDU_ALERT "Suppress alert when invalid control PDU is received (silently ignore)" OFF)
+ OPTION(SUPP_INVPDU_WARN "Suppress warning when invalid data PDU is received (silently ignore)" OFF)
+ OPTION(ADD_HEADER_CSUM "Add checksum to PDU headers (needed when the UDP checksum is not being utilized)" OFF)
++OPTION(MXL_OPT "Maxlinear optimizations" ON)
+ 
+ add_definitions(-DSYSCONFDIR=\"${CMAKE_INSTALL_PREFIX}/etc\")
+ add_definitions(-DLOCALSTATEDIR=\"${CMAKE_INSTALL_PREFIX}/var/lib\")
+@@ -102,3 +103,7 @@
+ if (CMAKE_GENERATOR MATCHES "Ninja")
+     set(CMAKE_PLATFORM_HAS_INSTALLNAME 1)
+ endif()
++
++INSTALL(TARGETS udpst
++    RUNTIME DESTINATION /usr/bin
++)
+diff -Naur a/config.h.cmake b/config.h.cmake
+--- a/config.h.cmake	2025-09-19 15:23:54.998946019 +0530
++++ b/config.h.cmake	2025-09-19 15:22:46.912429080 +0530
+@@ -22,5 +22,6 @@
+ #cmakedefine SUPP_INVPDU_ALERT
+ #cmakedefine SUPP_INVPDU_WARN
+ #cmakedefine ADD_HEADER_CSUM
++#cmakedefine MXL_OPT
+ 
+ #endif /* CONFIG_H */
+diff -Naur a/udpst_data.c b/udpst_data.c
+--- a/udpst_data.c	2025-09-19 15:28:26.129032487 +0530
++++ b/udpst_data.c	2025-09-19 15:36:48.882036740 +0530
+@@ -222,6 +222,81 @@
+ 
+ #if defined(HAVE_SENDMMSG)
+ #if defined(HAVE_GSO)
++#if defined(MXL_OPT)
++struct gso_loadHdr
++{
++        uint16_t loadId; // Load ID
++        uint8_t testAction;  // Test action
++        uint8_t rxStopped;   // Receive traffic stopped indicator (BOOL)
++        uint32_t start_lpduSeqNo;  // Give the start seq no for this burst/GSO.
++        uint16_t burst_size;    // not fixed 64K need to review.
++        uint16_t spduSeqErr; // Status PDU sequence error count
++        //
++        uint32_t spduTime_sec;  // Send time in last received status PDU
++        uint32_t spduTime_nsec; // Send time in last received status PDU
++        uint32_t lpduTime_sec;  // Send time of this load PDU
++        uint32_t lpduTime_nsec; // Send time of this load PDU
++        //
++        uint16_t rttRespDelay; // Response delay for RTT calculation (ms)
++        uint16_t mtu;           // calculate from application.
++};
++
++static void _gso_populate_header(struct gso_loadHdr *lHdr, struct connection *c,
++                unsigned int rttRespDelay, int lPayloadLen, unsigned int seq, unsigned int mtu)
++{
++        lHdr->loadId     = htons(LOAD_ID);
++        lHdr->testAction = (uint8_t) c->testAction;
++        lHdr->rxStopped  = (uint8_t) c->rxStoppedLoc;
++        lHdr->start_lpduSeqNo  = ++seq;
++        lHdr->burst_size  = (uint16_t)lPayloadLen;
++        lHdr->spduSeqErr    = htons((uint16_t) c->spduSeqErr);
++        lHdr->spduTime_sec  = htonl((uint32_t) c->spduTime.tv_sec);
++        lHdr->spduTime_nsec = htonl((uint32_t) c->spduTime.tv_nsec);
++        lHdr->lpduTime_sec  = htonl((uint32_t) repo.systemClock.tv_sec);
++        lHdr->lpduTime_nsec = htonl((uint32_t) repo.systemClock.tv_nsec);
++        lHdr->rttRespDelay  = htons((uint16_t) rttRespDelay);
++        lHdr->mtu  = (uint16_t) mtu;
++}
++
++static void send_udp_type_cmsg(struct cmsghdr *cm)
++{
++        uint16_t *valp;
++
++        memset(cm, 0, sizeof(struct cmsghdr));
++        cm->cmsg_level = SOL_UDP;
++        cm->cmsg_type = OB_UDPST_GSO;
++        cm->cmsg_len = CMSG_LEN(sizeof(uint16_t));
++        valp = (uint16_t *)CMSG_DATA(cm);
++        *valp = LOAD_ID;
++}
++
++struct CMSG_CONTROL
++{
++        char control[
++                CMSG_SPACE(sizeof(uint16_t))
++        ];
++
++        size_t msg_controllen;
++};
++
++typedef struct CMSG_CONTROL CMSG_CTL;
++
++static CMSG_CTL initializeGSO(struct connection *c)
++{
++        struct msghdr msg = {0};
++        struct cmsghdr *cmsg;
++        CMSG_CTL cctl = {0};
++
++        cctl.msg_controllen = sizeof(cctl.control);
++
++        msg.msg_control = cctl.control;
++        msg.msg_controllen = sizeof(cctl.control);
++        cmsg = CMSG_FIRSTHDR(&msg);
++        send_udp_type_cmsg(cmsg);
++
++        return cctl;
++}
++#endif // MXL_OPT
+ //
+ // Send a burst of messages using GSO (Generic Segmentation Offload)
+ //
+@@ -234,6 +309,7 @@
+         struct mmsghdr mmsg[MMSG_SEGMENTS];
+         struct iovec iov[MMSG_SEGMENTS];
+         struct timespec tspecvar;
++        unsigned int initial_seq = 0;
+ 
+         //
+         // Calculate RTT response delay
+@@ -254,6 +330,120 @@
+         }
+         j    = 0; // Message count
+         cmsg = (struct cmsghdr *) cmsgbuf;
++        CMSG_CTL cctl;
++
++#if defined(MXL_OPT)
++        if (c->ipProtocol != IPPROTO_IPV6) {
++                while (totalburst > 0) {
++                        totalsize  = 0;
++                        nextsndbuf = sndbuf;
++                        struct gso_loadHdr *lHdr = (struct gso_loadHdr *) sndbuf;
++                        for (i = 0; i < totalburst; i++) {
++                                if (i < burstsize)
++                                        uvar = payload;
++                                else
++                                        uvar = addon;
++                                //
++                                // Check for GSO limits
++                                //
++                                if (i >= UDP_MAX_SEGMENTS) // Segment limit
++                                        break;
++                                if (totalsize + uvar > IP_MAXPACKET) // Size limit
++                                        break;
++                                if (i == 0) {
++                                        cctl = initializeGSO(c);
++                                }
++                                totalsize += uvar;
++                                nextsndbuf += payload;
++                        }
++                        // update initial pdu info...
++                        _gso_populate_header(lHdr, c, rttrd, totalsize, c->lpduSeqNo, uvar);    
++                        //
++                        // Setup message structure for buffer
++                        //
++                        iov[j].iov_base                = (void *) lHdr;
++                        iov[j].iov_len                 = sizeof(struct gso_loadHdr);
++                        mmsg[j].msg_hdr.msg_iov        = &iov[j];
++                        mmsg[j].msg_hdr.msg_iovlen     = 1;
++                        mmsg[j].msg_hdr.msg_control    = cctl.control;
++                        mmsg[j].msg_hdr.msg_controllen = cctl.msg_controllen;;
++                        j++;
++                        totalburst -= i;
++                        if (burstsize > 0)
++                                burstsize -= i;
++
++                        c->lpduSeqNo += (totalsize/uvar);
++                        //
++                        // Advance to next send buffer
++                        //
++                        sndbuf += DEF_BUFFER_SIZE;
++                }
++        } else {
++                while (totalburst > 0) {
++                        //
++                        // Fill send buffer until GSO limit or burst completion
++                        //
++                        totalsize  = 0;
++                        nextsndbuf = sndbuf;
++                        for (i = 0; i < totalburst; i++) {
++                                if (i < burstsize)
++                                        uvar = payload;
++                                else
++                                        uvar = addon;
++                                //
++                                // Check for GSO limits
++                                //
++                                if (i >= UDP_MAX_SEGMENTS) // Segment limit
++                                        break;
++                                if (totalsize + uvar > IP_MAXPACKET) // Size limit
++                                        break;
++                                //
++                                // Build load PDU (including corresponding control message on first one)
++                                //
++                                struct loadHdr *lHdr = (struct loadHdr *) nextsndbuf;
++                                _populate_header(lHdr, c, rttrd);
++                                lHdr->lpduSeqNo  = htonl((uint32_t) ++c->lpduSeqNo);
++                                lHdr->udpPayload = htons((uint16_t) uvar);
++#ifdef ADD_HEADER_CSUM
++                                if (c->protocolVer >= CHECKSUM_PVER)
++                                        lHdr->checkSum = checksum(lHdr, sizeof(struct loadHdr));
++#endif
++                                if (c->randPayload) {
++                                        _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
++                                }
++                                if (i == 0) {
++                                        cmsg->cmsg_len                  = GSO_CMSG_LEN;
++                                        cmsg->cmsg_level                = SOL_UDP;
++                                        cmsg->cmsg_type                 = UDP_SEGMENT;
++                                        *((uint16_t *) CMSG_DATA(cmsg)) = (uint16_t) uvar;
++                                }
++                                totalsize += uvar;
++                                nextsndbuf += payload;
++                        }
++                        totalburst -= i;
++                        if (burstsize > 0)
++                                burstsize -= i;
++
++                        //
++                        // Setup message structure for buffer
++                        //
++                        iov[j].iov_base                = (void *) sndbuf;
++                        iov[j].iov_len                 = (size_t) totalsize;
++                        mmsg[j].msg_hdr.msg_iov        = &iov[j];
++                        mmsg[j].msg_hdr.msg_iovlen     = 1;
++                        mmsg[j].msg_hdr.msg_control    = cmsg;
++                        mmsg[j].msg_hdr.msg_controllen = GSO_CMSG_SIZE;
++                        j++;
++
++                        //
++                        // Advance to next send buffer
++                        //
++                        sndbuf += DEF_BUFFER_SIZE;
++                        cmsg = (struct cmsghdr *) ((char *) cmsg + GSO_CMSG_SIZE);
++                }
++
++    }
++#else
+         while (totalburst > 0) {
+                 //
+                 // Fill send buffer until GSO limit or burst completion
+@@ -316,6 +506,7 @@
+                 sndbuf += DEF_BUFFER_SIZE;
+                 cmsg = (struct cmsghdr *) ((char *) cmsg + GSO_CMSG_SIZE);
+         }
++#endif
+ 
+         //
+         // Send complete burst with single system call
+diff -Naur a/udpst_protocol.h b/udpst_protocol.h
+--- a/udpst_protocol.h	2025-09-19 15:41:43.771570468 +0530
++++ b/udpst_protocol.h	2025-09-19 15:42:02.863151429 +0530
+@@ -47,7 +47,7 @@
+ #define PROTOCOL_MIN  10 // Minimum protocol version for backward compatibility
+ #define MULTIKEY_PVER 11 // Protocol version required for multi-key support
+ #define CHECKSUM_PVER 11 // Protocol version required for checksum support
+-
++#define OB_UDPST_GSO 107 
+ //----------------------------------------------------------------------------
+ //
+ // Sending rate structure for a single index (row) of transmission parameters

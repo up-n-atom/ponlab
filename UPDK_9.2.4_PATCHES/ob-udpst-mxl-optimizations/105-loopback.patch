@@ -1,0 +1,244 @@
+From 5e4b1e1e3a1e496e584513eb82e7ac0a09bc021d Mon Sep 17 00:00:00 2001
+From: knkumar <knkumar@maxlinear.com>
+Date: Wed, 19 Nov 2025 02:47:15 -0800
+Subject: [PATCH] 105-loopback
+
+---
+ udpst_common.h  |   1 +
+ udpst_control.c |  43 +++++++++++++++++-
+ udpst_data.c    | 116 +++++++++++++++++++++++++++++++++---------------
+ 3 files changed, 122 insertions(+), 38 deletions(-)
+
+diff --git a/udpst_common.h b/udpst_common.h
+index 2b229d9..4185afb 100644
+--- a/udpst_common.h
++++ b/udpst_common.h
+@@ -128,4 +128,5 @@ typedef int BOOL;
+ #define tspecclear(tsp) ((tsp)->tv_sec = (tsp)->tv_nsec = 0)
+ //----------------------------------------------------------------------------
+ 
++extern int is_loopback_ip(const char *ip_str);
+ #endif /* UDPST_COMMON_H */
+diff --git a/udpst_control.c b/udpst_control.c
+index 3d57177..07c4787 100644
+--- a/udpst_control.c
++++ b/udpst_control.c
+@@ -147,6 +147,38 @@ extern cJSON *json_top, *json_output;
+ static char *testHdrV4 = TESTHDR_LINE1 TESTHDR_LINE2 "IPv4 ToS: %d%s\n";
+ static char *testHdrV6 = TESTHDR_LINE1 TESTHDR_LINE2 "IPv6 TClass: %d%s\n";
+ 
++
++int is_loopback_ip(const char *ip_str) {
++    struct in6_addr addr6;
++
++    // Try parsing as IPv6
++    if (inet_pton(AF_INET6, ip_str, &addr6) == 1) {
++        // Check for IPv6 loopback (::1)
++        if (IN6_IS_ADDR_LOOPBACK(&addr6)) {
++            return 1;
++        }
++
++        // Check if it's an IPv4-mapped IPv6 address
++        if (IN6_IS_ADDR_V4MAPPED(&addr6)) {
++            uint8_t *ipv4 = &addr6.s6_addr[12];
++            if (ipv4[0] == 127) {
++                return 1; // IPv4 loopback
++            }
++        }
++    }
++
++    // Try parsing as IPv4
++    struct in_addr addr4;
++    if (inet_pton(AF_INET, ip_str, &addr4) == 1) {
++        uint8_t *bytes = (uint8_t *)&addr4;
++        if (bytes[0] == 127) {
++            return 1; // IPv4 loopback
++        }
++    }
++
++    return 0;
++}
++
+ //----------------------------------------------------------------------------
+ // Function definitions
+ //----------------------------------------------------------------------------
+@@ -1037,8 +1069,11 @@ int service_actreq(int connindex) {
+ 
+ #if defined(MXL_OPT)
+         int val2 = 1;
+-
+         int opt_name = OB_UDPST;
++
++	if (is_loopback_ip(c->remAddr))
++		return 0;
++
+         if (c->ipProtocol == IPPROTO_IPV6)
+                 opt_name = OB_UDPST6;
+ 
+@@ -1371,11 +1406,15 @@ int service_actresp(int connindex) {
+         tspecplus(&repo.systemClock, &tspecvar, &c->timer3Thresh);
+         c->timer3Action = &stop_test;
+ 
++
+ #if defined(MXL_OPT)
++	if (is_loopback_ip(c->remAddr))
++		return 0;
++
+         if ((c->testType == TEST_TYPE_DS)) {
+                 int val2 = 1;
+-
+                 int opt_name = OB_UDPST;
++
+                 if (c->ipProtocol == IPPROTO_IPV6)
+                         opt_name = OB_UDPST6;
+ 
+diff --git a/udpst_data.c b/udpst_data.c
+index b413376..dda4c0c 100644
+--- a/udpst_data.c
++++ b/udpst_data.c
+@@ -297,46 +297,24 @@ static CMSG_CTL initializeGSO(struct connection *c)
+         return cctl;
+ }
+ #endif // MXL_OPT
+-//
+-// Send a burst of messages using GSO (Generic Segmentation Offload)
+-//
+-static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned int payload, unsigned int addon) {
+-        register struct connection *c = &conn[connindex];
+-        char *sndbuf, *nextsndbuf, cmsgbuf[GSO_CMSG_SIZE * MMSG_SEGMENTS] = {0};
+-        unsigned int uvar, rttrd = 0, totalsize;
+-        int i, j, var;
+-        struct cmsghdr *cmsg;
+-        struct mmsghdr mmsg[MMSG_SEGMENTS];
+-        struct iovec iov[MMSG_SEGMENTS];
+-        struct timespec tspecvar;
+-        unsigned int initial_seq = 0;
+ 
+-        //
+-        // Calculate RTT response delay
+-        //
+-        if (tspecisset(&c->pduRxTime)) {
+-                tspecminus(&repo.systemClock, &c->pduRxTime, &tspecvar);
+-                rttrd = (unsigned int) tspecmsec(&tspecvar);
+-        }
+-
+-        //
+-        // Prepare send structures
+-        //
+-        memset(mmsg, 0, sizeof(mmsg));
+-        if (c->randPayload) {
+-                sndbuf = repo.sndBufRand;
+-        } else {
+-                sndbuf = repo.sndBuffer;
+-        }
+-        j    = 0; // Message count
+-        cmsg = (struct cmsghdr *) cmsgbuf;
++static void mxl_dp_gso(char *sndbuf, unsigned int payload, unsigned int addon, int totalburst,
++		      register struct connection *c, int burstsize,
++		      unsigned int rttrd, int connindex)
++{
++	struct gso_loadHdr *lHdr;
+         CMSG_CTL cctl;
++        unsigned int uvar, totalsize;
++        char *nextsndbuf;
++        struct iovec iov[MMSG_SEGMENTS];
++        struct mmsghdr mmsg[MMSG_SEGMENTS];
++        int i, j, var;
++        j = 0; 
+ 
+-#if defined(MXL_OPT)
+         while (totalburst > 0) {
+                 totalsize  = 0;
+                 nextsndbuf = sndbuf;
+-                struct gso_loadHdr *lHdr = (struct gso_loadHdr *) sndbuf;
++                lHdr = (struct gso_loadHdr *) sndbuf;
+                 for (i = 0; i < totalburst; i++) {
+                         if (i < burstsize)
+                                 uvar = payload;
+@@ -377,7 +355,74 @@ static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned
+                 //
+                 sndbuf += DEF_BUFFER_SIZE;
+         }
+-#else
++        //
++        // Send complete burst with single system call
++        //
++        // NOTE: Certain error conditions are expected when overloading an interface
++        //
++        var = sendmmsg(c->fd, mmsg, j, 0);
++        if (var == -1 && errno == EINVAL) { // Flag GSO incompatibility
++                var = sprintf(scratch, "ERROR: GSO incompatible with IP fragmentation (disable jumbo sizes or increase MTU)\n");
++                send_proc(errConn, scratch, var);
++                tspeccpy(&c->endTime, &repo.systemClock); // End testing
++                return;
++        }
++        if (!conf.errSuppress) {
++                if (var < 0) {
++                        //
++                        // An error of EAGAIN (Resource temporarily unavailable) indicates the send buffer is full
++                        //
++                        if ((var = socket_error(connindex, errno, "SENDMMSG+GSO")) > 0)
++                                send_proc(errConn, scratch, var);
++
++                } else if (var < j) {
++                        //
++                        // Not all messages sent indicates the send buffer is full
++                        //
++                        var = sprintf(scratch, "[%d]SENDMMSG+GSO INCOMPLETE: Only %d out of %d sent\n", connindex, var, j);
++                        send_proc(errConn, scratch, var);
++                }
++        }
++}
++
++//
++// Send a burst of messages using GSO (Generic Segmentation Offload)
++//
++static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned int payload, unsigned int addon) {
++        register struct connection *c = &conn[connindex];
++        char *sndbuf, *nextsndbuf, cmsgbuf[GSO_CMSG_SIZE * MMSG_SEGMENTS] = {0};
++        unsigned int uvar, rttrd = 0, totalsize;
++        int i, j, var;
++        struct cmsghdr *cmsg;
++        struct mmsghdr mmsg[MMSG_SEGMENTS];
++        struct iovec iov[MMSG_SEGMENTS];
++        struct timespec tspecvar;
++        unsigned int initial_seq = 0;
++
++        //
++        // Calculate RTT response delay
++        //
++        if (tspecisset(&c->pduRxTime)) {
++                tspecminus(&repo.systemClock, &c->pduRxTime, &tspecvar);
++                rttrd = (unsigned int) tspecmsec(&tspecvar);
++        }
++
++        //
++        // Prepare send structures
++        //
++        memset(mmsg, 0, sizeof(mmsg));
++        if (c->randPayload) {
++                sndbuf = repo.sndBufRand;
++        } else {
++                sndbuf = repo.sndBuffer;
++        }
++        j    = 0; // Message count
++        cmsg = (struct cmsghdr *) cmsgbuf;
++
++#if defined(MXL_OPT)
++	if (!is_loopback_ip(c->remAddr))
++		return mxl_dp_gso(sndbuf, payload, addon, totalburst, c, burstsize, rttrd, connindex);
++#endif
+         while (totalburst > 0) {
+                 //
+                 // Fill send buffer until GSO limit or burst completion
+@@ -440,7 +485,6 @@ static void _sendmmsg_gso(int connindex, int totalburst, int burstsize, unsigned
+                 sndbuf += DEF_BUFFER_SIZE;
+                 cmsg = (struct cmsghdr *) ((char *) cmsg + GSO_CMSG_SIZE);
+         }
+-#endif
+ 
+         //
+         // Send complete burst with single system call
+-- 
+2.43.5
+
