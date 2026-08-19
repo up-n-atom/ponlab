@@ -1,0 +1,115 @@
+.build test config:
+  stage: build
+  image: "$CI_REGISTRY_IMAGE/$CI_DESIGNATED_BRANCH/builder:latest"
+  tags:
+    - firmware-builder
+  variables:
+    CI_BUILD_CONFIG: >
+      +DEVEL +BUILD_LOG +SDK +INCLUDE_CONFIG +IB +IB_STANDALONE
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$TFTP_IMAGE_DOWNLOAD_URL'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DESIGNATED_BRANCH'
+    - if: '$CI_COMMIT_TAG =~ /^prplos-v[0-9]+\.[0-9]+\.[0-9]+.*$/'
+    - when: manual
+  before_script:
+    - touch .build_failed
+
+  script:
+    - mkdir -p logs
+    - set -o pipefail
+    - git config --global --add safe.directory '*'
+
+    - |
+      crlf_check_failed=$(rgrep -U $'\x0D' profiles | cut -d: -f1 | sort -u || true)
+      if test -n "$crlf_check_failed"; then
+        echo -e "ERROR: detected CRLF issues in the following YAML profiles:\n"
+        for profile in $crlf_check_failed; do
+          echo " * $profile"
+        done
+        echo -e "\nIt might result in hard to debug issues, please fix them."
+        exit 1
+      fi
+
+    - |
+      if [ -z "$CI_COMMIT_TAG" ] && [ "$CI_DESIGNATED_BRANCH" != "$CI_COMMIT_BRANCH" ]; then
+        echo "Enabling coredumps and exception tracing in the build."
+        export CI_BUILD_ENABLE_COREDUMPS=1
+        export CI_BUILD_ENABLE_EXCEPTION_TRACE=1
+      else
+        echo "Coredumps and exception tracing are disabled in this build."
+      fi
+
+    - for script in .gitlab/scripts/build.d/*; do bash "$script"; done
+
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -v -q "Restricted.*OSP"; then
+        sed -i -E 's;git.openwrt.org/(feed|project);github.com/openwrt;' feeds.conf.default
+        export CI_BUILD_PROFILE="$(echo $CI_JOB_NAME | sed 's/build test \(.*\)/\1/')"
+        scripts/gen_config.py $CI_BUILD_PROFILE 2>&1 | tee logs/build.log
+        git checkout -- feeds.conf.default
+
+        for option in $CI_BUILD_CONFIG $CI_BUILD_CONFIG_EXTRA; do
+          echo "$option" | sed -E "s/^\+(.*)$/CONFIG_\1=y/;s/^\-(.*)$/CONFIG_\1=n/" >> .config
+        done
+        cat .config
+        make defconfig | tee --append logs/build.log
+
+        make -j $(nproc) tools/tar/compile 2>&1 | tee --append logs/build.log
+        make -j $(nproc) download check FIXUP=1 2>&1 | tee --append logs/build.log
+      else
+        grep --color -e "Error updating feeds" -e "ERROR:.*failed to build." logs/build.log && exit 1
+      fi
+
+    - >
+      git diff-index --exit-code HEAD || {
+        ret=$?
+        echo "Package integrity issues, please check the output bellow or packages-hash-issues.patch from artifacts"
+        git diff | tee packages-hash-issues.patch
+        exit $ret
+      }
+
+    - >
+      topdir=$(pwd);
+      for feed in $(find feeds -name .git); do
+        pushd $(dirname $feed) > /dev/null; git diff-index --exit-code HEAD || {
+          ret=$?
+          echo "Feed $(dirname $feed) packages integrity issues, please check the output bellow or feed-packages-hash-issues.patch from artifacts"
+          git diff | tee --append $topdir/feed-packages-hash-issues.patch
+          exit $ret
+        }
+        popd > /dev/null
+      done
+
+    - >
+      trap "
+        grep -qz 'package/install[[:space:]]make -r world' logs/build.log && {
+          echo '[!] ERROR: package/install seems to fail, enabling verbose output'
+          make package/install V=s 2>&1 | tee --append logs/build.log
+          grep -C5 'Collected errors:' logs/build.log
+        }
+        echo '[!] ERROR: build failed'
+        exit 1
+      " ERR
+    - make -j $(nproc) 2>&1 | tee --append logs/build.log
+    - rm .build_failed
+
+  after_script:
+    - >
+      if test -f .build_failed && grep -qr 'make\[[[:digit:]]\].*Error [[:digit:]]$' logs; then
+        printf "\n====== Showing Make errors found in the log files ======";
+        for file in $(grep -lr 'make\[[[:digit:]]\+\].*Error [[:digit:]]\+$' logs); do
+          printf "\n====== Make errors from $CI_JOB_URL/artifacts/file/$file ======\n" ;
+          grep -r -C20 'make\[[[:digit:]]\+\].*Error [[:digit:]]\+$' $file ;
+        done
+      fi
+
+  artifacts:
+    expire_in: 1 month
+    when: always
+    paths:
+      - bin
+      - logs
+      - ./*packages-hash-issues.patch

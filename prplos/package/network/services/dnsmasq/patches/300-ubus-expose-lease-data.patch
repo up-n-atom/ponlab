@@ -1,0 +1,611 @@
+From e26d9d9ce0bb76c938a54b3381d655b24411d992 Mon Sep 17 00:00:00 2001
+From: Eduardo Aguilar <eduardo.aguilar_ext@softathome.com>
+Date: Fri, 11 Feb 2022 12:53:02 +0100
+Subject: [PATCH] ubus: expose more lease data
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+* Add dnsmasq networkid to the events.
+* Expose DHCPREQUEST options.
+* 'leases' ubus method to retrieve the list of leases.
+
+The purpose of the patch is to be able to synchronize with leases
+from dnsmasq using ubus only. The ubus 'leases' method can be called
+once and then subscribe to the events based on the dhcp packets
+received.
+
+The ubus events remain as they were, just add the parameter of the
+networkid to identify the pool to which they belong in the config,
+and the requested dhcp options from the client.
+
+Signed-off-by: Eduardo Aguilar <eduardo.aguilar_ext@softathome.com>
+Signed-off-by: Petr Štetiar <ynezz@true.cz> [rebased onto v2.86]
+Signed-off-by: Petr Štetiar <ynezz@true.cz>
+---
+ src/dnsmasq.h |  23 ++++-
+ src/lease.c   |  11 +++
+ src/rfc2131.c |  80 +++++++++++-------
+ src/ubus.c    | 226 +++++++++++++++++++++++++++++++++++++++++++++++++-
+ 4 files changed, 308 insertions(+), 32 deletions(-)
+
+--- a/src/dnsmasq.h
++++ b/src/dnsmasq.h
+@@ -286,6 +286,8 @@ struct event_desc {
+ #define option_var(x) (daemon->options[(x) / OPTION_BITS])
+ #define option_val(x) ((1u) << ((x) % OPTION_BITS))
+ #define option_bool(x) (option_var(x) & option_val(x))
++#define option_len(opt) ((int)(((unsigned char *)(opt))[1]))
++#define option_ptr(opt, i) ((void *)&(((unsigned char *)(opt))[2u+(unsigned int)(i)]))
+ 
+ /* extra flags for my_syslog, we use facilities since they are known 
+    not to occupy the same bits as priorities, no matter how syslog.h is set up. 
+@@ -825,6 +827,9 @@ struct dhcp_lease {
+   } *slaac_address;
+   int vendorclass_count;
+ #endif
++#ifdef HAVE_UBUS
++  struct ubus_extra_info *ubus_extra_info;
++#endif
+   struct dhcp_lease *next;
+ };
+ 
+@@ -1509,6 +1514,7 @@ char *host_from_dns(struct in_addr addr)
+ 
+ /* lease.c */
+ #ifdef HAVE_DHCP
++struct dhcp_lease* lease_getfirst(void);
+ void lease_update_file(time_t now);
+ void lease_update_dns(int force);
+ void lease_init(time_t now);
+@@ -1598,6 +1604,18 @@ void emit_dbus_signal(int action, struct
+ 
+ /* ubus.c */
+ #ifdef HAVE_UBUS
++struct ubus_extra_info {
++  const char* net;
++  u32   xid;
++  struct reply_option {
++    struct reply_option* next;
++    unsigned char tag;
++    unsigned char* raw_option_data;
++    size_t raw_option_length;
++    char* option_name;
++    char* option_value;
++  } *request_options;
++};
+ struct blob_attr;
+ typedef void (*ubus_dns_notify_cb)(struct blob_attr *msg, void *priv);
+ 
+@@ -1607,7 +1625,10 @@ void check_ubus_listeners(void);
+ void drop_ubus_listeners(void);
+ struct blob_buf *ubus_dns_notify_prepare(void);
+ int ubus_dns_notify(const char *type, ubus_dns_notify_cb cb, void *priv);
+-void ubus_event_bcast(const char *type, const char *mac, const char *ip, const char *name, const char *interface);
++void ubus_event_bcast(const char *type, const char *mac, const char *ip, const char *name, const char *interface, struct dhcp_lease *lease);
++struct reply_option* ubus_parse_options(unsigned char *start, unsigned char *end);
++void ubus_delete_options(struct reply_option* list);
++void ubus_free_extrainfo(struct ubus_extra_info* extra);
+ #  ifdef HAVE_CONNTRACK
+ void ubus_event_bcast_connmark_allowlist_refused(u32 mark, const char *name);
+ void ubus_event_bcast_connmark_allowlist_resolved(u32 mark, const char *pattern, const char *ip, u32 ttl);
+--- a/src/lease.c
++++ b/src/lease.c
+@@ -21,6 +21,10 @@
+ static struct dhcp_lease *leases = NULL, *old_leases = NULL;
+ static int dns_dirty, file_dirty, leases_left;
+ 
++struct dhcp_lease* lease_getfirst(void) {
++  return leases;
++}
++
+ static int read_leases(time_t now, FILE *leasestream)
+ {
+   unsigned long ei;
+@@ -789,6 +793,9 @@ struct dhcp_lease *lease4_allocate(struc
+     {
+       lease->addr = addr;
+       daemon->metrics[METRIC_LEASES_ALLOCATED_4]++;
++#ifdef HAVE_UBUS
++      lease->ubus_extra_info = whine_malloc(sizeof(struct ubus_extra_info));
++#endif
+     }
+   
+   return lease;
+@@ -1105,6 +1112,10 @@ int do_script_run(time_t now)
+ 	      free(slaac);
+ 	    }
+ #endif
++#ifdef HAVE_UBUS
++      ubus_free_extrainfo(lease->ubus_extra_info);
++      lease->ubus_extra_info = NULL;
++#endif
+ 	  kill_name(lease);
+ #ifdef HAVE_SCRIPT
+ 	  queue_script(ACTION_DEL, lease, lease->old_hostname, now);
+--- a/src/rfc2131.c
++++ b/src/rfc2131.c
+@@ -18,9 +18,6 @@
+ 
+ #ifdef HAVE_DHCP
+ 
+-#define option_len(opt) ((int)(((unsigned char *)(opt))[1]))
+-#define option_ptr(opt, i) ((void *)&(((unsigned char *)(opt))[2u+(unsigned int)(i)]))
+-
+ #ifdef HAVE_SCRIPT
+ static void add_extradata_opt(struct dhcp_lease *lease, unsigned char *opt);
+ #endif
+@@ -33,8 +30,8 @@ static void option_put_string(struct dhc
+ 			      int opt, const char *string, int null_term);
+ static struct in_addr option_addr(unsigned char *opt);
+ static unsigned int option_uint(unsigned char *opt, int offset, int size);
+-static void log_packet(char *type, void *addr, unsigned char *ext_mac, 
+-		       int mac_len, char *interface, char *string, char *err, u32 xid);
++static void log_packet(char *type, void *addr, unsigned char *ext_mac,
++                       int mac_len, char *interface, char *string, char *err, u32 xid, struct dhcp_lease *lease);
+ static unsigned char *option_find(struct dhcp_packet *mess, size_t size, int opt_type, int minsize);
+ static unsigned char *option_find1(unsigned char *p, unsigned char *end, int opt, int minsize);
+ static size_t dhcp_packet_size(struct dhcp_packet *mess, unsigned char *agent_id, unsigned char *real_end);
+@@ -100,6 +97,7 @@ size_t dhcp_reply(struct dhcp_context *c
+   struct dhcp_opt *o;
+   unsigned char pxe_uuid[17];
+   unsigned char *oui = NULL, *serial = NULL;
++  int prune = 0;
+ #ifdef HAVE_SCRIPT
+   unsigned char *class = NULL;
+ #endif
+@@ -674,7 +672,7 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	}
+       
+       daemon->metrics[METRIC_BOOTP]++;
+-      log_packet("BOOTP", logaddr, mess->chaddr, mess->hlen, iface_name, NULL, message, mess->xid);
++      log_packet("BOOTP", logaddr, mess->chaddr, mess->hlen, iface_name, NULL, message, mess->xid, NULL);
+       
+       return message ? 0 : dhcp_packet_size(mess, agent_id, real_end);
+     }
+@@ -931,7 +929,8 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	  opt71.next = daemon->dhcp_opts;
+ 	  do_encap_opts(&opt71, OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, 0);
+ 	  
+-	  log_packet("PXE", &mess->yiaddr, emac, emac_len, iface_name, (char *)mess->file, NULL, mess->xid);
++	  log_packet("PXE", &mess->yiaddr, emac, emac_len, iface_name, (char *)mess->file, NULL, mess->xid, NULL);
++
+ 	  log_tags(tagif_netid, ntohl(mess->xid));
+ 	  return dhcp_packet_size(mess, agent_id, real_end);	  
+ 	}
+@@ -1006,7 +1005,8 @@ size_t dhcp_reply(struct dhcp_context *c
+ 		    do_encap_opts(pxe_opts(pxearch, tagif_netid, tmp->local, now), OPTION_VENDOR_CLASS_OPT, DHOPT_VENDOR_MATCH, mess, end, 0);
+ 	    
+ 		  daemon->metrics[METRIC_PXE]++;
+-		  log_packet("PXE", NULL, emac, emac_len, iface_name, ignore ? "proxy-ignored" : "proxy", NULL, mess->xid);
++		  log_packet("PXE", NULL, emac, emac_len, iface_name, ignore ? "proxy-ignored" : "proxy", NULL, mess->xid, NULL);
++
+ 		  log_tags(tagif_netid, ntohl(mess->xid));
+ 		  if (!ignore)
+ 		    apply_delay(mess->xid, recvtime, tagif_netid);
+@@ -1041,7 +1041,7 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	return 0;
+       
+       daemon->metrics[METRIC_DHCPDECLINE]++;
+-      log_packet("DHCPDECLINE", option_ptr(opt, 0), emac, emac_len, iface_name, NULL, daemon->dhcp_buff, mess->xid);
++      log_packet("DHCPDECLINE", option_ptr(opt, 0), emac, emac_len, iface_name, NULL, daemon->dhcp_buff, mess->xid, NULL);
+       
+       if (lease && lease->addr.s_addr == option_addr(opt).s_addr)
+ 	lease_prune(lease, now);
+@@ -1068,15 +1068,16 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	  !(opt = option_find(mess, sz, OPTION_SERVER_IDENTIFIER, INADDRSZ)) ||
+ 	  option_addr(opt).s_addr != server_id(context, override, fallback).s_addr)
+ 	return 0;
+-      
+-      if (lease && lease->addr.s_addr == mess->ciaddr.s_addr)
++      prune = (lease && lease->addr.s_addr == mess->ciaddr.s_addr);
++      if (prune == 0)
++        message = _("unknown lease");
++
++      log_packet("DHCPRELEASE", &mess->ciaddr, emac, emac_len, iface_name, NULL, message, mess->xid, lease);
++
++      if (prune != 0)
+ 	lease_prune(lease, now);
+-      else
+-	message = _("unknown lease");
+ 
+       daemon->metrics[METRIC_DHCPRELEASE]++;
+-      log_packet("DHCPRELEASE", &mess->ciaddr, emac, emac_len, iface_name, NULL, message, mess->xid);
+-	
+       return 0;
+       
+     case DHCPDISCOVER:
+@@ -1142,7 +1143,7 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	}
+       
+       daemon->metrics[METRIC_DHCPDISCOVER]++;
+-      log_packet("DHCPDISCOVER", opt ? option_ptr(opt, 0) : NULL, emac, emac_len, iface_name, NULL, message, mess->xid); 
++      log_packet("DHCPDISCOVER", opt ? option_ptr(opt, 0) : NULL, emac, emac_len, iface_name, NULL, message, mess->xid, NULL);
+ 
+       if (message || !(context = narrow_context(context, mess->yiaddr, tagif_netid)))
+ 	return 0;
+@@ -1163,7 +1164,7 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	}
+       
+       daemon->metrics[METRIC_DHCPOFFER]++;
+-      log_packet("DHCPOFFER" , &mess->yiaddr, emac, emac_len, iface_name, NULL, NULL, mess->xid);
++      log_packet("DHCPOFFER",  &mess->yiaddr, emac, emac_len, iface_name, NULL, NULL, mess->xid, NULL);
+       
+       time = calc_time(context, config, option_find(mess, sz, OPTION_LEASE_TIME, 4));
+       clear_packet(mess, end);
+@@ -1276,8 +1277,8 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	}
+ 
+       daemon->metrics[METRIC_DHCPREQUEST]++;
+-      log_packet("DHCPREQUEST", &mess->yiaddr, emac, emac_len, iface_name, NULL, NULL, mess->xid);
+-      
++      log_packet("DHCPREQUEST", &mess->yiaddr, emac, emac_len, iface_name, NULL, NULL, mess->xid, NULL);
++
+     rapid_commit:
+       if (!message)
+ 	{
+@@ -1351,7 +1352,7 @@ size_t dhcp_reply(struct dhcp_context *c
+       if (message)
+ 	{
+ 	  daemon->metrics[rapid_commit ? METRIC_NOANSWER : METRIC_DHCPNAK]++;
+-	  log_packet(rapid_commit ? "NOANSWER" : "DHCPNAK", &mess->yiaddr, emac, emac_len, iface_name, NULL, message, mess->xid);
++	  log_packet(rapid_commit ? "NOANSWER" : "DHCPNAK", &mess->yiaddr, emac, emac_len, iface_name, NULL, message, mess->xid, NULL);
+ 
+ 	  /* rapid commit case: lease allocate failed but don't send DHCPNAK */
+ 	  if (rapid_commit)
+@@ -1380,7 +1381,17 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	    }
+ 
+ 	  log_tags(tagif_netid, ntohl(mess->xid));
+-	  
++
++#ifdef HAVE_UBUS
++      if (lease && lease->ubus_extra_info) {
++        lease->ubus_extra_info->net = context->netid.net;
++        if (lease->ubus_extra_info->request_options) {
++          ubus_delete_options(lease->ubus_extra_info->request_options);
++        }
++        lease->ubus_extra_info->request_options = ubus_parse_options(&mess->options[0] + sizeof(u32), end);
++      }
++#endif
++
+ 	  if (do_classes)
+ 	    {
+ 	      /* pick up INIT-REBOOT events. */
+@@ -1510,7 +1521,6 @@ size_t dhcp_reply(struct dhcp_context *c
+ 	    override = lease->override;
+ 
+ 	  daemon->metrics[METRIC_DHCPACK]++;
+-	  log_packet("DHCPACK", &mess->yiaddr, emac, emac_len, iface_name, hostname, NULL, mess->xid);  
+ 
+ 	  clear_packet(mess, end);
+ 	  option_put(mess, end, OPTION_MESSAGE_TYPE, 1, DHCPACK);
+@@ -1522,14 +1532,21 @@ size_t dhcp_reply(struct dhcp_context *c
+ 		     netid, subnet_addr, fqdn_flags, borken_opt, pxearch, uuid, vendor_class_len, now, time, fuzz, pxevendor);
+ 	}
+ 
+-      return dhcp_packet_size(mess, agent_id, real_end); 
++       size_t result = dhcp_packet_size(mess, agent_id, real_end);
++#ifdef HAVE_UBUS
++       if (lease && lease->ubus_extra_info && lease->ubus_extra_info->net) {
++         lease->ubus_extra_info->net = context->netid.net;
++       }
++#endif
++       log_packet("DHCPACK", &mess->yiaddr, emac, emac_len, iface_name, hostname, NULL, mess->xid, lease);
++       return result;
+       
+     case DHCPINFORM:
+       if (ignore || have_config(config, CONFIG_DISABLE))
+ 	message = _("ignored");
+       
+       daemon->metrics[METRIC_DHCPINFORM]++;
+-      log_packet("DHCPINFORM", &mess->ciaddr, emac, emac_len, iface_name, message, NULL, mess->xid);
++      log_packet("DHCPINFORM", &mess->ciaddr, emac, emac_len, iface_name, message, NULL, mess->xid, NULL);
+      
+       if (message || mess->ciaddr.s_addr == 0)
+ 	return 0;
+@@ -1556,7 +1573,7 @@ size_t dhcp_reply(struct dhcp_context *c
+       log_tags(tagif_netid, ntohl(mess->xid));
+       
+       daemon->metrics[METRIC_DHCPACK]++;
+-      log_packet("DHCPACK", &mess->ciaddr, emac, emac_len, iface_name, hostname, NULL, mess->xid);
++      log_packet("DHCPACK", &mess->ciaddr, emac, emac_len, iface_name, hostname, NULL, mess->xid, lease);
+       
+       if (lease)
+ 	{
+@@ -1689,9 +1706,12 @@ static void add_extradata_opt(struct dhc
+ }
+ #endif
+ 
+-static void log_packet(char *type, void *addr, unsigned char *ext_mac, 
+-		       int mac_len, char *interface, char *string, char *err, u32 xid)
++static void log_packet(char *type, void *addr, unsigned char *ext_mac,
++                    int mac_len, char *interface, char *string, char *err,
++                    u32 xid, struct dhcp_lease* lease)
+ {
++  (void)lease;
++
+   if (!err && !option_bool(OPT_LOG_OPTS) && option_bool(OPT_QUIET_DHCP))
+     return;
+   
+@@ -1722,10 +1742,12 @@ static void log_packet(char *type, void
+ 	      err ? err : "");
+   
+ #ifdef HAVE_UBUS
++  if (lease && lease->ubus_extra_info)
++    lease->ubus_extra_info->xid = xid;
+   if (!strcmp(type, "DHCPACK"))
+-    ubus_event_bcast("dhcp.ack", daemon->namebuff, addr ? daemon->addrbuff : NULL, string, interface);
++    ubus_event_bcast("dhcp.ack", daemon->namebuff, addr ? daemon->addrbuff : NULL, string, interface, lease);
+   else if (!strcmp(type, "DHCPRELEASE"))
+-    ubus_event_bcast("dhcp.release", daemon->namebuff, addr ? daemon->addrbuff : NULL, string, interface);
++    ubus_event_bcast("dhcp.release", daemon->namebuff, addr ? daemon->addrbuff : NULL, string, interface, lease);
+ #endif
+ }
+ 
+--- a/src/ubus.c
++++ b/src/ubus.c
+@@ -27,6 +27,12 @@ static int ubus_handle_metrics(struct ub
+ 			       struct ubus_request_data *req, const char *method,
+ 			       struct blob_attr *msg);
+ 
++static int ubus_handle_leases(struct ubus_context *ctx, struct ubus_object *obj,
++                   struct ubus_request_data *req, const char *method,
++                   struct blob_attr *msg);
++struct reply_option* ubus_parse_options(unsigned char *start, unsigned char *end);
++void ubus_delete_options(struct reply_option* list);
++
+ #ifdef HAVE_CONNTRACK
+ enum {
+   SET_CONNMARK_ALLOWLIST_MARK,
+@@ -56,6 +62,7 @@ static void ubus_subscribe_cb(struct ubu
+ 
+ static const struct ubus_method ubus_object_methods[] = {
+   UBUS_METHOD_NOARG("metrics", ubus_handle_metrics),
++  UBUS_METHOD_NOARG("leases", ubus_handle_leases),
+ #ifdef HAVE_CONNTRACK
+   UBUS_METHOD("set_connmark_allowlist", ubus_handle_set_connmark_allowlist, set_connmark_allowlist_policy),
+ #endif
+@@ -226,6 +233,133 @@ static int ubus_handle_metrics(struct ub
+   return UBUS_STATUS_OK;
+ }
+ 
++static void ubus_fill_options(struct reply_option *list) {
++  char buf[256];
++  struct reply_option *itt = list;
++  while (itt) {
++    if ((itt->option_name != NULL) && (itt->option_value != NULL)) {
++      void* option = blobmsg_open_table(&b, itt->option_name);
++      blobmsg_add_u32(&b, "tag", itt->tag);
++      blobmsg_add_string(&b, "value", itt->option_value);
++      if (itt->raw_option_data) {
++        char* p = buf;
++        *p = 0;
++        size_t len = itt->raw_option_length <= sizeof(buf) ? itt->raw_option_length : sizeof(buf);
++        for (size_t i = 0; i < len; ++i) {
++          unsigned char v = itt->raw_option_data[i];
++          sprintf(p, "%02x", (int)v);
++          p += 2;
++        }
++        blobmsg_add_string(&b, "raw", buf);
++      }
++      blobmsg_close_table(&b, option);
++    }
++    itt = itt->next;
++  }
++}
++
++static int ubus_handle_leases(struct ubus_context *ctx, struct ubus_object *obj,
++                              struct ubus_request_data *req, const char *method,
++                              struct blob_attr *msg) {
++  (void)obj;
++  (void)method;
++  (void)msg;
++
++  struct dhcp_lease *lease = lease_getfirst();
++  char name[64];
++  int index = 0;
++  char str[INET6_ADDRSTRLEN];
++  const char* s;
++  char* p;
++  char buf[64];
++
++  blob_buf_init(&b, 0);
++  void* leases = blobmsg_open_array(&b, "leases");
++
++  while (lease) {
++    sprintf(name, "lease%d", index);
++    void* entry = blobmsg_open_table(&b, name);
++
++    if (lease->hostname) {
++      blobmsg_add_string(&b, "hostname", lease->hostname);
++    }
++    if (lease->fqdn) {
++      blobmsg_add_string(&b, "FQDN", lease->fqdn);
++    }
++
++    s = inet_ntop(AF_INET, &lease->addr, str, sizeof(str));
++    if (s) blobmsg_add_string(&b, "ipv4", str);
++
++    if (lease->override.s_addr) {
++      s = inet_ntop(AF_INET, &lease->override, str, sizeof(str));
++      if (s) blobmsg_add_string(&b, "override", str);
++    }
++
++    if (lease->giaddr.s_addr) {
++      s = inet_ntop(AF_INET, &lease->giaddr, str, sizeof(str));
++      if (s) blobmsg_add_string(&b, "giaddr", str);
++    }
++
++    strftime(buf, sizeof(buf), "%FT%TZ", gmtime(&lease->expires));
++    blobmsg_add_string(&b, "expires", buf);
++
++    if (indextoname(daemon->dhcpfd, lease->last_interface, buf)) {
++      blobmsg_add_string(&b, "last_interface", buf);
++    }
++
++    if (indextoname(daemon->dhcpfd, lease->new_interface, buf)) {
++      blobmsg_add_string(&b, "new_interface", buf);
++      blobmsg_add_u32(&b, "new_prefix_length", lease->new_prefixlen);
++    }
++
++    switch (lease->hwaddr_type) {
++      case ARPHRD_NETROM: s = "KA9Q NET/ROM Pseudo"; break;
++      case ARPHRD_ETHER: s = "Ethernet"; break;
++      case ARPHRD_EETHER: s = "Experimental Ethernet"; break;
++      case ARPHRD_AX25: s = "AX.25 Level 2"; break;
++      case ARPHRD_PRONET: s = "PROnet token ring"; break;
++      case ARPHRD_CHAOS: s = "Chaosnet"; break;
++      case ARPHRD_IEEE802: s = "IEEE 802.2 Ethernet/TR/TB"; break;
++      case ARPHRD_ARCNET: s = "ARCnet"; break;
++      case ARPHRD_APPLETLK: s = "APPLEtalk"; break;
++      case ARPHRD_DLCI: s = "Frame Relay DLCI"; break;
++      case ARPHRD_ATM: s = "ATM"; break;
++      case ARPHRD_METRICOM: s = "Metricom STRIP"; break;
++      case ARPHRD_IEEE1394: s = "IEEE 1394 IPv4"; break;
++      case ARPHRD_EUI64: s = "EUI-64"; break;
++      case ARPHRD_INFINIBAND: s = "InfiniBand"; break;
++      default: s = "Unknown";
++    }
++    blobmsg_add_string(&b, "hwaddr_type", s);
++    p = buf;
++    for (int i = 0; i < lease->hwaddr_len; ++i, p += 2) {
++      if (i >= (int)( sizeof(buf) / 2 )) break;
++      sprintf(p, "%02X", lease->hwaddr[i]);
++    }
++    blobmsg_add_string(&b, "hwaddr", buf);
++
++    if (lease->ubus_extra_info) {
++      if (lease->ubus_extra_info->net)
++        blobmsg_add_string(&b, "net", lease->ubus_extra_info->net);
++
++      if (lease->ubus_extra_info->request_options) {
++        void* table = blobmsg_open_table(&b, "options_request");
++        ubus_fill_options(lease->ubus_extra_info->request_options);
++        blobmsg_close_table(&b, table);
++      }
++    }
++
++    blobmsg_close_table(&b, entry);
++    ++index;
++    lease = lease->next;
++  }
++
++  blobmsg_close_array(&b, leases);
++  ubus_send_reply(ctx, req, b.head);
++  return 0;
++}
++
++
+ #ifdef HAVE_CONNTRACK
+ static int ubus_handle_set_connmark_allowlist(struct ubus_context *ctx, struct ubus_object *obj,
+ 					      struct ubus_request_data *req, const char *method,
+@@ -398,7 +532,7 @@ int ubus_dns_notify(const char *type, ub
+ 	return ubus_complete_request(ubus, &dreq.req.req, 100);
+ }
+ 
+-void ubus_event_bcast(const char *type, const char *mac, const char *ip, const char *name, const char *interface)
++void ubus_event_bcast(const char *type, const char *mac, const char *ip, const char *name, const char *interface, struct dhcp_lease* lease)
+ {
+   struct ubus_context *ubus = (struct ubus_context *)daemon->ubus;
+ 
+@@ -414,10 +548,98 @@ void ubus_event_bcast(const char *type,
+     CHECK(blobmsg_add_string(&b, "name", name));
+   if (interface)
+     CHECK(blobmsg_add_string(&b, "interface", interface));
+-  
++
++  if (lease) {
++    if (lease->ubus_extra_info) {
++      if (lease->ubus_extra_info->net)
++        blobmsg_add_string(&b, "net", lease->ubus_extra_info->net);
++
++      char sxid[9];
++      sprintf(sxid, "%08X", lease->ubus_extra_info->xid);
++      blobmsg_add_string(&b, "xid", sxid);
++
++      if (!strcmp(type, "dhcp.ack")) {
++        if (lease->ubus_extra_info->request_options) {
++          void* table = blobmsg_open_table(&b, "options_request");
++          ubus_fill_options(lease->ubus_extra_info->request_options);
++          blobmsg_close_table(&b, table);
++        }
++      }
++    }
++  }
++
+   CHECK(ubus_notify(ubus, &ubus_object, type, b.head, -1));
+ }
+ 
++struct reply_option* ubus_parse_options(unsigned char *start, unsigned char* end) {
++
++  struct reply_option* elem = NULL;
++  unsigned char* ptr = start;
++  while (*ptr != OPTION_END) {
++    char *optname = option_string(AF_INET, ptr[0],
++                      option_ptr(ptr, 0), option_len(ptr), daemon->namebuff, MAXDNAME);
++    struct reply_option* new_element = whine_malloc(sizeof(struct reply_option));
++
++    if (new_element) {
++      new_element->next = elem;
++      elem = new_element;
++      new_element->tag = ptr[0];
++      if (option_ptr(ptr, 0)) {
++        new_element->raw_option_data = whine_malloc(option_len(ptr));
++        if (new_element->raw_option_data) {
++          if ((unsigned char*)(option_ptr(ptr, 0) + option_len(ptr)) >= end) {
++            my_syslog(LOG_ERR, _("Option length would surpass options buffer"));
++            break;
++          } else {
++            memcpy(new_element->raw_option_data, option_ptr(ptr, 0), option_len(ptr));
++            new_element->raw_option_length = option_len(ptr);
++          }
++        } else {
++          break;
++        }
++      }
++      if (optname) {
++        new_element->option_name = strdup(optname);
++        if (new_element->option_name == NULL) {
++          my_syslog(LOG_ERR, _("Could not allocate option_name"));
++          break;
++        }
++      }
++      if (daemon->namebuff) {
++        new_element->option_value = strdup(daemon->namebuff);
++        if (new_element->option_value == NULL) {
++          my_syslog(LOG_ERR, _("Could not allocate option_value"));
++          break;
++        }
++      }
++    } else {
++      break;
++    }
++
++    ptr += ptr[1] + 2;
++  }
++  return elem;
++}
++
++void ubus_delete_options(struct reply_option* list) {
++  struct reply_option* itt = list;
++  while (itt) {
++    struct reply_option* next = itt->next;
++    free(itt->raw_option_data);
++    free(itt->option_name);
++    free(itt->option_value);
++    free(itt);
++    itt = next;
++  }
++}
++
++void ubus_free_extrainfo(struct ubus_extra_info* extra) {
++  if (extra != NULL) {
++    ubus_delete_options(extra->request_options);
++    free(extra);
++  }
++}
++
+ #ifdef HAVE_CONNTRACK
+ void ubus_event_bcast_connmark_allowlist_refused(u32 mark, const char *name)
+ {
