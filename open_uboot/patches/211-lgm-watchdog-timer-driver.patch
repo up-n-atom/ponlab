@@ -1,0 +1,566 @@
+# HG changeset patch
+# Parent  730859db69f7ad98c34159da31687eb540db772b
+
+diff --git a/cmd/mxl/wdt.c b/cmd/mxl/wdt.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/wdt.c
+@@ -0,0 +1,161 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Watchdog commands
++ *
++ * Copyright (c) 2019 Michael Walle <michael@walle.cc>
++ * 
++ * Modified to remove wdt expire and add wdt test
++ */
++
++#include <common.h>
++#include <command.h>
++#include <dm.h>
++#include <wdt.h>
++
++static struct udevice *currdev;
++
++static int do_wdt_list(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	struct udevice *dev;
++	struct uclass *uc;
++	int ret;
++
++	ret = uclass_get(UCLASS_WDT, &uc);
++	if (ret)
++		return CMD_RET_FAILURE;
++
++	uclass_foreach_dev(dev, uc)
++		printf("%s (%s)\n", dev->name, dev->driver->name);
++
++	return CMD_RET_SUCCESS;
++}
++
++static int do_wdt_dev(struct cmd_tbl *cmdtp, int flag, int argc,
++		      char *const argv[])
++{
++	int ret;
++
++	if (argc > 1) {
++		ret = uclass_get_device_by_name(UCLASS_WDT, argv[1], &currdev);
++		if (ret) {
++			printf("Can't get the watchdog timer: %s\n", argv[1]);
++			return CMD_RET_FAILURE;
++		}
++	} else {
++		if (!currdev) {
++			printf("No watchdog timer device set!\n");
++			return CMD_RET_FAILURE;
++		}
++		printf("dev: %s\n", currdev->name);
++	}
++
++	return CMD_RET_SUCCESS;
++}
++
++static int check_currdev(void)
++{
++	if (!currdev) {
++		printf("No device set, use 'wdt dev' first\n");
++		return CMD_RET_FAILURE;
++	}
++	return 0;
++}
++
++static int do_wdt_start(struct cmd_tbl *cmdtp, int flag, int argc,
++			char *const argv[])
++{
++	int ret;
++	u64 timeout;
++	ulong flags = 0;
++
++	if (argc < 2)
++		return CMD_RET_USAGE;
++
++	ret = check_currdev();
++	if (ret)
++		return ret;
++
++	timeout = simple_strtoull(argv[1], NULL, 0);
++	if (argc > 2)
++		flags = simple_strtoul(argv[2], NULL, 0);
++
++	ret = wdt_start(currdev, timeout, flags);
++	if (ret == -ENOSYS) {
++		printf("Starting watchdog timer not supported.\n");
++		return CMD_RET_FAILURE;
++	} else if (ret) {
++		printf("Starting watchdog timer failed (%d)\n", ret);
++		return CMD_RET_FAILURE;
++	}
++
++	return CMD_RET_SUCCESS;
++}
++
++static int do_wdt_stop(struct cmd_tbl *cmdtp, int flag, int argc,
++		       char *const argv[])
++{
++	int ret;
++
++	ret = check_currdev();
++	if (ret)
++		return ret;
++
++	ret = wdt_stop(currdev);
++	if (ret == -ENOSYS) {
++		printf("Stopping watchdog timer not supported.\n");
++		return CMD_RET_FAILURE;
++	} else if (ret) {
++		printf("Stopping watchdog timer failed (%d)\n", ret);
++		return CMD_RET_FAILURE;
++	}
++
++	return CMD_RET_SUCCESS;
++}
++
++static int do_wdt_reset(struct cmd_tbl *cmdtp, int flag, int argc,
++			char *const argv[])
++{
++	int ret;
++
++	ret = check_currdev();
++	if (ret)
++		return ret;
++
++	ret = wdt_reset(currdev);
++	if (ret == -ENOSYS) {
++		printf("Resetting watchdog timer not supported.\n");
++		return CMD_RET_FAILURE;
++	} else if (ret) {
++		printf("Resetting watchdog timer failed (%d)\n", ret);
++		return CMD_RET_FAILURE;
++	}
++
++	return CMD_RET_SUCCESS;
++}
++
++/* we need this in lgm u-boot because we will refresh watchdog timer during console prompt */
++static int do_wdt_test(struct cmd_tbl *cmdtp, int flag, int argc,
++			char *const argv[])
++{
++	printf("Watchdog test, board will reset after wdt expire.\n");
++	while(1);
++
++	return CMD_RET_SUCCESS;
++}
++
++static char wdt_help_text[] =
++	"list - list watchdog devices\n"
++	"wdt dev [<name>] - get/set current watchdog device\n"
++	"wdt start <timeout ms> [flags] - start watchdog timer\n"
++	"wdt stop - stop watchdog timer\n"
++	"wdt reset - reset watchdog timer\n"
++	"wdt test - test watchdog expiry by not refreshing timer\n";
++
++U_BOOT_CMD_WITH_SUBCMDS(wdt, "Watchdog sub-system", wdt_help_text,
++	U_BOOT_SUBCMD_MKENT(list, 1, 1, do_wdt_list),
++	U_BOOT_SUBCMD_MKENT(dev, 2, 1, do_wdt_dev),
++	U_BOOT_SUBCMD_MKENT(start, 3, 1, do_wdt_start),
++	U_BOOT_SUBCMD_MKENT(stop, 1, 1, do_wdt_stop),
++	U_BOOT_SUBCMD_MKENT(reset, 1, 1, do_wdt_reset),
++	U_BOOT_SUBCMD_MKENT(test, 1, 1, do_wdt_test));
+diff --git a/drivers/watchdog/lgm_wdt.c b/drivers/watchdog/lgm_wdt.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/watchdog/lgm_wdt.c
+@@ -0,0 +1,363 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include <common.h>
++#include <log.h>
++#include <watchdog.h>
++#include <asm/arch-lightning/gptc.h>
++#include <asm/arch-lightning/reg.h>
++#include <asm/arch-lightning/rcu.h>
++#include <asm/arch-lightning/chip_top.h>
++#include <wdt.h>
++#include <dm.h>
++#include <errno.h>
++
++#define GPTC0_BASE GPT0_MODULE_BASE
++#define GPTC1_BASE GPT1_MODULE_BASE
++#define GPTC2_BASE GPT2_MODULE_BASE
++#define GPTC3_BASE GPT3_MODULE_BASE
++
++enum watchdog_num_t {
++	WDT_0,
++	WDT_1,
++	WDT_2,
++	WDT_3,
++};
++
++u32 WDT_RUNNING = 1;
++static u32 watchdog_timeout = CONFIG_WATCHDOG_TIMEOUT_MSECS;
++
++static void watchdog_init(u32 wdt_num,u32 wdt_timer)
++{
++
++	/* wdt_timer: 1 = 1ms;  1000 = 1000ms*/
++	if ((wdt_num == WDT_0) || (wdt_num == WDT_1)) {
++		 /* gptc1 - full kernel clock  (200MHz/10),tc2,tc3*/
++		REG32(GPTC1_BASE) = 0x010A00;
++	} else {
++		 /* gptc2 - full kernel clock (200MHz/10),tc2,tc3 */
++		REG32(GPTC2_BASE) = 0x010A00;
++	}
++
++	/* 32-bit, timer, count down, auto-reload
++	 * count for 1S, 10*20000*wdt_timer/200MHZ = 1s , if wdt_timer=1000
++	 * Interrupt enabled
++	*/
++	switch (wdt_num) {
++	case WDT_0:
++		REG32(GPTC1_BASE + 0x30) = 0x10;
++		REG32(GPTC1_BASE + 0x40) = 20000 * wdt_timer;
++		REG32(GPTC1_BASE + 0xf4) |= 0x4;
++		break;
++	case WDT_1:
++		REG32(GPTC1_BASE + 0x50) = 0x10;
++		REG32(GPTC1_BASE + 0x60) = 20000 * wdt_timer;
++		REG32(GPTC1_BASE + 0xf4) |= 0x10;
++		break;
++	case WDT_2:
++		REG32(GPTC2_BASE + 0x30) = 0x10;
++		REG32(GPTC2_BASE + 0x40) = 20000 * wdt_timer;
++		REG32(GPTC2_BASE + 0xf4) |= 0x4;
++		break;
++	case WDT_3:
++		REG32(GPTC2_BASE + 0x50) = 0x10;
++		REG32(GPTC2_BASE + 0x60) = 20000 * wdt_timer;
++		REG32(GPTC2_BASE + 0xf4) |= 0x10;
++		break;
++	default:
++		break;
++
++	}
++
++	return;
++
++}
++
++void hw_watchdog_init(void)
++{
++	watchdog_timeout = CONFIG_WATCHDOG_TIMEOUT_MSECS;
++	watchdog_init(WDT_0, watchdog_timeout);
++	return;
++}
++
++static int poll_watchdog_ready(u32 reg, int bit)
++{
++	int timeout = 0;
++	do {
++		if ((REG32(reg) & bit) != 0)
++			return 0;
++		timeout++;
++	} while (timeout < 0xFFFFF);
++
++	return 1;
++}
++
++static void watchdog_start(u32 wdt_num)
++{
++	int ret = 1;
++
++	switch (wdt_num) {
++	case WDT_0:
++		REG32(GPTC1_BASE + 0xf4) |= (0x3 << 2); /*Interrupt GPTC1-tc2AB enabled*/
++		REG32(GPTC1_BASE + 0x38) = 0x05;     /* Reload and Run */
++		ret = poll_watchdog_ready(GPTC1_BASE + 0x30, 0x1);
++		break;
++	case WDT_1:
++		REG32(GPTC1_BASE + 0xf4) |= (0x3 << 4); /*Interrupt GPTC1-tc3AB enabled*/
++		REG32(GPTC1_BASE + 0x58) = 0x05;      /*Reload and Run*/
++		ret = poll_watchdog_ready(GPTC1_BASE + 0x50, 0x1);
++		break;
++	case WDT_2:
++		REG32(GPTC2_BASE + 0xf4) |= (0x3 << 2); /* Interrupt GPTC2-tc2AB enabled*/
++		REG32(GPTC2_BASE + 0x38) = 0x05;      /* Reload and Run*/
++		ret = poll_watchdog_ready(GPTC2_BASE + 0x30, 0x1);
++		break;
++	case WDT_3:
++		REG32(GPTC2_BASE + 0xf4) |= (0x3 << 4); /* Interrupt GPTC2-tc3AB enabled*/
++		REG32(GPTC2_BASE + 0x58) = 0x05;      /* Reload and Run*/
++		ret = poll_watchdog_ready(GPTC2_BASE + 0x50, 0x1);
++		break;
++	default:
++		break;
++	}
++
++	/* Check if we successfully enabled the GPTC run */
++	if (ret) {
++		debug("error waiting for watchdog timer ready\n");
++		return;
++	}
++
++#if !defined(CONFIG_LIGHTNING_A0)
++	REG32(BASEIA_WDT_RST_EN_B0) = 0x40 | (1 << wdt_num);
++#else
++	REG32(RCU_BASEIA_WDT_RST_EN) = 0x40 | (1 << wdt_num);
++#endif
++
++	return;
++}
++void hw_watchdog_start(void)
++{
++	watchdog_start(WDT_0);
++	WDT_RUNNING = 1;
++	return;
++}
++
++static void watchdog_stop(u32 wdt_num)
++{
++	switch (wdt_num) {
++	case WDT_0:
++		/* Interrupt disable reg GPTC1-tc2AB disabled*/
++		/* Interrupt capture reg GPTC1-tc2AB clear irq status*/
++		/* Interrupt node control reg GPTC1-tc2AB clear irq request*/
++		/*0x6,2AB Stop*/
++		REG32(GPTC1_BASE + 0xf0) |= (0x3 << 2);
++		REG32(GPTC1_BASE + 0xf8) &= ~(0x3 << 2);
++		REG32(GPTC1_BASE + 0xfc) |= (0x3 << 2);
++		REG32(GPTC1_BASE + 0x38) = 0x6;
++		break;
++	case WDT_1:
++		/*Interrupt GPTC1-tc3AB disabled*/
++		/* Interrupt capture reg GPTC1-tc3AB clear irq status*/
++		/* Interrupt node control reg GPTC1-tc3AB clear irq request*/
++		/*3AB Stop*/
++		REG32(GPTC1_BASE + 0xf0) |= (0x3 << 4);
++		REG32(GPTC1_BASE + 0xf8) &= ~(0x3 << 4);
++		REG32(GPTC1_BASE + 0xfc) |= (0x3 << 4);
++		REG32(GPTC1_BASE + 0x58) = 0x6;
++		break;
++	case WDT_2:
++		/*Interrupt GPTC2-tc2AB disabled*/
++		/* Interrupt capture reg GPTC2-tc2AB clear irq status*/
++		/* Interrupt node control reg GPTC2-tc2AB clear irq request*/
++		/* 2AB Stop*/
++		REG32(GPTC2_BASE + 0xf0) |= (0x3 << 2);
++		REG32(GPTC2_BASE + 0xf8) &= ~(0x3 << 2);
++		REG32(GPTC2_BASE + 0xfc) |= (0x3 << 2);
++		REG32(GPTC2_BASE + 0x38) = 0x6;
++		break;
++	case WDT_3:
++		/* Interrupt GPTC2-tc3AB disabled*/
++		/* Interrupt capture reg GPTC2-tc3AB clear irq status*/
++		/* Interrupt node control reg GPTC2-tc3AB clear irq request*/
++		/* 3AB Stop*/
++		REG32(GPTC2_BASE + 0xf0) |= (0x3 << 4);
++		REG32(GPTC2_BASE + 0xf8) &= ~(0x3 << 4);
++		REG32(GPTC2_BASE + 0xfc) |= (0x3 << 4);
++		REG32(GPTC2_BASE + 0x58) = 0x6;
++		break;
++	default:
++		break;
++	}
++
++	return;
++}
++void hw_watchdog_stop(void)
++{
++	watchdog_stop(WDT_0);
++	WDT_RUNNING = 0;
++	return;
++}
++
++
++void hw_watchdog_set_timer(u32 timeout)
++{
++	u32 timeout_cal = timeout;
++
++	hw_watchdog_stop();
++	watchdog_init(WDT_0, timeout_cal);
++
++	return;
++}
++
++#ifndef CONFIG_SPL_BUILD
++static int need_wdt_reset(int wdt_num, u32 timeout)
++{
++	u32 count = 0;
++
++	/* skip if WDT is not running */
++	if (WDT_RUNNING == 0)
++		return 0;
++
++	switch (wdt_num) {
++	case WDT_0:
++		count = REG32(GPTC1_BASE + 0x48);
++		break;
++	case WDT_1:
++		count = REG32(GPTC1_BASE + 0x68);
++		break;
++	case WDT_2:
++		count = REG32(GPTC2_BASE + 0x48);
++		break;
++	case WDT_3:
++		count = REG32(GPTC2_BASE + 0x68);
++		break;
++	default:
++		break;
++	}
++
++	if (count > (timeout >> 1))
++		return 0;
++
++	return 1;
++}
++
++void hw_watchdog_reset(void)
++{
++	if (!need_wdt_reset(WDT_0, watchdog_timeout))
++		return;
++
++	if (WDT_RUNNING == 1) {
++		hw_watchdog_set_timer(watchdog_timeout);
++		hw_watchdog_start();
++	}
++}
++#else
++void hw_watchdog_reset(void)
++{
++
++}
++#endif
++
++#if CONFIG_IS_ENABLED(WDT)
++
++struct lgm_wdt_priv {
++	void __iomem *regs;
++};
++
++static int lgm_wdt_reset(struct udevice *dev)
++{
++	struct lgm_wdt_priv *priv = dev_get_priv(dev);
++	int ret = 1;
++
++	/* use WDT_0 */
++	REG32(priv->regs + 0xf4) |= (0x3 << 2); /*Interrupt GPTC1-tc2AB enabled*/
++	REG32(priv->regs + 0x38) = 0x05;     /* Reload and Run */
++	ret = poll_watchdog_ready((u32)priv->regs + 0x30, 0x1);
++
++	return ret;
++}
++
++static int lgm_wdt_start(struct udevice *dev, u64 timeout_ms, ulong flags)
++{
++	struct lgm_wdt_priv *priv = dev_get_priv(dev);
++	u32 lgm_timeout = timeout_ms & 0xFFFFFFFF; /* cannot support such a long timeout */
++
++	debug("%s: Starting wdt %d\n", __func__, lgm_timeout);
++
++	watchdog_timeout = lgm_timeout;
++
++	/* Interrupt disable reg GPTC1-tc2AB disabled*/
++	/* Interrupt capture reg GPTC1-tc2AB clear irq status*/
++	/* Interrupt node control reg GPTC1-tc2AB clear irq request*/
++	/*0x6,2AB Stop*/
++	REG32(priv->regs + 0xf0) |= (0x3 << 2);
++	REG32(priv->regs + 0xf8) &= ~(0x3 << 2);
++	REG32(priv->regs + 0xfc) |= (0x3 << 2);
++	REG32(priv->regs + 0x38) = 0x6;
++
++	REG32(priv->regs) = 0x010A00;
++
++	/* 32-bit, timer, count down, auto-reload
++	 * count for 1S, 10*20000*wdt_timer/200MHZ = 1s , if wdt_timer=1000
++	 * Interrupt enabled
++	*/
++	REG32(priv->regs + 0x30) = 0x10;
++	REG32(priv->regs + 0x40) = 20000 * lgm_timeout;
++	REG32(priv->regs + 0xf4) |= 0x4;
++
++	return lgm_wdt_reset(dev);
++}
++
++static int lgm_wdt_stop(struct udevice *dev)
++{
++	struct lgm_wdt_priv *priv = dev_get_priv(dev);
++
++	/* use WDT_0 */
++	/* Interrupt disable reg GPTC1-tc2AB disabled*/
++	/* Interrupt capture reg GPTC1-tc2AB clear irq status*/
++	/* Interrupt node control reg GPTC1-tc2AB clear irq request*/
++	/*0x6,2AB Stop*/
++	REG32(priv->regs + 0xf0) |= (0x3 << 2);
++	REG32(priv->regs + 0xf8) &= ~(0x3 << 2);
++	REG32(priv->regs + 0xfc) |= (0x3 << 2);
++	REG32(priv->regs + 0x38) = 0x6;
++
++	return 0;
++}
++
++static int lgm_wdt_probe(struct udevice *dev)
++{
++	struct lgm_wdt_priv *priv = dev_get_priv(dev);
++
++	priv->regs = dev_read_addr_ptr(dev);
++	if (!priv->regs)
++		return -EINVAL;
++
++	debug("%s: Probing wdt%u\n", __func__, dev_seq(dev));
++	return 0;
++}
++
++static const struct wdt_ops lgm_wdt_ops = {
++	.start = lgm_wdt_start,
++	.stop = lgm_wdt_stop,
++	.reset = lgm_wdt_reset,
++};
++
++static const struct udevice_id lgm_wdt_ids[] = {
++	{ .compatible = "mxl,lgm-wdt" },
++	{ }
++};
++
++U_BOOT_DRIVER(lgm_wdt) = {
++	.name = "lgm_wdt",
++	.id = UCLASS_WDT,
++	.of_match = lgm_wdt_ids,
++	.ops = &lgm_wdt_ops,
++	.probe = lgm_wdt_probe,
++	.priv_auto	= sizeof(struct lgm_wdt_priv),
++};
++
++#endif /* CONFIG_IS_ENABLED(WDT) */
++
+diff --git a/include/watchdog.h b/include/watchdog.h
+--- a/include/watchdog.h
++++ b/include/watchdog.h
+@@ -21,7 +21,7 @@ int init_func_watchdog_reset(void);
+ #endif
+ 
+ #if defined(CONFIG_WATCHDOG) || defined(CONFIG_HW_WATCHDOG)
+-#define INIT_FUNC_WATCHDOG_INIT	init_func_watchdog_init,
++#define INIT_FUNC_WATCHDOG_INIT		init_func_watchdog_init,
+ #define INIT_FUNC_WATCHDOG_RESET	init_func_watchdog_reset,
+ #else
+ #define INIT_FUNC_WATCHDOG_INIT
+@@ -84,4 +84,16 @@ int init_func_watchdog_reset(void);
+ #if defined(CONFIG_MPC85xx) && !defined(__ASSEMBLY__)
+ 	void init_85xx_watchdog(void);
+ #endif
++
++#if defined(CONFIG_WDT_LGM)
++void hw_watchdog_stop(void);
++void hw_watchdog_init(void);
++void hw_watchdog_start(void);
++extern void hw_watchdog_reset(void);
++#ifdef WATCHDOG_RESET
++#undef WATCHDOG_RESET
++#define WATCHDOG_RESET hw_watchdog_reset
++#endif
++#endif /* CONFIG_WDT_LGM */
++
+ #endif /* _WATCHDOG_H_ */

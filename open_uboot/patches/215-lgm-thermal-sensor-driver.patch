@@ -1,0 +1,574 @@
+# HG changeset patch
+# Parent  6d532815a6779731c711e51b194c2bda5728c112
+
+diff --git a/drivers/thermal/lgm_thermal.c b/drivers/thermal/lgm_thermal.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/thermal/lgm_thermal.c
+@@ -0,0 +1,200 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include <common.h>
++#include <asm/io.h>
++#include <dm.h>
++#include <errno.h>
++#include <malloc.h>
++#include <thermal.h>
++#include "lgm_thermal.h"
++
++#define PVT_TST_NUM 0xC
++
++#define PVT_SENSOR_IRQ_EN 0xE0680040
++#define PVT_SENSOR_PVT_TST_NUM 0xE068000C
++#define IRQ_EN_TS_IRQ_ENABLE_POS 1
++
++
++/* channel:  0 - 3: 0 = temperature
++ *		   1 = voltage
++ *	   	   2 = process
++ */
++struct lgm_thermal_plat {
++	u32 regbase;
++	int channel;
++};
++
++static int lgm_set_device_sensor(struct udevice *dev, int sensor)
++{
++	struct lgm_thermal_plat *pvt_dev = dev_get_priv(dev);
++	
++	if (!pvt_dev)
++		return 1;
++
++	pvt_dev->channel = sensor;
++	return 0;
++}
++
++int wait_for_spdif_ready(u32 base, int timeout_val)
++{
++	int counter = 0;
++
++	while (readl(base + TS_SDIF_STATUS) & 3) {
++		counter++;
++		if (counter >= timeout_val)
++			return -1;
++	}
++
++	return 0;
++}
++
++static int lgm_get_temperature(struct udevice *dev, int *temp)
++{
++	struct lgm_thermal_plat *pvt_dev = dev_get_priv(dev);
++	int chan;
++	int timeout = 0xFFFF;
++	u32 data, reg;
++	u32 spdif_data;
++	u8 spdif_addr;
++	int ret, int_data;
++
++	if (!pvt_dev)
++		return 1;
++
++	reg = pvt_dev->regbase;
++	chan = pvt_dev->channel;
++
++	if (chan > 4) {
++		printf("Channel is betwen 0-4\n");
++		return 1;
++	}
++
++	/* Set IRQ for TS */
++	writel(readl(reg + PVT_SENSOR_IRQ_EN) | IRQ_EN_TS_IRQ_ENABLE_POS,
++			reg + PVT_SENSOR_IRQ_EN);
++	/* Irq AlarmA/AlarmB, sampleDone and sampleFault */
++	writel(TS_IRQ_EN_SETTINGS, reg + TS_0_IRQ_ENABLE + 0x40 * chan);
++	/* Disable IRQ for PD & VM */
++	writel(0, reg + PD_0_IRQ_ENABLE + 0x40 * chan);
++	writel(0, reg + VM_0_IRQ_ENABLE + 0x200 * chan);
++	/* Set AlarmA for TS, [31:16]  ALARM_THRESH */
++	writel(ALARM_CONFIG, reg + TS_0_ALARMA_CFG + 0x40 * chan);
++	/* Set AlarmB for TS, [15:00]  HYST_THRESH */
++	writel(ALARM_CONFIG, reg + TS_0_ALARMB_CFG + 0x40 * chan);
++	/* 0: sample counter enabled,1:0,2:0 */
++	writel(0, reg + TS_SMPL_CTRL);
++	/* PVT Sample HiLo Control */
++	writel(TS_HILI_RESET_0_SMPL_HI_CLR_MASK,
++		reg + TS_0_HILO_RESET + 0x40 * chan);
++	/*Clk config */
++	writel(0, reg + TS_SDIF_HALT);
++	/* Enable TS */
++	writel(0, reg + TS_SDIF_DISABLE);
++	/* Configure the clock synth: clk_ts = clk_sys/(2+3)=40/5=8MHz */
++	writel((CLK_SYNTH_EN | CLK_SYNTH_HOLD
++		| CLK_SYNTH_HI | CLK_SYNTH_LO),
++		reg + TS_CLK_SYNTH);
++
++	ret = wait_for_spdif_ready(reg, timeout);
++	if (ret)
++		goto timeout;
++
++	/* Configure the SDA registers */
++	/* Program TS SDIF ip_ctrl, cload, cont, reset */
++	/* reg: 0x88000116 */
++	spdif_data = 0x116;
++	spdif_addr = 0x0;
++	writel((TS_SPDIF_SEND_MSG | (spdif_addr << TS_SDIF_ADDR_POS)
++		| spdif_data), reg + TS_SDIF);
++	ret = wait_for_spdif_ready(reg, timeout);
++	if (ret)
++		goto timeout;
++
++	/* Program TS SDIF ip_tmr, power up delay */
++	/* reg: 0x8D000100 */
++	spdif_data = 0x100;
++	spdif_addr = 0x5;
++	writel((TS_SPDIF_SEND_MSG | (spdif_addr << TS_SDIF_ADDR_POS)
++		| spdif_data), reg + TS_SDIF);
++	ret = wait_for_spdif_ready(reg, timeout);
++	if (ret)
++		goto timeout;
++
++	/* Program TS SDIF ip_cfg, cfg0 = 1 */
++	/* reg: 0x89000001 */
++	spdif_data = 0x0001;
++	spdif_addr = 0x01;
++	writel((TS_SPDIF_SEND_MSG | (spdif_addr << TS_SDIF_ADDR_POS)
++		| spdif_data), reg + TS_SDIF);
++	ret = wait_for_spdif_ready(reg, timeout);
++	if (ret)
++		goto timeout;
++
++	/* program TS SDIF ip_data */
++	/* reg: 0x8BFFBBFF */
++	spdif_data = 0xFFBBFF;
++	spdif_addr = 0x03;
++	writel((TS_SPDIF_SEND_MSG | (spdif_addr << TS_SDIF_ADDR_POS)
++		| spdif_data), reg + TS_SDIF);
++	ret = wait_for_spdif_ready(reg, timeout);
++	if (ret)
++		goto timeout;
++
++	/* wait for TS data */
++	while (readl(reg + TS_0_SDIF_DONE + 0x40 * chan) != 1) {
++		timeout--;
++		if (timeout <= 0)
++			goto timeout;
++	}
++
++	data = readl(reg + TS_0_SDIF_DATA  + 0x40 * chan);
++	/* Calculate temp */
++	int_data = (int)(data & 0xFFFF);
++	*temp =  (int_data * 50 - 43780) / 1000;
++	return 0;
++
++timeout:
++	printf("timeout waiting for SDIF interface\n");
++	return -EBUSY;
++}
++
++static int lgm_thermal_probe(struct udevice *dev)
++{
++	struct lgm_thermal_plat *priv = dev_get_priv(dev);
++
++	if (!priv)
++		return 1;
++
++	priv->regbase = fdtdec_get_uint(gd->fdt_blob,
++			dev_of_offset(dev), "reg", dev_seq(dev));
++
++	/* Read scratch reg to verify */
++	writel(0x12345678, priv->regbase + PVT_TST_NUM);
++	if (readl(priv->regbase + PVT_TST_NUM) != 0x12345678)
++		return 1;
++
++	return 0;
++}
++
++static const struct dm_thermal_ops lgm_thermal_ops = {
++	.get_temp	= lgm_get_temperature,
++	.set_device_sensor = lgm_set_device_sensor,
++};
++
++static const struct udevice_id lgm_thermal_ids[] = {
++	{ .compatible = "mxl,pvt-sensor" },
++	{}
++};
++
++U_BOOT_DRIVER(lgm_thermal) = {
++	.name	= "lgm_thermal",
++	.id	= UCLASS_THERMAL,
++	.of_match = lgm_thermal_ids,
++	.ops	= &lgm_thermal_ops,
++	.probe	= lgm_thermal_probe,
++	.priv_auto = sizeof(struct lgm_thermal_plat),
++	.flags  = DM_FLAG_PRE_RELOC,
++};
+diff --git a/drivers/thermal/lgm_thermal.h b/drivers/thermal/lgm_thermal.h
+new file mode 100644
+--- /dev/null
++++ b/drivers/thermal/lgm_thermal.h
+@@ -0,0 +1,317 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#ifndef _LGM_THERMAL_H_
++#define _LGM_THERMAL_H_
++
++/*------------------------------------------------------
++ TS Register Offset Address starts from 0x00000080
++ to 0x00000180
++------------------------------------------------------*/
++/* TS COMMON Register Details  */
++#define TS_CLK_SYNTH		0x00000080
++#define TS_SDIF_DISABLE		0x00000084
++#define TS_SDIF_STATUS		0x00000088
++#define TS_SDIF				0x0000008C
++#define TS_SDIF_HALT		0x00000090
++#define TS_SDIF_CTRL		0x00000094
++#define TS_SMPL_CTRL		0x000000A0
++#define TS_SMPL_CLR			0x000000A4
++#define TS_SMPL_CNT			0x000000A8
++
++/*TS Individual Macro Register 0 */
++#define TS_0_IRQ_ENABLE		0x000000C0
++#define TS_0_IRQ_STATUS		0x000000C4
++#define TS_0_IRQ_CLR		0x000000C8
++#define TS_0_IRQ_TEST		0x000000CC
++#define TS_0_SDIF_RDATA		0x000000D0
++#define TS_0_SDIF_DONE		0x000000D4
++#define TS_0_SDIF_DATA		0x000000D8
++#define TS_0_ALARMA_CFG		0x000000E0
++#define TS_0_ALARMB_CFG		0x000000E4
++#define TS_0_SMPL_HILO		0x000000E8
++#define TS_0_HILO_RESET		0x000000EC
++
++/* TS Individual Macro Register 1 */
++#define TS_1_IRQ_ENABLE		0x00000100
++#define TS_1_IRQ_STATUS		0x00000104
++#define TS_1_IRQ_CLR		0x00000108
++#define TS_1_IRQ_TEST		0x0000010C
++#define TS_1_SDIF_RDATA		0x00000110
++#define TS_1_SDIF_DONE		0x00000114
++#define TS_1_SDIF_DATA		0x00000118
++#define TS_1_ALARMA_CFG		0x00000120
++#define TS_1_ALARMB_CFG		0x00000124
++#define TS_1_SMPL_HILO		0x00000128
++#define TS_1_HILO_RESET		0x0000012C
++
++/* TS Individual Macro Register 2 */
++#define TS_2_IRQ_ENABLE		0x00000140
++#define TS_2_IRQ_STATUS		0x00000144
++#define TS_2_IRQ_CLR		0x00000148
++#define TS_2_IRQ_TEST		0x0000014C
++#define TS_2_SDIF_RDATA		0x00000150
++#define TS_2_SDIF_DONE		0x00000154
++#define TS_2_SDIF_DATA		0x00000158
++#define TS_2_ALARMA_CFG		0x00000160
++#define TS_2_ALARMB_CFG		0x00000164
++#define TS_2_SMPL_HILO		0x00000168
++#define TS_2_HILO_RESET		0x0000016C
++
++/* TS Individual Macro Register 3 */
++#define TS_3_IRQ_ENABLE		0x00000180
++#define TS_3_IRQ_STATUS		0x00000184
++#define TS_3_IRQ_CLR		0x00000188
++#define TS_3_IRQ_TEST		0x0000018C
++#define TS_3_SDIF_RDATA		0x00000190
++#define TS_3_SDIF_DONE		0x00000194
++#define TS_3_SDIF_DATA		0x00000198
++#define TS_3_ALARMA_CFG		0x000001A0
++#define TS_3_ALARMB_CFG		0x000001A4
++#define TS_3_SMPL_HILO		0x000001A8
++#define TS_3_HILO_RESET		0x000001AC
++
++/* TS Individual Macro Register 4 */
++#define TS_4_IRQ_ENABLE		0x000001C0
++#define TS_4_IRQ_STATUS		0x000001C4
++#define TS_4_IRQ_CLR		0x000001C8
++#define TS_4_IRQ_TEST		0x000001CC
++#define TS_4_SDIF_RDATA		0x000001D0
++#define TS_4_SDIF_DONE		0x000001D4
++#define TS_4_SDIF_DATA		0x000001D8
++#define TS_4_ALARMA_CFG		0x000001E0
++#define TS_4_ALARMB_CFG		0x000001E4
++#define TS_4_SMPL_HILO		0x000001E8
++#define TS_4_HILO_RESET		0x000001EC
++
++/*----------------------------------------------------
++ PD Register Offset Address starts from 0x00000200
++ to 0x00000380
++----------------------------------------------------*/
++#define PD_CLK_SYNTH		0x00000200	
++#define PD_SDIF_DISABLE		0x00000204
++#define PD_SDIF_STATUS		0x00000208
++#define PD_SDIF				0x0000020C
++#define PD_SDIF_HALT		0x00000210
++#define PD_SDIF_CTRL		0x00000214
++#define PD_SMPL_CTRL		0x00000220
++#define PD_SMPL_CLR			0x00000224
++#define PD_SMPL_CNT			0x00000228
++
++/*PD Individual Macro Register 0 */
++#define PD_0_IRQ_ENABLE		0x00000240
++#define PD_0_IRQ_STATUS		0x00000244
++#define PD_0_IRQ_CLR		0x00000248
++#define PD_0_IRQ_TEST		0x0000024C
++#define PD_0_SDIF_RDATA		0x00000250
++#define PD_0_SDIF_DONE		0x00000254
++#define PD_0_SDIF_DATA		0x00000258
++#define PD_0_ALARMA_CFG		0x00000260
++#define PD_0_ALARMB_CFG		0x00000264
++#define PD_0_SMPL_HILO		0x00000268
++#define PD_0_HILO_RESET		0x0000026C
++
++/* PD Individual Macro Register 1 */
++#define PD_1_IRQ_ENABLE		0x00000280 
++#define PD_1_IRQ_STATUS		0x00000284
++#define PD_1_IRQ_CLR		0x00000288
++#define PD_1_IRQ_TEST		0x0000028C
++#define PD_1_SDIF_RDATA		0x00000290
++#define PD_1_SDIF_DONE		0x00000294
++#define PD_1_SDIF_DATA		0x00000298
++#define PD_1_ALARMA_CFG		0x000002A0
++#define PD_1_ALARMB_CFG		0x000002A4
++#define PD_1_SMPL_HILO		0x000002A8
++#define PD_1_HILO_RESET		0x000002AC
++
++/* PD Individual Macro Register 2 */
++#define PD_2_IRQ_ENABLE		0x000002C0
++#define PD_2_IRQ_STATUS		0x000002C4
++#define PD_2_IRQ_CLR		0x000002C8
++#define PD_2_IRQ_TEST		0x000002CC
++#define PD_2_SDIF_RDATA		0x000002D0
++#define PD_2_SDIF_DONE		0x000002D4
++#define PD_2_SDIF_DATA		0x000002D8
++#define PD_2_ALARMA_CFG		0x000002E0
++#define PD_2_ALARMB_CFG		0x000002E4
++#define PD_2_SMPL_HILO		0x000002E8
++#define PD_2_HILO_RESET		0x000002EC
++
++/* PD Individual Macro Register 3 */
++#define PD_3_IRQ_ENABLE		0x00000300 
++#define PD_3_IRQ_STATUS		0x00000304
++#define PD_3_IRQ_CLR		0x00000308
++#define PD_3_IRQ_TEST		0x0000030C
++#define PD_3_SDIF_RDATA		0x00000310
++#define PD_3_SDIF_DONE		0x00000314
++#define PD_3_SDIF_DATA		0x00000318
++#define PD_3_ALARMA_CFG		0x00000320
++#define PD_3_ALARMB_CFG		0x00000324
++#define PD_3_SMPL_HILO		0x00000328
++#define PD_3_HILO_RESET		0x0000032C
++
++/* PD Individual Macro Register 4 */
++#define PD_4_IRQ_ENABLE		0x00000340 
++#define PD_4_IRQ_STATUS		0x00000344
++#define PD_4_IRQ_CLR		0x00000348
++#define PD_4_IRQ_TEST		0x0000034C
++#define PD_4_SDIF_RDATA		0x00000350
++#define PD_4_SDIF_DONE		0x00000354
++#define PD_4_SDIF_DATA		0x00000358
++#define PD_4_ALARMA_CFG		0x00000360
++#define PD_4_ALARMB_CFG		0x00000364
++#define PD_4_SMPL_HILO		0x00000368
++#define PD_4_HILO_RESET		0x0000036C
++
++/*----------------------------------------------------
++ VM Register Offset Address starts from 0x00000400
++ Must re-confirm gap (VM_0_IRQ_ENABLE - VM_CLK_SYNTH) 
++ 	0x200 or 0x400
++------------------------------------------------------*/
++#define VM_CLK_SYNTH		0x00000400 
++#define VM_SDIF_DISABLE		0x00000404
++#define VM_SDIF_STATUS		0x00000408
++#define VM_SDIF				0x0000040C
++#define VM_SDIF_HALT		0x00000410
++#define VM_SDIF_CTRL		0x00000414
++#define VM_SMPL_CTRL		0x00000420
++#define VM_SMPL_CLR			0x00000424
++#define VM_SMPL_CNT			0x00000428
++
++
++/*VM Individual Macro Register 0 */
++#define VM_0_IRQ_ENABLE			0x00000600
++#define VM_0_IRQ_STATUS			0x00000604
++#define VM_0_IRQ_CLR			0x00000608
++#define VM_0_IRQ_TEST			0x0000060C
++#define VM_0_ALARMA_ENABLE		0x00000610
++#define VM_0_ALARMA_STATUS		0x00000614
++#define VM_0_ALARMA_CLR			0x00000618
++#define VM_0_ALARMA_TEST		0x0000061C
++#define VM_0_ALARMB_ENABLE		0x00000620
++#define VM_0_ALARMB_STATUS		0x00000624
++#define VM_0_ALARMB_CLR			0x00000628
++#define VM_0_ALARMB_TEST		0x0000062C
++#define VM_0_SDIF_RDATA			0x00000630
++#define VM_0_SDIF_DONE			0x00000634
++
++#define VM_0_CH_0_SDIF_DATA		0x00000640
++#define VM_0_CH_0_ALARMA_CFG	0x00000680
++#define VM_0_CH_0_ALARMB_CFG	0x00000684
++#define VM_0_CH_0_SMPL_HILO		0x00000688
++#define VM_0_CH_0_HILO_RESET	0x0000068C
++
++/* VM Individual Macro Register 1 */
++#define VM_1_IRQ_ENABLE			0x00000800 
++#define VM_1_IRQ_STATUS			0x00000804
++#define VM_1_IRQ_CLR			0x00000808
++#define VM_1_IRQ_TEST			0x0000080C
++#define VM_1_IRQ_ALARMA_ENABLE	0x00000810
++#define VM_1_IRQ_ALARMA_STATUS	0x00000814
++#define VM_1_IRQ_ALARMA_CLR		0x00000818
++#define VM_1_IRQ_ALARMA_TEST	0x0000081C
++#define VM_1_IRQ_ALARMB_ENABLE	0x00000820
++#define VM_1_IRQ_ALARMB_STATUS	0x00000824
++#define VM_1_IRQ_ALARMB_CLR		0x00000828
++#define VM_1_IRQ_ALARMB_TEST	0x0000082C
++#define VM_1_SDIF_RDATA			0x00000830
++#define VM_1_SDIF_DONE			0x00000834
++
++#define VM_1_CH_0_SDIF_DATA		0x00000840
++#define VM_1_CH_0_ALARMA_CFG	0x00000880
++#define VM_1_CH_0_ALARMB_CFG	0x00000884
++#define VM_1_CH_0_SMPL_HILO		0x00000888
++#define VM_1_CH_0_HILO_RESET	0x0000088C
++
++/* VM Individual Macro Register 2 */
++#define VM_2_IRQ_ENABLE			0x00000A00 
++#define VM_2_IRQ_STATUS			0x00000A04
++#define VM_2_IRQ_CLR			0x00000A08
++#define VM_2_IRQ_TEST			0x00000A0C
++#define VM_2_IRQ_ALARMA_ENABLE	0x00000A10
++#define VM_2_IRQ_ALARMA_STATUS	0x00000A14
++#define VM_2_IRQ_ALARMA_CLR		0x00000A18
++#define VM_2_IRQ_ALARMA_TEST	0x00000A1C
++#define VM_2_IRQ_ALARMB_ENABLE	0x00000A20
++#define VM_2_IRQ_ALARMB_STATUS	0x00000A24
++#define VM_2_IRQ_ALARMB_CLR		0x00000A28
++#define VM_2_IRQ_ALARMB_TEST	0x00000A2C
++#define VM_2_SDIF_RDATA			0x00000A30
++#define VM_2_SDIF_DONE			0x00000A34
++
++#define VM_2_CH_0_SDIF_DATA		0x00000A40
++#define VM_2_CH_0_ALARMA_CFG	0x00000A80
++#define VM_2_CH_0_ALARMB_CFG	0x00000A84
++#define VM_2_CH_0_SMPL_HILO		0x00000A88
++#define VM_2_CH_0_HILO_RESET	0x00000A8C
++
++/* VM Individual Macro Register 3 */
++#define VM_3_IRQ_ENABLE			0x00000C00
++#define VM_3_IRQ_STATUS			0x00000C04
++#define VM_3_IRQ_CLR			0x00000C08
++#define VM_3_IRQ_TEST			0x00000C0C
++#define VM_3_IRQ_ALARMA_ENABLE	0x00000C10
++#define VM_3_IRQ_ALARMA_STATUS	0x00000C14
++#define VM_3_IRQ_ALARMA_CLR		0x00000C18
++#define VM_3_IRQ_ALARMA_TEST	0x00000C1C
++#define VM_3_IRQ_ALARMB_ENABLE	0x00000C20
++#define VM_3_IRQ_ALARMB_STATUS	0x00000C24
++#define VM_3_IRQ_ALARMB_CLR		0x00000C28
++#define VM_3_IRQ_ALARMB_TEST	0x00000C2C
++#define VM_3_SDIF_RDATA			0x00000C30
++#define VM_3_SDIF_DONE			0x00000C34
++
++#define VM_3_CH_0_SDIF_DATA		0x00000C40
++#define VM_3_CH_0_ALARMA_CFG	0x00000C80
++#define VM_3_CH_0_ALARMB_CFG	0x00000C84
++#define VM_3_CH_0_SMPL_HILO		0x00000C88
++#define VM_3_CH_0_HILO_RESET	0x00000C8C
++
++/* VM Individual Macro Register 4 */
++#define VM_4_IRQ_ENABLE			0x00000E00
++#define VM_4_IRQ_STATUS			0x00000E04
++#define VM_4_IRQ_CLR			0x00000E08
++#define VM_4_IRQ_TEST			0x00000E0C
++#define VM_4_IRQ_ALARMA_ENABLE	0x00000E10
++#define VM_4_IRQ_ALARMA_STATUS	0x00000E14
++#define VM_4_IRQ_ALARMA_CLR		0x00000E18
++#define VM_4_IRQ_ALARMA_TEST	0x00000E1C
++#define VM_4_IRQ_ALARMB_ENABLE	0x00000E20
++#define VM_4_IRQ_ALARMB_STATUS	0x00000E24
++#define VM_4_IRQ_ALARMB_CLR		0x00000E28
++#define VM_4_IRQ_ALARMB_TEST	0x00000E2C
++#define VM_4_SDIF_RDATA			0x00000E30
++#define VM_4_SDIF_DONE			0x00000E34
++
++#define VM_4_CH_0_SDIF_DATA		0x00000E40
++#define VM_4_CH_0_ALARMA_CFG	0x00000E80
++#define VM_4_CH_0_ALARMB_CFG	0x00000E84
++#define VM_4_CH_0_SMPL_HILO		0x00000E88
++#define VM_4_CH_0_HILO_RESET		0x00000E8C
++
++#define TS_IRQ_ENABLE_0_IRQ_EN_ALARMB_MASK 0x10u
++#define TS_IRQ_ENABLE_0_IRQ_EN_ALARMA_MASK 0x8u
++#define TS_IRQ_ENABLE_0_IRQ_EN_DONE_MASK 0x2u
++#define TS_IRQ_ENABLE_0_IRQ_EN_FAULT_MASK 0x1u
++#define TS_IRQ_EN_SETTINGS TS_IRQ_ENABLE_0_IRQ_EN_ALARMB_MASK \
++			| TS_IRQ_ENABLE_0_IRQ_EN_ALARMA_MASK \
++			| TS_IRQ_ENABLE_0_IRQ_EN_DONE_MASK \
++			| TS_IRQ_ENABLE_0_IRQ_EN_FAULT_MASK
++#define TS_ALARM_CFG_0_ALARM_THRESH_POS	16
++#define ALARM_THRESH	0x05B0
++#define HYST_THRESH	0x0600
++#define ALARM_CONFIG	(0x05B0 << TS_ALARM_CFG_0_ALARM_THRESH_POS) \
++			| HYST_THRESH
++#define TS_HILI_RESET_0_SMPL_HI_CLR_MASK 0x2
++#define CLK_SYNTH_LO	0x02
++#define CLK_SYNTH_HI	(1 << 8)
++#define CLK_SYNTH_HOLD	(1 << 16)
++#define CLK_SYNTH_EN	(1 << 24)
++#define TS_SDIF_SDIF_PROG	0x80000000u
++#define TS_SDIF_SDIF_WRN	0x8000000u
++#define TS_SDIF_ADDR_POS	24
++#define TS_SPDIF_SEND_MSG	TS_SDIF_SDIF_PROG | TS_SDIF_SDIF_WRN
++
++#endif
+diff --git a/drivers/thermal/thermal-uclass.c b/drivers/thermal/thermal-uclass.c
+--- a/drivers/thermal/thermal-uclass.c
++++ b/drivers/thermal/thermal-uclass.c
+@@ -25,6 +25,16 @@ int thermal_get_temp(struct udevice *dev
+ 	return ops->get_temp(dev, temp);
+ }
+ 
++int thermal_set_sensor(struct udevice *dev, int sensor)
++{
++	const struct dm_thermal_ops *ops = device_get_ops(dev);
++
++	if (!ops->set_device_sensor)
++		return -ENOSYS;
++
++	return ops->set_device_sensor(dev, sensor);
++}
++
+ UCLASS_DRIVER(thermal) = {
+ 	.id		= UCLASS_THERMAL,
+ 	.name		= "thermal",
+diff --git a/include/thermal.h b/include/thermal.h
+--- a/include/thermal.h
++++ b/include/thermal.h
+@@ -10,6 +10,7 @@
+ struct udevice;
+ 
+ int thermal_get_temp(struct udevice *dev, int *temp);
++int thermal_set_sensor(struct udevice *dev, int sensor);
+ 
+ /**
+  * struct dm_thermal_ops - Driver model Thermal operations
+@@ -28,6 +29,12 @@ struct dm_thermal_ops {
+ 	 * @temp:	pointer that returns the measured temperature
+ 	 */
+ 	int (*get_temp)(struct udevice *dev, int *temp);
++	/* Set sensor to be probed
++	 * 
++	 * Some devices may have multiple sensors. This is to be called
++	 * before getting the temp (if needed).
++	 */
++	int (*set_device_sensor)(struct udevice *dev, int sensor);
+ };
+ 
+ #endif	/* _THERMAL_H_ */

@@ -1,0 +1,456 @@
+# HG changeset patch
+# Parent  7b9bbe54138f9947c48e7dab12638d9645a7f5d8
+
+diff --git a/cmd/mxl/cmd_mxl_commit.c b/cmd/mxl/cmd_mxl_commit.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_mxl_commit.c
+@@ -0,0 +1,359 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ * Commit early boot images
++ */
++
++#include <common.h>
++#include <command.h>
++#include <mmc.h>
++#include <part.h>
++#include <fs.h>
++#include <div64.h>
++#include <memalign.h>
++#include <asm/secureboot.h>
++#include <configs/maxlinear/udt.h>
++
++#define USER_PARTITION			0
++#define BOOT_PARTITION_0		1
++#define BOOT_PARTITION_1		2
++#define EMMC_BLOCK_SIZE			0x200
++#define SIZE_OF_IBRH_HEAD		0x800
++#define SIZE_OF_IBRH_TAIL		0xC
++#define SIZE_OF_MKIMAGE_HEADER	0x40
++#define SIZE_OF_RBE			CONFIG_SPL_PAD_SIZE
++
++extern int auth_image(unsigned long src_addr, u32 image_len, int image_type);
++extern void svn_update_all(void);
++
++#ifdef CONFIG_BOOT_FROM_EMMC
++static int commit_emmc_boot_partition(void)
++{
++	int count, ret = 0;
++	int dev = mmc_get_env_dev();
++	char *img_buff = NULL;
++	ulong blkcnt;
++	struct mmc *mmc = find_mmc_device(dev);
++
++	/*** 1. IMAGE_ID_RBE from boot partition 0 ***/
++	/* select boot partition 0 */
++	ret = blk_select_hwpart_devnum(IF_TYPE_MMC, 0, BOOT_PARTITION_0);
++	if (ret) {
++		printf("error selecting BOOT_PARTITION_0\n");
++		goto err;
++	}
++
++	blkcnt = lldiv(SIZE_OF_RBE, EMMC_BLOCK_SIZE);
++	if (SIZE_OF_RBE % EMMC_BLOCK_SIZE) blkcnt++;
++	count = blk_dread(mmc_get_blk_desc(mmc), 0,
++				blkcnt, (u8 *)CONFIG_LOADADDR);
++	if (!count) {
++		printf("error reading from BOOT_PARTITION_0\n");
++		goto err;
++	}
++
++	/* make a copy of IMAGE_ID_RBE before authentication */
++	img_buff = memalign(64, SIZE_OF_RBE);
++	memmove(img_buff, (char *)CONFIG_LOADADDR, SIZE_OF_RBE);
++
++	/* authenticate IMAGE_ID_RBE */
++	ret = auth_image(CONFIG_LOADADDR + SIZE_OF_IBRH_HEAD + SIZE_OF_IBRH_TAIL,
++						0, IMAGE_ID_RBE);
++	if (ret) {
++		printf("IMAGE_ID_RBE image authentication failed <pass through>\n");
++		/* goto err; */
++	}
++
++	/* copy IMAGE_ID_RBE to boot partition 1 */
++	ret = blk_select_hwpart_devnum(IF_TYPE_MMC, 0, BOOT_PARTITION_1);
++	if (ret) {
++		printf("error selecting BOOT_PARTITION_1\n");
++		goto err;
++	}
++	count = blk_dwrite(mmc_get_blk_desc(mmc), 0,
++				blkcnt, (u8 *)img_buff);
++	if (!count) {
++		printf("error writing to BOOT_PARTITION_1\n");
++		goto err;
++	}
++
++	goto no_err;
++
++err:
++	update_udt_failure(UDT_IMAGE_COMMIT_FAILED, UPG_IMAGE_WRITE_FAIL);
++no_err:
++	free(img_buff);
++	return ret;
++}
++
++static int commit_emmc_fs_partition(void)
++{
++	int ret = 0;
++	char *filename = NULL;
++	char *img_buff_3 = NULL;
++	char *img_buff_4 = NULL;
++	loff_t rdsize, wrsize;
++
++	/*** 4. IMAGE_ID_KERNEL from user partition ***/
++	/* check fs avaiable in extended_boot_a (mmc 0:9) */
++	ret = fs_set_blk_dev("mmc", "0:9", FS_TYPE_ANY);
++	if (ret) {
++		printf("error accessing extended_boot_a\n");
++		goto err;
++	}
++
++	/* read IMAGE_ID_KERNEL from extended_boot_a */
++	filename = env_get("bootfile");
++	ret = fs_read(filename, CONFIG_LOADADDR, 0, 0, &rdsize);
++	if (ret < 0) {
++		printf("unable to read %s from extended_boot_a\n", filename);
++		goto err;
++	}
++
++	/* make a copy of IMAGE_ID_KERNEL before authentication */
++	img_buff_3 = memalign(64, rdsize);
++	memmove(img_buff_3, (char *)CONFIG_LOADADDR, rdsize);
++
++	/* authenticate IMAGE_ID_KERNEL */
++	ret = auth_image(CONFIG_LOADADDR + SIZE_OF_MKIMAGE_HEADER,
++						0, IMAGE_ID_KERNEL);
++	if (ret) {
++		printf("image authentication failed\n");
++		goto err;
++	}
++
++	/* copy IMAGE_ID_KERNEL to extended_boot_b */
++	/* check fs avaiable in extended_boot_b (mmc 0:a) */
++	ret = fs_set_blk_dev("mmc", "0:a", FS_TYPE_ANY);
++	if (ret) {
++		printf("error accessing extended_boot_b\n");
++		goto err;
++	}
++
++	/* write IMAGE_ID_KERNEL to extended_boot_b */
++	ret = fs_write(filename, (ulong)img_buff_3, 0, rdsize, &wrsize);
++	if (ret < 0) {
++		printf("unable to write %s from extended_boot_b\n", filename);
++		goto err;
++	}
++
++	/*** 5. IMAGE_ID_ROOTFS from user partition ***/
++	/* check fs avaiable in extended_boot_a (mmc 0:9) */
++	ret = fs_set_blk_dev("mmc", "0:9", FS_TYPE_ANY);
++	if (ret) {
++		printf("error accessing extended_boot_a\n");
++		goto err;
++	}
++
++	/* read IMAGE_ID_ROOTFS from extended_boot_a */
++	filename = env_get("rootfs");
++	ret = fs_read(filename, CONFIG_LOADADDR, 0, 0, &rdsize);
++	if (ret < 0) {
++		printf("unable to read %s from extended_boot_a\n", filename);
++		goto err;
++	}
++
++	/* make a copy of IMAGE_ID_ROOTFS before authentication */
++	img_buff_4 = memalign(64, rdsize);
++	memmove(img_buff_4, (char *)CONFIG_LOADADDR, rdsize);
++
++	/* authenticate IMAGE_ID_ROOTFS */
++	ret = auth_image(CONFIG_LOADADDR, 0, IMAGE_ID_ROOTFS);
++	if (ret) {
++		printf("image authentication failed\n");
++		goto err;
++	}
++
++	/* copy IMAGE_ID_ROOTFS to extended_boot_b */
++	/* check fs avaiable in extended_boot_b (mmc 0:a) */
++	ret = fs_set_blk_dev("mmc", "0:a", FS_TYPE_ANY);
++	if (ret) {
++		printf("error accessing extended_boot_b\n");
++		goto err;
++	}
++
++	/* write IMAGE_ID_ROOTFS to extended_boot_b */
++	ret = fs_write(filename, (ulong)img_buff_4, 0, rdsize, &wrsize);
++	if (ret < 0) {
++		printf("unable to write %s from extended_boot_a\n", filename);
++		goto err;
++	}
++
++	goto no_err;
++
++err:
++	update_udt_failure(UDT_IMAGE_COMMIT_FAILED, UPG_IMAGE_WRITE_FAIL);
++no_err:
++	free(img_buff_3);
++	free(img_buff_4);
++	return ret;
++}
++
++static int chk_commit_emmc(void)
++{
++	int count, ret = 0;
++	int dev = mmc_get_env_dev();
++	char *img_buff_1 = NULL;
++	char *img_buff_2 = NULL;
++	ulong blksize = EMMC_BLOCK_SIZE;
++	unsigned long tep_size, uboot_size;
++	struct mmc *mmc = find_mmc_device(dev);
++	struct disk_partition part;
++
++	if (commit_emmc_boot_partition()) {
++		printf("error commit image to boot partition\n");
++		goto err;
++	}
++
++	/* get user partition info */
++	ret = blk_dselect_hwpart(mmc_get_blk_desc(mmc), USER_PARTITION);
++	if (ret) {
++		printf("error reading info from USER_PARTITION\n");
++		goto err;
++	}
++
++	/* select user partition */
++	ret = blk_select_hwpart_devnum(IF_TYPE_MMC, 0, USER_PARTITION);
++	if (ret) {
++		printf("error selecting USER_PARTITION\n");
++		goto err;
++	}
++
++	/*** 2. IMAGE_ID_TEP from user partition ***/
++	/* get TEP firmware partition entry name */
++	ret = part_get_info_by_name(mmc_get_blk_desc(mmc), "tep_firmware_a", &part);
++	if (ret) {
++		printf("error cannot find USER_PARTITION.tep_firmware_a\n");
++		goto err;
++	}
++
++	if (!part.blksz)
++		blksize = part.blksz;
++
++	tep_size = part.size;
++	count = blk_dread(mmc_get_blk_desc(mmc), part.start,
++			  tep_size, (u8 *)CONFIG_LOADADDR);
++	if (!count) {
++		printf("error reading from USER_PARTITION.tep_firmware_a\n");
++		goto err;
++	}
++
++	/* make a copy of IMAGE_ID_RBE before authentication */
++	img_buff_1 = memalign(64, tep_size);
++	memmove(img_buff_1, (char *)CONFIG_LOADADDR, tep_size);
++
++	/* authenticate IMAGE_ID_TEP */
++	ret = auth_image(CONFIG_LOADADDR, 0, IMAGE_ID_TEP);
++	if (ret) {
++		printf("image authentication failed\n");
++		goto err;
++	}
++
++	/* copy IMAGE_ID_TEP to user partition by entry name */
++	ret = part_get_info_by_name(mmc_get_blk_desc(mmc), "tep_firmware_b", &part);
++	if (ret) {
++		printf("error cannot find USER_PARTITION.tep_firmware_b\n");
++		goto err;
++	}
++
++	count = blk_dwrite(mmc_get_blk_desc(mmc), part.start,
++			    tep_size, (u8 *)img_buff_1);
++	if (!count) {
++		printf("error writing to USER_PARTITION.tep_firmware_b\n");
++		goto err;
++	}
++
++	/*** 3. IMAGE_ID_UBOOT from user partition ***/
++	/* get U-Boot partition entry name */
++	ret = part_get_info_by_name(mmc_get_blk_desc(mmc), "uboot_a", &part);
++	if (ret) {
++		printf("error cannot find USER_PARTITION.uboot_a\n");
++		goto err;
++	}
++
++	if (!part.blksz)
++		blksize = part.blksz;
++
++	uboot_size = part.size;
++	count = blk_dread(mmc_get_blk_desc(mmc), part.start,
++			  uboot_size, (u8 *)CONFIG_LOADADDR);
++	if (!count) {
++		printf("error reading from USER_PARTITION.uboot_a\n");
++		goto err;
++	}
++
++	/* make a copy of IMAGE_ID_UBOOT before authentication */
++	img_buff_2 = memalign(64, uboot_size);
++	memmove(img_buff_2, (char *)CONFIG_LOADADDR, uboot_size);
++
++	/* authenticate IMAGE_ID_UBOOT */
++	ret = auth_image(CONFIG_LOADADDR + SIZE_OF_MKIMAGE_HEADER,
++			 0, IMAGE_ID_UBOOT);
++	if (ret) {
++		printf("image authentication failed\n");
++		goto err;
++	}
++
++	/* copy IMAGE_ID_UBOOT to user partition by entry name */
++	ret = part_get_info_by_name(mmc_get_blk_desc(mmc), "uboot_b", &part);
++	if (ret) {
++		printf("error cannot find USER_PARTITION.uboot_b\n");
++		goto err;
++	}
++
++	count = blk_dwrite(mmc_get_blk_desc(mmc), part.start,
++			   uboot_size, (u8 *)img_buff_2);
++	if (!count) {
++		printf("error writing to USER_PARTITION.uboot_b\n");
++		goto err;
++	}
++
++	if (commit_emmc_fs_partition()) {
++		printf("error commit images to file system\n");
++		goto err;
++	}
++
++	goto no_err;
++
++err:
++	update_udt_failure(UDT_IMAGE_COMMIT_FAILED, UPG_IMAGE_WRITE_FAIL);
++no_err:
++	free(img_buff_1);
++	free(img_buff_2);
++	return ret;
++}
++#endif /* CONFIG_BOOT_FROM_EMMC */
++
++#ifdef CONFIG_BOOT_FROM_NAND
++static int chk_commit_nand(void)
++{
++	int result = 0;
++	return result;
++}
++#endif /* CONFIG_BOOT_FROM_NAND */
++
++static int do_mxl_commit(struct cmd_tbl *cmdtp, int flag, int argc, char * const argv[])
++{
++	int result = 0;
++
++	if (argc != 1)
++		return CMD_RET_USAGE;
++
++#ifdef CONFIG_BOOT_FROM_EMMC
++	result = chk_commit_emmc();
++#elif CONFIG_BOOT_FROM_NAND
++	result = chk_commit_nand();
++#endif
++
++	if (!result)
++		svn_update_all();
++
++	return 0;
++}
++
++U_BOOT_CMD(
++	mxl_commit, CONFIG_SYS_MAXARGS, 0, do_mxl_commit,
++	"commit all updated images",
++	"mxl_commit\n"
++);
+diff --git a/cmd/mxl/cmd_svn_update.c b/cmd/mxl/cmd_svn_update.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_svn_update.c
+@@ -0,0 +1,84 @@
++#include <common.h>
++#include <command.h>
++#include <asm/secureboot.h>
++
++u32 image_svn_value[SB_ROLLBACK_ID_ROOTFS + 1] = {0};
++u32 image_fsvn_value[SB_ROLLBACK_ID_ROOTFS + 1] = {0};
++u32 otp_svn_value[SB_ROLLBACK_ID_ROOTFS + 1] = {0};
++u32 otp_fsvn_value[SB_ROLLBACK_ID_ROOTFS + 1] = {0};
++
++void svn_update_all(void);
++
++static void get_otp_svn_values(void)
++{
++	int image_type;
++
++	for (image_type = SB_ROLLBACK_ID_RBE; image_type <= SB_ROLLBACK_ID_ROOTFS; image_type++)
++	{
++		otp_svn_value[image_type] = chk_rollback_id(image_type);
++
++#if defined(CONFIG_FLEXI_RBID)
++		otp_fsvn_value[image_type] = chk_flexi_rbid(image_type);
++#endif
++	}
++}
++
++static void otp_svn_update(int image_type)
++{
++	upd_rollback_id(image_type, image_svn_value[image_type]);
++}
++
++#if defined(CONFIG_FLEXI_RBID)
++static void otp_fsvn_update(int image_type)
++{
++	upd_flexi_rbid(image_type, image_fsvn_value[image_type]);
++}
++#endif
++
++void svn_update_all(void)
++{
++	int image_type;
++
++	get_otp_svn_values();
++
++	/* special handling for RBE image svn */
++#if defined(CONFIG_RBE_ROLLBACKID_VALUE)
++	image_svn_value[SB_ROLLBACK_ID_RBE] = CONFIG_RBE_ROLLBACKID_VALUE;
++#else
++	image_svn_value[SB_ROLLBACK_ID_RBE] = 0;
++#endif
++
++	for (image_type = SB_ROLLBACK_ID_RBE; image_type <= SB_ROLLBACK_ID_ROOTFS; image_type++)
++	{
++		if (image_svn_value[image_type] > otp_svn_value[image_type])
++		{
++			otp_svn_update(image_type);
++		}
++
++#if defined(CONFIG_FLEXI_RBID)
++		if (otp_fsvn_value[image_type] != 0) /* flexible policy */
++		{
++			if (image_fsvn_value[image_type] > otp_fsvn_value[image_type])
++			{
++				otp_fsvn_update(image_type);
++			}
++		}
++#endif
++	}
++}
++
++static int do_svn_update(struct cmd_tbl *cmdtp, int flag, int argc, char * const argv[])
++{
++	if (argc != 1)
++		return CMD_RET_USAGE;
++
++	svn_update_all();
++
++	return 0;
++}
++
++U_BOOT_CMD(
++	svn_update, CONFIG_SYS_MAXARGS, 0, do_svn_update,
++	"update svn values into OTP",
++	"svn_update\n"
++);

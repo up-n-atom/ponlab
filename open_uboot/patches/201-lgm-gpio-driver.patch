@@ -1,0 +1,614 @@
+# HG changeset patch
+# Parent  d34d25bc681f1878ca5c16e1ae667f8e528b8b26
+
+diff --git a/doc/device-tree-bindings/gpio/mxl,x86-lightning-mountain-gpio.txt b/doc/device-tree-bindings/gpio/mxl,x86-lightning-mountain-gpio.txt
+new file mode 100644
+--- /dev/null
++++ b/doc/device-tree-bindings/gpio/mxl,x86-lightning-mountain-gpio.txt
+@@ -0,0 +1,63 @@
++Maxlinear Corporation GPIO/Mux driver.
++
++The GPIO driver is extended to include a mux component to reduce the
++complexity of what is supported and most importantly to reduce the overall
++footprint of the U-boot for Lightning Mountain.
++
++It consists of 4 GPIO/MUX banks and each bank contains up to 32 GPIO pins.
++Input value:  0 [PIN_INPUT]
++Output value: 1 [PIN_OUTPUT]
++Mux function can take values of 0, 1, 2, 3 [GPIO_MODE_FUNCn]
++
++Required properties:
++- compatible : "mxl,lgm-gpio"
++- #gpio-cells : Must be three to include the mux function of the defined
++  gpio pins.
++- ngpios : Number of pins of the bank.
++- gpio-controller : Marks the device node as a GPIO controller.
++
++Optional:
++- gpio-default : This defines the default GPIO configurations that needs
++  to be configured during boot-time. This can be ommited if such requirements
++  are not needed for that specific board/platform.
++
++For example:
++
++gpio0: gpio@e2800000 {
++	gpio-controller;
++	#gpio-cells = <3>;
++	compatible = "mxl,lgm-gpio";
++	reg = <0xe2800000 0x80>,
++		<0xe2880000 0x100>;
++	ngpios = <32>;
++
++	gpio-default = <&gpio2 17 PIN_OUTPUT GPIO_MODE_FUNC2>,
++		       <&gpio2 10 PIN_OUTPUT GPIO_MODE_FUNC0>;
++};
++
++The default gpio configurations can also be defined in each indivual GPIO
++device nodes as such:
++
++&gpio2 {
++	gpio-default = <&gpio2 17 PIN_OUTPUT GPIO_MODE_FUNC2>,
++		       <&gpio2 10 PIN_OUTPUT GPIO_MODE_FUNC0>,
++};
++
++Extending this, within each respective peripheral device nodes, the
++definition of the device's GPIO requirements have to be
++spelt out in this format:
++
++  <gpio-name> = <&[gpio-bank] [pin #] [input/output] [function]>
++
++For example:
++
++&i2c0 {
++	i2c-sda = <&gpio0 12 PIN_INPUT GPIO_MODE_FUNC2>;
++	i2c-scl = <&gpio0 20 PIN_INPUT GPIO_MODE_FUNC2>;
++
++	pmic@6a {
++		compatible = "intel,bd2653swv";
++		reg = <0x6a>;
++		status = "okay";
++	};
++};
+diff --git a/drivers/gpio/lgm_gpio.c b/drivers/gpio/lgm_gpio.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/gpio/lgm_gpio.c
+@@ -0,0 +1,515 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (c) 2018, Intel Corporation.
++ * Copyright (C) 2020-2022 MaxLinear, Inc
++ *
++ * Lightning Mountain GPIO driver
++ */
++
++#include <asm/gpio.h>
++#include <asm/io.h>
++#include <asm/arch/project.h>
++#include <common.h>
++#include <lgm_gpio.h>
++
++#include <dt-bindings/gpio/gpio.h>
++#include <dm.h>
++#include <fdtdec.h>
++
++#define GPIO_HW 2
++#define MAX_GPIO 104
++
++int gpio_init = 0;
++short gpio_stat[MAX_GPIO];
++
++struct gpio_plat_data {
++	u32 *base;
++	u32 *pmux_base;
++	int function;
++};
++
++/* Checked if pins are reserved for U-boot
++ * functionality
++ */
++int check_reserved(unsigned int gpio)
++{
++	if (gpio >= MAX_GPIO)
++		return -EINVAL;
++
++	/* alt fn 0 = gpio mode else reserved */
++	if (gpio_stat[gpio] != 0)
++		return 1;
++
++	return 0;
++}
++
++static int gpio_get_bank(unsigned int gpio)
++{
++	int bank = -1;
++
++	switch (gpio) {
++	case 0 ... 31:
++		bank = 0;
++		break;
++	case 32 ... 63:
++		bank = 1;
++		break;
++	case 64 ... 95:
++		bank = 2;
++		break;
++	case 96 ... 103:
++		bank = 3;
++		break;
++	default:
++		printf("Error %d value out of range\n", gpio);
++	}
++
++	return bank;
++}
++
++#ifndef CONFIG_DM_GPIO
++int gpio_free(unsigned int gpio)
++{
++	return 0;
++}
++
++int gpio_request(unsigned int gpio, const char *label)
++{
++	return 0;
++}
++
++/* ret: 1 -- output
++ * ret: 0 -- input
++ */
++int gpio_get_direction(unsigned int gpio)
++{
++	int bank;
++	int dir;
++
++	bank = gpio_get_bank(gpio);
++	if (bank < 0)
++		return -EINVAL;
++
++	dir = readl(GPIO_FUNCTION_CONTROL_MODULE_BASE + 0x100 * bank + DIR_0)
++			>> ((gpio - 32 * bank) & 0x1);
++	return dir;
++}
++
++/* Get input GPIO value */
++int gpio_get_value(unsigned int gpio)
++{
++	uint32_t value;
++	int bank;
++
++	bank = gpio_get_bank(gpio);
++	if (bank < 0)
++		return -EINVAL;
++
++	if (gpio_get_direction(gpio))
++		value = readl(GPIO_FUNCTION_CONTROL_MODULE_BASE
++				+ 0x100 * bank + OUT_0);
++	else
++		value = readl(GPIO_FUNCTION_CONTROL_MODULE_BASE
++				+ 0x100 * bank + IN_0);
++
++	return (value >> (gpio - 32 * bank)) & 0x1;
++}
++
++/* Set output GPIO value */
++int gpio_set_value(unsigned int gpio, int value)
++{
++	int bank;
++	u32 reg;
++
++	bank = gpio_get_bank(gpio);
++	if (bank < 0)
++		return -EINVAL;
++
++	reg = readl(GPIO_FUNCTION_CONTROL_MODULE_BASE
++			+ 0x100 * bank + OUT_0);
++	reg &= ~(1 << (gpio - 32 * bank));
++	reg |= ((value & 0x1) << (gpio - 32 * bank));
++	writel(reg, GPIO_FUNCTION_CONTROL_MODULE_BASE
++		+ 0x100 * bank + OUT_0);
++
++	return 0;
++}
++
++int gpio_direction_output(unsigned int gpio, int value)
++{
++	if (check_reserved(gpio)) {
++		printf("GPIO pin %d is reserved\n", gpio);
++		return -1;
++	}
++
++	config_gpio(gpio, GPIO_OUTPUT_DIR, GPIO_ALT_FUNC_0);
++
++	return gpio_set_value(gpio, value);
++}
++
++int gpio_direction_input(unsigned int gpio)
++{
++	if (check_reserved(gpio)) {
++		printf("GPIO pin %d is reserved\n", gpio);
++		return -1;
++	}
++
++	config_gpio(gpio, GPIO_INPUT_DIR, GPIO_ALT_FUNC_0);
++	return 0;
++}
++
++void gpio_info(void)
++{
++	int i, dir, func;
++	int bank;
++
++	printf("	 \tDirection\tValue\tFunction\tReserved?\n");
++	for (i = 0; i < MAX_GPIO; i++) {
++		printf("GPIO[%d]:\t", i);
++		/* direction */
++		dir = gpio_get_direction(i);
++		printf("%s\t\t", (dir) ? "OUTPUT" : "INPUT");
++
++		/* value */
++		printf("%d\t", gpio_get_value(i));
++
++		bank = gpio_get_bank(i);
++		if (bank < 0)
++			return;
++
++		/* function */
++		func = readl(GPIO_PAD_CONTROL_MODULE_BASE
++				+ 0x100 * bank + 4 * (i - 32 * bank));
++
++		printf("%d\t\t", (func & 0x3));
++
++		/* reserved ? */
++		printf("%s\n", (gpio_stat[i] != 0)
++			? "RESERVED" : "NOT-RESERVED");
++	}
++}
++#endif /* CONFIG_DM_GPIO */
++
++void pads_init_pin(unsigned int pin, unsigned int value)
++{
++	int bank;
++
++	bank = gpio_get_bank(pin);
++	if (bank < 0)
++		return;
++
++	writel(value, GPIO_PAD_CONTROL_MODULE_BASE
++		+ 0x100 * bank + 4 * (pin - 32 * bank));
++}
++
++int gpio_set_mux(unsigned int gpio, int value)
++{
++	if (gpio >= MAX_GPIO || value >= 4)
++		return -EINVAL;
++
++	pads_init_pin(gpio, value);
++
++	return 0;
++}
++
++/* During boot, we reserve pins which are crucial to u-boot
++ * to function properly (e.g. flash gpio pins) to prevent
++ * users from re-configuring these pins
++ */
++int gpio_reserve_and_set(unsigned int gpio, unsigned int direction,
++					unsigned int value)
++{
++	if (gpio_init != 1) {
++		/* default as gpio */
++		memset(gpio_stat, 0, MAX_GPIO);
++		gpio_init = 1;
++	}
++
++	debug("Reserving gpio: %d, dir: %d & val: %d\n",
++				gpio, direction, value);
++
++	/* reserve gpio */
++	gpio_stat[gpio] = value;
++
++	if (direction != GPIO_HW)
++		config_gpio(gpio, direction, GPIO_ALT_FUNC_0);
++
++	pads_init_pin(gpio, value);
++
++	return 0;
++}
++
++static int config_pinmux(u32 pinmux_base, int pin, unsigned int func_num)
++{
++	int reg;
++	int current = 0;
++
++	debug("config pin %d func %d for pinmux for pinmux_base: 0x%08x\n",
++	      pin, func_num, pinmux_base);
++
++	writel(func_num, pinmux_base + pin * 4);
++
++	reg = readl(pinmux_base + PUEN_0);
++	reg &= ~(1 << pin);
++	writel(reg, pinmux_base + PUEN_0);
++
++	reg = readl(pinmux_base + PDEN_0);
++	reg &= ~(1 << pin);
++	writel(reg, pinmux_base + PDEN_0);
++
++	reg = readl(pinmux_base + SRC_0);
++	reg |= BIT(pin);
++	writel(reg, pinmux_base + SRC_0);
++	writel(func_num, pinmux_base + pin * 4);
++
++	if (pin < 16) {
++		reg = readl(pinmux_base + DCC_0);
++		reg |= (current << (2 * pin));
++		writel(reg, pinmux_base + DCC_0);
++	} else {
++		reg = readl(pinmux_base + DCC_1);
++		reg |= (current << (2 * (pin - 16)));
++		writel(reg, pinmux_base + DCC_1);
++	}
++
++	reg = readl(pinmux_base + OD_0);
++	reg &= ~(1 << pin);
++	writel(reg, pinmux_base + OD_0);
++
++	return 0;
++}
++
++static u32 get_base_addr(u32 module_base, int bank)
++{
++	return (module_base + 0x100 * bank);
++}
++
++static void set_pinmux(unsigned int pin, int direction,
++			unsigned int func_num)
++{
++	int bank;
++	int rel_pin;
++	u32 pinmux_base;
++
++	bank = gpio_get_bank(pin);
++	if (bank < 0)
++		return;
++
++	rel_pin = pin - (32 * bank);
++
++	pinmux_base = get_base_addr(GPIO_PAD_CONTROL_MODULE_BASE, bank);
++	config_pinmux(pinmux_base, rel_pin, func_num);
++}
++
++static int __config_gpio_reg(u32 gpio_base, int pin, int direction,
++			 unsigned int func_num)
++{
++	u32 reg;
++
++	debug("config pin %d func %d for gpio base: 0x%08x, dir: %d\n",
++		pin, func_num, gpio_base, direction);
++
++	if (direction) {
++		reg = readl(gpio_base + DIR_0);
++		reg |= (1 << pin);
++		writel(reg, gpio_base + DIR_0);
++	} else {
++		reg = readl(gpio_base + DIR_0);
++		reg &= ~(1 << pin);
++		writel(reg, gpio_base + DIR_0);
++	}
++	return 0;
++}
++
++/* GPIO low level debug print */
++void config_gpio(unsigned int pin, int dir, unsigned int func_num)
++{
++	int rel_pin, bank = 0;
++	u32 gpio_base;
++
++	set_pinmux(pin, dir, func_num);
++	bank = gpio_get_bank(pin);
++	if (bank < 0)
++		return;
++
++	rel_pin = pin - (32 * bank);
++	gpio_base = get_base_addr(GPIO_FUNCTION_CONTROL_MODULE_BASE, bank);
++	__config_gpio_reg(gpio_base, rel_pin, dir, func_num);
++}
++
++#if defined(CONFIG_DM_GPIO)
++static int lgm_gpio_set_value(struct udevice *device, unsigned offset,
++			      int value)
++{
++	struct gpio_plat_data *plat = dev_get_plat(device);
++	u32 reg;
++
++	reg = readl((u32)plat->base + OUT_0);
++	reg &= ~(1 << offset);
++	reg |= ((value & 0x1) << offset);
++
++	writel(reg, plat->base + OUT_0);
++
++	return 0;
++}
++
++static int lgm_set_flags(struct udevice *device, uint offset, ulong flags)
++{
++	struct gpio_plat_data *plat = dev_get_plat(device);
++	int func, dir;
++	int value = 0;
++
++	func = (flags >> 8) & 0x3;
++	switch (flags & 0xf) {
++	case GPIOD_IS_IN:
++		dir = GPIO_INPUT_DIR;
++		break;
++	default:
++		dir = GPIO_OUTPUT_DIR;
++		break;
++	}
++
++	/* GPIOD_IS_OUT_ACTIVE determines out value */
++	if (flags & GPIOD_IS_OUT_ACTIVE)
++		value = 1;
++
++	debug("flags: %lu, dir: %d, func %d, pin: %d\n",
++		flags, dir, func, offset);
++
++	config_pinmux((u32)plat->pmux_base, offset, func);
++	 __config_gpio_reg((u32)plat->base, offset, dir, func);
++
++	/* the legacy gpio_request_output will probably need this */
++	if (func == 0 && dir == GPIO_OUTPUT_DIR)
++		lgm_gpio_set_value(device, offset, value);
++
++	return 0;
++}
++
++static int lgm_gpio_direction_input(struct udevice *device, unsigned offset)
++{
++	return lgm_set_flags(device, offset,
++			     (GPIO_ALT_FUNC_0 << 8) | GPIO_INPUT_DIR);
++}
++
++static int lgm_gpio_direction_output(struct udevice *device, unsigned offset,
++				     int value)
++{
++	lgm_set_flags(device, offset,
++		      (GPIO_ALT_FUNC_0 << 8) | GPIO_OUTPUT_DIR);
++	return lgm_gpio_set_value(device, offset, value);
++}
++
++static int lgm_gpio_get_value(struct udevice *device, unsigned offset)
++{
++	struct gpio_plat_data *plat = dev_get_plat(device);
++	int direction;
++	unsigned long value;
++
++	direction = (readl((u32)plat->base + DIR_0) >> offset) & 0x1;
++	if (direction == GPIO_OUTPUT_DIR)
++		value = readl((u32)plat->base + OUT_0);
++	else
++		value = readl((u32)plat->base + IN_0);
++
++	return (value >> offset) & 0x1;
++}
++
++static int lgm_gpio_get_function(struct udevice *device, unsigned offset)
++{
++	struct gpio_plat_data *plat = dev_get_plat(device);
++	u32 direction, func;
++
++	/* first check the pinmux is to gpio */
++	func = readl((u32)plat->pmux_base + offset * 4);
++	func &= 0x7;
++	if (func != GPIO_ALT_FUNC_0)
++		return GPIOF_FUNC;
++
++	direction = (readl((u32)plat->base + DIR_0) >> offset) & 0x1;
++	if (direction == GPIO_OUTPUT_DIR)
++		return GPIOF_OUTPUT;
++	else
++		return GPIOF_INPUT;
++}
++
++static int lgm_gpio_xlate(struct udevice *dev, struct gpio_desc *desc,
++			  struct ofnode_phandle_args *args)
++{
++	int dir, func;
++
++	debug("%s: argc: %x, [0]: %x, [1]: %x, [2]: %x\n", __func__,
++	      args->args_count, args->args[0], args->args[1], args->args[2]);
++
++	desc->offset = args->args[0];
++
++	/* flags = func | dir */
++	dir = args->args[1];
++	func = args->args[2];
++	desc->flags = dir | (func << 8);
++
++	return 0;
++}
++
++static int lgm_gpio_of_to_plat(struct udevice *device)
++{
++	struct gpio_plat_data *plat = dev_get_plat(device);
++
++	plat->base = dev_read_addr_ptr(device);
++	plat->pmux_base = (u32 *)devfdt_get_addr_index(device, 1);
++	if (!plat->base)
++		printf("error getting gpio base\n");
++
++	return 0;
++}
++
++static int gpio_lgm_bind(struct udevice *parent)
++{
++	return 0;
++}
++
++static int gpio_lgm_probe(struct udevice *device)
++{
++	struct gpio_plat_data *plat = dev_get_plat(device);
++	struct gpio_dev_priv *uc_priv = dev_get_uclass_priv(device);
++	char name[20];
++	char *str;
++
++	snprintf(name, 20, "gpio@%8lx", (uintptr_t)plat->base);
++	str = strdup(name);
++	if (!str)
++		return -ENOMEM;
++
++	uc_priv->bank_name = str;
++        uc_priv->gpio_count = dev_read_u32_default(device, "ngpios", 32);
++
++	debug("probing lgm gpio %s w %d gpios\n", name, uc_priv->gpio_count);
++	return 0;
++}
++
++static const struct dm_gpio_ops gpio_lgm_ops = {
++	.direction_input	= lgm_gpio_direction_input,
++	.direction_output	= lgm_gpio_direction_output,
++	.get_value		= lgm_gpio_get_value,
++	.set_value		= lgm_gpio_set_value,
++	.get_function		= lgm_gpio_get_function,
++	.set_flags		= lgm_set_flags,
++	.xlate			= lgm_gpio_xlate,
++};
++
++static const struct udevice_id lgm_gpio_ids[] = {
++	{ .compatible = "mxl,lgm-gpio" },
++	{ }
++};
++
++U_BOOT_DRIVER(gpio_lgm) = {
++	.name	= "gpio_lgm",
++	.id	= UCLASS_GPIO,
++	.of_match = lgm_gpio_ids,
++	.of_to_plat = of_match_ptr(lgm_gpio_of_to_plat),
++	.plat_auto	= sizeof(struct gpio_plat_data),
++	.ops	= &gpio_lgm_ops,
++	.bind	= gpio_lgm_bind,
++	.probe	= gpio_lgm_probe,
++};
++#endif /* CONFIG_DM_GPIO */
+diff --git a/include/lgm_gpio.h b/include/lgm_gpio.h
+new file mode 100755
+--- /dev/null
++++ b/include/lgm_gpio.h
+@@ -0,0 +1,18 @@
++/*
++ * Copyright 2008,2010 Freescale Semiconductor, Inc
++ * Andy Fleming
++ *
++ * Based (loosely) on the Linux code
++ *
++ * SPDX-License-Identifier:	GPL-2.0+
++ */
++
++#ifndef _LGM_GPIO_H_
++#define _LGM_GPIO_H_
++
++void config_gpio(unsigned int pin, int dir, unsigned int func_num);
++int gpio_reserve_and_set(unsigned int gpio, unsigned int direction,	unsigned int value);
++int gpio_set_value(unsigned int gpio, int value);
++int gpio_get_value(unsigned int gpio);
++
++#endif /* _MMC_H_ */

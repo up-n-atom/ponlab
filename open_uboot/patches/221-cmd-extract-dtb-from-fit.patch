@@ -1,0 +1,1242 @@
+# HG changeset patch
+# Parent  55825a0ad8552f8d4b2d5feaa3b6bbef71ee85b0
+
+diff --git a/cmd/mxl/cmd_extract_dtb.c b/cmd/mxl/cmd_extract_dtb.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_extract_dtb.c
+@@ -0,0 +1,1099 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++
++#include <asm/arch/api.h>
++#include <asm/gpio.h>
++#include <bootm.h>
++#include <common.h>
++#include <command.h>
++#include <dm.h>
++#include <i2c.h>
++#include <fdt_support.h>
++#include <image.h>
++#include <lgm_gpio.h>
++#include <mapmem.h>
++#include <malloc.h>
++#include <linux/libfdt.h>
++#include <linux/sizes.h>
++#include <linux/sfp.h>
++#include <pi4ioe5v6408_gpio.h>
++
++#define FIXED_SERDES_BUS	1
++#define MAX_ARG			8
++#define MAX_IMAGE_SUPPORTED	32
++#define SERDES			4
++#define MAX_SERDES_NAME_SIZE	16
++#define MAX_DEVICE_NAME_SIZE	16
++#define AIC_EEPROM_MAGIC_WORD	"mxlACcfg"
++#define WAN_EEPROM_ADDR		0x50
++#define HSEC_EEPROM_CHIP_BASE	0x50
++#define MXL3710_EXPANDER_ADDR	0x44
++#define WAN_I2C_BUS		2	/* Virt number, 4th port on mux */
++#define HSEC_I2C_BUS		3
++#define WAN_SERDES		5
++#define ERR_CHAR		'X'
++
++/* TODO: What are these values */
++#define RJ45_TYPE		1
++#define UNKNOWN_TYPE		2
++#define CODE_1000BT		2
++
++struct dtb_list {
++	int size;
++	unsigned long data;
++	unsigned long aligned_base_addr;
++	char *node_name;
++};
++
++struct serdes_config {
++	char serdes_name[MAX_SERDES_NAME_SIZE];
++	char device_name[MAX_DEVICE_NAME_SIZE];
++	int dev_type;
++	int has_dtbo;
++	u16 dtbo_len;
++	u32 serdes_dtbo_addr;
++	void *aic_devices;
++};
++
++struct aic_eeprom_hdr {
++	char magicword[8];	/* Magic word */
++	u8 res;			/* Reserved */
++	u8 dev_type;		/* AIC card type */
++	u16 total_len; 		/* Total length of EEPROM - including the HDR */
++	u16 dtbo_len;		/* dtbo length  */
++	u16 dtbo_off;		/* Offset to dtbo from this position */
++	u16 devinfo_len;	/* Device information length */
++	u16 devinfo_off;	/* Offset to device information from this pos */
++};
++
++enum serdes_dev_type {
++	DEV_INVALID,
++	DEV_WAVE700,
++	DEV_ARGUS,
++	DEV_MXL3710_AIC,
++	DEV_10G_ETH,
++	DEV_PCIE_SINGLE_LANE,
++	DEV_SFP_ETH,
++	DEV_SFP_PON,
++	DEV_REALTEK,
++	DEV_MOCA,
++	DEV_GSW140,
++};
++
++struct dtb_list image_desc_list[MAX_IMAGE_SUPPORTED];
++struct serdes_config serdes_info[SERDES];
++struct serdes_config wan_serdes_info;
++
++static void print_serdes_info(struct serdes_config *cfg)
++{
++	debug("..... Serdes: %s\n.. Device: %s\n.. Type: %d\n",
++		cfg->serdes_name, cfg->device_name, cfg->dev_type);
++	debug(".. Device has dtbo: %s\n", cfg->has_dtbo ? "yes" : "no");
++
++	if (cfg->has_dtbo)
++		debug(".. Device's DTBO len: %d, at memory address 0x%08x\n",
++				cfg->dtbo_len, cfg->serdes_dtbo_addr);
++}
++
++static void dump_serdes_info(struct serdes_config *lan,
++				 struct serdes_config *wan)
++{
++	int i;
++
++	print_serdes_info(wan);
++
++	for (i = 0; i < SERDES; i++, lan++)
++		print_serdes_info(lan);
++}
++
++static unsigned long get_dtb_base(const struct dtb_list *list)
++{
++	if (list->aligned_base_addr != 0)
++		return list->aligned_base_addr;
++	else
++		return list->data;
++}
++
++static int get_base_dtb_size(const struct dtb_list *list)
++{
++	return list->size;
++}
++
++static char *get_dev_type(int dev_type)
++{
++	switch(dev_type) {
++	case 1:
++		return "wave-700";
++	case 2:
++		return "argus";
++	case 3:
++		return "10g-eth";
++	case 4:
++		return "pcie";
++	case 5:
++		return "sfp-eth";
++	case 6:
++		return "pon";
++	default:
++		return "Invalid";
++	}
++}
++
++static struct dtb_list *find_dtbo_by_name(char *name,
++			struct dtb_list *list)
++{
++	int i;
++	struct dtb_list *tmp_list = list;
++
++	for (i = 0; i < MAX_IMAGE_SUPPORTED; i++, tmp_list++) {
++		if (!strcmp(name, tmp_list->node_name))
++			return tmp_list;
++	}
++
++	return NULL;
++}
++
++static char val_to_serdes(int serdes)
++{
++	char serdes_char = ERR_CHAR;
++
++	switch (serdes) {
++	case 0:
++		serdes_char = 'A';
++		break;
++	case 1:
++		serdes_char = 'B';
++		break;
++	case 2:
++		serdes_char = 'C';
++		break;
++	case 3:
++		serdes_char = 'D';
++		break;
++	case 5:
++		serdes_char = 'W';
++		break;
++	default:
++		printf("Unkown serdes requested #%d\n", serdes);
++		return serdes_char;
++	}
++
++	return serdes_char;
++}
++
++static void set_device_name(struct serdes_config *info, int serdes)
++{
++	int devtype = info->dev_type;
++	char serdes_cfg = val_to_serdes(serdes);
++
++	if (serdes_cfg == 'X')
++		return;
++
++	switch (devtype) {
++	case DEV_WAVE700:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_wav700");
++		snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++			"dtbo_serdes%cdl", serdes_cfg);
++		break;
++	case DEV_ARGUS:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_argus");
++		snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++			"dtbo_serdes%cdl", serdes_cfg);
++		break;
++	case DEV_MXL3710_AIC:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_mxl3710");
++		snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++			"dtbo_serdes%cdl", serdes_cfg);
++		break;
++	case DEV_10G_ETH:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_10g_eth");
++		/* 10G ETH can be on WAN or LAN ports */
++		if (serdes != WAN_SERDES)
++			snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++				 "dtbo_serdes%csl", serdes_cfg);
++		else
++			snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++				"wan_serdes");
++		break;
++	case DEV_PCIE_SINGLE_LANE:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_pcie-%dx", serdes + 1);
++		snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++			"dtbo_serdes%csl", serdes_cfg);
++		break;
++	case DEV_SFP_ETH:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_sfp_eth");
++		snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++			"wan_serdes");
++		break;
++	case DEV_SFP_PON:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_sfp_pon");
++		snprintf(info->serdes_name, MAX_SERDES_NAME_SIZE,
++			"wan_serdes");
++		break;
++	case DEV_REALTEK:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_realtek");
++		break;
++	case DEV_MOCA:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_moca");
++		break;
++	case DEV_GSW140:
++		snprintf(info->device_name, MAX_DEVICE_NAME_SIZE,
++			"dtbo_gsw140");
++		break;
++	default:
++		snprintf(info->serdes_name, 7, "invalid");
++		break;
++	}
++}
++
++static int get_i2c_chip(int serdes, struct udevice *bus)
++{
++	int i;
++	struct udevice *dev;
++
++	/* Try to get the data from DTS, trying not to hardcode */
++	for (i = 0, device_find_first_child(bus, &dev); dev;
++			i++, device_find_next_child(&dev)) {
++		struct dm_i2c_chip *chip = dev_get_parent_plat(dev);
++
++		if (chip->chip_addr == serdes + HSEC_EEPROM_CHIP_BASE)
++			return chip->chip_addr;
++	}
++
++	return -1;
++}
++
++static int get_gpio_desc(struct gpio_desc *desc, bool is_wan,
++			 int function, const char *node_name)
++{
++	int node;
++	const void *blob = gd->fdt_blob;
++
++	if (is_wan)
++		node = fdt_node_offset_by_compatible(blob, 0,
++						"wan-mode-detect");
++	else
++		node = fdt_node_offset_by_compatible(blob, 0,
++						"lan-mode-detect");
++
++	if (node < 0)
++		return -EINVAL;
++
++	if (gpio_request_by_name_nodev(offset_to_ofnode(node),
++					node_name, 0,
++					desc, function)) {
++		printf("Failed to get %s switch gpio\n", node_name);
++		return -EINVAL;
++	}
++
++	return 0;
++
++}
++
++static void set_default_dev_type(struct serdes_config *info, int serdes)
++{
++	int ret;
++	struct gpio_desc pcie_sw;
++
++	/* if no eeprom can be probed, set it to pcie-sl or 10g eth */
++	switch (serdes) {
++	case FIXED_SERDES_BUS:
++		ret = get_gpio_desc(&pcie_sw, 0, GPIOD_IS_IN,
++					 "pcie-lan-switch");
++		if (ret)
++			return;
++		/* Octopus: serdes-B configured to 10G-lan or PCI-e */
++		if (dm_gpio_get_value(&pcie_sw) == 1)
++			info->dev_type = DEV_10G_ETH;
++		else
++			info->dev_type = DEV_PCIE_SINGLE_LANE;
++		break;
++	default:
++		info->dev_type = DEV_PCIE_SINGLE_LANE;
++		break;
++	}
++}
++
++static int get_eeprom_dtbo(struct udevice *dev, u8 devaddr,
++			int dtbo_offset, int dtbo_len,
++			struct serdes_config *info)
++{
++	int ret;
++	u8 *eeprom_data;
++
++	eeprom_data = malloc(dtbo_len);
++	ret = dm_i2c_read(dev, dtbo_offset, eeprom_data, dtbo_len);
++	if (ret) {
++		printf("Failed to read eeprom data at dev 0x%02X of len %d\n",
++				devaddr, dtbo_len);
++		info->has_dtbo = 0;
++		return -EINVAL;
++	}
++
++	info->serdes_dtbo_addr = (u32)eeprom_data;
++	info->has_dtbo = 1;
++	info->dtbo_len = dtbo_len;
++	debug("eeprom DTBO for %s at address 0x%08x\n",
++						get_dev_type(info->dev_type),
++						info->serdes_dtbo_addr);
++	return 0;
++}
++
++static int detect_mxl3710_dev(struct udevice *dev,
++				struct serdes_config *config_ptr)
++{
++//wyl
++#if 0
++	u8 port = 0;
++	struct serdes_config *aic_dev;
++
++#ifdef CONFIG_DM_PI4IOE5V6408
++	u8 reg;
++	int ret;
++	int chip_addr = -1;
++	int bus_num = 3;
++	struct udevice *bus;
++	struct udevice *dev;
++
++	/* detect i2c expander */
++	ret = uclass_get_device_by_seq(UCLASS_I2C, bus_num, &bus);
++	if (ret)
++		/* i2c bus failed, fallback to ethernet */
++		goto fallback;
++
++	/* Try to get the data from DTS, trying not to hardcode */
++	for (i = 0, device_find_first_child(bus, &dev); dev;
++			i++, device_find_next_child(&dev)) {
++		struct dm_i2c_chip *chip = dev_get_parent_plat(dev);
++
++		if (chip->chip_addr == MXL3710_EXPANDER_ADDR)
++			chip_addr = chip->chip_addr;
++	}
++
++	if (chip_addr < 0) {
++		printf("Cannot find i2c expander on mxl3710\n");
++		return -EINVAL;
++	}
++
++	/* TODO: Change to standard gpio commands when available */
++	/* configure port 3 & 4 to input */
++	i2c_expander_reg03h_io_dir_rd(&reg);
++	reg &= ~((1 << 3) | (1 << 4))
++	i2c_expander_reg03h_io_dir_wr(reg);
++
++	/* read port 3 & 4 to detect configuration */
++	i2c_expander_reg0fh_gpio_input_val_rd(&port)
++	port = ((port >> 3) & 0x3)
++#endif /* CONFIG_DM_PI4IOE5V6408 */
++
++	aic_dev = (struct serdes_config *)
++			malloc(2 * sizeof(struct serdes_config));
++	if (!aic_dev)
++		return -ENOMEM;
++
++	/* Realtek phy */
++	aic_dev[0].dev_type = DEV_REALTEK;
++	set_device_name(&aic_dev[0], 1);
++	switch (port) {
++	case 1:
++		aic_dev[1].dev_type = DEV_MOCA;
++		break;
++	case 2:
++		aic_dev[1].dev_type = DEV_GSW140;
++		break;
++	default:
++		free(aic_dev);
++		return -EINVAL;
++	}
++
++	set_device_name(&aic_dev[1], 1);
++	config_ptr->aic_devices = (void *) aic_dev;
++#endif
++	return 0;
++}
++
++static u8 connector_type(u8 *data)
++{
++	return data[2];
++}
++
++static int read_wan_eeprom(struct udevice *bus,
++			    struct serdes_config *config_ptr,
++			    int bus_num, int serdes)
++{
++	u8 *pon_data;
++	u8 offs = 0;
++	int ret;
++	int chip = WAN_EEPROM_ADDR;
++	struct udevice *dev;
++
++	debug("WAN eeprom serdes: %d serdes%c\n",
++					serdes, val_to_serdes(serdes));
++
++	/* Determine connecter type and set appropriate device type */
++	pon_data = (u8 *)malloc(32);
++	if (pon_data == NULL) {
++		config_ptr->dev_type  = DEV_SFP_ETH;
++		set_device_name(config_ptr, WAN_SERDES);
++		return -ENOMEM;
++	}
++
++	ret = i2c_get_chip(bus, chip, 1, &dev);
++	if (!ret)
++		ret = dm_i2c_read(dev, offs, pon_data, 32);
++
++	if (connector_type(pon_data) == SFF8024_CONNECTOR_SC)
++		config_ptr->dev_type = DEV_SFP_PON;
++	else
++		config_ptr->dev_type = DEV_SFP_ETH;
++
++#if 0
++	/* TODO: A better way to detect, needs to be seen */
++	u8 eth_code;
++
++	eth_code = pon_data[6];
++
++	if (connector_type(pon_data) == SFF8024_CONNECTOR_RJ45
++			&& eth_code == 1000BASE_T)
++			config_ptr->dev_type = DEV_SFP_ETH;
++	} else {
++		config_ptr->dev_type = DEV_SFP_PON;
++	}
++#endif
++
++	set_device_name(config_ptr, WAN_SERDES);
++	free(pon_data);
++	return 0;
++}
++
++static int read_eeprom(struct udevice *bus, struct serdes_config *config_ptr,
++			u8 *eeprom_data, int bus_num, int serdes)
++{
++	int ret, is_mxl_eeprom = 1;
++	int offs = 0;
++	int chip;
++	struct aic_eeprom_hdr *hdr;
++	struct udevice *dev;
++
++	chip = get_i2c_chip(serdes, bus);
++	if (chip < 0)
++		goto no_eeprom;
++
++	ret = i2c_get_chip(bus, chip, 1, &dev);
++	if (!ret)
++		/* try to read eeprom header 5*/
++		ret = dm_i2c_read(dev, offs, eeprom_data,
++				sizeof(struct aic_eeprom_hdr));
++	if (ret)
++		goto no_eeprom;
++
++	hdr = (struct aic_eeprom_hdr *)eeprom_data;
++	/* is it a MXL eeprom */
++	if (strncmp(hdr->magicword, AIC_EEPROM_MAGIC_WORD, 8)) {
++		is_mxl_eeprom = 0;
++		printf("Non-mxl eeprom detected\n");
++	}
++
++	/* if device has dtbo, func get_eeprom_dtbo will set this to 1 */
++	config_ptr->has_dtbo = 0;
++
++	if (is_mxl_eeprom == 1) {
++		/* MXL EEPROM header found, try to get device type */
++		if (hdr->dev_type < 1 || hdr->dev_type > 5) {
++			printf("Invalid device type param from eeprom %d\n",
++						hdr->dev_type);
++			goto no_eeprom;
++		}
++
++		debug("eeprom with device type: %s\n",
++					get_dev_type(hdr->dev_type));
++
++		/* set serdes device and type */
++		config_ptr->dev_type = hdr->dev_type;
++		set_device_name(config_ptr, serdes);
++
++		debug("dtbo len=%d, offs=%d\n", ntohs(hdr->dtbo_len),
++						ntohs(hdr->dtbo_off));
++
++		/* get dtbo if any */
++		if (hdr->dtbo_len != 0)
++			get_eeprom_dtbo(dev, chip, ntohs(hdr->dtbo_off),
++					 ntohs(hdr->dtbo_len), config_ptr);
++
++		/* for MXL3710 cards, there are two interfaces within
++		 * the card itself. Detect the connected interfaces and
++		 * insert the proper serdes dtbos
++		 */
++		if (config_ptr->dev_type == DEV_MXL3710_AIC) {
++			ret = detect_mxl3710_dev(bus, config_ptr);
++			if (ret)
++				printf("Error configuring AIC card\n");
++		}
++
++		return 0;
++	}
++
++no_eeprom:
++	set_default_dev_type(config_ptr, serdes);
++	set_device_name(config_ptr, serdes);
++
++	return 0;
++}
++
++static int probe_i2c_slave(struct serdes_config *config_ptr,
++			   u8 *eeprom_data, int bus_num, int serdes)
++{
++	int ret = 0;
++	struct udevice *bus;
++
++	ret = uclass_get_device_by_seq(UCLASS_I2C, bus_num, &bus);
++	if (ret)
++		/* i2c bus failed, fallback to ethernet */
++		goto fallback;
++
++	if (bus_num != WAN_I2C_BUS) {
++		/* read eeprom from i2c slave device */
++		ret = read_eeprom(bus, config_ptr, eeprom_data,
++				  bus_num, serdes);
++	} else {
++		ret = read_wan_eeprom(bus, config_ptr, bus_num, serdes);
++	}
++
++	return ret;
++
++fallback:
++	set_default_dev_type(config_ptr, serdes);
++	set_device_name(config_ptr, serdes);
++	return -1;
++}
++
++static int probe_all_serdes(struct serdes_config *info, int max_serdes)
++{
++	int ret = 0;
++	int i;
++	u8 *eeprom_data;
++	struct serdes_config *config_ptr = info;
++
++	eeprom_data = malloc(sizeof(struct aic_eeprom_hdr));
++	if (!eeprom_data)
++		return -ENOMEM;
++
++	/* For each serdes, configure i2c mux to access serdes
++	 * i2c device via connected i2c bus.
++	 * If EEPROM is available, figure out what is the card info.
++	 * 	- also need to find out if DTBO exists in the EEPROM.
++	 * If EEPROM is unavailable, we configure it to PON or ethernet.
++	*/
++	for (i = 0; i < max_serdes; i++, config_ptr++) {
++		ret = probe_i2c_slave(config_ptr, eeprom_data,
++					HSEC_I2C_BUS, i);
++	}
++
++	free(eeprom_data);
++
++#if 0
++	/* TODO: dummy dummy dummy, remove when all is finalised */
++escape:
++	/* dummy */
++	sprintf(info->serdes_name, "dtbo_pon");
++	info->has_dtbo = 0;
++#endif
++
++	return ret;
++}
++
++static int probe_wan_serdes(struct serdes_config *info)
++{
++	int ret;
++	struct gpio_desc pon_mode_abs_pin, wan_switch_pin;
++
++	ret = get_gpio_desc(&pon_mode_abs_pin, 1, GPIOD_IS_IN,
++				"pon-mode-abs");
++	if (ret)
++		return ret;
++
++	ret = get_gpio_desc(&wan_switch_pin, 1, GPIOD_IS_OUT,
++				"wan-mode-switch");
++	if (ret)
++		return ret;
++
++	/* When WAN_MOD_ABS GPIO is pulled low, SFP cage is attached.
++	 * Set WAN_MODE_SWITCH gpio to 1 when SFP cage is attached,
++	 * set to 0 otherwise.
++	 */
++	if (dm_gpio_get_value(&pon_mode_abs_pin) == 0x1) {
++		dm_gpio_set_value(&wan_switch_pin, 0x0);
++		info->dev_type = DEV_10G_ETH;
++		set_device_name(info, WAN_SERDES);
++		return 0;
++	} else {
++		dm_gpio_set_value(&wan_switch_pin, 0x1);
++	}
++
++	ret = probe_i2c_slave(info, NULL, WAN_I2C_BUS, 0);
++	return ret;
++}
++
++#ifdef CONFIG_DM_PI4IOE5V6408
++static void configure_aic_phys(struct serdes_config *info)
++{
++	struct serdes_config *aic_dev, *ptr = info++;
++
++	if (!ptr->aic_devices)
++		return;
++
++	/* Skip realtek phy detection as it is connected. Determine only
++	 * Moca or GSW140
++	 */
++	aic_dev = (struct serdes_confi *)ptr->aic_devices;
++
++	/* Configure realtek phy reset port to out of reset */
++	i2c_expander_reg05h_output_value_wr(0x1);
++
++	aic_dev++;
++	if (!aic_dev)
++		return;
++
++	if (aic_dev->dev_type == DEV_MOCA)
++		i2c_expander_reg05h_output_value_wr(0x2);
++	else
++		i2c_expander_reg05h_output_value_wr(0x4);
++
++}
++#endif /* CONFIG_DM_PI4IOE5V6408 */
++
++static int apply_dtbo(struct dtb_list *desc, struct fdt_header *fdt_blob,
++			int *fdt_size, int *extrasize)
++{
++	int ret;
++	int dtb_extrasize = *extrasize;
++	int dtb_curr_size = *fdt_size;
++	struct fdt_header *dtbo;
++
++	/* the fdt memory allocated in ram */
++	dtb_extrasize += desc->size;
++	if (dtb_extrasize >= dtb_curr_size) {
++		dtb_curr_size += (desc->size + SZ_8K);
++		/* resize the DTB, otherwise it may fail */
++		fdt_shrink_to_minimum(fdt_blob, dtb_curr_size);
++	}
++
++	printf("Overlay %s from address 0x%08x\n",
++			desc->node_name, (u32)desc->aligned_base_addr);
++	dtbo = (struct fdt_header *)map_sysmem(desc->aligned_base_addr, 0);
++	ret = fdt_overlay_apply_verbose(fdt_blob, dtbo);
++	if (ret)
++		return -EINVAL;
++
++	*fdt_size = dtb_curr_size;
++	*extrasize = dtb_extrasize;
++	return 0;
++}
++
++static int find_and_apply_dtbo(char *dev_name, struct dtb_list *list,
++				struct fdt_header *fdt_blob,
++				int *curr_fdt_size, int *extrasize)
++{
++	struct dtb_list *dev_desc;
++	int ret;
++
++	dev_desc = find_dtbo_by_name(dev_name, list);
++	if (dev_desc == NULL) {
++		printf("Cannot find %s dtbo\n", dev_name);
++		return -EINVAL;
++	}
++
++	ret = apply_dtbo(dev_desc, fdt_blob,
++			 curr_fdt_size, extrasize);
++	if (ret)
++		printf("Cannot apply dtbo for Realtek AIC device\n");
++
++	return ret;
++}
++
++/* Detects the DTBOs needed for the AIC cards and applies them to the base */
++static int apply_aic_dev_dtbo(struct serdes_config *aic_config,
++				struct dtb_list *list,
++				struct fdt_header *fdt_blob,
++				int *curr_fdt_size, int *extrasize)
++{
++	int ret, err = 0;
++
++	ret = find_and_apply_dtbo(aic_config->device_name, list, fdt_blob,
++				curr_fdt_size, extrasize);
++	if (ret) {
++		err++;
++		printf("Failed to apply %s dtbo\n", aic_config->device_name);
++	}
++
++	/* go to the next config */
++	aic_config++;
++	if (!aic_config)
++		return -EINVAL;
++
++	ret = find_and_apply_dtbo(aic_config->device_name, list, fdt_blob,
++				curr_fdt_size, extrasize);
++	if (ret) {
++		err++;
++		printf("Failed to apply %s dtbo\n", aic_config->device_name);
++	}
++
++	return err;
++}
++
++static int configure_serdes_info(struct fdt_header *fdt_blob,
++				struct serdes_config *info,
++				struct dtb_list *list,
++				int max_serdes)
++{	int i, ret, err = 0;
++	int overlay_applied = 0;
++	int curr_fdt_size, extrasize;
++	int fdt_size = get_base_dtb_size(list);
++	struct serdes_config *config_ptr = info;
++	struct fdt_header *dtbo;
++	struct dtb_list *dev_desc, *serdes_desc;
++
++	extrasize = fdt_size;
++	curr_fdt_size = fdt_size + SZ_8K;
++	/* resize the DTB, otherwise it may fail */
++	fdt_shrink_to_minimum(fdt_blob, curr_fdt_size);
++
++	if (!strncmp(config_ptr->serdes_name, "wan_serdes", 10)) {
++		dev_desc = find_dtbo_by_name(config_ptr->device_name, list);
++		if (dev_desc == NULL) {
++			printf("Cannot find %s dtbo\n",
++				config_ptr->device_name);
++			err++;
++			goto done;
++		}
++
++		ret = apply_dtbo(dev_desc, fdt_blob,
++				 &curr_fdt_size, &extrasize);
++		if (ret) {
++			printf("Cannot apply dtbo for wan device\n");
++			err++;
++		} else {
++			overlay_applied++;
++		}
++
++		goto done;
++	}
++
++	/* For each serdes, apply the DTBO(s) if applicable */
++	for (i = 0; i < max_serdes; i++, config_ptr++) {
++		serdes_desc = find_dtbo_by_name(config_ptr->serdes_name, list);
++		if (serdes_desc == NULL) {
++			printf("Cannot find %s serdes dtbo for serdes %c\n",
++				config_ptr->serdes_name, val_to_serdes(i));
++			continue;
++		}
++
++		/* for each serdes:
++		 * 	- one dtbo for the serdes configuration
++		 *	- one dtbo for the device configuration
++		 *	- optional: one dtbo from device eeprom
++		 */
++		ret = apply_dtbo(serdes_desc, fdt_blob,
++				&curr_fdt_size, &extrasize);
++		if (ret) {
++			/* serdes configuration is a MUST */
++			printf("Cannot apply dtbo for serdes %c\n",
++				val_to_serdes(i));
++			err++;
++			continue;
++		}
++		overlay_applied++;
++
++		dev_desc = find_dtbo_by_name(config_ptr->device_name, list);
++		if (dev_desc == NULL) {
++			printf("Cannot find %s aic dtbo for serdes %c\n",
++				config_ptr->device_name, val_to_serdes(i));
++			continue;
++		}
++
++		ret = apply_dtbo(dev_desc, fdt_blob,
++				&curr_fdt_size, &extrasize);
++		if (ret) {
++			/* AIC configuration is optional (depending on card) */
++			printf("Cannot apply dtbo for aic in serdes %c\n",
++				val_to_serdes(i));
++			err++;
++			continue;
++		}
++		overlay_applied++;
++
++		/* we embed two more DTBOs into the serdes_config struct
++		 * hence we check and apply
++		*/
++		if (config_ptr->dev_type == DEV_MXL3710_AIC) {
++			/* apply MXL3710 end PHY dtbo */
++			struct serdes_config *aic_ptr =
++					(struct serdes_config *)config_ptr->aic_devices;
++			if (aic_ptr) {
++				ret = apply_aic_dev_dtbo(aic_ptr, list,
++							fdt_blob,
++							&curr_fdt_size,
++							&extrasize);
++				if (ret) {
++					printf("Cannot locate aic end device dtbo\n");
++					err += ret;
++					overlay_applied += (2 - ret);
++					continue;
++				}
++				overlay_applied += (2 - ret);
++			}
++		}
++
++		/* apply eeprom dtbo if any */
++		/* EEPROM DTBO is optional */
++		if (config_ptr->has_dtbo) {
++			printf("EEPROM overlay found .. ");
++			extrasize += config_ptr->dtbo_len;
++			if (extrasize >= curr_fdt_size) {
++				curr_fdt_size += (dev_desc->size + SZ_8K);
++				/* resize the DTB, otherwise it may fail */
++				fdt_shrink_to_minimum(fdt_blob, curr_fdt_size);
++			}
++
++			dtbo = (struct fdt_header *)
++					map_sysmem(config_ptr->serdes_dtbo_addr, 0);
++			ret = fdt_overlay_apply_verbose(fdt_blob, dtbo);
++			if (ret) {
++				printf("Cannot apply EEPROM dtbo for serdes %c\n",
++						val_to_serdes(i));
++				err++;
++				continue;
++			}
++			printf(" and applied successfully\n");
++			overlay_applied++;
++		}
++	}
++
++done:
++	printf("%d serdes probed .. ", max_serdes);
++	printf("%d overlay DTBOs applied succesfully .. ", overlay_applied);
++	printf("%d attempts failed\n", err);
++
++	return err;
++}
++
++static void update_serdes_config_in_env(struct serdes_config *serdes_info,
++					 struct serdes_config *wan_serdes,
++					 int max_serdes)
++{
++	int i;
++	char serdes[16];
++
++	/* update for visual feedback in the u-boot env */
++	for (i = 0; i < max_serdes; i++, serdes_info++) {
++		snprintf(serdes, 16, "serdes_%d", i);
++		env_set(serdes, get_dev_type(serdes_info->dev_type));
++	}
++
++	snprintf(serdes, 16, "wan_serdes");
++	env_set(serdes, get_dev_type(wan_serdes->dev_type));
++}
++
++static int is_fit_image(const void *addr)
++{
++	return fit_check_format(addr, IMAGE_SIZE_INVAL);
++}
++
++static int init_dtb_layout(void *fit, struct dtb_list *image_list)
++{
++	int noffset, images_noffset, ndepth;
++	int count;
++	const void *data;
++	void *vdata;
++	size_t image_size;
++
++	/* Find images parent node offset */
++	images_noffset = fdt_path_offset(fit, FIT_IMAGES_PATH);
++	if (images_noffset < 0) {
++		printf("Can't find images parent node '%s' (%s)\n",
++		       FIT_IMAGES_PATH, fdt_strerror(images_noffset));
++		return -EINVAL;
++	}
++
++	for (ndepth = 0, count = 0,
++		noffset = fdt_next_node(fit, images_noffset, &ndepth);
++	     (noffset >= 0) && (ndepth > 0);
++	     noffset = fdt_next_node(fit, noffset, &ndepth), image_list++) {
++		if (ndepth == 1) {
++			count++;
++			const char *dtbo_name =
++					fit_get_name(fit, noffset, NULL);
++			/* Get image node name */
++			debug("Image %u (%s)\n", count, dtbo_name);
++			image_list->node_name = (char *)fit_get_name(fit, noffset, NULL);
++			/* Get the data address and size in memory */
++			fit_image_get_data_and_size(fit, noffset,
++						&data, &image_size);
++			vdata = (void *)data;
++			image_list->data = (unsigned long)map_to_sysmem(vdata);
++			image_list->size = (int)image_size;
++			debug("node %s blob address: 0x%08x\n",
++				image_list->node_name, (u32)image_list->data);
++			debug("node %s blob size: %d bytes\n",
++				image_list->node_name, image_list->size);
++
++			/* make sure that the blobs are aligned else
++			 * the FDT apply will fail
++			*/
++			if (image_list->data & 0xFF) {
++				image_list->aligned_base_addr =
++					(u32)memalign(256, image_list->size);
++				memcpy((u32 *)image_list->aligned_base_addr,
++					(u32 *)image_list->data, image_list->size);
++			}
++		}
++	}
++
++	return count;
++}
++
++static int get_dtb_size(const void *dtb_addr)
++{
++	const void *data = dtb_addr;
++	struct fdt_headr *blob = (struct fdt_headr *)dtb_addr;
++	int len = 0;
++
++	len = fdt_totalsize(blob);
++
++	debug("Found device tree image at %px len %zu\n", data, len);
++	return len;
++}
++
++static int do_fit(struct cmd_tbl *cmdtp, int flag, int argc, char *const argv[])
++{
++	int num_args, image_size;
++	int num_dtb_in_fit, max_serdes;
++	unsigned long fit_load_addr;
++	unsigned long dtb_data, dtb_load_addr;
++	struct fdt_header *fdt_blob;
++	struct serdes_config *info = &serdes_info[0];
++	struct serdes_config *wan_cfg = &wan_serdes_info;
++	void *hdr = NULL;
++
++	if (argc < 2 )
++		return CMD_RET_USAGE;
++
++	num_args = argc - 1;
++
++	fit_load_addr =  hextoul(argv[1], NULL);
++	dtb_load_addr = hextoul(argv[2], NULL);
++	if (!fit_load_addr || !dtb_load_addr)
++		return CMD_RET_USAGE;
++
++	printf("fit load addr: 0x%08x\n", (u32)fit_load_addr);
++	hdr = (void *)map_sysmem(fit_load_addr, 0);
++	/* handle if not FIT format image (this image must be DTB)
++	 * by copying it to the expected dtb load address.
++	*/
++	if (is_fit_image(hdr)) {
++		fdt_blob = (struct fdt_header *)hdr;
++		if (!dtb_load_addr || !fdt_valid(&fdt_blob))
++			return CMD_RET_USAGE;
++		image_size = get_dtb_size(hdr);
++		if (image_size == 0) {
++			printf("Invalid DTB image\n");
++			return CMD_RET_USAGE;
++		}
++		memcpy((u32 *)dtb_load_addr,
++			(u32 *)fit_load_addr, image_size);
++
++		return 0;
++	}
++
++	/* Next, this image is probably a FIT image
++	 * and we will try to process the FIT image.
++	*/
++	if (fit_check_format(hdr, IMAGE_SIZE_INVAL)) {
++		printf("Bad FIT image format!\n");
++		goto err_fit;
++	}
++
++	/* populate list with all the dtb and dtbo images */
++	num_dtb_in_fit = init_dtb_layout(hdr, &image_desc_list[0]);
++	if (num_dtb_in_fit <= 0)
++		goto err_fit;
++
++	/* Process the dtb in the FIT image first.
++	 * Copy the image to the dtb load address used by bootm.
++	*/
++	dtb_data = get_dtb_base(&image_desc_list[0]);
++	printf("DTB data is at 0x%08x\n", (u32)dtb_data);
++	if (dtb_data != dtb_load_addr) {
++		/* finally the dtb will be loaded to $dtb_loadaddr which
++		 * is used in the bootm command
++		*/
++		memcpy((u32 *)dtb_load_addr, (u32 *)dtb_data,
++				get_base_dtb_size(&image_desc_list[0]));
++		hdr = map_sysmem(dtb_load_addr, 0);
++	} else {
++		hdr = map_sysmem(dtb_data, 0);
++	}
++
++	fdt_blob = (struct fdt_header *)hdr;
++	/* check if dtb is valid */
++	if (!fdt_valid(&fdt_blob))
++		goto err_dtb;
++
++	/* apply and set working dtb image */
++	set_working_fdt_addr(map_to_sysmem(fdt_blob));
++
++	/* probe wan i2c device */
++	probe_wan_serdes(wan_cfg);
++
++	if (cpu_is_urx6x1())
++		max_serdes = 2;
++	else
++		max_serdes = 4;
++
++	/* probe i2c devices */
++	probe_all_serdes(info, max_serdes);
++
++	dump_serdes_info(&serdes_info[0], wan_cfg);
++
++	/* configure board DTB configurations */
++	configure_serdes_info(fdt_blob, info, &image_desc_list[0], max_serdes);
++
++	configure_serdes_info(fdt_blob, wan_cfg, &image_desc_list[0], 1);
++
++	/* update env variable if any */
++	update_serdes_config_in_env(info, wan_cfg, max_serdes);
++
++#ifdef CONFIG_DM_PI4IOE5V6408
++	/* bring AIC device out of reset */
++	configure_aic_phys(info);
++#endif
++
++	return 0;
++
++err_dtb:
++	unmap_sysmem(fdt_blob);
++err_fit:
++	unmap_sysmem(hdr);
++	return -1;
++}
++
++U_BOOT_CMD(
++	fit_load,	255,	0,	do_fit,
++	"load and process fit images from [FIT image address] to [DTB load address]",
++	"<fit-image load addr> <device tree load addr>\n"
++	"\t <FIT image addr> - DDR address where the FIT image is loaded to\n"
++	"\t <DTB load addr> - Address where DTB is expected and referenced by bootm\n"
++	"## If image in <FIT image addr> is a DTB, the DTB will be copied to the load address\n"
++);
+diff --git a/include/linux/sfp.h b/include/linux/sfp.h
+new file mode 100644
+--- /dev/null
++++ b/include/linux/sfp.h
+@@ -0,0 +1,130 @@
++/* SPDX-License-Identifier: GPL-2.0+
++ * Taken from Linux kernel (linux/sfp.h)
++ *
++*/ 
++
++/* SFF8024 defined constants */
++enum {
++	SFF8024_ID_UNK			= 0x00,
++	SFF8024_ID_SFF_8472		= 0x02,
++	SFF8024_ID_SFP			= 0x03,
++	SFF8024_ID_DWDM_SFP		= 0x0b,
++	SFF8024_ID_QSFP_8438		= 0x0c,
++	SFF8024_ID_QSFP_8436_8636	= 0x0d,
++	SFF8024_ID_QSFP28_8636		= 0x11,
++
++	SFF8024_ENCODING_UNSPEC		= 0x00,
++	SFF8024_ENCODING_8B10B		= 0x01,
++	SFF8024_ENCODING_4B5B		= 0x02,
++	SFF8024_ENCODING_NRZ		= 0x03,
++	SFF8024_ENCODING_8472_MANCHESTER= 0x04,
++	SFF8024_ENCODING_8472_SONET	= 0x05,
++	SFF8024_ENCODING_8472_64B66B	= 0x06,
++	SFF8024_ENCODING_8436_MANCHESTER= 0x06,
++	SFF8024_ENCODING_8436_SONET	= 0x04,
++	SFF8024_ENCODING_8436_64B66B	= 0x05,
++	SFF8024_ENCODING_256B257B	= 0x07,
++	SFF8024_ENCODING_PAM4		= 0x08,
++
++	SFF8024_CONNECTOR_UNSPEC	= 0x00,
++	/* codes 01-05 not supportable on SFP, but some modules have single SC */
++	SFF8024_CONNECTOR_SC		= 0x01,
++	SFF8024_CONNECTOR_FIBERJACK	= 0x06,
++	SFF8024_CONNECTOR_LC		= 0x07,
++	SFF8024_CONNECTOR_MT_RJ		= 0x08,
++	SFF8024_CONNECTOR_MU		= 0x09,
++	SFF8024_CONNECTOR_SG		= 0x0a,
++	SFF8024_CONNECTOR_OPTICAL_PIGTAIL= 0x0b,
++	SFF8024_CONNECTOR_MPO_1X12	= 0x0c,
++	SFF8024_CONNECTOR_MPO_2X16	= 0x0d,
++	SFF8024_CONNECTOR_HSSDC_II	= 0x20,
++	SFF8024_CONNECTOR_COPPER_PIGTAIL= 0x21,
++	SFF8024_CONNECTOR_RJ45		= 0x22,
++	SFF8024_CONNECTOR_NOSEPARATE	= 0x23,
++	SFF8024_CONNECTOR_MXC_2X16	= 0x24,
++
++	SFF8024_ECC_UNSPEC		= 0x00,
++	SFF8024_ECC_100G_25GAUI_C2M_AOC	= 0x01,
++	SFF8024_ECC_100GBASE_SR4_25GBASE_SR = 0x02,
++	SFF8024_ECC_100GBASE_LR4_25GBASE_LR = 0x03,
++	SFF8024_ECC_100GBASE_ER4_25GBASE_ER = 0x04,
++	SFF8024_ECC_100GBASE_SR10	= 0x05,
++	SFF8024_ECC_100GBASE_CR4	= 0x0b,
++	SFF8024_ECC_25GBASE_CR_S	= 0x0c,
++	SFF8024_ECC_25GBASE_CR_N	= 0x0d,
++	SFF8024_ECC_10GBASE_T_SFI	= 0x16,
++	SFF8024_ECC_10GBASE_T_SR	= 0x1c,
++	SFF8024_ECC_5GBASE_T		= 0x1d,
++	SFF8024_ECC_2_5GBASE_T		= 0x1e,
++};
++
++/* SFP EEPROM registers */
++enum {
++	SFP_PHYS_ID			= 0x00,
++	SFP_PHYS_EXT_ID			= 0x01,
++	SFP_CONNECTOR			= 0x02,
++	SFP_COMPLIANCE			= 0x03,
++	SFP_ENCODING			= 0x0b,
++	SFP_BR_NOMINAL			= 0x0c,
++	SFP_RATE_ID			= 0x0d,
++	SFP_LINK_LEN_SM_KM		= 0x0e,
++	SFP_LINK_LEN_SM_100M		= 0x0f,
++	SFP_LINK_LEN_50UM_OM2_10M	= 0x10,
++	SFP_LINK_LEN_62_5UM_OM1_10M	= 0x11,
++	SFP_LINK_LEN_COPPER_1M		= 0x12,
++	SFP_LINK_LEN_50UM_OM4_10M	= 0x12,
++	SFP_LINK_LEN_50UM_OM3_10M	= 0x13,
++	SFP_VENDOR_NAME			= 0x14,
++	SFP_VENDOR_OUI			= 0x25,
++	SFP_VENDOR_PN			= 0x28,
++	SFP_VENDOR_REV			= 0x38,
++	SFP_OPTICAL_WAVELENGTH_MSB	= 0x3c,
++	SFP_OPTICAL_WAVELENGTH_LSB	= 0x3d,
++	SFP_CABLE_SPEC			= 0x3c,
++	SFP_CC_BASE			= 0x3f,
++	SFP_OPTIONS			= 0x40,	/* 2 bytes, MSB, LSB */
++	SFP_BR_MAX			= 0x42,
++	SFP_BR_MIN			= 0x43,
++	SFP_VENDOR_SN			= 0x44,
++	SFP_DATECODE			= 0x54,
++	SFP_DIAGMON			= 0x5c,
++	SFP_ENHOPTS			= 0x5d,
++	SFP_SFF8472_COMPLIANCE		= 0x5e,
++	SFP_CC_EXT			= 0x5f,
++
++	SFP_PHYS_EXT_ID_SFP		= 0x04,
++	SFP_OPTIONS_HIGH_POWER_LEVEL	= BIT(13),
++	SFP_OPTIONS_PAGING_A2		= BIT(12),
++	SFP_OPTIONS_RETIMER		= BIT(11),
++	SFP_OPTIONS_COOLED_XCVR		= BIT(10),
++	SFP_OPTIONS_POWER_DECL		= BIT(9),
++	SFP_OPTIONS_RX_LINEAR_OUT	= BIT(8),
++	SFP_OPTIONS_RX_DECISION_THRESH	= BIT(7),
++	SFP_OPTIONS_TUNABLE_TX		= BIT(6),
++	SFP_OPTIONS_RATE_SELECT		= BIT(5),
++	SFP_OPTIONS_TX_DISABLE		= BIT(4),
++	SFP_OPTIONS_TX_FAULT		= BIT(3),
++	SFP_OPTIONS_LOS_INVERTED	= BIT(2),
++	SFP_OPTIONS_LOS_NORMAL		= BIT(1),
++	SFP_DIAGMON_DDM			= BIT(6),
++	SFP_DIAGMON_INT_CAL		= BIT(5),
++	SFP_DIAGMON_EXT_CAL		= BIT(4),
++	SFP_DIAGMON_RXPWR_AVG		= BIT(3),
++	SFP_DIAGMON_ADDRMODE		= BIT(2),
++	SFP_ENHOPTS_ALARMWARN		= BIT(7),
++	SFP_ENHOPTS_SOFT_TX_DISABLE	= BIT(6),
++	SFP_ENHOPTS_SOFT_TX_FAULT	= BIT(5),
++	SFP_ENHOPTS_SOFT_RX_LOS		= BIT(4),
++	SFP_ENHOPTS_SOFT_RATE_SELECT	= BIT(3),
++	SFP_ENHOPTS_APP_SELECT_SFF8079	= BIT(2),
++	SFP_ENHOPTS_SOFT_RATE_SFF8431	= BIT(1),
++	SFP_SFF8472_COMPLIANCE_NONE	= 0x00,
++	SFP_SFF8472_COMPLIANCE_REV9_3	= 0x01,
++	SFP_SFF8472_COMPLIANCE_REV9_5	= 0x02,
++	SFP_SFF8472_COMPLIANCE_REV10_2	= 0x03,
++	SFP_SFF8472_COMPLIANCE_REV10_4	= 0x04,
++	SFP_SFF8472_COMPLIANCE_REV11_0	= 0x05,
++	SFP_SFF8472_COMPLIANCE_REV11_3	= 0x06,
++	SFP_SFF8472_COMPLIANCE_REV11_4	= 0x07,
++	SFP_SFF8472_COMPLIANCE_REV12_0	= 0x08,
++};

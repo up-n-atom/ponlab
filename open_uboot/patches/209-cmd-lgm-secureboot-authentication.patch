@@ -1,0 +1,535 @@
+# HG changeset patch
+# Parent  b3a90575ba3447e3a36c734a9b544bb8c24711d3
+
+diff --git a/cmd/mxl/cmd_auth.c b/cmd/mxl/cmd_auth.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/cmd_auth.c
+@@ -0,0 +1,527 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include <common.h>
++#include <command.h>
++#include <image.h>
++#include <linux/libfdt.h>
++#include <memalign.h>
++#include <asm/secureboot.h>
++#include <asm/io.h>
++#include <configs/maxlinear/udt.h>
++
++/* ibrh tag: sum of upper and lower 16 bit word must be equal to 0xFFFF */
++#define TAG_VALID(tag) ((((tag) & 0xFFFF) + (((tag) >> 16) & 0xFFFF) == 0xFFFF)?1:0)
++#define SIZE_OF_RBE_IBRH_HEAD 0x800
++#define SIZE_OF_RBE_IBRH_TAIL 0xC
++
++/* PAD image size + PAD_SZ for chunks */
++#define PAD_SZ 0x100000
++
++int auth_image(unsigned long src_addr, u32 image_len, int image_type);
++
++/* Authenticate a non-legacy format DTB file in the fullimage */
++static int auth_dtb(const void *addr)
++{
++	const void *data;
++	int noffset, depth = 0;
++	int ret, len = 0;
++	int image_size;
++
++	/* Look for dtb within fit image, which is in
++	 * the node below parent.
++	 */
++	noffset = fdt_path_offset(addr, FIT_IMAGES_PATH);
++	do {
++		noffset = fdt_next_node(addr, noffset, &depth);
++		printf("noffset %d depth %d name %s\n", noffset, depth,
++		      fdt_get_name(addr, noffset, NULL));
++		if (depth == 1)
++			break;
++	} while (noffset >= 0);
++
++	if (noffset < 0) {
++		error("Unable to find dtb within fit image\n");
++		update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++		return fdt_totalsize(addr);
++	}
++
++	data = fdt_getprop(addr, noffset, FIT_DATA_PROP, &len);
++	if (!len) {
++		error("Unable to find dtb data\n");
++		update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++		return fdt_totalsize(addr);
++	}
++
++	printf("Found device tree image at %px len %zu\n", data, len);
++	image_size = fdt_totalsize(addr);
++	/* we authenticate only the image after the FIT headers */
++	ret = auth_image((unsigned long)data, len, SB_ROLLBACK_NO_CHECK);
++	if (ret)
++		return -1;
++
++	return image_size;
++}
++
++int auth_image(unsigned long src_addr, u32 image_len, int image_type)
++{
++	unsigned int chunks;
++	int ret, i;
++	u32 img_rollback_id = 0;
++	u32 otp_rollback_id  = 0;
++	u32 img_id = 0;
++	u32 sb_attrib_err = SB_ATTRIB_VALID;
++	u32 chunk_size = SB_MAX_CHUNK_SIZE;
++	struct SBIF_Attributes attribute_table;
++	u32 entry_address = 0;
++	u32 target_address = 0;
++#if (defined(CONFIG_FLEXI_RBID) || defined(CONFIG_COMPATIBILITY_VER))
++	u32 img_flexi_rbid = 0;
++	u32 compatibilityVer = 0;
++#endif
++
++	/* validate mkimage header */
++	image_header_t *hdr = NULL;
++	u32 mkhdr_size = 0;
++	u32 mkimg_size, mkimg_type;
++
++	chunks = (image_len / chunk_size) + 1;
++	debug("imglen: 0x%08x, chunksize: 0x%08x chunks: %u\n",
++			image_len, chunk_size, chunks);
++
++	memmove(hdr, (char *)src_addr, sizeof(image_header_t));
++
++	if (ntohl(hdr->ih_magic) == IH_MAGIC) {
++		/* valid mkimage header */
++		mkhdr_size = sizeof(image_header_t);
++		printf("\n AUTH_IMAGE: size of image_header_t  : 0x%08x \n", mkhdr_size);
++		printf("\n AUTH_IMAGE: ih_magic                : 0x%08x \n", ntohl(hdr->ih_magic));
++
++		mkimg_size = ntohl(hdr->ih_size);
++		printf("\n AUTH_IMAGE: ih_size                 : 0x%08x \n", mkimg_size);
++
++		mkimg_type = swab32(ntohl(hdr->ih_type));
++		printf("\n AUTH_IMAGE: ih_type                 : 0x%08x \n", mkimg_type);
++	} else {
++		printf("\n AUTH_IMAGE: mkimage header not available \n");
++		/* TBD: error handling: as for now proceed to legacy auth handling */
++		goto auth_legacy;
++	}
++
++	/* validate secure header */
++	u32 with_ibrh = 0;
++	u16 header_tag = 0;
++	u8 *auth_buf = NULL;
++
++	/* check if image contain ibrh */
++	if (TAG_VALID(readl(src_addr + mkhdr_size)))
++		with_ibrh = SIZE_OF_RBE_IBRH_HEAD + SIZE_OF_RBE_IBRH_TAIL;
++
++	/* check sb header */
++	header_tag = readw(src_addr + mkhdr_size + with_ibrh);
++
++	if (SB_IMAGE_CHK == header_tag) {
++		/* make a copy of image with sb header */
++		auth_buf = memalign(64, mkimg_size);
++		if (auth_buf == NULL)
++			printf("%s: Could not memalign 0x%x bytes \n",
++				   __func__, mkimg_size);
++
++		memmove(auth_buf, (char *)(src_addr + mkhdr_size + with_ibrh), mkimg_size);
++
++		/* chunks due to limitation of the hardware capabilities. */
++		for (i = 0; i < chunks; i++) {
++			ret = bootrom_sec_api_auth((unsigned long)auth_buf, &attribute_table);
++			if (ret) {
++				printf("\n AUTH_IMAGE: image authentication error \n");
++				update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_AUTH_FAIL);
++				return ret;
++			}
++
++			sb_attrib_err = get_sbif_attributes(&attribute_table, &entry_address, &target_address,
++													&img_rollback_id, &img_id);
++			if ((SB_ATTRIB_INVALID == sb_attrib_err) && (IMAGE_ID_RBE == image_type)) {
++				/* invalid image attribute in RBE */
++				goto pass;
++			} else {
++				/* todo: image attribute handling, now pass through */
++				printf("\n TODO: ATTRIB HANDLING <0x%08x>: <%s>:<%d>:<%s> \n",
++									sb_attrib_err, __FILE__, __LINE__, __func__);
++			} /* SB_ATTRIB_INVALID */
++
++			/* next chunk is at CHUNK_SIZE + PAD_SZ */
++			auth_buf += SB_MAX_CHUNK_SIZE + PAD_SZ;
++		}/* SB_MAX_CHUNK_SIZE */
++
++#if (defined(CONFIG_FLEXI_RBID) || defined(CONFIG_COMPATIBILITY_VER))
++		get_sbif_attrib_extra(&attribute_table,
++				&img_flexi_rbid, &compatibilityVer);
++#endif
++
++#if defined(CONFIG_COMPATIBILITY_VER)
++		compat_ver_hdr_to_env(image_type, compatibilityVer);
++#endif
++
++#if defined(CONFIG_FLEXI_RBID)
++		u32 otp_flexi_rbid = 0;
++
++		otp_rollback_id = chk_rollback_id(image_type);
++		otp_flexi_rbid = chk_flexi_rbid(image_type);
++
++		if (otp_flexi_rbid == 0) /* strict polcy */
++		{
++			/* check image anti-rollback with otp anti-rollback value */
++			if (img_rollback_id < otp_rollback_id)
++			{
++				update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_ARBID_CHECK_FAIL);
++				goto fail;
++			}
++		}
++		else /* flexible policy */
++		{
++			if ((img_rollback_id < otp_rollback_id) && (img_flexi_rbid < otp_flexi_rbid))
++			{
++				update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_ARBID_CHECK_FAIL);
++				goto fail;
++			}
++		}
++#elif defined(CONFIG_ROLLBACKID_SUPPORT)
++		otp_rollback_id = chk_rollback_id(image_type);
++		/* check image anti-rollback with otp anti-rollback value */
++		if (img_rollback_id < otp_rollback_id)
++		{
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_ARBID_CHECK_FAIL);
++			goto fail;
++		}
++#endif
++
++		/* image type (caller) must match with image id */
++		if (((u32)image_type != img_id) && (IMAGE_ID_IGNORE != (u32)image_type)) {
++			printf("\n AUTH_IMAGE: Image Type: 0x%08x != Image Identifier: 0x%08x\n",
++						(u32)image_type, img_id);
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++			goto fail;
++		}
++
++#if defined(CONFIG_COMPATIBILITY_VER)
++		u32 kernel_compat_ver = 0;
++		u32 rootfs_compat_ver = 0;
++#endif
++
++		/* image type (header) must match with image id */
++		switch(img_id) {
++			case IMAGE_ID_IGNORE:
++				break;
++			case IMAGE_ID_RBE:
++			case IMAGE_ID_TEP:
++				if (IH_TYPE_FIRMWARE != mkimg_type)
++				{
++					update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++					goto fail;
++				}
++				break;
++			case IMAGE_ID_UBOOT:
++				if (IH_TYPE_UBOOT != mkimg_type)
++				{
++					update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++					goto fail;
++				}
++				break;
++			case IMAGE_ID_KERNEL:
++				if (IH_TYPE_KERNEL != mkimg_type)
++				{
++					update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++					goto fail;
++				}
++#if defined(CONFIG_COMPATIBILITY_VER)
++				kernel_compat_ver = env_get_hex("KERNEL_compat_ver", 0);
++				rootfs_compat_ver = env_get_hex("ROOTFS_compat_ver", 0);
++
++				if ((kernel_compat_ver != 0) && (rootfs_compat_ver != 0))
++				{
++					if (kernel_compat_ver != rootfs_compat_ver)
++					{
++						update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_COMPAT_FAIL);
++						goto fail;
++					}
++				}
++#endif
++				break;
++			case IMAGE_ID_ROOTFS:
++				if (IH_TYPE_FILESYSTEM != mkimg_type)
++				{
++					update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++					goto fail;
++				}
++
++#if defined(CONFIG_COMPATIBILITY_VER)
++				kernel_compat_ver = getenv_hex("KERNEL_compat_ver", 0);
++				rootfs_compat_ver = getenv_hex("ROOTFS_compat_ver", 0);
++
++				if ((kernel_compat_ver != 0) && (rootfs_compat_ver != 0))
++				{
++					if (kernel_compat_ver != rootfs_compat_ver)
++					{
++						update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_COMPAT_FAIL);
++						goto fail;
++					}
++				}
++#endif
++			break;
++			default:
++				printf("\n AUTH_IMAGE: mkimg_type : 0x%08x is not matching the required img_id : 0x%08x\n",
++						mkimg_type, img_id);
++				update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++				goto fail;
++		}
++		goto pass;
++	} else {
++		printf("\n AUTH_IMAGE: image authentication failed!\n");
++		update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_MKIMAGE_HDR_CHECK_FAIL);
++		goto fail;
++	}
++
++fail:
++	free(auth_buf);
++	return 1;
++
++pass:
++	image_svn_value[image_type] = img_rollback_id; /* need to save this value for svn_update later */
++#if defined(CONFIG_FLEXI_RBID)
++	image_fsvn_value[image_type] = img_flexi_rbid; /* need to save this value for svn_update later */
++#endif
++	free(auth_buf);
++	return 0;
++
++auth_legacy:
++	/* chunks due to limitation of the hardware capabilities. */
++	for (i = 0; i < chunks; i++) {
++		printf("authenticating at address: 0x%lx\n", src_addr);
++		ret = bootrom_sec_api_auth(src_addr, &attribute_table);
++		if (ret) {
++			printf("Image authentication error at address 0x%lx\n",
++				src_addr);
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_AUTH_FAIL);
++			return ret;
++		}
++
++		sb_attrib_err = get_sbif_attributes(&attribute_table, &entry_address, &target_address,
++													&img_rollback_id, &img_id);
++		if ((SB_ATTRIB_INVALID == sb_attrib_err) && (IMAGE_ID_RBE == image_type)) {
++			/* invalid image attribute in RBE */
++			continue;
++		} else {
++			/* todo: image attribute handling, now pass through */
++			printf("\n TODO: ATTRIB HANDLING <0x%08x>: <%s>:<%d>:<%s> \n",
++								sb_attrib_err, __FILE__, __LINE__, __func__);
++		} /* SB_ATTRIB_INVALID */
++
++		/* next chunk is at CHUNK_SIZE + PAD_SZ */
++		src_addr += SB_MAX_CHUNK_SIZE + PAD_SZ;
++	}
++
++#if (defined(CONFIG_FLEXI_RBID) || defined(CONFIG_COMPATIBILITY_VER))
++		get_sbif_attrib_extra(&attribute_table,
++				&img_flexi_rbid, &compatibilityVer);
++#endif
++
++#if defined(CONFIG_COMPATIBILITY_VER)
++		compat_ver_hdr_to_env(image_type, compatibilityVer);
++#endif
++
++#if defined(CONFIG_FLEXI_RBID)
++		u32 otp_flexi_rbid = 0;
++
++		otp_rollback_id = chk_rollback_id(image_type);
++		otp_flexi_rbid = chk_flexi_rbid(image_type);
++
++		if (otp_flexi_rbid == 0) /* strict polcy */
++		{
++			/* check image anti-rollback with otp anti-rollback value */
++			if (img_rollback_id < otp_rollback_id)
++			{
++				update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_ARBID_CHECK_FAIL);
++				return 1;
++			}
++		}
++		else /* flexible policy */
++		{
++			if ((img_rollback_id < otp_rollback_id) && (img_rollback_id < otp_flexi_rbid))
++			{
++				update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_ARBID_CHECK_FAIL);
++				return 1;
++			}
++		}
++#elif defined(CONFIG_ROLLBACKID_SUPPORT)
++		otp_rollback_id = chk_rollback_id(image_type);
++		/* check image anti-rollback with otp anti-rollback value */
++		if (img_rollback_id < otp_rollback_id)
++		{
++			update_udt_failure(UDT_UPGRADE_FAILED, UPG_IMAGE_ARBID_CHECK_FAIL);
++			return 1;
++		}
++#endif
++
++	image_svn_value[image_type] = img_rollback_id; /* need to save this value for svn_update later */
++#if defined(CONFIG_FLEXI_RBID)
++	image_fsvn_value[image_type] = img_flexi_rbid; /* need to save this value for svn_update later */
++#endif
++
++	return 0;
++}
++
++/* Authenticate a fullimage (multi-image format) binary.
++ * BE CAREFUL. Make sure that the destination addresses do
++ * not overlap with source addresses. Otherwise the image upgrade
++ * following this check will be garbage.
++ * src_addr: The address including the mkimage header
++ * size: Total size of the fullimage.
++ */
++int do_auth_fullimage(struct cmd_tbl *cmdtp, int flag,
++			int argc, char * const argv[])
++{
++	int ret, src_len;
++	u32 pad, image_size = 0;
++	unsigned long src_addr, img_ptr = 0;
++	image_header_t *pimg_header = NULL;
++
++	if (argc != 3)
++		return CMD_RET_USAGE;
++
++	src_addr = simple_strtoul(argv[1], NULL, 16);
++	src_len = simple_strtoul(argv[2], NULL, 16);
++
++	debug("srclen: 0x%x, srcaddr:0x%lu\n", src_len, src_addr);
++
++	do {
++		img_ptr = (!img_ptr ? src_addr : img_ptr + image_size);
++
++		/* dtb image needs special handling as it does not use legacy
++		 * header
++		 */
++		if (genimg_get_format((const void *)img_ptr) == IMAGE_FORMAT_FIT) {
++			debug("DTB found at address 0x%x\n", (u32)img_ptr);
++			ret = auth_dtb((void *)img_ptr);
++			if (ret < 0)
++				return ret;
++
++			image_size = ret;
++			continue;
++		}
++
++		/* offset should start at the mkimage header */
++		pimg_header = (image_header_t *)img_ptr;
++		/* if mkimage header is not available, exit */
++		if (pimg_header &&
++			ntohl(pimg_header->ih_magic) != IH_MAGIC) {
++			printf("no mkimage header\n");
++			return -1;
++		}
++
++		image_size = sizeof(image_header_t)
++				+ ntohl(pimg_header->ih_size);
++		pad = (16 - (image_size % 16)) % 16;
++		if (!image_check_hcrc(pimg_header)
++			|| !image_check_dcrc(pimg_header)) {
++				printf ("Bad Header Checksum\n");
++				return 1;
++		}
++
++		/* authenticating the images and checking of the
++		 * rollback ID
++		 */
++		switch(pimg_header->ih_type) {
++		case IH_TYPE_MULTI:
++			image_size = sizeof(image_header_t) +
++					sizeof(uint32_t) *
++					(image_multi_count(pimg_header)
++					+ 1);
++			continue;
++		case IH_TYPE_FILESYSTEM:
++			printf("authenticating rootfs of size 0x%08x... \n", image_size);
++			ret = auth_image(img_ptr + sizeof(image_header_t),
++					image_size, SB_ROLLBACK_ID_ROOTFS);
++			if (ret)
++				goto err;
++			break;
++		case IH_TYPE_KERNEL:
++			printf("authenticating kernel of size 0x%08x... \n", image_size);
++			ret = auth_image(img_ptr + sizeof(image_header_t),
++					image_size, SB_ROLLBACK_ID_KERNEL);
++			if (ret)
++				goto err;
++			break;
++		case IH_TYPE_FIRMWARE:
++			printf("authenticating tep firmware of size 0x%08x... \n", image_size);
++			ret = auth_image(img_ptr + sizeof(image_header_t),
++					image_size, SB_ROLLBACK_ID_TEP);
++			if (ret)
++				goto err;
++			break;
++		case IH_TYPE_UBOOT:
++			printf("authenticating U-boot 0x%08x... \n", image_size);
++			ret = auth_image(img_ptr + sizeof(image_header_t),
++					image_size, SB_ROLLBACK_ID_UBOOT);
++			if (ret)
++				goto err;
++			break;
++		default:
++			printf("Unknown image type!\n");
++			image_size = image_size + 8 + pad;
++			continue;
++		}
++
++		/* offset the image size to the next 16B pad */
++		image_size += pad;
++
++	} while (src_len > (img_ptr - src_addr) + image_size);
++
++	return 0;
++
++err:
++	printf("Verification of fullimage failed!\n");
++	return 1;
++}
++
++/* Authenticate an image binary from source address.
++ * src_addr: Address in DDR where the image resides.
++ * image type: As per the description, used for anti-rollback
++ *		checks.
++ * image size: Size of the binary.
++ */
++int do_auth(struct cmd_tbl *cmdtp, int flag, int argc, char * const argv[])
++{
++	u64 src_addr;
++	int ret, image_type;
++	u32 image_size;
++
++	if (argc != 4)
++		return CMD_RET_USAGE;
++
++	image_type = simple_strtoul(argv[1], NULL, 16);
++	src_addr   = simple_strtoul(argv[2], NULL, 16);
++	image_size = simple_strtoul(argv[3], NULL, 16);
++
++	ret = auth_image(src_addr, image_size, image_type);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++U_BOOT_CMD(
++	auth, CONFIG_SYS_MAXARGS, 0, do_auth,
++	"authenticate an image-type at src_addr",
++	"<image type> <src addr> <image length>\n"
++	"\t- image type (RBE=1, TEP=2, U-BOOT=3, KERNEL=4, ROOTFS=5),\n"
++	"\t authenticate image-type placed in addr."
++);
++
++U_BOOT_CMD(
++	auth_fullimage, CONFIG_SYS_MAXARGS, 0, do_auth_fullimage,
++	"authenticate a multi-image binary created with mkimage headers",
++	"<src_addr> <size>\n"
++	"\t authenticate fullimage at address <src_addr> of length <size>\n"
++);

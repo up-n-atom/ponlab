@@ -1,0 +1,523 @@
+# HG changeset patch
+# Parent  e310e01e0e3091640a5b5f587ec010a8db345fed
+
+diff --git a/cmd/led.c b/cmd/led.c
+--- a/cmd/led.c
++++ b/cmd/led.c
+@@ -77,7 +77,7 @@ int do_led(struct cmd_tbl *cmdtp, int fl
+ 	const char *led_label;
+ 	struct udevice *dev;
+ #ifdef CONFIG_LED_BLINK
+-	int freq_ms = 0;
++	int freq_HZ = 0;
+ #endif
+ 	int ret;
+ 
+@@ -93,7 +93,7 @@ int do_led(struct cmd_tbl *cmdtp, int fl
+ 	if (cmd == LEDST_BLINK) {
+ 		if (argc < 4)
+ 			return CMD_RET_USAGE;
+-		freq_ms = dectoul(argv[3], NULL);
++		freq_HZ = dectoul(argv[3], NULL);
+ 	}
+ #endif
+ 	ret = led_get_by_label(led_label, &dev);
+@@ -109,7 +109,7 @@ int do_led(struct cmd_tbl *cmdtp, int fl
+ 		break;
+ #ifdef CONFIG_LED_BLINK
+ 	case LEDST_BLINK:
+-		ret = led_set_period(dev, freq_ms);
++		ret = led_set_period(dev, freq_HZ);
+ 		if (!ret)
+ 			ret = led_set_state(dev, LEDST_BLINK);
+ 		break;
+@@ -128,7 +128,7 @@ int do_led(struct cmd_tbl *cmdtp, int fl
+ }
+ 
+ #ifdef CONFIG_LED_BLINK
+-#define BLINK "|blink [blink-freq in ms]"
++#define BLINK "|blink [blink-freq in 0,2,4,8,10 (Hz)]"
+ #else
+ #define BLINK ""
+ #endif
+diff --git a/cmd/mxl/serial_sft_cmd.c b/cmd/mxl/serial_sft_cmd.c
+new file mode 100644
+--- /dev/null
++++ b/cmd/mxl/serial_sft_cmd.c
+@@ -0,0 +1,85 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2022 MaxLinear, Inc.
++ *
++ */
++#include <common.h>
++#include <sso.h>
++#include <command.h>
++
++#define SSO_ON	1
++#define SSO_OFF	0
++
++int parse_sso_arg(char *val)
++{
++	if (strcmp(val, "off") == 0)
++		return SSO_OFF;
++	else if ((strcmp(val, "on") == 0))
++		return SSO_ON;
++
++	return -EINVAL;
++}
++
++int do_sso(struct cmd_tbl *cmdtp, int flag, int argc, char * const argv[])
++{
++	int ret, pin_no, sso_no;
++	unsigned long val;
++	u8 duty_cycle = 0xff;
++
++	if ((argc <= 1) || (argc > 5))
++		return CMD_RET_USAGE;
++
++	if (strcmp(argv[1], "init") == 0) {
++		if (argc != 3)
++			return CMD_RET_USAGE;
++
++		sso_no = (int)simple_strtoul(argv[2], NULL, 10);
++		if (sso_no < 0)
++			return CMD_RET_USAGE;
++
++		sso_init(sso_no);
++		return 0;
++
++	} else if (strcmp(argv[1], "set") == 0) {
++		if (argc < 4)
++			return CMD_RET_USAGE;
++
++		pin_no = (int)simple_strtoul(argv[2], NULL, 10);
++		if (pin_no < 0)
++			return CMD_RET_USAGE;
++
++		val = parse_sso_arg(argv[3]);
++		if (val < 0)
++			return CMD_RET_USAGE;
++
++		if (argc > 4)
++			duty_cycle = (u8)simple_strtoul(argv[4], NULL, 16);
++
++		ret = sso_output(pin_no, val, duty_cycle);
++		if (ret)
++			return ret;
++
++	} else if (strcmp(argv[1], "setall") == 0) {
++		val = (unsigned long)simple_strtoul(argv[2], NULL, 16);
++
++		if (argc > 3)
++			duty_cycle = (u8)simple_strtoul(argv[3], NULL, 16);
++
++		ret = sso_output_all(val, duty_cycle);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
++U_BOOT_CMD(
++	sso, 6, 1, do_sso,
++	"configure serial shift output value",
++	"init [sso no]\n"
++	"sso set [output pin] [on|off] [duty cycle]\n"
++	"\tsets output of gpio number with duty cycle value (optional)\n"
++	"sso setall [output value] [duty cycle]\n"
++	"\tsets all the output of the sso with value\n"
++);
++
+diff --git a/drivers/led/led_lgm.c b/drivers/led/led_lgm.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/led/led_lgm.c
+@@ -0,0 +1,346 @@
++/* Copyright (c) 2021, Maxlinear, Inc.
++ *
++ * LED driver to control the LED via SSO in LGM
++ *
++ * SPDX-License-Identifier: GPL-2.0
++ */
++
++#include <common.h>
++#include <dm.h>
++#include <errno.h>
++#include <led.h>
++#include <log.h>
++#include <asm/io.h>
++#include <dm/lists.h>
++#include <linux/bitops.h>
++#include <asm/arch/project.h>
++#include <sso.h>
++
++#define LEDS_MAX		32
++#define LEDS_WAIT		100
++
++/* LED Mode register */
++#define LED_MODE_REG		0x0
++#define LED_MODE_OFF		0
++#define LED_MODE_ON		1
++#define LED_MODE_MASK		1
++
++/* LED Controller Global settings register */
++#define LED_CTRL_REG			0x00
++#define LED_CTRL_MASK			0x1f
++#define LED_CTRL_LED_TEST_MODE		BIT(0)
++#define LED_CTRL_SERIAL_LED_DATA_PPOL	BIT(1)
++#define LED_CTRL_SERIAL_LED_CLK_POL	BIT(2)
++#define LED_CTRL_SERIAL_LED_EN_POL	BIT(3)
++#define LED_CTRL_SERIAL_LED_MSB_FIRST	BIT(4)
++
++/* LED Controller IP LED source select register */
++#define LED_HW_LED_EN_REG		0x08
++/* LED Flash control register0 */
++#define LED_FLASH_RATE_CONTROL_REG0	0x10
++/* Soft LED input register */
++#define LED_SW_LED_IP_REG		0xb8
++/* Parallel LED Output Polarity Register */
++#define LED_PLED_OP_PPOL_REG		0xc0
++
++struct lgm_led_priv {
++	void __iomem *regs;
++	u8 pin;
++};
++
++
++/**************************************************/
++
++/* no means of controlling the duty cycles
++ * from led command, we fix it to max.
++ * duty cycle dimming only works so far with fast update mode
++ * not FPID mode
++ */
++#define LED_DUTY_CYCLE	0xFF
++#define LGM_LED_OFF	0x00
++#define LGM_LED_ON	0x01
++
++static int led_init = 0;
++
++void __led_set(led_id_t mask, int state)
++{
++	if (state == STATUS_LED_OFF)
++		state = LGM_LED_OFF;
++	else
++		state = LGM_LED_ON;
++
++	if (mask == STATUS_LED_YELLOW) {
++		sso_output(LED_GREEN, state, LED_DUTY_CYCLE);
++		sso_output(LED_RED, state, LED_DUTY_CYCLE);
++	} else if (mask == LED_GREEN) {
++		sso_output(LED_GREEN, state, LED_DUTY_CYCLE);
++	} else if (mask == LED_RED) {
++		sso_output(LED_RED, state, LED_DUTY_CYCLE);
++	} else if (mask == LED_BLUE) {
++		sso_output(LED_BLUE, state, LED_DUTY_CYCLE);
++	} else {
++		sso_output(mask, state, LED_DUTY_CYCLE);
++	}
++}
++
++void __led_toggle(led_id_t mask)
++{
++	int led1_stat, led2_stat;
++	int status;
++
++	if (mask == STATUS_LED_YELLOW) {
++		led1_stat = sso_get_status(LED_GREEN);
++		led2_stat = sso_get_status(LED_RED);
++
++		if (led1_stat == LGM_LED_ON &&
++			led2_stat == LGM_LED_ON) {
++			sso_output(LED_GREEN, LGM_LED_OFF, LED_DUTY_CYCLE);
++			sso_output(LED_RED, LGM_LED_OFF, LED_DUTY_CYCLE);
++		} else if (led1_stat == LGM_LED_OFF &&
++			led2_stat == LGM_LED_OFF) {
++			sso_output(LED_GREEN, LGM_LED_ON, LED_DUTY_CYCLE);
++			sso_output(LED_RED, LGM_LED_ON, LED_DUTY_CYCLE);
++		} else if (led1_stat == LGM_LED_ON) {
++			sso_output(LED_GREEN, LGM_LED_OFF, LED_DUTY_CYCLE);
++			sso_output(LED_RED, LGM_LED_OFF, LED_DUTY_CYCLE);
++		} else {
++			sso_output(LED_GREEN, LGM_LED_ON, LED_DUTY_CYCLE);
++			sso_output(LED_RED, LGM_LED_ON, LED_DUTY_CYCLE);
++		}
++	} else {
++		status = sso_get_status(mask);
++		if (status == LGM_LED_ON)
++			sso_output(mask, LGM_LED_OFF, LED_DUTY_CYCLE);
++		else if (status == LGM_LED_OFF)
++			sso_output(mask, LGM_LED_ON, LED_DUTY_CYCLE);
++	}
++}
++
++void __led_init(led_id_t mask, int state)
++{
++	int sso_cfg = CONFIG_LGM_SSO_PORT;
++
++	if (led_init == 0) {
++		sso_init(sso_cfg);
++		led_init = 1;
++	}
++
++	if (state == STATUS_LED_OFF)
++		state = LGM_LED_OFF;
++	else
++		state = LGM_LED_ON;
++
++	__led_set(mask, state);
++}
++#ifdef CONFIG_LGM_SSO_BLUE_LED_PIN
++void blue_led_on(void)
++{
++	__led_set(STATUS_LED_BLUE, STATUS_LED_ON);
++}
++
++void blue_led_off(void)
++{
++	__led_set(STATUS_LED_BLUE, STATUS_LED_OFF);
++}
++#endif
++
++#ifdef CONFIG_LGM_SSO_RED_LED_PIN
++void red_led_on(void)
++{
++	__led_set(STATUS_LED_RED, STATUS_LED_ON);
++}
++
++void red_led_off(void)
++{
++	__led_set(STATUS_LED_RED, STATUS_LED_OFF);
++}
++#endif
++
++#ifdef CONFIG_LGM_SSO_GREEN_LED_PIN
++void green_led_on(void)
++{
++	__led_set(STATUS_LED_GREEN, STATUS_LED_ON);
++}
++
++void green_led_off(void)
++{
++	__led_set(STATUS_LED_GREEN, STATUS_LED_OFF);
++}
++#endif
++
++
++#if defined(CONFIG_LGM_SSO_RED_LED_PIN) && \
++	defined(CONFIG_LGM_SSO_GREEN_LED_PIN)
++void yellow_led_on(void)
++{
++	__led_set(STATUS_LED_YELLOW, STATUS_LED_ON);
++}
++
++void yellow_led_off(void)
++{
++	__led_set(STATUS_LED_YELLOW, STATUS_LED_OFF);
++}
++#endif
++
++void __led_blink(led_id_t mask, int freq)
++{
++	if (mask == STATUS_LED_YELLOW) {
++		sso_set_blink(LED_GREEN, freq);
++		sso_set_blink(LED_RED, freq);
++	} else {
++		sso_set_blink(mask, freq);
++	}
++
++	sso_sw_update();
++}
++
++
++#ifdef CONFIG_LED_BLINK
++static int lgm_led_set_period(struct udevice *dev, int period_HZ)
++{
++	struct lgm_led_priv *priv = dev_get_priv(dev);
++
++	/*only 0,2,4,8,10 HZ blink supported*/
++	if(period_HZ == 0 || period_HZ == 2 || period_HZ == 4 || period_HZ == 8 || period_HZ == 10)
++		sso_set_blink(priv->pin, period_HZ);
++	else
++		printf("only 0,2,4,8,10 HZ blink supported");
++
++	return 0;
++}
++#endif
++
++static enum led_state_t lgm_led_get_state(struct udevice *dev)
++{
++	struct lgm_led_priv *priv = dev_get_priv(dev);
++	return sso_get_status(priv->pin);
++}
++
++static int lgm_led_set_state(struct udevice *dev, enum led_state_t state)
++{
++	unsigned int pin;
++	struct lgm_led_priv *priv = dev_get_priv(dev);
++	pin = priv->pin;
++
++	switch (state) {
++	case LEDST_OFF:
++		sso_output(pin, LEDST_OFF, CONFIG_LGM_SSO_LED_DUTY_CYCLE);
++#ifdef CONFIG_LED_BLINK
++		lgm_led_set_period(dev, 0);
++#endif
++		break;
++	case LEDST_ON:
++		sso_output(pin, LEDST_ON, CONFIG_LGM_SSO_LED_DUTY_CYCLE);
++#ifdef CONFIG_LED_BLINK
++		lgm_led_set_period(dev, 0);
++#endif
++		break;
++	case LEDST_TOGGLE:
++		if (lgm_led_get_state(dev) == LEDST_OFF)
++			return lgm_led_set_state(dev, LEDST_ON);
++		else
++			return lgm_led_set_state(dev, LEDST_OFF);
++		break;
++#ifdef CONFIG_LED_BLINK
++	case LEDST_BLINK:
++		sso_output(pin, LEDST_ON, CONFIG_LGM_SSO_LED_DUTY_CYCLE);
++		break;
++#endif
++	default:
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static const struct led_ops lgm_led_ops = {
++	.get_state = lgm_led_get_state,
++	.set_state = lgm_led_set_state,
++#ifdef CONFIG_LED_BLINK
++	.set_period = lgm_led_set_period,
++#endif
++};
++
++static int lgm_led_probe(struct udevice *dev)
++{
++	struct led_uc_plat *uc_plat = dev_get_uclass_plat(dev);
++
++	sso_init(CONFIG_LGM_SSO_PORT);
++	/* Top-level LED node */
++	if (!uc_plat->label) {
++		void __iomem *regs;
++
++		regs = dev_remap_addr(dev);
++		if (!regs)
++			return -EINVAL;
++	} else {
++		struct lgm_led_priv *priv = dev_get_priv(dev);
++		void __iomem *regs;
++		unsigned int pin;
++
++		regs = dev_remap_addr(dev_get_parent(dev));
++
++		if (!regs)
++			return -EINVAL;
++
++		pin = dev_read_u32_default(dev, "pin", LEDS_MAX);
++
++		if (pin >= LEDS_MAX)
++			return -EINVAL;
++
++		priv->regs = regs;
++		priv->pin = pin;
++
++		/* configure the polarity */
++		if (dev_read_bool(dev, "active-low"))
++			debug("lgm_led_probe.active-low \n");
++		else
++			debug("lgm_led_probe.active-high \n");
++
++	}
++	return 0;
++}
++
++static int lgm_led_bind(struct udevice *parent)
++{
++	ofnode node;
++
++	dev_for_each_subnode(node, parent) {
++		struct led_uc_plat *uc_plat;
++		struct udevice *dev;
++		const char *label;
++		int ret;
++
++		label = ofnode_read_string(node, "label");
++		if (!label) {
++			debug("%s: node %s has no label\n", __func__,
++			      ofnode_get_name(node));
++			return -EINVAL;
++		}
++		ret = device_bind_driver_to_node(parent, "lgm-led",
++						 ofnode_get_name(node),
++						 node, &dev);
++
++		if (ret)
++			return ret;
++
++		uc_plat = dev_get_uclass_plat(dev);
++		uc_plat->label = label;
++	}
++	return 0;
++}
++
++static const struct udevice_id lgm_led_ids[] = {
++	{ .compatible = "mxl,lgm-leds" },
++	{ /* sentinel */ }
++};
++
++U_BOOT_DRIVER(lgm_led) = {
++	.name = "lgm-led",
++	.id = UCLASS_LED,
++	.of_match = lgm_led_ids,
++	.bind = lgm_led_bind,
++	.probe = lgm_led_probe,
++	.priv_auto	= sizeof(struct lgm_led_priv),
++	.ops = &lgm_led_ops,
++};
+diff --git a/include/dt-bindings/misc/lgm-sso.h b/include/dt-bindings/misc/lgm-sso.h
+new file mode 100644
+--- /dev/null
++++ b/include/dt-bindings/misc/lgm-sso.h
+@@ -0,0 +1,15 @@
++#ifndef LGM_SSO_BINDINGS_H
++#define LGM_SSO_BINDINGS_H
++
++#ifndef CONFIG_SERIAL_SHIFT_LGM 
++#define CONFIG_LGM_SSO_LED1_PIN_NO	0
++#define CONFIG_LGM_SSO_LED2_PIN_NO	0
++#define CONFIG_LGM_SSO_LED3_PIN_NO	0
++#define CONFIG_LGM_SSO_LED4_PIN_NO	0
++#define CONFIG_LGM_SSO_LED5_PIN_NO	0
++#define CONFIG_LGM_SSO_BLUE_LED_PIN_NO	0
++#define CONFIG_LGM_SSO_GREEN_LED_PIN_NO 0
++#define CONFIG_LGM_SSO_RED_LED_PIN_NO	0
++#endif /* CONFIG_SERIAL_SHIFT_LGM*/
++
++#endif /* LGM_SSO_BINDINGS_H */
+diff --git a/include/led.h b/include/led.h
+--- a/include/led.h
++++ b/include/led.h
+@@ -117,4 +117,16 @@ int led_set_period(struct udevice *dev, 
+  */
+ int led_default_state(void);
+ 
++#ifndef CONFIG_STATUS_LED
++#define STATUS_LED_OFF		0
++#define STATUS_LED_BLINKING	1
++#define STATUS_LED_ON		2
++
++typedef unsigned long led_id_t;
++extern void __led_toggle (led_id_t mask);
++extern void __led_init (led_id_t mask, int state);
++extern void __led_set (led_id_t mask, int state);
++void __led_blink(led_id_t mask, int freq);
+ #endif
++
++#endif

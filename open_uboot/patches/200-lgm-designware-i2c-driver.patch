@@ -1,0 +1,268 @@
+# HG changeset patch
+# Parent  537a4a2e3fe5214301c9051a9799d1ad40d707ee
+
+diff --git a/drivers/i2c/designware_i2c.c b/drivers/i2c/designware_i2c.c
+--- a/drivers/i2c/designware_i2c.c
++++ b/drivers/i2c/designware_i2c.c
+@@ -17,6 +17,7 @@
+ #include "designware_i2c.h"
+ #include <dm/device_compat.h>
+ #include <linux/err.h>
++#include <asm/arch/project.h>
+ 
+ /*
+  * This assigned unique hex value is constant and is derived from the two ASCII
+@@ -24,11 +25,68 @@
+  */
+ #define DW_I2C_COMP_TYPE	0x44570140
+ 
++/* TODO: Only CHD products will need this, need to properly define
++ * this somewhere, prob DTS?
++ */
++#define REQUEST 0x1
++#define RELEASE 0x0
++#define PMIC_ADDRESS    0x6A
++
++__weak void i2c_force_recover(void);
++
++static int i2c_need_semaphore(int i2c_hwnum)
++{
++	if (CONFIG_IS_ENABLED(VENDOR_MAXLINEAR) &&
++			i2c_hwnum == 0)
++		return 1;
++
++	return 0;
++}
++
++static int acquire_semaphore(struct i2c_regs *i2c_base)
++{
++	unsigned int timeout = 0xFFFFF;
++
++	writel(REQUEST, (EPU_AON_SYS_PM_CONTROL + SW_I2C_REQUEST));
++	do {
++		timeout--;
++		if (timeout == 0)
++			return -1;
++
++		udelay(20);
++	} while((readl(EPU_AON_SYS_PM_CONTROL + HW_I2C_RELEASE) & 0x1) == 0);
++
++	return 0;
++}
++
++static int release_semaphore(void)
++{
++	writel(RELEASE, (EPU_AON_SYS_PM_CONTROL + SW_I2C_REQUEST));
++	udelay(100);
++
++	return 0;
++}
++
++static int need_i2c0_workaround(struct i2c_regs *i2c_base)
++{
++	if (CONFIG_IS_ENABLED(VENDOR_MAXLINEAR)
++		&& ((u32)i2c_base == I2C0_BASE))
++		return 1;
++	else
++		return 0;
++}
++
+ static int dw_i2c_enable(struct i2c_regs *i2c_base, bool enable)
+ {
+ 	u32 ena = enable ? IC_ENABLE_0B : 0;
+ 	int timeout = 100;
+ 
++	/* we cannot disable i2c0 while epu is running else
++	 * we cannot recover from a bus timeout
++	 */
++	if (ena == 0 && need_i2c0_workaround(i2c_base))
++		return 0;
++
+ 	do {
+ 		writel(ena, &i2c_base->ic_enable);
+ 		if ((readl(&i2c_base->ic_enable_status) & IC_ENABLE_0B) == ena)
+@@ -474,6 +532,9 @@ static int __dw_i2c_read(struct i2c_regs
+ 	      addr);
+ #endif
+ 
++        debug("\ni2c base: 0x%08x, dev: %02x, addr: %02x, alen: %d, len: %d\n",
++                        (u32)i2c_base, dev, addr, alen, len);
++
+ 	if (i2c_xfer_init(i2c_base, dev, addr, alen))
+ 		return 1;
+ 
+@@ -576,17 +637,36 @@ static int __dw_i2c_write(struct i2c_reg
+ static int __dw_i2c_init(struct i2c_regs *i2c_base, int speed, int slaveaddr)
+ {
+ 	int ret;
++	u32 reg;
+ 
+-	/* Disable i2c */
+-	ret = dw_i2c_enable(i2c_base, false);
+-	if (ret)
+-		return ret;
++	if (need_i2c0_workaround(i2c_base)) {
++		i2c_force_recover();
++	} else {
++		/* Disable i2c */
++		ret = dw_i2c_enable(i2c_base, false);
++		if (ret)
++			return ret;
++	}
++
++	/* Program pmic offset in target addr */
++	if (CONFIG_IS_ENABLED(VENDOR_MAXLINEAR)
++		&& ((u32)i2c_base == I2C0_BASE)) {
++		reg = readl(&i2c_base->ic_tar);
++		reg &= ~(IC_TAR_MASK);
++		reg &= ~(IC_TAR_10_BIT_ADDR);
++		writel(reg | PMIC_ADDRESS, &i2c_base->ic_tar);
++	}
+ 
+ 	writel(IC_CON_SD | IC_CON_RE | IC_CON_SPD_FS | IC_CON_MM,
+ 	       &i2c_base->ic_con);
+ 	writel(IC_RX_TL, &i2c_base->ic_rx_tl);
+ 	writel(IC_TX_TL, &i2c_base->ic_tx_tl);
+-	writel(IC_STOP_DET, &i2c_base->ic_intr_mask);
++
++	if (need_i2c0_workaround(i2c_base))
++		writel(IC_TX_EMPTY, &i2c_base->ic_intr_mask);
++	else
++		writel(IC_STOP_DET, &i2c_base->ic_intr_mask);
++
+ #if !CONFIG_IS_ENABLED(DM_I2C)
+ 	_dw_i2c_set_bus_speed(NULL, i2c_base, speed, IC_CLK);
+ 	writel(slaveaddr, &i2c_base->ic_sar);
+@@ -621,7 +701,7 @@ static struct i2c_regs *i2c_get_base(str
+ 		return (struct i2c_regs *)CONFIG_SYS_I2C_BASE1;
+ #endif
+ 	case 0:
+-		return (struct i2c_regs *)CONFIG_SYS_I2C_BASE;
++		return (struct i2c_regs *)CONFIG_SYS_I2C_BASE0;
+ 	default:
+ 		printf("Wrong I2C-adapter number %d\n", adap->hwadapnr);
+ 	}
+@@ -658,7 +738,16 @@ static int dw_i2c_probe(struct i2c_adapt
+ {
+ 	struct i2c_regs *i2c_base = i2c_get_base(adap);
+ 	u32 tmp;
+-	int ret;
++	int ret, hw_semaphore;
++
++	hw_semaphore = i2c_need_semaphore(adap->hwadapnr);
++	if (hw_semaphore) {
++		ret = acquire_semaphore(i2c_base);
++		if (ret) {
++			printf("Unable to aquire hw lock\n");
++			return 1;
++		}
++	}
+ 
+ 	/*
+ 	 * Try to read the first location of the chip.
+@@ -667,6 +756,11 @@ static int dw_i2c_probe(struct i2c_adapt
+ 	if (ret)
+ 		dw_i2c_init(adap, adap->speed, adap->slaveaddr);
+ 
++	if (hw_semaphore) {
++		release_semaphore();
++		writel(IC_TX_EMPTY, i2c_base->ic_intr_mask);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -681,7 +775,16 @@ static int designware_i2c_xfer(struct ud
+ 			       int nmsgs)
+ {
+ 	struct dw_i2c *i2c = dev_get_priv(bus);
+-	int ret;
++	int ret, hw_semaphore = 0;
++
++	hw_semaphore = i2c_need_semaphore(bus->seq_);
++	if (hw_semaphore) {
++		ret = acquire_semaphore(i2c->regs);
++		if (ret) {
++			printf("Unable to aquire hw lock\n");
++			return 1;
++		}
++	}
+ 
+ 	debug("i2c_xfer: %d messages\n", nmsgs);
+ 	for (; nmsgs > 0; nmsgs--, msg++) {
+@@ -695,11 +798,18 @@ static int designware_i2c_xfer(struct ud
+ 		}
+ 		if (ret) {
+ 			debug("i2c_write: error sending\n");
+-			return -EREMOTEIO;
++			ret = -EREMOTEIO;
++			goto rel_semaphore;
+ 		}
+ 	}
+ 
+-	return 0;
++rel_semaphore:
++	if (hw_semaphore) {
++		release_semaphore();
++		writel(IC_TX_EMPTY, &i2c->regs->ic_intr_mask);
++	}
++
++	return ret;
+ }
+ 
+ static int designware_i2c_set_bus_speed(struct udevice *bus, unsigned int speed)
+@@ -723,13 +833,27 @@ static int designware_i2c_probe_chip(str
+ 	struct dw_i2c *i2c = dev_get_priv(bus);
+ 	struct i2c_regs *i2c_base = i2c->regs;
+ 	u32 tmp;
+-	int ret;
++	int ret, hw_semaphore;
++
++	hw_semaphore = i2c_need_semaphore(bus->seq_);
++	if (hw_semaphore) {
++		ret = acquire_semaphore(i2c_base);
++		if (ret) {
++			debug("Unable to aquire hw lock\n");
++			return 1;
++		}
++	}
+ 
+ 	/* Try to read the first location of the chip */
+ 	ret = __dw_i2c_read(i2c_base, chip_addr, 0, 1, (uchar *)&tmp, 1);
+ 	if (ret)
+ 		__dw_i2c_init(i2c_base, 0, 0);
+ 
++	if (hw_semaphore) {
++		release_semaphore();
++		writel(IC_TX_EMPTY, &i2c->regs->ic_intr_mask);
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/i2c/designware_i2c.h b/drivers/i2c/designware_i2c.h
+--- a/drivers/i2c/designware_i2c.h
++++ b/drivers/i2c/designware_i2c.h
+@@ -12,6 +12,12 @@
+ #include <reset.h>
+ #include <linux/bitops.h>
+ 
++#ifdef CONFIG_VENDOR_MAXLINEAR
++#define I2C0_BASE       0xE0500000
++#else
++#define I2C0_BASE       0x0
++#endif
++
+ struct i2c_regs {
+ 	u32 ic_con;		/* 0x00 */
+ 	u32 ic_tar;		/* 0x04 */
+@@ -91,6 +97,9 @@ struct i2c_regs {
+ #define IC_CON_SPD_HS		0x0006
+ #define IC_CON_MM		0x0001
+ 
++#define IC_TAR_MASK             0x03FF
++#define IC_TAR_10_BIT_ADDR      0x1000
++
+ /* i2c target address register definitions */
+ #define TAR_ADDR		0x0050
+ 

@@ -1,0 +1,401 @@
+# HG changeset patch
+# Parent  0e4e3d30b2fbcf0b88afd73ba5fb55b75a33d679
+
+diff --git a/drivers/serial/serial.c b/drivers/serial/serial.c
+--- a/drivers/serial/serial.c
++++ b/drivers/serial/serial.c
+@@ -128,6 +128,7 @@ serial_initfunc(pl01x_serial_initialize)
+ serial_initfunc(pxa_serial_initialize);
+ serial_initfunc(sh_serial_initialize);
+ serial_initfunc(mtk_serial_initialize);
++serial_initfunc(mxl_serial_initialize);
+ 
+ /**
+  * serial_register() - Register serial driver with serial driver core
+@@ -182,6 +183,7 @@ int serial_initialize(void)
+ 	pxa_serial_initialize();
+ 	sh_serial_initialize();
+ 	mtk_serial_initialize();
++	mxl_serial_initialize();
+ 
+ 	serial_assign(default_serial_console()->name);
+ 
+diff --git a/drivers/serial/serial_mxl.c b/drivers/serial/serial_mxl.c
+new file mode 100644
+--- /dev/null
++++ b/drivers/serial/serial_mxl.c
+@@ -0,0 +1,374 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (C) 2022 Maxlinear Corporation
++ *
++ * Serial (ASC) interface driver
++ *
++ */
++
++#include <common.h>
++#include <errno.h>
++#include <asm/arch/project.h>
++#include <dm.h>
++#include <fdtdec.h>
++#include <serial.h>
++#include <watchdog.h>
++
++/* avoid use of the U_BOOT_DEVICE() macro for Non FDT */
++/* #define MXL_SERIAL_NON_FDT */
++#define ASC_TXFIFO_FL			1
++#define ASC_RXFIFO_FL			1
++#define ASC_TXFIFO_FULL			16
++
++DECLARE_GLOBAL_DATA_PTR;
++
++/* information based on device tree for serial port */
++struct mxl_serial_plat {
++	u8  per_id;
++	u32 asc_base;
++	u32 asc_baudrate;
++};
++
++/* default legacy asc0 register base address */
++static u32 ASC_BASE = ASC0_MODULE_BASE;
++
++/*
++*
++* initialize ASC channel
++*
++* This routine initializes the number of data bits, parity
++* and set the selected baud rate. Interrupts are disabled.
++* Set the modem control signals if the option is selected.
++*
++* RETURNS: N/A
++*/
++int mxl_serial_init(void)
++{
++#ifdef SRAM_LOG
++	/* log to sdram counter reset */
++	REG32(SRAM_LOG_CNT) = 0;
++#endif
++
++	/* set CLC register*/
++	CLEAR_BIT(REG32(ASC_BASE+ASC_CLC), ASC_CLC_DISS_MASK);
++	/* peripheral kernel runs at the same clock as the bus */
++	SET_BITFIELD(REG32(ASC_BASE+ASC_CLC),
++				  ASC_CLC_RMC_MASK, ASC_CLC_RMC_POS, 0x0001);
++
++	/* initial async mode */
++	SET_BITFIELD(REG32(ASC_BASE+ASC_MCON),
++		  ASC_MCON_M_MASK, ASC_MCON_M_POS, CONST_ASC_MCON_M_ASYNC);
++
++	/* select input port */
++	SET_BITFIELD(REG32(ASC_BASE+ASC_PISEL),
++		  ASC_PISEL_RIS_MASK, ASC_PISEL_RIS_POS,
++		  CONST_ASC_PISEL_RIS_A);
++
++	/* TXFIFO's filling level */
++	SET_BITFIELD(REG32(ASC_BASE+ASC_TXFCON),
++		  ASC_TXFCON_TXFITL_MASK, ASC_TXFCON_TXFITL_POS,
++		  ASC_TXFIFO_FL);
++
++	/* enable TXFIFO */
++	SET_BIT(REG32(ASC_BASE+ASC_TXFCON), ASC_TXFCON_TXFEN_MASK);
++
++	/* RXFIFO's filling level */
++	SET_BITFIELD(REG32(ASC_BASE+ASC_RXFCON),
++		  ASC_RXFCON_RXFITL_MASK, ASC_RXFCON_RXFITL_POS,
++		  ASC_RXFIFO_FL);
++
++	/* enable RXFIFO */
++	SET_BIT(REG32(ASC_BASE+ASC_RXFCON), ASC_RXFCON_RXFEN_MASK);
++
++	/* receiver enable */
++	SET_BIT(REG32(ASC_BASE+ASC_WHBSTATE), ASC_WHBSTATE_SETREN_MASK);
++
++	return 0;
++}
++
++/*
++ *             FDV            fASC
++ * BaudRate = ----- * --------------------
++ *             512    16 * (ReloadValue+1)
++ */
++
++/*
++ *                  FDV          fASC
++ * ReloadValue = ( ----- * --------------- ) - 1
++ *                  512     16 * BaudRate
++ */
++static void asc_serial_divs(u32 baudrate, u32 fasc, u32 *pfdv, u32 *preload)
++{
++	u32 clock = fasc/16;
++	u32 fdv;				/* best fdv */
++	u32 reload = 0;			/* best reload */
++	u32 diff;				/* smallest diff */
++	u32 idiff;				/* current diff */
++	u32 ireload;			/* current reload */
++	u32 i;					/* current fdv */
++	u32 result;				/* current resulting baudrate */
++
++	if(clock > 0x7FFFFF)
++		clock /= 512;
++	else
++		baudrate *= 512;
++
++	fdv = 512; /* start with 1:1 fraction */
++	diff = baudrate; /* highest possible */
++
++	/* i is the test fdv value -- start with the largest possible */
++	for (i = 512; i > 0; i--)
++	{
++		ireload = (clock * i) / baudrate;
++
++		if(ireload < 1)
++			break; /* already invalid */
++
++		result = (clock * i) / ireload;
++
++		idiff = (result > baudrate) ? (result - baudrate) : (baudrate - result);
++		if (idiff == 0)
++		{
++			fdv = i;
++			reload = ireload;
++			break; /* can't do better */
++		}
++		else if(idiff < diff)
++		{
++			fdv = i; /* best so far */
++			reload = ireload;
++			diff = idiff; /* update lowest diff*/
++		}
++	}
++
++	*pfdv = (fdv == 512) ? 0 : fdv;
++	*preload = reload - 1;
++
++#if defined(CONFIG_IS_HAPS)
++	/* 5MHz >> 9600baud */
++	/* *pfdv    = 47 & ASC_FDV_FD_VAL_MASK; */
++	/* 5MHz >> 86400baud */
++	*pfdv    = 425 & ASC_FDV_FD_VAL_MASK;
++	*preload = 2;
++#endif
++}
++
++static void __serial_setbrg(struct udevice *dev, int baudrate)
++{
++	u32 bg, fdv;
++	int config_baudrate;
++
++	if (baudrate < 0)
++		config_baudrate = CONFIG_BAUDRATE;
++	else
++		config_baudrate = baudrate;
++
++	/* asc_serial_divs(CONFIG_BAUDRATE, get_fpi_clk(), &fdv, &uiReloadValue); */
++	asc_serial_divs(config_baudrate, F_SSC_CLK, &fdv, &bg);
++
++	/* Disable Baud Rate Generator; BG should only be written when R=0 */
++	CLEAR_BIT(REG32(ASC_BASE+ASC_MCON), ASC_MCON_R_MASK);
++
++	/* Enable Fractional Divider, FDE=1 */
++	SET_BIT(REG32(ASC_BASE+ASC_MCON), ASC_MCON_FDE_MASK);
++
++	/* Set fractional divider value */
++	REG32(ASC_BASE+ASC_FDV) = fdv & ASC_FDV_FD_VAL_MASK;
++
++	/* Set reload value in BG */
++	REG32(ASC_BASE+ASC_BG) = bg & ASC_BG_BR_VAL_MASK;
++
++	/* Enable Baud Rate Generator, R=1 */
++	SET_BIT(REG32(ASC_BASE+ASC_MCON), ASC_MCON_R_MASK);
++}
++
++void mxl_serial_setbrg(void)
++{
++	__serial_setbrg(NULL, -1);
++}
++
++void asc_serial_putc(const char c)
++{
++	u32 txFl = 0;
++
++	/* check do we have a free space in the TX FIFO */
++	/* get current filling level */
++	do {
++		txFl = (REG32(ASC_BASE+ASC_FSTAT)
++			& ASC_FSTAT_TXFFL_MASK ) >> ASC_FSTAT_TXFFL_POS;
++		WATCHDOG_RESET();
++	} while (txFl == ASC_TXFIFO_FULL);
++
++	/* write char to Transmit Buffer Register */
++	REG32(ASC_BASE+ASC_TBUF) = c;
++
++	/* check for errors */
++	if (REG32(ASC_BASE+ASC_STATE) & ASC_STATE_TOE_MASK) {
++		SET_BIT(REG32(ASC_BASE+ASC_WHBSTATE),
++			ASC_WHBSTATE_CLRTOE_MASK);
++	}
++}
++
++void asc_serial_puts(const char *s)
++{
++	while (*s) {
++		asc_serial_putc (*s++);
++	}
++}
++
++int asc_serial_getc(void)
++{
++	while ((REG32(ASC_BASE + ASC_FSTAT) & ASC_FSTAT_RXFFL_MASK) == 0) {
++		WATCHDOG_RESET();
++	}
++
++	return (REG32(ASC_BASE + ASC_RBUF) & ASC_RBUF_RD0_MASK);
++}
++
++#ifdef CONFIG_SPL_BUILD
++static struct serial_device mxl_serial_drv = {
++	.name = "mxl_serial",
++	.start = mxl_serial_init,
++	.stop = NULL,
++	.setbrg = mxl_serial_setbrg,
++	.putc = asc_serial_putc,
++	.puts	= default_serial_puts,
++	.getc = asc_serial_getc,
++};
++
++struct serial_device *default_serial_console(void)
++{
++	return &mxl_serial_drv;
++}
++
++void mxl_serial_initialize(void)
++{
++	serial_register(&mxl_serial_drv);
++}
++#endif
++
++#ifdef CONFIG_DM_SERIAL
++int dm_mxl_serial_setbrg(struct udevice *dev, int baudrate)
++{
++	__serial_setbrg(dev, baudrate);
++	return 0;
++}
++
++int mxl_serial_probe(struct udevice *dev)
++{
++	return mxl_serial_init();
++}
++
++
++int mxl_serial_getc(struct udevice *dev)
++{
++	return asc_serial_getc();
++}
++
++int mxl_serial_putc(struct udevice *dev, const char ch)
++{
++	asc_serial_putc(ch);
++	return 0;
++}
++
++int mxl_serial_pending(struct udevice *dev, bool input)
++{
++	int res = 1;
++
++	if ((REG32(ASC_BASE+ASC_FSTAT) & ASC_FSTAT_RXFFL_MASK) == 0)
++		res = 0;
++
++	return res;
++}
++
++static int mxl_serial_of_to_plat(struct udevice *dev)
++{
++	struct mxl_serial_plat *plat = dev_get_plat(dev);
++
++	plat->per_id = dev_read_u32_default(dev, "id", 0);
++	debug("\n SERIAL: ASC%d configured for uart \n", plat->per_id);
++
++	plat->asc_base = dev_read_u32_default(dev, "reg", ASC_BASE);
++	if (plat->asc_base != ASC_BASE) {
++		ASC_BASE = plat->asc_base;
++	}
++
++	plat->asc_baudrate= dev_read_u32_default(dev, "current-speed", 0);
++	debug("SERIAL: %s:ASC baudrate = %d\n", __func__, plat->asc_baudrate);
++
++	return 0;
++}
++
++static const struct dm_serial_ops mxl_serial_ops = {
++	.setbrg	= dm_mxl_serial_setbrg,
++	.getc = mxl_serial_getc,
++	.putc = mxl_serial_putc,
++	.pending = mxl_serial_pending,
++	.clear = NULL,
++};
++
++static const struct udevice_id mxl_serial_ids[] = {
++	{ .compatible = "mxl,twinhill-serial" },
++	{ .compatible = "mxl,lightning-serial"},
++	{ }
++};
++
++U_BOOT_DRIVER(mxl_serial) = {
++	.name = "mxl_serial",
++	.id = UCLASS_SERIAL,
++	.of_match = mxl_serial_ids,
++	.of_to_plat = mxl_serial_of_to_plat,
++	.plat_auto = sizeof(struct mxl_serial_plat),
++	.probe = mxl_serial_probe,
++	.ops = &mxl_serial_ops,
++	.flags = DM_FLAG_PRE_RELOC,
++};
++
++#else /* CONFIG_DM_SERIAL */
++
++static struct serial_device mxl_serial_drv = {
++	.name = "mxl_serial",
++	.start = mxl_serial_init,
++	.stop = NULL,
++	.setbrg = mxl_serial_setbrg,
++	.putc = asc_serial_putc,
++	.puts	= default_serial_puts,
++	.getc = asc_serial_getc,
++};
++
++struct serial_device *default_serial_console(void)
++{
++	return &mxl_serial_drv;
++}
++#endif /* CONFIG_DM_SERIAL */
++
++#ifdef CONFIG_DEBUG_UART
++#include <debug_uart.h>
++
++static inline void _debug_uart_init(void)
++{
++#ifdef SRAM_LOG
++	char *buff;
++	buff = SRAM_LOG_START;
++	REG32(SRAM_LOG_CNT)
++		+= LOG2RAM((buff+REG32(SRAM_LOG_CNT)),
++				"\nRAMLOG:<%s>", __func__);
++#endif
++	mxl_serial_init();
++	__serial_setbrg(NULL, -1);
++}
++
++static inline void _debug_uart_putc(int ch)
++{
++	asc_serial_putc(ch);
++}
++
++DEBUG_UART_FUNCS
++#endif
++
++#if MXL_SERIAL_NON_FDT
++U_BOOT_DEVICE(mxl_serial_non_fdt) = {
++	.name = "mxl_serial_non_fdt",
++	.platdata = NULL,
++};
++#endif
