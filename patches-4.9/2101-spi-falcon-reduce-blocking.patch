@@ -1,0 +1,165 @@
+reduce possible system-blocking by accesses to EBU registers:
+- use a small delay to relax system performance
+- do locking with a hardware semaphore (with no impact, if the MPS module is not active)
+
+--- a/drivers/spi/spi-falcon.c
++++ b/drivers/spi/spi-falcon.c
+@@ -77,6 +77,8 @@
+ #define SFSTAT_CMD_ERR		0x20000000
+ /* Access Command Pending */
+ #define SFSTAT_CMD_PEND		0x00400000
++/* Protocol Engine Active */
++#define SFSTAT_ACTIVE		0x00100000
+ /* Frequency set to 100MHz. */
+ #define EBUCC_EBUDIV_SELF100	0x00000001
+ /* Serial Flash */
+@@ -91,11 +93,44 @@
+ #define CLOCK_100M	100000000
+ #define CLOCK_50M	50000000
+ 
++#define UDELAY_VAL	1
++
+ struct falcon_sflash {
+ 	u32 sfcmd; /* for caching of opcode, direction, ... */
+ 	struct spi_master *master;
+ };
+ 
++#define MPS_BASE		KSEG1ADDR(0x1D004000)
++#define VPE0_BINSEM(x)		(0x100+4*(x))
++#define VPE1_BINSEM(x)		(0x200+4*(x))
++#define BINSEM_NR		1
++
++static inline void binsem_lock(void)
++{
++	while (ltq_r32((void*)(MPS_BASE + VPE0_BINSEM(BINSEM_NR))) != 0) ;
++}
++static inline void binsem_unlock(void)
++{
++	ltq_w32(0, (void*)(MPS_BASE + VPE0_BINSEM(BINSEM_NR)));
++}
++
++static inline int wait_cmd_pending(struct device *dev)
++{
++	u32 val;
++	do {
++		binsem_lock();
++		val = ltq_ebu_r32(SFSTAT);
++		binsem_unlock();
++		if (val & SFSTAT_CMD_ERR) {
++			/* reset error status */
++			dev_err(dev, "SFSTAT: CMD_ERR (%x)\n", val);
++			ltq_ebu_w32(SFSTAT_CMD_ERR, SFSTAT);
++			return -EBADE;
++		}
++	} while (val & (SFSTAT_CMD_PEND | SFSTAT_ACTIVE));
++	return 0;
++}
++
+ int falcon_sflash_xfer(struct spi_device *spi, struct spi_transfer *t,
+ 		unsigned long flags)
+ {
+@@ -195,8 +230,11 @@ int falcon_sflash_xfer(struct spi_device
+ 			priv->sfcmd &= ~(SFCMD_ALEN_MASK | SFCMD_DUMLEN_MASK);
+ 			priv->sfcmd |= (alen << SFCMD_ALEN_OFFSET) |
+ 					 (dumlen << SFCMD_DUMLEN_OFFSET);
+-			if (alen > 0)
++			if (alen > 0) {
++				binsem_lock();
+ 				ltq_ebu_w32(val, SFADDR);
++				binsem_unlock();
++			}
+ 
+ 			dev_dbg(dev, "wr %02X, alen=%d (addr=%06X) dlen=%d\n",
+ 				priv->sfcmd & SFCMD_OPC_MASK,
+@@ -232,14 +270,22 @@ int falcon_sflash_xfer(struct spi_device
+ 						~SFCMD_KEEP_CS_KEEP_SELECTED;
+ 				}
+ 				if ((len == 4) || (bytelen == 0)) {
++					if (wait_cmd_pending(dev)<0)
++						return -EBADE;
++					binsem_lock();
+ 					ltq_ebu_w32(val, SFDATA);
+ 					ltq_ebu_w32(priv->sfcmd
+ 						| (len<<SFCMD_DLEN_OFFSET),
+ 						SFCMD);
++					binsem_unlock();
++					udelay(UDELAY_VAL);
+ 					len = 0;
+ 					val = 0;
+-					priv->sfcmd &= ~(SFCMD_ALEN_MASK
+-							 | SFCMD_DUMLEN_MASK);
++					if (priv->sfcmd & (SFCMD_ALEN_MASK | SFCMD_DUMLEN_MASK)) {
++						priv->sfcmd &= ~(SFCMD_ALEN_MASK
++								| SFCMD_DUMLEN_MASK);
++						udelay(UDELAY_VAL);
++					 }
+ 				}
+ 			} while (bytelen);
+ 			state = state_end;
+@@ -257,22 +303,23 @@ int falcon_sflash_xfer(struct spi_device
+ 				}
+ 				len = (bytelen > 4) ? 4 : bytelen;
+ 				bytelen -= len;
++				if (wait_cmd_pending(dev)<0)
++					return -EBADE;
++				binsem_lock();
+ 				ltq_ebu_w32(priv->sfcmd
+ 					| (len << SFCMD_DLEN_OFFSET), SFCMD);
+-				priv->sfcmd &= ~(SFCMD_ALEN_MASK
+-						 | SFCMD_DUMLEN_MASK);
+-				do {
+-					val = ltq_ebu_r32(SFSTAT);
+-					if (val & SFSTAT_CMD_ERR) {
+-						/* reset error status */
+-						dev_err(dev, "SFSTAT: CMD_ERR");
+-						dev_err(dev, " (%x)\n", val);
+-						ltq_ebu_w32(SFSTAT_CMD_ERR,
+-							SFSTAT);
+-						return -EBADE;
+-					}
+-				} while (val & SFSTAT_CMD_PEND);
++				binsem_unlock();
++				if (priv->sfcmd & (SFCMD_ALEN_MASK | SFCMD_DUMLEN_MASK)) {
++					priv->sfcmd &= ~(SFCMD_ALEN_MASK
++							| SFCMD_DUMLEN_MASK);
++					udelay(UDELAY_VAL);
++				 }
++				udelay(UDELAY_VAL);
++				if (wait_cmd_pending(dev)<0)
++					return -EBADE;
++				binsem_lock();
+ 				val = ltq_ebu_r32(SFDATA);
++				binsem_unlock();
+ 				do {
+ 					*rxp = (val & 0xFF);
+ 					rxp++;
+@@ -286,9 +333,11 @@ int falcon_sflash_xfer(struct spi_device
+ 		case state_disable_cs:
+ 		{
+ 			priv->sfcmd &= ~SFCMD_KEEP_CS_KEEP_SELECTED;
++			binsem_lock();
+ 			ltq_ebu_w32(priv->sfcmd | (0 << SFCMD_DLEN_OFFSET),
+ 				SFCMD);
+ 			val = ltq_ebu_r32(SFSTAT);
++			binsem_unlock();
+ 			if (val & SFSTAT_CMD_ERR) {
+ 				/* reset error status */
+ 				dev_err(dev, "SFSTAT: CMD_ERR (%x)\n", val);
+@@ -327,6 +376,8 @@ static int falcon_sflash_setup(struct sp
+ 	dev_dbg(dev, "max_speed is %d Hz, set speed to %d Hz\n", 
+ 		spi->max_speed_hz, ebuclk / i);
+ 
++	binsem_lock();
++
+ 	/* setup period of serial clock */
+ 	ltq_ebu_w32_mask(SFTIME_SCKF_POS_MASK
+ 			| SFTIME_SCKR_POS_MASK
+@@ -347,6 +398,8 @@ static int falcon_sflash_setup(struct sp
+ 	/* set address wrap around to maximum for 24-bit addresses */
+ 	ltq_ebu_w32_mask(SFCON_DEV_SIZE_MASK, SFCON_DEV_SIZE_A23_0, SFCON);
+ 
++	binsem_unlock();
++
+ 	spin_unlock_irqrestore(&ebu_lock, flags);
+ 
+ 	return 0;

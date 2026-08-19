@@ -1,0 +1,1110 @@
+Lantiq SVIP SoC pinctrl driver
+
+--- /dev/null
++++ b/arch/mips/include/asm/mach-lantiq/svip/pinctrl-svip.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (C) 2012 Lantiq Deutschland GmbH */
++/* Copyright (C) 2018 Intel Corporation */
++
++#ifndef _LANTIQ_PINCTRL_SVIP_H__
++#define _LANTIQ_PINCTRL_SVIP_H__
++
++extern int svip_enable_external_int(u32 exint, u32 mode);
++extern int svip_disable_external_int(u32 exint);
++
++#endif /* _LANTIQ_PINCTRL_SVIP_H__ */
+--- a/drivers/pinctrl/Kconfig
++++ b/drivers/pinctrl/Kconfig
+@@ -181,6 +181,11 @@ config PINCTRL_ST
+ 	select PINCONF
+ 	select GPIOLIB_IRQCHIP
+ 
++config PINCTRL_SVIP
++	bool
++	depends on SOC_SVIP
++	depends on PINCTRL_LANTIQ
++
+ config PINCTRL_TZ1090
+ 	bool "Toumaz Xenif TZ1090 pin control driver"
+ 	depends on SOC_TZ1090
+--- a/drivers/pinctrl/Makefile
++++ b/drivers/pinctrl/Makefile
+@@ -25,6 +25,7 @@ obj-$(CONFIG_PINCTRL_PISTACHIO)	+= pinct
+ obj-$(CONFIG_PINCTRL_ROCKCHIP)	+= pinctrl-rockchip.o
+ obj-$(CONFIG_PINCTRL_SINGLE)	+= pinctrl-single.o
+ obj-$(CONFIG_PINCTRL_SIRF)	+= sirf/
++obj-$(CONFIG_PINCTRL_SVIP)	+= pinctrl-svip.o
+ obj-$(CONFIG_ARCH_TEGRA)	+= tegra/
+ obj-$(CONFIG_PINCTRL_TZ1090)	+= pinctrl-tz1090.o
+ obj-$(CONFIG_PINCTRL_TZ1090_PDC)	+= pinctrl-tz1090-pdc.o
+--- /dev/null
++++ b/drivers/pinctrl/pinctrl-svip.c
+@@ -0,0 +1,1067 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2012 John Crispin <blogic@openwrt.org> */
++/* Copyright (C) 2018 Intel Corporation */
++
++#include <linux/interrupt.h>
++#include <linux/err.h>
++#include <linux/slab.h>
++#include <linux/module.h>
++#include <linux/of_platform.h>
++#include <linux/of_address.h>
++#include <linux/of_gpio.h>
++#include <linux/of_irq.h>
++#include <linux/ioport.h>
++#include <linux/io.h>
++#include <linux/device.h>
++#include <linux/platform_device.h>
++#include <linux/kernel_stat.h>
++
++#include "../gpio/gpiolib.h"
++#include "pinctrl-lantiq.h"
++
++#include <lantiq_soc.h>
++
++#define PINS			32
++#define PORTS			5
++#define PORT(x)			(x / PINS)
++#define PORT_PIN(x)		(x % PINS)
++
++/* we have 2 mux bits that can be set for each pin */
++#define MUX_ALT0		0x1
++#define MUX_ALT1		0x2
++
++/* number of external interrupts */
++#define SVIP_EIU		17
++/* start number of external interrupts */
++#define SVIP_EIU_START		180
++
++/* these are the offsets to our registers */
++#define GPIO_OUT		0x00
++#define GPIO_IN			0x04
++#define GPIO_DIR		0x08
++#define GPIO_ALT0		0x0C
++#define GPIO_ALT1		0x10
++#define GPIO_PUEN		0x14
++#define GPIO_EXINTCR0		0x18
++#define GPIO_EXINTCR1		0x1C
++#define GPIO_IRNCR		0x20
++#define GPIO_IRNICR		0x24
++#define GPIO_IRNEN		0x28
++#define GPIO_IRNCFG		0x2C
++#define GPIO_IRNENSET		0x30
++#define GPIO_IRNENCLR		0x34
++
++/* turn a gpio_chip into a svip_gpio_port */
++#define ctop(c)		container_of(c, struct svip_gpio_port, gpio_chip)
++
++/* macros to help us access the registers */
++#define gpio_getbit(m, r, p)	(!!(ltq_r32(m + r) & BIT(p)))
++#define gpio_setbit(m, r, p)	ltq_w32_mask(0, BIT(p), m + r)
++#define gpio_clearbit(m, r, p)	ltq_w32_mask(BIT(p), 0, m + r)
++
++#define MFP_SVIP(a, f0, f1, f2, f3)	\
++	{				\
++		.name = #a,		\
++		.pin = a,		\
++		.func = {		\
++			SVIP_MUX_##f0,	\
++			SVIP_MUX_##f1,	\
++			SVIP_MUX_##f2,	\
++			SVIP_MUX_##f3,	\
++		},			\
++	}
++
++#define GRP_MUX(a, m, p)		\
++	{ .name = a, .mux = SVIP_MUX_##m, .pins = p, .npins = ARRAY_SIZE(p), }
++
++#define SVIP_MAX_PIN_PORT0		20
++#define SVIP_MAX_PIN_PORT1		20
++#define SVIP_MAX_PIN_PORT2		19
++#define SVIP_MAX_PIN_PORT3		20
++#define SVIP_MAX_PIN_PORT4		24
++
++enum svip_mux {
++	SVIP_MUX_GPIO = 0,
++	SVIP_MUX_SPI,
++	SVIP_MUX_ASC,
++	SVIP_MUX_PCM,
++	SVIP_MUX_SLIC,
++	SVIP_MUX_EBU,
++	SVIP_MUX_JTAG,
++	SVIP_MUX_EXIN,
++	SVIP_MUX_TDM,
++	SVIP_MUX_STP,
++	SVIP_MUX_SIN,
++	SVIP_MUX_GPT,
++	SVIP_MUX_NMI,
++	SVIP_MUX_MDIO,
++	SVIP_MUX_MII,
++	SVIP_MUX_EPHY,
++	SVIP_MUX_DFE,
++	SVIP_MUX_SDIO,
++	SVIP_MUX_GPHY,
++	SVIP_MUX_NONE = 0xffff,
++};
++
++struct svip_gpio_port {
++	struct gpio_chip gpio_chip;
++	struct irq_domain *domain;
++	char name[6];
++};
++
++static const struct ltq_mfp_pin svip_mfp_port0[SVIP_MAX_PIN_PORT0] = {
++/*       pin    f0	f1	f2	f3   */
++MFP_SVIP(GPIO0, SPI, GPIO, NONE, NONE),
++MFP_SVIP(GPIO1, SPI, GPIO, NONE, NONE),
++MFP_SVIP(GPIO2, SPI, GPIO, NONE, NONE),
++MFP_SVIP(GPIO3, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO4, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO5, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO6, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO7, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO8, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO9, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO10, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO11, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO12, SPI, GPIO, SPI, NONE),
++MFP_SVIP(GPIO13, SPI, GPIO, SPI, SPI),
++MFP_SVIP(GPIO14, GPIO, ASC, NONE, NONE),
++MFP_SVIP(GPIO15, GPIO, ASC, NONE, NONE),
++MFP_SVIP(GPIO16, GPIO, ASC, NONE, NONE),
++MFP_SVIP(GPIO17, GPIO, ASC, NONE, NONE),
++MFP_SVIP(GPIO18, JTAG, GPIO, NONE, NONE),
++MFP_SVIP(GPIO19, NONE, GPIO, NONE, NONE) };
++static const struct ltq_mfp_pin svip_mfp_port1[SVIP_MAX_PIN_PORT1] = {
++/*       pin    f0	f1	f2	f3   */
++MFP_SVIP(GPIO32, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO33, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO34, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO35, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO36, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO37, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO38, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO39, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO40, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO41, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO42, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO43, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO44, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO45, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO46, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO47, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO48, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO49, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO50, PCM, GPIO, NONE, NONE),
++MFP_SVIP(GPIO51, PCM, GPIO, NONE, NONE) };
++static const struct ltq_mfp_pin svip_mfp_port2[SVIP_MAX_PIN_PORT2] = {
++/*       pin    f0	f1	f2	f3   */
++MFP_SVIP(GPIO64, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO65, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO66, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO67, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO68, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO69, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO70, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO71, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO72, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO73, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO74, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO75, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO76, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO77, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO78, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO79, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO80, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO81, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO82, EBU, GPIO, NONE, NONE) };
++static const struct ltq_mfp_pin svip_mfp_port3[SVIP_MAX_PIN_PORT3] = {
++/*       pin    f0	f1	f2	f3   */
++MFP_SVIP(GPIO96, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO97, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO98, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO99, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO100, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO101, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO102, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO103, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO104, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO105, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO106, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO107, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO108, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO109, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO110, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO111, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO112, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO113, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO114, EBU, GPIO, NONE, NONE),
++MFP_SVIP(GPIO115, EBU, GPIO, NONE, NONE) };
++static const struct ltq_mfp_pin svip_mfp_port4[SVIP_MAX_PIN_PORT4] = {
++/*       pin    f0	f1	f2	f3   */
++MFP_SVIP(GPIO128, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO129, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO130, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO131, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO132, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO133, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO134, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO135, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO136, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO137, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO138, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO139, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO140, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO141, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO142, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO143, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO144, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO145, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO146, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO147, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO148, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO149, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO150, SLIC, GPIO, NONE, NONE),
++MFP_SVIP(GPIO151, SLIC, GPIO, NONE, NONE) };
++
++/* Port 0 */
++static const unsigned pins_spi0[] = { GPIO0, GPIO1, GPIO2 };
++static const unsigned pins_spi1[] = { GPIO3, GPIO4, GPIO5 };
++static const unsigned pins_spi2[] = { GPIO4, GPIO5 };
++
++/* For both master and slave modes */
++static const unsigned pins_spi0_cs0[] = { GPIO6 };
++/* Next 7 used only in master mode */
++static const unsigned pins_spi0_cs1[] = { GPIO7 };
++static const unsigned pins_spi0_cs2[] = { GPIO8 };
++static const unsigned pins_spi0_cs3[] = { GPIO9 };
++static const unsigned pins_spi0_cs4[] = { GPIO10 };
++static const unsigned pins_spi0_cs5[] = { GPIO11 };
++static const unsigned pins_spi0_cs6[] = { GPIO12 };
++static const unsigned pins_spi0_cs7[] = { GPIO13 };
++
++/* For master mode only */
++static const unsigned pins_spi1_m_cs0[] = { GPIO6 };
++/* For slave mode only */
++static const unsigned pins_spi1_s_cs0[] = { GPIO7 };
++/* Next 7 used only in master mode */
++static const unsigned pins_spi1_cs1[] = { GPIO7 };
++static const unsigned pins_spi1_cs2[] = { GPIO8 };
++static const unsigned pins_spi1_cs3[] = { GPIO9 };
++static const unsigned pins_spi1_cs4[] = { GPIO10 };
++static const unsigned pins_spi1_cs5[] = { GPIO11 };
++static const unsigned pins_spi1_cs6[] = { GPIO12 };
++static const unsigned pins_spi1_cs7[] = { GPIO13 };
++
++/* SPI2 works only in slave mode */
++static const unsigned pins_spi2_cs0[] = { GPIO7 };
++static const unsigned pins_spi2_int[] = { GPIO13 };
++
++static const unsigned pins_asc0[] = { GPIO14, GPIO15 };
++static const unsigned pins_asc1[] = { GPIO16, GPIO17 };
++static const unsigned pins_jtag[] = { GPIO18 };
++
++static const unsigned pins_exin0[] = { GPIO7 };
++static const unsigned pins_exin1[] = { GPIO8 };
++static const unsigned pins_exin2[] = { GPIO9 };
++static const unsigned pins_exin3[] = { GPIO10 };
++static const unsigned pins_exin4[] = { GPIO11 };
++static const unsigned pins_exin5[] = { GPIO12 };
++static const unsigned pins_exin6[] = { GPIO13 };
++static const unsigned pins_exin7[] = { GPIO14 };
++static const unsigned pins_exin8[] = { GPIO15 };
++static const unsigned pins_exin9[] = { GPIO16 };
++static const unsigned pins_exin10[] = { GPIO17 };
++static const unsigned pins_exin16[] = { GPIO19 };
++
++/* Port 1 */
++static const unsigned pins_pcm0[] = { GPIO32, GPIO33, GPIO34, GPIO35, GPIO36 };
++static const unsigned pins_pcm1[] = { GPIO37, GPIO38, GPIO39, GPIO40, GPIO41 };
++static const unsigned pins_pcm2[] = { GPIO42, GPIO43, GPIO44, GPIO45, GPIO46 };
++static const unsigned pins_pcm3[] = { GPIO47, GPIO48, GPIO49, GPIO50, GPIO51 };
++static const unsigned pins_exin11[] = { GPIO50 };
++static const unsigned pins_exin12[] = { GPIO49 };
++static const unsigned pins_exin13[] = { GPIO48 };
++static const unsigned pins_exin14[] = { GPIO47 };
++static const unsigned pins_exin15[] = { GPIO51 };
++
++/* Port 2 */
++static const unsigned pins_ebu_a0[] = { GPIO64 };
++static const unsigned pins_ebu_a1[] = { GPIO65 };
++static const unsigned pins_ebu_a2[] = { GPIO66 };
++static const unsigned pins_ebu_a3[] = { GPIO67 };
++static const unsigned pins_ebu_a4[] = { GPIO68 };
++static const unsigned pins_ebu_a5[] = { GPIO69 };
++static const unsigned pins_ebu_a6[] = { GPIO70 };
++static const unsigned pins_ebu_a7[] = { GPIO71 };
++static const unsigned pins_ebu_a8[] = { GPIO72 };
++static const unsigned pins_ebu_a9[] = { GPIO73 };
++static const unsigned pins_ebu_a10[] = { GPIO74 };
++static const unsigned pins_ebu_a11[] = { GPIO75 };
++static const unsigned pins_ebu_rd[] = { GPIO76 };
++static const unsigned pins_ebu_wr[] = { GPIO77 };
++static const unsigned pins_ebu_ale[] = { GPIO78 };
++static const unsigned pins_ebu_wait[] = { GPIO79 };
++static const unsigned pins_ebu_rdy[] = { GPIO80 };
++static const unsigned pins_ebu_bc0[] = { GPIO81 };
++static const unsigned pins_ebu_bc1[] = { GPIO82 };
++
++/* Port 3 */
++static const unsigned pins_ebu_ad0[] = { GPIO96 };
++static const unsigned pins_ebu_ad1[] = { GPIO97 };
++static const unsigned pins_ebu_ad2[] = { GPIO98 };
++static const unsigned pins_ebu_ad3[] = { GPIO99 };
++static const unsigned pins_ebu_ad4[] = { GPIO100 };
++static const unsigned pins_ebu_ad5[] = { GPIO101 };
++static const unsigned pins_ebu_ad6[] = { GPIO102 };
++static const unsigned pins_ebu_ad7[] = { GPIO103 };
++static const unsigned pins_ebu_ad8[] = { GPIO104 };
++static const unsigned pins_ebu_ad9[] = { GPIO105 };
++static const unsigned pins_ebu_ad10[] = { GPIO106 };
++static const unsigned pins_ebu_ad11[] = { GPIO107 };
++static const unsigned pins_ebu_ad12[] = { GPIO108 };
++static const unsigned pins_ebu_ad13[] = { GPIO109 };
++static const unsigned pins_ebu_ad14[] = { GPIO110 };
++static const unsigned pins_ebu_ad15[] = { GPIO111 };
++static const unsigned pins_ebu_cs0[] = { GPIO112 };
++static const unsigned pins_ebu_cs1[] = { GPIO113 };
++static const unsigned pins_ebu_cs2[] = { GPIO114 };
++static const unsigned pins_ebu_cs3[] = { GPIO115 };
++
++/* Port 4 */
++static const unsigned pins_slic0[] = { GPIO128, GPIO129, GPIO130 };
++static const unsigned pins_slic1[] = { GPIO131, GPIO132, GPIO133 };
++static const unsigned pins_slic2[] = { GPIO134, GPIO135, GPIO136 };
++static const unsigned pins_slic3[] = { GPIO137, GPIO138, GPIO139 };
++static const unsigned pins_slic4[] = { GPIO140, GPIO141, GPIO142 };
++static const unsigned pins_slic5[] = { GPIO143, GPIO144, GPIO145 };
++static const unsigned pins_slic6[] = { GPIO146, GPIO147, GPIO148 };
++static const unsigned pins_slic7[] = { GPIO149, GPIO150, GPIO151 };
++
++static const struct ltq_pin_group svip_grps_port0[] = {
++GRP_MUX("spi0", SPI, pins_spi0),
++GRP_MUX("spi1", SPI, pins_spi1),
++GRP_MUX("spi2", SPI, pins_spi2),
++GRP_MUX("spi0 cs0", SPI, pins_spi0_cs0),
++GRP_MUX("spi0 cs1", SPI, pins_spi0_cs1),
++GRP_MUX("spi0 cs2", SPI, pins_spi0_cs2),
++GRP_MUX("spi0 cs3", SPI, pins_spi0_cs3),
++GRP_MUX("spi0 cs4", SPI, pins_spi0_cs4),
++GRP_MUX("spi0 cs5", SPI, pins_spi0_cs5),
++GRP_MUX("spi0 cs6", SPI, pins_spi0_cs6),
++GRP_MUX("spi0 cs7", SPI, pins_spi0_cs7),
++GRP_MUX("spi1 m cs0", SPI, pins_spi1_m_cs0),
++GRP_MUX("spi1 s cs0", SPI, pins_spi1_s_cs0),
++GRP_MUX("spi1 cs1", SPI, pins_spi1_cs1),
++GRP_MUX("spi1 cs2", SPI, pins_spi1_cs2),
++GRP_MUX("spi1 cs3", SPI, pins_spi1_cs3),
++GRP_MUX("spi1 cs4", SPI, pins_spi1_cs4),
++GRP_MUX("spi1 cs5", SPI, pins_spi1_cs5),
++GRP_MUX("spi1 cs6", SPI, pins_spi1_cs6),
++GRP_MUX("spi1 cs7", SPI, pins_spi1_cs7),
++GRP_MUX("spi2 cs0", SPI, pins_spi2_cs0),
++GRP_MUX("spi2 int", SPI, pins_spi2_int),
++GRP_MUX("asc0", ASC, pins_asc0),
++GRP_MUX("asc1", ASC, pins_asc1),
++GRP_MUX("jtag", JTAG, pins_jtag),
++GRP_MUX("exin0", EXIN, pins_exin0),
++GRP_MUX("exin1", EXIN, pins_exin1),
++GRP_MUX("exin2", EXIN, pins_exin2),
++GRP_MUX("exin3", EXIN, pins_exin3),
++GRP_MUX("exin4", EXIN, pins_exin4),
++GRP_MUX("exin5", EXIN, pins_exin5),
++GRP_MUX("exin6", EXIN, pins_exin6),
++GRP_MUX("exin7", EXIN, pins_exin7),
++GRP_MUX("exin8", EXIN, pins_exin8),
++GRP_MUX("exin9", EXIN, pins_exin9),
++GRP_MUX("exin10", EXIN, pins_exin10),
++GRP_MUX("exin16", EXIN, pins_exin16) };
++
++static const struct ltq_pin_group svip_grps_port1[] = {
++GRP_MUX("pcm0", PCM, pins_pcm0),
++GRP_MUX("pcm1", PCM, pins_pcm1),
++GRP_MUX("pcm2", PCM, pins_pcm2),
++GRP_MUX("pcm3", PCM, pins_pcm3),
++GRP_MUX("exin11", EXIN, pins_exin11),
++GRP_MUX("exin12", EXIN, pins_exin12),
++GRP_MUX("exin13", EXIN, pins_exin13),
++GRP_MUX("exin14", EXIN, pins_exin14),
++GRP_MUX("exin15", EXIN, pins_exin15) };
++
++static const struct ltq_pin_group svip_grps_port2[] = {
++GRP_MUX("ebu a0", EBU, pins_ebu_a0),
++GRP_MUX("ebu a1", EBU, pins_ebu_a1),
++GRP_MUX("ebu a2", EBU, pins_ebu_a2),
++GRP_MUX("ebu a3", EBU, pins_ebu_a3),
++GRP_MUX("ebu a4", EBU, pins_ebu_a4),
++GRP_MUX("ebu a5", EBU, pins_ebu_a5),
++GRP_MUX("ebu a6", EBU, pins_ebu_a6),
++GRP_MUX("ebu a7", EBU, pins_ebu_a7),
++GRP_MUX("ebu a8", EBU, pins_ebu_a8),
++GRP_MUX("ebu a9", EBU, pins_ebu_a9),
++GRP_MUX("ebu a10", EBU, pins_ebu_a10),
++GRP_MUX("ebu a11", EBU, pins_ebu_a11),
++GRP_MUX("ebu rd", EBU, pins_ebu_rd),
++GRP_MUX("ebu wr", EBU, pins_ebu_wr),
++GRP_MUX("ebu ale", EBU, pins_ebu_ale),
++GRP_MUX("ebu wait", EBU, pins_ebu_wait),
++GRP_MUX("ebu rdy", EBU, pins_ebu_rdy),
++GRP_MUX("ebu bc0", EBU, pins_ebu_bc0),
++GRP_MUX("ebu bc1", EBU, pins_ebu_bc1) };
++
++static const struct ltq_pin_group svip_grps_port3[] = {
++GRP_MUX("ebu ad0", EBU, pins_ebu_ad0),
++GRP_MUX("ebu ad1", EBU, pins_ebu_ad1),
++GRP_MUX("ebu ad2", EBU, pins_ebu_ad2),
++GRP_MUX("ebu ad3", EBU, pins_ebu_ad3),
++GRP_MUX("ebu ad4", EBU, pins_ebu_ad4),
++GRP_MUX("ebu ad5", EBU, pins_ebu_ad5),
++GRP_MUX("ebu ad6", EBU, pins_ebu_ad6),
++GRP_MUX("ebu ad7", EBU, pins_ebu_ad7),
++GRP_MUX("ebu ad8", EBU, pins_ebu_ad8),
++GRP_MUX("ebu ad9", EBU, pins_ebu_ad9),
++GRP_MUX("ebu ad10", EBU, pins_ebu_ad10),
++GRP_MUX("ebu ad11", EBU, pins_ebu_ad11),
++GRP_MUX("ebu ad12", EBU, pins_ebu_ad12),
++GRP_MUX("ebu ad13", EBU, pins_ebu_ad13),
++GRP_MUX("ebu ad14", EBU, pins_ebu_ad14),
++GRP_MUX("ebu ad15", EBU, pins_ebu_ad15),
++GRP_MUX("ebu cs0", EBU, pins_ebu_cs0),
++GRP_MUX("ebu cs1", EBU, pins_ebu_cs1),
++GRP_MUX("ebu cs2", EBU, pins_ebu_cs2),
++GRP_MUX("ebu cs3", EBU, pins_ebu_cs3) };
++
++static const struct ltq_pin_group svip_grps_port4[] = {
++GRP_MUX("slic0", SLIC, pins_slic0),
++GRP_MUX("slic1", SLIC, pins_slic1),
++GRP_MUX("slic2", SLIC, pins_slic2),
++GRP_MUX("slic3", SLIC, pins_slic3),
++GRP_MUX("slic4", SLIC, pins_slic4),
++GRP_MUX("slic5", SLIC, pins_slic5),
++GRP_MUX("slic6", SLIC, pins_slic6),
++GRP_MUX("slic7", SLIC, pins_slic7) };
++
++/* Port 0 groups */
++static const char * const svip_spi_grps[] = {
++	"spi0", "spi1", "spi2", "spi0 cs0", "spi0 cs1", "spi0 cs2", "spi0 cs3",
++	"spi0 cs4", "spi0 cs5", "spi0 cs6", "spi0 cs7",
++	"spi1 m cs0", "spi1 s cs0", "spi1 cs1", "spi1 cs2",
++	"spi1 cs3", "spi1 cs4", "spi1 cs5", "spi1 cs6",
++	"spi1 cs7", "spi2 cs0", "spi2 int" };
++static const char * const svip_asc_grps[] = { "asc0", "asc1" };
++static const char * const svip_jtag_grps[] = { "jtag" };
++static const char * const svip_exin_grps0[] = {
++	"exin0", "exin1", "exin2", "exin3", "exin4", "exin5", "exin6", "exin7",
++	"exin8", "exin9", "exin10", "exin16" };
++
++/* Port 1 groups */
++static const char * const svip_pcm_grps[] = { "pcm0", "pcm1", "pcm2", "pcm3" };
++static const char * const svip_exin_grps1[] = {
++	"exin11", "exin12", "exin13", "exin14", "exin15" };
++
++/* Port 2 groups */
++static const char * const svip_ebu_grps2[] = {
++	"ebu a0", "ebu a1", "ebu a2", "ebu a3", "ebu a4", "ebu a5", "ebu a6",
++	"ebu a7", "ebu a8", "ebu a9", "ebu a10", "ebu rd",
++	"ebu wr", "ebu ale", "ebu wait", "ebu rdy", "ebu bc0",
++	"ebu bc1" };
++
++/* Port 3 groups */
++static const char * const svip_ebu_grps3[] = {
++	"ebu ad0", "ebu ad1", "ebu ad2", "ebu ad3", "ebu ad4", "ebu ad5",
++	"ebu ad6", "ebu ad7", "ebu ad8", "ebu ad9", "ebu ad10", "ebu ad11",
++	"ebu ad12", "ebu ad13", "ebu ad14", "ebu ad15",
++	"ebu cs0", "ebu cs1", "ebu cs2", "ebu cs3" };
++
++/* Port 4 groups */
++static const char * const svip_slic_grps[] = {
++	"slic0", "slic1", "slic2", "slic3", "slic4", "slic5", "slic6",
++	"slic7" };
++
++static const struct ltq_pmx_func svip_funcs_port0[] = {
++{ "spi", ARRAY_AND_SIZE(svip_spi_grps) },
++{ "asc", ARRAY_AND_SIZE(svip_asc_grps) },
++{ "jtag", ARRAY_AND_SIZE(svip_jtag_grps) },
++{ "exin0", ARRAY_AND_SIZE(svip_exin_grps0) } };
++
++static const struct ltq_pmx_func svip_funcs_port1[] = {
++{ "pcm", ARRAY_AND_SIZE(svip_pcm_grps) },
++{ "exin1", ARRAY_AND_SIZE(svip_exin_grps1) } };
++static const struct ltq_pmx_func svip_funcs_port2[] = {
++{ "ebu2", ARRAY_AND_SIZE(svip_ebu_grps2) } };
++static const struct ltq_pmx_func svip_funcs_port3[] = {
++{ "ebu3", ARRAY_AND_SIZE(svip_ebu_grps3) } };
++static const struct ltq_pmx_func svip_funcs_port4[] = {
++{ "slic", ARRAY_AND_SIZE(svip_slic_grps) } };
++
++/* ---------  pinconf related code --------- */
++int svip_pinconf_get(struct pinctrl_dev *pctldev, unsigned pin,
++	unsigned long *config)
++{
++	struct ltq_pinmux_info *info = pinctrl_dev_get_drvdata(pctldev);
++	enum ltq_pinconf_param param = LTQ_PINCONF_UNPACK_PARAM(*config);
++
++	switch (param) {
++	case LTQ_PINCONF_PARAM_PULL:
++		if (gpio_getbit(info->membase[0], GPIO_PUEN, PORT_PIN(pin)))
++			*config = LTQ_PINCONF_PACK(param, 2);
++		else
++			*config = LTQ_PINCONF_PACK(param, 0);
++		break;
++
++	case LTQ_PINCONF_PARAM_OUTPUT:
++		*config = LTQ_PINCONF_PACK(param,
++			gpio_getbit(info->membase[0], GPIO_DIR, PORT_PIN(pin)));
++		break;
++	default:
++		dev_err(pctldev->dev, "Invalid config param %04x\n", param);
++		return -ENOTSUPP;
++	}
++	return 0;
++}
++
++int svip_pinconf_set(struct pinctrl_dev *pctldev, unsigned pin,
++	unsigned long *configs, unsigned num_configs)
++{
++	int i, arg;
++	struct ltq_pinmux_info *info = pinctrl_dev_get_drvdata(pctldev);
++	enum ltq_pinconf_param param;
++
++	for (i = 0; i < num_configs; i++) {
++		param = LTQ_PINCONF_UNPACK_PARAM(configs[i]);
++		arg = LTQ_PINCONF_UNPACK_ARG(configs[i]);
++		switch (param) {
++		case LTQ_PINCONF_PARAM_PULL:
++			if (arg == 0) {
++				gpio_clearbit(info->membase[0], GPIO_PUEN,
++					PORT_PIN(pin));
++				break;
++			} else if (arg == 2) {
++				gpio_setbit(info->membase[0], GPIO_PUEN,
++					PORT_PIN(pin));
++			} else
++				dev_err(pctldev->dev, "Invalid pull value %d\n",
++					arg);
++			break;
++
++		case LTQ_PINCONF_PARAM_OUTPUT:
++			if (arg == 0)
++				gpio_clearbit(info->membase[0], GPIO_DIR,
++					PORT_PIN(pin));
++			else
++				gpio_setbit(info->membase[0], GPIO_DIR,
++					PORT_PIN(pin));
++			break;
++
++		default:
++			dev_err(pctldev->dev, "Invalid config param %04x\n",
++				param);
++			return -ENOTSUPP;
++		}
++	}
++	return 0;
++}
++
++static int svip_pinconf_group_get(struct pinctrl_dev *pctldev,
++	unsigned selector, unsigned long *config)
++{
++	struct ltq_pinmux_info *info = pinctrl_dev_get_drvdata(pctldev);
++	int i, ret = 0;
++
++	for (i = 0; i < info->grps[selector].npins && !ret; i++)
++		ret = svip_pinconf_get(pctldev, info->grps[selector].pins[i],
++			config);
++
++	return ret;
++}
++
++int svip_pinconf_group_set(struct pinctrl_dev *pctldev, unsigned selector,
++	unsigned long *configs, unsigned num_configs)
++{
++	struct ltq_pinmux_info *info = pinctrl_dev_get_drvdata(pctldev);
++	int i, ret = 0;
++
++	for (i = 0; i < info->grps[selector].npins && !ret; i++)
++		ret = svip_pinconf_set(pctldev, info->grps[selector].pins[i],
++			configs, num_configs);
++
++	return ret;
++}
++
++static const struct pinconf_ops svip_pinconf_ops = {
++	.pin_config_get = svip_pinconf_get,
++	.pin_config_set = svip_pinconf_set,
++	.pin_config_group_get = svip_pinconf_group_get,
++	.pin_config_group_set = svip_pinconf_group_set, };
++
++static struct pinctrl_desc svip_pctrl_desc[PORTS] = {
++{ .owner = THIS_MODULE, .confops = &svip_pinconf_ops },
++{ .owner = THIS_MODULE, .confops = &svip_pinconf_ops },
++{ .owner = THIS_MODULE, .confops = &svip_pinconf_ops },
++{ .owner = THIS_MODULE, .confops = &svip_pinconf_ops },
++{ .owner = THIS_MODULE, .confops = &svip_pinconf_ops } };
++
++static int mux_apply(struct ltq_pinmux_info *info, int pin, int mux)
++{
++	if (mux & MUX_ALT0)
++		gpio_setbit(info->membase[0], GPIO_ALT0, PORT_PIN(pin));
++	else
++		gpio_clearbit(info->membase[0], GPIO_ALT0, PORT_PIN(pin));
++
++	if (mux & MUX_ALT1)
++		gpio_setbit(info->membase[0], GPIO_ALT1, PORT_PIN(pin));
++	else
++		gpio_clearbit(info->membase[0], GPIO_ALT1, PORT_PIN(pin));
++
++	return 0;
++}
++
++static inline int svip_mux_apply(struct pinctrl_dev *pctrldev, int pin, int mux)
++{
++	struct ltq_pinmux_info *info = pinctrl_dev_get_drvdata(pctrldev);
++
++	return mux_apply(info, pin, mux);
++}
++
++static const struct ltq_cfg_param svip_cfg_params[] = {
++{ "lantiq,pull", LTQ_PINCONF_PARAM_PULL },
++{ "lantiq,open-drain", LTQ_PINCONF_PARAM_OPEN_DRAIN },
++{ "lantiq,output", LTQ_PINCONF_PARAM_OUTPUT }, };
++
++static struct ltq_pinmux_info svip_info[PORTS] = {
++{ .desc = &svip_pctrl_desc[0], .apply_mux = svip_mux_apply, .params =
++	svip_cfg_params, .num_params = ARRAY_SIZE(svip_cfg_params) },
++{ .desc = &svip_pctrl_desc[1], .apply_mux = svip_mux_apply, .params =
++	svip_cfg_params, .num_params = ARRAY_SIZE(svip_cfg_params) },
++{ .desc = &svip_pctrl_desc[2], .apply_mux = svip_mux_apply, .params =
++	svip_cfg_params, .num_params = ARRAY_SIZE(svip_cfg_params) },
++{ .desc = &svip_pctrl_desc[3], .apply_mux = svip_mux_apply, .params =
++	svip_cfg_params, .num_params = ARRAY_SIZE(svip_cfg_params) },
++{ .desc = &svip_pctrl_desc[4], .apply_mux = svip_mux_apply, .params =
++	svip_cfg_params, .num_params = ARRAY_SIZE(svip_cfg_params) } };
++
++/* ---------  gpio_chip related code --------- */
++
++static struct irq_chip svip_gpio_irq_chip;
++
++static void svip_gpio_set(struct gpio_chip *chip, unsigned int pin, int val)
++{
++	struct ltq_pinmux_info *info = dev_get_drvdata(chip->parent);
++
++	if (val)
++		gpio_setbit(info->membase[0], GPIO_OUT, PORT_PIN(pin));
++	else
++		gpio_clearbit(info->membase[0], GPIO_OUT, PORT_PIN(pin));
++}
++
++static int svip_gpio_get(struct gpio_chip *chip, unsigned int pin)
++{
++	struct ltq_pinmux_info *info = dev_get_drvdata(chip->parent);
++
++	return gpio_getbit(info->membase[0], GPIO_IN, PORT_PIN(pin));
++}
++
++static int svip_gpio_dir_in(struct gpio_chip *chip, unsigned int pin)
++{
++	struct ltq_pinmux_info *info = dev_get_drvdata(chip->parent);
++
++	gpio_clearbit(info->membase[0], GPIO_DIR, PORT_PIN(pin));
++
++	return 0;
++}
++
++static int svip_gpio_dir_out(struct gpio_chip *chip, unsigned int pin, int val)
++{
++	struct ltq_pinmux_info *info = dev_get_drvdata(chip->parent);
++
++	gpio_setbit(info->membase[0], GPIO_DIR, PORT_PIN(pin));
++	svip_gpio_set(chip, pin, val);
++
++	return 0;
++}
++
++static int svip_gpio_req(struct gpio_chip *chip, unsigned offset)
++{
++	int gpio = chip->base + offset;
++
++	return pinctrl_request_gpio(gpio);
++}
++
++static void svip_gpio_free(struct gpio_chip *chip, unsigned offset)
++{
++	int gpio = chip->base + offset;
++
++	pinctrl_free_gpio(gpio);
++}
++
++
++static int svip_gpio_to_irq(struct gpio_chip *chip, unsigned offset)
++{
++	struct ltq_pinmux_info *info = dev_get_drvdata(chip->parent);
++	int i;
++	int gpio;
++
++	if (offset > chip->ngpio)
++		return -ENXIO;
++
++	gpio = chip->base + offset;
++
++	for (i = 0; i < info->num_exin; i++)
++		if (info->exin[i] == gpio)
++			return irq_create_mapping(ctop(chip)->domain, offset);
++
++	return -ENXIO;
++}
++
++static void svip_gpio_disable_irq(struct irq_data *d)
++{
++	struct ltq_pinmux_info *info = irq_get_chip_data(d->irq);
++
++	gpio_setbit(info->membase[0], GPIO_IRNENCLR, d->hwirq);
++}
++
++static void svip_gpio_enable_irq(struct irq_data *d)
++{
++	struct ltq_pinmux_info *info = irq_get_chip_data(d->irq);
++
++	gpio_setbit(info->membase[0], GPIO_IRNENSET, d->hwirq);
++}
++
++static void svip_gpio_ack_irq(struct irq_data *d)
++{
++	struct ltq_pinmux_info *info = irq_get_chip_data(d->irq);
++
++	gpio_setbit(info->membase[0], GPIO_IRNCR, d->hwirq);
++}
++
++
++static void svip_gpio_mask_and_ack_irq(struct irq_data *d)
++{
++	struct ltq_pinmux_info *info = irq_get_chip_data(d->irq);
++
++	gpio_setbit(info->membase[0], GPIO_IRNENCLR, d->hwirq);
++	gpio_setbit(info->membase[0], GPIO_IRNCR, d->hwirq);
++}
++
++
++static int svip_gpio_irq_type(struct irq_data *d, unsigned int type)
++{
++	struct ltq_pinmux_info *info = irq_get_chip_data(d->irq);
++
++	if ((type & IRQ_TYPE_SENSE_MASK) == IRQ_TYPE_NONE)
++		return 0;
++
++	if ((type & (IRQ_TYPE_LEVEL_HIGH | IRQ_TYPE_LEVEL_LOW)) != 0) {
++		/* level triggered */
++		gpio_setbit(info->membase[0], GPIO_IRNCFG, d->hwirq);
++		irq_set_chip_handler_name_locked(d,
++			&svip_gpio_irq_chip, handle_level_irq, "level");
++	} else {
++		/* edge triggered */
++		gpio_clearbit(info->membase[0], GPIO_IRNCFG, d->hwirq);
++		irq_set_chip_handler_name_locked(d,
++			&svip_gpio_irq_chip, handle_simple_irq, "edge");
++	}
++
++	if ((type & IRQ_TYPE_EDGE_BOTH) == IRQ_TYPE_EDGE_BOTH)
++		gpio_setbit(info->membase[0], GPIO_EXINTCR1, d->hwirq);
++	else {
++		if ((type & (IRQ_TYPE_EDGE_RISING | IRQ_TYPE_LEVEL_HIGH)) != 0)
++			/* positive logic: rising edge, high level */
++			gpio_clearbit(info->membase[0], GPIO_EXINTCR0, d->hwirq);
++		else
++			/* negative logic: falling edge, low level */
++			gpio_setbit(info->membase[0], GPIO_EXINTCR0, d->hwirq);
++		gpio_clearbit(info->membase[0], GPIO_EXINTCR1, d->hwirq);
++	}
++
++	gpio_clearbit(info->membase[0], GPIO_DIR, d->hwirq);
++	return 0;
++}
++
++
++static void svip_gpio_irq_handler(struct irq_desc *desc)
++{
++	struct svip_gpio_port *gpio_port = irq_desc_get_handler_data(desc);
++	struct ltq_pinmux_info *info = gpio_port->domain->host_data;
++	int child_irq, pin, exint, irq;
++	static int pins[] = {
++		7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 17, 16, 15, 19, 19 };
++
++	irq = irq_desc_get_irq(desc);
++	exint = irq - SVIP_EIU_START;
++	if (exint < 0 || exint > 16)
++		return;
++	pin = pins[exint];
++
++	/* acknowledge interrupt */
++	ltq_w32(BIT(pin), info->membase[0] + GPIO_IRNCR);
++
++	desc->irq_data.chip->irq_ack(&desc->irq_data);
++
++	child_irq = irq_find_mapping(gpio_port->domain, pin);
++	if (child_irq)
++		generic_handle_irq(child_irq);
++}
++
++
++static int svip_gpio_irq_map(struct irq_domain *d, unsigned int irq,
++	irq_hw_number_t hw)
++{
++	struct ltq_pinmux_info *info = d->host_data;
++	int offset = hw;
++	int i, err;
++	char name[6];
++
++	if (!info)
++		return -EINVAL;
++
++	if (offset > info->num_pads)
++		return -ENXIO;
++
++	for (i = 0; i < info->num_exin; i++)
++		if (info->exin[i] % PINS == offset) {
++			snprintf(name, sizeof(name), "gpio%d", offset / PINS);
++			irq_set_chip_and_handler_name(irq, &svip_gpio_irq_chip,
++				handle_simple_irq, name);
++			err = irq_set_chip_data(irq, info);
++			if (err)
++				return err;
++
++			/* set to negative logic (falling edge, low level) */
++			gpio_setbit(info->membase[0], GPIO_EXINTCR0, hw);
++			return 0;
++		}
++
++	return -ENXIO;
++}
++
++static struct irq_chip svip_gpio_irq_chip = {
++	.name = "gpio_irq_mux",
++	.irq_mask = svip_gpio_disable_irq,
++	.irq_unmask = svip_gpio_enable_irq,
++	.irq_ack = svip_gpio_ack_irq,
++	.irq_mask_ack = svip_gpio_mask_and_ack_irq,
++	.irq_set_type = svip_gpio_irq_type,
++};
++
++static const struct irq_domain_ops irq_domain_ops = {
++	.xlate = irq_domain_xlate_onetwocell,
++	.map = svip_gpio_irq_map,
++};
++
++
++static struct irqaction gpio_cascade = {
++	.handler = no_action,
++	.name = "gpio_cascade",
++};
++
++
++/* --------- register the pinctrl layer --------- */
++/* External Interrupt Control Registers: */
++/* todo map External Interrupt number to the global GPIO number */
++/* P0_EXINTCR0 P0_EXINTCR1 */
++static const unsigned svip_exin_pin_map_port0[] = {
++	GPIO7, GPIO8, GPIO9, GPIO10, GPIO11, GPIO12, GPIO13, GPIO14, GPIO15,
++	GPIO16, GPIO17, GPIO19 };
++/* P1_EXINTCR0 P1_EXINTCR1 */
++static const unsigned svip_exin_pin_map_port1[] = {
++	GPIO50, GPIO49, GPIO48, GPIO47, GPIO51 };
++#define SVIP_EXIN_NONE 0xffff
++/* external interrupt possible only on port 0 and port 1 */
++static const unsigned svip_exin_pin_map_port2[] = { SVIP_EXIN_NONE };
++static const unsigned svip_exin_pin_map_port3[] = { SVIP_EXIN_NONE };
++static const unsigned svip_exin_pin_map_port4[] = { SVIP_EXIN_NONE };
++
++#define soc_cfg_port_x(_port_num, _num_exin)\
++	{SVIP_MAX_PIN_PORT##_port_num, svip_mfp_port##_port_num,\
++	svip_grps_port##_port_num, ARRAY_SIZE(svip_grps_port##_port_num),\
++	svip_funcs_port##_port_num, ARRAY_SIZE(svip_funcs_port##_port_num),\
++	svip_exin_pin_map_port##_port_num, _num_exin}
++
++static struct pinctrl_svip_soc {
++	int pin_count;
++	const struct ltq_mfp_pin *mfp;
++	const struct ltq_pin_group *grps;
++	unsigned int num_grps;
++	const struct ltq_pmx_func *funcs;
++	unsigned int num_funcs;
++	const unsigned *exin;
++	unsigned int num_exin;
++} soc_cfg[PORTS] = {
++soc_cfg_port_x(0, 12),
++soc_cfg_port_x(1, 5),
++soc_cfg_port_x(2, 0),
++soc_cfg_port_x(3, 0),
++soc_cfg_port_x(4, 0), };
++
++static const struct of_device_id svip_match[] = {
++{ .compatible = "lantiq,pinctrl-svip" },
++{ }, };
++MODULE_DEVICE_TABLE(of, svip_match);
++
++static int pinmux_svip_probe(struct platform_device *pdev)
++{
++	struct device_node *node = pdev->dev.of_node;
++	struct pinctrl_gpio_range *svip_gpio_range;
++	int ret = 0;
++	/* load and remap the gpio resources of the different banks */
++	struct platform_device *ppdev;
++	const __be32 *prop;
++	int bank;
++	const struct pinctrl_svip_soc *svip_soc;
++	struct svip_gpio_port *gpio_port;
++	struct resource *gpiores, *irqres;
++	int i = 0;
++
++	svip_gpio_range = devm_kzalloc(&pdev->dev,
++		sizeof(struct pinctrl_gpio_range), GFP_KERNEL);
++	if (!svip_gpio_range)
++		return -ENOMEM;
++
++	if (!of_device_is_available(node)) {
++		dev_err(&pdev->dev, "!of_device_is_available\n");
++		return -1;
++	}
++	prop = of_get_property(node, "lantiq,bank", NULL);
++	if (!prop) {
++		dev_err(&pdev->dev, "failed to read banks\n");
++		return -1;
++	}
++	bank = be32_to_cpup(prop);
++
++	ppdev = of_find_device_by_node(node);
++	if (!ppdev) {
++		dev_err(&pdev->dev, "failed to find port pdev\n");
++		return -1;
++	}
++
++	svip_soc = &soc_cfg[bank];
++
++	svip_info[bank].clk[0] = clk_get(&ppdev->dev, NULL);
++	if (IS_ERR(svip_info[bank].clk[0])) {
++		dev_err(&ppdev->dev, "failed to get clock\n");
++		return PTR_ERR(svip_info[bank].clk[0]);
++	}
++
++	/* get and remap our register range */
++	gpiores = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	svip_info[bank].membase[0] = devm_ioremap_resource(&pdev->dev, gpiores);
++	if (IS_ERR(svip_info[bank].membase[0]))
++		return PTR_ERR(svip_info[bank].membase[0]);
++
++	/* load our pad descriptors */
++	svip_info[bank].pads = devm_kzalloc(&pdev->dev,
++		sizeof(struct pinctrl_pin_desc) * svip_soc->pin_count, GFP_KERNEL);
++
++	if (!svip_info[bank].pads) {
++		dev_err(&pdev->dev, "Failed to allocate pads\n");
++		return -ENOMEM;
++	}
++	for (i = 0; i < svip_soc->pin_count; i++) {
++		/* strlen("ioXY") + 1 = 5 */
++		char *name = devm_kzalloc(&pdev->dev, 5, GFP_KERNEL);
++
++		if (!name) {
++			dev_err(&pdev->dev, "Failed to allocate pad name\n");
++			return -ENOMEM;
++		}
++		snprintf(name, 5, "io%d", bank * PINS + i);
++		svip_info[bank].pads[i].number = bank * PINS + i;
++		svip_info[bank].pads[i].name = name;
++	}
++	clk_enable(svip_info[bank].clk[0]);
++	svip_pctrl_desc[bank].pins = svip_info[bank].pads;
++
++	/* load the gpio chip */
++	gpio_port = devm_kzalloc(&pdev->dev, sizeof(struct svip_gpio_port),
++		GFP_KERNEL);
++	if (!gpio_port)
++		return -ENOMEM;
++
++	snprintf(gpio_port->name, sizeof(gpio_port->name), "gpio%d", bank);
++	gpio_port->gpio_chip.label = gpio_port->name;
++	gpio_port->gpio_chip.direction_input = svip_gpio_dir_in;
++	gpio_port->gpio_chip.direction_output = svip_gpio_dir_out;
++	gpio_port->gpio_chip.get = svip_gpio_get;
++	gpio_port->gpio_chip.set = svip_gpio_set;
++	gpio_port->gpio_chip.request = svip_gpio_req;
++	gpio_port->gpio_chip.free = svip_gpio_free;
++	gpio_port->gpio_chip.base = bank * PINS;
++	gpio_port->gpio_chip.ngpio = svip_soc->pin_count;
++	gpio_port->gpio_chip.parent = &pdev->dev;
++
++	irqres = kmalloc(sizeof(*irqres) * svip_soc->num_exin, GFP_KERNEL);
++	if (!irqres) {
++		dev_err(&pdev->dev, "Failed to allocate memory for IRQ resource\n");
++		return -ENOMEM;
++	}
++	if (of_irq_to_resource_table(node, irqres, svip_soc->num_exin) ==
++		svip_soc->num_exin) {
++		svip_info[bank].exin = svip_soc->exin;
++		svip_info[bank].num_exin = svip_soc->num_exin;
++		gpio_port->gpio_chip.to_irq = svip_gpio_to_irq;
++		gpio_port->domain = irq_domain_add_simple(node, svip_soc->pin_count,
++			0, &irq_domain_ops, &svip_info[bank]);
++		for(i = 0; i < svip_soc->num_exin; i++) {
++			setup_irq(irqres[i].start, &gpio_cascade);
++			irq_set_handler_data(irqres[i].start, gpio_port);
++			irq_set_chained_handler(irqres[i].start, svip_gpio_irq_handler);
++		}
++	}
++	kfree(irqres);
++
++	of_gpiochip_add(&gpio_port->gpio_chip);
++	ret = gpiochip_add(&gpio_port->gpio_chip);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to register gpio chip\n");
++		return ret;
++	}
++
++	/* setup the data needed by pinctrl */
++	svip_pctrl_desc[bank].name = dev_name(&pdev->dev);
++	svip_pctrl_desc[bank].npins = svip_soc->pin_count;
++	svip_info[bank].num_pads = svip_soc->pin_count;
++	svip_info[bank].num_mfp = svip_soc->pin_count;
++	svip_info[bank].mfp = svip_soc->mfp;
++	svip_info[bank].grps = svip_soc->grps;
++	svip_info[bank].num_grps = svip_soc->num_grps;
++	svip_info[bank].funcs = svip_soc->funcs;
++	svip_info[bank].num_funcs = svip_soc->num_funcs;
++	svip_info[bank].exin = svip_soc->exin;
++	svip_info[bank].num_exin = svip_soc->num_exin;
++
++	/* register with the generic lantiq layer */
++	ret = ltq_pinctrl_register(pdev, &svip_info[bank]);
++	if (ret) {
++		dev_err(&pdev->dev, "Failed to register pinctrl driver\n");
++		return ret;
++	}
++
++	/* finish with registering the gpio range in pinctrl */
++	svip_gpio_range->name = "SVIP GPIO";
++	svip_gpio_range->id = bank;
++	svip_gpio_range->base = gpio_port->gpio_chip.base;
++	svip_gpio_range->pin_base = svip_info[bank].pads[0].number;
++	svip_gpio_range->npins = gpio_port->gpio_chip.ngpio;
++	svip_gpio_range->gc = &gpio_port->gpio_chip;
++	pinctrl_add_gpio_range(svip_info[bank].pctrl, svip_gpio_range);
++
++	dev_info(&pdev->dev, "Init done\n");
++	return 0;
++}
++
++static struct platform_driver pinmux_svip_driver = {
++	.probe = pinmux_svip_probe,
++	.driver = {
++		.name = "pinctrl-svip",
++		.owner = THIS_MODULE,
++		.of_match_table = svip_match,
++	},
++};
++
++static int __init pinmux_svip_init(void)
++{
++	return platform_driver_register(&pinmux_svip_driver);
++}
++
++core_initcall_sync(pinmux_svip_init);
