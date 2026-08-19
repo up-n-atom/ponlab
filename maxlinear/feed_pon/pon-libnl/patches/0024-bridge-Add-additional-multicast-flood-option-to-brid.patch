@@ -1,0 +1,212 @@
+From 2b52cdbf1b0469b4fe59a88cae661669ff022163 Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hmehrtens@maxlinear.com>
+Date: Mon, 16 Aug 2021 18:31:24 +0200
+Subject: bridge: Add additional multicast flood option to bridge
+
+This allows to configure the multicast flooding on a bridge and not a
+bridge port.
+---
+ include/linux-private/linux/if_link.h    | 12 ++++
+ include/netlink/route/link/bridge_info.h | 12 ++++
+ lib/route/link/bridge_info.c             | 86 ++++++++++++++++++++++++
+ libnl-route-3.sym                        |  2 +
+ 4 files changed, 112 insertions(+)
+
+diff --git a/include/linux-private/linux/if_link.h b/include/linux-private/linux/if_link.h
+index 5f815b0..7f0eae7 100644
+--- a/include/linux-private/linux/if_link.h
++++ b/include/linux-private/linux/if_link.h
+@@ -284,11 +284,23 @@ enum {
+ 	IFLA_BR_MCAST_STATS_ENABLED,
+ 	IFLA_BR_MCAST_IGMP_VERSION,
+ 	IFLA_BR_MCAST_MLD_VERSION,
++	IFLA_BR_VLAN_STATS_PER_PORT,
++	IFLA_BR_MULTI_BOOLOPT,
++	IFLA_BR_MCAST_FLOOD,
+ 	__IFLA_BR_MAX,
+ };
+ 
+ #define IFLA_BR_MAX	(__IFLA_BR_MAX - 1)
+ 
++enum br_mcast_flood_mode {
++	/** Packet is flooded to port members of ingress bridge port */
++	BR_MCAST_FLOOD_ALL,
++	/** Packet is discarded */
++	BR_MCAST_FLOOD_DISCARD,
++	/** Packet is forwarded to logical port 0 CTP port 0 bridge port 0 */
++	BR_MCAST_FLOOD_CPU,
++};
++
+ struct ifla_bridge_id {
+ 	__u8	prio[2];
+ 	__u8	addr[6]; /* ETH_ALEN */
+diff --git a/include/netlink/route/link/bridge_info.h b/include/netlink/route/link/bridge_info.h
+index 8c9739d..f840723 100644
+--- a/include/netlink/route/link/bridge_info.h
++++ b/include/netlink/route/link/bridge_info.h
+@@ -15,6 +15,15 @@
+ #include <netlink/netlink.h>
+ #include <netlink/route/link.h>
+ 
++enum rtnl_link_bridge_flood_mode {
++	/** Packet is flooded to port members of ingress bridge port */
++	RTNL_BRIDGE_MCAST_FLOOD_ALL,
++	/** Packet is dscarded */
++	RTNL_BRIDGE_MCAST_FLOOD_DISCARD,
++	/** Packet is forwarded to logical port 0 CTP port 0 bridge port 0 */
++	RTNL_BRIDGE_MCAST_FLOOD_CPU,
++};
++
+ #ifdef __cplusplus
+ extern "C" {
+ #endif
+@@ -22,6 +31,9 @@ extern "C" {
+ extern int rtnl_link_bridge_set_mcast_snooping(struct rtnl_link *link, uint8_t activate);
+ extern int rtnl_link_bridge_get_mcast_snooping(struct rtnl_link *link, uint8_t *activate);
+ 
++extern int rtnl_link_bridge_set_mc_flood(struct rtnl_link *link, enum rtnl_link_bridge_flood_mode mcast_flood);
++extern int rtnl_link_bridge_get_mc_flood(struct rtnl_link *link, enum rtnl_link_bridge_flood_mode *mcast_flood);
++
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/lib/route/link/bridge_info.c b/lib/route/link/bridge_info.c
+index 4df680d..81244f9 100644
+--- a/lib/route/link/bridge_info.c
++++ b/lib/route/link/bridge_info.c
+@@ -22,15 +22,18 @@
+ #include <netlink-private/route/link/api.h>
+ 
+ #define BRIDGE_ATTR_MCAST_SNOOPING	(1 << 0)
++#define BRIDGE_ATTR_MCAST_FLOOD		(1 << 1)
+ 
+ struct bridge_info
+ {
+ 	uint8_t			b_mcast_snooping;
++	enum br_mcast_flood_mode	b_mcast_flood;
+ 	uint32_t		ce_mask; /* to support attr macros */
+ };
+ 
+ static struct nla_policy bi_attrs_policy[IFLA_BR_MAX+1] = {
+ 	[IFLA_BR_MCAST_SNOOPING]	= { .type = NLA_U8 },
++	[IFLA_BR_MCAST_FLOOD]		= { .type = NLA_U8 },
+ };
+ 
+ static inline struct bridge_info *bridge_info(struct rtnl_link *link)
+@@ -77,6 +80,12 @@ static int bridge_info_parse(struct rtnl_link *link, struct nlattr *data,
+ 		bi->ce_mask |= BRIDGE_ATTR_MCAST_SNOOPING;
+ 	}
+ 
++	if (tb[IFLA_BR_MCAST_FLOOD]) {
++		bi->b_mcast_flood =
++		    nla_get_u8(tb[IFLA_BR_MCAST_FLOOD]);
++		bi->ce_mask |= BRIDGE_ATTR_MCAST_FLOOD;
++	}
++
+ errout:
+ 	return err;
+ }
+@@ -94,6 +103,10 @@ static int bridge_info_put_attrs(struct nl_msg *msg, struct rtnl_link *link)
+ 		NLA_PUT_U8(msg, IFLA_BR_MCAST_SNOOPING,
+ 			   bi->b_mcast_snooping);
+ 
++	if (bi->ce_mask & BRIDGE_ATTR_MCAST_FLOOD)
++		NLA_PUT_U8(msg, IFLA_BR_MCAST_FLOOD,
++			   bi->b_mcast_flood);
++
+ 	nla_nest_end(msg, data);
+ 	return 0;
+ 
+@@ -170,6 +183,79 @@ int rtnl_link_bridge_get_mcast_snooping(struct rtnl_link *link, uint8_t *activat
+ 	return 0;
+ }
+ 
++/**
++ * Set MC flood
++ * @arg link		Link object of type bridge
++ * @arg ip_lookup	IP Lookup to set.
++ *
++ * @see rtnl_link_bridge_get_mc_flood()
++ *
++ * @return Zero on success, otherwise a negative error code.
++ * @retval -NLE_OPNOTSUPP Link is not a bridge
++ */
++int rtnl_link_bridge_set_mc_flood(struct rtnl_link *link,
++				  enum rtnl_link_bridge_flood_mode mcast_flood)
++{
++	struct bridge_info *bi = bridge_info(link);
++
++	IS_BRIDGE_INFO_ASSERT(link);
++
++	switch (mcast_flood) {
++	case RTNL_BRIDGE_MCAST_FLOOD_ALL:
++		bi->b_mcast_flood = BR_MCAST_FLOOD_ALL;
++		break;
++	case RTNL_BRIDGE_MCAST_FLOOD_DISCARD:
++		bi->b_mcast_flood = BR_MCAST_FLOOD_DISCARD;
++		break;
++	case RTNL_BRIDGE_MCAST_FLOOD_CPU:
++		bi->b_mcast_flood = BR_MCAST_FLOOD_CPU;
++		break;
++	default:
++		return -NLE_INVAL;
++	}
++	bi->ce_mask |= BRIDGE_ATTR_MCAST_FLOOD;
++
++	return 0;
++}
++
++/**
++ * Get MC flood
++ * @arg link		Link object of type bridge
++ * @arg ip_lookup	Output argument.
++ *
++ * @see rtnl_link_bridge_set_mc_flood()
++ *
++ * @return Zero on success, otherwise a negative error code.
++ * @retval -NLE_OPNOTSUPP Link is not a bridge
++ */
++int rtnl_link_bridge_get_mc_flood(struct rtnl_link *link,
++				  enum rtnl_link_bridge_flood_mode *mcast_flood)
++{
++	struct bridge_info *bi = bridge_info(link);
++
++	IS_BRIDGE_INFO_ASSERT(link);
++
++	if (!(bi->ce_mask & BRIDGE_ATTR_MCAST_FLOOD))
++		return -NLE_NOATTR;
++
++	if (!mcast_flood)
++		return -NLE_INVAL;
++
++	switch (bi->b_mcast_flood) {
++	case BR_MCAST_FLOOD_ALL:
++		*mcast_flood = RTNL_BRIDGE_MCAST_FLOOD_ALL;
++		break;
++	case BR_MCAST_FLOOD_DISCARD:
++		*mcast_flood = RTNL_BRIDGE_MCAST_FLOOD_DISCARD;
++		break;
++	case BR_MCAST_FLOOD_CPU:
++		*mcast_flood = RTNL_BRIDGE_MCAST_FLOOD_CPU;
++		break;
++	default:
++		return -NLE_INVAL;
++	}
++	return 0;
++}
+ 
+ static void __init bridge_info_init(void)
+ {
+diff --git a/libnl-route-3.sym b/libnl-route-3.sym
+index a52ca23..0ede3b9 100644
+--- a/libnl-route-3.sym
++++ b/libnl-route-3.sym
+@@ -272,6 +272,8 @@ global:
+ 	rtnl_link_bridge_set_learning_limit;
+ 	rtnl_link_bridge_set_mcast_snooping;
+ 	rtnl_link_bridge_get_mcast_snooping;
++	rtnl_link_bridge_set_mc_flood;
++	rtnl_link_bridge_get_mc_flood;
+ 	rtnl_link_bridge_set_port_state;
+ 	rtnl_link_bridge_set_priority;
+ 	rtnl_link_bridge_str2flags;

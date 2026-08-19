@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zdoychev@maxlinear.com>
+Date: Mon, 7 Nov 2022 22:56:19 +0100
+Subject: flower: add cfm support
+
+Add support for matching on CFM level and opcode.
+
+Signed-off-by: Zahari Doychev <zdoychev@maxlinear.com>
+---
+ include/uapi/linux/pkt_cls.h |  12 ++++
+ lib/ll_proto.c               |   1 +
+ man/man8/tc-flower.8         |  25 ++++++++-
+ tc/f_flower.c                | 103 ++++++++++++++++++++++++++++++++++-
+ 4 files changed, 139 insertions(+), 2 deletions(-)
+
+diff --git a/include/uapi/linux/pkt_cls.h b/include/uapi/linux/pkt_cls.h
+index 28938439..9ba4fd18 100644
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -585,6 +585,8 @@ enum {
+ 	TCA_FLOWER_KEY_HASH,		/* u32 */
+ 	TCA_FLOWER_KEY_HASH_MASK,	/* u32 */
+ 
++	TCA_FLOWER_KEY_CFM,
++
+ 	__TCA_FLOWER_MAX,
+ };
+ 
+@@ -678,6 +680,16 @@ enum {
+ 	TCA_FLOWER_KEY_FLAGS_FRAG_IS_FIRST = (1 << 1),
+ };
+ 
++enum {
++	TCA_FLOWER_KEY_CFM_OPT_UNSPEC,
++	TCA_FLOWER_KEY_CFM_MD_LEVEL,	/* u8 */
++	TCA_FLOWER_KEY_CFM_OPCODE, /* u8 */
++	__TCA_FLOWER_KEY_CFM_OPT_MAX,	/* u8 */
++};
++
++#define TCA_FLOWER_KEY_CFM_OPT_MAX \
++		(__TCA_FLOWER_KEY_CFM_OPT_MAX - 1)
++
+ #define TCA_FLOWER_MASK_FLAGS_RANGE	(1 << 0) /* Range-based match */
+ 
+ /* Match-all classifier */
+diff --git a/lib/ll_proto.c b/lib/ll_proto.c
+index 78179311..cbcd7996 100644
+--- a/lib/ll_proto.c
++++ b/lib/ll_proto.c
+@@ -81,6 +81,7 @@ __PF(8021AD,802.1ad)
+ __PF(MPLS_UC,mpls_uc)
+ __PF(MPLS_MC,mpls_mc)
+ __PF(TEB,teb)
++__PF(CFM,cfm)
+ 
+ { 0x8100, "802.1Q" },
+ { 0x88cc, "LLDP" },
+diff --git a/man/man8/tc-flower.8 b/man/man8/tc-flower.8
+index 4541d937..1b6e0582 100644
+--- a/man/man8/tc-flower.8
++++ b/man/man8/tc-flower.8
+@@ -92,7 +92,9 @@ flower \- flow based traffic control filter
+ }
+ .IR OPTIONS " | "
+ .BR ip_flags
+-.IR IP_FLAGS " }"
++.IR IP_FLAGS " | "
++.BR cfm
++.IR CFM }"
+ 
+ .ti -8
+ .IR LSE_LIST " := [ " LSE_LIST " ] " LSE
+@@ -110,6 +112,13 @@ flower \- flow based traffic control filter
+ .B ttl
+ .IR TTL " }"
+ 
++.ti -8
++.IR CFM " := "
++.B cfm mdl
++.IR LEVEL " | "
++.B op
++.IR OPCODE "
++
+ .SH DESCRIPTION
+ The
+ .B flower
+@@ -456,6 +465,20 @@ respectively. firstfrag and nofirstfrag can be used to further distinguish
+ fragmented packet. firstfrag can be used to indicate the first fragmented
+ packet. nofirstfrag can be used to indicates subsequent fragmented packets
+ or non-fragmented packets.
++.TP
++.BI cfm " CFM_OPTIONS"
++Match on CFM fields.
++.I CFM_OPTIONS
++is a list of options that describe the properties of the CFM information
++fields to match.
++.RS
++.TP
++.BI mdl " LEVEL "
++Match on CFM MD level.
++.TP
++.BI op " OPCODE "
++Match on the CFM opcode field specified.
++
+ .SH NOTES
+ As stated above where applicable, matches of a certain layer implicitly depend
+ on the matches of the next lower layer. Precisely, layer one and two matches
+diff --git a/tc/f_flower.c b/tc/f_flower.c
+index 7f78195f..3f4eb985 100644
+--- a/tc/f_flower.c
++++ b/tc/f_flower.c
+@@ -89,12 +89,14 @@ static void explain(void)
+ 		"			ct_state MASKED_CT_STATE |\n"
+ 		"			ct_label MASKED_CT_LABEL |\n"
+ 		"			ct_mark MASKED_CT_MARK |\n"
+-		"			ct_zone MASKED_CT_ZONE }\n"
++		"			ct_zone MASKED_CT_ZONE |\n"
++		"			cfm CFM |\n"
+ 		"	LSE-LIST := [ LSE-LIST ] LSE\n"
+ 		"	LSE := lse depth DEPTH { label LABEL | tc TC | bos BOS | ttl TTL }\n"
+ 		"	FILTERID := X:Y:Z\n"
+ 		"	MASKED_LLADDR := { LLADDR | LLADDR/MASK | LLADDR/BITS }\n"
+ 		"	MASKED_CT_STATE := combination of {+|-} and flags trk,est,new,rel,rpl,inv\n"
++		"	CFM := { level LEVEL | MIN_LEVEL-MAX_LEVEL | op OPCODE }\n"
+ 		"	ACTION-SPEC := ... look at individual actions\n"
+ 		"\n"
+ 		"NOTE:	CLASSID, IP-PROTO are parsed as hexadecimal input.\n"
+@@ -1319,6 +1321,62 @@ static int flower_parse_mpls(int *argc_p, char ***argv_p, struct nlmsghdr *nlh)
+ 	return 0;
+ }
+ 
++static int flower_parse_cfm(int *argc_p, char ***argv_p,
++			    __be16 eth_type,
++			    struct nlmsghdr *n)
++{
++	struct rtattr *cfm_attr;
++	char **argv = *argv_p;
++	int argc = *argc_p;
++	int ret = -1;
++
++	if (eth_type != htons(ETH_P_CFM)) {
++		fprintf(stderr,
++			"Can't set attribute if ethertype isn't CFM\n");
++		return -1;
++	}
++
++	cfm_attr = addattr_nest(n, MAX_MSG,
++				TCA_FLOWER_KEY_CFM | NLA_F_NESTED);
++
++	while (argc > 0) {
++		if (matches(*argv, "mdl") == 0) {
++			__u8 val;
++
++			NEXT_ARG();
++			ret = get_u8(&val, *argv, 10);
++			if (ret < 0) {
++				fprintf(stderr, "Illegal \"cfm md level\"\n");
++				return -1;
++			}
++			addattr8(n, MAX_MSG, TCA_FLOWER_KEY_CFM_MD_LEVEL, val);
++		} else if (matches(*argv, "op") == 0) {
++			__u8 val;
++
++			NEXT_ARG();
++			ret = get_u8(&val, *argv, 10);
++			if (ret < 0) {
++				fprintf(stderr, "Illegal \"cfm opcode\"\n");
++				return -1;
++			}
++			addattr8(n, MAX_MSG, TCA_FLOWER_KEY_CFM_OPCODE, val);
++		} else {
++			ret = 0;
++			break;
++		}
++		argc--; argv++;
++	}
++
++	addattr_nest_end(n, cfm_attr);
++
++	*argc_p = argc;
++	*argv_p = argv;
++
++	if (ret)
++		fprintf(stderr,"md level or opcode missing\n");
++	return ret;
++}
++
+ static int flower_parse_opt(struct filter_util *qu, char *handle,
+ 			    int argc, char **argv, struct nlmsghdr *n)
+ {
+@@ -1865,6 +1923,12 @@ static int flower_parse_opt(struct filter_util *qu, char *handle,
+ 				return -1;
+ 			}
+ 			continue;
++		} else if (matches(*argv, "cfm") == 0) {
++			NEXT_ARG();
++			ret = flower_parse_cfm(&argc, &argv, eth_type, n);
++			if (ret < 0)
++				return -1;
++			continue;
+ 		} else if (strcmp(*argv, "help") == 0) {
+ 			explain();
+ 			return -1;
+@@ -2543,6 +2607,41 @@ static void flower_print_arp_op(const char *name,
+ 			       flower_print_arp_op_to_name);
+ }
+ 
++static void flower_print_cfm(struct rtattr *attr)
++{
++	struct rtattr *tb[TCA_FLOWER_KEY_CFM_OPT_MAX + 1];
++	struct rtattr *v;
++	SPRINT_BUF(out);
++	size_t done = 0;
++
++	if (!attr || !(attr->rta_type & NLA_F_NESTED))
++		return;
++
++	parse_rtattr(tb, TCA_FLOWER_KEY_CFM_OPT_MAX, RTA_DATA(attr),
++		     RTA_PAYLOAD(attr));
++
++	print_nl();
++	print_string(PRINT_FP, NULL, "  cfm", NULL);
++	open_json_object("cfm");
++
++	v = tb[TCA_FLOWER_KEY_CFM_MD_LEVEL];
++	if (v) {
++		done += sprintf(out, " mdl %u", rta_getattr_u8(v));
++		print_uint(PRINT_JSON, "mdl", NULL, rta_getattr_u8(v));
++
++	}
++
++	v = tb[TCA_FLOWER_KEY_CFM_OPCODE];
++	if (v) {
++		done += sprintf(out + done, " op %u", rta_getattr_u8(v));
++		print_uint(PRINT_JSON, "op", NULL, rta_getattr_u8(v));
++
++	}
++
++	close_json_object();
++	print_string(PRINT_FP, "cfm", "%s", out);
++}
++
+ static int flower_print_opt(struct filter_util *qu, FILE *f,
+ 			    struct rtattr *opt, __u32 handle)
+ {
+@@ -2757,6 +2856,8 @@ static int flower_print_opt(struct filter_util *qu, FILE *f,
+ 	flower_print_ct_label(tb[TCA_FLOWER_KEY_CT_LABELS],
+ 			      tb[TCA_FLOWER_KEY_CT_LABELS_MASK]);
+ 
++	flower_print_cfm(tb[TCA_FLOWER_KEY_CFM]);
++
+ 	close_json_object();
+ 
+ 	if (tb[TCA_FLOWER_FLAGS]) {

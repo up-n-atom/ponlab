@@ -1,0 +1,600 @@
+From 3aaecceda8b775b5026264fab164a35097b798c2 Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hmehrtens@maxlinear.com>
+Date: Wed, 13 Jan 2021 16:45:41 +0100
+Subject: Add tc action police handling
+
+This adds support for the police action.
+
+The police action is used to offload the meters from OMCI to the hardware.
+---
+ Makefile.am                        |   2 +
+ include/netlink-private/types.h    |  11 +
+ include/netlink/route/act/police.h |  42 +++
+ lib/route/act/police.c             | 454 +++++++++++++++++++++++++++++
+ libnl-route-3.sym                  |  14 +
+ 5 files changed, 523 insertions(+)
+ create mode 100644 include/netlink/route/act/police.h
+ create mode 100644 lib/route/act/police.c
+
+diff --git a/Makefile.am b/Makefile.am
+index 3d97540..fcfdd69 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -124,6 +124,7 @@ libnlinclude_netlink_route_act_HEADERS = \
+ 	include/netlink/route/act/skbedit.h \
+ 	include/netlink/route/act/vlan.h \
+ 	include/netlink/route/act/colmark.h \
++	include/netlink/route/act/police.h \
+ 	$(NULL)
+ libnlinclude_netlink_route_clsdir = $(libnlincludedir)/netlink/route/cls
+ libnlinclude_netlink_route_cls_HEADERS = \
+@@ -381,6 +382,7 @@ lib_libnl_route_3_la_SOURCES = \
+ 	lib/route/act/mirred.c \
+ 	lib/route/act/skbedit.c \
+ 	lib/route/act/vlan.c \
++	lib/route/act/police.c \
+ 	lib/route/addr.c \
+ 	lib/route/class.c \
+ 	lib/route/classid.c \
+diff --git a/include/netlink-private/types.h b/include/netlink-private/types.h
+index d61fe42..ccbcd95 100644
+--- a/include/netlink-private/types.h
++++ b/include/netlink-private/types.h
+@@ -31,6 +31,7 @@
+ #include <linux/tc_act/tc_skbedit.h>
+ #include <linux/tc_act/tc_gact.h>
+ #include <linux/tc_act/tc_vlan.h>
++#include <linux-private/linux/pkt_cls.h>
+ #include <linux-private/linux/tc_act/tc_colmark.h>
+ #include <linux-private/linux/tc_act/tc_vlan.h>
+ #include <linux/sock_diag.h>
+@@ -589,6 +590,16 @@ struct rtnl_colmark
+ 	uint32_t		c_flags;
+ };
+ 
++struct rtnl_police
++{
++	struct tc_police	p_parm;
++	struct rtnl_ratespec	p_rate;
++	struct rtnl_ratespec	p_peakrate;
++	uint32_t		p_avrate;
++	uint32_t		p_result;
++	uint32_t		p_mask;
++};
++
+ struct rtnl_mirred
+ {
+ 	struct tc_mirred m_parm;
+diff --git a/include/netlink/route/act/police.h b/include/netlink/route/act/police.h
+new file mode 100644
+index 0000000..fc9fcd2
+--- /dev/null
++++ b/include/netlink/route/act/police.h
+@@ -0,0 +1,42 @@
++/*
++ * netlink/route/act/police.h	police action
++ *
++ *	This library is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU Lesser General Public
++ *	License as published by the Free Software Foundation version 2.1
++ *	of the License.
++ *
++ * Copyright (c) 2021 MaxLinear, Inc.
++ * Copyright (c) 2019 Intel Corporation
++ */
++
++#ifndef NETLINK_POLICE_H_
++#define NETLINK_POLICE_H_
++
++#include <netlink/netlink.h>
++#include <netlink/cache.h>
++#include <netlink/route/action.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++extern uint64_t rtnl_police_get_rate(struct rtnl_act *);
++extern int rtnl_police_set_rate(struct rtnl_act *, uint64_t);
++extern uint64_t rtnl_police_get_peakrate(struct rtnl_act *);
++extern int rtnl_police_set_peakrate(struct rtnl_act *, uint64_t);
++extern uint32_t rtnl_police_get_mtu(struct rtnl_act *);
++extern int rtnl_police_set_mtu(struct rtnl_act *, uint32_t);
++extern uint32_t rtnl_police_get_burst(struct rtnl_act *);
++extern int rtnl_police_set_burst(struct rtnl_act *, uint32_t);
++extern int rtnl_police_set_action(struct rtnl_act *, int);
++extern int rtnl_police_get_action(struct rtnl_act *);
++extern uint32_t rtnl_police_get_avrate(struct rtnl_act *);
++extern int rtnl_police_set_avrate(struct rtnl_act *, uint32_t);
++extern uint32_t rtnl_police_get_result(struct rtnl_act *);
++extern int rtnl_police_set_result(struct rtnl_act *, uint32_t);
++
++#ifdef __cplusplus
++}
++#endif
++#endif
+diff --git a/lib/route/act/police.c b/lib/route/act/police.c
+new file mode 100644
+index 0000000..a50a079
+--- /dev/null
++++ b/lib/route/act/police.c
+@@ -0,0 +1,454 @@
++/*
++ * lib/route/act/police.c		police action
++ *
++ *	This library is free software; you can redistribute it and/or
++ *	modify it under the terms of the GNU Lesser General Public
++ *	License as published by the Free Software Foundation version 2.1
++ *	of the License.
++ *
++ * Copyright (c) 2021 MaxLinear, Inc.
++ * Copyright (c) 2019 Intel Corporation
++ */
++
++/**
++ * @ingroup act
++ * @defgroup act_police Editing
++ *
++ * @{
++ */
++
++#include <netlink-private/netlink.h>
++#include <netlink-private/tc.h>
++#include <netlink/netlink.h>
++#include <netlink/attr.h>
++#include <netlink/utils.h>
++#include <netlink-private/route/tc-api.h>
++#include <netlink/route/act/police.h>
++#include <linux/pkt_cls.h>
++
++/** @cond SKIP */
++#define ACT_POLICE_HAS_AVRATE		0x01
++#define ACT_POLICE_HAS_RESEULT		0x02
++/** @endcond */
++
++static struct nla_policy police_policy[TCA_POLICE_MAX + 1] = {
++	[TCA_POLICE_TBF]	= { .minlen = sizeof(struct tc_police) },
++	[TCA_POLICE_RATE]	= { .minlen = TC_RTAB_SIZE },
++	[TCA_POLICE_PEAKRATE]	= { .minlen = TC_RTAB_SIZE },
++	[TCA_POLICE_AVRATE]	= { .type = NLA_U32 },
++	[TCA_POLICE_RESULT]	= { .type = NLA_U32 },
++};
++
++static int police_msg_parser(struct rtnl_tc *tc, void *data)
++{
++	struct rtnl_police *u = data;
++	struct nlattr *tb[TCA_POLICE_MAX + 1];
++	int err;
++
++	err = tca_parse(tb, TCA_POLICE_MAX, tc, police_policy);
++	if (err < 0)
++		return err;
++
++	u->p_mask = 0;
++
++	if (tb[TCA_POLICE_TBF])
++		nla_memcpy(&u->p_parm, tb[TCA_POLICE_TBF], sizeof(u->p_parm));
++	else
++		return -NLE_MISSING_ATTR;
++
++	rtnl_copy_ratespec(&u->p_rate, &u->p_parm.rate);
++	rtnl_copy_ratespec(&u->p_peakrate, &u->p_parm.peakrate);
++
++	if (tb[TCA_POLICE_AVRATE]) {
++		u->p_mask |= ACT_POLICE_HAS_AVRATE;
++		u->p_avrate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
++	}
++
++	if (tb[TCA_POLICE_RESULT]) {
++		u->p_mask |= ACT_POLICE_HAS_RESEULT;
++		u->p_result = nla_get_u32(tb[TCA_POLICE_RESULT]);
++	}
++
++	return 0;
++}
++
++static int police_clone(void *_dst, void *_src)
++{
++	struct rtnl_police *dst = _dst, *src = _src;
++
++	memcpy(&dst->p_parm, &src->p_parm, sizeof(src->p_parm));
++	dst->p_avrate = src->p_avrate;
++	dst->p_result = src->p_result;
++	return 0;
++}
++
++static void police_dump_line(struct rtnl_tc *tc, void *data,
++			     struct nl_dump_params *p)
++{
++	struct rtnl_police *u = data;
++
++	if (!u)
++		return;
++
++	nl_dump(p, " rate %u, peakrate %u",
++		u->p_rate.rs_rate64, u->p_peakrate.rs_rate64);
++
++	if (u->p_mask & ACT_POLICE_HAS_AVRATE)
++		nl_dump(p, " avrate %u", u->p_avrate);
++
++	if (u->p_mask & ACT_POLICE_HAS_RESEULT)
++		nl_dump(p, " result %u", u->p_result);
++
++	switch (u->p_parm.action) {
++	case TC_POLICE_UNSPEC:
++		nl_dump(p, " unspecified");
++		break;
++	case TC_POLICE_OK:
++		nl_dump(p, " ok");
++		break;
++	case TC_POLICE_RECLASSIFY:
++		nl_dump(p, " reclassify");
++		break;
++	case TC_POLICE_SHOT:
++		nl_dump(p, " shot");
++		break;
++	case TC_POLICE_PIPE:
++		nl_dump(p, " pipe");
++		break;
++	}
++}
++
++static void police_dump_details(struct rtnl_tc *tc, void *data,
++				struct nl_dump_params *p)
++{
++	struct rtnl_police *u = data;
++
++	if (!u)
++		return;
++
++	nl_dump(p, " rate %u", u->p_rate.rs_rate64);
++	nl_dump(p, " peakrate %u", u->p_peakrate.rs_rate64);
++
++	if (u->p_mask & ACT_POLICE_HAS_AVRATE)
++		nl_dump(p, " avrate %u", u->p_avrate);
++
++	if (u->p_mask & ACT_POLICE_HAS_RESEULT)
++		nl_dump(p, " result %u", u->p_result);
++
++	nl_dump(p, "\n");
++}
++
++static int police_msg_fill(struct rtnl_tc *tc, void *data, struct nl_msg *msg)
++{
++	struct rtnl_police *u = data;
++	uint32_t rtable[RTNL_TC_RTABLE_SIZE], ptable[RTNL_TC_RTABLE_SIZE];
++
++	if (!u)
++		return 0;
++
++	rtnl_tc_build_rate_table(tc, &u->p_rate, rtable);
++	rtnl_rcopy_ratespec(&u->p_parm.rate, &u->p_rate);
++
++	rtnl_tc_build_rate_table(tc, &u->p_peakrate, ptable);
++	rtnl_rcopy_ratespec(&u->p_parm.peakrate, &u->p_peakrate);
++
++	NLA_PUT(msg, TCA_POLICE_TBF, sizeof(u->p_parm), &u->p_parm);
++
++	NLA_PUT(msg, TCA_POLICE_RATE, sizeof(rtable), &rtable);
++
++	NLA_PUT(msg, TCA_POLICE_PEAKRATE, sizeof(rtable), &ptable);
++
++	if (u->p_mask & ACT_POLICE_HAS_AVRATE)
++		NLA_PUT_U32(msg, TCA_POLICE_AVRATE, u->p_avrate);
++
++	if (u->p_mask & ACT_POLICE_HAS_RESEULT)
++		NLA_PUT_U32(msg, TCA_POLICE_RESULT, u->p_result);
++
++	return 0;
++
++nla_put_failure:
++	return -NLE_MSGSIZE;
++}
++
++/**
++ * Return rate of police action
++ * @arg class		police action object
++ *
++ * @return Rate in bytes/s or 0 if unspecified.
++ */
++uint64_t rtnl_police_get_rate(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (u)
++		return u->p_rate.rs_rate64;
++
++	return 0;
++}
++
++/**
++ * Set rate of police action
++ * @arg class		police action object
++ * @arg rate		new rate in bytes per second
++ *
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_police_set_rate(struct rtnl_act *act, uint64_t rate)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	u->p_rate.rs_cell_log = UINT8_MAX; /* use default value */
++	u->p_rate.rs_rate64 = rate;
++
++	return 0;
++}
++
++/**
++ * Return rate of police action
++ * @arg class		police action object
++ *
++ * @return Rate in bytes/s or 0 if unspecified.
++ */
++uint64_t rtnl_police_get_peakrate(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (u)
++		return u->p_peakrate.rs_rate64;
++
++	return 0;
++}
++
++/**
++ * Set rate of police action
++ * @arg class		police action object
++ * @arg rate		new rate in bytes per second
++ *
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_police_set_peakrate(struct rtnl_act *act, uint64_t rate)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	u->p_peakrate.rs_cell_log = UINT8_MAX; /* use default value */
++	u->p_peakrate.rs_rate64 = rate;
++
++	return 0;
++}
++
++/**
++ * Return rate of police action
++ * @arg class		police action object
++ *
++ * @return Rate in bytes/s or 0 if unspecified.
++ */
++uint32_t rtnl_police_get_mtu(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (u)
++		return u->p_parm.mtu;
++
++	return 0;
++}
++
++/**
++ * Set rate of police action
++ * @arg class		police action object
++ * @arg rate		new rate in bytes per second
++ *
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_police_set_mtu(struct rtnl_act *act, uint32_t rate)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	u->p_parm.mtu = rate;
++
++	return 0;
++}
++
++/**
++ * Return rate of police action
++ * @arg class		police action object
++ *
++ * @return Rate in bytes/s or 0 if unspecified.
++ */
++uint32_t rtnl_police_get_burst(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (u)
++		return u->p_parm.burst;
++
++	return 0;
++}
++
++/**
++ * Set rate of police action
++ * @arg class		police action object
++ * @arg rate		new rate in bytes per second
++ *
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_police_set_burst(struct rtnl_act *act, uint32_t rate)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	u->p_parm.burst = rate;
++
++	return 0;
++}
++
++/**
++ * @name Attribute Modifications
++ * @{
++ */
++
++int rtnl_police_set_action(struct rtnl_act *act, int action)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	if (action > TC_POLICE_PIPE || action < TC_POLICE_UNSPEC)
++		return -NLE_INVAL;
++
++	u->p_parm.action = action;
++	return 0;
++}
++
++int rtnl_police_get_action(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++	return u->p_parm.action;
++}
++
++/**
++ * Return avrate of police action
++ * @arg class		police action object
++ *
++ * @return Rate in bytes/s or 0 if unspecified.
++ */
++uint32_t rtnl_police_get_avrate(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (u && (u->p_mask & ACT_POLICE_HAS_AVRATE))
++		return u->p_avrate;
++
++	return 0;
++}
++
++/**
++ * Set avrate of police action
++ * @arg class		police action object
++ * @arg rate		new rate in bytes per second
++ *
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_police_set_avrate(struct rtnl_act *act, uint32_t rate)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	u->p_avrate = rate;
++	u->p_mask |= ACT_POLICE_HAS_AVRATE;
++
++	return 0;
++}
++
++/**
++ * Return result rate of police action
++ * @arg class		police action object
++ *
++ * @return Rate in bytes/s or 0 if unspecified.
++ */
++uint32_t rtnl_police_get_result(struct rtnl_act *act)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (u && (u->p_mask & ACT_POLICE_HAS_RESEULT))
++		return u->p_result;
++
++	return 0;
++}
++
++/**
++ * Set result rate of police action
++ * @arg class		police action object
++ * @arg rate		new rate in bytes per second
++ *
++ * @return 0 on success or a negative error code.
++ */
++int rtnl_police_set_result(struct rtnl_act *act, uint32_t rate)
++{
++	struct rtnl_police *u;
++
++	u = (struct rtnl_police *) rtnl_tc_data(TC_CAST(act));
++	if (!u)
++		return -NLE_NOMEM;
++
++	u->p_result = rate;
++	u->p_mask |= ACT_POLICE_HAS_RESEULT;
++
++	return 0;
++}
++
++/** @} */
++
++static struct rtnl_tc_ops police_ops = {
++	.to_kind		= "police",
++	.to_type		= RTNL_TC_TYPE_ACT,
++	.to_size		= sizeof(struct rtnl_police),
++	.to_msg_parser		= police_msg_parser,
++	.to_clone		= police_clone,
++	.to_msg_fill		= police_msg_fill,
++	.to_dump = {
++		    [NL_DUMP_LINE] = police_dump_line,
++		    [NL_DUMP_DETAILS] = police_dump_details,
++		    },
++};
++
++static void __init police_init(void)
++{
++	rtnl_tc_register(&police_ops);
++}
++
++static void __exit police_exit(void)
++{
++	rtnl_tc_unregister(&police_ops);
++}
++
++/** @} */
+diff --git a/libnl-route-3.sym b/libnl-route-3.sym
+index f5563e3..a08288a 100644
+--- a/libnl-route-3.sym
++++ b/libnl-route-3.sym
+@@ -169,6 +169,20 @@ global:
+ 	rtnl_colmark_set_drop_precedence;
+ 	rtnl_colmark_set_meter_type;
+ 	rtnl_colmark_set_mode;
++	rtnl_police_get_rate;
++	rtnl_police_set_rate;
++	rtnl_police_get_peakrate;
++	rtnl_police_set_peakrate;
++	rtnl_police_get_mtu;
++	rtnl_police_set_mtu;
++	rtnl_police_get_burst;
++	rtnl_police_set_burst;
++	rtnl_police_set_action;
++	rtnl_police_get_action;
++	rtnl_police_get_avrate;
++	rtnl_police_set_avrate;
++	rtnl_police_get_result;
++	rtnl_police_set_result;
+ 	rtnl_drr_set_quantum;
+ 	rtnl_drr_get_quantum;
+ 	rtnl_ematch_add_child;

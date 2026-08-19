@@ -1,0 +1,826 @@
+From 6dddb33d8d13e2dad13a20214bedb7198d837039 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <przemyslawx.czarnota@intel.com>
+Date: Thu, 18 Jun 2020 20:07:30 +0200
+Subject: red: implement red qdisc
+
+---
+ Makefile.am                       |   3 +
+ include/netlink-private/types.h   |   2 +
+ include/netlink/route/qdisc/red.h |  24 +++
+ lib/route/qdisc/red.c             | 314 +++++++++++++++++++++++++++---
+ libnl-route-3.sym                 |  18 ++
+ tests/test-create-qdisc-red.c     | 293 ++++++++++++++++++++++++++++
+ 6 files changed, 624 insertions(+), 30 deletions(-)
+ create mode 100644 tests/test-create-qdisc-red.c
+
+diff --git a/Makefile.am b/Makefile.am
+index 61e779f..5fdc684 100644
+--- a/Makefile.am
++++ b/Makefile.am
+@@ -859,6 +859,7 @@ check_PROGRAMS += \
+ 	tests/test-create-macsec \
+ 	tests/test-create-macvlan \
+ 	tests/test-create-macvtap \
++	tests/test-create-qdisc-red \
+ 	tests/test-create-sit \
+ 	tests/test-create-veth \
+ 	tests/test-create-vlan \
+@@ -922,6 +923,8 @@ tests_test_u32_filter_with_actions_CPPFLAGS       = $(tests_cppflags)
+ tests_test_u32_filter_with_actions_LDADD          = $(tests_ldadd)
+ tests_test_flower_filter_with_actions_CPPFLAGS    = $(tests_cppflags)
+ tests_test_flower_filter_with_actions_LDADD       = $(tests_ldadd)
++tests_test_create_qdisc_red_CPPFLAGS              = $(tests_cppflags)
++tests_test_create_qdisc_red_LDADD                 = $(tests_ldadd)
+ 
+ check_PROGRAMS += \
+ 	tests/test-cache-mngr \
+diff --git a/include/netlink-private/types.h b/include/netlink-private/types.h
+index 70fe8a9..65d6fb8 100644
+--- a/include/netlink-private/types.h
++++ b/include/netlink-private/types.h
+@@ -818,6 +818,8 @@ struct rtnl_red
+ 	uint8_t		qr_wlog;
+ 	uint8_t		qr_plog;
+ 	uint8_t		qr_scell_log;
++	uint8_t		qr_stab[256];
++	uint32_t        qr_max_p;
+ 	uint32_t	qr_mask;
+ };
+ 
+diff --git a/include/netlink/route/qdisc/red.h b/include/netlink/route/qdisc/red.h
+index accb8d9..8fffd98 100644
+--- a/include/netlink/route/qdisc/red.h
++++ b/include/netlink/route/qdisc/red.h
+@@ -7,6 +7,7 @@
+  *	of the License.
+  *
+  * Copyright (c) 2003-2006 Thomas Graf <tgraf@suug.ch>
++ * Copyright (c) 2019 Intel Corporation
+  */
+ 
+ #ifndef NETLINK_RED_H_
+@@ -17,4 +18,27 @@
+ extern  void rtnl_red_set_limit(struct rtnl_qdisc *qdisc, int limit);
+ extern int rtnl_red_get_limit(struct rtnl_qdisc *qdisc);
+ 
++struct rtnl_qdisc;
++
++extern void rtnl_qdisc_red_set_limit(struct rtnl_qdisc *qdisc, int limit);
++extern int rtnl_qdisc_red_get_limit(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_min(struct rtnl_qdisc *qdisc, int min);
++extern int rtnl_qdisc_red_get_min(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_max(struct rtnl_qdisc *qdisc, int max);
++extern int rtnl_qdisc_red_get_max(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_flags(struct rtnl_qdisc *qdisc, int flags);
++extern int rtnl_qdisc_red_get_flags(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_wlog(struct rtnl_qdisc *qdisc, int wlog);
++extern int rtnl_qdisc_red_get_wlog(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_plog(struct rtnl_qdisc *qdisc, int plog);
++extern int rtnl_qdisc_red_get_plog(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_scell_log(struct rtnl_qdisc *qdisc, int scell_log);
++extern int rtnl_qdisc_red_get_scell_log(struct rtnl_qdisc *qdisc);
++extern void rtnl_qdisc_red_set_max_p(struct rtnl_qdisc *qdisc, uint32_t max_p);
++extern int rtnl_qdisc_red_get_max_p(struct rtnl_qdisc *qdisc);
++
++extern void rtnl_qdisc_red_set_stab(struct rtnl_qdisc *qdisc,
++				    const unsigned char *stab, unsigned int size);
++int rtnl_qdisc_red_get_stab(struct rtnl_qdisc *qdisc, unsigned char *stab, unsigned int size);
++
+ #endif
+diff --git a/lib/route/qdisc/red.c b/lib/route/qdisc/red.c
+index f05626e..1b34958 100644
+--- a/lib/route/qdisc/red.c
++++ b/lib/route/qdisc/red.c
+@@ -7,6 +7,7 @@
+  *	of the License.
+  *
+  * Copyright (c) 2003-2011 Thomas Graf <tgraf@suug.ch>
++ * Copyright (c) 2019 Intel Corporation
+  */
+ 
+ /**
+@@ -23,6 +24,7 @@
+ #include <netlink-private/route/tc-api.h>
+ #include <netlink/route/qdisc.h>
+ #include <netlink/route/qdisc/red.h>
++#include <string.h>
+ 
+ /** @cond SKIP */
+ #define RED_ATTR_LIMIT		0x01
+@@ -32,10 +34,16 @@
+ #define RED_ATTR_WLOG		0x10
+ #define RED_ATTR_PLOG		0x20
+ #define RED_ATTR_SCELL_LOG	0x40
++#define RED_ATTR_STAB		0x80
++#define RED_ATTR_MAX_P         0x100
+ /** @endcond */
+ 
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++
+ static struct nla_policy red_policy[TCA_RED_MAX+1] = {
+ 	[TCA_RED_PARMS]		= { .minlen = sizeof(struct tc_red_qopt) },
++	[TCA_RED_STAB]		= {0},
++	[TCA_RED_MAX_P]		= {.type = NLA_U32},
+ };
+ 
+ static int red_msg_parser(struct rtnl_tc *tc, void *data)
+@@ -69,6 +77,19 @@ static int red_msg_parser(struct rtnl_tc *tc, void *data)
+ 			RED_ATTR_FLAGS | RED_ATTR_WLOG | RED_ATTR_PLOG |
+ 			RED_ATTR_SCELL_LOG);
+ 
++	if (!tb[TCA_RED_STAB])
++		return 0;
++
++	memcpy(red->qr_stab, nla_data(tb[TCA_RED_STAB]),
++	       MIN(sizeof(red->qr_stab), nla_len(tb[TCA_RED_STAB])));
++	red->qr_mask |= RED_ATTR_STAB;
++
++	if (!tb[TCA_RED_MAX_P])
++		return 0;
++
++	red->qr_max_p = nla_get_u32(tb[TCA_RED_MAX_P]);
++	red->qr_mask |= RED_ATTR_MAX_P;
++
+ 	return 0;
+ }
+ 
+@@ -77,9 +98,16 @@ static void red_dump_line(struct rtnl_tc *tc, void *data,
+ {
+ 	struct rtnl_red *red = data;
+ 
+-	if (red) {
+-		/* XXX: limit, min, max, flags */
+-	}
++	if (red)
++		nl_dump(p,
++			" limit %u qth_min %u qth_max %u flags %u wlog %u plog %u scell_log %u",
++			red->qr_limit,
++			red->qr_qth_min,
++			red->qr_qth_max,
++			red->qr_flags,
++			red->qr_wlog,
++			red->qr_plog,
++			red->qr_scell_log);
+ }
+ 
+ static void red_dump_details(struct rtnl_tc *tc, void *data,
+@@ -87,39 +115,52 @@ static void red_dump_details(struct rtnl_tc *tc, void *data,
+ {
+ 	struct rtnl_red *red = data;
+ 
+-	if (red) {
+-		/* XXX: wlog, plog, scell_log */
+-	}
+-}
+-
+-static void red_dump_stats(struct rtnl_tc *tc, void *data,
+-			   struct nl_dump_params *p)
+-{
+-	struct rtnl_red *red = data;
+-
+-	if (red) {
+-		/* XXX: xstats */
+-	}
++	if (red)
++		nl_dump(p,
++			"limit %u\nqth_min %u\nqth_max %u\nflags %u\nwlog %u\nplog %u\nscell_log %u\n",
++			red->qr_limit,
++			red->qr_qth_min,
++			red->qr_qth_max,
++			red->qr_flags,
++			red->qr_wlog,
++			red->qr_plog,
++			red->qr_scell_log);
+ }
+ 
+ static int red_msg_fill(struct rtnl_tc *tc, void *data, struct nl_msg *msg)
+ {
+ 	struct rtnl_red *red = data;
++	struct tc_red_qopt opts;
+ 
+ 	if (!red)
+ 		BUG();
+ 
+-#if 0
+-	memset(&opts, 0, sizeof(opts));
+-	opts.quantum = sfq->qs_quantum;
+-	opts.perturb_period = sfq->qs_perturb;
+-	opts.limit = sfq->qs_limit;
++	if (!((red->qr_mask & RED_ATTR_LIMIT) &&
++	      (red->qr_mask & RED_ATTR_QTH_MIN) &&
++	      (red->qr_mask & RED_ATTR_QTH_MAX) &&
++	      (red->qr_mask & RED_ATTR_FLAGS) &&
++	      (red->qr_mask & RED_ATTR_WLOG) &&
++	      (red->qr_mask & RED_ATTR_PLOG) &&
++	      (red->qr_mask & RED_ATTR_SCELL_LOG) &&
++	      (red->qr_mask & RED_ATTR_STAB) &&
++	      (red->qr_mask & RED_ATTR_MAX_P)))
++		return -NLE_NOATTR;
++
++	opts.Plog = red->qr_plog;
++	opts.Wlog = red->qr_wlog;
++	opts.limit = red->qr_limit;
++	opts.flags = red->qr_flags;
++	opts.qth_min = red->qr_qth_min;
++	opts.qth_max = red->qr_qth_max;
++	opts.Scell_log = red->qr_scell_log;
+ 
+-	if (nlmsg_append(msg, &opts, sizeof(opts), NL_DONTPAD) < 0)
+-		goto errout;
+-#endif
++	NLA_PUT(msg, TCA_RED_PARMS, sizeof(opts), &opts);
++	NLA_PUT(msg, TCA_RED_STAB, sizeof(red->qr_stab), red->qr_stab);
++	NLA_PUT_U32(msg, TCA_RED_MAX_P, red->qr_max_p);
+ 
+-	return -NLE_OPNOTSUPP;
++	return 0;
++nla_put_failure:
++	return -1;
+ }
+ 
+ /**
+@@ -133,11 +174,12 @@ static int red_msg_fill(struct rtnl_tc *tc, void *data, struct nl_msg *msg)
+  * @arg limit		New limit in number of packets.
+  * @return 0 on success or a negative error code.
+  */
+-void rtnl_red_set_limit(struct rtnl_qdisc *qdisc, int limit)
++void rtnl_qdisc_red_set_limit(struct rtnl_qdisc *qdisc, int limit)
+ {
+ 	struct rtnl_red *red;
+ 
+-	if (!(red = rtnl_tc_data(TC_CAST(qdisc))))
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
+ 		BUG();
+ 
+ 	red->qr_limit = limit;
+@@ -149,11 +191,12 @@ void rtnl_red_set_limit(struct rtnl_qdisc *qdisc, int limit)
+  * @arg qdisc		RED qdisc.
+  * @return Limit or a negative error code.
+  */
+-int rtnl_red_get_limit(struct rtnl_qdisc *qdisc)
++int rtnl_qdisc_red_get_limit(struct rtnl_qdisc *qdisc)
+ {
+ 	struct rtnl_red *red;
+ 
+-	if (!(red = rtnl_tc_data(TC_CAST(qdisc))))
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
+ 		BUG();
+ 
+ 	if (red->qr_mask & RED_ATTR_LIMIT)
+@@ -162,6 +205,218 @@ int rtnl_red_get_limit(struct rtnl_qdisc *qdisc)
+ 		return -NLE_NOATTR;
+ }
+ 
++void rtnl_qdisc_red_set_min(struct rtnl_qdisc *qdisc, int min)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_qth_min = (uint32_t) min;
++	red->qr_mask |= RED_ATTR_QTH_MIN;
++}
++
++int rtnl_qdisc_red_get_min(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_QTH_MIN)
++		return (int) red->qr_qth_min;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_max(struct rtnl_qdisc *qdisc, int max)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_qth_max = (uint32_t) max;
++	red->qr_mask |= RED_ATTR_QTH_MAX;
++}
++
++int rtnl_qdisc_red_get_max(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_QTH_MAX)
++		return (int) red->qr_qth_max;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_flags(struct rtnl_qdisc *qdisc, int flags)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_flags = (uint32_t) flags;
++	red->qr_mask |= RED_ATTR_FLAGS;
++}
++
++int rtnl_qdisc_red_get_flags(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_FLAGS)
++		return (int) red->qr_flags;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_wlog(struct rtnl_qdisc *qdisc, int wlog)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_wlog = (uint8_t) wlog;
++	red->qr_mask |= RED_ATTR_WLOG;
++}
++
++int rtnl_qdisc_red_get_wlog(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_WLOG)
++		return (int) red->qr_wlog;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_plog(struct rtnl_qdisc *qdisc, int plog)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_plog = (uint8_t) plog;
++	red->qr_mask |= RED_ATTR_PLOG;
++}
++
++int rtnl_qdisc_red_get_plog(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_PLOG)
++		return (int) red->qr_plog;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_max_p(struct rtnl_qdisc *qdisc, uint32_t max_p)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_max_p = max_p;
++	red->qr_mask |= RED_ATTR_MAX_P;
++}
++
++int rtnl_qdisc_red_get_max_p(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_MAX_P)
++		return (int) red->qr_max_p;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_scell_log(struct rtnl_qdisc *qdisc, int scell_log)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	red->qr_scell_log = (uint8_t) scell_log;
++	red->qr_mask |= RED_ATTR_SCELL_LOG;
++}
++
++int rtnl_qdisc_red_get_scell_log(struct rtnl_qdisc *qdisc)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_SCELL_LOG)
++		return (int) red->qr_scell_log;
++	else
++		return -NLE_NOATTR;
++}
++
++void rtnl_qdisc_red_set_stab(struct rtnl_qdisc *qdisc,
++			     const unsigned char *stab, unsigned int size)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	memcpy(red->qr_stab, stab, MIN(size, sizeof(red->qr_stab)));
++	red->qr_mask |= RED_ATTR_STAB;
++}
++
++int rtnl_qdisc_red_get_stab(struct rtnl_qdisc *qdisc,
++			    unsigned char *stab, unsigned int size)
++{
++	struct rtnl_red *red;
++
++	red = rtnl_tc_data(TC_CAST(qdisc));
++	if (!red)
++		BUG();
++
++	if (red->qr_mask & RED_ATTR_STAB) {
++		memcpy(stab, red->qr_stab, MIN(size, sizeof(red->qr_stab)));
++		return 0;
++	} else {
++		return -NLE_NOATTR;
++	}
++}
++
+ /** @} */
+ 
+ static struct rtnl_tc_ops red_ops = {
+@@ -172,7 +427,6 @@ static struct rtnl_tc_ops red_ops = {
+ 	.to_dump = {
+ 	    [NL_DUMP_LINE]	= red_dump_line,
+ 	    [NL_DUMP_DETAILS]	= red_dump_details,
+-	    [NL_DUMP_STATS]	= red_dump_stats,
+ 	},
+ 	.to_msg_fill		= red_msg_fill,
+ };
+diff --git a/libnl-route-3.sym b/libnl-route-3.sym
+index 7a7fe86..a82ef78 100644
+--- a/libnl-route-3.sym
++++ b/libnl-route-3.sym
+@@ -681,6 +681,24 @@ global:
+ 	rtnl_qdisc_prio_get_priomap;
+ 	rtnl_qdisc_prio_set_bands;
+ 	rtnl_qdisc_prio_set_priomap;
++	rtnl_qdisc_red_set_limit;
++	rtnl_qdisc_red_get_limit;
++	rtnl_qdisc_red_set_min;
++	rtnl_qdisc_red_get_min;
++	rtnl_qdisc_red_set_max;
++	rtnl_qdisc_red_get_max;
++	rtnl_qdisc_red_set_flags;
++	rtnl_qdisc_red_get_flags;
++	rtnl_qdisc_red_set_wlog;
++	rtnl_qdisc_red_get_wlog;
++	rtnl_qdisc_red_set_plog;
++	rtnl_qdisc_red_get_plog;
++	rtnl_qdisc_red_set_scell_log;
++	rtnl_qdisc_red_get_scell_log;
++	rtnl_qdisc_red_set_stab;
++	rtnl_qdisc_red_get_stab;
++	rtnl_qdisc_red_set_max_p;
++	rtnl_qdisc_red_get_max_p;
+ 	rtnl_qdisc_put;
+ 	rtnl_qdisc_tbf_get_limit;
+ 	rtnl_qdisc_tbf_get_peakrate;
+diff --git a/tests/test-create-qdisc-red.c b/tests/test-create-qdisc-red.c
+new file mode 100644
+index 0000000..55502e4
+--- /dev/null
++++ b/tests/test-create-qdisc-red.c
+@@ -0,0 +1,293 @@
++#include <netlink/netlink.h>
++#include <netlink/route/link.h>
++#include <netlink/route/qdisc.h>
++#include <netlink/route/qdisc/red.h>
++#include <netlink/route/tc.h>
++#include <string.h>
++#include <stdio.h>
++
++static struct rtnl_link *link_dummy_alloc(void)
++{
++	struct rtnl_link *dummy;
++	int err;
++
++	dummy = rtnl_link_alloc();
++	if (!dummy)
++		return NULL;
++
++	err = rtnl_link_set_type(dummy, "dummy");
++	if (err) {
++		rtnl_link_put(dummy);
++		return NULL;
++	}
++
++	return dummy;
++}
++
++static int link_dummy_add(struct nl_sock *sk, const char *name)
++{
++	int error;
++	struct rtnl_link *link;
++
++	link = link_dummy_alloc();
++	if (!link)
++		return -1;
++
++	rtnl_link_set_name(link, "dummy0");
++
++	error = rtnl_link_add(sk, link, NLM_F_CREATE);
++	if (error < 0) {
++		rtnl_link_put(link);
++		return error;
++	}
++
++	rtnl_link_put(link);
++	return 0;
++}
++
++static struct rtnl_qdisc *qdisc_red_alloc(void)
++{
++	struct rtnl_qdisc *qdisc;
++	int error;
++
++	qdisc = rtnl_qdisc_alloc();
++
++	if (!qdisc)
++		return NULL;
++
++	error = rtnl_tc_set_kind(TC_CAST(qdisc), "red");
++	if (error) {
++		rtnl_qdisc_put(qdisc);
++		return NULL;
++	}
++
++	return qdisc;
++}
++
++static struct rtnl_qdisc *qdisc_red_alloc_for_link(struct rtnl_link *link)
++{
++	struct rtnl_qdisc *qdisc;
++
++	qdisc = qdisc_red_alloc();
++
++	if (!qdisc)
++		return NULL;
++
++	rtnl_tc_set_link(TC_CAST(qdisc), link);
++	rtnl_tc_set_parent(TC_CAST(qdisc), TC_H_ROOT);
++	rtnl_tc_set_handle(TC_CAST(qdisc), TC_HANDLE(8000, 0));
++
++	return qdisc;
++}
++
++static struct nl_cache *link_cache_alloc(struct nl_sock *sock)
++{
++	struct nl_cache *link_cache;
++	int error;
++
++	error = rtnl_link_alloc_cache(sock, AF_UNSPEC, &link_cache);
++	if (error < 0)
++		return NULL;
++
++	return link_cache;
++}
++
++static struct nl_cache *qdisc_cache_alloc(struct nl_sock *sock)
++{
++	struct nl_cache *qdisc_cache;
++	int error;
++
++	error = rtnl_qdisc_alloc_cache(sock, &qdisc_cache);
++	if (error < 0)
++		return NULL;
++
++	return qdisc_cache;
++}
++
++struct test_ctx {
++	struct nl_sock *sk;
++	struct rtnl_qdisc *qdisc;
++	struct rtnl_link *link;
++	struct nl_cache *link_cache;
++	struct nl_cache *qdisc_cache;
++};
++
++int test_setup(struct test_ctx *test_ctx)
++{
++	struct nl_sock *sk = NULL;
++	struct rtnl_qdisc *qdisc = NULL;
++	struct rtnl_link *link = NULL;
++	struct nl_cache *link_cache = NULL;
++	struct nl_cache *qdisc_cache = NULL;
++	int error;
++
++	memset(test_ctx, 0, sizeof(*test_ctx));
++
++	sk = nl_socket_alloc();
++	error = nl_connect(sk, NETLINK_ROUTE);
++	if (error < 0) {
++		nl_perror(error, "Unable to connect socket");
++		goto error;
++	}
++
++	error = link_dummy_add(sk, "dummy0");
++	if (error) {
++		printf("Cannot create dummy link\n");
++		goto error;
++	}
++
++	link_cache = link_cache_alloc(sk);
++	if (!link_cache) {
++		printf("link cache fail\n");
++		goto error;
++	}
++
++	qdisc_cache = qdisc_cache_alloc(sk);
++	if (!qdisc_cache) {
++		printf("qdisc cache fail\n");
++		goto error;
++	}
++
++	link = rtnl_link_get_by_name(link_cache, "dummy0");
++	if (!link) {
++		printf("link get by name\n");
++		goto error;
++	}
++
++	qdisc = qdisc_red_alloc_for_link(link);
++	if (!qdisc) {
++		printf("Cannot allocate red qdisc\n");
++		goto error;
++	}
++
++	test_ctx->sk = sk;
++	test_ctx->qdisc = qdisc;
++	test_ctx->link = link;
++	test_ctx->link_cache = link_cache;
++	test_ctx->qdisc_cache = qdisc_cache;
++
++	return 0;
++error:
++	if (link) {
++		rtnl_link_delete(sk, link);
++		rtnl_link_put(link);
++	}
++	if (qdisc_cache)
++		nl_cache_free(qdisc_cache);
++	if (link_cache)
++		nl_cache_free(link_cache);
++	if (sk)
++		nl_close(sk);
++	return -1;
++
++}
++
++int test_basic_qdisc_add(struct test_ctx *test_ctx)
++{
++	int error;
++	struct rtnl_qdisc *qdisc = NULL;
++	unsigned char buf[256] = { 3 };
++	unsigned char out_buf[256] = { 0 };
++
++	rtnl_qdisc_red_set_limit(test_ctx->qdisc, 2);
++	rtnl_qdisc_red_set_min(test_ctx->qdisc, 3);
++	rtnl_qdisc_red_set_max(test_ctx->qdisc, 10);
++	rtnl_qdisc_red_set_flags(test_ctx->qdisc, 0);
++	rtnl_qdisc_red_set_wlog(test_ctx->qdisc, 4);
++	rtnl_qdisc_red_set_plog(test_ctx->qdisc, 5);
++	rtnl_qdisc_red_set_scell_log(test_ctx->qdisc, 6);
++	rtnl_qdisc_red_set_stab(test_ctx->qdisc, buf, sizeof(buf));
++
++	error = rtnl_qdisc_add(test_ctx->sk, test_ctx->qdisc, NLM_F_CREATE);
++	if (error) {
++		printf("Cannot add red qdisc %d\n", error);
++		return error;
++	}
++
++	error = nl_cache_refill(test_ctx->sk, test_ctx->qdisc_cache);
++	qdisc = rtnl_qdisc_get(test_ctx->qdisc_cache,
++			       rtnl_link_get_ifindex(test_ctx->link),
++			       TC_HANDLE(8000, 0));
++
++	if (!qdisc) {
++		printf("Cannot get red qdisc\n");
++		return -1;
++	}
++
++	if (rtnl_qdisc_red_get_limit(test_ctx->qdisc) != 2)
++		return -1;
++	if (rtnl_qdisc_red_get_min(test_ctx->qdisc) != 3)
++		return -1;
++	if (rtnl_qdisc_red_get_max(test_ctx->qdisc) != 10)
++		return -1;
++	if (rtnl_qdisc_red_get_flags(test_ctx->qdisc) != 0)
++		return -1;
++	if (rtnl_qdisc_red_get_wlog(test_ctx->qdisc) != 4)
++		return -1;
++	if (rtnl_qdisc_red_get_plog(test_ctx->qdisc) != 5)
++		return -1;
++	if (rtnl_qdisc_red_get_scell_log(test_ctx->qdisc) != 6)
++		return -1;
++	if (rtnl_qdisc_red_get_stab(test_ctx->qdisc, out_buf, sizeof(out_buf)))
++		return -1;
++	if (memcmp(buf, out_buf, sizeof(buf)) != 0)
++		return -1;
++
++	rtnl_qdisc_put(qdisc);
++
++	return error;
++}
++
++int test_basic_qdisc_add_should_fail(struct test_ctx *test_ctx)
++{
++	int error;
++
++	error = rtnl_qdisc_add(test_ctx->sk, test_ctx->qdisc, NLM_F_CREATE);
++	if (!error) {
++		printf("Added qdisc but expected to fail\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++void test_teardown(struct test_ctx *test_ctx)
++{
++	if (!test_ctx->qdisc)
++		return;
++
++	rtnl_qdisc_put(test_ctx->qdisc);
++	rtnl_link_delete(test_ctx->sk, test_ctx->link);
++	rtnl_link_put(test_ctx->link);
++	nl_cache_free(test_ctx->link_cache);
++	nl_close(test_ctx->sk);
++}
++
++int test(const char *name, int (*test_fn) (struct test_ctx *test_ctx))
++{
++	struct test_ctx test_ctx = { 0 };
++	int error;
++
++	error = test_setup(&test_ctx);
++	if (error) {
++		printf("%s: test_setup failed\n", name);
++		goto error;
++	}
++
++	error = test_fn(&test_ctx);
++	if (error)
++		printf("%s failed\n", name);
++	else
++		printf("%s passed\n", name);
++
++	test_teardown(&test_ctx);
++error:
++	return 0;
++}
++
++int main(int argc, char **args)
++{
++	return test("test_basic_qdisc_add", test_basic_qdisc_add) ||
++	    test("test_basic_qdisc_add_should_fail",
++		 test_basic_qdisc_add_should_fail) || 0;
++}
