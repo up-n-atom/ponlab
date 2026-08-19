@@ -1,0 +1,463 @@
+From 641369951895da87e1cc59f71e2a998b01567aaa Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Mon, 12 Jun 2023 08:06:15 +0200
+Subject: [PATCH] WLANRTSYS-55993: Implement support for WHM: part2
+
+---
+ hostapd/config_file.c         | 143 +++++++++++++++++++++++++++++++++-
+ src/ap/ap_config.c            |   1 +
+ src/ap/ap_config.h            |   9 ++-
+ src/ap/ap_drv_ops.h           |  13 ++++
+ src/ap/dfs.c                  |  25 ++++++
+ src/ap/hostapd.c              |  20 +++++
+ src/ap/hostapd.h              |   4 +
+ src/ap/mxl_zwdfs.c            |   1 +
+ src/common/vendor_cmds_copy.h |  30 +++++++
+ src/drivers/driver.h          |   8 ++
+ src/drivers/driver_nl80211.c  |  17 ++++
+ 11 files changed, 269 insertions(+), 2 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 2348715c3..1022a6a7a 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2538,6 +2538,142 @@ static int get_hex_config(u8 *buf, size_t max_len, int line,
+ }
+ 
+ 
++/* Find a token in the given character string. Besides the characters recognized as
++ * spaces by isspace (including '\t' and '\n'), additional delimiters are passed
++ * by 'delimiters' argument.
++ */
++void read_token (char **p, char** token_start, int* token_len, char* delimiters)
++{
++	/* skip possible spaces before token */
++	while (isspace(**p))
++		(*p)++;
++	*token_start = *p;
++
++	/* find the end of the token */
++	while (**p != '\0' && !isspace(**p) && os_strchr(delimiters, **p) == NULL)
++		(*p)++;
++	*token_len = *p - *token_start;
++
++	/* skip possible spaces after token */
++	while (isspace(**p))
++		(*p)++;
++}
++
++
++/**
++ * Read WHM configuration from whm.conf file
++ * Syntax of whm.conf file
++ * @param_name=@param_value
++ * Example : whm_enable=1 #Enables the main whm flag
++ */
++int hostapd_whm_read_config(int* whm_cfg, const char* fname)
++{
++	char buf[256], *pos;
++	int line = 0,val=0;
++	FILE *f = fopen(fname, "r");
++	if (f == NULL) {
++		wpa_printf(MSG_ERROR, "WHM: Could not open config file '%s'.", fname);
++		return -1;
++	}
++
++	/* We don't use any special handling for '\n' because isspace('\n') returns true. */
++	while (fgets(buf, sizeof(buf), f)) {
++		line++;
++
++		/* Skip leading spaces. */
++		pos = buf;
++		while (isspace(*pos))
++			pos++;
++		if (*pos != '\0' && *pos != '#') { /* <name> = <value> */
++			char *name, *value, *endptr;
++			int  name_len, value_len;
++			read_token (&pos, &name, &name_len, "=");
++			if(*pos != '=')
++				goto syntax_error;
++			pos++;
++
++			/* Value is the rest of the line, it can contain spaces */
++			/* However, cut off the leading and trailing spaces */
++			while (isspace(*pos))
++				(pos)++;
++			value = pos;
++			value_len = 0;
++			while (*pos != '\0' && *pos != '#') {
++				if (!isspace(*pos))
++					value_len = pos - value + 1;
++				pos++;
++			}
++
++			/* Make name and value null-terminated strings */
++			name[name_len] = 0;
++			value[value_len] = 0;
++
++			if (strcmp(name, "whm_enable") == 0) {
++				val = strtol(value, &endptr, 10);
++				if (!IS_VALID_BOOL_RANGE(val)) {
++					wpa_printf(MSG_ERROR, "line %d: invalid whm_enable %d", line, val);
++					goto syntax_error;
++				}
++				*whm_cfg |= val << WHM_ENABLE;
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "whm_hostapd_warn") == 0) {
++				val = strtol(value, &endptr, 10);
++				if (!IS_VALID_BOOL_RANGE(val)) {
++					wpa_printf(MSG_ERROR, "line %d: invalid whm_hostapd_warn %d", line, val);
++					goto syntax_error;
++				}
++				*whm_cfg |= val << WHM_HOSTAP_WARN;
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "whm_driver_warn") == 0) {
++				val = strtol(value, &endptr, 10);
++				if (!IS_VALID_BOOL_RANGE(val)) {
++					wpa_printf(MSG_ERROR, "line %d: invalid whm_driver_warn %d", line, val);
++					goto syntax_error;
++				}
++				*whm_cfg |= val << WHM_DRV_WARN;
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "whm_fw_warn") == 0) {
++				val = strtol(value, &endptr, 10);
++				if (!IS_VALID_BOOL_RANGE(val)) {
++					wpa_printf(MSG_ERROR, "line %d: invalid whm_fw_warn %d", line, val);
++					goto syntax_error;
++				}
++				*whm_cfg |= val << WHM_FW_WARN;
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else if (strcmp(name, "whm_phy_warn") == 0) {
++				val = strtol(value, &endptr, 10);
++				if (!IS_VALID_BOOL_RANGE(val)) {
++					wpa_printf(MSG_ERROR, "line %d: invalid whm_phy_warn %d", line, val);
++					goto syntax_error;
++				}
++				*whm_cfg |= val << WHM_PHY_WARN;
++				if (*endptr != '\0')
++					goto syntax_error;
++			}
++			else /* Unknown parameter name */
++				continue ;
++		}
++	}
++
++	fclose (f);
++	wpa_printf(MSG_DEBUG, "WHM: Reading config file %s successful (%d lines)", fname, line);
++	return 0; /* success */
++
++syntax_error:
++	fclose (f);
++	*whm_cfg = DEFAULT_WHM;
++	wpa_printf(MSG_ERROR, "WHM: Syntax error in config file '%s', line %d.", fname, line);
++	return -1;
++}
++
+ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			       struct hostapd_bss_config *bss,
+ 			       const char *buf, char *pos, int line)
+@@ -5561,7 +5697,12 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 	} else if (os_strcmp(buf, "greylist_file") == 0) {
+ 			wpa_printf(MSG_WARNING, "Line %d: greylist_file: greylist feature is not implemented yet", line);
+ 	} else if (os_strcmp(buf, "whm_config_file") == 0) {
+-		wpa_printf(MSG_WARNING, "Line %d: whm_config_file: WHM feature is not implemented yet", line);
++		os_free(conf->whm_config_file);
++		conf->whm_config_file = os_strdup(pos);
++		if (conf->whm_config_file != NULL && conf->whm_config_file[0] != '\0')
++			hostapd_whm_read_config(&conf->whm_cfg_flag, conf->whm_config_file);
++		else
++			wpa_printf(MSG_ERROR, "Error Reading whm config file");
+ #ifdef CONFIG_VENDOR_MXL
+ 	} else if (mxl_hostapd_config_fill(conf, bss, buf, pos, line)) {
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 96b544f70..1383efe4e 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -376,6 +376,7 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->mbssid_aid_offset = NON_MULTIBSS_AID_OFFSET;
+ 	conf->ext_cap_max_num_msdus_in_amsdu = EXT_CAP_MAX_NUM_MSDU_IN_AMSDU_DEFAULT;
+ 	conf->sFilsBeaconFlag = 1; /* By Default we should receive/process the incoming Fils frame on 6G */
++	conf->whm_cfg_flag = DEFAULT_WHM;
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_config_defaults(conf);
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 4ac40579a..b14765dd3 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1384,7 +1384,6 @@ struct hostapd_config {
+ #define DEFAULT_MU_OPERATION	1
+ 	int sMuOperation;
+ 	int override_6g_mbssid_default_mode;
+-	int whm_cfg_flag;	/* WHM configuration bitfields */
+ 	unsigned adv_proto_query_resp_len;	/* Advertisement protocol IE */
+ 
+ 	u8 owl; /* Forwarding incoming probe reqests to upper layers */
+@@ -1395,6 +1394,14 @@ struct hostapd_config {
+ 	/* Extended Capabilities: Max Number of MSDUs in A-MSDU */
+ 	u8 ext_cap_max_num_msdus_in_amsdu;
+ 	u8 psd_20mhz;
++#define DEFAULT_WHM      (0)
++#define WHM_ENABLE       (0)
++#define WHM_HOSTAP_WARN  (1)
++#define WHM_DRV_WARN     (2)
++#define WHM_FW_WARN      (3)
++#define WHM_PHY_WARN     (4)
++	char *whm_config_file;      /* WHM configuration filename */
++	int whm_cfg_flag;           /* WHM configuration bitfields */
+ #ifdef CONFIG_VENDOR_MXL
+ 	struct mxl_hostapd_config mxl_conf;
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index e34ff6879..4393d482f 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -494,6 +494,19 @@ static inline int hostapd_drv_set_whm_config(struct hostapd_data *hapd, int whm_
+ 	return hapd->driver->set_whm_config(hapd->drv_priv, whm_cfg_flag);
+ }
+ 
++static inline int hostapd_drv_set_whm_trigger(struct hostapd_data *hapd, int warning_id)
++{
++	if (hapd->driver == NULL || hapd->driver->set_whm_config == NULL)
++		return -ENOTSUP;
++
++	if (!((hapd->iconf->whm_cfg_flag & BIT(WHM_ENABLE)) && (hapd->iconf->whm_cfg_flag & BIT(WHM_HOSTAP_WARN)))) {
++		wpa_printf(MSG_ERROR, "WHM is disabled - can't handle warning (%d) from Hostapd", warning_id);
++		return -ENOTSUP;
++	}
++
++	return hapd->driver->set_whm_trigger(hapd->drv_priv, warning_id);
++}
++
+ static inline int hostapd_drv_set_mbssid_num_vaps_in_group(struct hostapd_data *hapd,
+ 	const u8 mbssid_num_vaps_in_group)
+ {
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 25982214d..46b31ef6e 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -973,6 +973,20 @@ int hostapd_is_dfs_chan_available(struct hostapd_iface *iface)
+ }
+ 
+ 
++static void hostapd_handle_acs_dfs_failure(struct hostapd_iface *iface)
++{
++	/* WHM to trigger if CH_SWITCH happens in case of RADAR detected.
++	 * and selects a lower bandwidth (< 80MHz)
++	 */
++	int ch_width = mxl_hostapd_get_num_width(hostapd_get_oper_chwidth(iface->conf), iface->conf->secondary_channel);
++	if (ch_width < 80)
++	{
++		wpa_printf(MSG_ERROR, "WHM-ACS: RADAR detcted, Channel Switch to channel %d and width %d ", iface->conf->channel, ch_width);
++		hostapd_handle_acs_whm_warning(iface);
++	}
++}
++
++
+ static int hostapd_dfs_request_channel_switch(struct hostapd_iface *iface,
+ 					      int channel, int freq,
+ 					      int secondary_channel,
+@@ -994,6 +1008,11 @@ static int hostapd_dfs_request_channel_switch(struct hostapd_iface *iface,
+ 	new_vht_oper_chwidth = hostapd_get_oper_chwidth(iface->conf);
+ 	hostapd_set_oper_chwidth(iface->conf, current_vht_oper_chwidth);
+ 
++	/* WHM to trigger if CH_SWITCH happens in case of RADAR detected.
++	 * and selects a lower bandwidth (< 80MHz)
++	 */
++	hostapd_handle_acs_dfs_failure(iface);
++
+ 	/* Setup CSA request */
+ 	os_memset(&csa_settings, 0, sizeof(csa_settings));
+ 	csa_settings.cs_count = 5;
+@@ -1336,6 +1355,12 @@ static int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ 
+ 	mxl_hostapd_channel_switch_reason_set(iface, HAPD_CHAN_SWITCH_RADAR_DETECTED);
+ 	hostapd_setup_interface_complete(iface, err);
++
++	/* WHM to trigger if CH_SWITCH happens in case of RADAR detected.
++	 * and selects a lower bandwidth (< 80MHz)
++	 */
++	hostapd_handle_acs_dfs_failure(iface);
++
+ 	return err;
+ }
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 757f8c543..31ccdd46d 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -2187,6 +2187,12 @@ static int setup_interface(struct hostapd_iface *iface)
+ 	 */
+ 	iface->driver_ap_teardown = 0;
+ 
++	/* WHM: set whm_if_fail initalized to TRUE to consider default disable
++	 * interface call to be treated as failure. Good cases will be marked
++	 * false as needed
++	 */
++	iface->whm_if_fail = true;
++
+ 	if (!iface->phy[0]) {
+ 		const char *phy = hostapd_drv_get_radio_name(hapd);
+ 		if (phy) {
+@@ -4064,6 +4070,15 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 		return -1;
+ 	}
+ 
++	if (hapd_iface->whm_if_fail) {
++		wpa_printf(MSG_WARNING, "WHM-IFDOWN: %s is being disabled,"
++					" Trigger WHM warning id - %d",
++					hapd_iface->bss[0]->conf->iface, WHM_HOSTAP_IFDOWN);
++		hostapd_drv_set_whm_trigger(hapd_iface->bss[0], WHM_HOSTAP_IFDOWN);
++	}
++	/* reset to default value */
++	hapd_iface->whm_if_fail = true;
++
+ 	wpa_msg(hapd_iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_DISABLED);
+ 	driver = hapd_iface->bss[0]->driver;
+ 	drv_priv = hapd_iface->bss[0]->drv_priv;
+@@ -5454,3 +5469,8 @@ int hostapd_get_psd_val(struct hostapd_iface *iface, u8 *val)
+ 	*val = (u8) psd;
+ 	return 0;
+ }
++
++void hostapd_handle_acs_whm_warning (struct hostapd_iface *iface)
++{
++	hostapd_drv_set_whm_trigger(iface->bss[0], WHM_HOSTAP_ACS_FAILURE);
++}
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index aaf458616..e4487be78 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -724,6 +724,8 @@ struct hostapd_iface {
+ 
+ 	int set_freq_done;
+ 	int block_tx; /* Is TX block on or off */
++
++	bool whm_if_fail;
+ };
+ 
+ /* hostapd.c */
+@@ -864,4 +866,6 @@ int hostapd_link_remove(struct hostapd_data *hapd, u32 count);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ void hostapd_tx_queue_params(struct hostapd_data *hapd);
++void hostapd_handle_acs_whm_warning (struct hostapd_iface *iface);
++
+ #endif /* HOSTAPD_H */
+diff --git a/src/ap/mxl_zwdfs.c b/src/ap/mxl_zwdfs.c
+index 97d3d46c9..3ba0d206d 100644
+--- a/src/ap/mxl_zwdfs.c
++++ b/src/ap/mxl_zwdfs.c
+@@ -261,6 +261,7 @@ int mxl_hostapd_set_zwdfs_antenna(struct hostapd_data *hapd, int enable)
+ 	iface->mxl_iface.failsafe.bandwidth = 20;
+ 
+ 	if (needs_restart) {
++		iface->whm_if_fail = false;
+ 		hostapd_disable_iface(iface);
+ 	}
+ 	else
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index e35569dd9..c158892c8 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -657,4 +657,34 @@ struct intel_vendor_unconnected_sta {
+   u16 rate;
+ } __attribute__ ((packed));
+ 
++/* Data for WHM warningID */
++typedef enum {
++  WHM_DRV_MAC_FATAL = 1,
++  WHM_DRV_STA_DISCONNECT,
++  WHM_DRV_TX_STALL,
++  WHM_DRV_RX_STALL,
++  /* Add new driver warnings here */
++  WHM_HOSTAP_SAMPLE = 51,
++  WHM_HOSTAP_ACS_FAILURE,
++  WHM_HOSTAP_IFDOWN,
++  /* Add new hostap warnings here */
++  WHM_WARNING_TRIGGER_BY_IW = 101,
++  WHM_IW_IFDOWN
++  /* Add new IW warnings here */
++}whm_warning_id;
++
++typedef enum {
++  WHM_HOSTAPD_TRIGGER = 1,
++  WHM_DRIVER_TRIGGER,
++  WHM_FW_TRIGGER,
++  WHM_IW_TRIGGER,
++  WHM_PHY_TRIGGER
++}whm_warning_layer;
++
++struct intel_vendor_whm_event_cfg {
++  whm_warning_id    warning_id;
++  whm_warning_layer warning_layer;
++  u32               num_cards;
++} __attribute__ ((packed));
++
+ #endif /* _VENDOR_CMDS_H_ */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 0db388182..a0795b588 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5274,6 +5274,14 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*set_whm_config)(void *priv, int whm_cfg_flag);
+ 
++	/**
++	 * set_whm_trigger - Trigger whm to collect the debug info
++	 * @priv: Private driver interface data
++	 * @whm_cfg_flag : whm config
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int (*set_whm_trigger)(void *priv, int whm_cfg_flag);
++
+ 	/**
+ 	 * get_tx_power_20mhz - get tx power for 20mhz bandwidth
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index fc4dc9618..00ff6e5e5 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14211,6 +14211,22 @@ int nl80211_set_whm_config(void *priv, int whm_cfg_flag)
+ 	return ret;
+ }
+ 
++int nl80211_set_whm_trigger(void *priv, int whm_warning_id)
++{
++	int ret;
++	int whm_trigger_cfg[] = {whm_warning_id, WHM_HOSTAPD_TRIGGER};
++
++	ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++				 LTQ_NL80211_VENDOR_SUBCMD_SET_WHM_TRIGGER,
++				 (u8 *) whm_trigger_cfg, sizeof(whm_trigger_cfg),
++				 NESTED_ATTR_NOT_USED, NULL);
++	if (ret < 0)
++		wpa_printf(MSG_ERROR,
++			   "nl80211: SET_WHM_TRIGGER CMD failed: %i (%s)",
++			   ret, strerror(-ret));
++	return ret;
++}
++
+ static int nl80211_unconnected_sta(void *priv, struct intel_vendor_unconnected_sta_req_cfg *req)
+ {
+ 	int res = 0;
+@@ -14469,6 +14485,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.get_sta_mlo_info = nl80211_get_sta_mlo_info,
+ 	.link_add = nl80211_link_add,
+ 	.set_whm_config = nl80211_set_whm_config,
++	.set_whm_trigger = nl80211_set_whm_trigger,
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	.register_frame = testing_nl80211_register_frame,
+ 	.radio_disable = testing_nl80211_radio_disable,
+-- 
+2.43.0
+

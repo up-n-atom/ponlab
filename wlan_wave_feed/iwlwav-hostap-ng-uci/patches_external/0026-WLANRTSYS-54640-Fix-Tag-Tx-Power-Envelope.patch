@@ -1,0 +1,376 @@
+From 6e3efb15f69af8269cafb0fc897dd3c772cfa7f1 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Tue, 25 Apr 2023 15:38:28 +0200
+Subject: [PATCH] WLANRTSYS-54640: Fix Tag: Tx Power Envelope
+
+---
+ hostapd/Makefile        |   1 +
+ src/ap/beacon.c         |  23 ++++
+ src/ap/mxl_ieee802_11.c | 250 ++++++++++++++++++++++++++++++++++++++++
+ src/ap/mxl_ieee802_11.h |  21 ++++
+ 4 files changed, 295 insertions(+)
+ create mode 100644 src/ap/mxl_ieee802_11.c
+ create mode 100644 src/ap/mxl_ieee802_11.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 944e399ae..455d3a9b9 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -372,6 +372,7 @@ OBJS += ../src/ap/mxl_dfs_file.o
+ OBJS += ../src/ap/mxl_zwdfs.o
+ OBJS += ../src/ap/mxl_softblock.o
+ OBJS += ../src/ap/mxl_rrm.o
++OBJS += ../src/ap/mxl_ieee802_11.o
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index b5022b07e..ce7faa33c 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -34,6 +34,9 @@
+ #include "taxonomy.h"
+ #include "ieee802_11_auth.h"
+ 
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_ieee802_11.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #ifdef NEED_AP_MLME
+ 
+@@ -825,14 +828,24 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 	    !is_6ghz_op_class(hapd->iconf->op_class)) {
+ 		pos = hostapd_eid_vht_capabilities(hapd, pos, 0);
+ 		pos = hostapd_eid_vht_operation(hapd, pos);
++#ifndef CONFIG_VENDOR_MXL
+ 		pos = hostapd_eid_txpower_envelope(hapd, pos);
++#endif /* CONFIG_VENDOR_MXL */
+ 	}
++#ifdef CONFIG_VENDOR_MXL
++	if (hapd->iconf->ieee80211ac && !hapd->conf->disable_11ac)
++		pos = hostapd_eid_txpower_envelope_vendor_mxl(hapd, pos);
++#endif /* CONFIG_VENDOR_MXL */
+ #endif /* CONFIG_IEEE80211AC */
+ 
+ #ifdef CONFIG_IEEE80211AX
+ 	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax &&
+ 	    is_6ghz_op_class(hapd->iconf->op_class))
++#ifndef CONFIG_VENDOR_MXL
+ 		pos = hostapd_eid_txpower_envelope(hapd, pos);
++#else /* CONFIG_VENDOR_MXL */
++		pos = hostapd_eid_txpower_envelope_vendor_mxl(hapd, pos);
++#endif /* CONFIG_VENDOR_MXL */
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	pos = hostapd_eid_wb_chsw_wrapper(hapd, pos);
+@@ -2409,14 +2422,24 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	    !is_6ghz_op_class(hapd->iconf->op_class)) {
+ 		tailpos = hostapd_eid_vht_capabilities(hapd, tailpos, 0);
+ 		tailpos = hostapd_eid_vht_operation(hapd, tailpos);
++#ifndef CONFIG_VENDOR_MXL
+ 		tailpos = hostapd_eid_txpower_envelope(hapd, tailpos);
++#endif /* CONFIG_VENDOR_MXL */
+ 	}
++#ifdef CONFIG_VENDOR_MXL
++	if (hapd->iconf->ieee80211ac && !hapd->conf->disable_11ac)
++		tailpos = hostapd_eid_txpower_envelope_vendor_mxl(hapd, tailpos);
++#endif /* CONFIG_VENDOR_MXL */
+ #endif /* CONFIG_IEEE80211AC */
+ 
+ #ifdef CONFIG_IEEE80211AX
+ 	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax &&
+ 	    is_6ghz_op_class(hapd->iconf->op_class))
++#ifndef CONFIG_VENDOR_MXL
+ 		tailpos = hostapd_eid_txpower_envelope(hapd, tailpos);
++#else /* CONFIG_VENDOR_MXL */
++		tailpos = hostapd_eid_txpower_envelope_vendor_mxl(hapd, tailpos);
++#endif /* CONFIG_VENDOR_MXL */
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	tailpos = hostapd_eid_wb_chsw_wrapper(hapd, tailpos);
+diff --git a/src/ap/mxl_ieee802_11.c b/src/ap/mxl_ieee802_11.c
+new file mode 100644
+index 000000000..36fdeb6c4
+--- /dev/null
++++ b/src/ap/mxl_ieee802_11.c
+@@ -0,0 +1,250 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include <math.h>
++#include "utils/includes.h"
++
++#ifndef CONFIG_NATIVE_WINDOWS
++
++#include "utils/common.h"
++#include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
++#include "hostapd.h"
++#include "ap_config.h"
++#include "sta_info.h"
++#include "beacon.h"
++#include "ieee802_11.h"
++#include "dfs.h"
++
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_hostapd.h"
++#include "mxl_coexistence.h"
++#include "mxl_ieee802_11.h"
++#endif /* CONFIG_VENDOR_MXL */
++
++u8 * hostapd_eid_txpower_envelope_vendor_mxl_6g(struct hostapd_data *hapd, u8 *eid, bool only_one_psd_limit)
++{
++#define MAX_TX_POWER_PSD_MIN_NUM_OCTETS         1
++#define MAX_TRANSMIT_PWR_INTERPRET_REG_EIRP_PSD 3
++#define MAX_TRANSMIT_PWR_INTERPRET_OFFSET       3
++#define MAX_TX_PWR_MINUS_ONE_DBM_MHZ            0xFE
++#define MAX_TX_PWR_CLIENT_SP_DBM_MHZ_LIMIT      0x22
++#define MAX_TX_PWR_LPI_CLIENT_FIVE_DBM_MHZ      10
++#define MAX_TRANSMIT_PWR_CATEGORY_SUB_ORDINATE_DEVICE  1
++#define MAX_TRANSMIT_PWR_CATEGORY_OFFSET        6
++/* Below will transform eirp 1 dBM into PSD with units of 1 dBm/MHz */
++#define MAX_TRANSMIT_EIRP_TO_PSD(eirp, bw) ((eirp) - (10.0 * log10(bw)))
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	int width, chan_idx = 0;
++	int max_power = 0xFF;
++	float max_client_psd = 0.0;
++	int current_freq, center_freq = 0;
++	int i = 0;
++
++	if (!only_one_psd_limit) {
++		/*
++		 * TODO: To compute PSD values based on the BW configured and advertise multiple PSD,
++		 *       one for each of the 20MHz channels contained within the configured BW
++		 */
++		return eid;
++	}
++
++	if (hapd->iface->conf->he_6ghz_reg_pwr_type == HE_6GHZ_INDOOR_AP) {
++		*eid++ = WLAN_EID_TRANSMIT_POWER_ENVELOPE;
++		*eid++ = 1 + MAX_TX_POWER_PSD_MIN_NUM_OCTETS;
++		*eid++ = (MAX_TRANSMIT_PWR_INTERPRET_REG_EIRP_PSD << MAX_TRANSMIT_PWR_INTERPRET_OFFSET);
++		/* -1.0 dBM is 0xFE in two’s compliment */
++		*eid++ = MAX_TX_PWR_MINUS_ONE_DBM_MHZ;
++
++		/* TPE for Subordinate Device power category */
++		/* One Max Transmit PSD for a PPDU of any BW */
++		*eid++ = WLAN_EID_TRANSMIT_POWER_ENVELOPE;
++		*eid++ = 1 + MAX_TX_POWER_PSD_MIN_NUM_OCTETS;
++		*eid++ = (MAX_TRANSMIT_PWR_INTERPRET_REG_EIRP_PSD << MAX_TRANSMIT_PWR_INTERPRET_OFFSET) |
++		(MAX_TRANSMIT_PWR_CATEGORY_SUB_ORDINATE_DEVICE << MAX_TRANSMIT_PWR_CATEGORY_OFFSET);
++		/* 5.0 dBm/MHz in units of 0.5 dBm/MHz */
++		*eid++ = MAX_TX_PWR_LPI_CLIENT_FIVE_DBM_MHZ;
++	}
++
++
++	if (hapd->iface->conf->he_6ghz_reg_pwr_type == HE_6GHZ_STANDARD_POWER_AP) {
++		width = op_class_to_bandwidth(hapd->iface->conf->op_class);
++		switch (width) {
++			case 20:
++			case 40:
++			case 80:
++				chan_idx = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
++				break;
++			case 160:
++			case 320:
++				chan_idx = hostapd_get_oper_centr_freq_seg1_idx(iface->conf);
++				break;
++			default:
++				wpa_printf(MSG_ERROR, "TPE: wrong or unsupported channel width %d", width);
++				return eid;
++		}
++		center_freq = hostapd_chan_to_freq(chan_idx, true);
++		//search for matching channel
++		for (current_freq =  center_freq - (width / 2) + 10;
++				current_freq <= center_freq + (width / 2) - 10;
++				current_freq += 20) {
++			for (i = 0; i < mode->num_channels; i++) {
++				if (mode->channels[i].freq == current_freq) {
++					if(mode->channels[i].max_tx_power < max_power) {
++						max_power = mode->channels[i].max_tx_power;
++						break;
++					}
++				}
++			}
++		}
++
++		*eid++ = WLAN_EID_TRANSMIT_POWER_ENVELOPE;
++		*eid++ = 1 + MAX_TX_POWER_PSD_MIN_NUM_OCTETS;
++		*eid++ = (MAX_TRANSMIT_PWR_INTERPRET_REG_EIRP_PSD << MAX_TRANSMIT_PWR_INTERPRET_OFFSET);
++
++		/* -1.0 dBM is 0xFE in two’s compliment */
++		if (max_power == 0xFF)
++			*eid++ = MAX_TX_PWR_MINUS_ONE_DBM_MHZ;
++		else {
++			/* Client's TX limit is -6dBm EIRP from AP's TX limit and is set in units of 0.5 dBm/MHz */
++			/* Current implementation works with lowest 20MHz channel, hence the fixed 20.0 below    */
++			max_client_psd = 2.0 * MAX_TRANSMIT_EIRP_TO_PSD((max_power - 6.0), 20.0);
++			max_client_psd = (max_client_psd > MAX_TX_PWR_CLIENT_SP_DBM_MHZ_LIMIT) ? MAX_TX_PWR_CLIENT_SP_DBM_MHZ_LIMIT : max_client_psd;
++			*eid++ = (int)max_client_psd;
++		}
++	}
++
++	return eid;
++}
++
++static u8 * hostapd_add_tpe_info_mxl(u8 *eid, u8 tx_pwr_count,
++			 enum max_tx_pwr_interpretation tx_pwr_intrpn,
++			 u8 tx_pwr_cat, u8 tx_pwr)
++{
++	int i;
++
++	*eid++ = WLAN_EID_TRANSMIT_POWER_ENVELOPE; /* Element ID */
++	*eid++ = 2 + tx_pwr_count; /* Length */
++
++	/*
++	* Transmit Power Information field
++	* bits 0-2 : Maximum Transmit Power Count
++	* bits 3-5 : Maximum Transmit Power Interpretation
++	* bits 6-7 : Maximum Transmit Power Category
++	*/
++	*eid++ = tx_pwr_count | (tx_pwr_intrpn << 3) | (tx_pwr_cat << 6);
++
++	/* Maximum Transmit Power field */
++	for (i = 0; i <= tx_pwr_count; i++)
++		*eid++ = tx_pwr;
++
++	return eid;
++}
++
++u8 * hostapd_eid_txpower_envelope_vendor_mxl(struct hostapd_data *hapd, u8 *eid)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_config *iconf = iface->conf;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct hostapd_channel_data *chan;
++	int dfs, i;
++	u8 channel, tx_pwr_count, local_pwr_constraint;
++	int max_tx_power;
++	u8 tx_pwr;
++	bool only_one_psd_limit_in_6g = true;
++
++	if (!mode)
++		return eid;
++
++	if (ieee80211_freq_to_chan(iface->freq, &channel) == NUM_HOSTAPD_MODES)
++		return eid;
++
++	for (i = 0; i < mode->num_channels; i++) {
++		if (mode->channels[i].freq == iface->freq)
++		 break;
++	}
++	if (i == mode->num_channels)
++		return eid;
++
++	if (is_6ghz_op_class(iface->conf->op_class))
++		return hostapd_eid_txpower_envelope_vendor_mxl_6g(hapd, eid, only_one_psd_limit_in_6g);
++
++	tx_pwr_count = 0;
++	switch (hostapd_get_oper_chwidth(iconf)) {
++	case CONF_OPER_CHWIDTH_USE_HT:
++		/* Max Transmit Power count = 0 (20 MHz) */
++		/* Max Transmit Power count = 1 (20, 40 MHz) */
++		tx_pwr_count = (iconf->secondary_channel ? 1 : 0);
++		break;
++	case CONF_OPER_CHWIDTH_80MHZ:
++		/* Max Transmit Power count = 2 (20, 40, and 80 MHz) */
++		tx_pwr_count = 2;
++		break;
++	case CONF_OPER_CHWIDTH_80P80MHZ:
++	case CONF_OPER_CHWIDTH_160MHZ:
++		/* Max Transmit Power count = 3 (20, 40, 80, 160/80+80 MHz) */
++		tx_pwr_count = 3;
++		break;
++	default:
++		return eid;
++	}
++
++	/*
++	* Below local_pwr_constraint logic is referred from
++	* hostapd_eid_pwr_constraint.
++	*
++	* Check if DFS is required by regulatory.
++	*/
++	dfs = hostapd_is_dfs_required(hapd->iface);
++	if (dfs < 0)
++		dfs = 0;
++
++	if (hapd->iconf->local_pwr_constraint == -1)
++		local_pwr_constraint = (dfs == 0) ? 0 : 3;
++	else
++		local_pwr_constraint = hapd->iconf->local_pwr_constraint;
++
++	/*
++	* A STA that is not an AP shall use a transmit power less than or
++	* equal to the local maximum transmit power level for the channel.
++	* The local maximum transmit power can be calculated from the formula:
++	* local max TX pwr = max TX pwr - local pwr constraint
++	* Where max TX pwr is maximum transmit power level specified for
++	* channel in Country element and local pwr constraint is specified
++	* for channel in this Power Constraint element.
++	*/
++	chan = &mode->channels[i];
++	max_tx_power = chan->max_tx_power - local_pwr_constraint;
++
++	/*
++	* Local Maximum Transmit power is encoded as two's complement
++	* with a 0.5 dB step.
++	*/
++	max_tx_power *= 2; /* in 0.5 dB steps */
++	if (max_tx_power > 127) {
++		/* 63.5 has special meaning of 63.5 dBm or higher */
++		max_tx_power = 127;
++	}
++	if (max_tx_power < -128)
++		max_tx_power = -128;
++	if (max_tx_power < 0)
++		tx_pwr = 0x80 + max_tx_power + 128;
++	else
++		tx_pwr = max_tx_power;
++
++	return hostapd_add_tpe_info_mxl(eid, tx_pwr_count, LOCAL_EIRP,
++				REG_DEFAULT_CLIENT,
++				tx_pwr);
++}
++#endif /* CONFIG_NATIVE_WINDOWS */
+diff --git a/src/ap/mxl_ieee802_11.h b/src/ap/mxl_ieee802_11.h
+new file mode 100644
+index 000000000..52061d417
+--- /dev/null
++++ b/src/ap/mxl_ieee802_11.h
+@@ -0,0 +1,21 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_IEEE802_11_H
++#define MXL_IEEE802_11_H
++
++struct hostapd_data;
++
++u8 * hostapd_eid_txpower_envelope_vendor_mxl_6g(struct hostapd_data *hapd, u8 *eid, bool only_one_psd_limit);
++u8 * hostapd_eid_txpower_envelope_vendor_mxl(struct hostapd_data *hapd, u8 *eid);
++#endif /* MXL_IEEE802_11_H */
+-- 
+2.43.0
+

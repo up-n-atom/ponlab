@@ -1,0 +1,2285 @@
+From 1cebb11c111eee3c6588902db28ecc5ccfe0c02a Mon Sep 17 00:00:00 2001
+From: Alexander Grishchenko <agrishchenko@maxlinear.com>
+Date: Thu, 25 Apr 2024 15:30:41 +0300
+Subject: [PATCH] WLANRTSYS-62198 Multi-AP: Enhance hostapd with proprietary
+ MXL support
+
+This commit introduces several enhancements to hostapd's multi-AP capabilities:
+
+- Add VLAN tagging support for EAPOL frames on multi-AP backhaul STAs
+- Implement legacy multi-AP support for Intel and Broadcom 4-address mode
+- Enhance multi-AP profile handling and association control
+- Add CSA (Channel Switch Announcement) handling for multi-AP scenarios
+- Extend multi-AP IE parsing and handling
+- Introduce new CLI commands for multi-AP configuration
+- Modify association and authentication logic for multi-AP specifics
+- Update driver interface to support new multi-AP features
+
+These changes provide more comprehensive support for multi-AP topologies,
+focusing on backhaul links, VLAN separation, and legacy compatibility.
+The enhancements extend standard multi-AP capabilities with proprietary
+features while maintaining backwards compatibility.
+
+Signed-off-by: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+---
+ hostapd/Makefile                   |   1 +
+ hostapd/config_file.c              |   8 +
+ hostapd/mxl_config.c               |  67 +++++-
+ hostapd/mxl_ctrl_iface.c           | 160 ++++++++++++++
+ hostapd/mxl_hostapd_cli.c          | 104 +++++++++
+ hostapd/mxl_hostapd_cli.h          |  28 +++
+ src/ap/ap_config.c                 |   6 +-
+ src/ap/drv_callbacks.c             |  12 +-
+ src/ap/hostapd.c                   |   6 +-
+ src/ap/ieee802_11.c                |  68 ++++++
+ src/ap/mxl_config.h                |   9 +
+ src/ap/mxl_csa.c                   | 342 +++++++++++++++++++++++++++++
+ src/ap/mxl_csa.h                   |  23 ++
+ src/ap/mxl_drv_callbacks.c         |  32 +++
+ src/ap/mxl_drv_callbacks.h         |   7 +
+ src/ap/mxl_hostapd.c               |  18 ++
+ src/ap/mxl_hostapd.h               |   2 +
+ src/ap/mxl_ieee802_11.c            |  95 ++++++++
+ src/ap/mxl_ieee802_11.h            |   9 +
+ src/ap/mxl_softblock.h             |   3 +
+ src/ap/mxl_sta_info.h              |   5 +
+ src/ap/sta_info.c                  |  28 ++-
+ src/ap/wpa_auth_glue.c             |   4 +
+ src/common/ieee802_11_common.c     |  39 ++++
+ src/common/ieee802_11_common.h     |  11 +
+ src/common/ieee802_11_defs.h       |  15 +-
+ src/common/mxl_ieee802_11_common.c |  27 +++
+ src/common/mxl_ieee802_11_common.h |   1 +
+ src/common/mxl_ieee802_11_defs.h   |  36 +++
+ src/drivers/driver.h               |  22 ++
+ src/drivers/driver_nl80211.c       |  21 ++
+ src/drivers/driver_nl80211_event.c |   8 +
+ src/drivers/mxl_driver.h           |   2 +
+ wpa_supplicant/config_ssid.h       |   7 +
+ wpa_supplicant/ctrl_iface.c        |  17 ++
+ wpa_supplicant/events.c            |  18 ++
+ wpa_supplicant/mxl_config_ssid.h   |  21 ++
+ wpa_supplicant/mxl_events.c        |  46 ++++
+ wpa_supplicant/mxl_supplicant.c    |  73 +++++-
+ wpa_supplicant/mxl_supplicant.h    |   5 +
+ wpa_supplicant/wpas_glue.c         |   8 +
+ 41 files changed, 1407 insertions(+), 7 deletions(-)
+ create mode 100644 src/ap/mxl_csa.c
+ create mode 100644 src/ap/mxl_csa.h
+ create mode 100644 wpa_supplicant/mxl_config_ssid.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index b2c8780fd..bea6b4104 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -408,6 +408,7 @@ OBJS += ../src/ap/mxl_drv_callbacks.o
+ OBJS += ../src/ap/mxl_sta_info.o
+ OBJS += ../src/ap/mxl_utils.o
+ OBJS += ../src/ap/mxl_wmm.o
++OBJS += ../src/ap/mxl_csa.o
+ ifdef CONFIG_AFC
+ OBJS += ../src/ap/mxl_afc.o
+ endif
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 27ecc5e18..6ad76f577 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -925,6 +925,14 @@ static int hostapd_fill_intlist(int *int_list, char *val, int exp_count)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_VENDOR_MXL
++/* Wrapper for static function so that it can be accessed in MXL code */
++int mxl_hostapd_parse_intlist(int **int_list, char *val) { return hostapd_parse_intlist(int_list, val); }
++static int parse_wpabuf_hex(int line, const char *name, struct wpabuf **buf, const char *val);
++int mxl_parse_wpabuf_hex(int line, const char *name, struct wpabuf **buf, const char *val)
++{ return parse_wpabuf_hex(line, name, buf, val); }
++#endif /* CONFIG_VENDOR_MXL */
++
+ static int hostapd_config_bss(struct hostapd_config *conf, const char *ifname)
+ {
+ 	struct hostapd_bss_config **all, *bss;
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 43df5d6a1..8473f73b7 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -1927,6 +1927,60 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 		}
+ 		mxl_bss_conf->disable_beacon_prot = val;
+ #endif /* CONFIG_IEEE80211BE */
++	} else if (os_strcmp(buf, "multi_ap_primary_vlanid") == 0) {
++		/* Only for compatibility with existings scripts. Same as "multi_ap_vlanid" parameter */
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, 0, MAX_VLAN_ID)) {
++			wpa_printf(MSG_ERROR, "Line %d: Invalid multi_ap_primary_vlanid '%s'",
++					line, buf);
++			return 0;
++		}
++		bss->multi_ap_vlanid = val;
++	} else if (os_strcmp(buf, "multi_ap_profile1_disallow") == 0) {
++		/* Only for compatibility with existings scripts */
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: Invalid multi_ap_profile1_disallow '%s'",
++					line, buf);
++			return 0;
++		}
++		if (val)
++			bss->multi_ap_client_disallow |= PROFILE1_CLIENT_ASSOC_DISALLOW;
++		else
++			bss->multi_ap_client_disallow &= ~PROFILE1_CLIENT_ASSOC_DISALLOW;
++	} else if (os_strcmp(buf, "multi_ap_profile2_disallow") == 0) {
++		/* Only for compatibility with existings scripts */
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: Invalid multi_ap_profile2_disallow '%s'",
++					line, buf);
++			return 0;
++		}
++		if (val)
++			bss->multi_ap_client_disallow |= PROFILE2_CLIENT_ASSOC_DISALLOW;
++		else
++			bss->multi_ap_client_disallow &= ~PROFILE2_CLIENT_ASSOC_DISALLOW;
++	} else if (os_strcmp(buf, "ul_csa") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid owl %d",
++					line, val);
++			return 0;
++		}
++		mxl_bss_conf->ul_csa = val;
++	} else if (os_strcmp(buf, "authresp_elements") == 0) {
++		if (mxl_parse_wpabuf_hex(line, buf, &mxl_bss_conf->authresp_elements, pos))
++			return 0;
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	} else if (os_strcmp(buf, "vendor_4addr") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid vendor_4addr %d",
++					line, val);
++			return 0;
++		}
++		mxl_bss_conf->vendor_4addr = val;
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
+ 	} else
+ 		return 0;
+ 
+@@ -2042,7 +2096,7 @@ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss)
+ {
+ 	struct mxl_hostapd_bss_config *mxl_bss_conf = &bss->mxl_bss_conf;
+ 	mxl_hostapd_soft_block_acl_clear_list(&mxl_bss_conf->deny_mac_sb);
+-	(void)mxl_bss_conf;
++	wpabuf_free(mxl_bss_conf->authresp_elements);
+ }
+ 
+ void mxl_hostapd_config_free(struct hostapd_config *conf)
+@@ -2101,5 +2155,16 @@ int mxl_hostapd_config_check_bss(struct hostapd_bss_config *bss, struct hostapd_
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
++
++	if (full_config && (bss->multi_ap == BACKHAUL_BSS)) {
++		wpa_printf(MSG_INFO, "WPS: backhaul BSS mode forced WPS to be disabled");
++		bss->wps_state = 0;
++	}
++
++	if (full_config && bss->multi_ap_client_disallow && !(bss->multi_ap & BACKHAUL_BSS)) {
++		wpa_printf(MSG_ERROR, "Invalid multi AP configuration. Can only disallow a Multi-AP profile for a backhaul AP.");
++		return -1;
++	}
++
+ 	return 0;
+ }
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index ddeb5776e..b8c773229 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -89,6 +89,143 @@ static int mxl_hostapd_ctrl_iface_send_afcd_request(struct hostapd_iface *iface,
+ }
+ #endif /* CONFIG_AFC */
+ 
++enum elem_type_e {
++	VENDOR_ELEM_TYPE,
++	AUTHRESP_ELEM_TYPE,
++	ASSOCRESP_ELEM_TYPE,
++	LAST_ELEM_TYPE
++};
++
++struct elem_type_item_t {
++	const char *param_name_prefix;
++	const char *cmd_prefix;
++};
++
++static const struct elem_type_item_t elem_types[LAST_ELEM_TYPE] = {
++	{ "vendor", "VENDOR" },
++	{ "authresp", "AUTHRESP" },
++	{ "assocresp", "ASSOCRESP" }
++};
++
++static int mxl_hostapd_ctrl_iface_get_elements (struct hostapd_data *hapd, const char *cmd,
++	char *buf, size_t buflen, enum elem_type_e elem_type)
++{
++	int ret, len = 0;
++	struct wpabuf *elements;
++
++	if (elem_type >= LAST_ELEM_TYPE)
++		return 0;
++
++	hapd = mxl_get_bss_index(&cmd, hapd, true, false);
++	if (hapd == NULL) {
++		ret = sprintf_s(buf, buflen, "CTRL: GET_%s_ELEMENTS - there is no iface with the given name\n",
++			elem_types[elem_type].cmd_prefix);
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	switch (elem_type) {
++		case VENDOR_ELEM_TYPE:    elements = hapd->conf->vendor_elements;    break;
++		case AUTHRESP_ELEM_TYPE:  elements = hapd->conf->mxl_bss_conf.authresp_elements;  break;
++		case ASSOCRESP_ELEM_TYPE: elements = hapd->conf->assocresp_elements; break;
++		default: return 0;
++	}
++
++	ret = sprintf_s(buf + len, buflen - len, "%s_elements=", elem_types[elem_type].param_name_prefix);
++	if (ret <= 0)
++		return len;
++	len += ret;
++
++	if (elements) {
++		ret = wpa_snprintf_hex_uppercase(buf + len, buflen - len,
++			wpabuf_head_u8(elements), wpabuf_len(elements));
++		if (os_snprintf_error(buflen - len, ret))
++			return len;
++		len += ret;
++	}
++
++	ret = sprintf_s(buf + len, buflen - len, "\n");
++	if (ret <= 0)
++		return len;
++	len += ret;
++
++	return len;
++}
++
++static int mxl_hostapd_ctrl_iface_set_elements (struct hostapd_data *hapd, const char *cmd, enum elem_type_e elem_type)
++{
++	struct wpabuf *new_elements;
++	struct wpabuf **p_elements;
++
++	if (elem_type >= LAST_ELEM_TYPE)
++		return -1;
++
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
++	if (NULL == hapd) {
++		wpa_printf(MSG_INFO, "CTRL: %s_ELEMENTS - there is no iface with the given name",
++			elem_types[elem_type].cmd_prefix);
++		return -1;
++	}
++
++	switch (elem_type) {
++		case VENDOR_ELEM_TYPE:    p_elements = &hapd->conf->vendor_elements;    break;
++		case AUTHRESP_ELEM_TYPE:  p_elements = &hapd->conf->mxl_bss_conf.authresp_elements;  break;
++		case ASSOCRESP_ELEM_TYPE: p_elements = &hapd->conf->assocresp_elements; break;
++		default: return -1;
++	}
++
++	if (!cmd) {
++		/* No elements specified */
++		wpabuf_free(*p_elements);
++		*p_elements = NULL;
++		/* remove Beacon/Probe resp IE */
++		if (elem_type == VENDOR_ELEM_TYPE)
++			if (ieee802_11_update_beacon(hapd))
++				return -1;
++		return 0;
++	}
++
++	new_elements = wpabuf_parse_bin(cmd);
++	if (!new_elements) {
++		wpa_printf(MSG_ERROR, "Invalid hex line '%s'", cmd);
++		return -1;
++	}
++	wpabuf_free(*p_elements);
++	*p_elements = new_elements;
++
++	/* update Beacon/Probe resp IE only */
++	if (elem_type == VENDOR_ELEM_TYPE)
++		if (ieee802_11_update_beacon(hapd))
++			return -1;
++
++	return 0;
++}
++
++static int mxl_hostapd_ctrl_iface_get_blacklist(struct hostapd_iface *iface,
++	char *buf, size_t buflen)
++{
++	int ret = 0, len = 0, i;
++
++	for (i = 0; i < iface->num_bss; i++) {
++		struct hostapd_data *bss = iface->bss[i];
++
++		ret = sprintf_s(buf + len, buflen - len, "%s\n", bss->conf->iface);
++		if (ret <= 0)
++			break;
++		len += ret;
++
++		ret = mxl_ieee802_11_multi_ap_blacklist_print(bss, buf + len, buflen - len);
++		if (os_snprintf_error(buflen - len, ret))
++			break;
++		len += ret;
++	}
++
++	return len;
++}
++
+ #ifdef CONFIG_EPCS_MXL
+ static int mxl_hostapd_ctrl_iface_send_epcs_req_frame(struct hostapd_data *hapd,
+ 				const char *cmd)
+@@ -3107,6 +3244,8 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			*reply_len = -1;
+ 	} else if (os_strncmp(buf, "GET_STA_SOFTBLOCK ", 18) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_sta_softblock(hapd, buf + 18, reply, reply_size);
++	} else if (os_strncmp(buf, "GET_BLACKLIST", 13) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_blacklist(hapd->iface, reply, reply_size);
+ 	} else if (os_strncmp(buf, "GET_POWER_MODE", 14) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_power_mode(hapd->iface, reply, reply_size);
+ 	} else if (os_strncmp(buf, "SET_POWER_MODE", 14) == 0) {
+@@ -3135,6 +3274,27 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (mxl_hostapd_ctrl_iface_send_epcs_req_frame(hapd, buf + sizeof("SEND_EPCS_REQ_FRAME ") - 1))
+ 			*reply_len = -1;
+ #endif /* CONFIG_EPCS_MXL */
++	} else if (os_strncmp(buf, "GET_VENDOR_ELEMENTS ", sizeof("GET_VENDOR_ELEMENTS ") - 1) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_elements(hapd,
++				buf + sizeof("GET_VENDOR_ELEMENTS ") - 1, reply, reply_size,
++				VENDOR_ELEM_TYPE);
++	} else if (os_strncmp(buf, "VENDOR_ELEMENTS ", sizeof("VENDOR_ELEMENTS ") - 1) == 0) {
++		if (mxl_hostapd_ctrl_iface_set_elements(hapd, buf + sizeof("VENDOR_ELEMENTS ") - 1, VENDOR_ELEM_TYPE))
++			*reply_len = -1;
++	} else if (os_strncmp(buf, "GET_AUTHRESP_ELEMENTS ", sizeof("GET_AUTHRESP_ELEMENTS ") - 1) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_elements(hapd,
++				buf + sizeof("GET_AUTHRESP_ELEMENTS ") - 1, reply, reply_size,
++				AUTHRESP_ELEM_TYPE);
++	} else if (os_strncmp(buf, "AUTHRESP_ELEMENTS ", sizeof("AUTHRESP_ELEMENTS ") - 1) == 0) {
++		if (mxl_hostapd_ctrl_iface_set_elements(hapd, buf + sizeof("AUTHRESP_ELEMENTS ") - 1, AUTHRESP_ELEM_TYPE))
++			*reply_len = -1;
++	} else if (os_strncmp(buf, "GET_ASSOCRESP_ELEMENTS ", sizeof("GET_ASSOCRESP_ELEMENTS ") - 1) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_elements(hapd,
++				buf + sizeof("GET_ASSOCRESP_ELEMENTS ") - 1, reply, reply_size,
++				ASSOCRESP_ELEM_TYPE);
++	} else if (os_strncmp(buf, "ASSOCRESP_ELEMENTS ", sizeof("ASSOCRESP_ELEMENTS ") - 1) == 0) {
++		if (mxl_hostapd_ctrl_iface_set_elements(hapd, buf + sizeof("ASSOCRESP_ELEMENTS ") - 1, ASSOCRESP_ELEM_TYPE))
++			*reply_len = -1;
+ 	} else {
+ 		return 0;
+ 	}
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index fa249a2c9..47873c417 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -12,6 +12,7 @@
+ *******************************************************************************/
+ 
+ #include "includes.h"
++#include "os.h"
+ #include "common/wpa_ctrl.h"
+ #include "mxl_hostapd_cli.h"
+ 
+@@ -450,3 +451,106 @@ int mxl_hostapd_cli_cmd_send_t2lm_teardown_frame(struct wpa_ctrl *ctrl, int argc
+ 	return mxl_hostapd_cli_cmd(ctrl, "SEND_T2LM_TEARDOWN_FRAME", 2, argc, argv);
+ }
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++int mxl_hostapd_cli_cmd_blacklist_get(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	return mxl_wpa_ctrl_command(ctrl, "GET_BLACKLIST");
++}
++
++static int _hostapd_cli_cmd_set_elements(struct wpa_ctrl *ctrl, int argc,
++		char *argv[], const char *cli_cmd_prefix, const char *ctlr_cmd_prefix)
++{
++	char cmd[128]; /* Extra space for HEX strings */
++	int res = 0;
++	int min_argc = 0;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	min_argc = 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	int max_argc = min_argc + 1;
++
++	if ((argc != max_argc) && (argc != min_argc)) {
++		printf("Invalid '%s_elements' command - %d argument(s): "
++				"%s%s elements (optional).\n", cli_cmd_prefix, max_argc,
++				max_argc == 2 ? "BSS name (is required) and " : "", cli_cmd_prefix);
++		return -1;
++	}
++
++	if (argc == min_argc) {
++		res = sprintf_s(cmd, sizeof(cmd), "%s_ELEMENTS %s", ctlr_cmd_prefix,
++				  min_argc == 1 ? argv[0] : "");
++		if (res <= 0) {
++			printf("%s: sprintf_s error %d", __func__, res);
++			return -1;
++		}
++	} else {
++		res = sprintf_s(cmd, sizeof(cmd), "%s_ELEMENTS %s %s", ctlr_cmd_prefix, 
++				  argv[0], max_argc == 2 ? argv[1] : "");
++		if (res <= 0) {
++			printf("%s: sprintf_s error %d", __func__, res);
++			return -1;
++		}
++	}
++	if (os_snprintf_error(sizeof(cmd), res)) {
++		printf("Too long %s_ELEMENTS command.\n", ctlr_cmd_prefix);
++		return -1;
++	}
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
++
++static int _hostapd_cli_cmd_get_elements(struct wpa_ctrl *ctrl, int argc,
++		char *argv[], const char *cli_cmd_prefix, const char *ctlr_cmd_prefix)
++{
++	char cmd[128]; /* Extra space for HEX strings */
++	int res;
++	int argc_num = 0;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++
++	if (argc != argc_num) {
++		printf("Invalid 'get_%s_elements' command%s%s%s\n", cli_cmd_prefix,
++				argc_num == 1 ? ": needs one argument:\n - BSS name for which VAP to get " : "",
++				argc_num == 1 ? cli_cmd_prefix : "" , argc_num == 1 ? "_elements" : "");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "GET_%s_ELEMENTS %s", ctlr_cmd_prefix,
++			  argc_num == 1 ? argv[0] : "");
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
++
++int mxl_hostapd_cli_cmd_set_vendor_elements(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return _hostapd_cli_cmd_set_elements(ctrl, argc, argv, "vendor", "VENDOR");
++}
++
++int mxl_hostapd_cli_cmd_get_vendor_elements(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return _hostapd_cli_cmd_get_elements(ctrl, argc, argv, "vendor", "VENDOR");
++}
++
++int mxl_hostapd_cli_cmd_set_authresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return _hostapd_cli_cmd_set_elements(ctrl, argc, argv, "authresp", "AUTHRESP");
++}
++
++int mxl_hostapd_cli_cmd_get_authresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return _hostapd_cli_cmd_get_elements(ctrl, argc, argv, "authresp", "AUTHRESP");
++}
++
++int mxl_hostapd_cli_cmd_set_assocresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return _hostapd_cli_cmd_set_elements(ctrl, argc, argv, "assocresp", "ASSOCRESP");
++}
++
++int mxl_hostapd_cli_cmd_get_assocresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return _hostapd_cli_cmd_get_elements(ctrl, argc, argv, "assocresp", "ASSOCRESP");
++}
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index 229861060..71732a02f 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -19,6 +19,12 @@ int mxl_hostapd_cli_cmd_accept_macacl(struct wpa_ctrl *ctrl, int argc, char *arg
+ int mxl_hostapd_cli_cmd_deny_macacl(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++#define MXL_CLI_BSS_NAME_PREFIX "<BSS_name> "
++#else
++#define MXL_CLI_BSS_NAME_PREFIX ""
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++
+ #ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ #define MXL_ACCEPT_ACL_DESCR_STR "<BSS_name> <ADD_MAC/DEL_MAC/DIS_MAC/DIS_ALL/SHOW/CLEAR> = accept MAC ACL"
+ #define MXL_DENY_ACL_DESCR_STR "<BSS_name> <ADD_MAC/DEL_MAC/SHOW/CLEAR> = deny MAC ACL"
+@@ -84,6 +90,21 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 	  " = request sta statistics"}, \
+ 	{ "report_sta_statistics", mxl_hostapd_cli_cmd_report_sta_statistics, NULL, \
+ 	  " = report sta statistics" }, \
++	{ "get_blacklist", mxl_hostapd_cli_cmd_blacklist_get, NULL, \
++	  " = print Multi-AP blacklist in the form <address reject_code>" }, \
++	/* Commands below can be either per BSS or per Radio */ \
++	{ "vendor_elements", mxl_hostapd_cli_cmd_set_vendor_elements, NULL, \
++	  MXL_CLI_BSS_NAME_PREFIX "[vendor_elements] = set vendor elements" }, \
++	{ "get_vendor_elements", mxl_hostapd_cli_cmd_get_vendor_elements, NULL, \
++	  MXL_CLI_BSS_NAME_PREFIX "= get vendor elements" }, \
++	{ "authresp_elements", mxl_hostapd_cli_cmd_set_authresp_elements, NULL, \
++	  MXL_CLI_BSS_NAME_PREFIX "[authresp_elements] = set authresp elements" }, \
++	{ "get_authresp_elements", mxl_hostapd_cli_cmd_get_authresp_elements, NULL, \
++	  MXL_CLI_BSS_NAME_PREFIX "= get authresp elements" }, \
++	{ "assocresp_elements", mxl_hostapd_cli_cmd_set_assocresp_elements, NULL, \
++	  MXL_CLI_BSS_NAME_PREFIX "[assocresp_elements] = set assocresp elements" }, \
++	{ "get_assocresp_elements", mxl_hostapd_cli_cmd_get_assocresp_elements, NULL, \
++	  MXL_CLI_BSS_NAME_PREFIX "= get assocresp elements" }, \
+ 
+ #ifdef CONFIG_ACS
+ #define MXL_CLI_COMMANDS_ACS \
+@@ -156,5 +177,12 @@ int mxl_hostapd_cli_cmd_req_noise_histogram(struct wpa_ctrl *ctrl, int argc, cha
+ int mxl_hostapd_cli_cmd_report_noise_histogram(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_req_sta_statistics(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_report_sta_statistics(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_blacklist_get(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_set_vendor_elements(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_vendor_elements(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_set_authresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_authresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_set_assocresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_assocresp_elements(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ 
+ #endif /* MXL_HOSTAPD_CLI_H */
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index b986eb8e6..1303bba6b 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -1071,7 +1071,6 @@ void hostapd_config_free_bss(struct hostapd_bss_config *conf)
+ 
+ 	wpabuf_free(conf->vendor_elements);
+ 	wpabuf_free(conf->assocresp_elements);
+-
+ 	os_free(conf->sae_groups);
+ #ifdef CONFIG_OWE
+ 	os_free(conf->owe_groups);
+@@ -1413,6 +1412,11 @@ static int hostapd_config_check_bss(struct hostapd_bss_config *bss,
+ 				    struct hostapd_config *conf,
+ 				    int full_config)
+ {
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_hostapd_config_check_bss(bss, conf, full_config))
++		return -1;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (full_config && is_6ghz_op_class(conf->op_class) &&
+ 	    !hostapd_config_check_bss_6g(bss))
+ 		return -1;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index eb027d73a..45d3d4150 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1922,7 +1922,7 @@ static int hostapd_event_new_sta(struct hostapd_data *hapd, const u8 *addr)
+ 	return 0;
+ }
+ 
+-
++#ifndef CONFIG_VENDOR_MXL
+ static struct hostapd_data * hostapd_find_by_sta(struct hostapd_iface *iface,
+ 						 const u8 *src)
+ {
+@@ -1996,6 +1996,7 @@ static void hostapd_event_eapol_rx(struct hostapd_data *hapd, const u8 *src,
+ 
+ 	ieee802_1x_receive(hapd, src, data, data_len, encrypted);
+ }
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #endif /* HOSTAPD */
+ 
+@@ -2532,11 +2533,20 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 		hostapd_event_new_sta(hapd, data->new_sta.addr);
+ 		break;
+ 	case EVENT_EAPOL_RX:
++#ifdef CONFIG_VENDOR_MXL
++		mxl_hostapd_event_eapol_rx(hapd, data->eapol_rx.src,
++					   data->eapol_rx.data,
++					   data->eapol_rx.data_len,
++					   data->eapol_rx.encrypted,
++					   data->eapol_rx.link_id,
++					   data->eapol_rx.vlan_id);
++#else /* CONFIG_VENDOR_MXL */
+ 		hostapd_event_eapol_rx(hapd, data->eapol_rx.src,
+ 				       data->eapol_rx.data,
+ 				       data->eapol_rx.data_len,
+ 				       data->eapol_rx.encrypted,
+ 				       data->eapol_rx.link_id);
++#endif /* CONFIG_VENDOR_MXL */
+ 		break;
+ 	case EVENT_ASSOC:
+ 		if (!data)
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index cb1abd52f..16dbd16e3 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3521,7 +3521,9 @@ dfs_offload:
+ #endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_owe_update_trans(iface);
+ 	airtime_policy_update_init(iface);
++#ifndef CONFIG_VENDOR_MXL
+ 	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_ENABLED);
++#endif /* CONFIG_VENDOR_MXL */
+ 	if (hapd->setup_complete_cb)
+ 		hapd->setup_complete_cb(hapd->setup_complete_cb_ctx);
+ 
+@@ -4577,9 +4579,11 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 		wpa_printf(MSG_ERROR, "%d Failed to invalidate RNR IE", __LINE__);
+ 		return -1;
+ 	}
+-#endif /* CONFIG_VENDOR_MXL */
+ 	for (j = 0; j < hapd_iface->num_bss; j++)
+ 		wpa_msg(hapd_iface->bss[j]->msg_ctx, MSG_INFO, AP_EVENT_DISABLED);
++#else /* CONFIG_VENDOR_MXL */
++	wpa_msg(hapd_iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_DISABLED);
++#endif /* CONFIG_VENDOR_MXL */
+ 	driver = hapd_iface->bss[0]->driver;
+ 	drv_priv = hapd_iface->bss[0]->drv_priv;
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 9f9fca982..9de2f1ade 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -66,6 +66,7 @@
+ #include "mxl_sta_info.h"
+ #include "mxl_ieee802_11.h"
+ #include "mxl_wmm.h"
++#include "mxl_csa.h"
+ #include "common/mxl_ieee802_11_common.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #ifdef CONFIG_WDS_WPA
+@@ -109,6 +110,7 @@ hostapd_ml_get_assoc_sta(struct hostapd_data *hapd, struct sta_info *sta,
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++#ifndef CONFIG_VENDOR_MXL
+ static u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid, size_t len)
+ {
+ 	struct multi_ap_params multi_ap = { 0 };
+@@ -135,6 +137,7 @@ static u8 * hostapd_eid_multi_ap(struct hostapd_data *hapd, u8 *eid, size_t len)
+ 
+ 	return eid + add_multi_ap_ie(eid, len, &multi_ap);
+ }
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ u8 * hostapd_eid_supp_rates(struct hostapd_data *hapd, u8 *eid)
+@@ -2882,6 +2885,8 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	int softblock_res = HOSTAPD_SOFTBLOCK_ACCEPT;
+ 	struct intel_vendor_event_msg_drop msg_dropped;
+ 	int snr_db = from_queue ? hapd->mxl_data.snr_db_from_sae_queue : hapd->iface->mxl_iface.snr_db_current_frame;
++	size_t vendor_ie_len = (hapd->conf->mxl_bss_conf.authresp_elements ? wpabuf_len(hapd->conf->mxl_bss_conf.authresp_elements) : 0);
++	u8 resp_ies[2 + WLAN_AUTH_CHALLENGE_LEN + vendor_ie_len];
+ #endif /* CONFIG_VENDOR_MXL */
+ 	u16 auth_alg, auth_transaction, status_code;
+ 	u16 resp = WLAN_STATUS_SUCCESS;
+@@ -2889,7 +2894,9 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	int res, reply_res;
+ 	u16 fc;
+ 	const u8 *challenge = NULL;
++#ifndef CONFIG_VENDOR_MXL
+ 	u8 resp_ies[2 + WLAN_AUTH_CHALLENGE_LEN];
++#endif /* CONFIG_VENDOR_MXL */
+ 	size_t resp_ies_len = 0;
+ 	u16 seq_ctrl;
+ 	struct radius_sta rad_info;
+@@ -2934,6 +2941,14 @@ static void handle_auth(struct hostapd_data *hapd,
+ 		sa = mgmt->sa;
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (!is_valid_ether_addr(sa)) {
++		wpa_printf(MSG_INFO, "handle_auth - Invalid STA MAC address: " MACSTR,
++			   MAC2STR(sa));
++		return;
++	}
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	auth_alg = le_to_host16(mgmt->u.auth.auth_alg);
+ 	auth_transaction = le_to_host16(mgmt->u.auth.auth_transaction);
+ 	status_code = le_to_host16(mgmt->u.auth.status_code);
+@@ -3209,6 +3224,9 @@ static void handle_auth(struct hostapd_data *hapd,
+ 		if (!sta) {
+ 			wpa_printf(MSG_DEBUG, "ap_sta_add() failed");
+ 			resp = WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
++#ifdef CONFIG_VENDOR_MXL
++			mxl_hostapd_check_limit_reached(hapd, mgmt->sa, &resp);
++#endif /* CONFIG_VENDOR_MXL */
+ 			goto fail;
+ 		}
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+@@ -3243,6 +3261,9 @@ static void handle_auth(struct hostapd_data *hapd,
+ 
+ 	sta->last_seq_ctrl = seq_ctrl;
+ 	sta->last_subtype = WLAN_FC_STYPE_AUTH;
++#ifdef CONFIG_VENDOR_MXL
++	sta->ssi_signal = rssi;
++#endif /* CONFIG_VENDOR_MXL */
+ #ifdef CONFIG_MBO
+ 	sta->auth_rssi = rssi;
+ #endif /* CONFIG_MBO */
+@@ -3382,6 +3403,11 @@ static void handle_auth(struct hostapd_data *hapd,
+ #endif /* CONFIG_PASN */
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_hostapd_add_authresp_elements(hapd, resp_ies + resp_ies_len, vendor_ie_len, &resp_ies_len))
++		goto fail;
++#endif /* CONFIG_VENDOR_MXL */
++
+  fail:
+ 	dst = mgmt->sa;
+ 	bssid = mgmt->bssid;
+@@ -3582,6 +3608,20 @@ static u16 check_multi_ap(struct hostapd_data *hapd, struct sta_info *sta,
+ 	if (!hapd->conf->multi_ap)
+ 		return WLAN_STATUS_SUCCESS;
+ 
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	/* Update multi_ap.capability with flag filled by mxl_hostapd_handle_legacy_multi_ap() */
++	if (sta->mxl_sta_info.multi_ap_value) {
++		os_memset(&multi_ap, 0, sizeof(multi_ap));
++		multi_ap.capability = sta->mxl_sta_info.multi_ap_value;
++		sta->flags |= WLAN_STA_MULTI_AP;
++		hostapd_logger(hapd, sta->addr,
++			       HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_INFO,
++			       "Processing LEGACY_MULTI_AP_MXL STA");
++		goto skip_multi_ap_ie;
++	}
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
+ 	if (!multi_ap_ie) {
+ 		if (!(hapd->conf->multi_ap & FRONTHAUL_BSS)) {
+ 			hostapd_logger(hapd, sta->addr,
+@@ -3599,6 +3639,10 @@ static u16 check_multi_ap(struct hostapd_data *hapd, struct sta_info *sta,
+ 	if (status != WLAN_STATUS_SUCCESS)
+ 		return status;
+ 
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++skip_multi_ap_ie:
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
+ 	if (multi_ap.capability && multi_ap.capability != MULTI_AP_BACKHAUL_STA)
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_INFO,
+@@ -3641,6 +3685,10 @@ static u16 check_multi_ap(struct hostapd_data *hapd, struct sta_info *sta,
+ 			       HOSTAPD_LEVEL_DEBUG,
+ 			       "Backhaul STA tries to associate with fronthaul-only BSS");
+ 
++#ifdef CONFIG_VENDOR_MXL
++	sta->mxl_sta_info.multi_ap_profile = multi_ap.profile;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	sta->flags |= WLAN_STA_MULTI_AP;
+ 	return WLAN_STATUS_SUCCESS;
+ }
+@@ -4171,6 +4219,9 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
+ 
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	mxl_hostapd_handle_legacy_multi_ap(hapd, sta, elems);
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
+ 	resp = check_multi_ap(hapd, sta, elems->multi_ap, elems->multi_ap_len);
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
+@@ -5437,7 +5488,11 @@ rsnxe_done:
+ #endif /* CONFIG_WPS */
+ 
+ 	if (sta && (sta->flags & WLAN_STA_MULTI_AP))
++#ifndef CONFIG_VENDOR_MXL
+ 		p = hostapd_eid_multi_ap(hapd, p, buf + buflen - p);
++#else
++		p = mxl_hostapd_eid_multi_ap(hapd, sta, p, buf + buflen - p);
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #ifdef CONFIG_P2P
+ 	if (sta && sta->p2p_ie && hapd->p2p_group) {
+@@ -5485,6 +5540,10 @@ rsnxe_done:
+ 		p += wpabuf_len(hapd->conf->assocresp_elements);
+ 	}
+ 
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	p = mxl_hostapd_eid_legacy_multi_ap(hapd, ies, ies_len, p, buf + buflen - p);
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
+ 	send_len += p - reply->u.assoc_resp.variable;
+ 
+ #ifdef CONFIG_FILS
+@@ -6683,6 +6742,10 @@ static int handle_action(struct hostapd_data *hapd,
+ 				return 1;
+ 		}
+ #endif /* CONFIG_DPP */
++#ifdef CONFIG_VENDOR_MXL
++		if (mxl_hostapd_handle_action_extcsa(hapd, (const u8 *) mgmt, len))
++			return 1;
++#endif /* CONFIG_VENDOR_MXL */
+ 		if (hapd->public_action_cb) {
+ 			hapd->public_action_cb(hapd->public_action_cb_ctx,
+ 					       (u8 *) mgmt, len, freq);
+@@ -6704,6 +6767,11 @@ static int handle_action(struct hostapd_data *hapd,
+ 	case WLAN_ACTION_RADIO_MEASUREMENT:
+ 		hostapd_handle_radio_measurement(hapd, (const u8 *) mgmt, len);
+ 		return 1;
++#ifdef CONFIG_VENDOR_MXL
++	case WLAN_ACTION_SPECTRUM_MGMT:
++		mxl_hostapd_handle_spectrum_management(hapd, (const u8 *) mgmt, len);
++		return 1;
++#endif /* CONFIG_VENDOR_MXL */
+ #ifdef CONFIG_SCS_MXL
+ 	case WLAN_ACTION_ROBUST_AV_STREAMING:
+ 		wpa_printf(MSG_DEBUG, "WLAN_ACTION_ROBUST_AV_STREAMING");
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 43ef1d960..73d29aca5 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -409,6 +409,13 @@ struct mxl_hostapd_bss_config {
+ 	bool disable_beacon_prot;
+ #endif /* CONFIG_IEEE80211BE */
+ 	u32 bss_same_ssid; /* bitmap size [32 bits] - Need to handle based on MAX_SUPPORTED_6GHZ_VAP_PER_RADIO - WLANRTSYS-61684 */
++
++	/* Multi-AP */
++	bool ul_csa;
++	struct wpabuf *authresp_elements;
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	bool vendor_4addr;
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
+ };
+ 
+ struct hostapd_config;
+@@ -421,11 +428,13 @@ void mxl_hostapd_config_defaults_bss(struct hostapd_bss_config *bss);
+ void mxl_hostapd_config_defaults(struct hostapd_config *conf);
+ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss);
+ int mxl_hostapd_config_check(struct hostapd_config *conf, int full_config);
++int mxl_hostapd_config_check_bss(struct hostapd_bss_config *bss, struct hostapd_config *conf, int full_config);
+ void mxl_hostapd_config_free(struct hostapd_config *conf);
+ int mxl_hostapd_config_check_bss_6g(struct hostapd_bss_config *bss);
+ int mxl_hostapd_config_check_bss(struct hostapd_bss_config *bss, struct hostapd_config *conf, int full_config);
+ 
+ int mxl_hostapd_parse_intlist(int **int_list, char *val);
++int mxl_parse_wpabuf_hex(int line, const char *name, struct wpabuf **buf, const char *val);
+ 
+ 
+ #define SCAN_PASSIVE_DWELL_DEFAULT 20
+diff --git a/src/ap/mxl_csa.c b/src/ap/mxl_csa.c
+new file mode 100644
+index 000000000..ed39bf3d1
+--- /dev/null
++++ b/src/ap/mxl_csa.c
+@@ -0,0 +1,342 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "hostapd.h"
++#include "common/hw_features_common.h"
++#include "ap/hw_features.h"
++#include "../hostapd/ctrl_iface.h"
++#include "ap_drv_ops.h"
++#include "dfs.h"
++#include "sta_info.h"
++#include "mxl_dfs_common.h"
++
++
++static int mxl_hostapd_csa_update_current_channel(struct hostapd_data *hapd)
++{
++	/* Update DFS state */
++	int ret = 0, i;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = mode = iface->current_mode;
++	int n_chans, n_chans1, start_chan_idx, start_chan_idx1;
++	struct hostapd_channel_data *channel;
++
++	start_chan_idx = dfs_get_start_chan_idx(iface, &start_chan_idx1);
++	if (start_chan_idx == -1)
++		return -1;
++
++	n_chans = dfs_get_used_n_chans(iface, &n_chans1);
++
++
++	wpa_printf(MSG_DEBUG, "Update DFS state start channel: %dMHz, n_chans: %d",
++		   mode->channels[start_chan_idx].freq, n_chans);
++	for (i = 0; i < n_chans; i++) {
++		channel = &mode->channels[start_chan_idx + i];
++		if (channel->flag & HOSTAPD_CHAN_RADAR) {
++			if (mxl_set_dfs_state_freq(iface, channel->freq, HOSTAPD_CHAN_DFS_UNAVAILABLE) != 1) {
++				wpa_printf(MSG_DEBUG, "Update hostapd DFS state channel:%d fail", channel->chan);
++				ret = -1;
++			}
++			if (mxl_hostapd_set_chan_dfs_state(iface, NL80211_DFS_UNAVAILABLE, channel->freq, 0, 0)) {
++				wpa_printf(MSG_DEBUG, "Update kernel DFS state channel:%d fail", channel->chan);
++				ret = -1;
++			}
++		}
++	}
++
++	return ret;
++}
++
++static int mxl_hostapd_csa_validate_channel(struct hostapd_data *hapd,
++					int start_ch, int bw)
++{
++	int i, j;
++	int n_chans = bw/20;
++	int chan = start_ch;
++	int pass = 0;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	for (j = 0; j < n_chans; j++) {
++		for (i = 0; i < mode->num_channels; i++) {
++			if (mode->channels[i].chan == chan) {
++				int flag = mode->channels[i].flag;
++				wpa_printf(MSG_DEBUG, "validate channel:%d", chan);
++				if (flag & HOSTAPD_CHAN_RADAR) {
++					/* new channel can be DFS/Available only for ETSI */
++					if (iface->dfs_domain != HOSTAPD_DFS_REGION_ETSI) {
++						wpa_printf(MSG_DEBUG, "CSA DFS channel can be used only in ETSI:%d", chan);
++						return -1;
++					}
++					if ((flag & HOSTAPD_CHAN_DFS_MASK) != HOSTAPD_CHAN_DFS_AVAILABLE) {
++						wpa_printf(MSG_DEBUG, "CSA DFS channel not available:%d", chan);
++						return -1;
++					}
++				}
++				pass++;
++				break;
++			}
++		}
++		chan += 4;
++	}
++
++	if (n_chans == pass)
++		return 0;
++
++	return -1;
++}
++
++/* Upstream CSA, CSA through backhaul */
++static void mxl_hostapd_handle_csa_request(struct hostapd_data *hapd,
++					     const u8 *buf, size_t len)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++	const u8 *pos, *ie, *end;
++	struct csa_settings settings;
++	struct sta_info *sta;
++	unsigned int i;
++	u8 switch_mode = 0;
++	u8 switch_count = 0;
++	u8 chan_width = 0;
++	u8 new_chan = 0;
++	u8 seg0_idx = 0;
++	u8 seg1_idx = 0;
++	int sec_ch = 0;
++	u8 start_ch = 0;
++	enum oper_chan_width width = CONF_OPER_CHWIDTH_USE_HT;
++	int chan_bw = 20;
++	struct hostapd_hw_modes *cmode = hapd->iface->current_mode;
++
++	if (!hapd->conf->mxl_bss_conf.ul_csa)
++		return;
++
++	/* Only 5G support */
++	if (hapd->iface->current_mode == NULL ||
++	    hapd->iface->current_mode->mode != HOSTAPD_MODE_IEEE80211A)
++		return;
++
++	/* Only for backhaul VAP */
++	if (!(hapd->conf->multi_ap & BACKHAUL_BSS))
++		return;
++
++	/* Only from associated station */
++	sta = ap_get_sta(hapd, mgmt->sa);
++	if (sta == NULL || !(sta->flags & WLAN_STA_ASSOC)) {
++		wpa_printf(MSG_DEBUG, "IEEE 802.11: Ignored CSA"
++			   "frame from unassociated STA " MACSTR, MAC2STR(mgmt->sa));
++		return;
++	}
++
++	/* Only for backhaul (multi-AP) station */
++	if (!(sta->flags & WLAN_STA_MULTI_AP)) {
++		wpa_printf(MSG_DEBUG, "IEEE 802.11: Ignored CSA"
++			   "frame from non backhaul STA " MACSTR, MAC2STR(mgmt->sa));
++		return;
++	}
++
++	/* Check if CSA in progress */
++	if (hostapd_csa_in_progress(iface))
++		return;
++
++	/* Check if active CAC */
++	if (iface->cac_started)
++		return;
++
++	end = buf + len;
++	pos = &mgmt->u.action.u.chan_switch.element_id;
++	os_memset(&settings, 0, sizeof(settings));
++
++	if (mgmt->u.action.category == WLAN_ACTION_PUBLIC &&
++	    mgmt->u.action.u.ext_chan_switch.action_code == WLAN_PA_EXT_CHANNEL_SWITCH_ANNOUNCE) {
++
++		switch_mode = mgmt->u.action.u.ext_chan_switch.switch_mode;
++		new_chan = mgmt->u.action.u.ext_chan_switch.new_chan;
++		switch_count = mgmt->u.action.u.ext_chan_switch.switch_count;
++		pos = mgmt->u.action.u.ext_chan_switch.variable;
++	} else {
++		ie = get_ie(pos, end - pos, WLAN_EID_CHANNEL_SWITCH);
++		if (ie) {
++			if (ie[1] != 3) {
++				wpa_printf(MSG_DEBUG, "Bad BW CSA element");
++				return;
++			}
++			switch_mode = ie[2];
++			new_chan = ie[3];
++			switch_count = ie[4];
++		} else {
++			wpa_printf(MSG_DEBUG, "No CSA element is found");
++			return;
++		}
++	}
++
++	start_ch = new_chan;
++
++	ie = get_ie(pos, end - pos, WLAN_EID_WIDE_BW_CHSWITCH);
++	if (ie) {
++		if (ie[1] != 3) {
++			wpa_printf(MSG_DEBUG, "Bad BW switch element");
++			return;
++		}
++		chan_width = ie[2];
++		seg0_idx = ie[3];
++		seg1_idx = ie[4];
++	}
++
++	ie = get_ie(pos, end - pos, WLAN_EID_SECONDARY_CHANNEL_OFFSET);
++	if (ie) {
++		if (ie[1] != 1) {
++			wpa_printf(MSG_DEBUG, "Bad Secondary channel offset element");
++			return;
++		}
++		switch (ie[2]) {
++			case 0:
++				sec_ch = 0;
++				break;
++			case 1:
++				sec_ch = 1;
++				chan_bw = 40;
++				break;
++			case 3:
++				sec_ch = -1;
++				chan_bw = 40;
++				start_ch -= 4;
++				break;
++			default:
++				wpa_printf(MSG_DEBUG, "Bad Secondary channel offset element");
++				return;
++		}
++	}
++
++	switch (chan_width) {
++		case 0:
++			break;
++		case 1:
++			if (seg1_idx) {
++				seg0_idx = seg1_idx;
++				seg1_idx = 0;
++				chan_bw = 160;
++				width = CONF_OPER_CHWIDTH_160MHZ;
++				start_ch = seg0_idx - 14;
++			}
++			else {
++				chan_bw = 80;
++				width = CONF_OPER_CHWIDTH_80MHZ;
++				start_ch = seg0_idx - 6;
++			}
++			break;
++		case 2:
++			chan_bw = 160;
++			width = CONF_OPER_CHWIDTH_160MHZ;
++			start_ch = seg0_idx - 14;
++			break;
++		default:
++			wpa_printf(MSG_DEBUG, "Wrong channel width parameter");
++			return;
++	}
++
++	if (!sec_ch && seg0_idx) {
++		wpa_printf(MSG_DEBUG, "Secondary channel offset element is not "
++			   "present, try to calculate offset by self");
++		sec_ch = mxl_hostapd_get_secondary_offset(new_chan, chan_bw, seg0_idx);
++	}
++
++	wpa_printf(MSG_DEBUG, "CSA mode:%d channel:%d count:%d freq_seg0_idx:%d "
++		   "freq_seg1_idx:%d secondary_channel:%d chan_bw:%d",
++		   switch_mode, new_chan, switch_count, seg0_idx,
++		   seg1_idx, sec_ch, chan_bw);
++
++	/* Prepare channel switch parameters */
++	mxl_hostapd_channel_switch_reason_set(iface, HAPD_CHAN_SWITCH_RADAR_DETECTED);
++	settings.cs_count = switch_count;
++	settings.block_tx = switch_mode;
++	if (hostapd_set_freq_params(&settings.freq_params,
++					iface->conf->hw_mode,
++					hostapd_hw_get_freq(hapd, new_chan),
++					new_chan,
++					iface->conf->enable_edmg,
++					iface->conf->edmg_channel,
++					iface->conf->ieee80211n,
++					iface->conf->ieee80211ac,
++					iface->conf->ieee80211ax,
++					iface->conf->ieee80211be,
++					sec_ch,
++					width,
++					seg0_idx,
++					0,
++					cmode ? cmode->vht_capab : 0,
++					cmode ? &cmode->he_capab[IEEE80211_MODE_AP] : NULL,
++					cmode ? &cmode->eht_capab[IEEE80211_MODE_AP] : NULL)) {
++
++		wpa_printf(MSG_ERROR, "failed to calculate CSA freq params");
++		return;
++	}
++
++	if (mxl_hostapd_csa_update_current_channel(hapd)) {
++		wpa_printf(MSG_DEBUG, "Can't update current channels, still continue");
++	}
++
++	if (mxl_hostapd_csa_validate_channel(hapd, start_ch, chan_bw)) {
++		wpa_printf(MSG_DEBUG, "CSA channel can't be used,"
++			   " try fail-safe channel or reduce bw");
++		hostapd_dfs_start_channel_switch(iface);
++		return;
++	}
++
++	/* Execute channel switch */
++	hostapd_prepare_and_send_csa_deauth_cfg_to_driver(iface->bss[0]);
++
++	for (i = 0; i < iface->num_bss; i++) {
++		if (hostapd_switch_channel(iface->bss[i], &settings)) {
++			wpa_printf(MSG_ERROR, "Unable to switch channel");
++			return;
++		}
++	}
++}
++
++void mxl_hostapd_handle_spectrum_management(struct hostapd_data *hapd,
++					const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++
++	if (len < IEEE80211_HDRLEN + 3)
++		return;
++
++	switch (mgmt->u.action.u.spectrum_action.action) {
++	case WLAN_SPEC_MGMT_CHANNEL_SWITCH_ANNOUNCE:
++		mxl_hostapd_handle_csa_request(hapd, buf, len);
++		break;
++	default:
++		wpa_printf(MSG_DEBUG, "Spectrum management action %u is not supported",
++			   mgmt->u.action.u.spectrum_action.action);
++		break;
++	}
++}
++
++int  mxl_hostapd_handle_action_extcsa(struct hostapd_data *hapd,
++				      const u8 *buf, size_t len)
++{
++	const struct ieee80211_mgmt *mgmt = (const struct ieee80211_mgmt *) buf;
++
++	if (len >= IEEE80211_HDRLEN + 2 &&
++		(mgmt->u.action.u.ext_chan_switch.action_code == WLAN_PA_EXT_CHANNEL_SWITCH_ANNOUNCE)) {
++		if (len < IEEE80211_HDRLEN + 6)
++			return 1;
++
++		mxl_hostapd_handle_csa_request(hapd, buf, len);
++		return 1;
++	}
++
++	return 0;
++}
+diff --git a/src/ap/mxl_csa.h b/src/ap/mxl_csa.h
+new file mode 100644
+index 000000000..78214bf48
+--- /dev/null
++++ b/src/ap/mxl_csa.h
+@@ -0,0 +1,23 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_CSA_H
++#define MXL_CSA_H
++
++void mxl_hostapd_handle_spectrum_management(struct hostapd_data *hapd,
++				      const u8 *buf, size_t len);
++
++int mxl_hostapd_handle_action_extcsa(struct hostapd_data *hapd,
++				     const u8 *buf, size_t len);
++
++#endif /* MXL_CSA_H */
+diff --git a/src/ap/mxl_drv_callbacks.c b/src/ap/mxl_drv_callbacks.c
+index 55794c2b4..593d3ef57 100644
+--- a/src/ap/mxl_drv_callbacks.c
++++ b/src/ap/mxl_drv_callbacks.c
+@@ -195,3 +195,35 @@ void mxl_align_punct_bitmap(struct hostapd_data *hapd)
+ 		hapd->iconf->punct_bitmap = 0;
+ 	}
+ }
++
++void mxl_hostapd_event_eapol_rx(struct hostapd_data *hapd, const u8 *src,
++				const u8 *data, size_t data_len,
++				enum frame_encryption encrypted,
++				int link_id,
++				u16 vlan_id)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct sta_info *sta = NULL;
++	size_t j;
++
++	(void)link_id;
++
++	for (j = 0; j < iface->num_bss; j++) {
++		sta = ap_get_sta(iface->bss[j], src);
++		if (sta && sta->flags & WLAN_STA_ASSOC) {
++			hapd = iface->bss[j];
++			break;
++		}
++	}
++
++	if (sta && (sta->flags & WLAN_STA_MULTI_AP) && (hapd->conf->multi_ap == BACKHAUL_BSS) && hapd->conf->multi_ap_vlanid)
++	{
++		if (hapd->conf->multi_ap_vlanid != vlan_id) {
++			wpa_printf(MSG_ERROR, "Droping EAPOL Frame(vlan:%u) from " MACSTR " vlan_id mismatch(%u)", vlan_id, MAC2STR(src),
++				   hapd->conf->multi_ap_vlanid);
++			return;
++		}
++	}
++
++	ieee802_1x_receive(hapd, src, data, data_len, encrypted);
++}
+diff --git a/src/ap/mxl_drv_callbacks.h b/src/ap/mxl_drv_callbacks.h
+index d48a51e25..4778c616d 100644
+--- a/src/ap/mxl_drv_callbacks.h
++++ b/src/ap/mxl_drv_callbacks.h
+@@ -20,4 +20,11 @@ int mxl_wpa_supplicant_event(void *ctx, enum wpa_event_type event, union wpa_eve
+ void mxl_hostapd_notif_disassoc(struct hostapd_data *hapd, const u8 *addr);
+ bool mxl_check_sa_query_need(struct hostapd_data *hapd, struct sta_info *sta);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++void mxl_hostapd_event_eapol_rx(struct hostapd_data *hapd, const u8 *src,
++				const u8 *data, size_t data_len,
++				enum frame_encryption encrypted,
++				int link_id,
++				u16 vlan_id);
++
+ #endif /* MXL_DRV_CALLBACKS_H */
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 594ebb7db..1a3657174 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -1665,6 +1665,11 @@ int mxl_hostapd_setup_interface(struct hostapd_data *hapd)
+ 	mxl_hostapd_set_eht_punct_bitmap(hapd, hapd->iconf->punct_bitmap);
+ #endif /* CONFIG_IEEE80211BE */
+ 
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_MESH_MODE, &hapd->conf->multi_ap, sizeof(hapd->conf->multi_ap))) {
++		wpa_printf(MSG_ERROR, "Failed to set multi_ap");
++		return -1;
++	}
++
+ 	/* Add next vendor command here */
+ 	return 0;
+ }
+@@ -1724,6 +1729,8 @@ int mxl_hostapd_setup_bss_post(struct hostapd_data *hapd)
+ #ifdef CONFIG_IEEE80211BE
+ 	mxl_hostapd_send_debug_mode_eht_cap(hapd);
+ #endif /* CONFIG_IEEE80211BE */
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, AP_EVENT_ENABLED);
+ 	return 0;
+ }
+ 
+@@ -3126,6 +3133,7 @@ void mxl_hostapd_init(struct hostapd_iface * hapd_iface)
+ {
+ 	mxl_hostapd_update_user_conf_cw(hapd_iface);
+ }
++
+ void mxl_parse_rnr(struct ieee802_11_elems *elems, struct dl_list *rnr_scan_6g_ap_info)
+ {
+ 	struct rnr_neighbor_ap_info *ap_info;
+@@ -3349,3 +3357,13 @@ next:
+ 	}
+ }
+ 
++void mxl_hostapd_check_limit_reached(struct hostapd_data *hapd, const u8 *sta_addr, u16 *resp)
++{
++	/* If STA cannot be added due to limit reached, send response code 33 */
++	if (hapd->mxl_data.limit_reached) {
++		hostapd_event_connect_failed_reason(hapd, sta_addr, MAX_CLIENT_REACHED);
++		if (hapd->conf->multi_ap == BACKHAUL_BSS) {
++			*resp = WLAN_STATUS_DENIED_INSUFFICIENT_BANDWIDTH;
++		}
++	}
++}
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 4a2bff29e..9a36f7e4a 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -142,6 +142,7 @@ struct mxl_hostapd_data {
+ 	bool bw_indication_ie_len_add;
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	u8 require_csa;		/* Variable to keep track whether csa IE should be added or not */
++	u8 limit_reached;
+ };
+ 
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+@@ -252,4 +253,5 @@ void mxl_remove_associated_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ bool mxl_hostapd_prune_sta(struct hostapd_data *hapd, const u8 *addr);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ void mxl_parse_rnr(struct ieee802_11_elems *elems, struct dl_list *rnr_scan_6g_ap_info);
++void mxl_hostapd_check_limit_reached(struct hostapd_data *hapd, const u8 *sta_addr, u16 *resp);
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/ap/mxl_ieee802_11.c b/src/ap/mxl_ieee802_11.c
+index 307674634..f32599f88 100644
+--- a/src/ap/mxl_ieee802_11.c
++++ b/src/ap/mxl_ieee802_11.c
+@@ -70,6 +70,8 @@
+ #include "mxl_hostapd.h"
+ #include "mxl_coexistence.h"
+ #include "mxl_ieee802_11.h"
++#include "mxl_csa.h"
++#include "common/mxl_ieee802_11_common.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #include "wpa_auth_i.h"
+ #include "mxl_sta_info.h"
+@@ -1075,4 +1077,97 @@ void mxl_cache_sta_deauth(struct hostapd_data *hapd, struct sta_info *sta)
+ 		}
+ 	}
+ }
++
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++void mxl_hostapd_handle_legacy_multi_ap(struct hostapd_data *hapd,
++		struct sta_info *sta, struct ieee802_11_elems *elems)
++{
++	sta->mxl_sta_info.multi_ap_value = 0;
++
++	/* Check for legacy Intel/MXL and Broadcom vendor-specific IE's */
++	if ((elems->intel_ie_4addr_mode &&
++			(elems->intel_ie_4addr_mode[VENDOR_INTEL_ATTRIBUTES_OFFSET] == VENDOR_INTEL_4ADDR_MODE_STA)) ||
++		((hapd->conf->mxl_bss_conf.vendor_4addr || (hapd->conf->multi_ap & BACKHAUL_BSS)) &&
++			elems->brcom_ie && (elems->brcom_ie[VENDOR_BRCOM_FLAGS1_OFFSET] & VENDOR_BRCOM_DWDS_CAPABLE))
++		) {
++		sta->mxl_sta_info.multi_ap_value = MULTI_AP_BACKHAUL_STA;
++	}
++}
++
++u8* mxl_hostapd_eid_legacy_multi_ap(struct hostapd_data *hapd, const u8 *ies, size_t ies_len, u8 *eid, size_t len)
++{
++	if (hapd->conf->multi_ap & BACKHAUL_BSS) {
++		struct ieee802_11_elems elems80211;
++		ieee802_11_parse_elems(ies, ies_len, &elems80211, 0);
++
++		if (elems80211.brcom_ie &&
++				(elems80211.brcom_ie[VENDOR_BRCOM_FLAGS1_OFFSET] & VENDOR_BRCOM_DWDS_CAPABLE) &&
++				(len >= elems80211.brcom_ie_len)) {
++			*eid++ = WLAN_EID_VENDOR_SPECIFIC;
++			*eid++ = elems80211.brcom_ie_len;
++			os_memcpy(eid, elems80211.brcom_ie, elems80211.brcom_ie_len);
++			eid += elems80211.brcom_ie_len;
++			len -= elems80211.brcom_ie_len;
++		}
++
++		if (elems80211.intel_ie_4addr_mode &&
++				(elems80211.intel_ie_4addr_mode[VENDOR_INTEL_ATTRIBUTES_OFFSET] == VENDOR_INTEL_4ADDR_MODE_STA) &&
++				(len >= elems80211.intel_ie_4addr_len)) {
++			*eid++ = WLAN_EID_VENDOR_SPECIFIC;
++			*eid++ = elems80211.intel_ie_4addr_len;
++			os_memcpy(eid, elems80211.intel_ie_4addr_mode, elems80211.intel_ie_4addr_len);
++			eid += elems80211.intel_ie_4addr_len;
++			len -= elems80211.intel_ie_4addr_len;
++		}
++	}
++	return eid;
++}
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
++int mxl_hostapd_add_authresp_elements(struct hostapd_data *hapd, u8 *pos, size_t vendor_ie_len, size_t *out_len)
++{
++	errno_t err;
++
++	if (hapd->conf->mxl_bss_conf.authresp_elements) {
++		err = memcpy_s(pos, vendor_ie_len, wpabuf_head(hapd->conf->mxl_bss_conf.authresp_elements), vendor_ie_len);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return -1;
++		}
++		*out_len += vendor_ie_len;
++	}
++	return 0;
++}
++
++u8 * mxl_hostapd_eid_multi_ap(struct hostapd_data *hapd, struct sta_info *sta, u8 *eid, size_t len)
++{
++	struct multi_ap_params multi_ap = { 0 };
++
++	if (!hapd->conf->multi_ap)
++		return eid;
++
++	if (hapd->conf->multi_ap & BACKHAUL_BSS)
++		multi_ap.capability |= MULTI_AP_BACKHAUL_BSS;
++	if (hapd->conf->multi_ap & FRONTHAUL_BSS)
++		multi_ap.capability |= MULTI_AP_FRONTHAUL_BSS;
++
++	/* Workaround: Reply with fAP and bAP bits to bSTA associated to fAP with WPS  */
++	if (sta && (sta->flags & WLAN_STA_MULTI_AP) && (sta->flags & WLAN_STA_WPS) && (hapd->conf->multi_ap == FRONTHAUL_BSS))
++		multi_ap.capability |= MULTI_AP_BACKHAUL_BSS;
++
++	if (hapd->conf->multi_ap_client_disallow &
++	    PROFILE1_CLIENT_ASSOC_DISALLOW)
++		multi_ap.capability |=
++			MULTI_AP_PROFILE1_BACKHAUL_STA_DISALLOWED;
++	if (hapd->conf->multi_ap_client_disallow &
++	    PROFILE2_CLIENT_ASSOC_DISALLOW)
++		multi_ap.capability |=
++			MULTI_AP_PROFILE2_BACKHAUL_STA_DISALLOWED;
++
++	multi_ap.profile = hapd->conf->multi_ap_profile;
++	multi_ap.vlanid = hapd->conf->multi_ap_vlanid;
++
++	return eid + add_multi_ap_ie(eid, len, &multi_ap);
++}
++
+ #endif /* CONFIG_NATIVE_WINDOWS */
+diff --git a/src/ap/mxl_ieee802_11.h b/src/ap/mxl_ieee802_11.h
+index 490fa1090..6701cffbe 100644
+--- a/src/ap/mxl_ieee802_11.h
++++ b/src/ap/mxl_ieee802_11.h
+@@ -56,4 +56,13 @@ void mxl_free_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_hostapd_eid_ml_critical_update(struct hostapd_data *hapd, u16 *capab_info);
+ bool mxl_check_sa_query(struct hostapd_data *hapd, struct sta_info *sta, int reassoc);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++void mxl_hostapd_handle_legacy_multi_ap(struct hostapd_data *hapd, struct sta_info *sta, struct ieee802_11_elems *elems);
++u8* mxl_hostapd_eid_legacy_multi_ap(struct hostapd_data *hapd, const u8 *ies, size_t ies_len, u8 *eid, size_t len);
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
++int mxl_hostapd_add_authresp_elements(struct hostapd_data *hapd, u8 *pos, size_t vendor_ie_len, size_t *out_len);
++u8 * mxl_hostapd_eid_multi_ap(struct hostapd_data *hapd, struct sta_info *sta, u8 *eid, size_t len);
++
+ #endif /* MXL_IEEE802_11_H */
+diff --git a/src/ap/mxl_softblock.h b/src/ap/mxl_softblock.h
+index ce15e7191..27e3fd0d0 100644
+--- a/src/ap/mxl_softblock.h
++++ b/src/ap/mxl_softblock.h
+@@ -95,4 +95,7 @@ void mxl_hostapd_free_cached_events(struct hostapd_data *hapd);
+ 
+ void mxl_set_snr_db_for_current_frame(void *hapd, int snr_db);
+ 
++int mxl_ieee802_11_multi_ap_blacklist_print(struct hostapd_data *hapd, char *buf,
++	size_t buflen);
++
+ #endif /* MXL_SOFTBLOCK_H */
+diff --git a/src/ap/mxl_sta_info.h b/src/ap/mxl_sta_info.h
+index f0c9cafd3..2726b0f14 100644
+--- a/src/ap/mxl_sta_info.h
++++ b/src/ap/mxl_sta_info.h
+@@ -17,6 +17,11 @@
+ 
+ struct hostapd_data;
+ struct mxl_sta_info {
++	u8 multi_ap_profile; /* Multi-AP spec agent Profile (1/2) */
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	u8 multi_ap_value;
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+ 	u8 non_ap_mld_mac[ETH_ALEN];
+ 	u8 sibling_sta_mac[ETH_ALEN];
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 0135cc401..8f3e0574e 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -809,13 +809,17 @@ static int num_res_sta_get_total(struct hostapd_data *hapd)
+ 	return num_res_sta;
+ }
+ 
++
+ struct sta_info * ap_sta_add(struct hostapd_data *hapd, const u8 *addr)
+ {
+ 	struct sta_info *sta;
+ 	int i;
+ 	int num_sta_total = num_sta_get_total(hapd);
+ 	int num_res_sta_total = num_res_sta_get_total(hapd);
+-
++#ifdef CONFIG_VENDOR_MXL
++	u8 *out_limit_reached = &hapd->mxl_data.limit_reached;
++	*out_limit_reached = 0;
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	sta = ap_get_sta(hapd, addr);
+ 	if (sta)
+@@ -828,6 +832,9 @@ struct sta_info * ap_sta_add(struct hostapd_data *hapd, const u8 *addr)
+ 			/* FIX: might try to remove some old STAs first? */
+ 			wpa_printf(MSG_ERROR, "no more room for new STAs (%d/%d)",
+ 				   hapd->num_sta, hapd->conf->max_num_sta);
++#ifdef CONFIG_VENDOR_MXL
++			*out_limit_reached = 1;
++#endif /* CONFIG_VENDOR_MXL */
+ 			return NULL;
+ 		}
+ 	} else { /* Number of reserved STAs is not set for this BSS */
+@@ -835,6 +842,9 @@ struct sta_info * ap_sta_add(struct hostapd_data *hapd, const u8 *addr)
+ 			wpa_printf(MSG_ERROR, "no more room for new STAs, "
+ 				   "reserved STAs limit is reached for BSS(%d/%d)",
+ 				   hapd->num_sta, hapd->conf->max_num_sta - num_res_sta_total);
++#ifdef CONFIG_VENDOR_MXL
++			*out_limit_reached = 1;
++#endif /* CONFIG_VENDOR_MXL */
+ 			return NULL;
+ 		}
+ 	}
+@@ -842,6 +852,9 @@ struct sta_info * ap_sta_add(struct hostapd_data *hapd, const u8 *addr)
+ 	if (num_sta_total >= hapd->iconf->ap_max_num_sta) {
+ 		wpa_printf(MSG_ERROR, "no more room for new STAs, Radio limit reached (%d/%d)",
+ 			   num_sta_total, hapd->iconf->ap_max_num_sta);
++#ifdef CONFIG_VENDOR_MXL
++		*out_limit_reached = 1;
++#endif /* CONFIG_VENDOR_MXL */
+ 		return NULL;
+ 	}
+ 
+@@ -2211,6 +2224,19 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 			goto free_alloc;
+ 		}
+ 		len += ret;
++#ifdef CONFIG_VENDOR_MXL
++		if (sta->flags & WLAN_STA_MULTI_AP) {
++			ret = sprintf_s(sta_extra_cap + len, STA_EXTRA_CAP_LEN - len, "multi_ap_profile=%d ",
++				sta->mxl_sta_info.multi_ap_profile);
++			if (ret <= 0) {
++				os_free(rates);
++				os_free(capabilities);
++				os_free(assoc_req);
++				goto free_alloc;
++			}
++			len += ret;
++		}
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s%s%s%s%s",
+ 			buf, ip_addr, signal_strength, rates, capabilities, assoc_req, sta_extra_cap, keyid_buf, dpp_pkhash_buf);
+diff --git a/src/ap/wpa_auth_glue.c b/src/ap/wpa_auth_glue.c
+index c6a53b80f..5015d51d0 100644
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -574,6 +574,10 @@ int hostapd_wpa_auth_send_eapol(void *ctx, const u8 *addr,
+ 		if (sta->mld_info.mld_sta && (sta->flags & WLAN_STA_AUTHORIZED))
+ 			link_id = -1;
+ #endif /* CONFIG_IEEE80211BE */
++#ifdef CONFIG_VENDOR_MXL
++		if (sta->flags & WLAN_STA_MULTI_AP)
++			flags |= MXL_WPA_STA_MULTI_AP;
++#endif /* CONFIG_VENDOR_MXL */
+ 	}
+ 
+ 	return hostapd_drv_hapd_send_eapol(hapd, addr, data, data_len,
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index f7a7f5fa3..3036420a0 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -158,6 +158,45 @@ static int ieee802_11_parse_vendor_specific(const u8 *pos, size_t elen,
+ 		}
+ 		break;
+ 
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	case OUI_INTEL:
++		switch (pos[3]) {
++		case VENDOR_INTEL_4ADDR_MODE_OUI_TYPE:
++			elems->intel_ie_4addr_mode = pos;
++			elems->intel_ie_4addr_len = elen;
++			break;
++		default:
++			wpa_printf(MSG_EXCESSIVE, "Unknown INTEL "
++				   "information element ignored "
++				   "(type=%d len=%lu)",
++				   pos[3], (unsigned long) elen);
++			return -1;
++		}
++		break;
++
++	case OUI_BRCOM:
++		switch (pos[3]) {
++		case VENDOR_BRCOM_VER2_OUI_TYPE:
++			if (elen < VENDOR_BRCOM_FLAGS1_OFFSET) {
++				wpa_printf(MSG_MSGDUMP, "short Broadcom "
++					   "information element ignored "
++					   "(len=%lu)",
++					   (unsigned long) elen);
++				return -1;
++			}
++			elems->brcom_ie = pos;
++			elems->brcom_ie_len = elen;
++			break;
++		default:
++			wpa_printf(MSG_EXCESSIVE, "Unknown Broadcom "
++				   "information element ignored "
++				   "(type=%d len=%lu)",
++				   pos[3], (unsigned long) elen);
++			return -1;
++		}
++		break;
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
+ 	case OUI_BROADCOM:
+ 		switch (pos[3]) {
+ 		case VENDOR_HT_CAPAB_OUI_TYPE:
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index 2dca522b0..b484969f4 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -11,6 +11,9 @@
+ 
+ #include "defs.h"
+ #include "ieee802_11_defs.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "common/mxl_ieee802_11_common.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ struct element {
+ 	u8 id;
+@@ -122,6 +125,10 @@ struct ieee802_11_elems {
+ 	const u8 *non_inheritance;
+ 	const u8 *wfa_capability_elem;
+ #endif /* CONFIG_VENDOR_MXL */
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	const u8 *intel_ie_4addr_mode;
++	const u8 *brcom_ie;
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
+ 	const u8 *multiple_bssid_index;
+ 
+ 	u8 ssid_len;
+@@ -192,6 +199,10 @@ struct ieee802_11_elems {
+ 	u8 non_inheritance_len;
+ 	u8 wfa_capability_elem_len;
+ #endif /* CONFIG_VENDOR_MXL */
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	u8 intel_ie_4addr_len;
++	u8 brcom_ie_len;
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
+ 
+ 	struct mb_ies_info mb_ies;
+ 
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index f8361c19f..f339b4c40 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1154,6 +1154,20 @@ struct ieee80211_mgmt {
+ 					u8 dialog_token;
+ 					u8 variable[];
+ 				} STRUCT_PACKED rrm;
++#ifdef CONFIG_VENDOR_MXL
++				struct{
++					u8 action_code;
++					u8 switch_mode;
++					u8 oper_class;
++					u8 new_chan;
++					u8 switch_count;
++					u8 variable[];
++				} STRUCT_PACKED ext_chan_switch;
++				struct {
++					u8 action; /* 4 */
++					u8 variable[];
++				} STRUCT_PACKED spectrum_action;
++#endif /* CONFIG_VENDOR_MXL */
+ #ifdef CONFIG_EPCS_MXL
+ 				struct {
+ 					u8 action;
+@@ -1508,7 +1522,6 @@ struct auth_fail_list {
+ #define MULTI_AP_PROFILE_1	1
+ #define MULTI_AP_PROFILE_2	2
+ #define MULTI_AP_PROFILE_MAX	6
+-
+ #define WMM_OUI_TYPE 2
+ #define WMM_OUI_SUBTYPE_INFORMATION_ELEMENT 0
+ #define WMM_OUI_SUBTYPE_PARAMETER_ELEMENT 1
+diff --git a/src/common/mxl_ieee802_11_common.c b/src/common/mxl_ieee802_11_common.c
+index a33f03eeb..76930b751 100644
+--- a/src/common/mxl_ieee802_11_common.c
++++ b/src/common/mxl_ieee802_11_common.c
+@@ -154,3 +154,30 @@ bool mxl_is_6ghz_unii5_unii7(int freq)
+ 	}
+ 	return false;
+ }
++
++
++u16 mxl_ieee802_11_add_vlan_hdr(u8 **buffer, u16 vlan_id, u16 encap_proto, const u8 *data, size_t *len)
++{
++	struct vlan_hdr *vlan_hdr_ptr;
++	errno_t err;
++
++	*buffer = os_zalloc(sizeof(struct vlan_hdr) + *len);
++	if (*buffer) {
++		vlan_hdr_ptr = (struct vlan_hdr *) (*buffer);
++		vlan_hdr_ptr->h_vlan_TCI = host_to_be16(vlan_id);
++		vlan_hdr_ptr->h_vlan_encapsulated_proto = host_to_be16(encap_proto);
++		err = memcpy_s(vlan_hdr_ptr + 1, *len, data, *len);
++		if (err != EOK) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			os_free(*buffer);
++			*buffer = NULL;
++			return encap_proto;
++		}
++		*len += sizeof(struct vlan_hdr);
++		return ETH_P_8021Q;
++	} else {
++		wpa_printf(MSG_ERROR, "%s: Failed to allocate memory for Vlan Header", __func__);
++	}
++
++	return encap_proto;
++}
+\ No newline at end of file
+diff --git a/src/common/mxl_ieee802_11_common.h b/src/common/mxl_ieee802_11_common.h
+index 4c526d836..764074a38 100644
+--- a/src/common/mxl_ieee802_11_common.h
++++ b/src/common/mxl_ieee802_11_common.h
+@@ -32,4 +32,5 @@ inline int action_payload_min_len_expected(u8 *action)
+ 	return IEEE80211_HDRLEN + 2 + 1;
+ }
+ 
++u16 mxl_ieee802_11_add_vlan_hdr(u8 **buffer, u16 vlan_id, u16 encap_proto, const u8 *data, size_t *len);
+ #endif /* MXL_IEEE802_11_COMMON_H */
+diff --git a/src/common/mxl_ieee802_11_defs.h b/src/common/mxl_ieee802_11_defs.h
+index 4fc3d5e6f..26b7ef448 100644
+--- a/src/common/mxl_ieee802_11_defs.h
++++ b/src/common/mxl_ieee802_11_defs.h
+@@ -157,6 +157,16 @@ struct multi_ap_blacklist {
+ 	u8 snrAuthLWM;
+ };
+ 
++/*
++ *  struct vlan_hdr - vlan header
++ *  @h_vlan_TCI: priority and VLAN ID
++ *  @h_vlan_encapsulated_proto: packet type ID or len
++ */
++struct vlan_hdr {
++	be16  h_vlan_TCI;
++	be16  h_vlan_encapsulated_proto;
++} STRUCT_PACKED;
++
+ /* Beacon Measurements */
+ struct tlv {
+ 	u8 type;
+@@ -217,6 +227,32 @@ struct dmg_link_adaptation_ack {
+ 	le32 ref_timestamp;
+ } STRUCT_PACKED;
+ 
++/* Spectrum Management Action codes */
++#define WLAN_SPEC_MGMT_MEASUREMENT_REQUEST 0
++#define WLAN_SPEC_MGMT_MEASUREMENT_REPORT 1
++#define WLAN_SPEC_MGMT_TPC_REQUEST 2
++#define WLAN_SPEC_MGMT_TPC_REPORT 3
++#define WLAN_SPEC_MGMT_CHANNEL_SWITCH_ANNOUNCE 4
++
++/* Multi-AP */
++#define MULTI_AP_VENDOR_TYPE                0x506f9a1b
++
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++/* Intel 4-address mode */
++#define OUI_INTEL                           0x001735
++#define VENDOR_INTEL_ATTRIBUTES_OFFSET      0x4
++#define VENDOR_INTEL_4ADDR_MODE_VENDOR_TYPE 0x00173530
++#define VENDOR_INTEL_4ADDR_MODE_OUI_TYPE    0x30
++#define VENDOR_INTEL_4ADDR_MODE_STA         0x01
++#define VENDOR_INTEL_3ADDR_MODE_STA         0x02
++
++/* Broadcom 4-address mode */
++#define OUI_BRCOM                           0x001018
++#define VENDOR_BRCOM_VER2_VENDOR_TYPE       0x00101802
++#define VENDOR_BRCOM_VER2_OUI_TYPE          0x2
++#define VENDOR_BRCOM_FLAGS1_OFFSET          0x6
++#define VENDOR_BRCOM_DWDS_CAPABLE           0x80
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
+ enum multi_link_support_e {
+ 	MULTILINK_DISABLED,
+ 	MULTILINK_EMLSR,
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index eccfa5695..ce5c42652 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6676,6 +6676,9 @@ union wpa_event_data {
+ 		size_t data_len;
+ 		enum frame_encryption encrypted;
+ 		int link_id;
++#ifdef CONFIG_VENDOR_MXL
++		u16 vlan_id;
++#endif /* CONFIG_VENDOR_MXL */
+ 	} eapol_rx;
+ 
+ 	struct intel_vendor_csa_received csa_received;
+@@ -7101,6 +7104,25 @@ static inline void drv_event_eapol_rx2(void *ctx, const u8 *src, const u8 *data,
+ 	wpa_supplicant_event(ctx, EVENT_EAPOL_RX, &event);
+ }
+ 
++#ifdef CONFIG_VENDOR_MXL
++static inline void mxl_drv_event_eapol_rx2(void *ctx, const u8 *src, const u8 *data,
++					   size_t data_len,
++					   enum frame_encryption encrypted,
++					   int link_id,
++					   u16 vlan_id)
++{
++	union wpa_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.eapol_rx.src = src;
++	event.eapol_rx.data = data;
++	event.eapol_rx.data_len = data_len;
++	event.eapol_rx.encrypted = encrypted;
++	event.eapol_rx.link_id = link_id;
++	event.eapol_rx.vlan_id = vlan_id;
++	wpa_supplicant_event(ctx, EVENT_EAPOL_RX, &event);
++}
++#endif /* CONFIG_VENDOR_MXL */
++
+ static inline void drv_event_ltq_csa_received (void *ctx, const u8 *data, size_t data_len)
+ {
+ 	errno_t err;
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 011b3e41f..9f77ee8ae 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -2860,6 +2860,11 @@ static int nl80211_action_subscribe_ap(struct i802_bss *bss)
+ {
+ 	int ret = 0;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	/* Spectrum MGMT CSA */
++	if (nl80211_register_action_frame(bss, (u8 *) "\x00\x04", 2) < 0)
++		ret = -1;
++#endif /* CONFIG_VENDOR_MXL */
+ 	/* Public Action frames */
+ 	if (nl80211_register_action_frame(bss, (u8 *) "\x04", 1) < 0)
+ 		ret = -1;
+@@ -6501,9 +6506,25 @@ static int wpa_driver_nl80211_hapd_send_eapol(
+ 	 * since it does not provide TX status notifications. */
+ 	if (drv->control_port_ap &&
+ 	    (drv->capa.flags & WPA_DRIVER_FLAGS_CONTROL_PORT))
++#ifdef CONFIG_VENDOR_MXL
++	{
++		struct hostapd_data *hapd = (struct hostapd_data *)(bss->ctx);
++		u8 *vlan_data = NULL;
++		u16 proto = ETH_P_EAPOL;
++		if ((flags & MXL_WPA_STA_MULTI_AP) && (hapd->conf->multi_ap == BACKHAUL_BSS) && hapd->conf->multi_ap_vlanid) {
++			proto = mxl_ieee802_11_add_vlan_hdr(&vlan_data, hapd->conf->multi_ap_vlanid, proto, data, &data_len);
++		}
++
++		res = nl80211_tx_control_port(bss, addr, proto,
++					vlan_data ? vlan_data : data, data_len, !encrypt, link_id);
++		os_free(vlan_data);
++		return res;
++	}
++#else
+ 		return nl80211_tx_control_port(bss, addr, ETH_P_EAPOL,
+ 					       data, data_len, !encrypt,
+ 					       link_id);
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	if (drv->device_ap_sme || !drv->use_monitor)
+ 		return nl80211_send_eapol_data(bss, addr, data, data_len);
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 99471f62b..143d7278d 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3843,10 +3843,18 @@ static void nl80211_control_port_frame(struct wpa_driver_nl80211_data *drv,
+ 			   MAC2STR(src_addr));
+ 		break;
+ 	case ETH_P_PAE:
++#ifdef CONFIG_VENDOR_MXL
++		mxl_drv_event_eapol_rx2(drv->ctx, src_addr,
++					nla_data(tb[NL80211_ATTR_FRAME]),
++					nla_len(tb[NL80211_ATTR_FRAME]),
++					encrypted, link_id,
++					((tb[NL80211_ATTR_VLAN_ID]) ? nla_get_u16(tb[NL80211_ATTR_VLAN_ID]) : 0));
++#else
+ 		drv_event_eapol_rx2(drv->ctx, src_addr,
+ 				    nla_data(tb[NL80211_ATTR_FRAME]),
+ 				    nla_len(tb[NL80211_ATTR_FRAME]),
+ 				    encrypted, link_id);
++#endif /* CONFIG_VENDOR_MXL */
+ 		break;
+ 	default:
+ 		wpa_printf(MSG_INFO,
+diff --git a/src/drivers/mxl_driver.h b/src/drivers/mxl_driver.h
+index 6d899bbc1..a8e855fe7 100644
+--- a/src/drivers/mxl_driver.h
++++ b/src/drivers/mxl_driver.h
+@@ -75,4 +75,6 @@ struct mxl_wpa_event_data {
+ #define HOSTAP_6GHZ_CHANNEL_FIRST 1
+ #define HOSTAP_6GHZ_CHANNEL_LAST 233
+ 
++#define MXL_WPA_STA_MULTI_AP BIT(7)
++
+ #endif /* MXL_DRIVER_H */
+diff --git a/wpa_supplicant/config_ssid.h b/wpa_supplicant/config_ssid.h
+index f873606ab..390ae8666 100644
+--- a/wpa_supplicant/config_ssid.h
++++ b/wpa_supplicant/config_ssid.h
+@@ -12,6 +12,9 @@
+ #include "common/defs.h"
+ #include "utils/list.h"
+ #include "eap_peer/eap_config.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_config_ssid.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ #define DEFAULT_EAP_WORKAROUND ((unsigned int) -1)
+@@ -1277,6 +1280,10 @@ struct wpa_ssid {
+ 	 * to use the interface in a bridge.
+ 	 */
+ 	int enable_4addr_mode;
++
++#ifdef CONFIG_VENDOR_MXL
++	struct mxl_wpa_ssid mxl_wpa_ssid;
++#endif /* CONFIG_VENDOR_MXL */
+ };
+ 
+ #endif /* CONFIG_SSID_H */
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index a4caa72e1..197578e55 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -2316,6 +2316,16 @@ static int wpa_supplicant_ctrl_iface_status(struct wpa_supplicant *wpa_s,
+ 			if (os_snprintf_error(end - pos, ret))
+ 				return pos - buf;
+ 			pos += ret;
++
++#ifdef CONFIG_VENDOR_MXL
++			ret = os_snprintf(pos, end - pos, "multi_ap_profile=%d"
++					  "\nmulti_ap_primary_vlanid=%d\n",
++					  ssid->multi_ap_profile,
++					  ssid->multi_ap_primary_vlanid);
++			if (os_snprintf_error(end - pos, ret))
++				return pos - buf;
++			pos += ret;
++#endif /* CONFIG_VENDOR_MXL */
+ 		}
+ 
+ 		if (wpa_s->connection_set &&
+@@ -3206,6 +3216,13 @@ static int wpa_supplicant_ctrl_iface_scan_result(
+ 		return -1;
+ 	pos += ret;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	ret = mxl_supplicant_dump_vendor_elements(bss, pos, end);
++	if (ret < 0)
++		return -1;
++	pos += ret;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	ret = os_snprintf(pos, end - pos, "\n");
+ 	if (os_snprintf_error(end - pos, ret))
+ 		return -1;
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index 450b2b6d9..508e7b233 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -52,6 +52,9 @@
+ #include "wmm_ac.h"
+ #include "dpp_supplicant.h"
+ #include "drivers/driver_nl80211.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_supplicant.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ #define MAX_OWE_TRANSITION_BSS_SELECT_COUNT 5
+@@ -2992,6 +2995,10 @@ static void multi_ap_process_assoc_resp(struct wpa_supplicant *wpa_s,
+ 		if (ssid->multi_ap_backhaul_sta)
+ 			ssid->multi_ap_primary_vlanid = multi_ap.vlanid;
+ 	}
++
++#ifdef CONFIG_VENDOR_MXL
++	mxl_multi_ap_process_assoc_resp(ssid, &multi_ap);
++#endif /* CONFIG_VENDOR_MXL */
+ }
+ 
+ 
+@@ -3002,13 +3009,20 @@ static void multi_ap_set_4addr_mode(struct wpa_supplicant *wpa_s)
+ 		return;
+ 
+ 	if (!wpa_s->multi_ap_ie) {
++#ifdef CONFIG_VENDOR_MXL
+ 		if  (wpa_s->conf->wds == IEEE80211_VENDOR_WDS_DYNAMIC)
+ 			return;
++#endif /* CONFIG_VENDOR_MXL */
+ 		wpa_printf(MSG_INFO,
+ 			   "AP does not include valid Multi-AP element");
+ 		goto fail;
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (!mxl_check_multi_ap_profile(wpa_s))
++		goto fail;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (!wpa_s->multi_ap_backhaul) {
+ 		if (wpa_s->multi_ap_fronthaul &&
+ 		    wpa_s->current_ssid->key_mgmt & WPA_KEY_MGMT_WPS) {
+@@ -6641,6 +6655,10 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ #endif /* CONFIG_DPP */
+ 		break;
+ 	case EVENT_EAPOL_RX:
++#ifdef CONFIG_VENDOR_MXL
++		if (!mxl_vlan_id_check(wpa_s, data->eapol_rx.src, data->eapol_rx.vlan_id))
++			return;
++#endif /* CONFIG_VENDOR_MXL */
+ 		wpa_supplicant_rx_eapol(wpa_s, data->eapol_rx.src,
+ 					data->eapol_rx.data,
+ 					data->eapol_rx.data_len,
+diff --git a/wpa_supplicant/mxl_config_ssid.h b/wpa_supplicant/mxl_config_ssid.h
+new file mode 100644
+index 000000000..ef9e269c2
+--- /dev/null
++++ b/wpa_supplicant/mxl_config_ssid.h
+@@ -0,0 +1,21 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_CONFIG_SSID_H
++#define MXL_CONFIG_SSID_H
++
++struct mxl_wpa_ssid {
++	u8 multi_ap_profile1_disallowed;
++	u8 multi_ap_profile2_disallowed;
++};
++#endif /* MXL_CONFIG_SSID_H */
+diff --git a/wpa_supplicant/mxl_events.c b/wpa_supplicant/mxl_events.c
+index db815d05f..b59f63bf8 100644
+--- a/wpa_supplicant/mxl_events.c
++++ b/wpa_supplicant/mxl_events.c
+@@ -16,6 +16,7 @@
+ #include "config.h"
+ #include "wpa_supplicant_i.h"
+ #include "common/vendor_cmds_copy.h"
++#include "ap/ap_config.h"
+ 
+ void mxl_drv_event_radar(void *ctx, const u8 *data, size_t data_len)
+ {
+@@ -39,3 +40,48 @@ void mxl_drv_event_radar(void *ctx, const u8 *data, size_t data_len)
+ 		wpas_request_disconnection(wpa_s);
+ 	}
+ }
++
++void mxl_multi_ap_process_assoc_resp(struct wpa_ssid *ssid, struct multi_ap_params *multi_ap)
++{
++	ssid->mxl_wpa_ssid.multi_ap_profile1_disallowed =
++		!!(multi_ap->capability & MULTI_AP_PROFILE1_BACKHAUL_STA_DISALLOWED);
++	ssid->mxl_wpa_ssid.multi_ap_profile2_disallowed =
++		!!(multi_ap->capability & MULTI_AP_PROFILE2_BACKHAUL_STA_DISALLOWED);
++}
++
++bool mxl_vlan_id_check(struct wpa_supplicant *wpa_s, const u8 *src, u16 vlan_id)
++{
++	u16 multi_ap_primary_vlanid;
++
++	if (!wpa_s->current_ssid || !src)
++		return false;
++
++	multi_ap_primary_vlanid = wpa_s->current_ssid->multi_ap_primary_vlanid;
++
++	if (multi_ap_primary_vlanid && (multi_ap_primary_vlanid != vlan_id)) {
++		wpa_printf(MSG_ERROR, "Droping EAPOL Frame(vlan:%u) from " MACSTR " vlan_id mismatch(%u)",
++			   vlan_id, MAC2STR(src), multi_ap_primary_vlanid);
++		return false;
++	}
++
++	return true;
++}
++
++bool mxl_check_multi_ap_profile(struct wpa_supplicant *wpa_s)
++{
++	struct wpa_ssid *ssid = wpa_s->current_ssid;
++
++	if (!ssid)
++		return false;
++
++	if ((ssid->multi_ap_profile == MULTI_AP_PROFILE_1 &&
++	    ssid->mxl_wpa_ssid.multi_ap_profile1_disallowed) ||
++	    (ssid->multi_ap_profile == MULTI_AP_PROFILE_2 &&
++	    ssid->mxl_wpa_ssid.multi_ap_profile2_disallowed)) {
++		wpa_printf(MSG_INFO,
++			   "Muilti-AP agent profile not allowed by AP");
++		return false;
++	}
++
++	return true;
++}
+diff --git a/wpa_supplicant/mxl_supplicant.c b/wpa_supplicant/mxl_supplicant.c
+index 4c81a3e78..43721fcd9 100644
+--- a/wpa_supplicant/mxl_supplicant.c
++++ b/wpa_supplicant/mxl_supplicant.c
+@@ -22,9 +22,10 @@
+ #include "common/mxl_ieee802_11_common.h"
+ #include "config.h"
+ #include "ap/mxl_hostapd.h"
++#include "mxl_supplicant_config.h"
+ #include "mxl_supplicant.h"
+ #include "driver_i.h"
+-
++#include "bss.h"
+ 
+ int mxl_supplicant_drv_get_vendor_data(struct wpa_supplicant *wpa_s,
+ 			int vendor_id, int subcmd,
+@@ -97,3 +98,73 @@ void mxl_supplicant_override_network_modes(struct wpa_supplicant *wpa_s, struct
+ 	if (wpa_s->conf->disable_eht)
+ 		ssid->disable_eht = 1;
+ }
++
++static char * mxl_supplicant_ie_hex(char *pos, char *end, const char *proto,
++				    const u8 *ie, size_t ie_len)
++{
++	int ret;
++
++	ret = sprintf_s(pos, end - pos, "[%s:", proto);
++	if (ret <= 0)
++		return pos;
++	pos += ret;
++
++	ret = wpa_snprintf_hex_uppercase(pos, end-pos, ie, ie_len);
++	if (os_snprintf_error(end - pos, ret))
++		return pos;
++	pos += ret;
++
++	ret = os_snprintf(pos, end - pos, "]");
++	if (os_snprintf_error(end - pos, ret))
++		return pos;
++	pos += ret;
++	return pos;
++}
++
++int mxl_supplicant_dump_vendor_elements(const struct wpa_bss *bss,
++					char *buf, char *end)
++{
++	int ret = 0;
++	char *pos = buf;
++	const u8 *ve_ie;
++
++	/* Dump vendor elements */
++	ret = os_snprintf(pos, end - pos, " VEs=");
++	if (os_snprintf_error(end - pos, ret))
++		return -1;
++	pos += ret;
++	ve_ie = wpa_bss_get_vendor_ie(bss, MULTI_AP_VENDOR_TYPE);
++	if (ve_ie) {
++		pos = mxl_supplicant_ie_hex(pos, end, "MULTIAP", ve_ie, 2 + ve_ie[1]);
++	}
++#ifdef CONFIG_LEGACY_MULTI_AP_MXL
++	ve_ie = wpa_bss_get_vendor_ie(bss, VENDOR_INTEL_4ADDR_MODE_VENDOR_TYPE);
++	if (ve_ie) {
++		pos = mxl_supplicant_ie_hex(pos, end, "INTEL_4ADDR", ve_ie, 2 + ve_ie[1]);
++	}
++	ve_ie = wpa_bss_get_vendor_ie(bss, VENDOR_BRCOM_VER2_VENDOR_TYPE);
++	if (ve_ie) {
++		pos = mxl_supplicant_ie_hex(pos, end, "BRCOM", ve_ie, 2 + ve_ie[1]);
++	}
++#endif /* CONFIG_LEGACY_MULTI_AP_MXL */
++
++	return pos - buf;
++}
++
++int mxl_wpa_drv_tx_control_port(struct wpa_supplicant *wpa_s, const u8 *dest, u16 proto, const u8 *buf, size_t buf_len, int not_encrypt)
++{
++	int ret;
++	u8 *vlan_buf = NULL;
++	size_t len = buf_len;
++
++	if (proto == ETH_P_EAPOL && wpa_s->current_ssid && wpa_s->current_ssid->multi_ap_primary_vlanid) {
++		/* Add vlan header */
++		proto = mxl_ieee802_11_add_vlan_hdr(&vlan_buf, 
++			wpa_s->current_ssid->multi_ap_primary_vlanid, proto, buf, &len);
++	}
++
++	ret = wpa_drv_tx_control_port(wpa_s, dest, proto, vlan_buf ? vlan_buf : buf, len,
++				      not_encrypt);
++	os_free(vlan_buf);
++	return ret;
++}
+diff --git a/wpa_supplicant/mxl_supplicant.h b/wpa_supplicant/mxl_supplicant.h
+index b59cff9c4..40285ac1c 100644
+--- a/wpa_supplicant/mxl_supplicant.h
++++ b/wpa_supplicant/mxl_supplicant.h
+@@ -26,5 +26,10 @@ int mxl_supplicant_drv_get_vendor_data(struct wpa_supplicant *wpa_s,
+ 	mxl_supplicant_drv_get_vendor_data(wpa_s, OUI_LTQ, (cmd__), (void*)(in_ptr__), (in_size__), (void*)(out_ptr__), (out_size__))
+ 
+ void mxl_supplicant_override_network_modes(struct wpa_supplicant *wpa_s, struct wpa_ssid *ssid);
++void mxl_multi_ap_process_assoc_resp(struct wpa_ssid *ssid, struct multi_ap_params *multi_ap);
++int mxl_supplicant_dump_vendor_elements(const struct wpa_bss *bss, char *buf, char *end);
++bool mxl_vlan_id_check(struct wpa_supplicant *wpa_s, const u8 *src, u16 vlan_id);
++int mxl_wpa_drv_tx_control_port(struct wpa_supplicant *wpa_s, const u8 *dest, u16 proto, const u8 *buf, size_t buf_len, int not_encrypt);
++bool mxl_check_multi_ap_profile(struct wpa_supplicant *wpa_s);
+ 
+ #endif
+diff --git a/wpa_supplicant/wpas_glue.c b/wpa_supplicant/wpas_glue.c
+index 55d996d5c..1c3bf0f15 100644
+--- a/wpa_supplicant/wpas_glue.c
++++ b/wpa_supplicant/wpas_glue.c
+@@ -29,6 +29,9 @@
+ #include "scan.h"
+ #include "notify.h"
+ #include "wpas_kay.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_supplicant.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ #ifndef CONFIG_NO_CONFIG_BLOBS
+@@ -117,8 +120,13 @@ int wpa_ether_send(struct wpa_supplicant *wpa_s, const u8 *dest,
+ 		int encrypt = wpa_s->wpa &&
+ 			wpa_sm_has_ptk_installed(wpa_s->wpa);
+ 
++#ifndef CONFIG_VENDOR_MXL
+ 		return wpa_drv_tx_control_port(wpa_s, dest, proto, buf, len,
+ 					       !encrypt);
++#else /* CONFIG_VENDOR_MXL */
++		return mxl_wpa_drv_tx_control_port(wpa_s, dest, proto, buf, len,
++						  !encrypt);
++#endif /* CONFIG_VENDOR_MXL */
+ 	}
+ 
+ 	if (wpa_s->l2) {
+-- 
+2.43.0
+

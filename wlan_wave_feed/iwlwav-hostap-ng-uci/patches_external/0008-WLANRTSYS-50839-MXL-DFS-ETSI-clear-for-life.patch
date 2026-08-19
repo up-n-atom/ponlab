@@ -1,0 +1,454 @@
+From 03884a924bf9585b51e5f6dd773c93ece3333b19 Mon Sep 17 00:00:00 2001
+From: mvuls <mvuls@maxlinear.com>
+Date: Wed, 8 Nov 2023 17:12:30 +0200
+Subject: [PATCH] WLANRTSYS-50839: MXL DFS ETSI clear for life
+
+---
+ hostapd/Makefile                  |   1 +
+ hostapd/mxl_config.c              |  11 ++
+ src/ap/dfs.c                      |  15 +++
+ src/ap/hw_features.c              |   6 +
+ src/ap/mxl_config.h               |   1 +
+ src/ap/mxl_dfs_file.c             | 216 ++++++++++++++++++++++++++++++
+ src/ap/mxl_dfs_file.h             |  21 +++
+ src/ap/mxl_hostapd.h              |   1 +
+ src/drivers/driver.h              |   3 +
+ src/drivers/driver_nl80211_capa.c |   3 +
+ src/drivers/mxl_driver.h          |   4 +
+ 11 files changed, 282 insertions(+)
+ create mode 100644 src/ap/mxl_dfs_file.c
+ create mode 100644 src/ap/mxl_dfs_file.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index ba7be1ac1..b03f4c1e4 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -368,6 +368,7 @@ OBJS += mxl_ctrl_iface.o
+ OBJS += ../src/drivers/mxl_driver_nl80211.o
+ OBJS += ../src/ap/mxl_dfs_common.o
+ OBJS += ../src/ap/mxl_sub_band_dfs.o
++OBJS += ../src/ap/mxl_dfs_file.o
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index e79dbe459..00c9798a0 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -103,6 +103,8 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->sub_band_dfs = val;
++	} else if (os_strcmp(buf, "dfs_channels_state_file_location") == 0) {
++		mxl_conf->dfs_channels_state_file = os_strdup(pos);
+ 	} else
+ 		return 0;
+ 	return 1;
+@@ -135,3 +137,12 @@ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss)
+ 	struct mxl_hostapd_bss_config *mxl_bss_conf = &bss->mxl_bss_conf;
+ 	(void)mxl_bss_conf;
+ }
++
++void mxl_hostapd_config_free(struct hostapd_config *conf)
++{
++	struct mxl_hostapd_config *mxl_conf = &conf->mxl_conf;
++
++	os_free(mxl_conf->dfs_channels_state_file);
++}
++
++
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index ffecc09fa..0bd050ab3 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -19,6 +19,7 @@
+ #include "dfs.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_dfs_common.h"
++#include "mxl_dfs_file.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ enum dfs_channel_type {
+@@ -652,6 +653,9 @@ static int set_dfs_state_freq(struct hostapd_iface *iface, int freq, u32 state)
+ 			if (chan->flag & HOSTAPD_CHAN_RADAR) {
+ 				chan->flag &= ~HOSTAPD_CHAN_DFS_MASK;
+ 				chan->flag |= state;
++#ifdef CONFIG_VENDOR_MXL
++				chan->mxl_chan_data.nop_time_passed_min = 0;
++#endif /* CONFIG_VENDOR_MXL */
+ 				return 1; /* Channel found */
+ 			}
+ 		}
+@@ -1166,6 +1170,9 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 			set_dfs_state(iface, freq, ht_enabled, chan_offset,
+ 				      chan_width, cf1, cf2,
+ 				      HOSTAPD_CHAN_DFS_AVAILABLE);
++#ifdef CONFIG_VENDOR_MXL
++			mxl_hostapd_dfs_file_update(iface, true);
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 			/*
+ 			 * Radar event from background chain for the selected
+@@ -1492,6 +1499,10 @@ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+ 			   cf1, cf2, HOSTAPD_CHAN_DFS_UNAVAILABLE))
+ 		return 0;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_dfs_file_radar(iface);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (!hostapd_dfs_is_background_event(iface, freq)) {
+ 		/* Skip if reported radar event not overlapped our channels */
+ 		if (!dfs_are_channels_overlapped(iface, freq, chan_width,
+@@ -1529,6 +1540,10 @@ int hostapd_dfs_nop_finished(struct hostapd_iface *iface, int freq,
+ 	set_dfs_state(iface, freq, ht_enabled, chan_offset, chan_width,
+ 		      cf1, cf2, HOSTAPD_CHAN_DFS_USABLE);
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_dfs_file_update(iface, false);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (iface->state == HAPD_IFACE_DFS && !iface->cac_started) {
+ 		/* Handle cases where all channels were initially unavailable */
+ 		hostapd_handle_dfs(iface);
+diff --git a/src/ap/hw_features.c b/src/ap/hw_features.c
+index 82a39b426..17718e8b0 100644
+--- a/src/ap/hw_features.c
++++ b/src/ap/hw_features.c
+@@ -25,6 +25,8 @@
+ #include "hw_features.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "common/mxl_ieee802_11_common.h"
++#include "mxl_hostapd.h"
++#include "mxl_dfs_file.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+@@ -1312,6 +1314,10 @@ int hostapd_select_hw_mode(struct hostapd_iface *iface)
+ 			return -2;
+ 		}
+ 	}
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_hostapd_send_dfs_channel_state(iface))
++		return -1;
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	switch (hostapd_check_chans(iface)) {
+ 	case HOSTAPD_CHAN_VALID:
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 2ea876aa6..9b4cfde49 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -29,6 +29,7 @@ struct mxl_hostapd_config {
+ 
+ 	int allow_scan_during_cac;
+ 	int sub_band_dfs;
++	char *dfs_channels_state_file;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_dfs_file.c b/src/ap/mxl_dfs_file.c
+new file mode 100644
+index 000000000..0237819d3
+--- /dev/null
++++ b/src/ap/mxl_dfs_file.c
+@@ -0,0 +1,216 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "utils/eloop.h"
++#include "hostapd.h"
++#include "common/hw_features_common.h"
++#include "mxl_dfs_common.h"
++int  mxl_is_in_chanlist(struct hostapd_iface *iface, struct hostapd_channel_data *chan);
++
++static int mxl_hostapd_dfs_channel_state_file_update(struct hostapd_iface *iface, int update_time)
++{
++	struct hostapd_channel_data *channel;
++	int i;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	FILE *f;
++	int keep_going = 0;
++	struct mxl_hostapd_config *mxl_conf = &iface->conf->mxl_conf;
++
++
++	if (!mxl_conf->dfs_channels_state_file)
++		return 0;
++
++	f = fopen(mxl_conf->dfs_channels_state_file, "w");
++	if (!f) {
++		wpa_printf(MSG_ERROR, "dfs_channels_state_file file '%s' not writable.", mxl_conf->dfs_channels_state_file);
++		os_free(mxl_conf->dfs_channels_state_file);
++		mxl_conf->dfs_channels_state_file = NULL;
++		return 0;
++	}
++
++	fprintf(f,"#state=0(USABLE),1(AVAILABLE),2(UNAVAILABLE)\n");
++
++	for (i = 0; i < mode->num_channels; i++) {
++		channel = &mode->channels[i];
++		if (channel->flag & HOSTAPD_CHAN_RADAR && mxl_is_in_chanlist(iface, channel)) {
++			if (((channel->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_AVAILABLE) &&
++					(iface->dfs_domain == HOSTAPD_DFS_REGION_ETSI)) {
++				fprintf(f,"channel=%d,state=1,nop_time=0\n", channel->chan);
++			}
++			if ((channel->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_UNAVAILABLE) {
++				if (channel->mxl_chan_data.nop_time_passed_min < 30) {
++					if (update_time) channel->mxl_chan_data.nop_time_passed_min++;
++					keep_going = 1;
++					fprintf(f,"channel=%d,state=2,nop_time=%d\n", channel->chan, channel->mxl_chan_data.nop_time_passed_min);
++				}
++			}
++		}
++	}
++	fclose(f);
++	return keep_going;
++}
++
++static void mxl_hostapd_dfs_channel_state_file_update_eloop(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_iface *iface = eloop_ctx;
++	if (mxl_hostapd_dfs_channel_state_file_update(iface, 1))
++		eloop_register_timeout(60, 0, mxl_hostapd_dfs_channel_state_file_update_eloop, iface, NULL);
++}
++
++static void mxl_hostapd_dfs_channel_state_file_parse(struct hostapd_iface *iface)
++{
++	struct hostapd_channel_data *ch;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	FILE *f;
++	int line = 0;
++	char buf[128], *pos;
++	int channel, state, nop_time;
++	struct mxl_hostapd_config *mxl_conf = &iface->conf->mxl_conf;
++	f = fopen(mxl_conf->dfs_channels_state_file, "r");
++	if (!f) {
++	/* no file yet, will be created later on*/
++		return;
++	}
++
++	while (fgets(buf, sizeof(buf), f)) {
++		line++;
++
++		if (buf[0] == '#')
++			continue;
++		pos = buf;
++		while (*pos != '\0') {
++			if (*pos == '\n') {
++				*pos = '\0';
++				break;
++			}
++			pos++;
++		}
++		if (buf[0] == '\0')
++			continue;
++		if (sscanf(buf, "channel=%d,state=%d,nop_time=%d", &channel, &state, &nop_time) != 3) {
++			wpa_printf(MSG_ERROR, "Invalid text at "
++					   "line %d in '%s'", line, mxl_conf->dfs_channels_state_file);
++			continue;
++		}
++		ch = hw_get_channel_chan(mode, channel, NULL);
++		if ( !ch || !mxl_is_in_chanlist(iface, ch)) {
++			wpa_printf(MSG_ERROR, "Invalid channel at "
++					   "line %d in '%s'", line, mxl_conf->dfs_channels_state_file);
++			continue;
++		}
++		if (state == 1) {
++			if (iface->dfs_domain != HOSTAPD_DFS_REGION_ETSI) {
++				wpa_printf(MSG_ERROR, "No support for available channels in non ETSI regions - at "
++					   "line %d in '%s'", line, mxl_conf->dfs_channels_state_file);
++				continue;
++			}
++			if ((ch->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_UNAVAILABLE) {
++			/* A radar was detected while hostapd was down */
++				goto state2;
++			}
++
++			mxl_set_dfs_state_freq(iface, ch->freq, HOSTAPD_CHAN_DFS_AVAILABLE);
++		}
++		if (state == 2) {
++			if (nop_time == 30) {
++				/* nop ended */
++				continue;
++			}
++state2:
++			mxl_set_dfs_state_freq(iface, ch->freq, HOSTAPD_CHAN_DFS_UNAVAILABLE);
++			if ((nop_time >= 0) && (nop_time < 30)) {
++				ch->mxl_chan_data.nop_time_passed_min = nop_time;
++			}
++			else
++			{
++				wpa_printf(MSG_ERROR, "Invalid nop_time at "
++					   "line %d in '%s'", line, mxl_conf->dfs_channels_state_file);
++				continue;
++			}
++		}
++	}
++
++	fclose(f);
++}
++
++void mxl_hostapd_dfs_file_update(struct hostapd_iface *iface, bool only_when_etsi)
++{
++	if (!iface->conf->mxl_conf.dfs_channels_state_file)
++		return;
++
++	if (only_when_etsi && (iface->dfs_domain != HOSTAPD_DFS_REGION_ETSI))
++		return;
++	
++	mxl_hostapd_dfs_channel_state_file_update(iface, 0);
++}
++
++void mxl_hostapd_dfs_file_radar(struct hostapd_iface *iface)
++{
++	if (iface->conf->mxl_conf.dfs_channels_state_file) {
++		/* If registered restart the timeout, so we won't update the nop time too soon */
++		if (eloop_is_timeout_registered(mxl_hostapd_dfs_channel_state_file_update_eloop, iface, NULL))
++			eloop_cancel_timeout(mxl_hostapd_dfs_channel_state_file_update_eloop, iface, NULL);
++		mxl_hostapd_dfs_channel_state_file_update(iface, 0);
++		eloop_register_timeout(60, 0, mxl_hostapd_dfs_channel_state_file_update_eloop, iface, NULL);
++	}
++}
++
++int mxl_hostapd_send_dfs_channel_state(struct hostapd_iface *iface)
++{
++	int i;
++	int update = 0;
++	struct hostapd_channel_data *channel;
++	struct hostapd_data *hapd = iface->bss[0];
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	if (!mode || !hapd) {
++		wpa_printf(MSG_ERROR, "HW mode or hostapd data not initialized, dfs channels state won't be sent");
++		return 1;
++	}
++
++	if (!iface->conf->mxl_conf.dfs_channels_state_file)
++		return 0;
++
++	/* So we will update the kernel only once, in boot, and not in every disable-enable */
++	if (!iface->mxl_iface.boot) {
++		mxl_hostapd_dfs_channel_state_file_parse(iface);
++
++		for (i = 0; i < mode->num_channels; i++) {
++			channel = &mode->channels[i];
++			if (channel->flag & HOSTAPD_CHAN_RADAR) {
++				if (((channel->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_AVAILABLE) &&
++						(iface->dfs_domain == HOSTAPD_DFS_REGION_ETSI)) {
++					mxl_hostapd_set_chan_dfs_state(iface, NL80211_DFS_AVAILABLE, channel->freq, 0, 0);
++				}
++				if ((channel->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_UNAVAILABLE) {
++					mxl_hostapd_set_chan_dfs_state(iface, NL80211_DFS_UNAVAILABLE, channel->freq, channel->mxl_chan_data.nop_time_passed_min, 0);
++					update = 1;
++				}
++			}
++		}
++		iface->mxl_iface.boot = true;
++	}
++	/* In case we had some radars while disabled */
++	else {
++		update = 1;
++	}
++	mxl_hostapd_dfs_channel_state_file_update(iface, 0);
++	if (update) {
++		/* Only register if not already registered - not needed otherwise */
++		if (!eloop_is_timeout_registered(mxl_hostapd_dfs_channel_state_file_update_eloop, iface, NULL))
++			eloop_register_timeout(60, 0, mxl_hostapd_dfs_channel_state_file_update_eloop, iface, NULL);
++	}
++	return 0;
++}
+diff --git a/src/ap/mxl_dfs_file.h b/src/ap/mxl_dfs_file.h
+new file mode 100644
+index 000000000..e76757618
+--- /dev/null
++++ b/src/ap/mxl_dfs_file.h
+@@ -0,0 +1,21 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_DFS_FILE_H
++#define MXL_DFS_FILE_H
++
++void mxl_hostapd_dfs_file_update(struct hostapd_iface *iface, bool only_when_etsi);
++void mxl_hostapd_dfs_file_radar(struct hostapd_iface *iface);
++int mxl_hostapd_send_dfs_channel_state(struct hostapd_iface *iface);
++
++#endif /* MXL_DFS_FILE_H */
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index b84ce55df..dca4b31b7 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -67,6 +67,7 @@ struct mxl_hostapd_iface {
+ 	int dfs_hist_entry_cnt;
+ 	hostapd_sb_dfs_orig_chandef_t sb_orig_chandef;
+ 	struct dl_list dfs_history; /* struct hostapd_dfs_history */
++	bool boot;
+ };
+ 
+ struct mxl_hostapd_data {
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 1e4b3fece..610458d87 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -179,6 +179,9 @@ struct hostapd_channel_data {
+ 	 * punct_bitmap - RU puncturing bitmap
+ 	 */
+ 	u16 punct_bitmap;
++#ifdef CONFIG_VENDOR_MXL
++	struct mxl_chan_data mxl_chan_data;
++#endif
+ };
+ 
+ #define HE_MAC_CAPAB_0		0
+diff --git a/src/drivers/driver_nl80211_capa.c b/src/drivers/driver_nl80211_capa.c
+index 8e033ceb0..847631bfb 100644
+--- a/src/drivers/driver_nl80211_capa.c
++++ b/src/drivers/driver_nl80211_capa.c
+@@ -1681,6 +1681,9 @@ static void phy_info_freq(struct hostapd_hw_modes *mode,
+ 	chan->flag = 0;
+ 	chan->allowed_bw = ~0;
+ 	chan->dfs_cac_ms = 0;
++#ifdef CONFIG_VENDOR_MXL
++	chan->mxl_chan_data.nop_time_passed_min = 0;
++#endif /* CONFIG_VENDOR_MXL */
+ 	if (ieee80211_freq_to_chan(chan->freq, &channel) != NUM_HOSTAPD_MODES)
+ 		chan->chan = channel;
+ 	else
+diff --git a/src/drivers/mxl_driver.h b/src/drivers/mxl_driver.h
+index 349a8c908..895641aa3 100644
+--- a/src/drivers/mxl_driver.h
++++ b/src/drivers/mxl_driver.h
+@@ -22,4 +22,8 @@ struct mxl_csa_settings {
+ 	s8 sb_dfs_bw; /* From enum nl80211_sb_dfs_bw, must be signed to store error (-1) */
+ };
+ 
++struct mxl_chan_data {
++	unsigned int nop_time_passed_min;
++};
++
+ #endif /* MXL_DRIVER_H */
+-- 
+2.43.0
+

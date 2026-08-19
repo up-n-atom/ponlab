@@ -1,0 +1,1105 @@
+From 6372c76d74594981bb1ad42de72768d2fc179bf2 Mon Sep 17 00:00:00 2001
+From: mvuls <mvuls@maxlinear.com>
+Date: Thu, 9 Nov 2023 11:39:24 +0200
+Subject: [PATCH] WLANRTSYS-50839: MXL ZWDFS
+
+---
+ hostapd/Makefile                   |   1 +
+ hostapd/ctrl_iface.c               |   5 +-
+ hostapd/main.c                     |   5 +
+ hostapd/mxl_config.c               |   7 +
+ hostapd/mxl_ctrl_iface.c           |  35 ++++
+ hostapd/mxl_hostapd_cli.c          |  31 +++
+ hostapd/mxl_hostapd_cli.h          |   6 +
+ src/ap/beacon.c                    |   3 +
+ src/ap/dfs.c                       |   8 +
+ src/ap/hostapd.c                   |   6 +-
+ src/ap/mxl_config.h                |   1 +
+ src/ap/mxl_dfs_common.c            |   8 +-
+ src/ap/mxl_dfs_common.h            |   9 +
+ src/ap/mxl_events.c                |  37 ++++
+ src/ap/mxl_hostapd.c               |  94 +++++++++
+ src/ap/mxl_hostapd.h               |   9 +
+ src/ap/mxl_zwdfs.c                 | 312 +++++++++++++++++++++++++++++
+ src/ap/mxl_zwdfs.h                 |  29 +++
+ src/common/ieee802_11_defs.h       |   3 +
+ src/common/mxl_ieee802_11_defs.h   |   1 +
+ src/common/mxl_vendor.h            |   1 +
+ src/common/mxl_wpa_ctrl.h          |   4 +
+ src/common/vendor_cmds_copy.h      |   7 +
+ src/drivers/driver.h               |   4 +
+ src/drivers/driver_nl80211_capa.c  |   7 +
+ src/drivers/driver_nl80211_event.c |   9 +
+ src/drivers/mxl_driver.h           |   3 +
+ src/drivers/mxl_driver_nl80211.c   |   6 +
+ src/drivers/mxl_driver_nl80211.h   |   1 +
+ 29 files changed, 643 insertions(+), 9 deletions(-)
+ create mode 100644 src/ap/mxl_zwdfs.c
+ create mode 100644 src/ap/mxl_zwdfs.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index b03f4c1e4..0fca86790 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -369,6 +369,7 @@ OBJS += ../src/drivers/mxl_driver_nl80211.o
+ OBJS += ../src/ap/mxl_dfs_common.o
+ OBJS += ../src/ap/mxl_sub_band_dfs.o
+ OBJS += ../src/ap/mxl_dfs_file.o
++OBJS += ../src/ap/mxl_zwdfs.o
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 835fb0f90..519df2035 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2624,7 +2624,10 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ 		}
+ 
+ 		settings.freq_params.channel = chan;
+-
++#ifdef CONFIG_VENDOR_MXL
++		if (mxl_hostapd_background_cac_possible(iface))
++			return mxl_hostapd_start_background_cac(iface, &settings);
++#endif /* CONFIG_VENDOR_MXL */
+ 		wpa_printf(MSG_DEBUG,
+ 			   "DFS/CAC to (channel=%u, freq=%d, sec_channel_offset=%d, bw=%d, center_freq1=%d)",
+ 			   settings.freq_params.channel,
+diff --git a/hostapd/main.c b/hostapd/main.c
+index b821b2a4a..76a369c5a 100644
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -310,6 +310,11 @@ setup_mld:
+ 
+ 		iface->drv_flags = capa.flags;
+ 		iface->drv_flags2 = capa.flags2;
++
++#ifdef CONFIG_VENDOR_MXL
++		iface->mxl_iface.drv_flags = capa.mxl_flags;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 		iface->probe_resp_offloads = capa.probe_resp_offloads;
+ 		/*
+ 		 * Use default extended capa values from per-radio information
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index a300a4b27..1d41c5221 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -112,6 +112,13 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->process_radar_slave_events = val;
++	} else if  (os_strcmp(buf, "background_cac") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid backround_cac value %d", line, val);
++			return 0;
++		}
++		mxl_conf->background_cac = val;
+ 	} else
+ 		return 0;
+ 	return 1;
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 9caa69b95..bc32a3d8e 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -257,6 +257,35 @@ static int mxl_hostapd_ctrl_iface_get_dfs_stats(struct hostapd_iface *iface, con
+ 	return len;
+ }
+ 
++static int mxl_hostapd_ctrl_iface_set_zwdfs_antenna(struct hostapd_data *hapd, char *cmd)
++{
++	int enable = atoi(cmd);
++
++	if (!IS_VALID_BOOL_RANGE(enable)) {
++		wpa_printf(MSG_ERROR, "CTRL: ZWDFS_ANT_SWITCH - Bad configuration option");
++		return -1;
++	}
++
++	return mxl_hostapd_set_zwdfs_antenna(hapd, enable);
++}
++
++static int mxl_hostapd_ctrl_iface_get_zwdfs_antenna(struct hostapd_data *hapd, char *reply, size_t reply_size)
++{
++	int res = 0;
++	int enabled;
++
++	if (mxl_hostapd_drv_get_zwdfs_antenna(hapd, &enabled))
++		return -1;
++
++	res = sprintf_s(reply, reply_size, "%d\n", enabled);
++	if (res <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++
++	return res;
++}
++
+ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -272,6 +301,12 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_failsafe_chan(hapd->iface, NULL, reply, reply_size);
+ 	} else if (os_strncmp(buf, "GET_DFS_STATS", 13) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_dfs_stats(hapd->iface, NULL, reply, reply_size);
++	} else if (os_strncmp(buf, "ZWDFS_ANT_SWITCH ", 17) == 0) {
++		if (mxl_hostapd_ctrl_iface_set_zwdfs_antenna(hapd, buf + 17) < 0)
++			*reply_len = -1;
++	} else if (os_strncmp(buf, "GET_ZWDFS_ANT", 13) == 0) {
++		if (mxl_hostapd_ctrl_iface_get_zwdfs_antenna(hapd, reply, reply_size) < 0)
++			*reply_len = -1;
+ 	} else {
+ 		return 0;
+ 	}
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index e461ff653..5b0da1982 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -112,3 +112,34 @@ int mxl_hostapd_cli_cmd_get_dfs_stats(struct wpa_ctrl *ctrl, int argc, char *arg
+ 
+ 	return mxl_wpa_ctrl_command(ctrl, cmd);
+ }
++
++int mxl_hostapd_cli_cmd_set_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 1) {
++		printf("Invalid zwdfs antenna set command - requires enable (1) / disable (0) value\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "ZWDFS_ANT_SWITCH %s", argv[0]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
++
++int mxl_hostapd_cli_cmd_get_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[32];
++	int res;
++
++	res = sprintf_s(cmd, sizeof(cmd), "GET_ZWDFS_ANT", argv[0]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index e4e715e2d..0ee125f71 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -28,10 +28,16 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 	  "get failsafe channel" },							\
+ 	{ "get_dfs_stats", mxl_hostapd_cli_cmd_get_dfs_stats, NULL,			\
+ 	  " = get Sub band DFS and radar detected per channel stats" },			\
++	{ "set_zwdfs_antenna", mxl_hostapd_cli_cmd_set_zwdfs_antenna, NULL,		\
++	  " = Enable/Disable ZWDFS antenna"},						\
++	{ "get_zwdfs_antenna", mxl_hostapd_cli_cmd_get_zwdfs_antenna, NULL,		\
++	  " = get ZWDFS antenna Enabled/Disabled"},					\
+ 
+ int mxl_hostapd_cli_cmd_get_hw_features(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_set_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_get_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_get_dfs_stats(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_set_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ 
+ #endif /* MXL_HOSTAPD_CLI_H */
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 935ffd25e..df2920751 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2259,6 +2259,9 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 
+ 	tailpos = hostapd_eid_wb_chsw_wrapper(hapd, tailpos);
+ 
++#ifdef CONFIG_VENDOR_MXL
++	tailpos = mxl_hostapd_eid_opmodenotif(hapd, tailpos);
++#endif /* CONFIG_VENDOR_MXL */
+ 	tailpos = hostapd_eid_rnr(hapd, tailpos, WLAN_FC_STYPE_BEACON);
+ 	tailpos = hostapd_eid_fils_indic(hapd, tailpos, 0);
+ 	tailpos = hostapd_get_rsnxe(hapd, tailpos, tailend - tailpos);
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 7e4bd5310..e5d112e79 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -20,6 +20,7 @@
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_dfs_common.h"
+ #include "mxl_dfs_file.h"
++#include "mxl_zwdfs.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ enum dfs_channel_type {
+@@ -788,6 +789,9 @@ static int dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq,
+ 
+ 	for (i = 0; i < n_chans; i++) {
+ 		chan = &mode->channels[start_chan_idx + i];
++#ifdef CONFIG_VENDOR_MXL
++		if (mxl_hostapd_check_only_dfs_chans(iface))
++#endif /* CONFIG_VENDOR_MXL */
+ 		if (!(chan->flag & HOSTAPD_CHAN_RADAR))
+ 			continue;
+ 		for (j = 0; j < radar_n_chans; j++) {
+@@ -1213,6 +1217,10 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 		hostpad_dfs_update_background_chain(iface);
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	return mxl_hostapd_zwdfs_switch(iface, success, freq, chan_width, cf1, cf2);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	return 0;
+ }
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 7acd4bccd..20456c605 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -667,7 +667,7 @@ static void hostapd_cleanup_iface(struct hostapd_iface *iface)
+ 
+ 	hostapd_cleanup_iface_partial(iface);
+ #ifdef CONFIG_VENDOR_MXL
+-	mxl_hostapd_dfs_history_deinit(iface);
++	mxl_hostapd_cleanup_iface(iface);
+ #endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_config_free(iface->conf);
+ 	iface->conf = NULL;
+@@ -2806,6 +2806,10 @@ void hostapd_interface_deinit(struct hostapd_iface *iface)
+ 	}
+ #endif /* CONFIG_FST */
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_interface_deinit(iface);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	for (j = (int) iface->num_bss - 1; j >= 0; j--) {
+ 		if (!iface->bss)
+ 			break;
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 2d31b10c3..7b93a5cb9 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -31,6 +31,7 @@ struct mxl_hostapd_config {
+ 	int sub_band_dfs;
+ 	char *dfs_channels_state_file;
+ 	int process_radar_slave_events;
++	int background_cac;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_dfs_common.c b/src/ap/mxl_dfs_common.c
+index 31ee80bec..708c81839 100644
+--- a/src/ap/mxl_dfs_common.c
++++ b/src/ap/mxl_dfs_common.c
+@@ -25,12 +25,6 @@
+ #include "common/vendor_cmds_copy.h"
+ #include "common/mxl_wpa_ctrl.h"
+ 
+-/* CAC finished reason code */
+-enum mxl_hostapd_cac_finished_stat {
+-	HOSTAPD_CAC_STAT_FAILED  = 0,
+-	HOSTAPD_CAC_STAT_SUCCESS = 1,
+-	HOSTAPD_CAC_STAT_PAUSED  = 2
+-};
+ 
+ int mxl_hostapd_set_chan_dfs_state(struct hostapd_iface *iface, enum nl80211_dfs_state dfs_state,
+ 				   int freq, int dfs_time, int dfs_debug)
+@@ -263,7 +257,7 @@ void mxl_hostapd_clear_rbm(void *ctx)
+ 	hapd->iface->mxl_iface.rbm = 0;
+ }
+ 
+-static int mxl_set_first_non_dfs_channel(struct hostapd_iface *iface)
++int mxl_set_first_non_dfs_channel(struct hostapd_iface *iface)
+ {
+ 	int j;
+ 	int flag;
+diff --git a/src/ap/mxl_dfs_common.h b/src/ap/mxl_dfs_common.h
+index af590f311..c4e5a5fa7 100644
+--- a/src/ap/mxl_dfs_common.h
++++ b/src/ap/mxl_dfs_common.h
+@@ -16,6 +16,13 @@
+ 
+ #include "drivers/mxl_driver_nl80211.h"
+ 
++/* CAC finished reason code */
++enum mxl_hostapd_cac_finished_stat {
++	HOSTAPD_CAC_STAT_FAILED  = 0,
++	HOSTAPD_CAC_STAT_SUCCESS = 1,
++	HOSTAPD_CAC_STAT_PAUSED  = 2
++};
++
+ int mxl_hostapd_drv_set_antenna(struct hostapd_iface *iface);
+ void mxl_hostapd_event_dfs_cac_paused(struct hostapd_data *hapd, struct dfs_event *radar);
+ struct hostapd_channel_data *
+@@ -49,5 +56,7 @@ bool mxl_hostapd_handle_first_non_dfs(struct hostapd_iface *iface);
+ int mxl_set_dfs_state(struct hostapd_iface *iface, int freq, int ht_enabled, int chan_offset, int chan_width, int cf1, int cf2, u32 state);
+ int mxl_dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq, int chan_width, int cf1, int cf2);
+ void mxl_hostapd_vendor_radar_detected(struct hostapd_data *hapd, const u8 *data, size_t data_len);
++int mxl_set_first_non_dfs_channel(struct hostapd_iface *iface);
++
+ 
+ #endif /* MXL_DFS_COMMON_H */
+diff --git a/src/ap/mxl_events.c b/src/ap/mxl_events.c
+index 96c70e9bf..4e075ec8a 100644
+--- a/src/ap/mxl_events.c
++++ b/src/ap/mxl_events.c
+@@ -20,6 +20,7 @@
+ enum mxl_event_type {
+ 	EVENT_MXL_FLUSH_STATIONS_RX,
+ 	EVENT_MXL_RADAR,
++	EVENT_MXL_COC,
+ };
+ 
+ union mxl_event_data {
+@@ -34,6 +35,11 @@ union mxl_event_data {
+ 		const u8 *data;
+ 		size_t data_len;
+ 	} radar;
++
++	struct coc {
++		const u8 *data;
++		size_t data_len;
++	} coc;
+ };
+ 
+ static const char * mxl_event_to_string(enum mxl_event_type event)
+@@ -42,6 +48,7 @@ static const char * mxl_event_to_string(enum mxl_event_type event)
+ 	switch (event) {
+ 	E2S(MXL_FLUSH_STATIONS_RX);
+ 	E2S(MXL_RADAR);
++	E2S(MXL_COC);
+ 	}
+ 
+ 	return "UNKNOWN";
+@@ -82,6 +89,23 @@ static void mxl_event_radar_detected(struct hostapd_data *hapd, const u8 *data,
+ 	mxl_hostapd_vendor_radar_detected(hapd, data, data_len);
+ }
+ 
++static void mxl_event_coc(struct hostapd_data *hapd, const u8 *data, size_t data_len)
++{
++	struct hostapd_iface *iface = hapd->iface;
++
++	/* Discard event if interface didn't finished initialization.
++	 * This may happen when driver sends irrelevant events due to station mode actions
++	 */
++	if (iface->state == HAPD_IFACE_UNINITIALIZED ||
++	    iface->state == HAPD_IFACE_DISABLED ||
++	    iface->state == HAPD_IFACE_COUNTRY_UPDATE ) {
++		wpa_printf(MSG_DEBUG, "discard driver event (%s) - interface not ready yet", __FUNCTION__);
++		return;
++	}
++
++	mxl_hostapd_update_coc(iface, data, data_len);
++}
++
+ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 			  union mxl_event_data *data)
+ {
+@@ -99,6 +123,10 @@ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 	case EVENT_MXL_RADAR:
+ 		mxl_event_radar_detected(hapd, data->radar.data, data->radar.data_len);
+ 		break;
++	case EVENT_MXL_COC:
++		mxl_event_coc(hapd, data->coc.data, data->coc.data_len);
++		break;
++	
+ 	default:
+ 		wpa_printf(MSG_ERROR, "Unknown MXL event %d", event);
+ 		break;
+@@ -123,3 +151,12 @@ void mxl_drv_event_radar(void *ctx, const u8 *data, size_t data_len)
+ 	event.radar.data_len = data_len;
+ 	mxl_process_event(ctx, EVENT_MXL_RADAR, &event);
+ }
++
++void mxl_drv_event_coc(void *ctx, const u8 *data, size_t data_len)
++{
++	union mxl_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.radar.data = data;
++	event.radar.data_len = data_len;
++	mxl_process_event(ctx, EVENT_MXL_COC, &event);
++}
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 09a8d078b..003fc5911 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -13,14 +13,21 @@
+ 
+ #include "utils/includes.h"
+ #include "utils/common.h"
++#include "utils/eloop.h"
+ #include "hostapd.h"
+ #include "ap_drv_ops.h"
+ #include "ap_config.h"
+ #include "sta_info.h"
++#include "beacon.h"
+ #include "mxl_hostapd.h"
+ #include "common/vendor_cmds_copy.h"
+ 
+ 
++#define COC_POWER_1x1_STATE 1
++#define COC_POWER_2x2_STATE 2
++#define COC_POWER_3x3_STATE 3
++#define COC_POWER_4x4_STATE 4
++
+ static void ap_sta_remove_in_other_bss_now(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	struct hostapd_iface *iface = hapd->iface;
+@@ -370,3 +377,90 @@ enum oper_chan_width mxl_get_oper_width(int width)
+ 
+ 	return -1; /* should never happen */
+ }
++
++void mxl_hostapd_cleanup_iface(struct hostapd_iface *iface)
++{
++	mxl_hostapd_dfs_history_deinit(iface);
++	if (iface->mxl_iface.zwdfs_info.csa_settings)
++		os_free(iface->mxl_iface.zwdfs_info.csa_settings);
++}
++
++static void mxl_ap_max_nss_omn_elem_timeout(void *eloop_data, void *user_data)
++{
++	struct hostapd_iface *iface = eloop_data;
++
++	wpa_printf(MSG_INFO, "Removing OMN element from beacon");
++
++	iface->mxl_iface.require_omn = 0;
++	ieee802_11_update_beacons(iface);
++}
++
++void mxl_hostapd_update_coc(struct hostapd_iface *iface, const u8 *data, size_t data_len)
++{
++	struct intel_vendor_event_coc *bw_params = (struct intel_vendor_event_coc *)data;
++
++	if (sizeof(*bw_params) != data_len) {
++		wpa_printf(MSG_ERROR, "Vendor COC event incorrect size %zu, expected %zu", data_len, sizeof(*bw_params));
++		return;
++	}
++
++	/* Should we send OMN IE continuesly or for certain period need to check */
++	iface->mxl_iface.require_omn = bw_params->coc_omn_IE;
++	eloop_cancel_timeout(mxl_ap_max_nss_omn_elem_timeout, iface, NULL);
++
++	ieee802_11_update_beacons(iface);
++
++	if (bw_params->coc_is_max_nss)
++		eloop_register_timeout(2, 0, mxl_ap_max_nss_omn_elem_timeout, iface, NULL);
++}
++
++u8 * mxl_hostapd_eid_opmodenotif(struct hostapd_data *hapd, u8 *eid)
++{
++	u8 *pos = eid;
++	enum oper_chan_width bw = hostapd_get_oper_chwidth(hapd->iface->conf);
++	int omn_ie = hapd->iface->mxl_iface.require_omn;
++
++	if (!omn_ie)
++		return pos;
++
++	*pos++ = WLAN_EID_OPERATING_MODE_NOTIFICATION;
++	*pos++ = 1;
++
++	if (omn_ie == COC_POWER_1x1_STATE) {
++		*pos = 0;
++	} else if (omn_ie == COC_POWER_2x2_STATE) {
++		*pos = BIT(4);
++	} else if (omn_ie == COC_POWER_3x3_STATE) {
++		*pos = BIT(5);
++	} else if (omn_ie == COC_POWER_4x4_STATE) {
++		*pos = BIT(4) | BIT (5);
++	}
++
++	switch (bw) {
++		case CONF_OPER_CHWIDTH_USE_HT:
++			if (hapd->iface->conf->secondary_channel == 0) {
++				*pos &= ~BIT(0);  /* For 20Mhz value should be zero*/
++			} else {
++				*pos |= BIT(0);
++			}
++			break;
++		case CONF_OPER_CHWIDTH_80MHZ:
++			*pos |= BIT(1);
++			break;
++		case CONF_OPER_CHWIDTH_160MHZ:
++			*pos |=  BIT (1) | BIT(2);
++			break;
++		default:
++			*pos &= ~BIT(0);
++			wpa_printf(MSG_INFO,"BW parameter on OMN IE  set to Default 20Mhz \n");
++			break;
++	}
++
++	pos++;
++	return pos;
++}
++
++void mxl_hostapd_interface_deinit(struct hostapd_iface *iface)
++{
++	eloop_cancel_timeout(mxl_ap_max_nss_omn_elem_timeout, iface, NULL);
++}
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index dca4b31b7..d83444cae 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -17,6 +17,7 @@
+ #include "../utils/mxl_common.h"
+ #include "../drivers/driver.h"
+ #include "mxl_sub_band_dfs.h"
++#include "mxl_zwdfs.h"
+ 
+ #define MXL_AID_MAX				447
+ #define MXL_AID_OFFSET			191
+@@ -68,6 +69,10 @@ struct mxl_hostapd_iface {
+ 	hostapd_sb_dfs_orig_chandef_t sb_orig_chandef;
+ 	struct dl_list dfs_history; /* struct hostapd_dfs_history */
+ 	bool boot;
++	bool check_only_dfs;
++	struct mxl_zwdfs_settings zwdfs_info;
++	u64 drv_flags;
++	u8 require_omn; /* Variable to keep track whether OMN IE should be added or not */
+ };
+ 
+ struct mxl_hostapd_data {
+@@ -109,5 +114,9 @@ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface);
+ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx);
+ struct hostapd_channel_data * mxl_hostapd_get_mode_channel(struct hostapd_iface *iface, unsigned int freq);
+ enum oper_chan_width mxl_get_oper_width(int width);
++void mxl_hostapd_cleanup_iface(struct hostapd_iface *iface);
++void mxl_hostapd_update_coc(struct hostapd_iface *iface, const u8 *data, size_t data_len);
++u8 * mxl_hostapd_eid_opmodenotif(struct hostapd_data *hapd, u8 *eid);
++void mxl_hostapd_interface_deinit(struct hostapd_iface *iface);
+ 
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/ap/mxl_zwdfs.c b/src/ap/mxl_zwdfs.c
+new file mode 100644
+index 000000000..074feff9f
+--- /dev/null
++++ b/src/ap/mxl_zwdfs.c
+@@ -0,0 +1,312 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "hostapd.h"
++#include "ap_drv_ops.h"
++#include "beacon.h"
++
++#include "mxl_dfs_common.h"
++#include "common/mxl_ieee802_11_common.h"
++#include "common/mxl_wpa_ctrl.h"
++
++static bool mxl_hostapd_is_zwdfs_iface(struct hostapd_iface *iface)
++{
++	return !!(iface->mxl_iface.drv_flags & MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC);
++}
++
++bool mxl_hostapd_background_cac_possible(struct hostapd_iface *iface)
++{
++	size_t i;
++	struct hapd_interfaces *ifaces = iface->interfaces;
++
++	if (!iface->conf->mxl_conf.background_cac)
++		return false;
++
++	if (iface->state != HAPD_IFACE_ENABLED)
++		return false;
++
++	if (iface->cac_started)
++		return false;
++
++	for (i = 0; i < ifaces->count; i++)
++		if (mxl_hostapd_is_zwdfs_iface(ifaces->iface[i]))
++			return true;
++
++	return false;
++}
++
++static void
++hostapd_set_conf_from_freq_params(struct hostapd_iface *iface, const struct hostapd_freq_params *freq_params)
++{
++	int seg0_idx = 0, seg1_idx = 0;
++	int bw_center_idx = 0;
++	enum oper_chan_width bw = CONF_OPER_CHWIDTH_USE_HT;
++
++	if (freq_params->center_freq1) {
++		if (is_6ghz_freq(freq_params->center_freq1))
++			seg0_idx = (freq_params->center_freq1 - STARTING_6G_FREQ_IN_MHZ) / 5;
++		else {
++			seg0_idx = 36 + (freq_params->center_freq1 - 5180) / 5;
++			bw_center_idx = seg0_idx;
++		}
++	}
++
++	if (freq_params->center_freq2) {
++		if (is_6ghz_freq(freq_params->center_freq2)) {
++			seg1_idx = (freq_params->center_freq2 - STARTING_6G_FREQ_IN_MHZ) / 5;
++			bw_center_idx = seg1_idx;
++		}
++		else
++			seg1_idx = 36 + (freq_params->center_freq2 - 5180) / 5;
++	}
++
++	switch (freq_params->bandwidth) {
++	case 0:
++	case 20:
++	case 40:
++		bw = CONF_OPER_CHWIDTH_USE_HT;
++		break;
++	case 80:
++		if (freq_params->center_freq2)
++			bw = CONF_OPER_CHWIDTH_80P80MHZ;
++		else
++			bw = CONF_OPER_CHWIDTH_80MHZ;
++		break;
++	case 160:
++		bw = CONF_OPER_CHWIDTH_160MHZ;
++		break;
++	case 320 :
++		bw = CONF_OPER_CHWIDTH_320MHZ;
++		break;
++	default:
++		wpa_printf(MSG_WARNING, "Unknown CSA bandwidth: %d", freq_params->bandwidth);
++		break;
++	}
++
++	iface->freq = freq_params->freq;
++	iface->conf->channel = freq_params->channel;
++	iface->conf->secondary_channel = freq_params->sec_channel_offset;
++
++	if (freq_params->bandwidth > 20 && iface->conf->secondary_channel == 0)
++		iface->conf->secondary_channel = mxl_hostapd_get_secondary_offset(iface->conf->channel, freq_params->bandwidth, bw_center_idx);
++
++	hostapd_set_oper_centr_freq_seg0_idx(iface->conf,seg0_idx);
++	hostapd_set_oper_centr_freq_seg1_idx(iface->conf,seg1_idx);
++	hostapd_set_oper_chwidth(iface->conf,bw);
++}
++
++int mxl_hostapd_start_background_cac(struct hostapd_iface *iface, const struct csa_settings *settings)
++{
++	size_t i;
++	struct hostapd_iface *zwdfs_iface = NULL;
++	struct hapd_interfaces *ifaces = iface->interfaces;
++
++	for (i = 0; i < ifaces->count; i++) {
++		if (mxl_hostapd_is_zwdfs_iface(ifaces->iface[i])) {
++			zwdfs_iface = ifaces->iface[i];
++			break;
++		}
++	}
++
++	if (!zwdfs_iface) {
++		wpa_printf(MSG_ERROR, "ZWDFS: Cannot start backround CAC, ZWDFS interface not enabled");
++		return -1;
++	}
++
++	if (mxl_hostapd_set_zwdfs_antenna(zwdfs_iface->bss[0], 1)) {
++		wpa_printf(MSG_ERROR, "ZWDFS: Failed to enable antenna");
++		return -1;
++	}
++
++	hostapd_set_conf_from_freq_params(zwdfs_iface, &settings->freq_params);
++
++	/* settings->beacon_data not filled/required, so os_memdup is enough here */
++	zwdfs_iface->mxl_iface.zwdfs_info.csa_settings = os_memdup(settings, sizeof(*settings));
++	if (!zwdfs_iface->mxl_iface.zwdfs_info.csa_settings)
++		return -1;
++
++	zwdfs_iface->mxl_iface.zwdfs_info.csa_iface = iface;
++
++	return 0;
++}
++
++int mxl_hostapd_zwdfs_switch(struct hostapd_iface *iface, int cac_status,
++			     int freq, int chan_width, int cf1, int cf2)
++{
++	size_t i;
++	int ret = 0;
++	int expected_num_chans;
++	struct hapd_interfaces *ifaces = iface->interfaces;
++	int num_chans = channel_width_to_int(chan_width) / 20;
++	struct hostapd_iface *csa_iface = iface->mxl_iface.zwdfs_info.csa_iface;
++	struct csa_settings *csa_settings = iface->mxl_iface.zwdfs_info.csa_settings;
++
++	if (!mxl_hostapd_is_zwdfs_iface(iface))
++		goto end;
++
++	/* do not cleanup and keep waiting: invalid CAC finished event */
++	if (!num_chans)
++		goto end;
++
++	/* do not cleanup and keep waiting: CAC finished will be invoked again with Success or Failure status */
++	if (HOSTAPD_CAC_STAT_PAUSED == cac_status)
++		goto end;
++
++	/* do not cleanup and keep waiting: CAC finished chandef does not cover all our chandef */
++	iface->mxl_iface.check_only_dfs = true;
++	expected_num_chans = mxl_dfs_are_channels_overlapped(iface, freq, chan_width, cf1, cf2);
++	iface->mxl_iface.check_only_dfs = false;
++	if (num_chans != expected_num_chans)
++		goto end;
++
++	/* ZWDFS switch not initiated */
++	if (!csa_iface || !csa_settings)
++		goto end;
++
++	/* Check if interface still exists */
++	for (i = 0; i < ifaces->count; i++)
++		if (csa_iface == ifaces->iface[i])
++			break;
++
++	if (i == ifaces->count)
++		goto cleanup;
++
++	/* CAC failed, do not continue ZWDFS switch */
++	if (HOSTAPD_CAC_STAT_SUCCESS != cac_status)
++		goto cleanup;
++
++	for (i = 0; i < csa_iface->num_bss; i++) {
++		hostapd_chan_switch_config(csa_iface->bss[i], &csa_settings->freq_params);
++		ret = hostapd_switch_channel(csa_iface->bss[i], csa_settings);
++		if (ret) {
++			wpa_printf(MSG_ERROR, "ZWDFS: hostapd_switch_channel failed: %s", csa_iface->bss[0]->conf->iface);
++			goto cleanup;
++		}
++	}
++
++cleanup:
++	ret = mxl_hostapd_set_zwdfs_antenna(iface->bss[0], 0);
++	if (ret)
++		wpa_printf(MSG_ERROR, "ZWDFS: Failed to disable antenna");
++
++	iface->mxl_iface.zwdfs_info.csa_iface = NULL;
++	os_free(iface->mxl_iface.zwdfs_info.csa_settings);
++	iface->mxl_iface.zwdfs_info.csa_settings = NULL;
++end:
++	return ret;
++}
++
++static int mxl_hostapd_drv_set_zwdfs_antenna(struct hostapd_data *hapd, int enable)
++{
++	int ret = MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_ZWDFS_ANT, &enable, sizeof(enable));
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_ZWDFS_ANTENNA failed: %i (%s)",
++			ret, strerror(-ret));
++
++	return ret;
++}
++
++bool mxl_hostapd_check_only_dfs_chans(struct hostapd_iface *iface)
++{
++	return iface->mxl_iface.check_only_dfs;
++}
++
++int mxl_hostapd_set_zwdfs_antenna(struct hostapd_data *hapd, int enable)
++{
++	int enabled;
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_config *conf = iface->conf;
++	int needs_restart = 0;
++
++	if (mxl_hostapd_drv_get_zwdfs_antenna(hapd, &enabled)) {
++		wpa_printf(MSG_ERROR, "Could not get current zwdfs antenna state");
++		return -1;
++	}
++
++	if (enabled == enable) {
++		wpa_printf(MSG_WARNING, "zwdfs antenna state is already in requested state");
++		return 0;
++	}
++
++	needs_restart = !(iface->state == HAPD_IFACE_ENABLED);
++
++	if (mxl_set_first_non_dfs_channel(iface)) {
++		wpa_printf(MSG_ERROR, "Could not set channel");
++		return -1;
++	}
++
++	/* set failsafe channel to channel retreived by set_first_non_dfs_channel().
++	 * this + disabling dynamic failsafe, will make sure zwdfs radio will not
++	 * jump to another DFS channel upon radar hit
++	 */
++	memset(&iface->mxl_iface.failsafe, 0, sizeof(iface->mxl_iface.failsafe));
++	iface->mxl_iface.failsafe.freq = iface->freq;
++	iface->mxl_iface.failsafe.center_freq1 = iface->freq;
++	iface->mxl_iface.failsafe.center_freq2 = 0;
++	iface->mxl_iface.failsafe.bandwidth = 20;
++
++	if (needs_restart) {
++		hostapd_disable_iface(iface);
++	}
++	else
++		hostapd_drv_stop_ap(hapd);
++
++	if (!needs_restart &&
++	    hostapd_set_freq(hapd, hapd->iconf->hw_mode, iface->freq,
++			     conf->channel, conf->enable_edmg,
++			     conf->edmg_channel, conf->ieee80211n,
++			     conf->ieee80211ac, conf->ieee80211ax,
++			     conf->ieee80211be,
++			     conf->secondary_channel, hostapd_get_oper_chwidth(conf),
++			     hostapd_get_oper_centr_freq_seg0_idx(conf),
++			     hostapd_get_oper_centr_freq_seg1_idx(conf))) {
++		wpa_printf(MSG_ERROR, "Could not set channel for kernel driver");
++		return -1;
++	} else if (needs_restart) {
++		if (hostapd_enable_iface(iface)) {
++			wpa_printf(MSG_ERROR, "Could not enable interface");
++			return -1;
++		}
++
++		hostapd_drv_stop_ap(hapd);
++	}
++
++	if (mxl_hostapd_drv_set_zwdfs_antenna(hapd, enable) < 0) {
++		wpa_printf(MSG_ERROR, "Failed to enable ZWDFS antenna");
++		return -1;
++	}
++
++	if (ieee802_11_set_beacon(hapd)) {
++		wpa_printf(MSG_ERROR, "Failed to reload ZWDFS interface");
++		return -1;
++	}
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, enable ? ZWDFS_ANT_ENABLE : ZWDFS_ANT_DISABLE);
++
++	return 0;
++}
++
++int mxl_hostapd_drv_get_zwdfs_antenna(struct hostapd_data *hapd, int *enabled)
++{
++	int ret;
++
++	ret = MXL_DRV_VENDOR_GET(LTQ_NL80211_VENDOR_SUBCMD_GET_ZWDFS_ANT, NULL, 0, enabled, sizeof(*enabled));
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending GET_ZWDFS_ANTENNA failed: %i (%s)", ret, strerror(-ret));
++
++	return ret;
++}
+diff --git a/src/ap/mxl_zwdfs.h b/src/ap/mxl_zwdfs.h
+new file mode 100644
+index 000000000..b7aa1ce9b
+--- /dev/null
++++ b/src/ap/mxl_zwdfs.h
+@@ -0,0 +1,29 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_ZWDFS_H
++#define MXL_ZWDFS_H
++
++struct mxl_zwdfs_settings {
++	struct csa_settings *csa_settings;
++	struct hostapd_iface *csa_iface;
++};
++
++int mxl_hostapd_drv_get_zwdfs_antenna(struct hostapd_data *hapd, int *enabled);
++int mxl_hostapd_set_zwdfs_antenna(struct hostapd_data *hapd, int enable);
++bool mxl_hostapd_check_only_dfs_chans(struct hostapd_iface *iface);
++bool mxl_hostapd_background_cac_possible(struct hostapd_iface *iface);
++int mxl_hostapd_start_background_cac(struct hostapd_iface *iface, const struct csa_settings *settings);
++int mxl_hostapd_zwdfs_switch(struct hostapd_iface *iface, int cac_status, int freq, int chan_width, int cf1, int cf2);
++
++#endif /* MXL_ZWDFS_H */
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 9e3771318..247ba283c 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -11,6 +11,9 @@
+ #define IEEE802_11_DEFS_H
+ 
+ #include <utils/common.h>
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_ieee802_11_defs.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ /* IEEE 802.11 defines */
+ 
+diff --git a/src/common/mxl_ieee802_11_defs.h b/src/common/mxl_ieee802_11_defs.h
+index aea8f1ebf..9e6e431d8 100644
+--- a/src/common/mxl_ieee802_11_defs.h
++++ b/src/common/mxl_ieee802_11_defs.h
+@@ -18,6 +18,7 @@
+ 
+ #define EHT_OPER_CHANWIDTH_320	4
+ 
++#define STARTING_6G_FREQ_IN_MHZ				5950
+ #define RNR_INFO_TBTT_HDR_TYPE		0x03
+ #define RNR_INFO_TBTT_HDR_FILTERED	0x04
+ #define RNR_INFO_TBTT_HDR_COLOC		0x08
+diff --git a/src/common/mxl_vendor.h b/src/common/mxl_vendor.h
+index c6959b9d9..4758ccf14 100644
+--- a/src/common/mxl_vendor.h
++++ b/src/common/mxl_vendor.h
+@@ -42,5 +42,6 @@
+ MXL_EXPORT_EVENT_API(mxl_drv_event_radar)
+ 
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_flush_stations)
++MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_coc)
+ 
+ #endif /* MXL_VENDOR_H */
+diff --git a/src/common/mxl_wpa_ctrl.h b/src/common/mxl_wpa_ctrl.h
+index 0484a7db4..9557c59d2 100644
+--- a/src/common/mxl_wpa_ctrl.h
++++ b/src/common/mxl_wpa_ctrl.h
+@@ -19,4 +19,8 @@
+ 
+ #define LTQ_RADAR "LTQ-DFS-RADAR-DETECTED "
+ 
++/* Event to indicate ZWDFS antenna enable/disable */
++#define ZWDFS_ANT_ENABLE "ZWDFS-ANT-ENABLE"
++#define ZWDFS_ANT_DISABLE "ZWDFS-ANT-DISABLE"
++
+ #endif /* MXL_WPA_CTRL_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 1da76dfcf..c70b1042f 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -443,4 +443,11 @@ struct intel_vendor_radar {
+   u8 radar_bit_map;
+ } __attribute__ ((packed));
+ 
++/* Data for EVENT_LTQ_COC events */
++struct intel_vendor_event_coc {
++  u8 coc_BW;
++  u8 coc_omn_IE;
++  u8 coc_is_max_nss;
++} __attribute__ ((packed));
++
+ #endif /* _VENDOR_CMDS_H_ */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 610458d87..86abc8cda 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2320,6 +2320,10 @@ struct wpa_driver_capa {
+ #define WPA_DRIVER_FLAGS2_SAE_OFFLOAD_AP	0x0000000000100000ULL
+ 	u64 flags2;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	u64 mxl_flags;
++#endif /* CONFIG_VENDOR_MXL */
++
+ #define FULL_AP_CLIENT_STATE_SUPP(drv_flags) \
+ 	(drv_flags & WPA_DRIVER_FLAGS_FULL_AP_CLIENT_STATE)
+ 
+diff --git a/src/drivers/driver_nl80211_capa.c b/src/drivers/driver_nl80211_capa.c
+index 847631bfb..102d3064a 100644
+--- a/src/drivers/driver_nl80211_capa.c
++++ b/src/drivers/driver_nl80211_capa.c
+@@ -18,6 +18,9 @@
+ #include "common/qca-vendor-attr.h"
+ #include "common/brcm_vendor.h"
+ #include "driver_nl80211.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_driver_nl80211.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ static int protocol_feature_handler(struct nl_msg *msg, void *arg)
+@@ -1178,6 +1181,10 @@ static int wiphy_info_handler(struct nl_msg *msg, void *arg)
+ 	if (tb[NL80211_ATTR_MLO_SUPPORT])
+ 		capa->flags2 |= WPA_DRIVER_FLAGS2_MLO;
+ 
++#if defined(CONFIG_VENDOR_MXL) && !defined(CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT)
++	mxl_nl80211_update_capa(tb, capa);
++#endif /* defined(CONFIG_VENDOR_MXL) && !defined(CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT) */
++
+ 	return NL_SKIP;
+ }
+ 
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index a1736995d..d450efd28 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3243,6 +3243,12 @@ static void mxl_nl80211_handle_radar(struct wpa_driver_nl80211_data *drv, const
+ 	mxl_drv_event_radar(drv->ctx, data, len);
+ }
+ 
++static void mxl_nl80211_handle_coc(struct wpa_driver_nl80211_data *drv, const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event:COC, ctx=%p", drv->ctx);
++	mxl_drv_event_coc(drv->ctx, data, len);
++}
++
+ #endif /* CONFIG_DRIVER_NL80211_MXL */
+ 
+ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+@@ -3255,6 +3261,9 @@ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 		case LTQ_NL80211_VENDOR_EVENT_RADAR_DETECTED:
+ 			mxl_nl80211_handle_radar(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_COC_BEACON_UPDATE:
++			mxl_nl80211_handle_coc(drv, data, len);
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported MXL vendor event %u", subcmd);
+ 			break;
+diff --git a/src/drivers/mxl_driver.h b/src/drivers/mxl_driver.h
+index 895641aa3..61985d8e5 100644
+--- a/src/drivers/mxl_driver.h
++++ b/src/drivers/mxl_driver.h
+@@ -26,4 +26,7 @@ struct mxl_chan_data {
+ 	unsigned int nop_time_passed_min;
+ };
+ 
++/** Driver supports background CAC */
++#define MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC	0x0000000000000001ULL
++
+ #endif /* MXL_DRIVER_H */
+diff --git a/src/drivers/mxl_driver_nl80211.c b/src/drivers/mxl_driver_nl80211.c
+index 74af556cd..2c827b2de 100644
+--- a/src/drivers/mxl_driver_nl80211.c
++++ b/src/drivers/mxl_driver_nl80211.c
+@@ -85,3 +85,9 @@ int mxl_nl80211_set_channel_dfs_state(void *priv, enum nl80211_dfs_state dfs_sta
+ 		   "%d (%s)", ret, strerror(-ret));
+ 	return -1;
+ }
++
++void mxl_nl80211_update_capa(struct nlattr **tb, struct wpa_driver_capa *capa)
++{
++	if (tb[NL80211_ATTR_WIPHY_DFS_ANTENNA])
++		capa->mxl_flags |= MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC;
++}
+diff --git a/src/drivers/mxl_driver_nl80211.h b/src/drivers/mxl_driver_nl80211.h
+index 654d63ed9..fb8b7db08 100644
+--- a/src/drivers/mxl_driver_nl80211.h
++++ b/src/drivers/mxl_driver_nl80211.h
+@@ -23,5 +23,6 @@
+ int mxl_nl80211_set_channel_dfs_state(void *priv, enum nl80211_dfs_state dfs_state,
+ 				      int freq, int dfs_time, int dfs_debug);
+ int mxl_nl80211_set_antenna(void *priv, u32 tx_ant, u32 rx_ant);
++void mxl_nl80211_update_capa(struct nlattr **tb, struct wpa_driver_capa *capa);
+ 
+ #endif /* MXL_DRIVER_NL80211_H */
+-- 
+2.43.0
+

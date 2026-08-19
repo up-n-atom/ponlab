@@ -1,0 +1,1113 @@
+From abc536c674c60a91c79d2f45fe1062869c44858e Mon Sep 17 00:00:00 2001
+From: mvuls <mvuls@maxlinear.com>
+Date: Wed, 8 Nov 2023 15:19:44 +0200
+Subject: [PATCH] WLANRTSYS-50839: MXL Sub Band DFS
+
+---
+ hostapd/Makefile             |   1 +
+ hostapd/mxl_config.c         |   7 +
+ hostapd/mxl_ctrl_iface.c     |  45 +++
+ hostapd/mxl_hostapd_cli.c    |  19 ++
+ hostapd/mxl_hostapd_cli.h    |   3 +
+ src/ap/dfs.c                 |  13 +-
+ src/ap/drv_callbacks.c       |   5 +
+ src/ap/hostapd.c             |  11 +-
+ src/ap/mxl_config.h          |   1 +
+ src/ap/mxl_dfs_common.c      |  13 +-
+ src/ap/mxl_dfs_common.h      |   4 +-
+ src/ap/mxl_hostapd.h         |   2 +
+ src/ap/mxl_sub_band_dfs.c    | 625 +++++++++++++++++++++++++++++++++++
+ src/ap/mxl_sub_band_dfs.h    |  49 +++
+ src/drivers/driver.h         |   4 +
+ src/drivers/driver_nl80211.c |  11 +
+ src/drivers/mxl_driver.h     |   4 +
+ src/drivers/mxl_nl80211.h    |   8 +
+ 18 files changed, 820 insertions(+), 5 deletions(-)
+ create mode 100644 src/ap/mxl_sub_band_dfs.c
+ create mode 100644 src/ap/mxl_sub_band_dfs.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 839cd99b8..ba7be1ac1 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -367,6 +367,7 @@ OBJS += ../src/common/mxl_ieee802_11_common.o
+ OBJS += mxl_ctrl_iface.o
+ OBJS += ../src/drivers/mxl_driver_nl80211.o
+ OBJS += ../src/ap/mxl_dfs_common.o
++OBJS += ../src/ap/mxl_sub_band_dfs.o
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index e29c2f608..e79dbe459 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -96,6 +96,13 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->allow_scan_during_cac = val;
++	} else if (os_strcmp(buf, "sub_band_dfs") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, SUBBAND_DFS_MIN, SUBBAND_DFS_MAX)) {
++			wpa_printf(MSG_ERROR, "Invalid sub_band_dfs value, must be in range 0..60");
++			return 0;
++		}
++		mxl_conf->sub_band_dfs = val;
+ 	} else
+ 		return 0;
+ 	return 1;
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index bca3bc283..9caa69b95 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -214,6 +214,49 @@ static int mxl_hostapd_ctrl_iface_get_failsafe_chan(struct hostapd_iface *iface,
+ 	return len;
+ }
+ 
++static int mxl_hostapd_ctrl_iface_get_dfs_stats(struct hostapd_iface *iface, const char *cmd,
++						char *buf, size_t buflen)
++{
++	struct os_tm tm;
++	int ret = 0, len = 0;
++	hostapd_dfs_history_t *entry;
++	const char *month_str = "Jan\0Feb\0Mar\0Apr\0May\0Jun\0"
++				"Jul\0Aug\0Sep\0Oct\0Nov\0Dec";
++
++	ret = sprintf_s(buf + len, buflen - len, "Sub Band DFS configured counter value %d\n",
++		        iface->conf->mxl_conf.sub_band_dfs);
++	if (ret <= 0)
++		return len;
++	len += ret;
++
++	ret = sprintf_s(buf + len, buflen - len, "Sub Band DFS current counter value %d\n",
++		        iface->mxl_iface.sb_dfs_cntr ? iface->mxl_iface.sb_dfs_cntr - 1 : 0);
++	if (ret <= 0)
++		return len;
++	len += ret;
++
++	/* DFS History statistics */
++	ret = sprintf_s(buf + len, buflen - len, "Radar detection history, last %d radar detections:\n", MAX_DFS_HIST_ENTRIES);
++	if (ret <= 0)
++		return len;
++	len += ret;
++
++	dl_list_for_each(entry, &iface->mxl_iface.dfs_history, hostapd_dfs_history_t, list) {
++		if (os_gmtime(entry->detect_time, &tm))
++			os_memset(&tm, 0, sizeof(tm));
++
++		ret = sprintf_s(buf + len, buflen - len, "%s %d %02d:%02d:%02d UTC: center chan %d, prim %d, bw %d, rbm 0x%02x, %s\n",
++				&month_str[4 * (tm.month - 1)], tm.day, tm.hour, tm.min, tm.sec, entry->seg0_idx, entry->primary, entry->bandwidth, entry->rbm,
++				entry->type == DFS_CHAN_SWITCH ? "new chan switch" : (entry->type == DFS_NO_SWITCH ? "no channel switch" : "sub band switch"));
++
++		if (ret <= 0)
++			return len;
++		len += ret;
++	}
++
++	return len;
++}
++
+ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -227,6 +270,8 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			*reply_len = -1;
+ 	} else if (os_strncmp(buf, "GET_FAILSAFE_CHAN", 17) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_failsafe_chan(hapd->iface, NULL, reply, reply_size);
++	} else if (os_strncmp(buf, "GET_DFS_STATS", 13) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_dfs_stats(hapd->iface, NULL, reply, reply_size);
+ 	} else {
+ 		return 0;
+ 	}
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index fe9dc731a..e461ff653 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -93,3 +93,22 @@ int mxl_hostapd_cli_cmd_get_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char
+ 	}
+ 	return mxl_wpa_ctrl_command(ctrl, cmd);
+ }
++
++int mxl_hostapd_cli_cmd_get_dfs_stats(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 0) {
++		printf("get_hw_features doesn't require parameters\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "GET_DFS_STATS");
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index a1143df53..e4e715e2d 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -26,9 +26,12 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 	  " set failsafe channel. Specify freq 0 for ACS" },				\
+ 	{ "get_failsafe_chan", mxl_hostapd_cli_cmd_get_failsafe_chan, NULL,		\
+ 	  "get failsafe channel" },							\
++	{ "get_dfs_stats", mxl_hostapd_cli_cmd_get_dfs_stats, NULL,			\
++	  " = get Sub band DFS and radar detected per channel stats" },			\
+ 
+ int mxl_hostapd_cli_cmd_get_hw_features(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_set_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_get_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_dfs_stats(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ 
+ #endif /* MXL_HOSTAPD_CLI_H */
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index ac5af55ae..ffecc09fa 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -740,6 +740,11 @@ static int dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq,
+ 	u8 radar_chan;
+ 	int res = 0;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_hostapd_sb_dfs_enabled(iface))
++		return 1;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	/* Our configuration */
+ 	mode = iface->current_mode;
+ 	start_chan_idx = dfs_get_start_chan_idx(iface, &start_chan_idx1);
+@@ -1192,6 +1197,9 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 				hostapd_setup_interface_complete(iface, 0);
+ 				iface->cac_started = 0;
+ 			}
++#ifdef CONFIG_VENDOR_MXL
++			else mxl_hostapd_handle_sb_dfs(iface);
++#endif /* CONFIG_VENDOR_MXL */
+ 		}
+ 	} else if (hostapd_dfs_is_background_event(iface, freq)) {
+ 		iface->radar_background.cac_started = 0;
+@@ -1453,6 +1461,9 @@ int mxl_dfs_check_chans_unavailable(struct hostapd_iface *iface, int start_chan_
+ 	{ return dfs_check_chans_unavailable(iface, start_chan_idx, n_chans); }
+ int mxl_hostapd_dfs_start_channel_switch(struct hostapd_iface *iface) { return hostapd_dfs_start_channel_switch(iface); }
+ int mxl_set_dfs_state_freq(struct hostapd_iface *iface, int freq, u32 state) { return set_dfs_state_freq(iface, freq, state); }
++void mxl_dfs_adjust_center_freq(struct hostapd_iface *iface, struct hostapd_channel_data *chan, int secondary_channel,
++				int sec_chan_idx_80p80, u8 *oper_centr_freq_seg0_idx, u8 *oper_centr_freq_seg1_idx)
++	{ return dfs_adjust_center_freq(iface, chan, secondary_channel, sec_chan_idx_80p80, oper_centr_freq_seg0_idx, oper_centr_freq_seg1_idx); }
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+@@ -1489,7 +1500,7 @@ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+ 	}
+ 
+ #ifdef CONFIG_VENDOR_MXL
+-	if (mxl_hostapd_handle_radar(iface))
++	if (mxl_hostapd_handle_radar(iface, cf1, chan_width))
+ 		return 0;
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index b1535283a..abf29ab0a 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2544,4 +2544,9 @@ void wpa_supplicant_event_global(void *ctx, enum wpa_event_type event,
+ 		wpa_supplicant_event(hapd, event, data);
+ }
+ 
++#ifdef CONFIG_VENDOR_MXL
++/* wrapper to access static functions from MXL code */
++struct hostapd_channel_data * mxl_hostapd_get_mode_channel(struct hostapd_iface *iface, unsigned int freq) { return hostapd_get_mode_channel(iface, freq); }
++#endif /* CONFIG_VENDOR_MXL */
++
+ #endif /* HOSTAPD */
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 5bb0de77f..4598218aa 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -666,6 +666,9 @@ static void hostapd_cleanup_iface(struct hostapd_iface *iface)
+ 			     NULL);
+ 
+ 	hostapd_cleanup_iface_partial(iface);
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_dfs_history_deinit(iface);
++#endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_config_free(iface->conf);
+ 	iface->conf = NULL;
+ 
+@@ -2835,7 +2838,9 @@ struct hostapd_iface * hostapd_alloc_iface(void)
+ 		return NULL;
+ 
+ 	dl_list_init(&hapd_iface->sta_seen);
+-
++#ifdef CONFIG_VENDOR_MXL
++	dl_list_init(&hapd_iface->mxl_iface.dfs_history);
++#endif /* CONFIG_VENDOR_MXL */
+ 	return hapd_iface;
+ }
+ 
+@@ -4080,6 +4085,10 @@ int hostapd_switch_channel(struct hostapd_data *hapd,
+ 		return ret;
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_sb_dfs_switch_update_cntr(hapd->iface, settings->mxl_csa_settings.sb_dfs_bw);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	hapd->csa_in_progress = 1;
+ 	return 0;
+ }
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 4e132e465..2ea876aa6 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -28,6 +28,7 @@ struct mxl_hostapd_config {
+ 	int ignore_40_mhz_intolerant;
+ 
+ 	int allow_scan_during_cac;
++	int sub_band_dfs;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_dfs_common.c b/src/ap/mxl_dfs_common.c
+index 6b6085c8a..160d631e5 100644
+--- a/src/ap/mxl_dfs_common.c
++++ b/src/ap/mxl_dfs_common.c
+@@ -20,6 +20,7 @@
+ #include "mxl_dfs_common.h"
+ #include "drivers/mxl_driver_nl80211.h"
+ #include "common/wpa_ctrl.h"
++#include "mxl_sub_band_dfs.h"
+ 
+ /* CAC finished reason code */
+ enum mxl_hostapd_cac_finished_stat {
+@@ -157,7 +158,7 @@ void mxl_hostapd_dfs_cac_restart(struct hostapd_iface *iface)
+ 		wpa_printf(MSG_DEBUG, "CAC won't be restarted, some channels are unavailable");
+ #ifdef CONFIG_ACS
+ 		if (!mxl_dfs_is_failsafe_enabled(iface))
+-			mxl_hostapd_handle_radar(iface);
++			mxl_hostapd_handle_radar(iface, 0, 0);
+ 		else
+ #endif
+ 			mxl_hostapd_dfs_start_channel_switch(iface);
+@@ -220,8 +221,16 @@ struct hostapd_channel_data * mxl_dfs_get_valid_channel(struct hostapd_iface *if
+ 	return channel;
+ }
+ 
+-bool mxl_hostapd_handle_radar(struct hostapd_iface *iface)
++bool mxl_hostapd_handle_radar(struct hostapd_iface *iface, int cf1, int bw)
+ {
++
++	if (cf1 && bw) {
++		if (mxl_hostapd_handle_sb_dfs_radar(iface, cf1, bw))
++			return true;
++
++		mxl_hostapd_add_dfs_history_entry(iface, cf1, bw, iface->mxl_iface.rbm, DFS_CHAN_SWITCH);
++	}
++
+ 	if (mxl_dfs_is_failsafe_enabled(iface))
+ 		return false;
+ 
+diff --git a/src/ap/mxl_dfs_common.h b/src/ap/mxl_dfs_common.h
+index 1dd5f700c..04a100da0 100644
+--- a/src/ap/mxl_dfs_common.h
++++ b/src/ap/mxl_dfs_common.h
+@@ -38,10 +38,12 @@ struct hostapd_channel_data * mxl_dfs_get_valid_channel(struct hostapd_iface *if
+ 							int *secondary_channel,
+ 							u8 *oper_centr_freq_seg0_idx,
+ 							u8 *oper_centr_freq_seg1_idx);
+-bool mxl_hostapd_handle_radar(struct hostapd_iface *iface);
++bool mxl_hostapd_handle_radar(struct hostapd_iface *iface, int cf1, int bw);
+ int mxl_set_dfs_state_freq(struct hostapd_iface *iface, int freq, u32 state);
+ bool mxl_hostapd_check_rbm(struct hostapd_iface *iface, int ch_pos);
+ void mxl_hostapd_set_rbm(void *ctx, u8 rbm);
+ void mxl_hostapd_clear_rbm(void *ctx);
++void mxl_dfs_adjust_center_freq(struct hostapd_iface *iface, struct hostapd_channel_data *chan, int secondary_channel,
++				int sec_chan_idx_80p80, u8 *oper_centr_freq_seg0_idx, u8 *oper_centr_freq_seg1_idx);
+ 
+ #endif /* MXL_DFS_COMMON_H */
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 74077978c..b84ce55df 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -16,6 +16,7 @@
+ 
+ #include "../utils/mxl_common.h"
+ #include "../drivers/driver.h"
++#include "mxl_sub_band_dfs.h"
+ 
+ #define MXL_AID_MAX				447
+ #define MXL_AID_OFFSET			191
+@@ -64,6 +65,7 @@ struct mxl_hostapd_iface {
+ 	u8 rbm; /* Radar Bit Map */
+ 	int sb_dfs_cntr;
+ 	int dfs_hist_entry_cnt;
++	hostapd_sb_dfs_orig_chandef_t sb_orig_chandef;
+ 	struct dl_list dfs_history; /* struct hostapd_dfs_history */
+ };
+ 
+diff --git a/src/ap/mxl_sub_band_dfs.c b/src/ap/mxl_sub_band_dfs.c
+new file mode 100644
+index 000000000..60d15dea5
+--- /dev/null
++++ b/src/ap/mxl_sub_band_dfs.c
+@@ -0,0 +1,625 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "hostapd.h"
++#include "common/hw_features_common.h"
++#include "dfs.h"
++
++#include "mxl_hostapd.h"
++#include "mxl_dfs_common.h"
++#include "mxl_sub_band_dfs.h"
++#include "drivers/mxl_nl80211.h"
++
++#define NUM_MAX_CHANS_IN_CHANDEF 8
++
++static int
++mxl_hostapd_get_num_chans(struct hostapd_iface *iface, enum oper_chan_width vht_oper_chwidth, int secondary)
++{
++	int n_chans = 1;
++
++	if (iface->conf->ieee80211n && secondary)
++		n_chans = 2;
++
++	if (iface->conf->ieee80211ac) {
++		switch (vht_oper_chwidth) {
++		case CONF_OPER_CHWIDTH_USE_HT:
++			break;
++		case CONF_OPER_CHWIDTH_80MHZ:
++			n_chans = 4;
++			break;
++		case CONF_OPER_CHWIDTH_160MHZ:
++			n_chans = 8;
++			break;
++		case CONF_OPER_CHWIDTH_80P80MHZ:
++			n_chans = 4;
++			break;
++		default:
++			break;
++		}
++	}
++
++	return n_chans;
++}
++
++static int
++mxl_hostapd_get_low_chan_idx(struct hostapd_iface *iface, u8 centr_freq_seg0_idx, enum oper_chan_width chwidth, u8 primary, int secondary)
++{
++	int i;
++	u8 low_chan;
++	int idx = -1;
++	struct hostapd_channel_data *chan;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++
++	if (!mode)
++		return idx;
++
++	if (iface->conf->ieee80211ac && chwidth >= CONF_OPER_CHWIDTH_80MHZ) {
++		low_chan = centr_freq_seg0_idx - mxl_hostapd_get_num_width(chwidth, secondary)/2/5 + 2;
++	}
++	else {
++		if (secondary >= 0)
++			low_chan = primary;
++		else
++			low_chan = primary - 4;
++	}
++
++	for (i = 0; i < mode->num_channels; i++) {
++		chan = &mode->channels[i];
++		if (chan->chan == low_chan) {
++			idx = i;
++			break;
++		}
++	}
++
++	return idx;
++}
++
++static int
++mxl_hostapd_sb_dfs_can_switch_to_full_bw(struct hostapd_iface *iface)
++{
++	int i;
++	int n_chans;
++	struct hostapd_hw_modes *mode;
++	struct hostapd_channel_data *chan;
++	int start_chan_idx = -1;
++
++	mode = iface->current_mode;
++	if (!mode)
++		return 0;
++
++	n_chans = mxl_hostapd_get_num_chans(iface, iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth, iface->mxl_iface.sb_orig_chandef.secondary_offset);
++	start_chan_idx = mxl_hostapd_get_low_chan_idx(iface, iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx,
++						      iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth,
++						      iface->mxl_iface.sb_orig_chandef.channel,
++						      iface->mxl_iface.sb_orig_chandef.secondary_offset);
++
++	if (-1 == start_chan_idx) {
++		wpa_printf(MSG_ERROR, "SB DFS: Could not get channel idx for channel %d",
++			   iface->mxl_iface.sb_orig_chandef.channel);
++		return 0;
++	}
++
++	for (i = 0; i < n_chans; i++) {
++		chan = &mode->channels[start_chan_idx + i];
++
++		if (!(chan->flag & HOSTAPD_CHAN_RADAR))
++			continue;
++
++		if ((chan->flag & HOSTAPD_CHAN_DFS_MASK) != HOSTAPD_CHAN_DFS_AVAILABLE)
++			return 0;
++	}
++
++	wpa_printf(MSG_INFO, "SB DFS: Switching back to full bandwidth");
++	return 1;
++}
++
++static int mxl_hostapd_bandwidth_to_nl_sb_dfs_bw(int bandwidth)
++{
++	switch (bandwidth) {
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++		return NL80211_SB_DFS_BW_20;
++	case CHAN_WIDTH_40:
++		return NL80211_SB_DFS_BW_40;
++	case CHAN_WIDTH_80:
++		return NL80211_SB_DFS_BW_80;
++	default:
++		return -1;
++	}
++}
++
++static int
++mxl_hostapd_sb_dfs_is_on_adjacent(struct hostapd_iface *iface, u8 channel)
++{
++	int i;
++	int n_chans, n_chans1;
++	int start_chan_idx, start_chan_idx1;
++	struct hostapd_channel_data *chan;
++	struct hostapd_hw_modes *mode;
++
++	mode = iface->current_mode;
++	if (!mode)
++		return 0;
++
++	start_chan_idx = mxl_dfs_get_start_chan_idx(iface, &start_chan_idx1);
++	n_chans = mxl_dfs_get_used_n_chans(iface, &n_chans1);
++
++	for (i = 0; i < n_chans; i++) {
++		chan = &mode->channels[start_chan_idx + i];
++
++		/* On operationl BW */
++		if (chan->chan == channel)
++			return 0;
++	}
++
++	return 1;
++}
++
++/* Counter is incremented on first radar detection, to track afterwards if
++ * sub band DFS is active, or when radar detected on non-operational sub band */
++static void
++mxl_hostapd_sb_dfs_inc_cntr(struct hostapd_iface *iface, u8 rbm)
++{
++	int i, start_chan_idx, n_chans;
++	struct hostapd_channel_data *chan;
++	struct hostapd_hw_modes *mode;
++
++	mode = iface->current_mode;
++	if (!mode)
++		return;
++
++	if (!iface->mxl_iface.sb_dfs_cntr) {
++		iface->mxl_iface.sb_dfs_cntr++;
++		return;
++	}
++
++	start_chan_idx = mxl_hostapd_get_low_chan_idx(iface, iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx,
++						      iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth,
++						      iface->mxl_iface.sb_orig_chandef.channel,
++						      iface->mxl_iface.sb_orig_chandef.secondary_offset);
++	n_chans = mxl_hostapd_get_num_chans(iface, iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth,
++					    iface->mxl_iface.sb_orig_chandef.secondary_offset);
++
++	if (-1 == start_chan_idx) {
++		wpa_printf(MSG_ERROR, "SB DFS: Cannot get start channel index");
++		return;
++	}
++
++	for (i = 0; i < n_chans; i++) {
++		chan = &mode->channels[start_chan_idx + i];
++
++		if (!(chan->flag & HOSTAPD_CHAN_RADAR))
++			continue;
++
++		if (!(rbm & BIT(i)))
++			continue;
++
++		if (mxl_hostapd_sb_dfs_is_on_adjacent(iface, chan->chan)) {
++			iface->mxl_iface.sb_dfs_cntr++;
++			return;
++		}
++
++	}
++}
++
++static bool
++mxl_hostapd_sb_dfs_check_cntr(struct hostapd_iface *iface, u8 rbm)
++{
++	int cur_count = iface->mxl_iface.sb_dfs_cntr;
++	mxl_hostapd_sb_dfs_inc_cntr(iface, rbm);
++
++	if ((iface->mxl_iface.sb_dfs_cntr - 1) > iface->conf->mxl_conf.sub_band_dfs) {
++		iface->mxl_iface.sb_dfs_cntr = cur_count;
++		return true;
++	}
++
++	iface->mxl_iface.sb_dfs_cntr = cur_count;
++	return false;
++}
++
++static bool
++mxl_hostapd_sub_dfs_curr_better_than_failsafe(struct hostapd_iface *iface)
++{
++	return false;
++}
++
++static int
++mxl_hostapd_sub_dfs_get_new_chan(struct hostapd_iface *iface, u8 rbm, int *new_bw, int *secondary_offset)
++{
++	int i;
++	u8 cons_no_radar = 0; /* Consecutive no radar channels */
++	u8 prev_no_radar_idx = 0;
++	u8 do_sb_switch = 0;
++	u8 last_cons_chan_idx = 0;
++	u8 max_cons_no_radar = 0;
++	u8 max_last_cons_chan_idx = 0;
++	int n_chans, n_chans1;
++	struct hostapd_hw_modes *mode;
++	u8 radar_vs_channel_map[NUM_MAX_CHANS_IN_CHANDEF][2] = {{0}};
++	struct hostapd_channel_data *chan;
++	int start_chan_idx, start_chan_idx1;
++
++	mode = iface->current_mode;
++	if (!mode)
++		return 0;
++
++	if (hostapd_csa_in_progress(iface)) {
++		wpa_printf(MSG_INFO, "SB DFS: CSA already in progress, ignore");
++		return -1;
++	}
++
++	if (iface->cac_started) {
++		wpa_printf(MSG_INFO, "SB DFS: CAC in progress, will switch to new channel");
++		return 0;
++	}
++
++	if (mxl_hostapd_sb_dfs_check_cntr(iface, rbm)) {
++		wpa_printf(MSG_INFO, "SB DFS: Counter exceeded");
++
++		if (hostapd_is_dfs_chan_available(iface) &&
++		    mxl_hostapd_sub_dfs_curr_better_than_failsafe(iface)) {
++			/* Sub band DFS will select the same channel */
++			wpa_printf(MSG_INFO, "SB DFS: Staying on the same channel (failsafe rank is worse)");
++		}
++		else {
++			return 0;
++		}
++	}
++
++	if (iface->mxl_iface.sb_dfs_cntr) {
++		start_chan_idx = mxl_hostapd_get_low_chan_idx(iface, iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx,
++							      iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth,
++							      iface->mxl_iface.sb_orig_chandef.channel,
++							      iface->mxl_iface.sb_orig_chandef.secondary_offset);
++		n_chans = mxl_hostapd_get_num_chans(iface, iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth,
++						    iface->mxl_iface.sb_orig_chandef.secondary_offset);
++	}
++	else {
++		start_chan_idx = mxl_dfs_get_start_chan_idx(iface, &start_chan_idx1);
++		n_chans = mxl_dfs_get_used_n_chans(iface, &n_chans1);
++	}
++
++	if (-1 == start_chan_idx) {
++		wpa_printf(MSG_ERROR, "SB DFS: Cannot get start channel index");
++		return 0;
++	}
++
++	wpa_printf(MSG_DEBUG, "SB DFS: n_chans %d, start idx %d", n_chans, start_chan_idx);
++
++	for (i = 0; i < n_chans; i++) {
++		chan = &mode->channels[start_chan_idx + i];
++		radar_vs_channel_map[i][0] = chan->chan;
++
++		if (!(chan->flag & HOSTAPD_CHAN_RADAR)) {
++			do_sb_switch = 1;
++			continue;
++		}
++
++		if ((chan->flag & HOSTAPD_CHAN_DFS_MASK) == HOSTAPD_CHAN_DFS_UNAVAILABLE)
++			radar_vs_channel_map[i][1] = 1;
++		else
++			do_sb_switch = 1;
++	}
++
++	if (!do_sb_switch) /* All channels UNAVAILABLE */
++		return 0;
++
++	for (i = 0; i < n_chans; i++) {
++		if (!radar_vs_channel_map[i][1]) {
++			if (0 == cons_no_radar || (i == prev_no_radar_idx + 1)) {
++				cons_no_radar++;
++				last_cons_chan_idx = i;
++			}
++			prev_no_radar_idx = i;
++		}
++		else {
++			if (cons_no_radar > max_cons_no_radar) {
++				max_cons_no_radar = cons_no_radar;
++				max_last_cons_chan_idx = last_cons_chan_idx;
++			}
++			cons_no_radar = 0;
++		}
++	}
++
++	if (max_cons_no_radar > cons_no_radar) {
++		cons_no_radar = max_cons_no_radar;
++		last_cons_chan_idx = max_last_cons_chan_idx;
++	}
++
++	wpa_printf(MSG_DEBUG, "SB DFS: Consecutive no radar channels: %d", cons_no_radar);
++
++	for (i = 0; i < n_chans; i++) {
++		wpa_printf(MSG_DEBUG, "SB DFS: Chan[%i] = %d, radar = %d", i, radar_vs_channel_map[i][0], radar_vs_channel_map[i][1]);
++	}
++
++	if (cons_no_radar == n_chans) {
++		wpa_printf(MSG_DEBUG, "SB DFS: All channels are available, wrong bit map provided?");
++		return -1;
++	}
++
++	/* This sub band selection makes sure secondary channel offset will be 1 if not 20 MHz bw chosen */
++	*secondary_offset = 1;
++	switch (cons_no_radar) {
++	case 1:
++		*new_bw = CHAN_WIDTH_20;
++		*secondary_offset = 0;
++		return radar_vs_channel_map[last_cons_chan_idx][0];
++	case 2:
++		if (last_cons_chan_idx % 2) {
++			*new_bw = CHAN_WIDTH_40;
++			return radar_vs_channel_map[last_cons_chan_idx - 1][0];
++		}
++		else {
++			*new_bw = CHAN_WIDTH_20;
++			*secondary_offset = 0;
++			return radar_vs_channel_map[last_cons_chan_idx - 1][0];
++		}
++	case 3:
++		*new_bw = CHAN_WIDTH_40;
++		if (last_cons_chan_idx % 2)
++			return radar_vs_channel_map[last_cons_chan_idx - 1][0];
++		else
++			return radar_vs_channel_map[last_cons_chan_idx - 2][0];
++	case 4:
++	case 5:
++	case 6:
++	case 7:
++		if (7 == last_cons_chan_idx) {
++			*new_bw = CHAN_WIDTH_80;
++			return radar_vs_channel_map[4][0];
++		}
++		else if ((cons_no_radar - 1) == last_cons_chan_idx) {
++			*new_bw = CHAN_WIDTH_80;
++			return radar_vs_channel_map[0][0];
++		}
++		else if (last_cons_chan_idx % 2) {
++			*new_bw = CHAN_WIDTH_40;
++			return radar_vs_channel_map[last_cons_chan_idx - 1][0];
++		}
++		else {
++			*new_bw = CHAN_WIDTH_40;
++			return radar_vs_channel_map[last_cons_chan_idx - 2][0];
++		}
++	case 8:
++		wpa_printf(MSG_DEBUG, "SB DFS: Radar detected on non DFS channel?");
++		return -1;
++	default:
++		return 0;
++	}
++
++	return 0;
++}
++
++/* Helper function for correct Klocwork analysis.
++ * This function have to be added to KW database:
++ * __dl_list_add_tail_obj - XMRF $2 : 0
++ */
++#define DL_LIST_ADD_TAIL(list, obj, item)	__dl_list_add_tail_obj(list, (obj), &(obj)->item)
++static inline void __dl_list_add_tail_obj(struct dl_list *list, void *obj, struct dl_list *item)
++{
++	dl_list_add_tail(list, item);
++}
++
++int mxl_hostapd_add_dfs_history_entry(struct hostapd_iface *iface, int cf1, int chan_width, u8 rbm, u8 type)
++{
++	struct os_time time;
++	u8 seg0_idx = 0;
++	hostapd_dfs_history_t *entry, *first_entry;
++
++	/* If maximum number of entries reached, delete the oldest one */
++	if (iface->mxl_iface.dfs_hist_entry_cnt >= MAX_DFS_HIST_ENTRIES) {
++		first_entry = dl_list_first(&iface->mxl_iface.dfs_history, hostapd_dfs_history_t, list);
++
++		if (first_entry) {
++			dl_list_del(&first_entry->list);
++			iface->mxl_iface.dfs_hist_entry_cnt--;
++			os_free(first_entry);
++		}
++	}
++
++	entry = os_zalloc(sizeof(*entry));
++
++	if (!entry)
++		return 1;
++
++	ieee80211_freq_to_chan(cf1, &seg0_idx);
++	entry->seg0_idx = seg0_idx;
++	entry->seg1_idx = 0; /* Not supported */
++	entry->bandwidth = channel_width_to_int(chan_width);
++	entry->rbm = rbm;
++	entry->primary = iface->conf->channel;
++	entry->type = type;
++	os_get_time(&time);
++	entry->detect_time = time.sec;
++
++	DL_LIST_ADD_TAIL(&iface->mxl_iface.dfs_history, entry, list);
++	iface->mxl_iface.dfs_hist_entry_cnt++;
++
++	return 0;
++}
++
++static int
++mxl_hostapd_sub_dfs_switch_chan(struct hostapd_iface *iface, u8 rbm, int chan, int bandwidth, int secondary_offset)
++{
++	int i, err;
++	enum oper_chan_width vht_oper_chwidth;
++	enum oper_chan_width orig_vht_oper_chwidth;
++	u8 vht_oper_centr_freq_seg0_idx = 0;
++	u8 vht_oper_centr_freq_seg1_idx = 0; /* 80+80 is not supported by DFS */
++	int secondary_channel = secondary_offset;
++	struct csa_settings csa_settings;
++	struct hostapd_channel_data *channel = NULL;
++	int switch_to_full = !chan && !bandwidth && !secondary_offset;
++	struct hostapd_hw_modes *cmode = iface->current_mode;
++
++	os_memset(&csa_settings, 0, sizeof(csa_settings));
++	csa_settings.cs_count = mxl_hostapd_get_cs_count(iface);
++	csa_settings.block_tx = 1;
++
++	if (switch_to_full)
++		chan = iface->mxl_iface.sb_orig_chandef.channel;
++
++	channel = mxl_hostapd_get_mode_channel(iface, (hostapd_chan_to_freq(chan, false)));
++	if (!channel) {
++		wpa_printf(MSG_ERROR, "SB DFS: Channel %d not supported by HW", chan);
++		return 1;
++	}
++
++	if (switch_to_full) {
++		csa_settings.mxl_csa_settings.sb_dfs_bw = NL80211_SB_DFS_BW_NORMAL;
++		secondary_channel = iface->mxl_iface.sb_orig_chandef.secondary_offset;
++		vht_oper_chwidth = iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth;
++		vht_oper_centr_freq_seg0_idx = iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx;
++	}
++	else {
++		csa_settings.mxl_csa_settings.sb_dfs_bw = mxl_hostapd_bandwidth_to_nl_sb_dfs_bw(bandwidth);
++
++		if (csa_settings.mxl_csa_settings.sb_dfs_bw == -1) {
++			wpa_printf(MSG_ERROR, "SB DFS: Could not set new operational sub band bandwidth");
++			return 1;
++		}
++
++		orig_vht_oper_chwidth = hostapd_get_oper_chwidth(iface->conf);
++
++		if (NL80211_SB_DFS_BW_80 == csa_settings.mxl_csa_settings.sb_dfs_bw) {
++			vht_oper_chwidth = CONF_OPER_CHWIDTH_80MHZ;
++			hostapd_set_oper_chwidth(iface->conf,vht_oper_chwidth);
++		} else {
++			vht_oper_chwidth = CONF_OPER_CHWIDTH_USE_HT;
++			hostapd_set_oper_chwidth(iface->conf,vht_oper_chwidth);
++		}
++
++		mxl_dfs_adjust_center_freq(iface, channel, secondary_channel, -1,
++					   &vht_oper_centr_freq_seg0_idx,
++					   &vht_oper_centr_freq_seg1_idx);
++
++		hostapd_set_oper_chwidth(iface->conf,orig_vht_oper_chwidth);
++
++		if (iface->mxl_iface.sb_dfs_cntr == 0) {
++			iface->mxl_iface.sb_orig_chandef.channel = iface->conf->channel;
++			iface->mxl_iface.sb_orig_chandef.secondary_offset = iface->conf->secondary_channel;
++			iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth = hostapd_get_oper_chwidth(iface->conf) ;
++			iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
++		}
++	}
++
++	err = hostapd_set_freq_params(&csa_settings.freq_params,
++				      iface->conf->hw_mode,
++				      channel->freq,
++				      channel->chan,
++				      iface->conf->enable_edmg,
++				      iface->conf->edmg_channel,
++				      iface->conf->ieee80211n,
++				      iface->conf->ieee80211ac,
++				      iface->conf->ieee80211ax,
++				      iface->conf->ieee80211be,
++				      secondary_channel,
++				      vht_oper_chwidth,
++				      vht_oper_centr_freq_seg0_idx,
++				      vht_oper_centr_freq_seg1_idx,
++				      cmode ? cmode->vht_capab : 0,
++				      cmode ? &cmode->he_capab[IEEE80211_MODE_AP] : NULL,
++				      cmode ? &cmode->eht_capab[IEEE80211_MODE_AP] : NULL);
++
++	for (i = 0; i < iface->num_bss; i++) {
++		err = hostapd_switch_channel(iface->bss[i], &csa_settings);
++		if (err)
++			break;
++	}
++
++	if (err){
++		wpa_printf(MSG_WARNING, "SB DFS: Failed to schedule CSA (%d)", err);
++		return 1;
++	}
++	else {
++		if (rbm)
++			mxl_hostapd_sb_dfs_inc_cntr(iface, rbm);
++	}
++	return 0;
++}
++
++void mxl_hostapd_handle_sb_dfs(struct hostapd_iface *iface)
++{
++	if (iface->mxl_iface.sb_dfs_cntr) {
++		if (mxl_hostapd_sb_dfs_can_switch_to_full_bw(iface))
++			mxl_hostapd_sub_dfs_switch_chan(iface, 0, 0, 0, 0);
++	}
++}
++
++bool mxl_hostapd_sb_dfs_enabled(struct hostapd_iface *iface)
++{
++	return iface->conf->mxl_conf.sub_band_dfs;
++}
++
++bool mxl_hostapd_handle_sb_dfs_radar(struct hostapd_iface *iface, int cf1, int chan_width)
++{
++	u8 rbm = iface->mxl_iface.rbm;
++	int sb_dfs_new_prim = 0;
++	int sb_dfs_new_bw = CHAN_WIDTH_20;
++	int secondary_offset = 0;
++
++	wpa_printf(MSG_DEBUG, "SB DFS: Radar Bit Map 0x%02x", rbm);
++
++	if (!mxl_hostapd_sb_dfs_enabled(iface))
++		return false;
++
++
++	sb_dfs_new_prim = mxl_hostapd_sub_dfs_get_new_chan(iface, rbm, &sb_dfs_new_bw, &secondary_offset);
++	if (sb_dfs_new_prim == -1) { /* Stay on the same channel */
++		mxl_hostapd_add_dfs_history_entry(iface, cf1, chan_width, rbm, DFS_NO_SWITCH);
++		return true;
++	}
++	else if (sb_dfs_new_prim > 0) {
++		wpa_printf(MSG_INFO, "SB DFS: New chan %d, bw %s, Secondary %d",
++			   sb_dfs_new_prim, channel_width_to_string(sb_dfs_new_bw), secondary_offset);
++		mxl_hostapd_add_dfs_history_entry(iface, cf1, chan_width, rbm, DFS_SUB_BAND_SWICH);
++		if (mxl_hostapd_sub_dfs_switch_chan(iface, rbm, sb_dfs_new_prim, sb_dfs_new_bw, secondary_offset))
++			wpa_printf(MSG_ERROR, "SB DFS: Failed to switch to sub band, will try to switch to new channel");
++		else
++			return true;
++	}
++	else { /* Will switch to new channel */
++		wpa_printf(MSG_INFO, "SB DFS: No sub band switch possible, will switch to new channel");
++		/* Restore original channel params */
++		if (iface->mxl_iface.sb_dfs_cntr) {
++			hostapd_set_oper_chwidth(iface->conf, iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth);
++			iface->conf->secondary_channel = iface->mxl_iface.sb_orig_chandef.secondary_offset;
++			iface->conf->channel = iface->mxl_iface.sb_orig_chandef.channel;
++			hostapd_set_oper_centr_freq_seg0_idx(iface->conf, iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx);
++		}
++	}
++
++	return false;
++}
++
++void mxl_hostapd_dfs_history_deinit(struct hostapd_iface *iface)
++{
++	hostapd_dfs_history_t *entry;
++
++	if (!iface->mxl_iface.dfs_hist_entry_cnt)
++		return;
++
++	while ((entry = dl_list_first(&iface->mxl_iface.dfs_history, hostapd_dfs_history_t, list))) {
++		dl_list_del(&entry->list);
++		iface->mxl_iface.dfs_hist_entry_cnt--;
++		os_free(entry);
++	}
++}
++
++void mxl_hostapd_sb_dfs_switch_update_cntr(struct hostapd_iface *iface, int mxl_sb_dfs_bw)
++{
++	if (NL80211_SB_DFS_BW_NORMAL == mxl_sb_dfs_bw)
++		iface->mxl_iface.sb_dfs_cntr = 0;
++}
+diff --git a/src/ap/mxl_sub_band_dfs.h b/src/ap/mxl_sub_band_dfs.h
+new file mode 100644
+index 000000000..f43fede84
+--- /dev/null
++++ b/src/ap/mxl_sub_band_dfs.h
+@@ -0,0 +1,49 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025 MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_SUB_BAND_DFS_H
++#define MXL_SUB_BAND_DFS_H
++
++struct hostapd_iface;
++
++typedef struct hostapd_sb_dfs_orig_chandef {
++	u8  channel;
++	int secondary_offset;
++	u8  vht_oper_chwidth;
++	u8  vht_oper_centr_freq_seg0_idx;
++} hostapd_sb_dfs_orig_chandef_t;
++
++typedef struct hostapd_dfs_history {
++	struct dl_list list;
++	os_time_t detect_time;
++	int bandwidth;
++	u8 primary;
++	u8 seg0_idx;
++	u8 seg1_idx;
++	u8 rbm; /* Radar Bit Map */
++	u8 type;
++} hostapd_dfs_history_t;
++
++#define MAX_DFS_HIST_ENTRIES		50
++#define DFS_CHAN_SWITCH			0
++#define DFS_SUB_BAND_SWICH		1
++#define DFS_NO_SWITCH			2
++
++bool mxl_hostapd_sb_dfs_enabled(struct hostapd_iface *iface);
++void mxl_hostapd_dfs_history_deinit(struct hostapd_iface *iface);
++bool mxl_hostapd_handle_sb_dfs_radar(struct hostapd_iface *iface, int cf1, int chan_width);
++int  mxl_hostapd_add_dfs_history_entry(struct hostapd_iface *iface, int cf1, int chan_width, u8 rbm, u8 type);
++void mxl_hostapd_handle_sb_dfs(struct hostapd_iface *iface);
++void mxl_hostapd_sb_dfs_switch_update_cntr(struct hostapd_iface *iface, int mxl_sb_dfs_bw);
++
++#endif /* MXL_SUB_BAND_DFS_H */
+\ No newline at end of file
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 4bc6f019a..1e4b3fece 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2728,6 +2728,10 @@ struct csa_settings {
+ 	u16 counter_offset_beacon[2];
+ 	u16 counter_offset_presp[2];
+ 
++#ifdef CONFIG_VENDOR_MXL
++	struct mxl_csa_settings mxl_csa_settings;
++#endif
++
+ 	u16 punct_bitmap;
+ };
+ 
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index c359ef02c..31ad8fb28 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11194,6 +11194,11 @@ static int nl80211_switch_channel(void *priv, struct csa_settings *settings)
+ 			 settings->punct_bitmap)))
+ 		goto error;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (settings->mxl_csa_settings.sb_dfs_bw && (nla_put_u8(msg, NL80211_ATTR_SB_DFS_BW, settings->mxl_csa_settings.sb_dfs_bw)))
++		goto error;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	/* beacon_after params */
+ 	ret = set_beacon_data(msg, &settings->beacon_after);
+ 	if (ret)
+@@ -11223,6 +11228,12 @@ static int nl80211_switch_channel(void *priv, struct csa_settings *settings)
+ 		wpa_printf(MSG_DEBUG, "nl80211: switch_channel failed err=%d (%s)",
+ 			   ret, strerror(-ret));
+ 	}
++
++#ifdef CONFIG_VENDOR_MXL
++	/* Update bandwidth here to avoid calling nl80211_set_channel() in set_ap()*/
++	bss->flink->bandwidth = settings->freq_params.bandwidth;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	return ret;
+ 
+ fail:
+diff --git a/src/drivers/mxl_driver.h b/src/drivers/mxl_driver.h
+index e0e4a405f..349a8c908 100644
+--- a/src/drivers/mxl_driver.h
++++ b/src/drivers/mxl_driver.h
+@@ -18,4 +18,8 @@ struct mxl_scan_cfg {
+ 	int rssi_threshold;
+ };
+ 
++struct mxl_csa_settings {
++	s8 sb_dfs_bw; /* From enum nl80211_sb_dfs_bw, must be signed to store error (-1) */
++};
++
+ #endif /* MXL_DRIVER_H */
+diff --git a/src/drivers/mxl_nl80211.h b/src/drivers/mxl_nl80211.h
+index afac2bbfc..31d68e227 100644
+--- a/src/drivers/mxl_nl80211.h
++++ b/src/drivers/mxl_nl80211.h
+@@ -71,4 +71,12 @@
+ 	NL80211_RADAR_CAC_PAUSED,		\
+ 
+ 
++enum nl80211_sb_dfs_bw {
++	NL80211_SB_DFS_BW_NORMAL,
++	NL80211_SB_DFS_BW_20,
++	NL80211_SB_DFS_BW_40,
++	NL80211_SB_DFS_BW_80,
++	NL80211_SB_DFS_BW_FULL,
++};
++
+ #endif /* MXL_NL80211_H */
+-- 
+2.43.0
+

@@ -1,0 +1,222 @@
+From 3173cba25b6bc008ad52d69a0c323701b93704d7 Mon Sep 17 00:00:00 2001
+From: mvulsx <mvuls@maxlinear.com>
+Date: Wed, 28 Jun 2023 05:50:41 +0000
+Subject: [PATCH] WLANRTSYS-56499: add ACS and DFS support for U-NII-4 channels
+
+Signed-off-by: mvulsx <mvuls@maxlinear.com>
+---
+ hostapd/config_file.c | 16 ++++++++++++++++
+ hostapd/hostapd.conf  | 12 ++++++++++++
+ src/ap/ap_config.h    | 13 +++++++++++++
+ src/ap/dfs.c          | 44 +++++++++++++++++++++++++++++++++++--------
+ src/ap/hostapd.c      |  5 +++++
+ src/ap/hostapd.h      |  1 +
+ 6 files changed, 83 insertions(+), 8 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 5bc817634..94afd50f4 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3619,6 +3619,15 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			conf->channel = atoi(pos);
+ 			conf->acs = conf->channel == 0;
+ 		}
++#ifdef CONFIG_ACS
++	} else if (os_strcmp(buf, "acs_unii4") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, 0, UNII4_CFG_MAX)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid acs_unii4 value %d, range is 0..%d", line, val, UNII4_CFG_MAX);
++			return 1;
++		}
++		conf->acs_unii4 = val;
++#endif /* CONFIG_ACS */
+ 	} else if (os_strcmp(buf, "edmg_channel") == 0) {
+ 		conf->edmg_channel = atoi(pos);
+ 	} else if (os_strcmp(buf, "enable_edmg") == 0) {
+@@ -5639,6 +5648,13 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ #endif /* CONFIG_IEEE80211BE */
++	} else if (os_strcmp(buf, "dfs_unii4") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, 0, UNII4_CFG_MAX)) {
++			wpa_printf(MSG_ERROR, "Invalid dfs_unii4 value %d, range is 0..%d", val, UNII4_CFG_MAX);
++			return 1;
++		}
++		conf->dfs_unii4 = val;
+ 	} else if (os_strcmp(buf, "mu_mimo_operation") == 0) {
+ 		int val = atoi(pos);
+ 		if (!IS_VALID_BOOL_RANGE(val)) {
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index 9f449c694..66017d1f8 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -247,6 +247,18 @@ channel=1
+ # default: 0 (open source ACS/DFS default 'chanlist' behavior)
+ #acs_chanlist_all_chans=0
+ 
++# Configure U-NII-4 for ACS
++# 0: U-NII-4 channels disabled (default)
++# 1: U-NII-4 channels partially enabled - only 160 MHz chandef with primary on lower 80 MHz part
++# 2: U-NII-4 channels fully enabled
++#acs_unii4=0
++
++# Configure U-NII-4 for DFS
++# 0: U-NII-4 channels disabled for DFS (default)
++# 1: U-NII-4 channels partially enabled - only 160 MHz chandef with primary on 149
++# 2: U-NII-4 channels fully enabled for DFS
++#dfs_unii4=0
++
+ # Beacon interval in kus (1.024 ms) (default: 100; range 10..65535)
+ beacon_int=100
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 77f311500..6dd9e3e4b 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1098,6 +1098,16 @@ struct spatial_reuse {
+ 	u8 srg_partial_bssid_bitmap[8];
+ };
+ 
++enum unii4_config_type
++{
++	UNII4_DISABLED,
++	UNII4_PARTIAL,
++	UNII4_ENABLED,
++
++	UNII4_AFTER_LAST,
++	UNII4_CFG_MAX = UNII4_AFTER_LAST - 1,
++};
++
+ #define BEACON_INTERVAL_MIN		10
+ #define BEACON_INTERVAL_MAX		UINT16_MAX
+ 
+@@ -1293,6 +1303,8 @@ struct hostapd_config {
+ 		double bias;
+ 	} *acs_chan_bias;
+ 	unsigned int num_acs_chan_bias;
++
++	int acs_unii4;
+ #endif /* CONFIG_ACS */
+ 
+ 	int sPowerSelection; /* tx power: 12%:9 25%:6 50%:3 75%:1 100%:0 */
+@@ -1410,6 +1422,7 @@ struct hostapd_config {
+ 	} mbssid;
+ 
+ 	u8 notify_action_frame; /* Forwarding incoming action frames to upper layers */
++	int dfs_unii4;
+ #define DEFAULT_MU_OPERATION	1
+ 	int sMuOperation;
+ 	int override_6g_mbssid_default_mode;
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 128e96f70..2387c5256 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -104,7 +104,7 @@ static int dfs_channel_available(struct hostapd_channel_data *chan,
+ }
+ 
+ 
+-static int dfs_is_chan_allowed(struct hostapd_channel_data *chan, int n_chans)
++static int dfs_is_chan_allowed(struct hostapd_channel_data *chan, int n_chans, int allow_unii4)
+ {
+ 	/*
+ 	 * The tables contain first valid channel number based on channel width.
+@@ -122,21 +122,44 @@ static int dfs_is_chan_allowed(struct hostapd_channel_data *chan, int n_chans)
+ 	 * 50, 114, 163
+ 	 */
+ 	int allowed_160[] = { 36, 100, 149 };
++
++	int non_unii4_40[] =  { 36, 44, 52, 60, 100, 108, 116, 124, 132, 149, 157, 184, 192 };
++	int non_unii4_80[] =  { 36, 52, 100, 116, 132, 149, };
++	int non_unii4_160[] = { 36, 100, };
++
+ 	int *allowed = allowed_40;
+ 	unsigned int i, allowed_no = 0;
+ 
+ 	switch (n_chans) {
+ 	case 2:
+-		allowed = allowed_40;
+-		allowed_no = ARRAY_SIZE(allowed_40);
++		if (UNII4_ENABLED == allow_unii4) {
++			allowed = allowed_40;
++			allowed_no = ARRAY_SIZE(allowed_40);
++		}
++		else {
++			allowed = non_unii4_40;
++			allowed_no = ARRAY_SIZE(non_unii4_40);
++		}
+ 		break;
+ 	case 4:
+-		allowed = allowed_80;
+-		allowed_no = ARRAY_SIZE(allowed_80);
++		if (UNII4_ENABLED == allow_unii4) {
++			allowed = allowed_80;
++			allowed_no = ARRAY_SIZE(allowed_80);
++		}
++		else {
++			allowed = non_unii4_80;
++			allowed_no = ARRAY_SIZE(non_unii4_80);
++		}
+ 		break;
+ 	case 8:
+-		allowed = allowed_160;
+-		allowed_no = ARRAY_SIZE(allowed_160);
++		if (allow_unii4) { /* UNII4_ENABLED or UNII4_PARTIAL */
++			allowed = allowed_160;
++			allowed_no = ARRAY_SIZE(allowed_160);
++		}
++		else {
++			allowed = non_unii4_160;
++			allowed_no = ARRAY_SIZE(non_unii4_160);
++		}
+ 		break;
+ 	default:
+ 		wpa_printf(MSG_DEBUG, "Unknown width for %d channels", n_chans);
+@@ -253,7 +276,7 @@ static int dfs_find_channel(struct hostapd_iface *iface,
+ 		/* Skip HT40/VHT incompatible channels */
+ 		if (iface->conf->ieee80211n &&
+ 		    iface->conf->secondary_channel &&
+-		    (!dfs_is_chan_allowed(chan, n_chans) ||
++		    (!dfs_is_chan_allowed(chan, n_chans, iface->conf->dfs_unii4) ||
+ 		     !(chan->allowed_bw & HOSTAPD_CHAN_WIDTH_40P))) {
+ 			wpa_printf(MSG_DEBUG,
+ 				   "DFS: channel %d (%d) is incompatible",
+@@ -261,6 +284,11 @@ static int dfs_find_channel(struct hostapd_iface *iface,
+ 			continue;
+ 		}
+ 
++		if (hostapd_is_unii4_freq(chan->freq) && (UNII4_ENABLED != iface->conf->dfs_unii4)) {
++			wpa_printf(MSG_DEBUG, "DFS: Skipping U-NII-4 channel %d (%d)", chan->freq, chan->chan);
++			continue;
++		}
++
+ 		/* Skip incompatible chandefs */
+ 		if (!dfs_chan_range_available(mode, i, n_chans, type)) {
+ 			wpa_printf(MSG_DEBUG,
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index f290e1933..5f067ee65 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -5718,3 +5718,8 @@ void hostapd_handle_acs_whm_warning (struct hostapd_iface *iface)
+ {
+ 	hostapd_drv_set_whm_trigger(iface->bss[0], WHM_HOSTAP_ACS_FAILURE);
+ }
++
++bool hostapd_is_unii4_freq (int freq)
++{
++	return (freq == 5845) || (freq == 5865) || (freq == 5885);
++}
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 37ccdf0a0..3e70198da 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -869,5 +869,6 @@ int hostapd_link_remove(struct hostapd_data *hapd, u32 count);
+ 
+ void hostapd_tx_queue_params(struct hostapd_data *hapd);
+ void hostapd_handle_acs_whm_warning (struct hostapd_iface *iface);
++bool hostapd_is_unii4_freq (int freq);
+ 
+ #endif /* HOSTAPD_H */
+-- 
+2.43.0
+

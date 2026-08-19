@@ -1,0 +1,318 @@
+From ad9aa8de58adb3cff2c0371959f44baa8beefdff Mon Sep 17 00:00:00 2001
+From: Jack Yang <wyang@maxlinear.com>
+Date: Mon, 8 Jan 2024 16:00:21 +0800
+Subject: [PATCH] WLANRTSYS-59921:
+
+1. move sProbeReqCltMode to mxl_conf structure
+2. add ProbeReqListTimer support to have timer to query probe request list from driver and flush it
+3. send RX-PROBE-REQUEST event to upper layer with MAC address and RSSI for each probe request
+---
+ hostapd/config_file.c         |   3 -
+ hostapd/mxl_config.c          |  10 +++
+ src/ap/ap_config.c            |   1 -
+ src/ap/ap_config.h            |   1 -
+ src/ap/mxl_config.h           |   5 ++
+ src/ap/mxl_hostapd.c          | 133 +++++++++++++++++++++++++++++++++-
+ src/ap/mxl_hostapd.h          |   8 ++
+ src/common/vendor_cmds_copy.h |   6 ++
+ 8 files changed, 159 insertions(+), 8 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 708dec013..f8b2fc85d 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5567,9 +5567,6 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 	} else if (os_strcmp(buf, "sMaxMpduLen") == 0) {
+ 		conf->sMaxMpduLen = atoi(pos);
+ 
+-	} else if (os_strcmp(buf, "sProbeReqCltMode") == 0) {
+-		conf->sProbeReqCltMode = atoi(pos);
+-
+ 	} else if (os_strcmp(buf, "sRTSmode") == 0) {
+ 		if (hostapd_fill_intlist(conf->sRTSmode, pos, ARRAY_SIZE(conf->sRTSmode))) {
+ 			wpa_printf(MSG_ERROR, "Line %d: wrong number of sRTSmode parameters, expected %d",
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index a057b11ea..4c5ad8130 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -1453,6 +1453,16 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->dynamic_edca = val;
++	} else if (os_strcmp(buf, "sProbeReqCltMode") == 0) {
++		mxl_conf->sProbeReqCltMode = atoi(pos);
++	} else if (os_strcmp(buf, "ProbeReqListTimer") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, PROBE_REQUEST_TIME_MIN, PROBE_REQUEST_TIME_MAX)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid probe request timer range %d",
++					line, val);
++			return 0;
++		}
++		mxl_conf->ProbeReqListTimer = atoi(pos);
+ 	} else if (os_strcmp(buf, "he_6ghz_pwr_mode") == 0) {
+ 		int val = atoi(pos);
+ 		if (!IS_VALID_BOOL_RANGE(val)) {
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 71cd5c562..aca50cb28 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -271,7 +271,6 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->sQAMplus = -1;
+ 	conf->sConfigMRCoex = -1;
+ 	conf->sBfMode = -1;
+-	conf->sProbeReqCltMode = 0;
+ 	conf->sMaxMpduLen = -1;
+ 
+ 	/* Set to invalid value means do not add Power Constraint IE */
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index d37576f07..c302e9e91 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1362,7 +1362,6 @@ struct hostapd_config {
+ 	int sConfigMRCoexInactiveTime;
+ 	int sConfigMRCoexCts2SelfActive;
+ 	int sBfMode;
+-	int sProbeReqCltMode;
+ 	int sMaxMpduLen;
+ 
+ 	struct wpabuf *lci;
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index cbc7a5130..01ce02832 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -252,6 +252,9 @@ struct eht_override_hw_capab {
+ 
+ typedef u8 macaddr[ETH_ALEN];
+ 
++#define PROBE_REQUEST_TIME_MIN 0
++#define PROBE_REQUEST_TIME_MAX 60
++
+ /**
+  * struct mxl_hostapd_config - Per-radio interface configuration
+  */
+@@ -295,6 +298,8 @@ struct mxl_hostapd_config {
+ 	u8 enable_eht_debug_mode;
+ 	struct ieee80211_eht_capabilities eht_capab_dbg;
+ #endif /* CONFIG_IEEE80211BE */
++	int sProbeReqCltMode;
++	int ProbeReqListTimer;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 686ba3e50..29bd6aa12 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -34,6 +34,8 @@
+ #define COC_POWER_3x3_STATE 3
+ #define COC_POWER_4x4_STATE 4
+ 
++#define WAVE_PROBE_REQ_LIST_MAX_SIZE	500
++
+ static void ap_sta_remove_in_other_bss_now(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	struct hostapd_iface *iface = hapd->iface;
+@@ -1422,6 +1424,71 @@ void mxl_hostapd_set_eht_punct_bitmap(struct hostapd_data *hapd, u16 punct_bitma
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 
++static void get_probe_request_list_timeout(void *eloop_data, void *user_data)
++{
++	struct hostapd_iface *iface = eloop_data;
++	struct hostapd_data *hapd = iface->bss[0];
++	struct mxl_hostapd_config *mxl_conf = &iface->conf->mxl_conf;
++	struct intel_vendor_probe_req_info probe_req_arr[WAVE_PROBE_REQ_LIST_MAX_SIZE] = {0};
++	size_t probe_req_size = sizeof(probe_req_arr);
++	size_t probe_req_list_num = 0;
++	int i;
++	u8 flush_probe_list = 1;
++
++	wpa_printf(MSG_MSGDUMP, "%s: interface=%s", __func__, iface->bss[0]->conf->iface);
++
++	if (mxl_conf->sProbeReqCltMode && mxl_conf->ProbeReqListTimer) {
++		if (MXL_DRV_VENDOR_GET_AT_LEAST(LTQ_NL80211_VENDOR_SUBCMD_GET_LAST_PROBE_REQS, &flush_probe_list, sizeof(flush_probe_list), probe_req_arr, &probe_req_size)) {
++			wpa_printf(MSG_ERROR, "Failed to get probe request list from driver");
++			return;
++		}
++
++		if (probe_req_size != 0) {
++			probe_req_list_num = probe_req_size / sizeof(struct intel_vendor_probe_req_info);
++			for (i = 0; i < probe_req_list_num; i++) {
++				wpa_msg_ctrl(hapd->msg_ctx, MSG_INFO, RX_PROBE_REQUEST "sa=" MACSTR
++						" signal=%d", MAC2STR(probe_req_arr[i].addr), probe_req_arr[i].rssi);
++			}
++		}
++
++		eloop_register_timeout(mxl_conf->ProbeReqListTimer, 0, get_probe_request_list_timeout, iface, NULL);
++	}
++}
++
++static void get_probe_request_list_timer_deinit(struct hostapd_iface *iface)
++{
++	if (iface == NULL || iface->conf == NULL) {
++		return;
++	}
++
++	struct mxl_hostapd_config *mxl_conf = &iface->conf->mxl_conf;
++
++	if ((mxl_conf->sProbeReqCltMode <= 0) || (mxl_conf->ProbeReqListTimer <=0)) {
++		return;
++	}
++
++	if (eloop_is_timeout_registered(get_probe_request_list_timeout, iface, NULL)) {
++		eloop_cancel_timeout(get_probe_request_list_timeout, iface, NULL);
++	}
++}
++
++static int get_probe_req_list_timer_init(struct hostapd_iface *iface)
++{
++	struct mxl_hostapd_config *mxl_conf = &iface->conf->mxl_conf;
++
++	if ((mxl_conf->sProbeReqCltMode <= 0) || (mxl_conf->ProbeReqListTimer <=0)) {
++		wpa_printf(MSG_DEBUG, "%s: %s sProbeReqCltMode=%d, ProbeReqListTimer=%d",
++				__func__, iface->bss[0]->conf->iface, mxl_conf->sProbeReqCltMode, mxl_conf->ProbeReqListTimer);
++		return 0;
++	}
++
++	if (!eloop_is_timeout_registered(get_probe_request_list_timeout, iface, NULL)) {
++		eloop_register_timeout(mxl_conf->ProbeReqListTimer, 0, get_probe_request_list_timeout, iface, NULL);
++	}
++
++	return 0;
++}
++
+ int mxl_hostapd_setup_interface(struct hostapd_data *hapd)
+ {
+ 	struct mxl_hostapd_config *mxl_conf = &hapd->iconf->mxl_conf;
+@@ -1510,6 +1577,65 @@ void mxl_hostapd_setup_interface_post(struct hostapd_iface *iface)
+ 		if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_AP_RETRY_LIMIT, ap_retry_limit_cfg, sizeof(ap_retry_limit_cfg)))
+ 			wpa_printf(MSG_WARNING, "set sTxRetryLimit failed");
+ 	}
++
++	get_probe_req_list_timer_init(iface);
++}
++
++int mxl_hostapd_drv_get_vendor_data_at_least(struct hostapd_data *hapd,
++			unsigned int vendor_id, unsigned int subcmd,
++			void *input_data, size_t input_data_size,
++			void *out_data, size_t *in_out_data_size)
++{
++	int ret;
++	errno_t err;
++	struct wpabuf *rsp;
++	size_t data_size = *in_out_data_size;
++
++	if (!out_data || !in_out_data_size || (data_size == 0)) {
++		wpa_printf(MSG_ERROR, "subcmd id: %d "
++			"out_data %p in_out_data %p in_out_data_size %zu", subcmd, out_data, in_out_data_size, data_size);
++		return -ENOBUFS;
++	}
++
++	rsp = wpabuf_alloc(data_size);
++	if (!rsp) {
++		return -ENOBUFS;
++	}
++
++	ret = hostapd_drv_vendor_cmd(hapd, vendor_id,
++				subcmd, input_data, input_data_size, NESTED_ATTR_NOT_USED, rsp);
++	if (ret) {
++		wpa_printf(MSG_ERROR, "subcmd id: %d "
++			"failed: %i (%s)", subcmd, ret, strerror(-ret));
++		goto out;
++	}
++
++	/* random size, check max size */
++	if (rsp->used > data_size) {
++		ret = -EMSGSIZE;
++		wpa_printf(MSG_ERROR, "subcmd id: %d returned %zu bytes bigger than max %zu",
++				subcmd, rsp->used, data_size);
++		goto out;
++	}
++
++	if (rsp->used != 0) {
++		err = memcpy_s(out_data, data_size, rsp->buf, rsp->used);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			ret = -ENOBUFS;
++			goto out;
++		}
++		*in_out_data_size = rsp->used;
++	}
++	else {
++		*in_out_data_size = 0;
++	}
++
++	wpa_printf(MSG_EXCESSIVE, "subcmd id: %d processed", subcmd);
++
++out:
++	wpabuf_free(rsp);
++	return ret;
+ }
+ 
+ int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
+@@ -1750,9 +1876,8 @@ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface)
+ 			wpa_printf(MSG_WARNING, "set sMaxMpduLen failed");
+ 	}
+ 
+-	if (hostapd_drv_vendor_cmd(hapd, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_CLT_PROBE_REQS_MODE,
+-					(u8*)&iface->conf->sProbeReqCltMode, sizeof(iface->conf->sProbeReqCltMode),
+-					NESTED_ATTR_NOT_USED, NULL))
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_CLT_PROBE_REQS_MODE,
++					&mxl_conf->sProbeReqCltMode, sizeof(mxl_conf->sProbeReqCltMode)))
+ 		wpa_printf(MSG_WARNING, "set sProbeReqCltMode failed");
+ 
+ 	if (hostapd_drv_vendor_cmd(hapd, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_INTERFER_THRESH,
+@@ -1859,6 +1984,8 @@ void mxl_hostapd_cleanup_iface(struct hostapd_iface *iface)
+ 	mxl_hostapd_dfs_history_deinit(iface);
+ 	if (iface->mxl_iface.zwdfs_info.csa_settings)
+ 		os_free(iface->mxl_iface.zwdfs_info.csa_settings);
++
++	get_probe_request_list_timer_deinit(iface);
+ }
+ 
+ void mxl_ap_max_nss_omn_elem_timeout(void *eloop_data, void *user_data)
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index bfd8ea279..9412d28c6 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -118,12 +118,20 @@ int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
+ 			void *input_data, size_t input_data_size,
+ 			void *out_data, size_t out_data_size);
+ 
++int mxl_hostapd_drv_get_vendor_data_at_least(struct hostapd_data *hapd,
++			unsigned int vendor_id, unsigned int subcmd,
++			void *input_data, size_t input_data_size,
++			void *out_data, size_t *in_out_data_size);
++
+ #define MXL_DRV_VENDOR_SET(cmd__, ptr__, size__) \
+ 	hostapd_drv_vendor_cmd(hapd, OUI_LTQ, (cmd__), (u8*)(ptr__), (size__), NESTED_ATTR_NOT_USED, NULL)
+ 
+ #define MXL_DRV_VENDOR_GET(cmd__, in_ptr__, in_size__, out_ptr__, out_size__) \
+ 	mxl_hostapd_drv_get_vendor_data(hapd, OUI_LTQ, (cmd__), (void*)(in_ptr__), (in_size__), (void*)(out_ptr__), (out_size__))
+ 
++#define MXL_DRV_VENDOR_GET_AT_LEAST(cmd__, in_ptr__, in_size__, out_ptr__, in_out_size_ptr__) \
++	mxl_hostapd_drv_get_vendor_data_at_least(hapd, OUI_LTQ, (cmd__), (void*)(in_ptr__), (in_size__), (void*)(out_ptr__), (in_out_size_ptr__))
++
+ struct hostapd_iface;
+ struct sta_info;
+ 
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 4b34123f8..414fdf221 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -476,6 +476,12 @@ struct intel_vendor_initial_data_cfg
+   u8  ieee80211n_acax_compat;
+ } __attribute__ ((packed));
+ 
++struct intel_vendor_probe_req_info {
++  DEF_IEEE_ADDR(addr);
++  u16 age;
++  s8 rssi;
++} __attribute__ ((packed));
++
+ /* SoftBlock Timer ACL configuration */
+ struct intel_vendor_sb_timer_acl_cfg {
+   int timer_acl_on;
+-- 
+2.43.0
+

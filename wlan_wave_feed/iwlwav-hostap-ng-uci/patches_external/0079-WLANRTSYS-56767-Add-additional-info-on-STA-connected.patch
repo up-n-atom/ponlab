@@ -1,0 +1,1235 @@
+From fb68b99a9a94e2431f266e5baff618b12bffbf42 Mon Sep 17 00:00:00 2001
+From: mvulsx <mvuls@maxlinear.com>
+Date: Thu, 6 Jul 2023 14:46:27 +0000
+Subject: [PATCH] WLANRTSYS-56767: Add additional info on STA
+ connected/disconnected events
+
+Signed-off-by: mvulsx <mvuls@maxlinear.com>
+---
+ hostapd/config_file.c        |   4 +
+ hostapd/ctrl_iface.c         |   6 -
+ src/ap/drv_callbacks.c       |   5 +
+ src/ap/ieee802_11.c          |  71 ++++
+ src/ap/ieee802_11.h          |   2 +
+ src/ap/ieee802_11_ht.c       |  26 ++
+ src/ap/ieee802_1x.c          |   5 +
+ src/ap/sta_info.c            | 621 ++++++++++++++++++++++++++++++++++-
+ src/ap/sta_info.h            |  19 ++
+ src/ap/wnm_ap.c              |   1 +
+ src/common/ieee802_11_defs.h |  70 ++++
+ src/utils/common.h           |   1 +
+ 12 files changed, 810 insertions(+), 21 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 595661612..d82857c77 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -1421,6 +1421,10 @@ static u8 set_he_cap(int val, u8 mask)
+ 	return (u8) (mask & (val << find_bit_offset(mask)));
+ }
+ 
++u8 get_he_cap(int val, u8 mask)
++{
++	return (u8) ((mask & val) >> find_bit_offset(mask));
++}
+ 
+ static int hostapd_parse_he_srg_bitmap(u8 *bitmap, char *val)
+ {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index a1d14dfd5..4c305cbe8 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -5753,12 +5753,6 @@ static int hostapd_ctrl_iface_get_he_phy_channel_width_set(struct hostapd_data *
+ 		return len;
+ 	len += ret;
+ 
+-#define HE_PHYCAP_CAP0_IDX 0
+-#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B0 (u8) BIT(1)
+-#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B1 (u8) BIT(2)
+-#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B2 (u8) BIT(3)
+-#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B3 (u8) BIT(4)
+-
+ 	if(he_caps->he_phy_capab_info[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B0) {
+ 			ret = sprintf_s(reply + len, reply_len - len, ",40MHz");
+ 			if (ret <= 0)
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 86be7fb9d..6ca4f5da6 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -934,6 +934,11 @@ void hostapd_notif_disassoc(struct hostapd_data *hapd, const u8 *addr)
+ 		return;
+ 	}
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	/* until required details is made available driver,
++	 * set reason and source values to unspecified and local respectively */
++	sta->disassoc_reason = WLAN_REASON_UNSPECIFIED;
++	sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC);
+ 	hostapd_set_sta_flags(hapd, sta);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index c2dbde97b..4620b667c 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3568,6 +3568,50 @@ static u16 copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
+ 	return WLAN_STATUS_SUCCESS;
+ }
+ 
++u16 copy_supported_channels(struct hostapd_data *hapd, struct sta_info *sta,
++			   struct ieee802_11_elems *elems)
++{
++	size_t	nof_max = sizeof(sta->supported_channels);
++	size_t	filled = 0;
++	int	remain;
++	u8	chan, range;
++	const u8 *pos;
++
++	sta->supported_channels_len = 0;
++
++	if (!elems->supp_channels) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_DEBUG,
++				"No supported channels element in AssocReq");
++		return WLAN_STATUS_SUCCESS;
++	}
++
++	pos = elems->supp_channels;
++	remain = elems->supp_channels_len;
++	while (remain > 1) { /* parse by pair of bytes: chan and range */
++		chan  = *pos++;
++		range = *pos++;
++		remain -= 2;
++		if (nof_max < (filled + range)) {
++			hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++					HOSTAPD_LEVEL_DEBUG,
++					"Supported channels number exceeds %zu",
++					nof_max);
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
++
++		for ( ; range > 0; range--) {
++			sta->supported_channels[filled++] = chan++;
++		}
++	}
++
++	sta->supported_channels_len = filled;
++
++	wpa_hexdump(MSG_DEBUG, "Supported channels",
++			sta->supported_channels, sta->supported_channels_len);
++
++	return WLAN_STATUS_SUCCESS;
++}
+ 
+ #ifdef CONFIG_OWE
+ 
+@@ -3940,9 +3984,18 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
+ 
++	resp = copy_supported_channels(hapd, sta, elems);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++
+ 	resp = copy_sta_ht_capab(hapd, sta, elems->ht_capabilities);
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
++	if (sta->ht_capabilities != NULL) {
++		resp = copy_sta_ht_operation(hapd, sta, elems->ht_operation);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
+ 	if (hapd->iconf->ieee80211n && hapd->iconf->require_ht &&
+ 	    !(sta->flags & WLAN_STA_HT)) {
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+@@ -3957,6 +4010,12 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 		if (resp != WLAN_STATUS_SUCCESS)
+ 			return resp;
+ 
++		if (sta->vht_capabilities != NULL) { /* set by copy_sta_vht_capab, don't reorder */
++			resp = copy_sta_vht_oper(hapd, sta, elems->vht_operation);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++
+ 		resp = set_sta_vht_opmode(hapd, sta, elems->opmode_notif);
+ 		if (resp != WLAN_STATUS_SUCCESS)
+ 			return resp;
+@@ -5848,6 +5907,9 @@ static void hostapd_disassoc_sta(struct hostapd_data *hapd,
+ 		"disassocation: STA=" MACSTR " reason_code=%d",
+ 		MAC2STR(mgmt->sa), le_to_host16(mgmt->u.disassoc.reason_code));
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	sta->disassoc_reason = le_to_host16(mgmt->u.disassoc.reason_code);
++	sta->disconnect_source = DISCONNECT_SOURCE_REMOTE;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;
+ 	sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
+@@ -6057,6 +6119,10 @@ static void handle_deauth(struct hostapd_data *hapd,
+ 	if (hostapd_ml_handle_disconnect(hapd, sta, mgmt, false))
+ 		return;
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	sta->deauth_reason = le_to_host16(mgmt->u.deauth.reason_code);
++	sta->disconnect_source = DISCONNECT_SOURCE_REMOTE;
++
+ 	hostapd_deauth_sta(hapd, sta, mgmt);
+ }
+ 
+@@ -6765,6 +6831,11 @@ static void handle_assoc_cb(struct hostapd_data *hapd,
+ 		 */
+ 		ap_sta_set_authorized(hapd, sta, 1);
+ 	}
++	else {
++		sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++		sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
++		ap_sta_set_authorized(hapd, sta, 0);
++	}
+ 
+ 	if (reassoc)
+ 		mlme_reassociate_indication(hapd, sta);
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index b06b93b4a..7633bc468 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -113,6 +113,8 @@ int hostapd_process_ml_assoc_req_addr(struct hostapd_data *hapd,
+ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta);
+ u16 copy_sta_ht_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 		      const u8 *ht_capab);
++u16 copy_sta_ht_operation(struct hostapd_data *hapd, struct sta_info *sta,
++			  const u8 *ht_operation);
+ u16 copy_sta_vendor_vht(struct hostapd_data *hapd, struct sta_info *sta,
+ 			const u8 *ie, size_t len);
+ u16 copy_sta_vendor2_vht(struct hostapd_data *hapd, struct sta_info *sta,
+diff --git a/src/ap/ieee802_11_ht.c b/src/ap/ieee802_11_ht.c
+index b3e1738ac..38805cd0a 100644
+--- a/src/ap/ieee802_11_ht.c
++++ b/src/ap/ieee802_11_ht.c
+@@ -415,6 +415,32 @@ u16 copy_sta_ht_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 	return WLAN_STATUS_SUCCESS;
+ }
+ 
++u16 copy_sta_ht_operation(struct hostapd_data *hapd, struct sta_info *sta,
++			  const u8 *ht_operation)
++{
++	errno_t err;
++
++	if (!ht_operation) {
++		os_free(sta->ht_operation);
++		sta->ht_operation = NULL;
++		return WLAN_STATUS_SUCCESS;
++	}
++
++	if (sta->ht_operation == NULL) {
++		sta->ht_operation = os_zalloc(sizeof(struct ieee80211_ht_operation));
++		if (sta->ht_operation == NULL)
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++
++	err = memcpy_s(sta->ht_operation, sizeof(struct ieee80211_ht_operation),
++		       ht_operation, sizeof(struct ieee80211_ht_operation));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++
++	return WLAN_STATUS_SUCCESS;
++}
+ 
+ void ht40_intolerant_add(struct hostapd_iface *iface, struct sta_info *sta)
+ {
+diff --git a/src/ap/ieee802_1x.c b/src/ap/ieee802_1x.c
+index e4002bab3..4cc339973 100644
+--- a/src/ap/ieee802_1x.c
++++ b/src/ap/ieee802_1x.c
+@@ -121,6 +121,11 @@ static void ieee802_1x_set_authorized(struct hostapd_data *hapd,
+ 	if (sta->flags & WLAN_STA_PREAUTH)
+ 		return;
+ 
++	if (!authorized) {
++		sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++		sta->deauth_reason = WLAN_REASON_IEEE_802_1X_AUTH_FAILED;
++		sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
++	}
+ 	ap_sta_set_authorized(hapd, sta, authorized);
+ 	res = hostapd_set_authorized(hapd, sta, authorized);
+ 	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE8021X,
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index ad9f1cbce..21c0a7e75 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -43,6 +43,12 @@
+ #include "mxl_hostapd.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
++#define UPPER_24G_FREQ_VALUE	2500
++
++#define DO_RELATE_OPER(return_value, first, second, operation) { \
++		return_value = (first operation second) ? first : second; \
++	}
++
+ static void ap_sta_remove_in_other_bss(struct hostapd_data *hapd,
+ 				       struct sta_info *sta);
+ static void ap_handle_session_timer(void *eloop_ctx, void *timeout_ctx);
+@@ -197,6 +203,10 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	accounting_sta_stop(hapd, sta);
+ 
+ 	/* just in case */
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	sta->disassoc_reason = (hapd->iface->mxl_iface.stas_free_reason < WLAN_REASON_UNSPECIFIED) ? WLAN_REASON_UNSPECIFIED :
++				hapd->iface->mxl_iface.stas_free_reason;
++	sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	hostapd_set_sta_flags(hapd, sta);
+ 
+@@ -382,6 +392,7 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ #endif /* CONFIG_FST */
+ 
+ 	os_free(sta->ht_capabilities);
++	os_free(sta->ht_operation);
+ 	os_free(sta->vht_capabilities);
+ 	os_free(sta->vht_operation);
+ 	os_free(sta->he_capab);
+@@ -481,7 +492,7 @@ void ap_handle_timer(void *eloop_ctx, void *timeout_ctx)
+ 	struct hostapd_data *hapd = eloop_ctx;
+ 	struct sta_info *sta = timeout_ctx;
+ 	unsigned long next_time = 0;
+-	int reason;
++	u16 reason;
+ 
+ 	wpa_printf(MSG_DEBUG, "%s: %s: " MACSTR " flags=0x%x timeout_next=%d",
+ 		   hapd->conf->iface, __func__, MAC2STR(sta->addr), sta->flags,
+@@ -611,6 +622,11 @@ skip_poll:
+ 		break;
+ 	case STA_DISASSOC:
+ 	case STA_DISASSOC_FROM_CLI:
++		sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++		reason = sta->disassoc_reason = (sta->timeout_next == STA_DISASSOC) ?
++						WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY :
++						WLAN_REASON_PREV_AUTH_NOT_VALID;
++		sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 		ap_sta_set_authorized(hapd, sta, 0);
+ 		sta->flags &= ~WLAN_STA_ASSOC;
+ 		hostapd_set_sta_flags(hapd, sta);
+@@ -623,9 +639,6 @@ skip_poll:
+ 		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_INFO, "disassociated due to "
+ 			       "inactivity");
+-		reason = (sta->timeout_next == STA_DISASSOC) ?
+-			WLAN_REASON_DISASSOC_DUE_TO_INACTIVITY :
+-			WLAN_REASON_PREV_AUTH_NOT_VALID;
+ 		sta->timeout_next = STA_DEAUTH;
+ 		wpa_printf(MSG_DEBUG, "%s: register ap_handle_timer timeout "
+ 			   "for " MACSTR " (%d seconds - AP_DEAUTH_DELAY)",
+@@ -925,6 +938,9 @@ void ap_sta_disassociate(struct hostapd_data *hapd, struct sta_info *sta,
+ 		sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
+ 		sta->timeout_next = STA_DEAUTH;
+ 	}
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	sta->disassoc_reason = reason;
++	sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	hostapd_set_sta_flags(hapd, sta);
+ 	wpa_printf(MSG_DEBUG, "%s: reschedule ap_handle_timer timeout "
+@@ -947,7 +963,6 @@ void ap_sta_disassociate(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	sta->wpa_sm = NULL;
+ 
+-	sta->disassoc_reason = reason;
+ 	sta->flags |= WLAN_STA_PENDING_DISASSOC_CB;
+ 	eloop_cancel_timeout(ap_sta_disassoc_cb_timeout, hapd, sta);
+ 	eloop_register_timeout(hapd->iface->drv_flags &
+@@ -983,6 +998,9 @@ void ap_sta_deauthenticate(struct hostapd_data *hapd, struct sta_info *sta,
+ 		   hapd->conf->iface, MAC2STR(sta->addr));
+ 	sta->last_seq_ctrl = WLAN_INVALID_MGMT_SEQ;
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK);
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	sta->deauth_reason = reason;
++	sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	hostapd_set_sta_flags(hapd, sta);
+ 	sta->timeout_next = STA_REMOVE;
+@@ -997,7 +1015,6 @@ void ap_sta_deauthenticate(struct hostapd_data *hapd, struct sta_info *sta,
+ 	accounting_sta_stop(hapd, sta);
+ 	ieee802_1x_free_station(hapd, sta);
+ 
+-	sta->deauth_reason = reason;
+ 	sta->flags |= WLAN_STA_PENDING_DEAUTH_CB;
+ 	eloop_cancel_timeout(ap_sta_deauth_cb_timeout, hapd, sta);
+ 	eloop_register_timeout(hapd->iface->drv_flags &
+@@ -1372,6 +1389,7 @@ const char * ap_sta_wpa_get_keyid(struct hostapd_data *hapd,
+ }
+ 
+ #define STA_EVENT_MAX_BUF_LEN	1024
++#define STA_EXTRA_CAP_LEN	300
+ 
+ const u8 * ap_sta_wpa_get_dpp_pkhash(struct hostapd_data *hapd,
+ 				     struct sta_info *sta)
+@@ -1380,13 +1398,387 @@ const u8 * ap_sta_wpa_get_dpp_pkhash(struct hostapd_data *hapd,
+ }
+ 
+ 
++static void sta_get_phy_mode_ch_width(struct hostapd_data *hapd, struct sta_info *sta,
++	unsigned int *phy_mode, unsigned int *max_ch_width)
++{
++	*phy_mode = PHY_TYPE_UNSPECIFIED;
++	*max_ch_width = NR_CHAN_WIDTH_20;
++	int ht_ch_width;
++
++	if (sta->he_capab) {
++		u8 *he_phy = (u8*) &(sta->he_capab->he_phy_capab_info);
++		*phy_mode = PHY_TYPE_HE;
++		if (he_phy[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B0) /* 40 MHz */
++			*max_ch_width = NR_CHAN_WIDTH_40;
++		if (he_phy[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B1) /* 40 and 80 MHz */
++			*max_ch_width = NR_CHAN_WIDTH_80;
++		else {
++			/* Non-AP STA with 20 MHz channel width (B1 = 0) */
++			/* If 20 MHz In 40 MHz HE PPDU In 2.4 GHz subfield is 1 and B4 = 1,
++			max channel width will be 40 MHz
++			*/
++			if ((he_phy[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B4) &&
++				(he_phy[HE_PHYCAP_CAP8_IDX] & HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_2_4_GHZ_BAND))
++				*max_ch_width = NR_CHAN_WIDTH_40;
++
++			/* If 20 MHz In 160/80+80 MHz HE PPDU subfield is set to 0 and B5 = 1,
++			max channel width will be 160 MHz otherwise 80 MHz
++			*/
++			if (he_phy[HE_PHYCAP_CAP8_IDX] & HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU) {
++				if (he_phy[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B5)
++					*max_ch_width = NR_CHAN_WIDTH_160;
++				else
++					*max_ch_width = NR_CHAN_WIDTH_80;
++			}
++		}
++		if ((he_phy[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B2) || /* 160 MHz */
++			(he_phy[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B3)) /* 160/80+80 MHz */
++			*max_ch_width = NR_CHAN_WIDTH_160;
++
++		return;
++	}
++
++	if (sta->vht_capabilities) {
++		u8 seg0 = 0, seg1 = 0;
++		struct ieee80211_vht_capabilities *capab;
++
++		capab = sta->vht_capabilities;
++		*phy_mode = PHY_TYPE_VHT;
++		if (sta->vht_operation) {
++			switch (sta->vht_operation->vht_op_info_chwidth) {
++			case 0:
++				if (sta->ht_operation) { /* identify channel width from HT operation */
++					if (sta->ht_operation->ht_param & HT_INFO_HT_PARAM_STA_CHNL_WIDTH)
++						*max_ch_width = NR_CHAN_WIDTH_40;
++					else
++						*max_ch_width = NR_CHAN_WIDTH_20;
++				}
++				break;
++			case 1:
++				seg0 = sta->vht_operation->vht_op_info_chan_center_freq_seg0_idx;
++				seg1 = sta->vht_operation->vht_op_info_chan_center_freq_seg1_idx;
++				if (seg1 && abs(seg1 - seg0) == 8) {
++					*max_ch_width = NR_CHAN_WIDTH_160;
++				}
++				else if (seg1) {
++					/* 80P80 : not supported */
++				}
++				else {
++					*max_ch_width = NR_CHAN_WIDTH_80;
++				}
++				break;
++			case 2:
++				*max_ch_width = NR_CHAN_WIDTH_160;
++				break;
++			case 3:
++				/* 80P80 : not supported */
++				break;
++			default:
++				break;
++			}
++		} else {
++			int vht_chanwidth = 0;
++			int vht_ext_nss_bw = 0;
++			/*
++			* If only the VHT Capabilities element is present (e.g., for
++			* normal clients), use it to determine the supported channel
++			* bandwidth.
++			*/
++			vht_chanwidth = capab->vht_capabilities_info &
++				VHT_CAP_SUPP_CHAN_WIDTH_MASK;
++			vht_ext_nss_bw = capab->vht_capabilities_info &
++				VHT_CAP_EXT_NSS_BW_3;
++
++			switch (hapd->iconf->vht_oper_chwidth) {
++			case 3:/* 80P80 : not supported */
++				break;
++			case 2:/*AP is BW160 case*/
++				if ((vht_chanwidth) || ((vht_chanwidth == 0) && (vht_ext_nss_bw)))
++					*max_ch_width = NR_CHAN_WIDTH_160;
++				break;
++			case 1:/*AP is BW80 case*/
++				*max_ch_width = NR_CHAN_WIDTH_80;
++				break;
++			case 0:/*AP is BW20/BW40 case*/
++			default:
++				if (sta->ht_capabilities) {
++					ht_ch_width = (le_to_host16(sta->ht_capabilities->ht_capabilities_info) & HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET);
++					*max_ch_width = (ht_ch_width != 0) ? NR_CHAN_WIDTH_40 : NR_CHAN_WIDTH_20;
++				} else {/*station is with VHT cap but no HT cap, goto error handling case*/
++					*phy_mode = PHY_TYPE_UNSPECIFIED;
++					goto phy_mode_unspec;
++				}
++				break;
++			}
++		}
++		return;
++	}
++
++	if (sta->ht_capabilities) {
++		*phy_mode = PHY_TYPE_HT;
++		ht_ch_width = (le_to_host16(sta->ht_capabilities->ht_capabilities_info) & HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET);
++		*max_ch_width = (ht_ch_width != 0) ? NR_CHAN_WIDTH_40 : NR_CHAN_WIDTH_20;
++		return;
++	}
++
++phy_mode_unspec:
++	if (*phy_mode == PHY_TYPE_UNSPECIFIED) { /* is not set yet by vht/ht */
++		if (hapd->iface->freq > UPPER_24G_FREQ_VALUE)
++			*phy_mode = PHY_TYPE_OFDM;
++		else {
++			u8 rate1_set = 0, rate6_set = 0;
++			int supp_rate = 0, i = 0;
++			for (i = 0; i < sta->supported_rates_len; i++) {
++				supp_rate = sta->supported_rates[i] & 0x7f;
++				if(supp_rate > 22) {
++					*phy_mode = PHY_TYPE_ERP;
++					rate1_set = 1;
++				}
++				else {
++					*phy_mode = PHY_TYPE_HRDSSS;
++					rate6_set = 1;
++				}
++				if(rate1_set && rate6_set) {
++					/* skip for now, enum doesn't cover BG mode */
++					*phy_mode = PHY_TYPE_UNSPECIFIED;
++					break;
++				}
++			}
++		}
++		*max_ch_width = NR_CHAN_WIDTH_20;
++	}
++
++	return;
++}
++
++/*
++  Identify max MCS and corresponding NSS value
++  for given HE MCS_NSS struct
++*/
++static void sta_get_he_mcs_nss(u8 *sta_he_mcs_nss, u8 *mcs, u8 *nss)
++{
++#define GET_HE_MCS_N_SS(n, m, sta_he_mcs_nss, mask, mcs, nss)		\
++		do {							\
++			u8 val = get_he_cap(sta_he_mcs_nss[m], mask);	\
++			if (val != IEEE80211_HE_MCS_NOT_SUPPORTED) { 	\
++				nss = n;				\
++				if (val <= mcs) {			\
++					mcs = val;			\
++				}					\
++			}						\
++		} while(0)
++
++	*mcs = 0;
++	*nss = 0;
++
++	GET_HE_MCS_N_SS(1, 0, sta_he_mcs_nss, HE_MCS_NSS_FOR_1SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(2, 0, sta_he_mcs_nss, HE_MCS_NSS_FOR_2SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(3, 0, sta_he_mcs_nss, HE_MCS_NSS_FOR_3SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(4, 0, sta_he_mcs_nss, HE_MCS_NSS_FOR_4SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(5, 1, sta_he_mcs_nss, HE_MCS_NSS_FOR_5SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(6, 1, sta_he_mcs_nss, HE_MCS_NSS_FOR_6SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(7, 1, sta_he_mcs_nss, HE_MCS_NSS_FOR_7SS, *mcs, *nss);
++	GET_HE_MCS_N_SS(8, 1, sta_he_mcs_nss, HE_MCS_NSS_FOR_8SS, *mcs, *nss);
++}
++
++static void sta_get_mcs_nss(struct hostapd_data *hapd, struct sta_info *sta, unsigned int *max_mcs,
++			    unsigned int *max_streams, unsigned int *tx_streams, unsigned int *rx_streams)
++{
++	int i = 0;
++	*max_mcs = 0;
++	*tx_streams = *rx_streams = *max_streams = 1;
++
++	if (sta->he_capab) {
++		/* array[0,1,2] = [TX,RX,max(TX,RX)] */
++		u8 he_80_mcs_array[3] = {0}, he_160_mcs_array[3] = {0};
++		u8 he_80_nss_array[3] = {0}, he_160_nss_array[3] = {0};
++		u8 *sta_he_mcs_nss = NULL;
++
++		/* STA TX/RX 80 */
++		sta_he_mcs_nss = (u8 *)&sta->he_capab->optional[HE_MCS_NSS_TX_MCS_MAP_LESS_EQ_80_MHZ_PART1_IDX];
++		sta_get_he_mcs_nss(sta_he_mcs_nss, &he_80_mcs_array[0], &he_80_nss_array[0]);
++		sta_he_mcs_nss = (u8 *)&sta->he_capab->optional[HE_MCS_NSS_RX_MCS_MAP_LESS_EQ_80_MHZ_PART1_IDX];
++		sta_get_he_mcs_nss(sta_he_mcs_nss, &he_80_mcs_array[1], &he_80_nss_array[1]);
++		/* find out min MCS and NSS between TX/RX */
++		DO_RELATE_OPER(he_80_mcs_array[2], he_80_mcs_array[0], he_80_mcs_array[1], <=)
++		DO_RELATE_OPER(he_80_nss_array[2], he_80_nss_array[0], he_80_nss_array[1], <=)
++		*tx_streams = he_80_nss_array[0];
++		*rx_streams = he_80_nss_array[1];
++
++		if (sta->he_capab->he_phy_capab_info[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B2) {
++			/* STA TX/RX 160 */
++			sta_he_mcs_nss = (u8 *)&sta->he_capab->optional[HE_MCS_NSS_TX_MCS_MAP_160_MHZ_PART1_IDX];
++			sta_get_he_mcs_nss(sta_he_mcs_nss, &he_160_mcs_array[0], &he_160_nss_array[0]);
++			sta_he_mcs_nss = (u8 *)&sta->he_capab->optional[HE_MCS_NSS_RX_MCS_MAP_160_MHZ_PART1_IDX];
++			sta_get_he_mcs_nss(sta_he_mcs_nss, &he_160_mcs_array[1], &he_160_nss_array[1]);
++			/* find out min MCS and NSS between TX/RX */
++			DO_RELATE_OPER(he_160_mcs_array[2], he_160_mcs_array[0], he_160_mcs_array[1], <=)
++			DO_RELATE_OPER(he_160_nss_array[2], he_160_nss_array[0], he_160_nss_array[1], <=)
++
++			/* it's not yet clear which of RX/TX MCS and NSS values needed by caller, so return min of the two for now */
++			DO_RELATE_OPER(he_80_mcs_array[2], he_80_mcs_array[2], he_160_mcs_array[2], <)
++			DO_RELATE_OPER(he_80_nss_array[2], he_80_nss_array[2], he_160_nss_array[2], <)
++			DO_RELATE_OPER(*tx_streams, he_80_nss_array[0], he_160_nss_array[0], <)
++			DO_RELATE_OPER(*rx_streams, he_80_nss_array[1], he_160_nss_array[1], <)
++		}
++
++		if (sta->he_capab->he_phy_capab_info[HE_PHYCAP_CAP0_IDX] & HE_PHY_CAP0_CHANNEL_WIDTH_SET_B3) {
++			/* 80P80 : not supported */
++		}
++
++		/* min MCS and NSS values after comparsion between different channel widths is stored in he_80_mcs/nss_array[2] */
++		*max_mcs = he_80_mcs_array[2];
++		*max_streams = he_80_nss_array[2];
++		switch(*max_mcs) {
++			case 0:
++				*max_mcs = 7;
++				break;
++			case 1:
++				*max_mcs = 9;
++				break;
++			case 2:
++				*max_mcs = 11;
++				break;
++			default:
++				break;
++		}
++		return;
++	}
++	if (sta->vht_capabilities) {
++		int mcs_per_nss = 0, rx_map = 0, tx_map = 0;
++		int mcs_array[2] = {0}, nss_array[2] = {0};
++		tx_map = sta->vht_capabilities->vht_supported_mcs_set.tx_map;
++		for (i = 0; i < VHT_RX_NSS_MAX_STREAMS; i++) { /* max streams same for RX/TX , ref : check_valid_vht_mcs */
++			mcs_per_nss = (((1 << 2) - 1) & (tx_map >> ((i * 2) - 1))); /* extract 2-bits at a time (MCS per SS) */
++			if (mcs_per_nss != 3) { /* SS not supported */
++				nss_array[0] = i + 1;
++				if (mcs_array[0] <= mcs_per_nss) {
++					mcs_array[0] = mcs_per_nss;
++				}
++			}
++		}
++		rx_map = sta->vht_capabilities->vht_supported_mcs_set.rx_map;
++		for (i = 0; i < VHT_RX_NSS_MAX_STREAMS; i++) {
++			mcs_per_nss = (((1 << 2) - 1) & (rx_map >> ((i * 2) - 1))); /* extract 2-bits at a time (MCS per SS) */
++			if (mcs_per_nss != 3) { /* SS not supported */
++				nss_array[1] = i + 1;
++				if (mcs_array[1] <= mcs_per_nss) {
++					mcs_array[1] = mcs_per_nss;
++				}
++			}
++		}
++		DO_RELATE_OPER(*max_mcs, mcs_array[0], mcs_array[1], <)
++		DO_RELATE_OPER(*max_streams, nss_array[0], nss_array[1], <)
++		*tx_streams = nss_array[0];
++		*rx_streams = nss_array[1];
++		switch(*max_mcs) {
++			case 0:
++				*max_mcs = 7;
++				break;
++			case 1:
++				*max_mcs = 8;
++				break;
++			case 2:
++				*max_mcs = 9;
++				break;
++			default:
++				break;
++		}
++		return;
++	}
++	if (sta->ht_capabilities) {
++		int rx_nss = 0, tx_nss = 0, rx_mcs = 0;
++		u8 tx_mcs_byte = 0, tx_mcs_set = 0, tx_rx_mcs_not_equal = 0;
++		u8 rx_mcs_byte = 0;
++		tx_mcs_byte = sta->ht_capabilities->supported_mcs_set[HT_CAP_SUPP_MCS_SET_TX_OCTET]; /* fetch 13th octet */
++		tx_mcs_set = (tx_mcs_byte & HT_CAP_SUPP_MCS_SET_TX_MCS_SET) ? 1 : 0; /* TX MCS Set Defined */
++		tx_rx_mcs_not_equal = (tx_mcs_byte & HT_CAP_SUPP_MCS_SET_TX_RX_MCS_SET_NOT_EQUAL) ? 1 : 0; /* TX RX MCS Set Not Equal*/
++		tx_nss = 0;
++		if (tx_mcs_set && tx_rx_mcs_not_equal) {
++			/* extract TX NSS from bit 98 and 99 */
++			tx_nss = ((tx_mcs_byte & HT_CAP_SUPP_MCS_SET_TX_MAX_NSS_SUPP) >> 4) + 1;
++		}
++		for (i = 0; i < HT_CAP_SUPP_MCS_SET_RX_OCTETS; i++) { /* parse first 4 octets for RX NSS */
++			rx_mcs_byte = sta->ht_capabilities->supported_mcs_set[i];
++			if (rx_mcs_byte & HT_CAP_SUPP_MCS_SET_RX_MASK) {
++				rx_mcs = 0;
++				rx_nss++;
++				while (rx_mcs_byte >>= 1) /* identify highest order MCS */
++					rx_mcs++;
++				if (rx_mcs > *max_mcs)
++					*max_mcs = rx_mcs;
++			}
++		}
++		if (tx_mcs_set && tx_rx_mcs_not_equal)
++			DO_RELATE_OPER(*max_streams, tx_nss, rx_nss, <) /* take min of TX/RX MCS */
++		else {
++			/* tx_rx_mcs_not_equal=0. set tx MCS equal to rx MCS */
++			*max_streams = rx_nss;
++			tx_nss = rx_nss;
++		}
++		*tx_streams = tx_nss;
++		*rx_streams = rx_nss;
++	}
++
++	return;
++}
++
++static const char *
++_sta_mode_to_str (struct hostapd_iface *iface, struct sta_info *sta)
++{
++	int i;
++	bool mode_b = false;
++
++	if (sta->flags & WLAN_STA_EHT)
++		return "802.11be";
++	if (sta->flags & WLAN_STA_HE)
++		return "802.11ax";
++	if (sta->flags & (WLAN_STA_VHT | WLAN_STA_VHT_OPMODE_ENABLED | WLAN_STA_VENDOR_VHT | WLAN_STA_VENDOR2_VHT))
++		return "802.11ac";
++	if (sta->flags & WLAN_STA_HT)
++		return "802.11n";
++	if (iface->current_mode->mode == HOSTAPD_MODE_IEEE80211A)
++		return "802.11a";
++
++	/* g or b */
++	for (i = 0; i < sta->supported_rates_len; i++) {
++		u8 rate_mbps, rate = sta->supported_rates[i];
++		rate_mbps = (rate & 0x7f) >> 1u;
++		switch (rate_mbps) {
++			case 6u:
++			case 9u:
++			case 12u:
++			case 18u:
++			case 24u:
++			case 36u:
++			case 48u:
++			case 54u:
++				return "802.11g";
++			case 1u:
++			case 2u:
++			case 11u:
++				mode_b = true;
++				break;
++			case 5u:
++				if(rate & 1) /* 0.5 */
++					mode_b = true;
++				break;
++		}
++	}
++	return mode_b ? "802.11b" : "UNKNOWN";
++}
++
+ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   int authorized)
+ {
+ 	const u8 *dev_addr = NULL;
+ 	char *buf, *pos, *end;
+ 	int buflen = STA_EVENT_MAX_BUF_LEN;
++	char *sta_extra_cap = NULL;
+ 	int i, ret = 0, len = 0;
++	unsigned int max_ch_width = 0, phy_mode = 0;
++	unsigned int mumimo = 0, max_mcs = 0, max_streams = 0, tx_streams = 0, rx_streams = 0;
++	unsigned int rrm_cap = 0, band_2g_capable = 0, band_5g_capable = 0, band_6g_capable = 0;
+ #ifdef CONFIG_P2P
+ 	u8 addr[ETH_ALEN];
+ 	u8 ip_addr_buf[4];
+@@ -1437,7 +1829,13 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 	else
+ #endif /* CONFIG_P2P */
+ 	{
+-		ret = sprintf_s(pos, end - pos, MACSTR, MAC2STR(sta->addr));
++		/* Report disassociation following expired BSS Transition Management Request timeout
++		 * in case STA didn't dis-associate on its own */
++		if (!authorized && (sta->timeout_next == STA_DISASSOC_FROM_CLI) &&
++			(sta->flags & WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT))
++			ret = sprintf_s(pos, end - pos, MACSTR " DISASSOC_TIMER_EXPIRED", MAC2STR(sta->addr));
++		else
++			ret = sprintf_s(pos, end - pos, MACSTR, MAC2STR(sta->addr));
+ 		if (ret <= 0) {
+ 			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 			goto free_alloc;
+@@ -1449,6 +1847,13 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		hapd->sta_authorized_cb(hapd->sta_authorized_cb_ctx,
+ 					sta->addr, authorized, dev_addr);
+ 
++	sta_extra_cap = os_malloc(STA_EXTRA_CAP_LEN);
++	if (sta_extra_cap == NULL) {
++		wpa_printf(MSG_ERROR, "malloc failed");
++		goto free_alloc;
++	}
++	sta_extra_cap[0] = '\0';
++
+ 	if (authorized) {
+ 		const u8 *dpp_pkhash;
+ 		const char *keyid;
+@@ -1466,6 +1871,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		dpp_pkhash_buf[0] = '\0';
+ 		keyid_buf[0] = '\0';
+ 		ip_addr[0] = '\0';
++		signal_strength[0] = '\0';
+ 
+ 		/* 4 symbols per rate */
+ 		rates = os_malloc(WLAN_SUPP_RATES_MAX * 4);
+@@ -1674,25 +2080,198 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		}
+ #endif
+ 
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s%s%s%s",
+-			buf, ip_addr, signal_strength, rates, capabilities, assoc_req, keyid_buf, dpp_pkhash_buf);
++		len = 0;
++		rrm_cap = (sta->capability & WLAN_CAPABILITY_RADIO_MEASUREMENT) ? 1 : 0;
++		band_2g_capable = band_5g_capable = band_6g_capable = 0;
++
++		if(is_6ghz_freq(hapd->iface->freq))
++			band_6g_capable = 1;
++		else if (hapd->iface->freq > UPPER_24G_FREQ_VALUE)
++			band_5g_capable = 1;
++		else
++			band_2g_capable = 1;
++
++		if (sta->supp_op_classes) {
++			/* First Op Class is the current one, which we
++			   already know according to our freq, but we
++			   use it anyway, just in case */
++			for (i = 1; i <= sta->supp_op_classes[0]; i++){
++				if(band_2g_capable && band_5g_capable &&
++				   band_6g_capable)
++					break;
++
++				if (!band_2g_capable &&
++				    is_24ghz_op_class (sta->supp_op_classes[i]))
++					band_2g_capable = 1;
++				else if (!band_5g_capable &&
++					 is_5ghz_op_class (sta->supp_op_classes[i]))
++					band_5g_capable = 1;
++				else if (!band_6g_capable &&
++					 is_6ghz_op_class (sta->supp_op_classes[i]))
++					band_6g_capable = 1;
++			}
++		}
++
++		len = 0;
++		ret = os_snprintf(sta_extra_cap + len, STA_EXTRA_CAP_LEN - len, " rrm_supported=%d band_2g_capable=%d band_5g_capable=%d  band_6g_capable=%d ",
++			rrm_cap, band_2g_capable, band_5g_capable, band_6g_capable);
++		if (os_snprintf_error(STA_EXTRA_CAP_LEN - len, ret)) {
++			os_free(rates);
++			os_free(capabilities);
++			os_free(assoc_req);
++			goto free_alloc;
++		}
++		len += ret;
++		sta_get_phy_mode_ch_width(hapd, sta, &phy_mode, &max_ch_width);
++		if (sta->he_capab) {
++			mumimo = (get_he_cap(sta->he_capab->he_phy_capab_info[HE_PHYCAP_CAP2_IDX], HE_PHY_CAP2_PARTIAL_BANDWIDTH_UL_MU_MIMO) ||
++				get_he_cap(sta->he_capab->he_phy_capab_info[HE_PHYCAP_CAP2_IDX], HE_PHY_CAP2_FULL_BANDWIDTH_UL_MU_MIMO) ||
++				get_he_cap(sta->he_capab->he_phy_capab_info[HE_PHYCAP_CAP6_IDX], HE_PHY_CAP6_PARTIAL_BANDWIDTH_DL_MU_MIMO));
++		}
++		sta_get_mcs_nss(hapd, sta, &max_mcs, &max_streams, &tx_streams, &rx_streams);
++		ret = sprintf_s(sta_extra_cap + len, STA_EXTRA_CAP_LEN - len,
++				"max_ch_width=%d max_streams=%d tx_streams=%d rx_streams=%d phy_mode=%d max_mcs=%d max_tx_power=%d mu_mimo=%d ",
++				max_ch_width, max_streams, tx_streams, rx_streams, phy_mode, max_mcs, sta->max_tx_power, mumimo);
++		if (ret <= 0) {
++			os_free(rates);
++			os_free(capabilities);
++			os_free(assoc_req);
++			goto free_alloc;
++		}
++		len += ret;
++		ret = sprintf_s(sta_extra_cap + len, STA_EXTRA_CAP_LEN - len, "rrm_cap=%02x %02x %02x %02x %02x ",
++				sta->rrm_enabled_capa[0], sta->rrm_enabled_capa[1], sta->rrm_enabled_capa[2],
++				sta->rrm_enabled_capa[3], sta->rrm_enabled_capa[4]);
++		if (ret <= 0) {
++			os_free(rates);
++			os_free(capabilities);
++			os_free(assoc_req);
++			goto free_alloc;
++		}
++		len += ret;
++
++		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s%s%s%s%s",
++			buf, ip_addr, signal_strength, rates, capabilities, assoc_req, sta_extra_cap, keyid_buf, dpp_pkhash_buf);
+ 
+ 		if (hapd->msg_ctx_parent &&
+ 		    hapd->msg_ctx_parent != hapd->msg_ctx)
+ 			wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
+-					  AP_STA_CONNECTED "%s%s%s%s%s%s%s",
+-					  buf, ip_addr, signal_strength, rates, capabilities, keyid_buf,
++					  AP_STA_CONNECTED "%s%s%s%s%s%s%s%s",
++					  buf, ip_addr, signal_strength, rates, capabilities, sta_extra_cap, keyid_buf,
+ 					  dpp_pkhash_buf);
+ 		os_free(rates);
+ 		os_free(capabilities);
+ 		os_free(assoc_req);
+ 	} else {
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_DISCONNECTED "%s", buf);
++		u16 reason = 0;
++		enum sta_disconnect_type type = DISCONNECT_TYPE_UNKNOWN;
++
++		if (hapd->iface->current_mode &&
++		    hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211AD) {
++			type = DISCONNECT_TYPE_DISASSOC;
++		}
++
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_DEBUG, "STA disconnect invoked with deauth reason %d, disconnect reason %d, source %d",
++				sta->deauth_reason, sta->disassoc_reason, sta->disconnect_source);
++
++		/* values for deauth and diassoc reason parameters not set together */
++		if (sta->deauth_reason) {
++			reason = sta->deauth_reason;
++			type = DISCONNECT_TYPE_DEAUTH;
++		}
++		if (sta->disassoc_reason) {
++			reason = sta->disassoc_reason;
++			type = DISCONNECT_TYPE_DISASSOC;
++		}
++		if (!sta->deauth_reason && !sta->disassoc_reason) {
++			reason = WLAN_REASON_PREV_AUTH_NOT_VALID;
++			type = DISCONNECT_TYPE_RECONNECT;
++		}
++
++		ret = sprintf_s(sta_extra_cap, STA_EXTRA_CAP_LEN,
++				" reason=%d source=%d type=%d", reason, sta->disconnect_source, type);
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			goto free_alloc;
++		}
++
++		{ /* Additional STA disconnect event parameters */
++			struct intel_vendor_sta_info sta_info = {0};
++			int encrypt_mode = hapd->conf->wpa_pairwise;
++			int auth_mode = hapd->conf->wpa_key_mgmt;
++			int proto = 0;
++			char wireles_mode[32]  = "UNKNOWN";
++			u32 last_tx_phy_rate   = 0;
++			u32 last_rx_phy_rate   = 0;
++			u32 max_supported_rate = 0;
++			u32 sta_bandwidth      = 0;
++			u32 tx_fail_pkts       = 0;
++			u32 retrans_pkts       = 0;
++			s32 signal_strength    = -128;
++
++			if (!MXL_DRV_VENDOR_GET(LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS, sta->addr, ETH_ALEN, &sta_info, sizeof(sta_info))) {
++				last_tx_phy_rate   = sta_info.LastDataDownlinkRate / 1000;
++				last_rx_phy_rate   = sta_info.LastDataUplinkRate / 1000;
++				max_supported_rate = sta_info.MaxRate / 1000;
++				tx_fail_pkts       = sta_info.ErrorsSent;
++				retrans_pkts       = sta_info.RetryCount;
++				signal_strength    = sta_info.SignalStrength;
++
++				if (sta_info.RateInfoFlag) {
++					sta_bandwidth = sta_info.RateCbwMHz;
++				}
++			}
++
++			os_strlcpy(wireles_mode, _sta_mode_to_str(hapd->iface, sta), sizeof(wireles_mode));
++
++			if (sta->wpa_sm) {
++				encrypt_mode = wpa_auth_get_pairwise(sta->wpa_sm);
++				auth_mode    = wpa_auth_sta_key_mgmt(sta->wpa_sm);
++				proto        = wpa_auth_sta_wpa_version(sta->wpa_sm);
++			}
++
++			ret = sprintf_s(sta_extra_cap + ret, STA_EXTRA_CAP_LEN - ret,
++					" wireles_mode=%s"
++					" last_tx_phy_rate=%uMbps"
++					" last_rx_phy_rate=%uMbps"
++					" max_supported_rate=%uMbps"
++					" encrypt_mode=%s"
++					" auth_mode=%s"
++					" RSSI=%d"
++					" channel=%u"
++					" bandwidth=%u"
++					" tx_fail_pkts=%u"
++					" retrans_pkts=%u",
++					wireles_mode,
++					last_tx_phy_rate,
++					last_rx_phy_rate,
++					max_supported_rate,
++					wpa_cipher_txt(encrypt_mode),
++					wpa_key_mgmt_txt(auth_mode, proto),
++					signal_strength,
++					hapd->iface->conf->channel,
++					sta_bandwidth,
++					tx_fail_pkts,
++					retrans_pkts);
++
++			if (ret <= 0) {
++				wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++				goto free_alloc;
++			}
++		}
++
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Generating AP_STA_DISCONNECTED event with %s%s", buf, sta_extra_cap);
++		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_DISCONNECTED "%s%s", buf, sta_extra_cap);
+ 
+ 		if (hapd->msg_ctx_parent &&
+ 		    hapd->msg_ctx_parent != hapd->msg_ctx)
+ 			wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
+-					  AP_STA_DISCONNECTED "%s", buf);
++					  AP_STA_DISCONNECTED "%s%s", buf, sta_extra_cap);
++
++		sta->deauth_reason = sta->disassoc_reason = 0;
++		sta->disconnect_source = DISCONNECT_SOURCE_UNKNOWN;
+ 	}
+ 
+ #ifdef CONFIG_FST
+@@ -1707,6 +2286,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ free_alloc:
+ 	os_free(buf);
++	os_free(sta_extra_cap);
+ }
+ 
+ 
+@@ -1730,6 +2310,17 @@ void ap_sta_disconnect(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	if (sta == NULL)
+ 		return;
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	if (hapd->iface->current_mode &&
++	    hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211AD) {
++		/* Deauthentication is not used in DMG/IEEE 802.11ad;
++		 * disassociate the STA instead. */
++		sta->disassoc_reason = reason;
++	}
++	else {
++		sta->deauth_reason = reason;
++	}
++	sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	sta->flags &= ~(WLAN_STA_AUTH | WLAN_STA_ASSOC);
+ 	hostapd_set_sta_flags(hapd, sta);
+@@ -1749,7 +2340,6 @@ void ap_sta_disconnect(struct hostapd_data *hapd, struct sta_info *sta,
+ 	    hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211AD) {
+ 		/* Deauthentication is not used in DMG/IEEE 802.11ad;
+ 		 * disassociate the STA instead. */
+-		sta->disassoc_reason = reason;
+ 		sta->flags |= WLAN_STA_PENDING_DISASSOC_CB;
+ 		eloop_cancel_timeout(ap_sta_disassoc_cb_timeout, hapd, sta);
+ 		eloop_register_timeout(hapd->iface->drv_flags &
+@@ -1759,7 +2349,6 @@ void ap_sta_disconnect(struct hostapd_data *hapd, struct sta_info *sta,
+ 		return;
+ 	}
+ 
+-	sta->deauth_reason = reason;
+ 	sta->flags |= WLAN_STA_PENDING_DEAUTH_CB;
+ 	eloop_cancel_timeout(ap_sta_deauth_cb_timeout, hapd, sta);
+ 	eloop_register_timeout(hapd->iface->drv_flags &
+@@ -1949,6 +2538,8 @@ int ap_sta_re_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
++	sta->flags &= ~WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
++	sta->disconnect_source = DISCONNECT_SOURCE_LOCAL;
+ 	ap_sta_set_authorized(hapd, sta, 0);
+ 	hostapd_drv_sta_remove(hapd, sta->addr);
+ 	sta->flags &= ~(WLAN_STA_ASSOC | WLAN_STA_AUTH | WLAN_STA_AUTHORIZED);
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 3f69c3c4e..afdef6021 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -21,6 +21,7 @@
+ /* STA flags */
+ #define WLAN_STA_AUTH BIT(0)
+ #define WLAN_STA_ASSOC BIT(1)
++#define WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT BIT(2)
+ #define WLAN_STA_AUTHORIZED BIT(5)
+ #define WLAN_STA_PENDING_POLL BIT(6) /* pending activity poll not ACKed */
+ #define WLAN_STA_SHORT_PREAMBLE BIT(7)
+@@ -52,6 +53,7 @@
+ /* Maximum number of supported rates (from both Supported Rates and Extended
+  * Supported Rates IEs). */
+ #define WLAN_SUPP_RATES_MAX 32
++#define WLAN_SUPP_CHANNELS_COUNT 100
+ 
+ struct hostapd_data;
+ 
+@@ -70,6 +72,19 @@ struct pending_eapol_rx {
+ 	enum frame_encryption encrypted;
+ };
+ 
++enum sta_disconnect_source {
++	DISCONNECT_SOURCE_UNKNOWN = 0,	/**< Unknown source */
++	DISCONNECT_SOURCE_LOCAL,	/**< Initiated locally */
++	DISCONNECT_SOURCE_REMOTE	/**< Initiated remotely */
++};
++
++enum sta_disconnect_type {
++	DISCONNECT_TYPE_UNKNOWN  = 0,	/**<Unknowntype*/
++	DISCONNECT_TYPE_DISASSOC,	/**<Disassociation*/
++	DISCONNECT_TYPE_DEAUTH,		/**<Deauthentication*/
++	DISCONNECT_TYPE_RECONNECT	/**<Reconnection*/
++};
++
+ #define EHT_ML_MAX_STA_PROF_LEN 1024
+ struct mld_info {
+ 	bool mld_sta;
+@@ -112,6 +127,8 @@ struct sta_info {
+ 	u16 listen_interval; /* or beacon_int for APs */
+ 	u8 supported_rates[WLAN_SUPP_RATES_MAX];
+ 	int supported_rates_len;
++	u8 supported_channels[WLAN_SUPP_CHANNELS_COUNT];
++	int supported_channels_len;
+ 	u8 qosinfo; /* Valid when WLAN_STA_WMM is set */
+ 
+ #ifdef CONFIG_MESH
+@@ -205,6 +222,7 @@ struct sta_info {
+ 	char *radius_cui; /* Chargeable-User-Identity from RADIUS */
+ 
+ 	struct ieee80211_ht_capabilities *ht_capabilities;
++	struct ieee80211_ht_operation *ht_operation;
+ 	struct ieee80211_vht_capabilities *vht_capabilities;
+ 	struct ieee80211_vht_operation *vht_operation;
+ 	u8 vht_opmode;
+@@ -346,6 +364,7 @@ struct sta_info {
+ 	/* IEEE 802.11f (IAPP) related data */
+ 	struct ieee80211_mgmt *last_assoc_req;
+ 	size_t last_assoc_req_len;
++	enum sta_disconnect_source disconnect_source;
+ };
+ 
+ 
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index ecb1b73d7..cc5ad3bbd 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -1100,6 +1100,7 @@ static void set_disassoc_timer(struct hostapd_data *hapd, struct sta_info *sta,
+ 		   " set to %d ms", MAC2STR(sta->addr), timeout);
+ 
+ 	sta->timeout_next = STA_DISASSOC_FROM_CLI;
++	sta->flags |= WLAN_STA_BSS_TRANS_MGMT_REQ_TIMEOUT;
+ 	eloop_cancel_timeout(ap_handle_timer, hapd, sta);
+ 	eloop_register_timeout(timeout / 1000,
+ 			       timeout % 1000 * 1000,
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index eaf6c88cf..62fb8b0eb 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1270,6 +1270,14 @@ struct auth_fail_list {
+ #define HT_CAP_AMPDU_MAXIMUM_AMPDU_LENGTH_EXPONENT	((u8)(BIT(0) | BIT(1)))
+ #define HT_CAP_AMPDU_MINIMUM_MPDU_START_SPACING 	((u8)(BIT(2) | BIT(3) | BIT(4)))
+ 
++/* Supported MCS Set field of HT Capabilities element */
++#define HT_CAP_SUPP_MCS_SET_TX_MCS_SET			((u8)BIT(0))
++#define HT_CAP_SUPP_MCS_SET_TX_RX_MCS_SET_NOT_EQUAL	((u8)BIT(1))
++#define HT_CAP_SUPP_MCS_SET_TX_MAX_NSS_SUPP		((u8)BIT(2) | BIT(3))
++#define HT_CAP_SUPP_MCS_SET_TX_OCTET			12
++#define HT_CAP_SUPP_MCS_SET_RX_OCTETS			4
++#define HT_CAP_SUPP_MCS_SET_RX_MASK			0xff
++
+ /* HT Extended Capabilities field within HT Capabilities element */
+ #define EXT_HT_CAP_INFO_PCO			((u16) BIT(0))
+ #define EXT_HT_CAP_INFO_PCO_TRANS_TIME_MASK	((u16) (BIT(1) | BIT(2)))
+@@ -2323,6 +2331,7 @@ enum phy_type {
+ 	PHY_TYPE_HT = 7,
+ 	PHY_TYPE_DMG = 8,
+ 	PHY_TYPE_VHT = 9,
++	PHY_TYPE_HE = 10,
+ };
+ 
+ /* IEEE P802.11-REVmd/D3.0, 9.4.2.36 - Neighbor Report element */
+@@ -2462,6 +2471,67 @@ struct ieee80211_spatial_reuse {
+ #define HE_PHYCAP_PPE_THRESHOLD_PRESENT_IDX	6
+ #define HE_PHYCAP_PPE_THRESHOLD_PRESENT		((u8) BIT(7))
+ 
++
++
++#define VHT_CAP_EXT_NSS_BW_3 ((u32) BIT(30) | BIT(31))
++
++#define HE_PHYCAP_CAP0_IDX 0
++#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B0 ((u8) BIT(1))
++#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B1 ((u8) BIT(2))
++#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B2 ((u8) BIT(3))
++#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B3 ((u8) BIT(4))
++#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B4 ((u8) BIT(5))
++#define HE_PHY_CAP0_CHANNEL_WIDTH_SET_B5 ((u8) BIT(6))
++
++#define HE_PHYCAP_CAP2_IDX 2
++#define HE_PHY_CAP2_FULL_BANDWIDTH_UL_MU_MIMO    ((u8) BIT(6))
++#define HE_PHY_CAP2_PARTIAL_BANDWIDTH_UL_MU_MIMO ((u8) BIT(7))
++
++#define HE_PHYCAP_CAP6_IDX 6
++#define HE_PHY_CAP6_PARTIAL_BANDWIDTH_DL_MU_MIMO ((u8) BIT(6))
++
++#define HE_PHYCAP_CAP8_IDX 8
++#define HE_PHY_CAP8_20MHZ_IN_40MHZ_HE_PPDU_2_4_GHZ_BAND	((u8) BIT(1))
++#define HE_PHY_CAP8_20MHZ_IN_160MHZ_HE_PPDU		((u8) BIT(2))
++
++/* HE-MCS and NSS set field */
++#define HE_MCS_NSS_RX_MCS_MAP_LESS_EQ_80_MHZ_PART1_IDX 0
++#define HE_MCS_NSS_TX_MCS_MAP_LESS_EQ_80_MHZ_PART1_IDX 2
++#define HE_MCS_NSS_RX_MCS_MAP_160_MHZ_PART1_IDX 4
++#define HE_MCS_NSS_TX_MCS_MAP_160_MHZ_PART1_IDX 6
++#define HE_MCS_NSS_RX_MCS_MAP 0Xff
++
++#define HE_MCS_NSS_FOR_1SS ((u8) (BIT(0) | BIT(1)))
++#define HE_MCS_NSS_FOR_2SS ((u8) (BIT(2) | BIT(3)))
++#define HE_MCS_NSS_FOR_3SS ((u8) (BIT(4) | BIT(5)))
++#define HE_MCS_NSS_FOR_4SS ((u8) (BIT(6) | BIT(7)))
++#define HE_MCS_NSS_FOR_5SS ((u8) (BIT(0) | BIT(1)))
++#define HE_MCS_NSS_FOR_6SS ((u8) (BIT(2) | BIT(3)))
++#define HE_MCS_NSS_FOR_7SS ((u8) (BIT(4) | BIT(5)))
++#define HE_MCS_NSS_FOR_8SS ((u8) (BIT(6) | BIT(7)))
++
++/**
++ * enum ieee80211_he_mcs_support - HE MCS support definitions
++ * @IEEE80211_HE_MCS_SUPPORT_0_7: MCSes 0-7 are supported for the
++ *	number of streams
++ * @IEEE80211_HE_MCS_SUPPORT_0_9: MCSes 0-9 are supported
++ * @IEEE80211_HE_MCS_SUPPORT_0_11: MCSes 0-11 are supported
++ * @IEEE80211_HE_MCS_NOT_SUPPORTED: This number of streams isn't supported
++ *
++ * These definitions are used in each 2-bit subfield of the rx_mcs_*
++ * and tx_mcs_* fields of &struct ieee80211_he_mcs_nss_supp, which are
++ * both split into 8 subfields by number of streams. These values indicate
++ * which MCSes are supported for the number of streams the value appears
++ * for.
++ */
++enum ieee80211_he_mcs_support {
++	IEEE80211_HE_MCS_SUPPORT_0_7	= 0,
++	IEEE80211_HE_MCS_SUPPORT_0_9	= 1,
++	IEEE80211_HE_MCS_SUPPORT_0_11	= 2,
++	IEEE80211_HE_MCS_NOT_SUPPORTED	= 3,
++};
++
++
+ /* HE PPE Threshold define */
+ #define HE_PPE_THRES_RU_INDEX_BITMASK_MASK	0xf
+ #define HE_PPE_THRES_RU_INDEX_BITMASK_SHIFT	3
+diff --git a/src/utils/common.h b/src/utils/common.h
+index fd748b52d..9cb154297 100644
+--- a/src/utils/common.h
++++ b/src/utils/common.h
+@@ -590,6 +590,7 @@ char * get_param(const char *cmd, const char *param);
+ void forced_memzero(void *ptr, size_t len);
+ 
+ #ifdef CONFIG_IEEE80211AX
++u8 get_he_cap(int val, u8 mask);
+ void clr_set_he_cap(u8 *field, int val, u8 mask);
+ #endif /* CONFIG_IEEE80211AX */
+ 
+-- 
+2.43.0
+

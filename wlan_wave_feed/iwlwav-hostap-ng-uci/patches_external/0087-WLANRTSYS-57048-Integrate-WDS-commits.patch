@@ -1,0 +1,908 @@
+From aa2b0398a1575b94eb22086765d9e904dd9b0d12 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Thu, 20 Jul 2023 13:54:30 +0200
+Subject: [PATCH] WLANRTSYS-57048: Integrate WDS commits
+
+- Legacy WDS implementation
+---
+ hostapd/Makefile                   |   1 +
+ hostapd/config_file.c              |   1 -
+ hostapd/mxl_config.c               |  48 +++
+ src/ap/ap_config.c                 |   1 +
+ src/ap/drv_callbacks.c             |   1 +
+ src/ap/hostapd.c                   |   8 +
+ src/ap/ieee802_11.c                |   8 +
+ src/ap/ieee802_11.h                |   6 +-
+ src/ap/mxl_config.h                |   5 +
+ src/ap/mxl_events.c                |  35 ++
+ src/ap/mxl_wds.c                   | 491 +++++++++++++++++++++++++++++
+ src/ap/mxl_wds.h                   |  21 ++
+ src/common/mxl_vendor.h            |   2 +
+ src/common/vendor_cmds_copy.h      |  16 +
+ src/drivers/driver_nl80211_event.c |  19 ++
+ 15 files changed, 661 insertions(+), 2 deletions(-)
+ create mode 100644 src/ap/mxl_wds.c
+ create mode 100644 src/ap/mxl_wds.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 14a1b73f9..af82e8fcd 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -378,6 +378,7 @@ OBJS += ../src/ap/mxl_zwdfs.o
+ OBJS += ../src/ap/mxl_softblock.o
+ OBJS += ../src/ap/mxl_rrm.o
+ OBJS += ../src/ap/mxl_ieee802_11.o
++OBJS += ../src/ap/mxl_wds.o
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 745a3814d..c4e0407ad 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5494,7 +5494,6 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		conf->sConfigMRCoexCts2SelfActive = val;
+-
+ 	} else if (os_strcmp(buf, "multi_ap") == 0) {
+ 		int val = atoi(pos);
+ 
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 39401500d..14ed9e433 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -89,6 +89,50 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->ignore_40_mhz_intolerant = val;
++	} else if (os_strcmp(buf, "sBridgeMode") == 0) {
++		mxl_bss_conf->sBridgeMode = atoi(pos);
++	} else if (os_strcmp(buf, "sAddPeerAP") == 0) {
++		char * start = pos;
++		int i, j=0;
++		char local_macaddr[18];
++		mxl_bss_conf->num_sAddPeerAP = 1;
++
++		while (*pos != '\0') {
++			if (*pos == ',')
++				mxl_bss_conf->num_sAddPeerAP++;
++			pos++;
++		}
++		wpa_printf(MSG_WARNING, "mxl_bss_conf->num_sAddPeerAP '%d'", mxl_bss_conf->num_sAddPeerAP);
++		mxl_bss_conf->sAddPeerAP = malloc(sizeof(macaddr)*mxl_bss_conf->num_sAddPeerAP);
++
++		pos = start;
++		while (*pos != '\0') {
++
++			for (i=0; i < sizeof(local_macaddr) - 1; i++) {
++				local_macaddr[i] = *pos;
++				pos++;
++			}
++			local_macaddr[sizeof(local_macaddr) - 1] = '\0';
++
++			if (hwaddr_aton(local_macaddr, mxl_bss_conf->sAddPeerAP[j])) {
++				wpa_printf(MSG_ERROR, "Invalid MAC address '%s'", local_macaddr);
++				free(mxl_bss_conf->sAddPeerAP);
++				mxl_bss_conf->sAddPeerAP = NULL;
++				pos = start;
++				return 0;
++			}
++			j++;
++
++			if (*pos != ',' && *pos != '\0') {
++				wpa_printf(MSG_ERROR, "Invalid MAC address at sAddPeerAP");
++				free(mxl_bss_conf->sAddPeerAP);
++				mxl_bss_conf->sAddPeerAP = NULL;
++				pos = start;
++				return 0;
++			}
++			if (*pos != '\0') pos++;
++		}
++		pos = start;
+ 	} else if  (os_strcmp(buf, "allow_scan_during_cac") == 0) {
+ 		int val = atoi(pos);
+ 		if (!IS_VALID_BOOL_RANGE(val)) {
+@@ -217,6 +261,10 @@ void mxl_hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 		WLAN_RRM_CAPS_BEACON_REPORT_PASSIVE | WLAN_RRM_CAPS_BEACON_REPORT_TABLE;
+ 	bss->radio_measurements[1] = WLAN_RRM_CAPS_STATISTICS_MEASUREMENT |
+ 		WLAN_RRM_CAPS_CHANNEL_LOAD;
++
++	mxl_bss_conf->sBridgeMode = -1;
++	mxl_bss_conf->sAddPeerAP = NULL;
++	mxl_bss_conf->num_sAddPeerAP = 0;
+ }
+ 
+ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 9df7ad256..4f8e93bf6 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -199,6 +199,7 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	bss->bcast_twt_config_sent = false;
+ 	os_memset((void *)&bss->broadcast_twt_schedules, 0, sizeof(broadcast_twt_schedules_t));
+ #endif
++
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_config_defaults_bss(bss);
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 6ca4f5da6..ff8503827 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -42,6 +42,7 @@
+ #include "dpp_hostapd.h"
+ #include "fils_hlp.h"
+ #include "neighbor_db.h"
++#include "../hostapd/mxl_ctrl_iface.h"
+ 
+ 
+ #ifdef CONFIG_FILS
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 2a73cb46a..f3146756e 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -59,6 +59,7 @@
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_hostapd.h"
+ #include "mxl_dfs_common.h"
++#include "mxl_wds.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #include "drivers/driver_nl80211.h"
+ #include "drivers/mxl_driver_nl80211.h"
+@@ -1645,6 +1646,13 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 			wpa_printf(MSG_WARNING, "set rssi_ignore_probe_request failed");
+ 	}
+ 
++
++#ifdef CONFIG_VENDOR_MXL
++	if(mxl_wds_setup(hapd)) {
++		wpa_printf(MSG_WARNING, "mxl_wds_setup failed!");
++		return -1;
++	}
++#endif /* CONFIG_VENDOR_MXL */
+ 	if (conf->wmm_enabled < 0)
+ 		conf->wmm_enabled = hapd->iconf->ieee80211n |
+ 			hapd->iconf->ieee80211ax;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 95868613d..dd916c72c 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -8383,3 +8383,11 @@ void punct_update_legacy_bw(u16 bitmap, u8 pri, enum oper_chan_width *width,
+ }
+ 
+ #endif /* CONFIG_NATIVE_WINDOWS */
++
++#ifdef CONFIG_VENDOR_MXL
++u16 mxl_copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
++			   struct ieee802_11_elems *elems)
++{
++	return copy_supp_rates(hapd, sta, elems);
++}
++#endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 7633bc468..33cb6975e 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -119,7 +119,6 @@ u16 copy_sta_vendor_vht(struct hostapd_data *hapd, struct sta_info *sta,
+ 			const u8 *ie, size_t len);
+ u16 copy_sta_vendor2_vht(struct hostapd_data *hapd, struct sta_info *sta,
+ 			const u8 *vht_capab);
+-
+ int update_ht_state(struct hostapd_data *hapd, struct sta_info *sta);
+ void ht40_intolerant_add(struct hostapd_iface *iface, struct sta_info *sta);
+ void ht40_intolerant_remove(struct hostapd_iface *iface, struct sta_info *sta);
+@@ -271,4 +270,9 @@ int multiple_bssid_ie_get_len(struct hostapd_data *hapd, bool is_beacon);
+ u8 * hostapd_eid_multiple_bssid(struct hostapd_data *hapd, u8 *eid, bool is_beacon);
+ u8 * hostapd_eid_ssid(struct hostapd_data *hapd, u8 *eid);
+ 
++#ifdef CONFIG_VENDOR_MXL
++u16 mxl_copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
++			   struct ieee802_11_elems *elems);
++#endif /* CONFIG_VENDOR_MXL */
++
+ #endif /* IEEE802_11_H */
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 22315a6c6..dafb1eea5 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -16,6 +16,8 @@
+ 
+ #include "mxl_softblock.h"
+ 
++typedef u8 macaddr[ETH_ALEN];
++
+ /**
+  * struct mxl_hostapd_config - Per-radio interface configuration
+  */
+@@ -55,6 +57,9 @@ struct mxl_hostapd_bss_config {
+ 	int sDisableSoftblock;
+ 
+ 	int rrm_manipulate_measurement;
++	int sBridgeMode;
++	macaddr *sAddPeerAP;
++	int num_sAddPeerAP;
+ };
+ 
+ struct hostapd_config;
+diff --git a/src/ap/mxl_events.c b/src/ap/mxl_events.c
+index f29d86447..184940b1f 100644
+--- a/src/ap/mxl_events.c
++++ b/src/ap/mxl_events.c
+@@ -16,12 +16,15 @@
+ #include "hostapd.h"
+ #include "mxl_hostapd.h"
+ #include "mxl_dfs_common.h"
++#include "mxl_wds.h"
+ 
+ enum mxl_event_type {
+ 	EVENT_MXL_FLUSH_STATIONS_RX,
+ 	EVENT_MXL_RADAR,
+ 	EVENT_MXL_COC,
+ 	EVENT_MXL_SOFTBLOCK_DROP,
++	EVENT_MXL_WDS_CONNECT,
++	EVENT_MXL_WDS_DISCONNECT,
+ };
+ 
+ union mxl_event_data {
+@@ -46,6 +49,12 @@ union mxl_event_data {
+ 		const u8 *data;
+ 		size_t data_len;
+ 	} softblock_drop;
++
++	struct wds_sta_info_data {
++		const u8 *data;
++		size_t data_len;
++	} wds_sta_info_data;
++
+ };
+ 
+ static const char * mxl_event_to_string(enum mxl_event_type event)
+@@ -56,6 +65,8 @@ static const char * mxl_event_to_string(enum mxl_event_type event)
+ 	E2S(MXL_RADAR);
+ 	E2S(MXL_COC);
+ 	E2S(MXL_SOFTBLOCK_DROP);
++	E2S(MXL_WDS_CONNECT);
++	E2S(MXL_WDS_DISCONNECT);
+ 	}
+ 
+ 	return "UNKNOWN";
+@@ -160,6 +171,12 @@ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 		mxl_event_ltq_softblock_drop(hapd, data->softblock_drop.data, data->softblock_drop.data_len);
+ 		break;
+ 	
++	case EVENT_MXL_WDS_CONNECT:
++		mxl_wds_event_connect(hapd, data->wds_sta_info_data.data, data->wds_sta_info_data.data_len);
++		break;
++	case EVENT_MXL_WDS_DISCONNECT:
++		mxl_wds_event_disconnect(hapd, data->wds_sta_info_data.data, data->wds_sta_info_data.data_len);
++		break;
+ 	default:
+ 		wpa_printf(MSG_ERROR, "Unknown MXL event %d", event);
+ 		break;
+@@ -202,3 +219,21 @@ void mxl_drv_event_softblock_drop(void *ctx, u8 *data, size_t data_len)
+ 	event.softblock_drop.data_len = data_len;
+ 	mxl_process_event(ctx, EVENT_MXL_SOFTBLOCK_DROP, &event);
+ }
++
++void mxl_drv_event_wds_connect(void *ctx, const u8 *data, size_t data_len)
++{
++	union mxl_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.wds_sta_info_data.data = data;
++	event.wds_sta_info_data.data_len = data_len;
++	mxl_process_event(ctx, EVENT_MXL_WDS_CONNECT, &event);
++}
++
++void mxl_drv_event_wds_disconnect(void *ctx, const u8 *data, size_t data_len)
++{
++	union mxl_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.wds_sta_info_data.data = data;
++	event.wds_sta_info_data.data_len = data_len;
++	mxl_process_event(ctx, EVENT_MXL_WDS_DISCONNECT, &event);
++}
+diff --git a/src/ap/mxl_wds.c b/src/ap/mxl_wds.c
+new file mode 100644
+index 000000000..aa6798aa5
+--- /dev/null
++++ b/src/ap/mxl_wds.c
+@@ -0,0 +1,491 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025 MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "includes.h"
++#include "../utils/common.h"
++#include "hostapd.h"
++#include "ap_drv_ops.h"
++#include "sta_info.h"
++#include "../drivers/driver.h"
++#include "ieee802_1x.h"
++#include "ieee802_11.h"
++#include "accounting.h"
++#include "beacon.h"
++#include "mxl_hostapd.h"
++#include "../../hostapd/mxl_ctrl_iface.h"
++#include "wpa_auth.h"
++
++static int mxl_wds_hostapd_eid_wmm_valid(struct hostapd_data *hapd, const u8 *eid,
++		size_t len)
++{
++	struct wmm_information_element *wmm;
++
++	wpa_hexdump(MSG_MSGDUMP, "WMM IE", eid, len);
++
++	if (len < sizeof(struct wmm_information_element)) {
++		wpa_printf(MSG_DEBUG, "Too short WMM IE (len=%lu)",
++				(unsigned long) len);
++		return 0;
++	}
++
++	wmm = (struct wmm_information_element *) eid;
++	wpa_printf(MSG_DEBUG, "Validating WMM IE: OUI %02x:%02x:%02x  "
++			"OUI type %d  OUI sub-type %d  version %d  QoS info 0x%x",
++			wmm->oui[0], wmm->oui[1], wmm->oui[2], wmm->oui_type,
++			wmm->oui_subtype, wmm->version, wmm->qos_info);
++	if (wmm->oui_subtype != WMM_OUI_SUBTYPE_PARAMETER_ELEMENT
++			|| wmm->version != WMM_VERSION) {
++		wpa_printf(MSG_DEBUG, "Unsupported WMM IE Subtype/Version");
++		return 0;
++	}
++
++	return 1;
++}
++
++static u16 mxl_wds_check_6ghz_assoc_valid(struct sta_info *sta)
++{
++	if (sta && !(sta->flags & WLAN_STA_HE)) {
++		/* station must be HE capable */
++		wpa_printf(MSG_ERROR,"Station does not support "
++				"mandatory HE - reject association");
++		return WLAN_STATUS_DENIED_HE_NOT_SUPPORTED;
++	}
++	else if (sta && ((!(sta->flags & WLAN_STA_6GHZ)) || (sta->flags & WLAN_STA_HT) ||
++				(sta->flags & WLAN_STA_VHT))) {
++
++		/* station must include HE 6GHz band capability and must not include HT/VHT capabilities */
++		wpa_printf(MSG_ERROR,"Station does not support "
++				"mandatory 6GHZ capability OR included HT/VHT - reject association");
++		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++	return WLAN_STATUS_SUCCESS;
++}
++
++int mxl_wds_setup(struct hostapd_data *hapd)
++{
++	struct mxl_hostapd_bss_config *mxl_bss_conf = &hapd->conf->mxl_bss_conf;
++
++	if (mxl_bss_conf->sBridgeMode != -1) {
++		if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_BRIDGE_MODE,
++				(u8*)&mxl_bss_conf->sBridgeMode,
++				sizeof(mxl_bss_conf->sBridgeMode)))
++			wpa_printf(MSG_WARNING, "LTQ_NL80211_VENDOR_SUBCMD_SET_BRIDGE_MODE failed");
++	}
++
++	if (mxl_bss_conf->num_sAddPeerAP > 0 && mxl_bss_conf->sAddPeerAP != NULL)
++	{
++		int i;
++		errno_t err;
++		uint8_t data8[sizeof(uint16_t) + sizeof(macaddr)];
++		uint8_t * data6 = data8 + sizeof(uint16_t);
++		uint16_t sa_family = 1;
++		err = memcpy_s(data8, sizeof(data8), &sa_family, sizeof(uint16_t));
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return -1;
++		}
++
++		for (i=0; i < mxl_bss_conf->num_sAddPeerAP; i++)
++		{
++			err = memcpy_s(data6, sizeof(macaddr), mxl_bss_conf->sAddPeerAP[i], sizeof(macaddr));
++			if (EOK != err) {
++				wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++				return -1;
++			}
++			if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_ADD_PEERAP,
++					(u8*)data8, sizeof(data8)))
++				wpa_printf(MSG_WARNING, "LTQ_NL80211_VENDOR_SUBCMD_SET_ADD_PEERAP failed");
++		}
++		wpa_printf(MSG_DEBUG, "%s: send CMD LTQ_NL80211_VENDOR_SUBCMD_SET_ADD_PEERAP", __func__);
++	}
++
++	return 0;
++}
++
++static u16 mxl_wds_check_wmm(struct hostapd_data *hapd, struct sta_info *sta,
++		const u8 *wmm_ie, size_t wmm_ie_len)
++{
++	sta->flags &= ~WLAN_STA_WMM;
++	sta->qosinfo = 0;
++	if (wmm_ie && hapd->conf->wmm_enabled) {
++		struct wmm_information_element *wmm;
++
++		if (!mxl_wds_hostapd_eid_wmm_valid(hapd, wmm_ie, wmm_ie_len)) {
++			hostapd_logger(hapd, sta->addr,
++			HOSTAPD_MODULE_WPA, HOSTAPD_LEVEL_DEBUG,
++					"invalid WMM element in association "
++							"request");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
++
++		sta->flags |= WLAN_STA_WMM;
++		wmm = (struct wmm_information_element *) wmm_ie;
++		sta->qosinfo = wmm->qos_info;
++	}
++	return WLAN_STATUS_SUCCESS;
++}
++
++static u16 mxl_wds_check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
++		const u8 *ies, size_t ies_len, int reassoc)
++{
++	struct ieee802_11_elems elems;
++	u16 resp;
++
++	if (ieee802_11_parse_elems(ies, ies_len, &elems, 1) == ParseFailed) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Station sent an invalid "
++						"association request");
++		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++#if 1 /*FIXME: open question if wmm parameters should be kept */
++	resp = mxl_wds_check_wmm(hapd, sta, elems.wmm, elems.wmm_len);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++#endif
++	resp = check_ext_capab(hapd, sta, elems.ext_capab, elems.ext_capab_len);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++	resp = mxl_copy_supp_rates(hapd, sta, &elems);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++	resp = copy_sta_ht_capab(hapd, sta, elems.ht_capabilities);
++	if (resp != WLAN_STATUS_SUCCESS)
++	return resp;
++	if (hapd->iconf->ieee80211n && hapd->iconf->require_ht &&
++			!(sta->flags & WLAN_STA_HT)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Station does not support "
++				"mandatory HT PHY - reject association");
++		return WLAN_STATUS_ASSOC_DENIED_NO_HT;
++	}
++#ifdef CONFIG_IEEE80211AC
++	if (hapd->iconf->channel > 14) {
++		resp = copy_sta_vht_capab(hapd, sta, elems.vht_capabilities);
++		if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++		resp = set_sta_vht_opmode(hapd, sta, elems.opmode_notif);
++		if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++		if (hapd->iconf->ieee80211ac && hapd->iconf->require_vht &&
++				!(sta->flags & WLAN_STA_VHT)) {
++			hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++					HOSTAPD_LEVEL_INFO, "Station does not support "
++					"mandatory VHT PHY - reject association");
++			return WLAN_STATUS_ASSOC_DENIED_NO_VHT;
++		}
++	}
++#endif /* CONFIG_IEEE80211AC */
++
++#ifdef CONFIG_IEEE80211AX
++		resp = copy_sta_he_capab(hapd, sta, IEEE80211_MODE_AP, elems.he_capabilities, elems.he_capabilities_len);
++		if (resp != WLAN_STATUS_SUCCESS)
++						return resp;
++		if (resp != WLAN_STATUS_SUCCESS)
++						return resp;
++		if (is_6ghz_op_class(hapd->iconf->op_class)) {
++			resp = copy_sta_he_6ghz_capab(hapd, sta, elems.he_6ghz_band_cap);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++			resp = mxl_wds_check_6ghz_assoc_valid(sta);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++		if (hapd->iconf->ieee80211ax && hapd->iconf->require_he &&
++				!(sta->flags & WLAN_STA_HE)) {
++			hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++					HOSTAPD_LEVEL_INFO, "Station does not support "
++					"mandatory HE PHY - reject association");
++			return WLAN_STATUS_DENIED_HE_NOT_SUPPORTED;
++		}
++#endif /* CONFIG_IEEE80211AX */
++#ifdef CONFIG_IEEE80211BE
++	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
++		resp = copy_sta_eht_capab(hapd, sta, IEEE80211_MODE_AP,
++					  elems.he_capabilities,
++					  elems.he_capabilities_len,
++					  elems.eht_capabilities,
++					  elems.eht_capabilities_len);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++#endif /* CONFIG_IEEE80211BE */
++
++	wpa_auth_sta_no_wpa(sta->wpa_sm);
++
++	return WLAN_STATUS_SUCCESS;
++}
++
++void mxl_wds_event_connect(struct hostapd_data *hapd,
++		const u8 *data, size_t data_len)
++{
++	struct sta_info *sta;
++	struct intel_vendor_wds_sta_info *wds_sta = (struct intel_vendor_wds_sta_info *) data;
++	struct ieee80211_ht_capabilities ht_cap[2] = {0};
++	struct ieee80211_vht_capabilities vht_cap[2] = {0};
++	struct ieee80211_he_capabilities he_cap[2] = {0};
++	struct ieee80211_eht_capabilities eht_cap[2] = {0};
++
++	u16 resp, i, capab_info = 0;
++	int new_assoc = 1;
++	u8 *ext_capab = NULL;
++	u8 *ext_capab1 = NULL;
++	errno_t err;
++	bool is_both_ml_sta_assoc_received = true;
++
++	/* Discard event if interface didn't finished initialization.
++	 * This may happen when driver sends irrelevant events due to station mode actions
++	 */
++	if (hapd->iface->state != HAPD_IFACE_ENABLED) {
++	  wpa_printf(MSG_DEBUG, "discard driver event (%s) - interface not initialized yet", __FUNCTION__);
++	  return;
++	}
++
++	if (!data) {
++		wpa_printf(MSG_ERROR, "NULL hostapd_wds_sta_connect data received");
++		return;
++	}
++
++	if (data_len != sizeof(*wds_sta) + wds_sta->assoc_req_ies_len) {
++		wpa_printf(MSG_ERROR, "Wrong hostapd_wds_sta_connect data length");
++		return;
++	}
++
++	hapd = mxl_get_bss_index(wds_sta->ifname, hapd->iface);
++	if (hapd == NULL) {
++		wpa_printf(MSG_ERROR, "Hostapd BSS with name %s not found", wds_sta->ifname);
++		return;
++	}
++
++	wpa_printf(MSG_DEBUG, "hostapd_wds_sta_connect " MACSTR,
++			MAC2STR(wds_sta->mac_addr));
++
++	sta = ap_sta_add(hapd, wds_sta->mac_addr);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Unable to handle new sta");
++		hostapd_drv_sta_remove(hapd, wds_sta->mac_addr);
++		return;
++	}
++	sta->flags |= WLAN_STA_AUTH;
++	wpa_printf(MSG_INFO, "RX max_rssi 0x%08x(%d)", wds_sta->max_rssi,
++			wds_sta->max_rssi);
++	sta->ssi_signal = wds_sta->max_rssi;
++
++	resp = mxl_wds_check_assoc_ies(hapd, sta, wds_sta->assoc_req_ies,
++			wds_sta->assoc_req_ies_len, 0);
++	if (resp != WLAN_STATUS_SUCCESS) {
++		wpa_printf(MSG_ERROR, "mxl_wds_check_assoc_ies() failed");
++		hostapd_drv_sta_remove(hapd, sta->addr);
++		return;
++	}
++
++#ifdef CONFIG_IEEE80211BE
++	/* As part of EHT open source kernel sync, EHT-MCS map for BW<=80 is sent
++	 * in EHT capability IE for VHT20 in AP mode. This is inline with the standard as
++	 * EHT-MCS map for 20 MHz only is applicable for station mode. Hence for VHT20 mode,
++	 * derive MCS0-7 and MCS8-9 from MCS0-9 information of peer beacons.
++	 */
++
++	if (sta->he_capab) {
++		if (!(sta->he_capab->he_phy_capab_info[0] &
++				    (HE_PHY_CAP0_CHANNEL_WIDTH_SET_B0 |
++				     HE_PHY_CAP0_CHANNEL_WIDTH_SET_B1 |
++				     HE_PHY_CAP0_CHANNEL_WIDTH_SET_B2 |
++				     HE_PHY_CAP0_CHANNEL_WIDTH_SET_B3))) {
++			if (sta->eht_capab) {
++				sta->eht_capab->optional[3] = sta->eht_capab->optional[2];
++				sta->eht_capab->optional[2] = sta->eht_capab->optional[1];
++				sta->eht_capab->optional[1] = sta->eht_capab->optional[0];
++				sta->eht_capab_len++;
++			}
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++
++	if (is_both_ml_sta_assoc_received && hostapd_get_aid(hapd, sta) < 0) {
++		hostapd_logger(hapd, wds_sta->mac_addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "No room for more AIDs");
++		hostapd_drv_sta_remove(hapd, sta->addr);
++		return;
++	}
++
++	if (wds_sta->short_preamble)
++		capab_info |= WLAN_CAPABILITY_SHORT_PREAMBLE;
++	if (wds_sta->short_slot_time)
++		capab_info |= WLAN_CAPABILITY_SHORT_SLOT_TIME;
++	sta->capability = capab_info;
++
++	if (hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G)
++		sta->flags |= WLAN_STA_NONERP;
++	for (i = 0; i < sta->supported_rates_len; i++) {
++		if ((sta->supported_rates[i] & 0x7f) > 22) {
++			sta->flags &= ~WLAN_STA_NONERP;
++			break;
++		}
++	}
++	if (sta->flags & WLAN_STA_NONERP && !sta->nonerp_set) {
++		sta->nonerp_set = 1;
++		hapd->iface->num_sta_non_erp++;
++		if (hapd->iface->num_sta_non_erp == 1)
++			ieee802_11_update_beacons(hapd->iface);
++	}
++
++	if (!(sta->capability & WLAN_CAPABILITY_SHORT_SLOT_TIME)
++			&& !sta->no_short_slot_time_set) {
++		sta->no_short_slot_time_set = 1;
++		hapd->iface->num_sta_no_short_slot_time++;
++		if (hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G
++				&& hapd->iface->num_sta_no_short_slot_time == 1)
++			ieee802_11_update_beacons(hapd->iface);
++	}
++
++	if (sta->capability & WLAN_CAPABILITY_SHORT_PREAMBLE)
++		sta->flags |= WLAN_STA_SHORT_PREAMBLE;
++	else
++		sta->flags &= ~WLAN_STA_SHORT_PREAMBLE;
++
++	if (!(sta->capability & WLAN_CAPABILITY_SHORT_PREAMBLE)
++			&& !sta->no_short_preamble_set) {
++		sta->no_short_preamble_set = 1;
++		hapd->iface->num_sta_no_short_preamble++;
++		if (hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G
++				&& hapd->iface->num_sta_no_short_preamble == 1)
++			ieee802_11_update_beacons(hapd->iface);
++	}
++
++	if (update_ht_state(hapd, sta) > 0)
++	    ieee802_11_update_beacons(hapd->iface);
++
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_DEBUG, "association OK (aid %d)", sta->aid);
++
++	/* Stop previous accounting session, if one is started, and allocate
++	 * new session id for the new session. */
++	accounting_sta_stop(hapd, sta);
++
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_INFO, "associated (aid %d)", sta->aid);
++
++	sta->flags |= WLAN_STA_ASSOC_REQ_OK;
++	if (sta->flags & WLAN_STA_ASSOC)
++		new_assoc = 0;
++	sta->flags |= WLAN_STA_ASSOC;
++	sta->flags &= ~WLAN_STA_WNM_SLEEP_MODE;
++
++#if 0
++	/*
++	 * Remove the STA entry in order to make sure the STA PS state gets
++	 * cleared and configuration gets updated in case of reassociation back
++	 * to the same AP.
++	 */
++	hostapd_drv_sta_remove(hapd, sta->addr);
++#endif
++	if ((sta->flags & WLAN_STA_HT) && is_both_ml_sta_assoc_received) {
++		hostapd_get_ht_capab(hapd, sta->ht_capabilities, &ht_cap[1]);
++	}
++#ifdef CONFIG_IEEE80211AC
++	if ((sta->flags & WLAN_STA_VHT) && is_both_ml_sta_assoc_received) {
++		hostapd_get_vht_capab(hapd, sta->vht_capabilities, &vht_cap[1]);
++	}
++#endif /* CONFIG_IEEE80211AC */
++
++#ifdef CONFIG_IEEE80211AX
++	if ((sta->flags & WLAN_STA_HE) && is_both_ml_sta_assoc_received) {
++		hostapd_get_he_capab(hapd, sta->he_capab, &he_cap[1], sta->he_capab_len);
++	}
++#endif /* CONFIG_IEEE80211AX */
++#ifdef CONFIG_IEEE80211BE
++	if ((sta->flags & WLAN_STA_EHT) && is_both_ml_sta_assoc_received)
++		hostapd_get_eht_capab(hapd, sta->eht_capab, &eht_cap[1], sta->eht_capab_len);
++#endif /* CONFIG_IEEE80211BE */
++
++	if (is_both_ml_sta_assoc_received && sta->ext_capability) {
++		ext_capab = os_malloc(1 + sta->ext_capability[0]);
++		if (ext_capab) {
++			err = memcpy_s(ext_capab, 1 + sta->ext_capability[0],
++				 sta->ext_capability, 1 + sta->ext_capability[0]);
++			if (EOK != err) {
++				wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++				os_free(ext_capab);
++				return;
++			}
++		}
++	}
++
++	if (is_both_ml_sta_assoc_received && hostapd_sta_add(hapd, sta->addr, sta->aid, sta->capability,
++			sta->supported_rates, sta->supported_rates_len,
++			sta->listen_interval,
++			sta->flags & WLAN_STA_HT ? &ht_cap[1] : NULL,
++			sta->flags & WLAN_STA_VHT ? &vht_cap[1] : NULL,
++			sta->flags & WLAN_STA_HE ? &he_cap[1] : NULL,
++			sta->flags & WLAN_STA_HE ? sta->he_capab_len : 0,
++			sta->flags & WLAN_STA_EHT ? &eht_cap[1] : NULL,
++			sta->flags & WLAN_STA_EHT ? sta->eht_capab_len : 0,
++			sta->he_6ghz_capab,
++			sta->flags , sta->qosinfo, sta->vht_opmode,
++			sta->p2p_ie ? 1 : 0, sta->added_unassoc, sta->last_assoc_req,
++			sta->last_assoc_req_len, sta->ssi_signal,
++			NULL, false)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			       HOSTAPD_LEVEL_NOTICE,
++			       "Could not add STA to kernel driver");
++		ap_free_sta(hapd, sta);
++		os_free(ext_capab);
++		os_free(ext_capab1);
++		return;
++	}
++
++	if (is_both_ml_sta_assoc_received) {
++		sta->flags |= WLAN_STA_AUTHORIZED;
++		hostapd_set_authorized(hapd, sta, 1);
++		hapd->new_assoc_sta_cb(hapd, sta, !new_assoc);
++		ieee802_1x_notify_port_enabled(sta->eapol_sm, 1);
++	}
++
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_INFO, "hostapd_wds_sta_connect: WDS STA connected");
++
++	os_free(ext_capab);
++	os_free(ext_capab1);
++}
++
++void mxl_wds_event_disconnect(struct hostapd_data *hapd,
++		const u8 *data, size_t data_len)
++{
++	struct intel_vendor_wds_sta_info *wds_sta = (struct intel_vendor_wds_sta_info *) data;
++
++	/* Discard event if interface didn't finished initialization.
++	 * This may happen when driver sends irrelevant events due to station mode actions
++	 */
++	if (hapd->iface->state != HAPD_IFACE_ENABLED) {
++	  wpa_printf(MSG_DEBUG, "discard driver event (%s) - interface not initialized yet", __FUNCTION__);
++	  return;
++	}
++
++	if (!data) {
++		wpa_printf(MSG_ERROR, "NULL hostapd_wds_sta_disconnect data received");
++		return;
++	}
++
++	if (data_len != sizeof(*wds_sta) + wds_sta->assoc_req_ies_len) {
++		wpa_printf(MSG_ERROR, "Wrong hostapd_wds_sta_disconnect data length");
++		return;
++	}
++
++	hapd = mxl_get_bss_index(wds_sta->ifname, hapd->iface);
++	if (hapd == NULL) {
++		wpa_printf(MSG_ERROR, "Hostapd BSS with name %s not found", wds_sta->ifname);
++		return;
++	}
++
++	hostapd_notif_disassoc(hapd, wds_sta->mac_addr);
++}
+diff --git a/src/ap/mxl_wds.h b/src/ap/mxl_wds.h
+new file mode 100644
+index 000000000..7b9a9c2a8
+--- /dev/null
++++ b/src/ap/mxl_wds.h
+@@ -0,0 +1,21 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_WDS_H
++#define MXL_WDS_H
++
++int mxl_wds_setup(struct hostapd_data *hapd);
++void mxl_wds_event_connect(struct hostapd_data *hapd, const u8 *data, size_t data_len);
++void mxl_wds_event_disconnect(struct hostapd_data *hapd, const u8 *data, size_t data_len);
++
++#endif /* MXL_WDS_H */
+\ No newline at end of file
+diff --git a/src/common/mxl_vendor.h b/src/common/mxl_vendor.h
+index 171f04efc..921676509 100644
+--- a/src/common/mxl_vendor.h
++++ b/src/common/mxl_vendor.h
+@@ -44,5 +44,7 @@ MXL_EXPORT_EVENT_API(mxl_drv_event_radar)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_flush_stations)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_coc)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_softblock_drop)
++MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_wds_connect)
++MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_wds_disconnect)
+ 
+ #endif /* MXL_VENDOR_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index b435e1e5b..84beeb0e8 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -677,6 +677,22 @@ struct intel_vendor_unconnected_sta {
+   u16 rate;
+ } __attribute__ ((packed));
+ 
++/* Data for EVENT_LTQ_WDS_CONNECT and EVENT_LTQ_WDS_DISCONNECT */
++struct intel_vendor_wds_sta_info {
++  char ifname[IFNAMSIZ + 1];
++  u32 max_rssi;
++  u32 sta_flags_mask;
++  u32 sta_flags_set;
++  size_t assoc_req_ies_len;
++  u16 beacon_interval;
++  DEF_IEEE_ADDR(mac_addr);
++  u8 dtim_period;
++  u8 protection;
++  u8 short_preamble;
++  u8 short_slot_time;
++  u8 assoc_req_ies[0];
++} __attribute__ ((packed));
++
+ /* Data for WHM warningID */
+ typedef enum {
+   WHM_DRV_MAC_FATAL = 1,
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index a30fe8ea5..b9cc900ea 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3270,6 +3270,19 @@ static void mxl_nl80211_handle_coc(struct wpa_driver_nl80211_data *drv, const u8
+ 	mxl_drv_event_coc(drv->ctx, data, len);
+ }
+ 
++static void mxl_nl80211_handle_wds_connect (struct wpa_driver_nl80211_data *drv,
++					const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive MXL vendor event: WDS connect, ctx=%p", drv->ctx);
++	mxl_drv_event_wds_connect(drv->ctx, data, len);
++}
++
++static void mxl_nl80211_handle_wds_disconnect (struct wpa_driver_nl80211_data *drv,
++					const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive MXL vendor event: WDS disconnect, ctx=%p", drv->ctx);
++	mxl_drv_event_wds_disconnect(drv->ctx, data, len);
++}
+ 
+ static void mxl_nl80211_handle_softblock_drop(struct wpa_driver_nl80211_data *drv,
+ 				const u8 *data, size_t len)
+@@ -3343,6 +3356,12 @@ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 		case LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA:
+ 			ltq_nl80211_handle_unconnected_sta(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_WDS_CONNECT:
++			mxl_nl80211_handle_wds_connect(drv, data, len);
++			break;
++		case LTQ_NL80211_VENDOR_EVENT_WDS_DISCONNECT:
++			mxl_nl80211_handle_wds_disconnect(drv, data, len);
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported MXL vendor event %u", subcmd);
+ 			break;
+-- 
+2.43.0
+

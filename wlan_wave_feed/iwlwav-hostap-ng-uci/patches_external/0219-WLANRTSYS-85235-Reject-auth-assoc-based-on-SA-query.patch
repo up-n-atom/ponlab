@@ -1,0 +1,734 @@
+From f30ca093bba4799ca22df2bbabb23fc9f2f1827b Mon Sep 17 00:00:00 2001
+From: Mathavan Magesh <mmagesh@maxlinear.com>
+Date: Tue, 8 Oct 2024 14:57:20 +0800
+Subject: [PATCH] WLANRTSYS-85235 Reject auth/assoc based on SA query
+
+Issue: When auth/assoc is received for connected station
+Hostapd removes current sta entry without checking it is
+valid request.
+
+Fix: Before adding new sta entry, check is there any station
+with same mac is present (Compare with all interfaces connected
+sta and its mld mac).
+If station exists send SA query action frame and reject the
+auth/assoc req.
+If SA query timedout cleanup the connected sta entry and allow
+the new connection.
+For mld STA always send SA query action frame on mainlink.
+
+FIXUP to WLANRTSYS-62845 MLO changes: MLO Auth Assoc, WPA3 and eapol
+changes
+---
+ src/ap/drv_callbacks.c     |   6 +++
+ src/ap/ieee802_11.c        |  35 ++++++-------
+ src/ap/ieee802_11_shared.c |   8 +++
+ src/ap/mxl_drv_callbacks.c |  40 ++++++++++++++
+ src/ap/mxl_drv_callbacks.h |   1 +
+ src/ap/mxl_hostapd.h       |   6 +--
+ src/ap/mxl_ieee802_11.c    |  68 ++++++++++++++++--------
+ src/ap/mxl_ieee802_11.h    |   4 +-
+ src/ap/mxl_mld.c           |  39 ++++++++++----
+ src/ap/mxl_sta_info.c      |  16 ------
+ src/ap/mxl_sta_info.h      |   3 +-
+ src/ap/mxl_utils.c         | 105 ++++++++++++++++---------------------
+ src/ap/sta_info.c          |   7 +++
+ 13 files changed, 206 insertions(+), 132 deletions(-)
+
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 7996ba73e..eb027d73a 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -117,6 +117,11 @@ void hostapd_notify_assoc_fils_finish(struct hostapd_data *hapd,
+ 
+ static bool check_sa_query_need(struct hostapd_data *hapd, struct sta_info *sta)
+ {
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	return mxl_check_sa_query_need(hapd, sta);
++#else
++
+ 	if ((sta->flags &
+ 	     (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED)) !=
+ 	    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED))
+@@ -138,6 +143,7 @@ static bool check_sa_query_need(struct hostapd_data *hapd, struct sta_info *sta)
+ 	}
+ 
+ 	return false;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ }
+ 
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 1a805b989..dc27bcfa4 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3135,11 +3135,12 @@ static void handle_auth(struct hostapd_data *hapd,
+ 
+ 	sta = ap_get_sta(hapd, sa);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-	if (sta && (sta->flags & WLAN_STA_ASSOC)) {
+-		mxl_hostapd_drv_cleanup_sta(hapd, sta);
+-		sta = NULL;
++	if (!sta && mxl_hostapd_prune_sta(hapd, sa)) {
++		wpa_printf(MSG_ERROR, "Sta " MACSTR " already in the connected list, drop auth", MAC2STR(sa));
++		return;
+ 	}
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
+ 	if (sta) {
+ 		sta->flags &= ~WLAN_STA_PENDING_FILS_ERP;
+ 		sta->ft_over_ds = 0;
+@@ -3198,9 +3199,8 @@ static void handle_auth(struct hostapd_data *hapd,
+ 			goto fail;
+ 		}
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-		mxl_auth_parse_ml_ie(hapd, mgmt, len, sta);
+-		if (sta->mxl_sta_info.ext_flags & WLAN_STA_MULTILINK)
+-			mxl_hostapd_cleanup_same_mld_mac_sta(hapd, sta);
++		if (!mxl_auth_parse_ml_ie(hapd, mgmt, len, sta))
++			goto fail;
+ #endif
+ 	}
+ 
+@@ -3277,7 +3277,8 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	}
+ 
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-	mxl_auth_parse_ml_ie(hapd, mgmt, len, sta);
++	if (!mxl_auth_parse_ml_ie(hapd, mgmt, len, sta))
++		goto fail;
+ #endif
+ 
+ 	switch (auth_alg) {
+@@ -4065,6 +4066,10 @@ end:
+ static bool check_sa_query(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   int reassoc)
+ {
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	return mxl_check_sa_query(hapd, sta, reassoc);
++#else
+ 	if ((sta->flags &
+ 	     (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED)) !=
+ 	    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED))
+@@ -4087,6 +4092,7 @@ static bool check_sa_query(struct hostapd_data *hapd, struct sta_info *sta,
+ 	}
+ 
+ 	return false;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ }
+ 
+ static u16 copy_bss_max_idle_period_from_sta(struct hostapd_data *hapd, struct sta_info *sta,
+@@ -5659,7 +5665,6 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	int left, i;
+ 	struct sta_info *sta;
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-	struct sta_info *unlinked_sta;
+ 	struct sta_info *linked_sta;
+ #endif
+ 	u8 *tmp = NULL;
+@@ -5758,8 +5763,10 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-	if (sta)
+-		mxl_ml_drv_remove_sta(hapd, sta);
++	if (!sta && mxl_hostapd_prune_sta(hapd, mgmt->sa)) {
++		wpa_printf(MSG_ERROR, "Sta " MACSTR " already in the connected list, drop assoc", MAC2STR(mgmt->sa));
++		return;
++	}
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+@@ -5935,14 +5942,6 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	sta->mxl_sta_info.sta_profile_status = WLAN_STATUS_SUCCESS;
+ 	if (mxl_mlo_check_assoc_ie(hapd, sta, pos, left, reassoc, capab_info))
+ 		goto fail;
+-	/* Remove the unlinked sta in sibling hapd */
+-	if (sta->mxl_sta_info.ext_flags & WLAN_STA_MULTILINK) {
+-		unlinked_sta = mxl_ap_get_unlinked_sta(hapd->mxl_data.sibling_hapd, sta);
+-		if (unlinked_sta) {
+-			ap_free_sta(hapd->mxl_data.sibling_hapd, unlinked_sta);
+-			wpa_printf(MSG_ERROR, "STA " MACSTR " Removing it's unlinked station ", MAC2STR(mgmt->sa));
+-		}
+-	}
+ 
+ 	linked_sta = sta->mxl_sta_info.linked_sta;
+ 	if (linked_sta && !(linked_sta->flags & WLAN_STA_EHT) && (linked_sta->mxl_sta_info.ext_flags & WLAN_STA_MULTILINK)) {
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index 4f33b0b78..efcb4dd82 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -268,6 +268,14 @@ void ieee802_11_sa_query_action(struct hostapd_data *hapd,
+ 
+ 	sta = ap_get_sta(hapd, sa);
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (sta && mxl_mlo_is_ml_sta(sta) && sta->sa_query_count == 0) {
++		/* SA query response may come in any link. Use Sta on which SA query was initiated */
++		sta = sta->mxl_sta_info.linked_sta;
++		hapd = hapd->mxl_data.sibling_hapd;
++	}
++#endif
++
+ #ifdef CONFIG_OCV
+ 	if (sta && wpa_auth_uses_ocv(sta->wpa_sm)) {
+ 		struct ieee802_11_elems elems;
+diff --git a/src/ap/mxl_drv_callbacks.c b/src/ap/mxl_drv_callbacks.c
+index 81990ae58..55794c2b4 100644
+--- a/src/ap/mxl_drv_callbacks.c
++++ b/src/ap/mxl_drv_callbacks.c
+@@ -135,6 +135,46 @@ int mxl_wpa_supplicant_event(void *ctx, enum wpa_event_type event, union wpa_eve
+ 	}
+ 	return 1;
+ }
++
++bool mxl_check_sa_query_need(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct sta_info *sta1;
++
++	if ((sta->flags &
++	    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED)) !=
++	    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED))
++		return false;
++
++	if (sta->auth_alg != WLAN_AUTH_FT) {
++		/*
++		 * STA has already been associated with MFP and SA Query timeout
++		 * has not been reached. Reject the association attempt
++		 * temporarily and start SA Query, if one is not pending.
++		 */
++
++		if (mxl_mlo_is_ml_sta(sta)) {
++
++			sta1 = sta->mxl_sta_info.linked_sta;
++			if (sta->sa_query_count || (sta1 && sta1->sa_query_count))
++				return true;
++
++			if ((sta->mxl_sta_info.ext_flags & WLAN_STA_MLD_STA) &&
++			    (hapd->conf->mxl_bss_conf.link_id != sta->mxl_sta_info.main_link_id) && sta1) {
++				/* The current Sta is secondary STA, Initiate SA query always in the main link */
++				sta = sta1;
++				hapd = hapd->mxl_data.sibling_hapd;
++			}
++		}
++
++		if (sta->sa_query_count == 0)
++			ap_sta_start_sa_query(hapd, sta);
++
++		return true;
++	}
++
++	return false;
++}
++
+ #else
+ int mxl_wpa_supplicant_event(void *ctx, enum wpa_event_type event, union wpa_event_data *data)
+ {
+diff --git a/src/ap/mxl_drv_callbacks.h b/src/ap/mxl_drv_callbacks.h
+index 4b51cedea..d48a51e25 100644
+--- a/src/ap/mxl_drv_callbacks.h
++++ b/src/ap/mxl_drv_callbacks.h
+@@ -18,5 +18,6 @@ void mxl_align_punct_bitmap(struct hostapd_data *hapd);
+ int mxl_wpa_supplicant_event(void *ctx, enum wpa_event_type event, union wpa_event_data *data);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+ void mxl_hostapd_notif_disassoc(struct hostapd_data *hapd, const u8 *addr);
++bool mxl_check_sa_query_need(struct hostapd_data *hapd, struct sta_info *sta);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* MXL_DRV_CALLBACKS_H */
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index d5f3f4b73..4a2bff29e 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -247,9 +247,9 @@ void mxl_hostapd_set_conf_from_freq_params(struct hostapd_iface *iface, const st
+ int mxl_check_linked_sta_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 				struct ieee802_11_elems *elems, int reassoc);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-void mxl_mlo_cleanup_mld_sta(struct hostapd_data *hapd, struct sta_info *sta);
+-void mxl_mlo_hostapd_prune_associations_mld_mac(struct hostapd_data *hapd, struct sta_info *new_sta);
+-void mxl_mlo_hostapd_prune_associations_mld(struct hostapd_data *hapd, const u8 *addr);
++void mxl_cleanup_sta(struct hostapd_data *hapd, struct sta_info *sta);
++void mxl_remove_associated_sta(struct hostapd_data *hapd, struct sta_info *sta);
++bool mxl_hostapd_prune_sta(struct hostapd_data *hapd, const u8 *addr);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ void mxl_parse_rnr(struct ieee802_11_elems *elems, struct dl_list *rnr_scan_6g_ap_info);
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/ap/mxl_ieee802_11.c b/src/ap/mxl_ieee802_11.c
+index 966bb661d..307674634 100644
+--- a/src/ap/mxl_ieee802_11.c
++++ b/src/ap/mxl_ieee802_11.c
+@@ -713,10 +713,6 @@ int mxl_mlo_add_associated_sta(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	ml_sta_info.is_ml = true;
+ 	mxl_hostapd_ml_sta_info_set(sta, ml_sta_info);
+-	/* Remove Station if there is any STA with same mld mac address */
+-	mxl_mlo_hostapd_prune_associations_mld_mac(hapd, sta);
+-	if (sta->mxl_sta_info.ext_flags & WLAN_STA_SINGLE_LINK_ML_ASSOC)
+-		mxl_mlo_hostapd_prune_associations_mld_mac(hapd->mxl_data.sibling_hapd, sta);
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	mxl_hostapd_sta_ext_capab_set(hapd, sta);
+@@ -757,11 +753,6 @@ int mxl_mlo_add_associated_sta(struct hostapd_data *hapd, struct sta_info *sta,
+ 		return -1;
+ 	}
+ 
+-	mxl_mlo_hostapd_prune_associations_mld(hapd, sta->addr);
+-	if (mxl_mlo_is_ml_sta(sta)) {
+-		mxl_mlo_hostapd_prune_associations_mld(hapd, sta->mxl_sta_info.non_ap_mld_mac);
+-	}
+-
+ 	if (sta1) {
+ 		wpa_printf(MSG_DEBUG, "Add associated linked STA " MACSTR
+ 				" (added_unassoc=%d auth_alg=%u ft_over_ds=%u reassoc=%d authorized=%d ft_tk=%d fils_tk=%d)",
+@@ -916,10 +907,11 @@ void mxl_wpa_mld_auth_sta_init(struct sta_info *sta)
+ 		sta->wpa_sm->mxl_sm.is_single_link_ml_sta = true;
+ }
+ 
+-void mxl_auth_parse_ml_ie(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt, size_t len, struct sta_info *sta)
++bool mxl_auth_parse_ml_ie(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt, size_t len, struct sta_info *sta)
+ {
+ 	const u8 *ml_pos = NULL, *end;
+ 	struct ieee802_11_elems elems;
++	u8 non_ap_mld_addr[ETH_ALEN];
+ 
+ 	ml_pos = mxl_auth_skip_fixed_fields(hapd, mgmt, len);
+ 	end = ((const u8 *) mgmt) + len;
+@@ -929,11 +921,20 @@ void mxl_auth_parse_ml_ie(struct hostapd_data *hapd, const struct ieee80211_mgmt
+ 				"auth request");
+ 	}
+ 	if (elems.multilink_ie && (elems.multilink_ie_len >= MIN_BASIC_MULTILINK_IE_LEN)) {
++		memcpy_s(non_ap_mld_addr, ETH_ALEN, (elems.multilink_ie + 3), ETH_ALEN);
++		if (os_memcmp(sta->mxl_sta_info.non_ap_mld_mac, non_ap_mld_addr, ETH_ALEN) &&
++			mxl_hostapd_prune_sta(hapd, non_ap_mld_addr)) {
++			wpa_printf(MSG_ERROR, "Sta with same MLD mac found " MACSTR,
++					MAC2STR(sta->mxl_sta_info.non_ap_mld_mac));
++			return false;
++		}
+ 		sta->mxl_sta_info.ext_flags |= WLAN_STA_MULTILINK;
+-		memcpy_s(sta->mxl_sta_info.non_ap_mld_mac, ETH_ALEN, (elems.multilink_ie + 3), ETH_ALEN);
++		memcpy_s(sta->mxl_sta_info.non_ap_mld_mac, ETH_ALEN, non_ap_mld_addr, ETH_ALEN);
+ 		wpa_printf(MSG_INFO, "Multilink element found in auth with MLD mac addr " MACSTR,
+ 					MAC2STR(sta->mxl_sta_info.non_ap_mld_mac));
+ 	}
++
++	return true;
+ }
+ 
+ bool mxl_check_assoc_ies_owe(struct hostapd_data *hapd, struct sta_info *sta, struct ieee802_11_elems *elems)
+@@ -970,6 +971,8 @@ void mxl_free_sta_profile(struct hostapd_data *hapd, struct sta_info *sta)
+ 	if (mxl_is_mlo_enabled(hapd->conf) && sta->mxl_sta_info.linked_sta) {
+ 		sta->mxl_sta_info.linked_sta->mxl_sta_info.sta_profile_ie = NULL;
+ 		sta->mxl_sta_info.linked_sta->mxl_sta_info.sta_profile_ie_len = 0;
++		sta->mxl_sta_info.linked_sta->mxl_sta_info.linked_sta = NULL;
++		sta->mxl_sta_info.linked_sta = NULL;
+ 	}
+ }
+ 
+@@ -1009,23 +1012,44 @@ void mxl_hostapd_drv_cleanup_sta(struct hostapd_data *hapd, struct sta_info *sta
+ 	}
+ }
+ 
+-void mxl_hostapd_cleanup_same_mld_mac_sta(struct hostapd_data *hapd, struct sta_info *sta)
++bool mxl_check_sa_query(struct hostapd_data *hapd, struct sta_info *sta, int reassoc)
+ {
+-	struct sta_info *sta1 = NULL;
++	struct sta_info *sta1;
++
++	if ((sta->flags &
++	    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED)) !=
++	    (WLAN_STA_ASSOC | WLAN_STA_MFP | WLAN_STA_AUTHORIZED))
++		return false;
++
++	if ((!reassoc || sta->auth_alg != WLAN_AUTH_FT)) {
++		/*
++		 * STA has already been associated with MFP and SA Query timeout
++		 * has not been reached. Reject the association attempt
++		 * temporarily and start SA Query, if one is not pending.
++		 */
+ 
+-	for (int i = 0; i < hapd->iface->interfaces->count; i++) {
+-		struct hostapd_iface *iface = hapd->iface->interfaces->iface[i];
+-		for (int j = 0; j < iface->num_bss; j++) {
+-			struct hostapd_data *hapd = iface->bss[j];
+-			sta1 = mxl_ap_get_sta_by_non_ap_mld_mac(hapd, sta->mxl_sta_info.non_ap_mld_mac);
+-			if (sta1) {
+-				if ((sta == sta1) || (sta->mxl_sta_info.linked_sta == sta1))
+-					continue;
+-				mxl_hostapd_drv_cleanup_sta(hapd, sta1);
++		if (mxl_mlo_is_ml_sta(sta)) {
++			sta1 = sta->mxl_sta_info.linked_sta;
++			if (sta->sa_query_count || (sta1 && sta1->sa_query_count))
++				return true;
++
++			if ((sta->mxl_sta_info.ext_flags & WLAN_STA_MLD_STA) &&
++			    (hapd->conf->mxl_bss_conf.link_id != sta->mxl_sta_info.main_link_id && sta1)) {
++				/* The current Sta is secondary STA, Initiate SA query always in the main link */
++				sta = sta1;
++				hapd = hapd->mxl_data.sibling_hapd;
+ 			}
++
+ 		}
++		if (sta->sa_query_count == 0)
++			ap_sta_start_sa_query(hapd, sta);
++
++		return true;
+ 	}
++
++	return false;
+ }
++
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ void mxl_cache_sta_deauth(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+diff --git a/src/ap/mxl_ieee802_11.h b/src/ap/mxl_ieee802_11.h
+index 599cd0d37..490fa1090 100644
+--- a/src/ap/mxl_ieee802_11.h
++++ b/src/ap/mxl_ieee802_11.h
+@@ -46,14 +46,14 @@ void mxl_mlo_handle_deauth(struct hostapd_data *hapd, const struct ieee80211_mgm
+ int mxl_mlo_add_associated_sta(struct hostapd_data *hapd, struct sta_info *sta, int reassoc);
+ void mxl_wpa_mld_auth_sta_init(struct sta_info *sta);
+ int mxl_mlo_sae_prepare_commit_pt(struct hostapd_data *hapd, struct sta_info *sta, const struct sae_pt *pt, const struct sae_pk *pk);
+-void mxl_auth_parse_ml_ie(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt, size_t len, struct sta_info *sta);
++bool mxl_auth_parse_ml_ie(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt, size_t len, struct sta_info *sta);
+ bool mxl_check_assoc_ies_owe(struct hostapd_data *hapd, struct sta_info *sta, struct ieee802_11_elems *elems);
+ void mxl_ml_drv_remove_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ int mxl_pmksa_cache_handle(struct sta_info *sta);
+ void mxl_free_sta_profile(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_hostapd_drv_cleanup_sta(struct hostapd_data *hapd, struct sta_info *sta);
+-void mxl_hostapd_cleanup_same_mld_mac_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_free_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_hostapd_eid_ml_critical_update(struct hostapd_data *hapd, u16 *capab_info);
++bool mxl_check_sa_query(struct hostapd_data *hapd, struct sta_info *sta, int reassoc);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* MXL_IEEE802_11_H */
+diff --git a/src/ap/mxl_mld.c b/src/ap/mxl_mld.c
+index cf1fd43f4..112afc705 100644
+--- a/src/ap/mxl_mld.c
++++ b/src/ap/mxl_mld.c
+@@ -32,6 +32,7 @@
+ #include "mxl_wds.h"
+ #include "mxl_beacon.h"
+ #include "mxl_wmm.h"
++#include "mxl_ieee802_11.h"
+ 
+ static void mxl_set_link_id(struct hostapd_data *hapd)
+ {
+@@ -1020,7 +1021,7 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 			*eid++ = hapd->conf->bss_idx - 1; /* BSSID IDX */
+ 	}
+ 
+-	wpa_printf(MSG_ERROR,"MLD: ml_type %d, MCST add host %d MCST add fw %d",
++	wpa_printf(MSG_DEBUG,"MLD: ml_type %d, MCST add host %d MCST add fw %d",
+ 			      ml_type, hapd->mxl_data.ml_ie_max_chan_sw_time_ie_add,
+ 			      hapd->mxl_data.ml_ie_max_chan_sw_time_ie_len_add);
+ 
+@@ -1151,6 +1152,7 @@ u16 mxl_multilink_ie_validate(struct hostapd_data *hapd, struct sta_info *sta,
+ 	size_t common_info_len = 0;
+ 	u8 mld_mac[ETH_ALEN] = {'\0'};
+ 	struct hostapd_data *sibling_hapd = NULL;
++	struct sta_info *sibling_sta = NULL;
+ 
+ 	if (!hapd || !hapd->mxl_data.sibling_hapd)
+ 		return WLAN_STATUS_UNSPECIFIED_FAILURE;
+@@ -1220,6 +1222,19 @@ u16 mxl_multilink_ie_validate(struct hostapd_data *hapd, struct sta_info *sta,
+ 			ie = (ie + ie_len + 2);
+ 			/*sta_profile_len*/
+ 			ie_len = per_sta_ie_len - (LINK_INFO_STA_CTRL_LEN + 2 + ie_len);
++
++			/* reject assoc req if sibling sta is already associated */
++			sibling_sta = ap_get_sta(sibling_hapd, sta->mxl_sta_info.sibling_sta_mac);
++			if (!sibling_sta && mxl_hostapd_prune_sta(sibling_hapd, sta->mxl_sta_info.sibling_sta_mac)) {
++				wpa_printf(MSG_ERROR, "Sibling sta: " MACSTR
++						" Already present in other bss, Reject assoc req", MAC2STR(sta->mxl_sta_info.sibling_sta_mac));
++				return WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY;
++			} else if (sibling_sta && sibling_hapd->conf->wpa && mxl_check_sa_query(sibling_hapd, sibling_sta, 0)) {
++				wpa_printf(MSG_ERROR, "Sibling sta: " MACSTR
++						" Already present start SA Query, Reject assoc req", MAC2STR(sta->mxl_sta_info.sibling_sta_mac));
++				return WLAN_STATUS_ASSOC_REJECTED_TEMPORARILY;
++			}
++
+ 			sta->mxl_sta_info.linked_sta = ap_sta_add(sibling_hapd, sta->mxl_sta_info.sibling_sta_mac);
+ 			if (!sta->mxl_sta_info.linked_sta) {
+ 				wpa_printf(MSG_ERROR, "Unable to handle linked sta");
+@@ -1428,7 +1443,9 @@ int mxl_ml_sta_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 	u8 link_id = hapd->conf->mxl_bss_conf.link_id;
+ 	u8 *ml_sta_addr;
+ 	u8 sibling_link_id;
++	u8 main_link_id = 0;
+ 	struct hostapd_data *tmp_hapd;
++	struct sta_info *linked_sta = NULL;
+ 
+ 	ml_sta_params = os_malloc(sizeof(struct mxl_ml_sta_add_param));
+ 	if (!ml_sta_params)
+@@ -1447,8 +1464,9 @@ int mxl_ml_sta_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 			((link_id == LINK_ID_5G) ? ml_sta_params->sta_addr2 : ml_sta_params->sta_addr3));
+ 	ml_sta_params->assoc_link_bitmap |= 1 << link_id;
+ 	memcpy_s(ml_sta_addr, ETH_ALEN, sta->addr, ETH_ALEN);
++	linked_sta = sta->mxl_sta_info.linked_sta;
+ 
+-	if (sta->mxl_sta_info.linked_sta) {
++	if (linked_sta) {
+ 		sibling_link_id = hapd->mxl_data.sibling_hapd->conf->mxl_bss_conf.link_id;
+ 
+ 		/* Populate EMLSR transition timeout from config param */
+@@ -1471,7 +1489,7 @@ int mxl_ml_sta_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 		ml_sta_addr = ((sibling_link_id == LINK_ID_2G) ? ml_sta_params->sta_addr1 :
+ 				((sibling_link_id == LINK_ID_5G) ? ml_sta_params->sta_addr2 : ml_sta_params->sta_addr3));
+ 		ml_sta_params->assoc_link_bitmap |= 1 << sibling_link_id;
+-		memcpy_s(ml_sta_addr, ETH_ALEN, sta->mxl_sta_info.linked_sta->addr, ETH_ALEN);
++		memcpy_s(ml_sta_addr, ETH_ALEN, linked_sta->addr, ETH_ALEN);
+ 
+ 		if (ml_sta_params->num_of_sim_links) /* STR */
+ 			ml_sta_params->eml_capab = 0;
+@@ -1479,8 +1497,8 @@ int mxl_ml_sta_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 	memcpy_s(ml_sta_params->mld_mac_addr, ETH_ALEN, sta->mxl_sta_info.non_ap_mld_mac, ETH_ALEN);
+ 	ml_sta_params->mld_id = hapd->conf->mld_id;
+ 
+-	if (sta->mxl_sta_info.linked_sta) {
+-		if(sta->aid == sta->mxl_sta_info.linked_sta->aid)
++	if (linked_sta) {
++		if(sta->aid == linked_sta->aid)
+ 			ml_sta_params->aid = sta->aid;
+ 	}
+ 	if (sta->mxl_sta_info.ext_flags & WLAN_STA_SINGLE_LINK_ML_ASSOC)
+@@ -1499,7 +1517,8 @@ int mxl_ml_sta_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 	if (switch_initial_active_link)
+ 		hapd = hapd->mxl_data.sibling_hapd;
+ 
+-	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_ML_STA_ADD, ml_sta_params, sizeof(struct mxl_ml_sta_add_param))) {
++	if (MXL_DRV_VENDOR_GET(LTQ_NL80211_VENDOR_SUBCMD_ML_STA_ADD, ml_sta_params, sizeof(struct mxl_ml_sta_add_param),
++				&main_link_id, sizeof(main_link_id))) {
+ 		wpa_printf(MSG_ERROR, "send LTQ_NL80211_VENDOR_SUBCMD_ML_STA_ADD failed!!!");
+ 		os_free(ml_sta_params);
+ 		return -1;
+@@ -1507,8 +1526,10 @@ int mxl_ml_sta_add(struct hostapd_data *hapd, struct sta_info *sta)
+ 	hapd = tmp_hapd;
+ 
+ 	sta->mxl_sta_info.ext_flags |= WLAN_STA_MLD_STA;
+-	if (sta->mxl_sta_info.linked_sta) {
+-		sta->mxl_sta_info.linked_sta->mxl_sta_info.ext_flags |= WLAN_STA_MLD_STA;
++	sta->mxl_sta_info.main_link_id = main_link_id;
++	if (linked_sta) {
++		linked_sta->mxl_sta_info.ext_flags |= WLAN_STA_MLD_STA;
++		linked_sta->mxl_sta_info.main_link_id = main_link_id;
+ 	}
+ 
+ 	os_free(ml_sta_params);
+@@ -1676,7 +1697,7 @@ int mxl_ml_handle_critical_update(struct hostapd_data *hapd)
+ 		flags = BSS_CRITICAL_UPDATE_COMMON;
+ 		sib_hapd_tx = sib_hapd;
+ 
+-		if ((sib_hapd->iconf->multibss_enable) 
++		if ((sib_hapd->iconf->multibss_enable)
+ 		    && (MULTIBSS_REFERENCE_BSS_IDX != sib_hapd->conf->bss_idx)) {
+ 			/* Set Non-Tx Critical Update */
+ 			sib_hapd->mxl_data.ml_non_tx_critical_update = true;
+diff --git a/src/ap/mxl_sta_info.c b/src/ap/mxl_sta_info.c
+index 18d1c11e8..df1ad691a 100644
+--- a/src/ap/mxl_sta_info.c
++++ b/src/ap/mxl_sta_info.c
+@@ -35,22 +35,6 @@ struct sta_info * mxl_ap_get_sta_by_non_ap_mld_mac(struct hostapd_data *hapd, co
+ 	return NULL;
+ }
+ 
+-struct sta_info * mxl_ap_get_unlinked_sta(struct hostapd_data *hapd, struct sta_info *new_sta)
+-{
+-	struct sta_info *sta;
+-
+-	for (sta = hapd->sta_list; sta; sta = sta->next) {
+-		if (new_sta->mxl_sta_info.linked_sta == sta)
+-			continue;
+-
+-		if (sta->mxl_sta_info.linked_sta)
+-			if (!os_memcmp(sta->mxl_sta_info.linked_sta->addr, new_sta->addr, ETH_ALEN))
+-				return sta;
+-	}
+-
+-	return NULL;
+-}
+-
+ void mxl_ml_ap_handle_timer(void *eloop_ctx, void *timeout_ctx)
+ {
+ 	struct hostapd_data *hapd = eloop_ctx;
+diff --git a/src/ap/mxl_sta_info.h b/src/ap/mxl_sta_info.h
+index 6c522c696..f0c9cafd3 100644
+--- a/src/ap/mxl_sta_info.h
++++ b/src/ap/mxl_sta_info.h
+@@ -33,7 +33,7 @@ struct mxl_sta_info {
+ #ifdef CONFIG_SCS_MXL
+ 	unsigned int scs_supported:1;
+ #endif /* CONFIG_SCS_MXL */
+-
++	u8 main_link_id;
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ };
+ 
+@@ -46,7 +46,6 @@ struct mxl_sta_info {
+ 
+ void mxl_ml_ap_handle_timer(void *eloop_ctx, void *timeout_ctx);
+ struct sta_info * mxl_ap_get_sta_by_non_ap_mld_mac(struct hostapd_data *hapd, const u8 *mac);
+-struct sta_info * mxl_ap_get_unlinked_sta(struct hostapd_data *hapd, struct sta_info *new_sta);
+ 
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* MXL_STA_INFO_H */
+diff --git a/src/ap/mxl_utils.c b/src/ap/mxl_utils.c
+index e8daf76f2..4eac68a48 100644
+--- a/src/ap/mxl_utils.c
++++ b/src/ap/mxl_utils.c
+@@ -25,9 +25,10 @@
+ #include "ieee802_1x.h"
+ #include "ap_drv_ops.h"
+ #include "ap/mxl_utils.h"
++#include "mxl_ieee802_11.h"
+ 
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-void mxl_mlo_cleanup_mld_sta(struct hostapd_data * hapd, struct sta_info *sta)
++void mxl_cleanup_sta(struct hostapd_data * hapd, struct sta_info *sta)
+ {
+ 	/* Clear the PTKSA cache entries for PASN */
+ 	ptksa_cache_flush(hapd->ptksa, sta->addr, WPA_CIPHER_NONE);
+@@ -50,80 +51,64 @@ void mxl_mlo_cleanup_mld_sta(struct hostapd_data * hapd, struct sta_info *sta)
+ 	ap_free_sta(hapd, sta);
+ }
+ 
+-static int mxl_mlo_prune_associations_mld(struct hostapd_iface *iface, void *ctx)
++void mxl_remove_associated_sta(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct sta_info *linked_sta = NULL;
++
++	if (mxl_mlo_is_ml_sta(sta)) {
++		wpa_printf(MSG_ERROR, "%s: Cleaning associated MLD Sta from hostapd and driver" MACSTR,
++			 hapd->conf->iface, MAC2STR(sta->addr));
++		mxl_ml_stop_sta_traffic_remove_mld(hapd, sta);
++		linked_sta = sta->mxl_sta_info.linked_sta;
++	}
++	else
++	{
++		wpa_printf(MSG_ERROR, "%s: Cleaning associated legacy Sta from hostapd and driver" MACSTR,
++			 hapd->conf->iface, MAC2STR(sta->addr));
++	}
++
++	mxl_cleanup_sta(hapd, sta);
++	if (linked_sta)
++		mxl_cleanup_sta(hapd->mxl_data.sibling_hapd, linked_sta);
++}
++
++static int mxl_clean_exiting_sta_entry_by_mac(struct hostapd_iface *iface, void *ctx)
+ {
+ 	struct prune_data *data = ctx;
+-	struct sta_info *osta, *linked_sta;
+-	struct hostapd_data *ohapd;
++	struct sta_info *sta;
++	struct hostapd_data *hapd;
+ 	size_t j;
+ 
+ 	for (j = 0; j < iface->num_bss; j++) {
+-		ohapd = iface->bss[j];
+-		if (ohapd == data->hapd)
+-			continue;
+-
+-		osta = ap_get_sta(ohapd, data->addr);
+-		if (!osta)
+-			continue;
+-
+-		if (ohapd->conf->mxl_bss_conf.mlo_enable && ohapd->mxl_data.sibling_hapd) {
+-			wpa_printf(MSG_INFO, "%s: Prune association MLD Sta " MACSTR,
+-					ohapd->conf->iface, MAC2STR(osta->addr));
+-			mxl_ml_stop_sta_traffic_remove_mld(ohapd, osta);
+-			linked_sta = osta->mxl_sta_info.linked_sta;
+-			mxl_mlo_cleanup_mld_sta(ohapd, osta);
+-			if (linked_sta)
+-				mxl_mlo_cleanup_mld_sta(ohapd->mxl_data.sibling_hapd, linked_sta);
++		hapd = iface->bss[j];
++
++		sta = ap_get_sta(hapd, data->addr);
++		if (!sta)
++			sta = mxl_ap_get_sta_by_non_ap_mld_mac(hapd, data->addr);
++
++		if (sta) {
++
++			if (hapd->conf->wpa && mxl_check_sa_query(hapd, sta, 0))
++				return 1;
++
++			mxl_remove_associated_sta(hapd, sta);
+ 		}
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-void mxl_mlo_hostapd_prune_associations_mld_mac(struct hostapd_data *hapd, struct sta_info *new_sta)
++bool mxl_hostapd_prune_sta(struct hostapd_data *hapd, const u8 *addr)
+ {
+-	struct sta_info *sta, *prev, *linked_sta;
+-	/* static variable used to count number of prunes done for debug purpose*/
+-	static u32 mld_prune_count = 0;
+-
+-	sta = hapd->sta_list;
+-	while (sta) {
+-		prev = sta;
+-		sta = sta->next;
+-
+-		if (new_sta == prev)
+-			continue;
+-
+-		if (mxl_mlo_is_ml_sta(prev)) {
+-			if (os_memcmp(prev->mxl_sta_info.non_ap_mld_mac, new_sta->mxl_sta_info.non_ap_mld_mac, ETH_ALEN) &&
+-					os_memcmp(prev->addr, new_sta->mxl_sta_info.non_ap_mld_mac, ETH_ALEN))
+-				continue;
+-
+-			if (prev->flags & WLAN_STA_AUTH) {
+-				mlme_deauthenticate_indication(
+-						hapd, prev, WLAN_REASON_UNSPECIFIED);
+-			}
+-			mld_prune_count++;
+-			wpa_printf(MSG_ERROR, "STA with same MLD MAC found. Removing station " MACSTR,
+-					MAC2STR(prev->addr));
+-			wpa_printf(MSG_ERROR,"MLD prune count %u", mld_prune_count);
+-			mxl_ml_stop_sta_traffic_remove_mld(hapd, prev);
+-			linked_sta = prev->mxl_sta_info.linked_sta;
+-			mxl_mlo_cleanup_mld_sta(hapd, prev);
+-			if (linked_sta && (linked_sta != new_sta))
+-				mxl_mlo_cleanup_mld_sta(hapd->mxl_data.sibling_hapd, linked_sta);
+-		}
+-	}
+-}
++	struct prune_data data = {0};
++	u16 status = 0;
+ 
+-void mxl_mlo_hostapd_prune_associations_mld(struct hostapd_data *hapd, const u8 *addr)
+-{
+-	struct prune_data data;
+-	data.hapd = hapd;
+ 	data.addr = addr;
++
+ 	if (hapd->iface->interfaces &&
+ 			hapd->iface->interfaces->for_each_interface)
+-		hapd->iface->interfaces->for_each_interface(
+-				hapd->iface->interfaces, mxl_mlo_prune_associations_mld, &data);
++		status = hapd->iface->interfaces->for_each_interface(
++					hapd->iface->interfaces, mxl_clean_exiting_sta_entry_by_mac, &data);
++	return status;
+ }
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 89784c0e1..0135cc401 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1331,6 +1331,13 @@ static void ap_sa_query_timer(void *eloop_ctx, void *timeout_ctx)
+ 		   " (count=%d)",
+ 		   hapd->conf->iface, MAC2STR(sta->addr), sta->sa_query_count);
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (sta->sa_query_count > 0 &&
++	    ap_check_sa_query_timeout(hapd, sta)) {
++		mxl_remove_associated_sta(hapd, sta);
++		return;
++	}
++#endif
+ 	if (sta->sa_query_count > 0 &&
+ 	    ap_check_sa_query_timeout(hapd, sta))
+ 		return;
+-- 
+2.43.0
+

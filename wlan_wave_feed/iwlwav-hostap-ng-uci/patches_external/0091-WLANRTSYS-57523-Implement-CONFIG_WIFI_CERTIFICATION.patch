@@ -1,0 +1,825 @@
+From ae1da3ca6c58ef011114e58f6faf901367c644c1 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Wed, 2 Aug 2023 16:07:59 +0200
+Subject: [PATCH] WLANRTSYS-57523: Implement CONFIG_WIFI_CERTIFICATION
+
+---
+ hostapd/Makefile             |   4 +
+ hostapd/config_file.c        | 132 +++++++++++++++++++++++++++++++
+ hostapd/ctrl_iface.c         | 145 +++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  79 +++++++++++++++++++
+ src/ap/ap_config.h           |   4 +
+ src/ap/ap_drv_ops.h          |  20 +++++
+ src/ap/pmksa_cache_auth.c    |  44 +++++++++++
+ src/ap/pmksa_cache_auth.h    |   3 +
+ src/ap/sta_info.h            |   4 +-
+ src/ap/wpa_auth.c            |   9 +++
+ src/ap/wpa_auth.h            |   4 +
+ src/ap/wpa_auth_glue.c       |   6 +-
+ src/ap/wpa_auth_ie.c         |  28 +++++++
+ src/drivers/driver.h         |  18 +++++
+ src/drivers/driver_nl80211.c |  34 ++++++++
+ src/utils/common.h           |   8 ++
+ 16 files changed, 540 insertions(+), 2 deletions(-)
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index a04956b55..4eeec0381 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -1328,6 +1328,10 @@ OBJS += ../src/rsn_supp/pmksa_cache.o
+ OBJS += ../src/rsn_supp/wpa_ie.o
+ endif
+ 
++ifdef CONFIG_WIFI_CERTIFICATION
++CFLAGS += -DCONFIG_WIFI_CERTIFICATION
++endif
++
+ $(DESTDIR)$(BINDIR)/%: %
+ 	install -D $(<) $(@)
+ 
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 47254b9a8..881897e5f 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2575,6 +2575,120 @@ void read_token (char **p, char** token_start, int* token_len, char* delimiters)
+ }
+ 
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++static int hostapd_config_parse_wpa_hex_buf(struct hostapd_bss_config *bss,const char *value)
++{
++#define WPA_STR_LEN 48
++#define WPA_STR_LEN_WITH_GROUP_MGMT_CIPHER 56
++
++	char *start, *end;
++	int last, len, ret = -1;
++	u8 *wpa_buf = NULL;
++	struct wpa_ie_data wpa_ie = {0};
++	int wpa_buf_len = 0;
++
++	char *buf = os_strdup(value);
++
++	if (buf == NULL)
++		return 1;
++
++	start = buf;
++	while (*start != '\0') {
++		while (*start == ' ' || *start == '\t')
++			start++;
++		if (*start == '\0')
++			break;
++		end = start;
++		while (*end != ' ' && *end != '\t' && *end != '\0')
++			end++;
++		last = *end == '\0';
++		*end = '\0';
++
++		len = os_strlen(start);
++		if(len != WPA_STR_LEN && len != WPA_STR_LEN_WITH_GROUP_MGMT_CIPHER) {
++			wpa_printf(MSG_ERROR, "invalid wpa hex buf length %d", len);
++			break;
++		}
++		/* converting hexstr to byte, so bytearray length will be half of the hex string */
++		wpa_buf_len = len / 2;
++		wpa_buf = os_malloc(wpa_buf_len);
++		if(wpa_buf == NULL) {
++			goto end;
++		}
++
++		if (hexstr2bin(start, wpa_buf, wpa_buf_len)) {
++			goto end;
++		}
++
++		if (wpa_buf[0] == WLAN_EID_RSN && wpa_buf_len >= sizeof(struct rsn_ie_hdr)) {
++			if (wpa_parse_wpa_ie_rsn(wpa_buf, wpa_buf_len, &wpa_ie)) {
++				wpa_printf(MSG_ERROR, "wpa_ie_rsn parsing failed of length %d", wpa_buf_len);
++				goto end;
++			}
++		} else if (wpa_buf[0] == WLAN_EID_VENDOR_SPECIFIC && wpa_buf_len >= sizeof(struct wpa_ie_hdr)) {
++			if (wpa_parse_wpa_ie_wpa(wpa_buf, wpa_buf_len, &wpa_ie)) {
++				wpa_printf(MSG_ERROR, "wpa_ie_wpa parsing failed of length %d", wpa_buf_len);
++				goto end;
++			}
++
++		}
++
++		/* Default GROUP_MGMT_CIPHER is WPA_CIPHER_AES_128_CMAC,
++		 * For certification, we will advertise if it includes in "wpa hex input"
++		 */
++		if(len != WPA_STR_LEN_WITH_GROUP_MGMT_CIPHER) {
++			wpa_ie.mgmt_group_cipher = WPA_CIPHER_NONE;
++		}
++
++		/* Update wpa data */
++		bss->wpa = wpa_ie.proto;
++		bss->group_cipher = wpa_ie.group_cipher;
++		bss->wpa_pairwise = wpa_ie.pairwise_cipher;
++		bss->wpa_key_mgmt = wpa_ie.key_mgmt;
++		bss->group_mgmt_cipher = wpa_ie.mgmt_group_cipher;
++
++		if (bss->wpa_key_mgmt == WPA_KEY_MGMT_IEEE8021X ||
++			bss->wpa_key_mgmt == WPA_KEY_MGMT_IEEE8021X_SHA256) {
++			bss->ieee802_1x = 1;
++		} else {
++			bss->ieee802_1x = 0;
++		}
++
++		if ((wpa_ie.capabilities & WPA_CAPABILITY_MFPR)
++				&& (wpa_ie.capabilities & WPA_CAPABILITY_MFPC)) {
++			bss->ieee80211w = MGMT_FRAME_PROTECTION_REQUIRED;
++		} else if (wpa_ie.capabilities & WPA_CAPABILITY_MFPC) {
++			bss->ieee80211w = MGMT_FRAME_PROTECTION_OPTIONAL;
++		} else {
++			bss->ieee80211w = NO_MGMT_FRAME_PROTECTION;
++		}
++
++		if (wpa_ie.capabilities & (RSN_NUM_REPLAY_COUNTERS_16 << 2)) {
++			bss->wmm_enabled = 1;
++		} else {
++			bss->wmm_enabled = 0;
++		}
++
++		if (wpa_ie.capabilities & WPA_CAPABILITY_PREAUTH) {
++			bss->rsn_preauth = 1;
++		} else {
++			bss->rsn_preauth = 0;
++		}
++
++		ret=0;
++		if (last)
++			break;
++		start = end + 1;
++	}
++end:
++	if(buf)
++		os_free(buf);
++	if(wpa_buf)
++		os_free(wpa_buf);
++	return ret;
++}
++#endif /* CONFIG_WIFI_CERTIFICATION */
++
+ /**
+  * Read WHM configuration from whm.conf file
+  * Syntax of whm.conf file
+@@ -2900,6 +3014,10 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		conf->testbed_mode = val;
++#ifdef CONFIG_WIFI_CERTIFICATION
++		extern int wpa_cert;
++		wpa_cert = val;
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ #ifdef EAP_SERVER
+ 	} else if (os_strcmp(buf, "eap_authenticator") == 0) {
+ 		bss->eap_server = atoi(pos);
+@@ -5882,6 +6000,20 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ #endif /* CONFIG_WDS_WPA */
++#ifdef CONFIG_WIFI_CERTIFICATION
++	/* This is required for WFA test (5.2.4 STAUT) where AP is expected to be configured with different security modes.
++	 * WFA script will provide wpa hex buffer containing different suites.
++	 * This is per BSS configuration and valid for 6G band.
++	 * and must be set in conf at end of each BSS configuration.
++	 */
++	} else if (is_6ghz_op_class(conf->op_class) && os_strcmp(buf, "wpa_hex_buf") == 0) {
++		int ret;
++		ret = hostapd_config_parse_wpa_hex_buf(bss,pos);
++		if(ret) {
++			wpa_printf(MSG_ERROR, "wpa hex buf parsing failed");
++			return 1;
++		}
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ #ifdef CONFIG_VENDOR_MXL
+ 	} else if (mxl_hostapd_config_fill(conf, bss, buf, pos, line)) {
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 44aca196c..f4bdee2c0 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -68,6 +68,7 @@
+ #include "fst/fst_ctrl_iface.h"
+ #include "config_file.h"
+ #include "ctrl_iface.h"
++#include "ap/wpa_auth_i.h"
+ #include "ap/bss_load.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_ctrl_iface.h"
+@@ -1719,6 +1720,127 @@ static int hostapd_ctrl_iface_reload_wpa_psk(struct hostapd_data *hapd)
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++static int hostapd_ctrl_iface_set_unprotected_deauth(struct hostapd_data *hapd, char *buf)
++{
++	if ( ( atoi(buf) == 0 ) || ( atoi(buf) == 1 ) )
++		return hostapd_drv_set_unprotected_deauth(hapd, atoi(buf));
++	return -1;
++}
++
++static int hostapd_ctrl_iface_set_pn_reset(struct hostapd_data *hapd, char *buf)
++{
++	if ( ( atoi(buf) == 0 ) || ( atoi(buf) == 1 ) )
++		return hostapd_drv_set_pn_reset(hapd, atoi(buf));
++	return -1;
++}
++
++static int hostapd_ctrl_iface_pmk_list(struct hostapd_data *hapd, char *buf,
++				  size_t len)
++{
++	return wpa_auth_pmk_list(hapd->wpa_auth, buf, len);
++}
++
++static int hostapd_ctrl_set_incorrect_pn(struct hostapd_data *hapd, const char *cmd)
++{
++	struct sta_info *sta;
++	u8 addr[ETH_ALEN];
++	u8 incorrect_pn[WPA_TK_MAX_LEN];
++
++	if (hwaddr_aton(cmd, addr))
++		return -1;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta)
++		return -1;
++
++	if (sta->last_tk_alg == WPA_ALG_NONE)
++		return -1;
++
++	wpa_printf(MSG_ERROR, "TESTING: Incorrect PN for " MACSTR,
++		   MAC2STR(sta->addr));
++
++	/* copy current key and change complement last byte */
++	os_memcpy(incorrect_pn, sta->last_tk, sta->last_tk_len);
++	incorrect_pn[sta->last_tk_len - 1 ] = ~(incorrect_pn[sta->last_tk_len - 1 ]);
++
++	return hostapd_drv_set_key(hapd->conf->iface, hapd, sta->last_tk_alg,
++				   sta->addr, sta->last_tk_key_idx, 0, 1, NULL, 0,
++				   incorrect_pn, sta->last_tk_len, KEY_FLAG_DEFAULT);
++}
++
++static int hostapd_ctrl_set_correct_pn(struct hostapd_data *hapd, const char *cmd)
++{
++	struct sta_info *sta;
++	u8 addr[ETH_ALEN];
++
++	if (hwaddr_aton(cmd, addr))
++		return -1;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta)
++		return -1;
++
++	if (sta->last_tk_alg == WPA_ALG_NONE)
++		return -1;
++
++	wpa_printf(MSG_ERROR, "TESTING: correct PN for " MACSTR,
++		   MAC2STR(sta->addr));
++
++	return hostapd_drv_set_key(hapd->conf->iface, hapd, sta->last_tk_alg,
++				   sta->addr, sta->last_tk_key_idx, 0, 1, NULL, 0,
++				   sta->last_tk, sta->last_tk_len, KEY_FLAG_DEFAULT);
++}
++
++static int hostapd_ctrl_get_ptk_rekey_timer(struct hostapd_data *hapd, char *cmd, char *reply,
++						size_t reply_size)
++{
++	struct sta_info *sta;
++	u8 addr[ETH_ALEN];
++
++	if (hwaddr_aton(cmd, addr))
++		return -1;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta)
++		return -1;
++
++	return sprintf_s(reply, reply_size, "%d",
++			sta->wpa_sm->wpa_auth->conf.wpa_ptk_rekey);
++
++}
++
++static int hostapd_ctrl_set_ptk_rekey_timer(struct hostapd_data *hapd, char *cmd)
++{
++	struct sta_info *sta;
++	u8 addr[ETH_ALEN];
++	char *tmp, *ptr = NULL;
++	int val;
++
++	PARSE_TOKEN(tmp, cmd, " ", &ptr);
++	if (hwaddr_aton(tmp, addr))
++		return -1;
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta)
++		return -1;
++
++	PARSE_TOKEN(tmp,cmd," ",&ptr);
++	val = atoi(tmp);
++	if (!IS_VALID_RANGE(val, AP_TIMER_DISABLE, AP_TIMER_MAX)) {
++		wpa_printf(MSG_ERROR, "invalid wpa_ptk_rekey %d",val);
++		return -1;
++	}
++
++	sta->wpa_sm->wpa_auth->conf.wpa_ptk_rekey = val;
++
++	wpa_printf(MSG_DEBUG, "TESTING: set new ptk timer %d", val);
++
++	wpa_auth_set_ptk_rekey_timer(sta->wpa_sm);
++
++	return 0;
++}
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ 
+ #ifdef CONFIG_TESTING_OPTIONS
+ 
+@@ -6567,6 +6689,29 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "UPDATE_RELOAD ", 14) == 0) {
+ 		if (hostapd_ctrl_iface_update_reload(hapd, buf + 14))
+ 			reply_len = -1;
++#ifdef CONFIG_WIFI_CERTIFICATION
++	} else if (os_strncmp(buf, "SET_UNPROTECTED_DEAUTH ", 23) == 0) {
++		if (hostapd_ctrl_iface_set_unprotected_deauth(hapd, buf + 23) < 0)
++			reply_len = -1;
++	} else if (os_strncmp(buf, "SET_PN_RESET ", 13) == 0) {
++		if (hostapd_ctrl_iface_set_pn_reset(hapd, buf + 13) < 0)
++			reply_len = -1;
++	} else if (os_strcmp(buf, "PMK") == 0) {
++		reply_len = hostapd_ctrl_iface_pmk_list(hapd, reply,
++							  reply_size);
++	} else if (os_strncmp(buf, "SET_INCORRECT_PN ", 17) == 0) {
++		if (hostapd_ctrl_set_incorrect_pn(hapd, buf + 17) < 0)
++			reply_len = -1;
++	} else if (os_strncmp(buf, "SET_CORRECT_PN ", 15) == 0) {
++		if (hostapd_ctrl_set_correct_pn(hapd, buf + 15) < 0)
++			reply_len = -1;
++	} else if (os_strncmp(buf, "GET_PTK_REKEY_TIMER ", 20) == 0) {
++		reply_len = hostapd_ctrl_get_ptk_rekey_timer(hapd, buf + 20,
++				 reply, reply_size);
++	} else if (os_strncmp(buf, "SET_PTK_REKEY_TIMER ", 20) == 0) {
++		if (hostapd_ctrl_set_ptk_rekey_timer(hapd, buf + 20) < 0)
++			reply_len = -1;
++#endif /*CONFIG_WIFI_CERTIFICATION */
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 19b7c3150..987a9f874 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -2266,6 +2266,69 @@ static int hostapd_cli_cmd_get_he_phy_channel_width_set (struct wpa_ctrl *ctrl,
+ 	return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++static int hostapd_cli_cmd_set_incorrect_pn(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "SET_INCORRECT_PN", 1, argc, argv);
++}
++
++static int hostapd_cli_cmd_set_correct_pn(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return hostapd_cli_cmd(ctrl, "SET_CORRECT_PN", 1, argc, argv);
++}
++
++static int hostapd_cli_cmd_pmk(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	return wpa_ctrl_command(ctrl, "PMK");
++}
++
++static int hostapd_cli_cmd_set_unprotected_deauth(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	if (argc != 1) {
++		printf("Invalid set_unprotected_deauth command - requires <enable>\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "SET_UNPROTECTED_DEAUTH", 1, argc, argv);
++}
++
++static int hostapd_cli_cmd_set_pn_reset(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	if (argc != 1) {
++		printf("Invalid set_pn_reset command - requires <enable>\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "SET_PN_RESET", 1, argc, argv);
++}
++
++static int hostapd_cli_cmd_get_ptk_rekey_timer(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	if (argc != 1) {
++		printf("Invalid get_ptk_rekey_timer command - requires <sta_bssid>\n");
++		return -1;
++	}
++
++	return hostapd_cli_cmd(ctrl, "GET_PTK_REKEY_TIMER", 1, argc, argv);
++}
++
++static int hostapd_cli_cmd_set_ptk_rekey_timer(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	if (argc != 2) {
++		printf("Invalid set_ptk_rekey_timer command - requires <sta_bssid>"
++				"<timer>\n");
++		return -1;
++	}
++
++        return hostapd_cli_cmd(ctrl, "SET_PTK_REKEY_TIMER", 2, argc, argv);
++}
++
++#endif /* CONFIG_WIFI_CERTIFICATION */
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2561,6 +2624,22 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  "<MAC addr> = get HE PHY Channel Width Set field for specified STA" },
+ 	{ "stop_ap", hostapd_cli_cmd_stop_ap, NULL,
+ 	  "= stop hostapd AP on current interface" },
++#ifdef CONFIG_WIFI_CERTIFICATION
++	{ "pmk", hostapd_cli_cmd_pmk, NULL,
++	  " = show PMK cache entries" },
++	{ "set_incorrect_pn", hostapd_cli_cmd_set_incorrect_pn, NULL,
++	 " = set incorrect pn" },
++	{ "set_correct_pn", hostapd_cli_cmd_set_correct_pn, NULL,
++	 " = set correct pn" },
++	{ "set_unprotected_deauth", hostapd_cli_cmd_set_unprotected_deauth, NULL,
++	  " = to enable support of unprotected deauth" },
++	{ "set_pn_reset", hostapd_cli_cmd_set_pn_reset, NULL,
++	  " = to enable pn reset" },
++	{ "get_ptk_rekey_timer", hostapd_cli_cmd_get_ptk_rekey_timer, NULL,
++	  " = get ptk rekey timer" },
++	{ "set_ptk_rekey_timer", hostapd_cli_cmd_set_ptk_rekey_timer, NULL,
++	  " = set ptk rekey timer" },
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index bbb0c79e0..3b4a4bb0b 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1489,6 +1489,10 @@ struct hostapd_config {
+ #define COEX_INACTIVE_TIME_MIN	2
+ #define COEX_INACTIVE_TIME_MAX	32
+ #define AP_MAX_VALID_CHAR		255
++#define AP_TIMER_DISABLE		0
++#define AP_TIMER_MIN			1
++#define AP_TIMER_MAX			86400
++
+ 
+ static inline enum oper_chan_width
+ hostapd_get_oper_chwidth(struct hostapd_config *conf)
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index 828842a14..e6ec52c6e 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -601,4 +601,24 @@ static inline int hostapd_drv_link_add(struct hostapd_data *hapd,
+ }
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++static inline int hostapd_drv_set_unprotected_deauth(struct hostapd_data *hapd,
++						int enable)
++{
++	if (hapd->driver == NULL || hapd->driver->set_unprotected_deauth == NULL)
++		return -ENOTSUP;
++
++	return hapd->driver->set_unprotected_deauth(hapd->drv_priv, enable);
++}
++
++static inline int hostapd_drv_set_pn_reset(struct hostapd_data *hapd,
++							int enable)
++{
++	if (hapd->driver == NULL || hapd->driver->set_pn_reset == NULL)
++		return -ENOTSUP;
++
++	return hapd->driver->set_pn_reset(hapd->drv_priv, enable);
++}
++#endif /* CONFIG_WIFI_CERTIFICATION */
++
+ #endif /* AP_DRV_OPS */
+diff --git a/src/ap/pmksa_cache_auth.c b/src/ap/pmksa_cache_auth.c
+index ee4232fd7..f30b604cd 100644
+--- a/src/ap/pmksa_cache_auth.c
++++ b/src/ap/pmksa_cache_auth.c
+@@ -683,6 +683,50 @@ int pmksa_cache_auth_list(struct rsn_pmksa_cache *pmksa, char *buf, size_t len)
+ 	return pos - buf;
+ }
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++/**
++ * pmk_cache_auth_list - Dump text list of entries in PMK cache
++ * @pmk: Pointer to PMK cache data from pmksa_cache_auth_init()
++ * @buf: Buffer for the list
++ * @len: Length of the buffer
++ * Returns: Number of bytes written to buffer
++ *
++ * This function is used to generate a text format representation of the
++ * current PMK cache contents for the ctrl_iface PMK command.
++ */
++int pmk_cache_auth_list(struct rsn_pmksa_cache *pmksa, char *buf, size_t len)
++{
++	int i, ret;
++	char *pos = buf;
++	struct rsn_pmksa_cache_entry *entry;
++	struct os_reltime now;
++
++	os_get_reltime(&now);
++	ret = os_snprintf(pos, buf + len - pos,
++			  "Index / SPA / PMK / expiration (in seconds) / opportunistic\n");
++	if (os_snprintf_error(buf + len - pos, ret))
++		return pos - buf;
++	pos += ret;
++	i = 0;
++	entry = pmksa->pmksa;
++	while (entry) {
++		ret = os_snprintf(pos, buf + len - pos, "%d " MACSTR " ",
++				  i, MAC2STR(entry->spa));
++		if (os_snprintf_error(buf + len - pos, ret))
++			return pos - buf;
++		pos += ret;
++		pos += wpa_snprintf_hex(pos, buf + len - pos, entry->pmk, PMK_LEN);
++		ret = os_snprintf(pos, buf + len - pos, " %d %d\n",
++				(int) (entry->expiration - now.sec),
++				entry->opportunistic);
++		if (os_snprintf_error(buf + len - pos, ret))
++			return pos - buf;
++		pos += ret;
++		entry = entry->next;
++	}
++	return pos - buf;
++}
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ 
+ #ifdef CONFIG_PMKSA_CACHE_EXTERNAL
+ #ifdef CONFIG_MESH
+diff --git a/src/ap/pmksa_cache_auth.h b/src/ap/pmksa_cache_auth.h
+index e38e7eca6..dc1536f13 100644
+--- a/src/ap/pmksa_cache_auth.h
++++ b/src/ap/pmksa_cache_auth.h
+@@ -76,6 +76,9 @@ void pmksa_cache_free_entry(struct rsn_pmksa_cache *pmksa,
+ int pmksa_cache_auth_radius_das_disconnect(struct rsn_pmksa_cache *pmksa,
+ 					   struct radius_das_attrs *attr);
+ int pmksa_cache_auth_list(struct rsn_pmksa_cache *pmksa, char *buf, size_t len);
++#ifdef CONFIG_WIFI_CERTIFICATION
++int pmk_cache_auth_list(struct rsn_pmksa_cache *pmksa, char *buf, size_t len);
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ void pmksa_cache_auth_flush(struct rsn_pmksa_cache *pmksa);
+ int pmksa_cache_auth_list_mesh(struct rsn_pmksa_cache *pmksa, const u8 *addr,
+ 			       char *buf, size_t len);
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 10281562f..e9a4c2bb2 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -337,14 +337,16 @@ struct sta_info {
+ 	struct dpp_pfs *dpp_pfs;
+ #endif /* CONFIG_DPP2 */
+ 
+-#ifdef CONFIG_TESTING_OPTIONS
++#if defined(CONFIG_TESTING_OPTIONS) || defined(CONFIG_WIFI_CERTIFICATION)
+ 	enum wpa_alg last_tk_alg;
+ 	int last_tk_key_idx;
+ 	u8 last_tk[WPA_TK_MAX_LEN];
+ 	size_t last_tk_len;
++#ifdef CONFIG_TESTING_OPTIONS
+ 	u8 *sae_postponed_commit;
+ 	size_t sae_postponed_commit_len;
+ #endif /* CONFIG_TESTING_OPTIONS */
++#endif /* CONFIG_TESTING_OPTIONS || CONFIG_WIFI_CERTIFICATION */
+ #ifdef CONFIG_AIRTIME_POLICY
+ 	unsigned int airtime_weight;
+ 	struct os_reltime backlogged_until;
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index 206e0a580..17de29fac 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -5790,6 +5790,15 @@ int wpa_auth_pmksa_list(struct wpa_authenticator *wpa_auth, char *buf,
+ 	return pmksa_cache_auth_list(wpa_auth->pmksa, buf, len);
+ }
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++int wpa_auth_pmk_list(struct wpa_authenticator *wpa_auth, char *buf,
++			size_t len)
++{
++	if (!wpa_auth || !wpa_auth->pmksa)
++		return 0;
++	return pmk_cache_auth_list(wpa_auth->pmksa, buf, len);
++}
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ 
+ void wpa_auth_pmksa_flush(struct wpa_authenticator *wpa_auth)
+ {
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index 46fd315c7..b7806ea5d 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -498,6 +498,10 @@ void wpa_auth_pmksa_remove(struct wpa_authenticator *wpa_auth,
+ 			   const u8 *sta_addr);
+ int wpa_auth_pmksa_list(struct wpa_authenticator *wpa_auth, char *buf,
+ 			size_t len);
++#ifdef CONFIG_WIFI_CERTIFICATION
++int wpa_auth_pmk_list(struct wpa_authenticator *wpa_auth, char *buf,
++			size_t len);
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ void wpa_auth_pmksa_flush(struct wpa_authenticator *wpa_auth);
+ int wpa_auth_pmksa_list_mesh(struct wpa_authenticator *wpa_auth, const u8 *addr,
+ 			     char *buf, size_t len);
+diff --git a/src/ap/wpa_auth_glue.c b/src/ap/wpa_auth_glue.c
+index 419271ebd..f2c7835fc 100644
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -461,7 +461,7 @@ static int hostapd_wpa_auth_set_key(void *ctx, int vlan_id, enum wpa_alg alg,
+ 		}
+ 	}
+ 
+-#ifdef CONFIG_TESTING_OPTIONS
++#if defined(CONFIG_TESTING_OPTIONS) || defined(CONFIG_WIFI_CERTIFICATION)
+ 	if (key_flag & KEY_FLAG_MODIFY) {
+ 		/* We are updating an already installed key. Don't overwrite
+ 		 * the already stored key information with zeros.
+@@ -477,6 +477,7 @@ static int hostapd_wpa_auth_set_key(void *ctx, int vlan_id, enum wpa_alg alg,
+ 				os_memcpy(sta->last_tk, key, key_len);
+ 			sta->last_tk_len = key_len;
+ 		}
++#ifdef CONFIG_TESTING_OPTIONS
+ 	} else if (alg == WPA_ALG_BIP_CMAC_128 ||
+ 		   alg == WPA_ALG_BIP_GMAC_128 ||
+ 		   alg == WPA_ALG_BIP_GMAC_256 ||
+@@ -501,7 +502,10 @@ static int hostapd_wpa_auth_set_key(void *ctx, int vlan_id, enum wpa_alg alg,
+ 			os_memcpy(hapd->last_gtk, key, key_len);
+ 		hapd->last_gtk_len = key_len;
+ 	}
++#else  /* CONFIG_TESTING_OPTIONS */
++	}  /* if only CONFIG_WIFI_CERTIFICATION flag is on */
+ #endif /* CONFIG_TESTING_OPTIONS */
++#endif /* CONFIG_TESTING_OPTIONS || CONFIG_WIFI_CERTIFICATION */
+ 	return hostapd_drv_set_key(ifname, hapd, alg, addr, idx, vlan_id, 1,
+ 				   NULL, 0, key, key_len, key_flag);
+ }
+diff --git a/src/ap/wpa_auth_ie.c b/src/ap/wpa_auth_ie.c
+index 9fb09c314..92f379961 100644
+--- a/src/ap/wpa_auth_ie.c
++++ b/src/ap/wpa_auth_ie.c
+@@ -24,6 +24,10 @@
+ int rsn_testing = 0;
+ #endif /* CONFIG_RSN_TESTING */
+ 
++/* It will be set under "testbed_mode" */
++#ifdef CONFIG_WIFI_CERTIFICATION
++int wpa_cert = 0;
++#endif
+ 
+ static int wpa_write_wpa_ie(struct wpa_auth_config *conf, u8 *buf, size_t len)
+ {
+@@ -354,6 +358,16 @@ int wpa_write_rsn_ie(struct wpa_auth_config *conf, u8 *buf, size_t len,
+ 			pos += 2;
+ 		}
+ 
++/* As a testbed device, it is required to advertise PMKID field even for "NO PMKID case" */
++#ifdef CONFIG_WIFI_CERTIFICATION
++	if (!pmkid && wpa_cert && (conf->group_mgmt_cipher == WPA_CIPHER_AES_128_CMAC)) {
++		/* PMKID NULL, update PMKID in RSNE as count as 0 */
++		/* PMKID Count */
++		WPA_PUT_LE16(pos, 0);
++		pos += 2;
++	}
++#endif /* CONFIG_WIFI_CERTIFICATION */
++
+ 		/* Management Group Cipher Suite */
+ 		switch (conf->group_mgmt_cipher) {
+ 		case WPA_CIPHER_AES_128_CMAC:
+@@ -368,14 +382,28 @@ int wpa_write_rsn_ie(struct wpa_auth_config *conf, u8 *buf, size_t len,
+ 		case WPA_CIPHER_BIP_CMAC_256:
+ 			RSN_SELECTOR_PUT(pos, RSN_CIPHER_SUITE_BIP_CMAC_256);
+ 			break;
++		case WPA_CIPHER_NONE:
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG,
+ 				   "Invalid group management cipher (0x%x)",
+ 				   conf->group_mgmt_cipher);
+ 			return -1;
+ 		}
++		if(conf->group_mgmt_cipher != WPA_CIPHER_NONE)
++			pos += RSN_SELECTOR_LEN;
++	}
++
++/* As a testbed device, it is required to populate Group Management Cipher Suite
++ * under RSNE even for default suite(WPA_CIPHER_AES_128_CMAC)
++ */
++#ifdef CONFIG_WIFI_CERTIFICATION
++	if (conf->ieee80211w != NO_MGMT_FRAME_PROTECTION &&
++		conf->group_mgmt_cipher == WPA_CIPHER_AES_128_CMAC && wpa_cert) {
++		RSN_SELECTOR_PUT(pos, RSN_CIPHER_SUITE_AES_128_CMAC);
+ 		pos += RSN_SELECTOR_LEN;
+ 	}
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ 
+ #ifdef CONFIG_RSN_TESTING
+ 	if (rsn_testing) {
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index acf78193e..a16401f82 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5334,6 +5334,24 @@ struct wpa_driver_ops {
+ 			      const u8 *match, size_t match_len,
+ 			      bool multicast);
+ #endif /* CONFIG_TESTING_OPTIONS */
++
++#ifdef CONFIG_WIFI_CERTIFICATION
++	/**
++	 * set_unprotected_deauth - Enable/Disable unprotected_deauth if supported.
++	 * @priv: Private driver interface data
++	 * @enable: Flag indicating enable/disable unprotected_deauth
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int (*set_unprotected_deauth)(void *priv, int enable);
++
++	/**
++	 * set_pn_reset - Enable/Disable pn reset if supported
++	 * @priv: Private driver interface data
++	 * @enable: Flag indicating enable/disable pn reset
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int (*set_pn_reset)(void *priv, int enable);
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ };
+ 
+ /**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index f7fecf01f..076ee19b1 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14541,6 +14541,36 @@ int nl80211_set_wds_wpa_sta(void *priv, const u8 *addr, const u8 remove)
+ }
+ #endif /* CONFIG_WDS_WPA */
+ 
++#ifdef CONFIG_WIFI_CERTIFICATION
++int nl80211_set_unprotected_deauth(void *priv, int enable)
++{
++	int ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_UNPROTECTED_DEAUTH,
++				(u8*) &enable, sizeof(enable), NESTED_ATTR_NOT_USED, NULL);
++
++	wpa_printf(MSG_DEBUG, "nl80211: sending LTQ_NL80211_VENDOR_SUBCMD_SET_UNPROTECTED_DEATUH with %d",enable);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_UNPROTECTED_DEAUTH failed: %i (%s)",
++			ret, strerror(-ret));
++
++	return ret;
++}
++
++int nl80211_set_pn_reset(void *priv, int enable)
++{
++	int ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_PN_RESET,
++				(u8*) &enable, sizeof(enable), NESTED_ATTR_NOT_USED, NULL);
++
++	wpa_printf(MSG_DEBUG, "nl80211: sending LTQ_NL80211_VENDOR_SUBCMD_SET_PN_RESET with %d",enable);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_PN_RESET failed: %i (%s)",
++			ret, strerror(-ret));
++
++	return ret;
++}
++#endif /* CONFIG_WIFI_CERTIFICATION */
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -14716,4 +14746,8 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.register_frame = testing_nl80211_register_frame,
+ 	.radio_disable = testing_nl80211_radio_disable,
+ #endif /* CONFIG_TESTING_OPTIONS */
++#ifdef CONFIG_WIFI_CERTIFICATION
++	.set_unprotected_deauth = nl80211_set_unprotected_deauth,
++	.set_pn_reset = nl80211_set_pn_reset,
++#endif /* CONFIG_WIFI_CERTIFICATION */
+ };
+diff --git a/src/utils/common.h b/src/utils/common.h
+index 2cdf3fcf6..be263a500 100644
+--- a/src/utils/common.h
++++ b/src/utils/common.h
+@@ -621,4 +621,12 @@ void * __hide_aliasing_typecast(void *foo);
+    #define MAX(x,y) ((x)>(y)?(x):(y))
+ #endif
+ 
++#define PARSE_TOKEN(p,x,y,z) \
++	do { \
++		if (NULL == (p = str_token(x,y,z))) { \
++			wpa_printf(MSG_ERROR, "parse_token failed"); \
++			return -1; \
++		} \
++	} while (0)
++
+ #endif /* COMMON_H */
+-- 
+2.43.0
+

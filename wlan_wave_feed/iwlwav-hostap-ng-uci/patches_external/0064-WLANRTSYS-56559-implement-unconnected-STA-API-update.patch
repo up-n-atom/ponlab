@@ -1,0 +1,239 @@
+From 3f18b895cc5a1185d79a0a8af123ddefda7a2729 Mon Sep 17 00:00:00 2001
+From: mvulsx <mvuls@maxlinear.com>
+Date: Wed, 28 Jun 2023 14:02:27 +0000
+Subject: [PATCH] WLANRTSYS-56559: implement unconnected STA API updates
+
+Signed-off-by: mvulsx <mvuls@maxlinear.com>
+---
+ hostapd/ctrl_iface.c   | 81 ++++++++++++++++++++++++++++++++++--------
+ src/ap/drv_callbacks.c |  5 +++
+ src/ap/hostapd.c       | 16 +++++++++
+ src/ap/hostapd.h       |  2 ++
+ 4 files changed, 90 insertions(+), 14 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index a90057027..cabe4de54 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -4704,21 +4704,65 @@ static int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const c
+ 	char *pos;
+ 	unsigned int bandwidth;
+ 	struct sta_info *sta;
++	u32 unconnected_sta_timeout = 0, res = 0;
++	struct wpabuf *buf = wpabuf_alloc(sizeof(u32));
++	struct hostapd_data *master = hapd->iface->bss[MASTER_VAP_BSS_IDX];
++
++	if (!buf) {
++		wpa_printf(MSG_ERROR, "unconnected_sta: Unable to allocate wpabuf");
++		goto err;
++	}
+ 
+ 	os_memset(&req, 0, sizeof(req));
+ 
++	/* Block scheduling a new scan if a scan is already running */
++	if (master->iface->in_unconnected_sta_scan) {
++		wpa_printf(MSG_ERROR, "unconnected_sta: Scan is already running, can't schedule new one");
++		goto err;
++	}
++
++	/* When CAC is running there would be no active vaps running.
++	   If an unconnected sta scan is triggered at that time,fw crashes.
++	   Blocking unconnected sta scan if CAC is running to avoid MAC fatals */
++	if (WAVE_FREQ_IS_5G(hapd->iface->freq)) {
++		if (master->iface->cac_started) {
++			wpa_printf(MSG_ERROR, "unconnected_sta: CAC is already running, can't schedule a scan");
++			goto err;
++		}
++	}
++
+ 	/* While fw is working on color change unconnected sta scan shouldn't be triggered.
+-	 * When an unconnected sta scan occurs fw would ideally disable BSS color filter
+-	 * for unconnected_sta_scan_time duration and then would re-enable the filter.
+-	 * Block scheduling an unconnected sta scan at such scenarios.
+-	 */
++	   When an unconnected sta scan occurs fw would ideally disable BSS color filter
++	   for unconnected_sta_scan_time duration and then would re-enable the filter.
++	   Block scheduling an unconnected sta scan at such scenarios. */
+ 	if (hapd->cca_in_progress) {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: BSS Color change in progress, can't schedule scan");
+-		return -1;
++		goto err;
++	}
++
++	/*Get dwell time for unassoc sta scan using master vap.
++	  This time is to schedule a backup timeout callback to revert the scan state */
++
++	if (hostapd_drv_vendor_cmd(master, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_GET_UNCONNECTED_STA_SCAN_TIME,
++				   NULL, sizeof(struct wpabuf), NESTED_ATTR_NOT_USED, buf)) {
++		wpa_printf(MSG_WARNING, "Unable to fetch Unconnected sta scan time");
++		goto err;
++	}
++
++	/*Result is ms. We convert this to secs.
++	  Add 2 seconds more to obtained scan time */
++	res = *(u32 *)(buf->buf);
++	if (!res) {
++		wpa_printf(MSG_WARNING, "Fetched invalid Unconnected sta scan time");
++		goto err;
+ 	}
+ 
++	unconnected_sta_timeout = (res/1000) + 2;
++	wpa_printf(MSG_DEBUG, "unconnected_sta: Unconnected scan duration is %d secs", unconnected_sta_timeout);
++
++
+ 	if (hwaddr_aton(cmd, req.addr))
+-		return -1;
++		goto err;
+ 
+ 	pos = os_strstr(cmd, " ");
+ 	if (pos) {
+@@ -4726,11 +4770,11 @@ static int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const c
+ 		req.freq = atoi(pos);
+ 		if (!hostapd_is_chandef_valid(hapd->iface, req.freq, 20)) {
+ 			wpa_printf(MSG_ERROR, "unconnected_sta: invalid freq provided");
+-			return -1;
++			goto err;
+ 		}
+ 	} else {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: freq not specified");
+-		return -1;
++		goto err;
+ 	}
+ 
+ 	pos = os_strstr(cmd, "center_freq1=");
+@@ -4739,7 +4783,7 @@ static int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const c
+ 		req.center_freq1 = atoi(pos);
+ 	} else {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: center_freq1 not specified");
+-		return -1;
++		goto err;
+ 	}
+ 
+ 	pos = os_strstr(cmd, "center_freq2=");
+@@ -4754,7 +4798,7 @@ static int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const c
+ 		bandwidth = atoi(pos);
+ 	} else {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: bandwidth not specified");
+-		return -1;
++		goto err;
+ 	}
+ 
+ 	switch (bandwidth) {
+@@ -4775,28 +4819,37 @@ static int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const c
+ 			break;
+ 		default:
+ 			wpa_printf(MSG_ERROR, "unconnected_sta: invalid bandwidth provided");
+-			return -1;
++			goto err;
+ 	}
+ 
+ 	if (!hostapd_is_chandef_valid(hapd->iface, req.center_freq1, bandwidth)) {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: invalid center_freq1 provided");
+-		return -1;
++		goto err;
+ 	}
+ 
+ 	if (req.center_freq2 &&
+ 		!hostapd_is_chandef_valid(hapd->iface, req.center_freq2, bandwidth)) {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: invalid center_freq2 provided");
+-		return -1;
++		goto err;
+ 	}
+ 
+ 	sta = ap_get_sta(hapd, req.addr);
+ 	if (sta) {
+ 		wpa_printf(MSG_ERROR, "unconnected_sta: disconnect STA "MACSTR" first",
+ 		MAC2STR(req.addr));
+-		return -1;
++		goto err;
+ 	}
+ 
++	master->iface->in_unconnected_sta_scan = 1;
++	eloop_register_timeout(unconnected_sta_timeout, 0, hostapd_unconnected_sta_scan_fail_handle_cb,
++			       master, NULL);
++	wpabuf_free(buf);
++
+ 	return hostapd_drv_unconnected_sta(hapd, &req);
++
++err:
++	wpabuf_free(buf);
++	return -1;
+ }
+ 
+ /* checks weather channel exists */
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 9b040b695..dc91adca2 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2236,6 +2236,11 @@ static void hostapd_event_ltq_unconnected_sta_rx(struct hostapd_data *hapd,
+ 		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 		return;
+ 	}
++
++	hapd->iface->in_unconnected_sta_scan = 0;
++	if (!eloop_cancel_timeout(hostapd_unconnected_sta_scan_fail_handle_cb, hapd, NULL))
++		wpa_printf(MSG_DEBUG, "Unconnected Sta: No fail handlers were cancelled");
++
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO,
+ 		UNCONNECTED_STA_RSSI "%s rx_bytes=%llu rx_packets=%u "
+ 		"rssi=%d %d %d %d SNR=%d %d %d %d rate=%d",
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 5f067ee65..25c01ce40 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -5423,6 +5423,7 @@ hostapd_color_switch_trigger(struct hostapd_data *hapd, u8 new_color)
+ {
+ 	int ret, switch_time, b;
+ 	struct cca_settings settings;
++	struct hostapd_data *master = hapd->iface->bss[MASTER_VAP_BSS_IDX];
+ 
+ 	if (hapd->cca_in_progress || hapd->csa_in_progress)
+ 		return;
+@@ -5432,6 +5433,11 @@ hostapd_color_switch_trigger(struct hostapd_data *hapd, u8 new_color)
+ 		return;
+ 	}
+ 
++	if (master->iface->in_unconnected_sta_scan) {
++		wpa_printf(MSG_ERROR, "unconnected_sta: Scan is already running, can't switch color");
++		return;
++	}
++
+ 	switch_time = hapd->switch_time ? hapd->switch_time :
+ 				hostapd_cca_calc_switch_time(hapd->iface);
+ 
+@@ -5723,3 +5729,13 @@ bool hostapd_is_unii4_freq (int freq)
+ {
+ 	return (freq == 5845) || (freq == 5865) || (freq == 5885);
+ }
++
++/* API to revert unconnected sta scan state when there
++   is no response from driver within timeout */
++void hostapd_unconnected_sta_scan_fail_handle_cb (void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++
++	wpa_printf(MSG_ERROR,"Unconnected sta: Failed to get response, reverting scan state");
++	hapd->iface->in_unconnected_sta_scan = 0;
++}
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 3e70198da..79ebb8be7 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -685,6 +685,7 @@ struct hostapd_iface {
+ 	 * used while juggling between HT20 and HT40 modes. */
+ 	int secondary_ch;
+ 
++	int in_unconnected_sta_scan;
+ #ifdef CONFIG_ACS
+ 	unsigned int acs_num_completed_scans;
+ #endif /* CONFIG_ACS */
+@@ -870,5 +871,6 @@ int hostapd_link_remove(struct hostapd_data *hapd, u32 count);
+ void hostapd_tx_queue_params(struct hostapd_data *hapd);
+ void hostapd_handle_acs_whm_warning (struct hostapd_iface *iface);
+ bool hostapd_is_unii4_freq (int freq);
++void hostapd_unconnected_sta_scan_fail_handle_cb (void *eloop_ctx, void *timeout_ctx);
+ 
+ #endif /* HOSTAPD_H */
+-- 
+2.43.0
+

@@ -1,0 +1,1192 @@
+From 535532e1ccca4616a1add2851fbfe7a13411fc43 Mon Sep 17 00:00:00 2001
+From: sjegadeesan <sjegadeesan@maxlinear.com>
+Date: Thu, 28 Mar 2024 14:00:46 +0530
+Subject: [PATCH] WLANRTSYS-64810 ZWDFS changes for wave700 in
+ iwlwav-hostap-ng.
+
+---
+ hostapd/ctrl_iface.c     |  20 +-
+ hostapd/mxl_config.c     |  11 +
+ hostapd/mxl_ctrl_iface.c |   5 +
+ src/ap/dfs.c             |  54 ++++-
+ src/ap/drv_callbacks.c   |   7 +
+ src/ap/mxl_config.h      |   1 +
+ src/ap/mxl_dfs_common.c  | 184 ++++++++++++++-
+ src/ap/mxl_dfs_common.h  |  23 +-
+ src/ap/mxl_hostapd.c     |  47 ++++
+ src/ap/mxl_hostapd.h     |   5 +
+ src/ap/mxl_zwdfs.c       | 480 ++++++++++++++++++++++++++++++++-------
+ src/ap/mxl_zwdfs.h       |   6 +-
+ 12 files changed, 752 insertions(+), 91 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 6e4e97e12..ddf696f2c 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3053,6 +3053,16 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ #ifdef CONFIG_VENDOR_MXL
+ 	if (iface->cac_started)
+ 		dfs_range++;
++
++	bool switch_type_zwdfs = false;
++
++	if ((str) && (!strncmp(str, "zwdfs", sizeof("zwdfs") - 1)))
++		switch_type_zwdfs = true;
++
++	if ((!dfs_range) && (switch_type_zwdfs)) {
++		wpa_printf(MSG_ERROR, "ZWDFS: DFS CAC is not required");
++		return -1;
++	}
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ 	iface->block_tx = false;
+@@ -3069,7 +3079,15 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ 
+ 		settings.freq_params.channel = chan;
+ #ifdef CONFIG_VENDOR_MXL
+-		if (mxl_hostapd_background_cac_possible(iface))
++		int bgcac_possible;
++
++		bgcac_possible = mxl_hostapd_background_cac_possible(iface, &settings, switch_type_zwdfs);
++
++		if (bgcac_possible < 0) {
++			return bgcac_possible;
++		}
++
++		if (bgcac_possible)
+ 			return mxl_hostapd_start_background_cac(iface, &settings);
+ #endif /* CONFIG_VENDOR_MXL */
+ 		wpa_printf(MSG_DEBUG,
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 3d58540c7..1d6510edb 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -1890,6 +1890,17 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 		size_t val = (size_t)atoi(pos);
+ 		if (val > mxl_conf->nlmsg_default_size)
+ 			mxl_conf->nlmsg_default_size = val;
++	} else if (os_strcmp(buf, "zwdfs_debug_chan") == 0) {
++		/* When radar detected on ZWDFS antenna, then "zwdfs_debug_chan" channel
++		 * will be set to zwdfs antenna. Applicable only for WAV700.
++		 */
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, DFS_DEBUG_CHAN_MIN, DFS_DEBUG_CHAN_MAX)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid zwdfs debug channel %d",
++				   line, val);
++			return 0;
++		}
++		mxl_conf->zwdfs_debug_chan = val;
+ 	} else
+ 		return 0;
+ 
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 92306ec77..683392021 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -468,6 +468,11 @@ static int mxl_hostapd_ctrl_iface_get_dfs_stats(struct hostapd_iface *iface, con
+ 		len += ret;
+ 	}
+ 
++	ret = sprintf_s(buf + len, buflen - len, "ZWDFS CAC retriggered count %d\n", iface->mxl_iface.zwdfs_cac_retriggered_count);
++	if (ret <= 0)
++		return len;
++	len += ret;
++
+ 	return len;
+ }
+ 
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index cb33c76a9..4d67b9986 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -1070,8 +1070,12 @@ static int hostapd_dfs_request_channel_switch(struct hostapd_iface *iface,
+ 		hostapd_disable_iface(iface);
+ 		return err;
+ 	}
++
+ #ifdef CONFIG_VENDOR_MXL
+ 	(void)mxl_hostapd_drv_set_antenna(iface, 0, 0);
++	if (iface->mxl_iface.cw_reduced) {
++		mxl_dfs_restore_original_cw(iface);
++	}
+ #endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_prepare_and_send_csa_deauth_cfg_to_driver(iface->bss[0]);
+ 
+@@ -1263,7 +1267,8 @@ int hostapd_dfs_complete_cac(struct hostapd_iface *iface, int success, int freq,
+ 	}
+ 
+ #ifdef CONFIG_VENDOR_MXL
+-	return mxl_hostapd_zwdfs_switch(iface, success, freq, chan_width, cf1, cf2);
++	/* In case of CAC completion in ZWDFS antenna/interface, set CAC cleared channel to operational 5G vaps.*/
++	return mxl_hostapd_handle_zwdfs_switch(iface, success, freq, chan_width, cf1, cf2);
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ 	return 0;
+@@ -1342,7 +1347,8 @@ static int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ #ifdef CONFIG_VENDOR_MXL
+ 	channel = mxl_dfs_get_valid_channel(iface, &secondary_channel,
+ 					   &oper_centr_freq_seg0_idx,
+-					   &oper_centr_freq_seg1_idx);
++					   &oper_centr_freq_seg1_idx,
++					   true);
+ 	if (!channel)
+ #endif /* CONFIG_VENDOR_MXL */
+ 	channel = dfs_get_valid_channel(iface, &secondary_channel,
+@@ -1464,9 +1470,15 @@ int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ 		channel_type = DFS_ANY_CHANNEL;
+ 
+ #ifdef CONFIG_VENDOR_MXL
++	bool skip_usable = true;
++
++	if ((mxl_dfs_use_radar_background(iface)) && (!iface->radar_background.cac_started)) {
++		skip_usable = false;
++	}
+ 	channel = mxl_dfs_get_valid_channel(iface, &secondary_channel,
+-					   &oper_centr_freq_seg0_idx,
+-					   &oper_centr_freq_seg1_idx);
++					    &oper_centr_freq_seg0_idx,
++					    &oper_centr_freq_seg1_idx,
++					    skip_usable);
+ 	if (!channel)
+ #endif /* CONFIG_VENDOR_MXL */
+ 	/* Perform channel switch/CSA */
+@@ -1476,6 +1488,18 @@ int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ 					channel_type);
+ 
+ 	if (!channel) {
++#ifdef CONFIG_VENDOR_MXL
++		int n_chans;
++
++		/* if channel width is more than 20 MHz, cut it by half and try
++		 * to find a channel.
++		 */
++		if (dfs_get_used_n_chans(iface, &n_chans) > 1) {
++			mxl_dfs_cut_cw_by_half(iface, true);
++			return hostapd_dfs_start_channel_switch(iface);
++		}
++		mxl_dfs_restore_original_cw(iface);
++#endif
+ 		/*
+ 		 * If there is no channel to switch immediately to, check if
+ 		 * there is another channel where we can switch even if it
+@@ -1496,6 +1520,9 @@ int hostapd_dfs_start_channel_switch(struct hostapd_iface *iface)
+ 			return 0;
+ 		}
+ 
++#ifdef CONFIG_VENDOR_MXL
++		if (!mxl_dfs_use_radar_background(iface))
++#endif
+ 		if (channel_type == DFS_ANY_CHANNEL) {
+ 			iface->freq = channel->freq;
+ 			iface->conf->channel = channel->chan;
+@@ -1535,6 +1562,10 @@ int mxl_set_dfs_state(struct hostapd_iface *iface, int freq, int ht_enabled, int
+ 	{ return set_dfs_state(iface, freq, ht_enabled, chan_offset, chan_width, cf1, cf2, state); }
+ int mxl_dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq, int chan_width, int cf1, int cf2)
+ 	{ return dfs_are_channels_overlapped(iface, freq, chan_width, cf1, cf2); }
++int mxl_dfs_check_chans_radar(struct hostapd_iface *iface, int start_chan_idx, int n_chans)
++	{ return dfs_check_chans_radar(iface, start_chan_idx, n_chans); }
++int mxl_dfs_check_chans_available(struct hostapd_iface *iface, int start_chan_idx, int n_chans)
++	{ return dfs_check_chans_available(iface, start_chan_idx, n_chans); }
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+@@ -1562,6 +1593,14 @@ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+ 	if (!iface->conf->ieee80211h)
+ 		return 0;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	/* Ignore radar event for background zwdfs antenna if zwdfs debug chan is enabled */
++	if ((mxl_hostapd_dfs_is_background_event(iface, freq, cf1)) &&
++	    (iface->conf->mxl_conf.zwdfs_debug_chan))
++		return 0;
++
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	/* mark radar frequency as invalid */
+ 	if (!set_dfs_state(iface, freq, ht_enabled, chan_offset, chan_width,
+ 			   cf1, cf2, HOSTAPD_CHAN_DFS_UNAVAILABLE))
+@@ -1569,9 +1608,14 @@ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+ 
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_dfs_file_radar(iface);
+-#endif /* CONFIG_VENDOR_MXL */
+ 
++	if (mxl_hostapd_handle_background_radar(iface, freq, cf1, chan_width))
++		return 0;
++
++	if (!mxl_hostapd_dfs_is_background_event(iface, freq, cf1)) {
++#else
+ 	if (!hostapd_dfs_is_background_event(iface, freq)) {
++#endif /* CONFIG_VENDOR_MXL */
+ 		/* Skip if reported radar event not overlapped our channels */
+ 		if (!dfs_are_channels_overlapped(iface, freq, chan_width,
+ 						 cf1, cf2))
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index c97e628fe..7996ba73e 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -44,6 +44,7 @@
+ #include "neighbor_db.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "wpa_auth_i.h"
++#include "mxl_dfs_common.h"
+ #include "../hostapd/mxl_ctrl_iface.h"
+ #include "mxl_beacon.h"
+ #include "ap/mxl_config.h"
+@@ -2187,6 +2188,12 @@ static void hostapd_event_dfs_cac_started(struct hostapd_data *hapd,
+ 					  struct dfs_event *radar)
+ {
+ 	wpa_printf(MSG_DEBUG, "DFS offload CAC started on %d MHz", radar->freq);
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_dfs_start_cac(hapd->iface, radar->freq, radar->ht_enabled,
++				  radar->chan_offset, radar->chan_width,
++				  radar->cf1, radar->cf2);
++	return;
++#endif
+ 	hostapd_dfs_start_cac(hapd->iface, radar->freq, radar->ht_enabled,
+ 			      radar->chan_offset, radar->chan_width,
+ 			      radar->cf1, radar->cf2);
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 0f5e2109d..016cc4306 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -349,6 +349,7 @@ struct mxl_hostapd_config {
+ 	int sProbeReqCltMode;
+ 	int ProbeReqListTimer;
+ 	size_t nlmsg_default_size;
++	int zwdfs_debug_chan;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_dfs_common.c b/src/ap/mxl_dfs_common.c
+index 9efee7227..99d030c96 100644
+--- a/src/ap/mxl_dfs_common.c
++++ b/src/ap/mxl_dfs_common.c
+@@ -24,7 +24,7 @@
+ #include "mxl_sub_band_dfs.h"
+ #include "common/vendor_cmds_copy.h"
+ #include "common/mxl_wpa_ctrl.h"
+-
++#include "ap/mxl_hostapd.h"
+ 
+ int mxl_hostapd_set_chan_dfs_state(struct hostapd_iface *iface, enum nl80211_dfs_state dfs_state,
+ 				   int freq, int dfs_time, int dfs_debug)
+@@ -105,7 +105,8 @@ struct hostapd_channel_data *
+ mxl_dfs_get_valid_channel_failsafe(struct hostapd_iface *iface,
+ 				   int *secondary_channel,
+ 				   u8 *vht_oper_centr_freq_seg0_idx,
+-				   u8 *vht_oper_centr_freq_seg1_idx)
++				   u8 *vht_oper_centr_freq_seg1_idx,
++				   bool skip_usable)
+ {
+ 	struct hostapd_channel_data *channel = NULL;
+ 
+@@ -200,7 +201,8 @@ void mxl_hostapd_update_cac_left_time(struct hostapd_iface *iface, os_time_t now
+ struct hostapd_channel_data * mxl_dfs_get_valid_channel(struct hostapd_iface *iface,
+ 							int *secondary_channel,
+ 							u8 *oper_centr_freq_seg0_idx,
+-							u8 *oper_centr_freq_seg1_idx)
++							u8 *oper_centr_freq_seg1_idx,
++							bool skip_usable)
+ {
+ 	struct hostapd_channel_data *channel = NULL;
+ 	*secondary_channel = *oper_centr_freq_seg0_idx = *oper_centr_freq_seg1_idx = 0;
+@@ -209,7 +211,8 @@ struct hostapd_channel_data * mxl_dfs_get_valid_channel(struct hostapd_iface *if
+ 		/* switch to failsafe channel */
+ 		channel = mxl_dfs_get_valid_channel_failsafe(iface, secondary_channel,
+ 							     oper_centr_freq_seg0_idx,
+-							     oper_centr_freq_seg1_idx);
++							     oper_centr_freq_seg1_idx,
++							     skip_usable);
+ 		if (!channel) {
+ 			wpa_printf(MSG_ERROR, "Failed to select failsafe channel");
+ 		}
+@@ -332,3 +335,176 @@ void mxl_hostapd_vendor_radar_detected(struct hostapd_data *hapd, const u8 *data
+ 	if (hapd->iconf->mxl_conf.process_radar_slave_events)
+ 		mxl_hostapd_process_slave_event(hapd->iface, radar);
+ }
++
++bool mxl_dfs_use_radar_background(struct hostapd_iface *iface)
++{
++	return ((iface->drv_flags2 & WPA_DRIVER_FLAGS2_RADAR_BACKGROUND) &&
++		(iface->conf->mxl_conf.background_cac));
++}
++
++bool mxl_hostapd_dfs_is_background_event(struct hostapd_iface *iface, int freq, int cf1)
++{
++	if (mxl_dfs_use_radar_background(iface)) {
++		u8 cf1_chan;
++
++		ieee80211_freq_to_chan(cf1, &cf1_chan);
++		return ((iface->radar_background.channel != -1) &&
++			(iface->radar_background.freq == freq) &&
++			(iface->radar_background.centr_freq_seg0_idx == cf1_chan));
++	}
++	return false;
++}
++
++int mxl_hapd_get_chan_idx(struct hostapd_hw_modes *mode, int freq)
++{
++	struct hostapd_channel_data *channel;
++	int res = 0;
++
++	for (int i = 0; i < mode->num_channels; i++) {
++		channel = &mode->channels[i];
++		if (channel->freq == freq) {
++			res = i;
++			break;
++		}
++	}
++	return res;
++}
++
++bool mxl_hostapd_handle_background_radar(struct hostapd_iface *iface, int freq, int cf1, int chan_width) {
++
++	if (mxl_hostapd_dfs_is_background_event(iface, freq, cf1)) {
++		/* Disable background ZWDFS antenna once radar detected in that chain.*/
++		wpa_printf(MSG_INFO, "Radar detected on background ZWDFS antenna. Disable ZWDFS\n");
++		if (mxl_hostapd_set_zwdfs_antenna(iface->bss[0], 0) < 0) {
++			wpa_printf(MSG_ERROR, "ZWDFS: Failed to disable antenna");
++		}	
++		return true;
++	}
++
++	/* Handle a case where background cac is triggred directly to the driver bypassing hostapd
++	 * and radar is reported on operating channel + (reported BW > operating channel BW) +
++	 * radar detected on non-overlapping channels.
++	 */
++	if (mxl_hostapd_handle_radar_non_match_freq(iface, cf1, chan_width))
++		return true;
++
++	return false;
++}
++
++
++bool mxl_hostapd_radar_chandef_matches_operational(struct hostapd_iface *iface, int cf1, int chan_width) {
++	u8 cf1_chan, seg0_idx;
++	enum oper_chan_width radar_oper_width;
++
++	ieee80211_freq_to_chan(cf1, &cf1_chan);
++	radar_oper_width = mxl_get_oper_width(channel_width_to_int(chan_width));
++
++	/* If channel is static, for "CHANWIDTH_USE_HT" seg0 index in conf is invalid. */
++	if (hostapd_get_oper_chwidth(iface->conf) == CHANWIDTH_USE_HT) {
++		seg0_idx = (iface->conf->channel) + (2 * (iface->conf->secondary_channel));
++	} else {
++		seg0_idx = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
++	}
++
++	if ((cf1_chan == seg0_idx) &&
++	    (radar_oper_width == hostapd_get_oper_chwidth(iface->conf))) {
++		return true;
++	}
++	return false;
++}
++
++bool mxl_hostapd_radar_chandef_matches_subband(struct hostapd_iface *iface, int cf1, int chan_width)
++{
++	u8 cf1_chan;
++	enum oper_chan_width radar_oper_width;
++
++	ieee80211_freq_to_chan(cf1, &cf1_chan);
++	radar_oper_width = mxl_get_oper_width(channel_width_to_int(chan_width));
++
++	if ((cf1_chan == iface->mxl_iface.sb_orig_chandef.vht_oper_centr_freq_seg0_idx) &&
++	    (radar_oper_width == iface->mxl_iface.sb_orig_chandef.vht_oper_chwidth)) {
++		return true;
++	}
++	return false;
++}
++
++bool mxl_hostapd_handle_radar_non_match_freq(struct hostapd_iface *iface, int cf1, int chan_width)
++{
++
++	if (!(mxl_hostapd_radar_chandef_matches_operational(iface, cf1, chan_width))) {
++		if (!(mxl_hostapd_radar_chandef_matches_subband(iface, cf1, chan_width))) {
++			wpa_printf(MSG_DEBUG, "Radar detected on non matching freq and BW, ignoring");
++			return true;
++		}
++	}
++	return false;
++}
++
++int mxl_hostapd_dfs_start_cac(struct hostapd_iface *iface, int freq,
++			      int ht_enabled, int chan_offset, int chan_width,
++			      int cf1, int cf2)
++{
++	if (mxl_hostapd_dfs_is_background_event(iface, freq, cf1)) {
++		iface->radar_background.cac_started = 1;
++	} else if (mxl_hostapd_radar_chandef_matches_operational(iface, cf1, chan_width)) {
++		/* This is called when the driver indicates that an offloaded
++		 * DFS has started CAC. */
++		hostapd_set_state(iface, HAPD_IFACE_DFS);
++		iface->cac_started = 1;
++	}
++
++	/* TODO: How to check CAC time for ETSI weather channels? */
++	iface->dfs_cac_ms = 60000;
++
++	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, DFS_EVENT_CAC_START
++		"freq=%d chan=%d chan_offset=%d width=%d seg0=%d "
++		"seg1=%d cac_time=%ds%s",
++		freq, (freq - 5000) / 5, chan_offset, chan_width, cf1, cf2,
++		iface->dfs_cac_ms / 1000,
++		mxl_hostapd_dfs_is_background_event(iface, freq, cf1) ?
++		" (background)" : "");
++
++	os_get_reltime(&iface->dfs_cac_start);
++	return 0;
++}
++
++void mxl_dfs_cut_cw_by_half(struct hostapd_iface *iface, bool backup)
++{
++	/* If this is the first cut, save original channel settings.
++	 * Function hostapd_set_freq_params checks if current channel settings are
++	 * valid and will refuse to switch if not. */
++	if (!(iface->mxl_iface.cw_reduced) && (backup)) {
++		iface->mxl_iface.cw_reduced = true;
++		iface->mxl_iface.current_secondary_channel = iface->conf->secondary_channel;
++		iface->mxl_iface.current_oper_chwidth = hostapd_get_oper_chwidth(iface->conf);
++	}
++
++	if (iface->conf->ieee80211ac || iface->conf->ieee80211ax) {
++		switch (hostapd_get_oper_chwidth(iface->conf)) {
++		case CHANWIDTH_USE_HT:
++			if (iface->conf->ieee80211n)
++				iface->conf->secondary_channel = 0;
++			break;
++		case CHANWIDTH_80MHZ:
++			hostapd_set_oper_chwidth(iface->conf,CHANWIDTH_USE_HT);
++			break;
++		case CHANWIDTH_160MHZ:
++		case CHANWIDTH_80P80MHZ:
++			hostapd_set_oper_chwidth(iface->conf,CHANWIDTH_80MHZ);
++			break;
++		default:
++			break;
++		}
++	} else if (iface->conf->ieee80211n) {
++		iface->conf->secondary_channel = 0;
++	}
++}
++
++void mxl_dfs_restore_original_cw(struct hostapd_iface *iface)
++{
++	if (!iface->mxl_iface.cw_reduced)
++		return;
++	iface->mxl_iface.cw_reduced = false;
++	iface->conf->secondary_channel = iface->mxl_iface.current_secondary_channel;
++	hostapd_set_oper_chwidth(iface->conf, iface->mxl_iface.current_oper_chwidth);
++}
+diff --git a/src/ap/mxl_dfs_common.h b/src/ap/mxl_dfs_common.h
+index 25bc2bb20..3789c9086 100644
+--- a/src/ap/mxl_dfs_common.h
++++ b/src/ap/mxl_dfs_common.h
+@@ -29,7 +29,8 @@ struct hostapd_channel_data *
+ mxl_dfs_get_valid_channel_failsafe(struct hostapd_iface *iface,
+ 				   int *secondary_channel,
+ 				   u8 *vht_oper_centr_freq_seg0_idx,
+-				   u8 *vht_oper_centr_freq_seg1_idx);
++				   u8 *vht_oper_centr_freq_seg1_idx,
++				   bool skip_usable);
+ int mxl_hostapd_set_chan_dfs_state(struct hostapd_iface *iface, enum nl80211_dfs_state dfs_state,
+ 				   int freq, int dfs_time, int dfs_debug);
+ void mxl_hostapd_cac_wpa_msg(struct hostapd_iface *iface, int status, int freq, int ht_enabled,
+@@ -44,7 +45,8 @@ void mxl_hostapd_update_cac_left_time(struct hostapd_iface *iface, os_time_t now
+ struct hostapd_channel_data * mxl_dfs_get_valid_channel(struct hostapd_iface *iface,
+ 							int *secondary_channel,
+ 							u8 *oper_centr_freq_seg0_idx,
+-							u8 *oper_centr_freq_seg1_idx);
++							u8 *oper_centr_freq_seg1_idx,
++							bool skip_usable);
+ bool mxl_hostapd_handle_radar(struct hostapd_iface *iface, int cf1, int bw);
+ int mxl_set_dfs_state_freq(struct hostapd_iface *iface, int freq, u32 state);
+ bool mxl_hostapd_check_rbm(struct hostapd_iface *iface, int ch_pos);
+@@ -57,6 +59,21 @@ int mxl_set_dfs_state(struct hostapd_iface *iface, int freq, int ht_enabled, int
+ int mxl_dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq, int chan_width, int cf1, int cf2);
+ void mxl_hostapd_vendor_radar_detected(struct hostapd_data *hapd, const u8 *data, size_t data_len);
+ int mxl_set_first_non_dfs_channel(struct hostapd_iface *iface);
+-
++int mxl_dfs_check_chans_radar(struct hostapd_iface *iface, int start_chan_idx, int n_chans);
++int mxl_hapd_get_chan_idx(struct hostapd_hw_modes *mode, int freq);
++bool mxl_dfs_use_radar_background(struct hostapd_iface *iface);
++bool mxl_hostapd_handle_background_radar(struct hostapd_iface *iface, int freq, int cf1, int chan_width);
++bool mxl_hostapd_radar_chandef_matches_operational(struct hostapd_iface *iface, int cf1, int chan_width);
++bool mxl_dfs_use_radar_background(struct hostapd_iface *iface);
++bool mxl_hostapd_dfs_is_background_event(struct hostapd_iface *iface, int freq, int cf1);
++bool mxl_hostapd_radar_chandef_matches_operational(struct hostapd_iface *iface, int cf1, int chan_width);
++bool mxl_hostapd_radar_chandef_matches_subband(struct hostapd_iface *iface, int cf1, int chan_width);
++bool mxl_hostapd_handle_radar_non_match_freq(struct hostapd_iface *iface, int cf1, int chan_width);
++int mxl_hostapd_dfs_start_cac(struct hostapd_iface *iface, int freq,
++			      int ht_enabled, int chan_offset, int chan_width,
++			      int cf1, int cf2);
++int mxl_dfs_check_chans_available(struct hostapd_iface *iface, int start_chan_idx, int n_chans);
++void mxl_dfs_cut_cw_by_half(struct hostapd_iface *iface, bool backup);
++void mxl_dfs_restore_original_cw(struct hostapd_iface *iface);
+ 
+ #endif /* MXL_DFS_COMMON_H */
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 6923b544b..850c790d1 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -30,6 +30,7 @@
+ #include "mxl_beacon.h"
+ #include "mxl_wpa_auth.h"
+ #include "mxl_sta_info.h"
++#include "common/mxl_ieee802_11_common.h"
+ 
+ #define COC_POWER_1x1_STATE 1
+ #define COC_POWER_2x2_STATE 2
+@@ -2897,3 +2898,49 @@ void mxl_hostapd_sta_ext_capab_set(struct hostapd_data *hapd, struct sta_info *s
+ 		hapd->mxl_data.ext_capab_len = (size_t)sta->ext_capability[0];
+ 	}
+ }
++
++void mxl_hostapd_set_conf_from_freq_params(struct hostapd_iface *iface, const struct hostapd_freq_params *freq_params)
++{
++	u8 seg0_idx = 0, seg1_idx = 0;
++	enum oper_chan_width bw = CONF_OPER_CHWIDTH_USE_HT;
++
++	if (freq_params->center_freq1)
++		ieee80211_freq_to_chan(freq_params->center_freq1, &seg0_idx);
++
++	if (freq_params->center_freq2)
++		ieee80211_freq_to_chan(freq_params->center_freq2, &seg1_idx);
++
++	switch (freq_params->bandwidth) {
++	case 0:
++	case 20:
++	case 40:
++		bw = CONF_OPER_CHWIDTH_USE_HT;
++		break;
++	case 80:
++		if (freq_params->center_freq2)
++			bw = CONF_OPER_CHWIDTH_80P80MHZ;
++		else
++			bw = CONF_OPER_CHWIDTH_80MHZ;
++		break;
++	case 160:
++		bw = CONF_OPER_CHWIDTH_160MHZ;
++		break;
++	case 320:
++		bw = CONF_OPER_CHWIDTH_320MHZ;
++		break;
++	default:
++		wpa_printf(MSG_WARNING, "Unknown CSA bandwidth: %d", freq_params->bandwidth);
++		break;
++	}
++
++	iface->freq = freq_params->freq;
++	iface->conf->channel = freq_params->channel;
++	iface->conf->secondary_channel = freq_params->sec_channel_offset;
++
++	if (freq_params->bandwidth > 20 && iface->conf->secondary_channel == 0)
++		iface->conf->secondary_channel = mxl_hostapd_get_secondary_offset(iface->conf->channel, freq_params->bandwidth, seg0_idx);
++
++	hostapd_set_oper_centr_freq_seg0_idx(iface->conf, seg0_idx);
++	hostapd_set_oper_centr_freq_seg1_idx(iface->conf, seg1_idx);
++	hostapd_set_oper_chwidth(iface->conf, bw);
++}
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 631d3ce11..094fce725 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -80,12 +80,16 @@ struct mxl_hostapd_iface {
+ 	bool boot;
+ 	bool check_only_dfs;
+ 	struct mxl_zwdfs_settings zwdfs_info;
++	uint32_t zwdfs_cac_retriggered_count;
+ 	u64 drv_flags;
+ 	u8 require_omn; /* Variable to keep track whether OMN IE should be added or not */
+ 	int snr_db_current_frame; /* SNR value for the currently processed frame */
+ 	unsigned int self_beacon_req:1;
+ 	struct beacon_request last_beacon_req;
+ 	int he_6ghz_reg_pwr_mode;
++	bool cw_reduced;
++	int current_secondary_channel;
++	u8 current_oper_chwidth;
+ };
+ 
+ #define MAX_EVENT_MSG_LEN			512
+@@ -231,6 +235,7 @@ void mxl_hostapd_set_wds_encryption(struct hostapd_data *hapd,
+ void mxl_hostapd_sta_ext_capab_reset(struct hostapd_data *hapd);
+ void mxl_hostapd_sta_ext_capab_set(struct hostapd_data *hapd, struct sta_info *sta);
+ int mxl_switch_channel(struct hostapd_data *hapd, struct csa_settings *settings);
++void mxl_hostapd_set_conf_from_freq_params(struct hostapd_iface *iface, const struct hostapd_freq_params *freq_params);
+ int mxl_check_linked_sta_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 				struct ieee802_11_elems *elems, int reassoc);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+diff --git a/src/ap/mxl_zwdfs.c b/src/ap/mxl_zwdfs.c
+index 3ba0d206d..069aee8ea 100644
+--- a/src/ap/mxl_zwdfs.c
++++ b/src/ap/mxl_zwdfs.c
+@@ -20,91 +20,54 @@
+ #include "mxl_dfs_common.h"
+ #include "common/mxl_ieee802_11_common.h"
+ #include "common/mxl_wpa_ctrl.h"
++#include "common/hw_features_common.h"
++#include "ap/mxl_hostapd.h"
++int  mxl_is_in_chanlist(struct hostapd_iface *iface, struct hostapd_channel_data *chan);
+ 
+ static bool mxl_hostapd_is_zwdfs_iface(struct hostapd_iface *iface)
+ {
+-	return !!(iface->mxl_iface.drv_flags & MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC);
++	return !!(iface->mxl_iface.drv_flags & MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC) || mxl_dfs_use_radar_background(iface);
+ }
+ 
+-bool mxl_hostapd_background_cac_possible(struct hostapd_iface *iface)
++int mxl_hostapd_background_cac_possible(struct hostapd_iface *iface, struct csa_settings *settings,
++					bool switch_type_zwdfs)
+ {
+ 	size_t i;
+ 	struct hapd_interfaces *ifaces = iface->interfaces;
+ 
+-	if (!iface->conf->mxl_conf.background_cac)
+-		return false;
++	if (!(mxl_dfs_use_radar_background(iface))) {
++		if (!iface->conf->mxl_conf.background_cac)
++			return 0;
+ 
+-	if (iface->state != HAPD_IFACE_ENABLED)
+-		return false;
++		if (iface->state != HAPD_IFACE_ENABLED)
++			return 0;
+ 
+-	if (iface->cac_started)
+-		return false;
++		if (iface->cac_started)
++			return 0;
+ 
+-	for (i = 0; i < ifaces->count; i++)
+-		if (mxl_hostapd_is_zwdfs_iface(ifaces->iface[i]))
+-			return true;
+-
+-	return false;
+-}
+-
+-static void
+-hostapd_set_conf_from_freq_params(struct hostapd_iface *iface, const struct hostapd_freq_params *freq_params)
+-{
+-	int seg0_idx = 0, seg1_idx = 0;
+-	int bw_center_idx = 0;
+-	enum oper_chan_width bw = CONF_OPER_CHWIDTH_USE_HT;
+-
+-	if (freq_params->center_freq1) {
+-		if (is_6ghz_freq(freq_params->center_freq1))
+-			seg0_idx = (freq_params->center_freq1 - STARTING_6G_FREQ_IN_MHZ) / 5;
+-		else {
+-			seg0_idx = 36 + (freq_params->center_freq1 - 5180) / 5;
+-			bw_center_idx = seg0_idx;
+-		}
++		for (i = 0; i < ifaces->count; i++)
++			if (mxl_hostapd_is_zwdfs_iface(ifaces->iface[i]))
++				return 1;
+ 	}
+ 
+-	if (freq_params->center_freq2) {
+-		if (is_6ghz_freq(freq_params->center_freq2)) {
+-			seg1_idx = (freq_params->center_freq2 - STARTING_6G_FREQ_IN_MHZ) / 5;
+-			bw_center_idx = seg1_idx;
++	/* ZWDFS on the same radio */
++	if (switch_type_zwdfs) {
++		int res;
++		if (!mxl_dfs_use_radar_background(iface)) {
++			return -1;
+ 		}
+-		else
+-			seg1_idx = 36 + (freq_params->center_freq2 - 5180) / 5;
+-	}
+-
+-	switch (freq_params->bandwidth) {
+-	case 0:
+-	case 20:
+-	case 40:
+-		bw = CONF_OPER_CHWIDTH_USE_HT;
+-		break;
+-	case 80:
+-		if (freq_params->center_freq2)
+-			bw = CONF_OPER_CHWIDTH_80P80MHZ;
+-		else
+-			bw = CONF_OPER_CHWIDTH_80MHZ;
+-		break;
+-	case 160:
+-		bw = CONF_OPER_CHWIDTH_160MHZ;
+-		break;
+-	case 320 :
+-		bw = CONF_OPER_CHWIDTH_320MHZ;
+-		break;
+-	default:
+-		wpa_printf(MSG_WARNING, "Unknown CSA bandwidth: %d", freq_params->bandwidth);
+-		break;
++		if ((iface->radar_background.cac_started) || (iface->state < HAPD_IFACE_ACS)) {
++			return -1;
++		}
++		res = mxl_zwdfs_check_chans_unavailable(iface, &settings->freq_params);
++		if (res) {
++			wpa_printf(MSG_ERROR, "ZWDFS %d chans unavailable - Cannot start background CAC\n", res);
++			return -1;
++		}
++		return 1;
+ 	}
+ 
+-	iface->freq = freq_params->freq;
+-	iface->conf->channel = freq_params->channel;
+-	iface->conf->secondary_channel = freq_params->sec_channel_offset;
+-
+-	if (freq_params->bandwidth > 20 && iface->conf->secondary_channel == 0)
+-		iface->conf->secondary_channel = mxl_hostapd_get_secondary_offset(iface->conf->channel, freq_params->bandwidth, bw_center_idx);
+-
+-	hostapd_set_oper_centr_freq_seg0_idx(iface->conf,seg0_idx);
+-	hostapd_set_oper_centr_freq_seg1_idx(iface->conf,seg1_idx);
+-	hostapd_set_oper_chwidth(iface->conf,bw);
++	return 0;
+ }
+ 
+ int mxl_hostapd_start_background_cac(struct hostapd_iface *iface, const struct csa_settings *settings)
+@@ -130,8 +93,46 @@ int mxl_hostapd_start_background_cac(struct hostapd_iface *iface, const struct c
+ 		return -1;
+ 	}
+ 
+-	hostapd_set_conf_from_freq_params(zwdfs_iface, &settings->freq_params);
++	if (mxl_dfs_use_radar_background(iface)) {
++
++		struct hostapd_freq_params *data_freq = (struct hostapd_freq_params *)&settings->freq_params;
++		int res;
++		struct hostapd_data *hapd = iface->bss[0];
++
++		wpa_printf(MSG_DEBUG, "Starting Background CAC on operational radio\n");
++		data_freq->radar_background = true;
++		data_freq->vht_enabled = iface->conf->ieee80211ac;
++		data_freq->he_enabled = iface->conf->ieee80211ax;
++		data_freq->eht_enabled = iface->conf->ieee80211be;
++
++		res = hapd->driver->start_dfs_cac(hapd->drv_priv, data_freq);
++
++		if (!res) {
++			uint8_t centr_freq_seg0_idx = 0;
++
++			/* Copy background radar params after CAC started successfully. */
++			iface->radar_background.cac_started = true;
++			iface->radar_background.channel = data_freq->channel;
++			iface->radar_background.freq = data_freq->freq;
++
++			if (settings->freq_params.bandwidth == 20) {
++				centr_freq_seg0_idx = data_freq->channel;
++			}
++			iface->radar_background.centr_freq_seg0_idx = centr_freq_seg0_idx;
++			/* Record CAC start time */
++			os_get_reltime(&iface->dfs_cac_start);
++			goto end;
++		}
++
++		if (mxl_hostapd_set_zwdfs_antenna(zwdfs_iface->bss[0], 0)) {
++			wpa_printf(MSG_DEBUG, "ZWDFS: Failed to disable antenna");
++		}
++		return -1;
++	}
++
++	mxl_hostapd_set_conf_from_freq_params(zwdfs_iface, &settings->freq_params);
+ 
++end:
+ 	/* settings->beacon_data not filled/required, so os_memdup is enough here */
+ 	zwdfs_iface->mxl_iface.zwdfs_info.csa_settings = os_memdup(settings, sizeof(*settings));
+ 	if (!zwdfs_iface->mxl_iface.zwdfs_info.csa_settings)
+@@ -165,11 +166,18 @@ int mxl_hostapd_zwdfs_switch(struct hostapd_iface *iface, int cac_status,
+ 		goto end;
+ 
+ 	/* do not cleanup and keep waiting: CAC finished chandef does not cover all our chandef */
+-	iface->mxl_iface.check_only_dfs = true;
+-	expected_num_chans = mxl_dfs_are_channels_overlapped(iface, freq, chan_width, cf1, cf2);
+-	iface->mxl_iface.check_only_dfs = false;
+-	if (num_chans != expected_num_chans)
+-		goto end;
++
++	/* Incase of Wav700, no need to check for overlapped channels. Here DFS overlap channels
++	 * are checked to validate whether we receive CAC events on the same channel we set on
++	 * the radio.
++	 */
++	if (!mxl_hostapd_dfs_is_background_event(iface, freq, cf1)) {
++		iface->mxl_iface.check_only_dfs = true;
++		expected_num_chans = mxl_dfs_are_channels_overlapped(iface, freq, chan_width, cf1, cf2);
++		iface->mxl_iface.check_only_dfs = false;
++		if (num_chans != expected_num_chans)
++			goto end;
++	}
+ 
+ 	/* ZWDFS switch not initiated */
+ 	if (!csa_iface || !csa_settings)
+@@ -193,6 +201,12 @@ int mxl_hostapd_zwdfs_switch(struct hostapd_iface *iface, int cac_status,
+ 		hostapd_chan_switch_config(csa_iface->bss[i], &csa_settings->freq_params);
+ 		ret = hostapd_switch_channel(csa_iface->bss[i], csa_settings);
+ 		if (ret) {
++			if (ret == -EBUSY) {
++				wpa_printf(MSG_ERROR, "ZWDFS: Set channel failed, Retriggering ZWDFS CAC");
++				if (!(ret = mxl_hostapd_zwdfs_restart_cac(iface, iface->radar_background.channel, chan_width))) {
++					goto end;
++				}
++			}
+ 			wpa_printf(MSG_ERROR, "ZWDFS: hostapd_switch_channel failed: %s", csa_iface->bss[0]->conf->iface);
+ 			goto cleanup;
+ 		}
+@@ -243,6 +257,30 @@ int mxl_hostapd_set_zwdfs_antenna(struct hostapd_data *hapd, int enable)
+ 		return 0;
+ 	}
+ 
++	/*
++	 * For WAV700, since ZWDFS is in the background chain, the background CAC
++	 * flag needs to be enabled in the configuration. However, for WAV600, since it has a
++	 * separate radio for ZWDFS, the background CAC flag does not need to be enabled.
++	 */
++	if (iface->drv_flags2 & WPA_DRIVER_FLAGS2_RADAR_BACKGROUND) {
++		if (!(iface->conf->mxl_conf.background_cac)) {
++			wpa_printf(MSG_ERROR, "Background CAC is disabled");
++			return -1;
++		}
++		/* reset zwdfs params */
++		iface->radar_background.cac_started = 0;
++		iface->radar_background.freq = 0;
++		iface->mxl_iface.zwdfs_info.csa_iface = NULL;
++
++		if (iface->mxl_iface.zwdfs_info.csa_settings) {
++			os_free(iface->mxl_iface.zwdfs_info.csa_settings);
++		}
++		iface->mxl_iface.zwdfs_info.csa_settings = NULL;
++		if (!enable)
++			iface->mxl_iface.zwdfs_cac_retriggered_count = 0;
++		goto end;
++	}
++
+ 	needs_restart = !(iface->state == HAPD_IFACE_ENABLED);
+ 
+ 	if (mxl_set_first_non_dfs_channel(iface)) {
+@@ -287,14 +325,17 @@ int mxl_hostapd_set_zwdfs_antenna(struct hostapd_data *hapd, int enable)
+ 		hostapd_drv_stop_ap(hapd);
+ 	}
+ 
++end:
+ 	if (mxl_hostapd_drv_set_zwdfs_antenna(hapd, enable) < 0) {
+ 		wpa_printf(MSG_ERROR, "Failed to enable ZWDFS antenna");
+ 		return -1;
+ 	}
+ 
+-	if (ieee802_11_set_beacon(hapd)) {
+-		wpa_printf(MSG_ERROR, "Failed to reload ZWDFS interface");
+-		return -1;
++	if (!mxl_dfs_use_radar_background(iface)) { /* set beacon is not need for zwdfs in background antenna chain */
++		if (ieee802_11_set_beacon(hapd)) {
++			wpa_printf(MSG_ERROR, "Failed to reload ZWDFS interface");
++			return -1;
++		}
+ 	}
+ 
+ 	wpa_msg(hapd->msg_ctx, MSG_INFO, enable ? ZWDFS_ANT_ENABLE : ZWDFS_ANT_DISABLE);
+@@ -313,3 +354,288 @@ int mxl_hostapd_drv_get_zwdfs_antenna(struct hostapd_data *hapd, int *enabled)
+ 
+ 	return ret;
+ }
++
++int mxl_zwdfs_check_chans_unavailable(struct hostapd_iface *iface, struct hostapd_freq_params *freq)
++{
++	struct hostapd_hw_modes *mode;
++	struct hostapd_channel_data *chan;
++	int n_chans = 1, res = -1;
++	int start_chan_idx = 0;
++	int low_freq;
++	int i;
++
++	mode = iface->current_mode;
++
++	if (mode == NULL) {
++		return res;
++	}
++
++	if (mode->mode != HOSTAPD_MODE_IEEE80211A) {
++		wpa_printf(MSG_WARNING, "current_mode != IEEE80211A");
++		return res;
++	}
++
++	switch (freq->bandwidth) {
++		case 20:
++			n_chans = 1;
++			break;
++		case 40:
++			n_chans = 2;
++			break;
++		case 80:
++			n_chans = 4;
++			break;
++		case 160:
++			n_chans = 8;
++			break;
++		default:
++		wpa_printf(MSG_INFO, "DFS chan_width %d not supported",
++			   freq->bandwidth);
++		return res;
++	}
++
++	low_freq = freq->center_freq1 - (freq->bandwidth / 2) + 10;
++	start_chan_idx = mxl_hapd_get_chan_idx(mode, low_freq); /* Get starting channel index */
++
++	/* Check if any of configured channels require DFS */
++	res = mxl_dfs_check_chans_radar(iface, start_chan_idx, n_chans);
++	wpa_printf(MSG_DEBUG,
++		   "DFS %d channels required radar detection", res);
++	if (!res) {
++		return -1;
++	}
++
++	for (i = 0; i < n_chans; i++) {
++		chan = &mode->channels[start_chan_idx + i];
++		if (!mxl_is_in_chanlist(iface, chan)) {
++			wpa_printf(MSG_DEBUG,
++				   "DFS: channel %d (%d) not in chanlist",
++				   chan->freq, chan->chan);
++			return -1;
++		}
++	}
++
++	res = mxl_dfs_check_chans_unavailable(iface, start_chan_idx, n_chans);
++	return res;
++}
++
++int mxl_hostapd_zwdfs_restart_cac(struct hostapd_iface *iface, u8 chan, enum chan_width chanwidth)
++{
++	struct csa_settings settings;
++	struct hostapd_hw_modes *mode = iface->current_mode;
++	struct hostapd_config *iconf = iface->conf;
++	uint8_t centr_freq_seg0_idx = 0;
++	enum oper_chan_width cw;
++	int freq = hostapd_chan_to_freq(chan, false);
++	int chan_offset, res;
++	uint32_t zwdfs_cac_retriggered_count;
++
++	if (!mode) {
++		return -1;
++	}
++
++	switch (chanwidth) {
++	case CHAN_WIDTH_UNKNOWN:
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++	case CHAN_WIDTH_40:
++		cw = CONF_OPER_CHWIDTH_USE_HT;
++		break;
++	case CHAN_WIDTH_80:
++		cw = CONF_OPER_CHWIDTH_80MHZ;
++		break;
++	default:
++		cw = CONF_OPER_CHWIDTH_160MHZ;
++		break;
++	}
++
++	zwdfs_cac_retriggered_count = iface->mxl_iface.zwdfs_cac_retriggered_count;
++	/* Disable zwdfs */
++	if (mxl_hostapd_set_zwdfs_antenna(iface->bss[0], 0)) {
++		wpa_printf(MSG_ERROR, "ZWDFS: Failed to disable antenna");
++		return -1;
++	}
++
++	/* Reset zwdfs channel set params */
++	iface->radar_background.cac_started = 0;
++	iface->radar_background.channel = -1;
++	iface->radar_background.freq = 0;
++	iface->mxl_iface.zwdfs_info.csa_iface = NULL;
++
++	if (iface->mxl_iface.zwdfs_info.csa_settings) {
++		os_free(iface->mxl_iface.zwdfs_info.csa_settings);
++	}
++	iface->mxl_iface.zwdfs_info.csa_settings = NULL;
++
++	wpa_printf(MSG_INFO, "mxl_hostapd_zwdfs_restart_cac: Setting channel %d to zwdfs antenna\n",
++		   iface->conf->mxl_conf.zwdfs_debug_chan);
++
++	if (chanwidth <= CHAN_WIDTH_20) {
++		centr_freq_seg0_idx = chan;
++		chan_offset = 0;
++	}
++
++	if (!centr_freq_seg0_idx) {
++		wpa_printf(MSG_INFO, "Radar detected: Couldn't get center channel\n");
++		return -1;
++	}
++
++	/* Fill frequency params based on chan */
++	hostapd_set_freq_params(&settings.freq_params, iconf->hw_mode, freq,
++				chan, iconf->enable_edmg,
++				iconf->edmg_channel, iconf->ieee80211n,
++				iconf->ieee80211ac, iconf->ieee80211ax, iconf->ieee80211be, chan_offset,
++				cw, centr_freq_seg0_idx, 0,
++				mode->vht_capab,
++				&mode->he_capab[IEEE80211_MODE_AP],
++				&mode->eht_capab[IEEE80211_MODE_AP]);
++
++	/* Set DFS state as HOSTAPD_CHAN_DFS_USABLE so that we can do CAC on the same channel again */
++	int n_chans = settings.freq_params.bandwidth / 20;
++	int low_freq  = settings.freq_params.center_freq1 - (settings.freq_params.bandwidth / 2) + 10;
++	int i, cur_freq;
++
++	for (i = 0; i < n_chans; i++) {
++		int chan_idx;
++
++		cur_freq = low_freq + i * 20;
++		chan_idx = mxl_hapd_get_chan_idx(mode, cur_freq);
++
++		/* Check whether the channel is a DFS channel */
++		if (mxl_dfs_check_chans_radar(iface, chan_idx, 1)) {
++			if (mxl_hostapd_set_chan_dfs_state(iface, NL80211_DFS_USABLE, cur_freq, 0, 1)) {
++				wpa_printf(MSG_ERROR, "DFS_DEBUG: Update kernel DFS state to 0x%x for channel %d failed",
++					   NL80211_DFS_USABLE, cur_freq);
++				return -1;
++			}
++
++			if (mxl_set_dfs_state_freq(iface, cur_freq, HOSTAPD_CHAN_DFS_USABLE) != 1) {
++				wpa_printf(MSG_ERROR, "DFS_DEBUG: Update hostapd DFS state to 0x%x for channel %d failed",
++					   HOSTAPD_CHAN_DFS_USABLE, cur_freq);
++				return -1;
++			}
++		}
++	}
++
++	/* Set channel to zwdfs background chain */
++	res = mxl_hostapd_start_background_cac(iface, &settings);
++	if(!res)
++		iface->mxl_iface.zwdfs_cac_retriggered_count = zwdfs_cac_retriggered_count + 1;
++
++	return res;
++}
++
++void mxl_hostapd_zwdfs_cac_on_radar(struct hostapd_iface *iface, struct csa_settings *settings)
++{
++	struct hostapd_hw_modes *cmode = iface->current_mode;
++	int n_chans, n_chans1, start_chan_idx, start_chan_idx1;
++	int err = -1;
++	struct csa_settings new_chan_settings;
++	struct hostapd_channel_data *channel = NULL;
++
++	/* If the new channel is a static failsafe channel, then no need for ZWDFS and
++	 * directly set the channel to operational vaps.
++	 */
++	if ((settings->freq_params.freq == iface->mxl_iface.failsafe.freq) &&
++	    (settings->freq_params.bandwidth == iface->mxl_iface.failsafe.bandwidth)) {
++		return;
++	}
++
++	if ((!mxl_dfs_use_radar_background(iface) || iface->radar_background.cac_started)) {
++		return;
++	}
++
++	memcpy_s(&new_chan_settings, sizeof(struct csa_settings), settings, sizeof(struct csa_settings));
++	mxl_hostapd_set_conf_from_freq_params(iface, &new_chan_settings.freq_params);
++
++	/* Get start (first) channel for current configuration */
++	start_chan_idx = mxl_dfs_get_start_chan_idx(iface,
++			 &start_chan_idx1);
++	if (start_chan_idx == -1) {
++		goto fail;
++	}
++
++	/* Get number of used channels, depend on width */
++	n_chans = mxl_dfs_get_used_n_chans(iface, &n_chans1);
++
++	/* Check if all channels are DFS available */
++	err = mxl_dfs_check_chans_available(iface, start_chan_idx, n_chans);
++	if (err) {
++		wpa_printf(MSG_ERROR, "%s: All channels are available. No need to run CAC in ZWDFS\n", __func__);
++		goto fail;
++	}
++
++	/* Check if any of the ZWDFS configured channels is unavailable */
++	err = mxl_zwdfs_check_chans_unavailable(iface, &new_chan_settings.freq_params);
++	if (err) {
++		wpa_printf(MSG_ERROR, "%s: ZWDFS %d chans unavailable - Cannot start background CAC\n", __func__, err);
++		goto fail;
++	}
++
++	if (!channel) {
++		/* Try to set first non-DFS channel to the operational vaps until ZWDFS CAC completed. */
++		if (!mxl_set_first_non_dfs_channel(iface)) {
++			err = hostapd_set_freq_params(&settings->freq_params,
++						      iface->conf->hw_mode,
++						      iface->freq,
++						      iface->conf->channel,
++						      iface->conf->enable_edmg,
++						      iface->conf->edmg_channel,
++						      iface->conf->ieee80211n,
++						      iface->conf->ieee80211ac,
++						      iface->conf->ieee80211ax,
++						      iface->conf->ieee80211be,
++						      iface->conf->secondary_channel,
++						      hostapd_get_oper_chwidth(iface->conf),
++						      hostapd_get_oper_centr_freq_seg0_idx(iface->conf),
++						      hostapd_get_oper_centr_freq_seg1_idx(iface->conf),
++						      cmode ? cmode->vht_capab : 0,
++						      cmode ? &cmode->he_capab[IEEE80211_MODE_AP] : NULL,
++						      cmode ? &cmode->eht_capab[IEEE80211_MODE_AP] : NULL);
++
++			if (err) {
++				wpa_printf(MSG_ERROR, "DFS failed to calculate CSA freq params");
++				goto fail;
++			}
++		} else {
++			wpa_printf(MSG_ERROR, "%s: Failed to set first non-DFS channel\n", __func__);
++			goto fail;
++		}
++	}
++
++	/* Start ZWDFS CAC in background */
++	if (mxl_hostapd_start_background_cac(iface, &new_chan_settings)) {
++		wpa_printf(MSG_ERROR, "%s: Failed to start Background CAC in ZWDFS antenna\n", __func__);
++		goto fail;
++	}
++	return;
++
++fail:
++	/* No need for ZWDFS background CAC or Unable to do it at this moment.
++	 * So, fill channel settings with the selected channel and this channel
++	 * will be set directly to operational vaps.
++	 */
++	memcpy_s(settings, sizeof(struct csa_settings), &new_chan_settings, sizeof(struct csa_settings));
++	mxl_hostapd_set_conf_from_freq_params(iface, &settings->freq_params);
++}
++
++int mxl_hostapd_handle_zwdfs_switch(struct hostapd_iface *iface, int success, int freq, int chan_width, int cf1, int cf2)
++{
++	if (mxl_hostapd_is_zwdfs_iface(iface)) {
++		if (mxl_dfs_use_radar_background(iface)) {
++			if (mxl_hostapd_dfs_is_background_event(iface, freq, cf1)) {
++				iface->radar_background.cac_started = 0;
++				/* For WAV700 ZWDFS background radar antenna, if zwdfs_debug_chan is set
++				 * then we need to restart the CAC on same channel.
++				 */
++				if (iface->conf->mxl_conf.zwdfs_debug_chan) {
++					return mxl_hostapd_zwdfs_restart_cac(iface, iface->conf->mxl_conf.zwdfs_debug_chan, chan_width);
++				}
++				return mxl_hostapd_zwdfs_switch(iface, success, freq, chan_width, cf1, cf2);
++			}
++		} else {
++			return mxl_hostapd_zwdfs_switch(iface, success, freq, chan_width, cf1, cf2);
++		}
++	}
++	return 0;
++}
+diff --git a/src/ap/mxl_zwdfs.h b/src/ap/mxl_zwdfs.h
+index b7aa1ce9b..7be25e26c 100644
+--- a/src/ap/mxl_zwdfs.h
++++ b/src/ap/mxl_zwdfs.h
+@@ -22,8 +22,12 @@ struct mxl_zwdfs_settings {
+ int mxl_hostapd_drv_get_zwdfs_antenna(struct hostapd_data *hapd, int *enabled);
+ int mxl_hostapd_set_zwdfs_antenna(struct hostapd_data *hapd, int enable);
+ bool mxl_hostapd_check_only_dfs_chans(struct hostapd_iface *iface);
+-bool mxl_hostapd_background_cac_possible(struct hostapd_iface *iface);
++int mxl_hostapd_background_cac_possible(struct hostapd_iface *iface, struct csa_settings *settings, bool switch_type_zwdfs);
+ int mxl_hostapd_start_background_cac(struct hostapd_iface *iface, const struct csa_settings *settings);
+ int mxl_hostapd_zwdfs_switch(struct hostapd_iface *iface, int cac_status, int freq, int chan_width, int cf1, int cf2);
+ 
++int mxl_zwdfs_check_chans_unavailable(struct hostapd_iface *iface, struct hostapd_freq_params *freq);
++int mxl_hostapd_zwdfs_restart_cac(struct hostapd_iface *iface, u8 chan, enum chan_width chanwidth);
++void mxl_hostapd_zwdfs_cac_on_radar(struct hostapd_iface *iface, struct csa_settings *settings);
++int mxl_hostapd_handle_zwdfs_switch(struct hostapd_iface *iface, int success, int freq, int chan_width, int cf1, int cf2);
+ #endif /* MXL_ZWDFS_H */
+-- 
+2.43.0
+

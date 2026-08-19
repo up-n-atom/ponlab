@@ -1,0 +1,4387 @@
+From a4f3d476fae2abdd996797c541cf23556c136615 Mon Sep 17 00:00:00 2001
+From: hmgokhale <hmgokhale@maxlinear.com>
+Date: Thu, 8 Feb 2024 10:29:50 +0530
+Subject: [PATCH] WLANRTSYS-60843 MLO changes: AP MLD configuration
+
+Signed-off-by: hmgokhale <hmgokhale@maxlinear.com>
+---
+ hostapd/Makefile                   |   11 +
+ hostapd/main.c                     |   10 +
+ hostapd/mxl_config.c               |  303 +++++++
+ src/ap/beacon.c                    |   79 +-
+ src/ap/drv_callbacks.c             |    8 +
+ src/ap/hostapd.c                   |  188 ++++-
+ src/ap/hostapd.h                   |    4 +
+ src/ap/ieee802_11.c                |    8 +
+ src/ap/ieee802_11_shared.c         |    6 +
+ src/ap/mxl_beacon.c                |  727 +++++++++++++++++
+ src/ap/mxl_beacon.h                |   34 +
+ src/ap/mxl_config.h                |   50 ++
+ src/ap/mxl_hostapd.c               |  150 +++-
+ src/ap/mxl_hostapd.h               |   25 +
+ src/ap/mxl_mld.c                   | 1181 ++++++++++++++++++++++++++++
+ src/ap/mxl_mld.h                   |  169 ++++
+ src/ap/mxl_wpa_auth.c              |   66 ++
+ src/ap/mxl_wpa_auth.h              |   37 +
+ src/ap/mxl_wpa_auth_glue.c         |   70 ++
+ src/ap/mxl_wpa_auth_glue.h         |   22 +
+ src/ap/wpa_auth.c                  |    3 +
+ src/ap/wpa_auth.h                  |    6 +
+ src/ap/wpa_auth_glue.c             |    9 +-
+ src/ap/wpa_auth_i.h                |    7 +
+ src/common/ieee802_11_common.c     |   42 +-
+ src/common/ieee802_11_common.h     |    8 +
+ src/common/mxl_ieee802_11_common.c |  111 +++
+ src/common/mxl_ieee802_11_common.h |    1 +
+ src/common/mxl_ieee802_11_defs.h   |   76 ++
+ src/common/vendor_cmds_copy.h      |   33 +-
+ src/drivers/driver.h               |    3 +
+ src/drivers/driver_nl80211_capa.c  |    3 +
+ src/drivers/mxl_driver.h           |   19 +
+ src/drivers/mxl_driver_nl80211.c   |   10 +
+ src/drivers/mxl_driver_nl80211.h   |    1 +
+ 35 files changed, 3413 insertions(+), 67 deletions(-)
+ create mode 100644 src/ap/mxl_beacon.c
+ create mode 100644 src/ap/mxl_beacon.h
+ create mode 100644 src/ap/mxl_mld.c
+ create mode 100644 src/ap/mxl_mld.h
+ create mode 100644 src/ap/mxl_wpa_auth.c
+ create mode 100644 src/ap/mxl_wpa_auth.h
+ create mode 100644 src/ap/mxl_wpa_auth_glue.c
+ create mode 100644 src/ap/mxl_wpa_auth_glue.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 971fb9f7d..321d181ab 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -357,6 +357,11 @@ ifdef CONFIG_IEEE80211BE
+ CONFIG_IEEE80211AX=y
+ CFLAGS += -DCONFIG_IEEE80211BE
+ OBJS += ../src/ap/ieee802_11_eht.o
++ifdef CONFIG_VENDOR_MXL
++ifdef CONFIG_IEEE80211BE_MXL_MLO
++CFLAGS+= -DCONFIG_IEEE80211BE_MXL_MLO
++endif
++endif
+ endif
+ 
+ ifdef CONFIG_IEEE80211AX
+@@ -387,6 +392,12 @@ OBJS += ../src/ap/mxl_softblock.o
+ OBJS += ../src/ap/mxl_rrm.o
+ OBJS += ../src/ap/mxl_ieee802_11.o
+ OBJS += ../src/ap/mxl_wds.o
++OBJS += ../src/ap/mxl_wpa_auth.o
++OBJS += ../src/ap/mxl_wpa_auth_glue.o
++OBJS += ../src/ap/mxl_beacon.o
++ifdef CONFIG_IEEE80211BE_MXL_MLO
++OBJS += ../src/ap/mxl_mld.o
++endif
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/hostapd/main.c b/hostapd/main.c
+index d6f835241..0b1a5e1e6 100644
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -1012,6 +1012,13 @@ int main(int argc, char *argv[])
+ 		}
+ 	}
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_mld_global_init(&interfaces)) {
++		wpa_printf(MSG_ERROR, "MLD Init Failed!!!");
++		goto out;
++	}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
+ 	/*
+ 	 * Enable configured interfaces. Depending on channel configuration,
+ 	 * this may complete full initialization before returning or use a
+@@ -1068,6 +1075,9 @@ int main(int argc, char *argv[])
+ 	dpp_global_deinit(interfaces.dpp);
+ #endif /* CONFIG_DPP */
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_mld_global_deinit(&interfaces);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	if (interfaces.eloop_initialized)
+ 		eloop_cancel_timeout(hostapd_periodic, &interfaces, NULL);
+ 	hostapd_global_deinit(pid_file, interfaces.eloop_initialized);
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 4c5ad8130..06e30bc2e 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -18,6 +18,7 @@
+ #include "ap/mxl_config.h"
+ #include "ap/mxl_hostapd.h"
+ #include "common/mxl_ieee802_11_defs.h"
++#include "crc32.h"
+ 
+ #ifdef CONFIG_IEEE80211AX
+ static int
+@@ -651,6 +652,208 @@ mxl_conf_fill_he_ppe_thresholds(struct mxl_hostapd_config *conf, const char *buf
+ }
+ #endif /* CONFIG_IEEE80211AX */
+ 
++static int mxl_hostapd_parse_colocated_6g_vap_info(struct hostapd_config *conf,
++		struct hostapd_bss_config *bss, char *val)
++{
++	char *tmp = val, *ptr = NULL;
++	int radio_index = 0, param_val = 0;
++	errno_t err = EOK;
++	u8 psd_20MHz;
++
++	/* expected order: radio_index BSSID SSID multibss_enable is_transmitted_bssid max_tx_power hidden_mode
++	 * eg: 0 11:22:33:44:55:66 test_6g_vap 1 1 30 0
++	 */
++	u8 bssid[ETH_ALEN] = {'\0'};
++	u8 empty_bssid[ETH_ALEN] = {'\0'};
++	char ssid[SSID_MAX_LEN + 1] = {'\0'};
++	int j = 0;
++	bool found = false; // flag will be used to find whether bssid entry found
++	bool multibss_enable = false, is_transmitted_bssid = false, unsolicited_frame_support = false, hidden_mode = false;
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_RANGE(param_val, 0, MAX_SUPPORTED_6GHZ_RADIO - 1)) {
++		wpa_printf(MSG_ERROR, "CONFIG: UPDATE_RNR: Bad radio_index %s", tmp);
++		return -1;
++	}
++	radio_index = param_val;
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	if (hwaddr_aton(tmp, bssid)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad BSSID %s", tmp);
++		return -1;
++	}
++
++	if (!os_memcmp(bssid, empty_bssid, ETH_ALEN)) { /* found place holder for new RNR */
++		wpa_printf(MSG_ERROR, "CTRL:UPDATE_RNR: all 0's BSSID, not valid?");
++		return -1;
++	}
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	if (strnlen_s(tmp, RSIZE_MAX_STR) > SSID_MAX_LEN) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad SSID %s", tmp);
++		return -1;
++	}
++	err = strncpy_s(ssid, sizeof(ssid), tmp, SSID_MAX_LEN);;
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "memcpy_s error %d", err);
++		return -1;
++	}
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_BOOL_RANGE(param_val)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad multlbss_enable %s", tmp);
++		return -1;
++	}
++	multibss_enable = param_val;
++
++	PARSE_TOKEN(tmp, val," ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_BOOL_RANGE(param_val)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad is_transmitted_bssid %s", tmp);
++		return -1;
++	}
++	is_transmitted_bssid = param_val;
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_BOOL_RANGE(param_val)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad unsolicited_frame_support %s", tmp);
++		return -1;
++	}
++	unsolicited_frame_support = param_val;
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = (atoi(tmp) - HOSTAP_6GHZ_10LOG_20MHZ) * HOSTAP_6GHZ_CONVERT_HALF_DB_UNIT;
++	if (!IS_VALID_RANGE(param_val, HOSTAP_6GHZ_PSD_20MHZ_MIN, HOSTAP_6GHZ_PSD_20MHZ_MAX)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: psd 20MHz %s", tmp);
++		return -1;
++	}
++	if (param_val < 0)
++		psd_20MHz = param_val + HOSTAPD_BYTE_2S_COMPLEMENT;
++	else
++		psd_20MHz = param_val;
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_BOOL_RANGE(param_val)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad hidden_mode %s", tmp);
++		return -1;
++	}
++	hidden_mode = param_val;
++
++
++	/* Update for existing RNR */
++	for (j = 0; (j < MAX_SUPPORTED_6GHZ_VAP_PER_RADIO) && !found; j++) {
++		if (!os_memcmp(conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].bssid, bssid, ETH_ALEN)) {
++			found = true;
++			break;
++		}
++	}
++
++	/* not existing RNR, find empty buffer in array and update new RNR */
++	if (!found) {
++		for (j = MASTER_VAP_BSS_IDX + 1; (j < MAX_SUPPORTED_6GHZ_VAP_PER_RADIO) && !found; j++) {
++			if (!os_memcmp(conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].bssid,
++					empty_bssid, ETH_ALEN)) {/* found place holder for new RNR */
++				found = true;
++				conf->mxl_conf.coloc_6g_ap_info[radio_index].TbttInfoCount++;
++				break;
++			}
++		}
++	}
++
++	if (!found) {
++		wpa_printf(MSG_ERROR,"No available space to hold new RNR report");
++		return -1;
++	}
++	err = memcpy_s(conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].Ssid, SSID_MAX_LEN, ssid, SSID_MAX_LEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return -1;
++	}
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].NeighApTbttOffset = TBTT_OFFSET_UNKNOWN; /* TODO (6GHz) Dynamic, 255=unknown */
++	err = memcpy_s(conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].bssid, ETH_ALEN, bssid, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return -1;
++	}
++	/*
++	OCT Recommended 0
++	Same SSID  x
++	Multiple BSSID x
++	Transmitted BSSID x
++	Member of ESS with 2.4/5GHz Co-located AP(#20024) 0
++	20 TU Probe Response Active x
++	Co-Located  AP 1
++	Reserved 0
++	0 1 x 0 x x x 0
++	*/
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].BssParams |= RNR_TBTT_INFO_BSS_PARAM_COLOC_AP; /*TODO (6GHz) Dynamic */
++	if (unsolicited_frame_support) {
++		conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].BssParams
++			|= RNR_TBTT_INFO_BSS_PARAM_20TU_PROBE_RES;
++	}
++	/*
++	 * Short SSID calculation is identical to FCS and it is defined in
++	 * IEEE802.11-REVmd/D2.2 9.4.2.170.3
++	 */
++	WPA_PUT_LE32(conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].ShortSsid, ieee80211_crc32((u8 *)ssid, strnlen_s(ssid, SSID_MAX_LEN)));
++	if (multibss_enable) {
++		conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].BssParams |= RNR_TBTT_INFO_BSS_PARAM_MULTIPLE_BSSID;
++		if (is_transmitted_bssid)
++			conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].BssParams |= RNR_TBTT_INFO_BSS_PARAM_TRANSMITTED_BSSID;
++	}
++
++	if ((bss->ssid.ssid_len) && (strnlen_s((char *)ssid, SSID_MAX_LEN) == bss->ssid.ssid_len) &&
++		(!os_memcmp(bss->ssid.ssid, ssid, bss->ssid.ssid_len)) && !hidden_mode) {
++		wpa_printf(MSG_DEBUG, "CTRL: UPDATE_RNR: Same ssid field set in rnr");
++		conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].BssParams |= RNR_TBTT_INFO_BSS_PARAM_SAME_SSID;
++	}
++	else
++		wpa_printf(MSG_DEBUG, "CTRL: UPDATE_RNR: Same ssid field not set in rnr");
++
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[j].psd_20MHz = psd_20MHz;
++	return 0;
++}
++
++static int mxl_hostapd_parse_colocated_6g_radio_info(struct hostapd_config *conf, char *val)
++{
++	char *tmp = val, *ptr = NULL;
++	int radio_index = 0, param_val = 0;
++
++	/* expected order: radio_index OperatingClass Channel, eg: 0 131 1*/
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_RANGE(param_val, 0, MAX_SUPPORTED_6GHZ_RADIO - 1)) {
++			wpa_printf(MSG_ERROR, "CONFIG: UPDATE_RNR: Bad radio_index %s", tmp);
++			return -1;
++	}
++	radio_index = param_val;
++
++	PARSE_TOKEN(tmp, val, " ", &ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_RANGE(param_val, HOSTAP_6GHZ_20MHZ_OP_CLASS, HOSTAP_6GHZ_80P80MHZ_OP_CLASS)) {
++		wpa_printf(MSG_ERROR, "CONFIG: UPDATE_RNR: Bad OperatingClass %s", tmp);
++		return -1;
++	}
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].OperatingClass = param_val;
++
++	PARSE_TOKEN(tmp,val," ",&ptr);
++	param_val = atoi(tmp);
++	if (!IS_VALID_RANGE(param_val, HOSTAP_6GHZ_CHANNEL_FIRST, HOSTAP_6GHZ_CHANNEL_LAST)) {
++		wpa_printf(MSG_ERROR, "CTRL: UPDATE_RNR: Bad Channel %s", tmp);
++		return -1;
++	}
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].ChanNum = (u8)param_val;
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].Reserved = 0;
++	conf->mxl_conf.coloc_6g_ap_info[radio_index].TbttInfoFieldType = 0; /* TODO (6GHz) Dynamic , possible 0,1,2,3 (1,2,3 are reserverd) */
++
++	return 0;
++}
++
+ #ifdef CONFIG_IEEE80211BE
+ 
+ static int
+@@ -1174,6 +1377,23 @@ mxl_conf_fill_be(struct hostapd_config *conf, const char *buf, char *pos, int li
+ 			return 0;
+ 		}
+ 		mxl_conf->eht_default_pe_duration = val;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	} else if (os_strcmp(buf, "rnr_tbtt_mld_non_zero_pad") == 0) {
++			int val = atoi(pos);
++			if (!IS_VALID_RANGE(val, RNR_TBTT_PADDING_BYTES_MIN, RNR_TBTT_PADDING_BYTES_MAX)) {
++				wpa_printf(MSG_ERROR, "Line %d: invalid rnr_tbtt_mld_non_zero_pad %d (expected [%d...%d])",
++				line, val, RNR_TBTT_PADDING_BYTES_MIN, RNR_TBTT_PADDING_BYTES_MAX);
++				return 0;
++			}
++			mxl_conf->rnr_tbtt_mld_non_zero_pad = val;
++	} else if (os_strcmp(buf, "rnr_6g_op_class_137_allowed") == 0) {
++			int val = atoi(pos);
++			if (!IS_VALID_BOOL_RANGE(val)) {
++				wpa_printf(MSG_ERROR, "Line %d: Invalid rnr_6g_op_class_137_allowed = %d",line, val);
++				return 0;
++			}
++			mxl_conf->rnr_6g_op_class_137_allowed = val;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	} else if (mxl_conf_fill_eht_mac_capab_info(mxl_conf, buf, pos)) {
+ 	} else if (mxl_conf_fill_eht_phy_capab_info(mxl_conf, buf, pos)) {
+ 	} else if (mxl_conf_fill_eht_txrx_mcs_support(mxl_conf, buf, pos)) {
+@@ -1184,6 +1404,44 @@ mxl_conf_fill_be(struct hostapd_config *conf, const char *buf, char *pos, int li
+ 	return 1;
+ }
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++static int mxl_hostapd_config_fill_mlo(struct hostapd_config *conf, const char *buf,
++				       char *pos, int line, struct hostapd_bss_config *bss) {
++	if (os_strcmp(buf, "mlo_enable") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid mlo_enable %d",
++					line, val);
++			return 0;
++		}
++		bss->mxl_bss_conf.mlo_enable = val;
++	} else if (os_strcmp(buf, "switch_initial_active_link") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid switch_initial_active_link %d",
++					line, val);
++			return 0;
++		}
++		bss->mxl_bss_conf.switch_initial_active_link = val;
++	} else if (os_strcmp(buf, "mld_num_simul_links") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid mld_num_simul_links %d",
++					line, val);
++			return 0;
++		}
++		bss->mxl_bss_conf.mld_num_simul_links = val;
++	} else if (os_strcmp(buf, "ap_mld_mac") == 0) {
++		if (hwaddr_aton(pos, bss->mxl_bss_conf.ap_mld_mac)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid ap_mld_mac item", line);
++			return 0;
++		}
++	} else
++		return 0;
++
++	return 1;
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+@@ -1260,6 +1518,19 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 		mxl_conf->ignore_40_mhz_intolerant = val;
+ 	} else if (os_strcmp(buf, "sBridgeMode") == 0) {
+ 		mxl_bss_conf->sBridgeMode = atoi(pos);
++	} else if (os_strcmp(buf, "colocated_6g_radio_info") == 0) {
++		if (mxl_hostapd_parse_colocated_6g_radio_info(conf, pos))
++			return 0;
++	} else if (os_strcmp(buf, "colocated_6g_vap_info") == 0) {
++		if (mxl_hostapd_parse_colocated_6g_vap_info(conf, bss, pos))
++			return 0;
++	} else if (os_strcmp(buf, "rnr_auto_update") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			 wpa_printf(MSG_ERROR, "Line %d: invalid rnr_auto_update %d",line, val);
++			return 0;
++		}
++		mxl_bss_conf->rnr_auto_update = val;
+ 	} else if (os_strcmp(buf, "sAddPeerAP") == 0) {
+ 		char * start = pos;
+ 		int i, j=0;
+@@ -1445,6 +1716,9 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ #endif /* CONFIG_IEEE80211AX */
+ #ifdef CONFIG_IEEE80211BE
+ 	} else if (mxl_conf_fill_be(conf, buf, pos, line)) {
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	} else if (mxl_hostapd_config_fill_mlo(conf, buf, pos, line, bss)) {
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* CONFIG_IEEE80211BE */
+ 	} else if (os_strcmp(buf, "dynamic_edca") == 0) {
+ 		int val = atoi(pos);
+@@ -1506,6 +1780,18 @@ void mxl_hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	mxl_bss_conf->sBridgeMode = -1;
+ 	mxl_bss_conf->sAddPeerAP = NULL;
+ 	mxl_bss_conf->num_sAddPeerAP = 0;
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	bss->mxl_bss_conf.mlo_enable = false;
++	bss->mxl_bss_conf.switch_initial_active_link = false;
++	bss->mxl_bss_conf.ml_ie_add = false;
++	bss->mld_id = INVALID_MLD_ID;
++	bss->mxl_bss_conf.link_id = INVALID_LINK_ID;
++	bss->mxl_bss_conf.mld_num_simul_links = MAX_NUM_MLD_SIMUL_LINKS;
++	os_memset(bss->mxl_bss_conf.ap_mld_mac, '\0', ETH_ALEN);
++	bss->mxl_bss_conf.eml_transition_timeout = EML_CAPAB_TRANSITION_TIMEOUT_DEFAULT;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++	mxl_bss_conf->rnr_auto_update = 1;
+ }
+ 
+ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+@@ -1547,3 +1833,20 @@ void mxl_hostapd_config_free(struct hostapd_config *conf)
+ 
+ 	os_free(mxl_conf->dfs_channels_state_file);
+ }
++int mxl_hostapd_config_check(struct hostapd_config *conf, int full_config)
++{
++#ifdef CONFIG_IEEE80211BE
++	if (full_config && conf->ieee80211be) {
++		int i;
++		for (i = 0; i < conf->num_bss; i++) {
++			if (!conf->bss[i]->disable_11be) {
++				if ((conf->bss[i]->wpa_key_mgmt & WPA_KEY_MGMT_OWE) || wpa_key_mgmt_sae(conf->bss[i]->wpa_key_mgmt)) {
++				    conf->bss[i]->rsn_pairwise |= WPA_CIPHER_GCMP_256;
++				}
++			}
++		}
++	}
++#endif /* CONFIG_IEEE80211BE */
++	return 0;
++}
++
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 8f33c2dff..e98b29e31 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -34,7 +34,11 @@
+ #include "taxonomy.h"
+ #include "ieee802_11_auth.h"
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++#include "mxl_mld.h"
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #ifdef CONFIG_VENDOR_MXL
++#include "mxl_beacon.h"
+ #include "mxl_ieee802_11.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+@@ -616,6 +620,9 @@ struct probe_resp_params {
+ #ifdef CONFIG_IEEE80211AX
+ 	u8 *cca_pos;
+ #endif /* CONFIG_IEEE80211AX */
++#ifdef CONFIG_VENDOR_MXL
++	u8 *probe_req_mle;
++#endif /* CONFIG_VENDOR_MXL */
+ };
+ 
+ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+@@ -684,6 +691,9 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+ 			buflen += hostapd_eid_eht_ml_beacon_len(
+ 				ml_elem_ap, params->mld_info, !!params->mld_ap);
+ 		}
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		buflen += mxl_hostapd_eid_ml_probe_len(hapd, params->probe_req_mle);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ 
+@@ -908,6 +918,9 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 		pos = hostapd_eid_eht_operation(hapd, pos);
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	pos = mxl_hostapd_eid_ml_probe(hapd, params->probe_req_mle, pos);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ #ifdef CONFIG_IEEE80211AC
+ 	if (hapd->conf->vendor_vht && !hapd->conf->disable_11ac)
+@@ -1751,6 +1764,9 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 	params.known_bss_len = elems.mbssid_known_bss_len;
+ 	params.is_ml_sta_info = false;
+ 	params.is_he_in_req = (elems.he_capabilities != NULL);
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	params.probe_req_mle = (u8 *) elems.probe_req_mle;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 	hostapd_gen_probe_resp(hapd, &params);
+ 
+@@ -1876,6 +1892,10 @@ static u8 * hostapd_unsol_bcast_probe_resp(struct hostapd_data *hapd,
+ 					   struct wpa_driver_ap_params *params)
+ {
+ 	struct probe_resp_params probe_params;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_is_mlo_enabled(hapd->conf))
++		return NULL;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 	if (!is_6ghz_op_class(hapd->iconf->op_class))
+ 		return NULL;
+@@ -2224,6 +2244,10 @@ static u8 * hostapd_gen_fils_discovery(struct hostapd_data *hapd, size_t *len)
+ static u8 * hostapd_fils_discovery(struct hostapd_data *hapd,
+ 				   struct wpa_driver_ap_params *params)
+ {
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_is_mlo_enabled(hapd->conf))
++		return NULL;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	params->fd_max_int = hapd->conf->fils_discovery_max_int;
+ 	if (is_6ghz_op_class(hapd->iconf->op_class) &&
+ 	    params->fd_max_int > FD_MAX_INTERVAL_6GHZ)
+@@ -2317,6 +2341,9 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 		 * long based on the common info and number of per
+ 		 * station profiles. For now use 256.
+ 		 */
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		tail_len += mxl_hostapd_multilink_ie_len_is_mlo(hapd);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 		if (hapd->conf->mld_ap)
+ 			tail_len += 256;
+ 	}
+@@ -2406,6 +2433,18 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	tailpos = hostapd_eid_rm_enabled_capab(hapd, tailpos,
+ 					       tailend - tailpos);
+ 
++	tailpos = hostapd_get_mde(hapd, tailpos, tailend - tailpos);
++
++	/* eCSA IE */
++	csa_pos = hostapd_eid_ecsa(hapd, tailpos);
++	if (csa_pos != tailpos)
++		hapd->cs_c_off_ecsa_beacon = csa_pos - tail - 1;
++	tailpos = csa_pos;
++
++	tailpos = hostapd_eid_supported_op_classes(hapd, tailpos);
++	tailpos = hostapd_eid_ht_capabilities(hapd, tailpos, NULL);
++	tailpos = hostapd_eid_ht_operation(hapd, tailpos);
++
+ 	/* Multiple BSSID */
+ 	if (hapd->iconf->multibss_enable && MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx) {
+ 		if (multiple_bssid_ie_len > (tailend - tailpos)) {
+@@ -2420,18 +2459,6 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 		}
+ 	}
+ 
+-	tailpos = hostapd_get_mde(hapd, tailpos, tailend - tailpos);
+-
+-	/* eCSA IE */
+-	csa_pos = hostapd_eid_ecsa(hapd, tailpos);
+-	if (csa_pos != tailpos)
+-		hapd->cs_c_off_ecsa_beacon = csa_pos - tail - 1;
+-	tailpos = csa_pos;
+-
+-	tailpos = hostapd_eid_supported_op_classes(hapd, tailpos);
+-	tailpos = hostapd_eid_ht_capabilities(hapd, tailpos, NULL);
+-	tailpos = hostapd_eid_ht_operation(hapd, tailpos);
+-
+ 	if (hapd->iconf->mbssid && hapd->iconf->num_bss > 1) {
+ 		if (ieee802_11_build_ap_params_mbssid(hapd, params)) {
+ 			os_free(head);
+@@ -2541,6 +2568,9 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 						IEEE80211_MODE_AP);
+ 		tailpos = hostapd_eid_eht_operation(hapd, tailpos);
+ 	}
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	tailpos = mxl_hostapd_eid_multilink_is_mlo(hapd, tailpos);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ #ifdef CONFIG_IEEE80211AC
+@@ -2801,6 +2831,12 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 			   hapd->csa_in_progress ? "CSA" : "CCA");
+ 		return -1;
+ 	}
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (hapd->iconf->ieee80211be && hapd->conf->mxl_bss_conf.mlo_enable && !hapd->conf->mxl_bss_conf.ml_ie_add) {
++		wpa_printf(MSG_ERROR, "ml_ie_add is not set. Cannot set beacon");
++		return -1;
++	}
++#endif
+ 
+ 	hapd->beacon_set_done = 1;
+ 
+@@ -2999,4 +3035,23 @@ int ieee802_11_update_beacons(struct hostapd_iface *iface)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_VENDOR_MXL
++u8 * mxl_hostapd_eid_ds_params(struct hostapd_data *hapd, u8 *eid)
++{
++	return hostapd_eid_ds_params(hapd, eid);
++}
++u8 * mxl_hostapd_eid_erp_info(struct hostapd_data *hapd, u8 *eid)
++{
++	return hostapd_eid_erp_info(hapd, eid);
++}
++u8 * mxl_hostapd_eid_country(struct hostapd_data *hapd, u8 *eid, int max_len)
++{
++	return hostapd_eid_country(hapd, eid, max_len);
++}
++u8 * mxl_hostapd_eid_supported_op_classes(struct hostapd_data *hapd, u8 *eid)
++{
++	return hostapd_eid_supported_op_classes(hapd, eid);
++}
++#endif /* CONFIG_VENDOR_MXL */
++
+ #endif /* CONFIG_NATIVE_WINDOWS */
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 9155b6048..1e3a80699 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -43,6 +43,7 @@
+ #include "fils_hlp.h"
+ #include "neighbor_db.h"
+ #include "../hostapd/mxl_ctrl_iface.h"
++#include "mxl_beacon.h"
+ #include "ap/mxl_config.h"
+ 
+ #ifdef CONFIG_FILS
+@@ -1270,6 +1271,13 @@ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 	for (i = 0; i < hapd->iface->num_bss; i++)
+ 		hostapd_neighbor_set_own_report(hapd->iface->bss[i]);
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (is_6ghz_op_class(hapd->iface->conf->op_class)) {
++		if (mxl_update_rnr_check(hapd->iface)) {
++			return;
++		}
++	}
++#endif /* CONFIG_VENDOR_MXL */
+ 	hapd->iface->conf->psd_20mhz = 0;
+ 	if (hostapd_get_psd_val(hapd->iface, &hapd->iface->conf->psd_20mhz))
+ 		wpa_printf(MSG_ERROR, "hostapd_get_psd_val failed");
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 94a021a9d..3291c513a 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -60,6 +60,10 @@
+ #include "mxl_hostapd.h"
+ #include "mxl_dfs_common.h"
+ #include "mxl_wds.h"
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++#include "mxl_mld.h"
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++#include "mxl_beacon.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #include "drivers/driver_nl80211.h"
+ #include "drivers/mxl_driver_nl80211.h"
+@@ -67,10 +71,6 @@
+ #ifdef CONFIG_WDS_WPA
+ #include "wds_wpa.h"
+ #endif
+-#ifdef CONFIG_VENDOR_MXL
+-#include "mxl_hostapd.h"
+-#endif /* CONFIG_VENDOR_MXL */
+-
+ 
+ static int hostapd_flush_old_stations(struct hostapd_data *hapd, u16 reason);
+ #ifdef CONFIG_WEP
+@@ -270,6 +270,13 @@ int hostapd_reload_config(struct hostapd_iface *iface)
+ 		hostapd_clear_old(iface);
+ 		for (j = 0; j < iface->num_bss; j++)
+ 			hostapd_reload_bss(iface->bss[j]);
++#ifdef CONFIG_VENDOR_MXL
++		if (is_6ghz_op_class(hapd->iconf->op_class)) {
++			return mxl_update_rnr_check(iface);
++		}
++
++
++#endif /* CONFIG_VENDOR_MXL */
+ 		return 0;
+ 	}
+ 
+@@ -581,6 +588,9 @@ void hostapd_free_hapd_data(struct hostapd_data *hapd)
+ #ifdef CONFIG_WDS_WPA
+ 	ltq_wds_wpa_deinit(hapd);
+ #endif
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_hostapd_deinit_mld_params(hapd);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #ifdef UBUS_SUPPORT
+ 	hostapd_ubus_free_bss(hapd);
+ #endif /* UBUS_SUPPORT */
+@@ -1340,7 +1350,7 @@ static int db_table_create_radius_attributes(sqlite3 *db)
+ 	BSSID(i) = BSSID_A | BSSID_B
+ 	where
+ 	BSSID_A is ( REF_BSSID & ZERO[(47-n+1):47] )
+-	BSSID_B is ( ZERO[0:(47-n)] & bin[( ( dec(REF_BSSID[(47-n+1):47]) + i) mod 2n), n] )
++	BSSID_B is ( ZERO[0:(47-n)] & bin[( (dec(REF_BSSID[(47-n+1):47]) + i) mod 2n), n] )
+ 	and
+ 	ZERO[b:c] denotes bits b to c inclusive of a 48-bit address set to 0
+ 	REF_BSSID[b:c] denotes bits b to c inclusive of the REF_BSSID address
+@@ -1461,6 +1471,10 @@ static int hostapd_start_beacon(struct hostapd_data *hapd,
+ {
+ 	struct hostapd_bss_config *conf = hapd->conf;
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_is_mlo_enabled(conf))
++		return 0;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	if (!conf->start_disabled && ieee802_11_set_beacon(hapd) < 0)
+ 		return -1;
+ 
+@@ -2219,7 +2233,6 @@ static int hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface,
+ 			wpa_printf(MSG_DEBUG,
+ 				   "NO_IR: All chan in new chanlist are NO_IR, stop AP.");
+ 		}
+-
+ 		hostapd_set_state(iface, HAPD_IFACE_NO_IR);
+ 		iface->is_no_ir = true;
+ 		hostapd_drv_stop_ap(iface->bss[0]);
+@@ -2615,6 +2628,9 @@ static int setup_interface2(struct hostapd_iface *iface)
+ 		 * feature data. */
+ 	} else {
+ 		int ret;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		mxl_hostapd_set_eml_capab(iface);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 		if (iface->conf->acs) {
+ 			iface->freq = 0;
+@@ -3375,7 +3391,12 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 		if (is_zero_ether_addr(hapd->conf->bssid))
+ 			prev_addr = hapd->own_addr;
+ 	}
+-
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_auto_update_rnr_db(hapd->iface) < 0) {
++		wpa_printf(MSG_ERROR, "%d Failed to automatically set RNR IE", __LINE__);
++		return -1;
++	}
++#endif /* CONFIG_VENDOR_MXL */
+ 	if (hapd->iconf->mbssid) {
+ 		for (j = 0; hapd->iconf->mbssid && j < iface->num_bss; j++) {
+ 			hapd = iface->bss[j];
+@@ -3395,6 +3416,10 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 
+ 	hapd = iface->bss[0];
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_mld_setup_interfaces(iface->interfaces);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
+ 	hostapd_tx_queue_params(hapd);
+ 
+ 	ap_list_init(iface);
+@@ -3448,6 +3473,9 @@ dfs_offload:
+ #endif /* CONFIG_FST */
+ 
+ 	hostapd_set_state(iface, HAPD_IFACE_ENABLED);
++#ifdef CONFIG_VENDOR_MXL
++	mxl_update_beacon_after_rnr(iface->interfaces);
++#endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_owe_update_trans(iface);
+ 	airtime_policy_update_init(iface);
+ 	wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_ENABLED);
+@@ -3472,8 +3500,13 @@ dfs_offload:
+ 		hostapd_drv_sta_allow(hapd, NULL, 0);
+ 	}
+ 
++#ifndef CONFIG_IEEE80211BE_MXL_MLO
++/*
++ *  This code need to be enabled when aligning MLO to opensource implementation
++ */
+ 	if (iface->interfaces && iface->interfaces->count > 1)
+ 		ieee802_11_set_beacons(iface);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 	hostapd_post_up_vendor_radio_cmd(iface);
+ #ifdef CONFIG_VENDOR_MXL
+@@ -3752,6 +3785,9 @@ hostapd_alloc_bss_data(struct hostapd_iface *hapd_iface,
+ #ifdef CONFIG_SAE
+ 	dl_list_init(&hapd->sae_commit_queue);
+ #endif /* CONFIG_SAE */
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	hapd->mxl_data.sibling_hapd = NULL;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_alloc_bss_data(hapd);
+@@ -4061,6 +4097,10 @@ void hostapd_interface_deinit_free(struct hostapd_iface *iface)
+ #ifdef UBUS_SUPPORT
+ 	hostapd_ubus_free_iface(iface);
+ #endif /* UBUS_SUPPORT */
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_mlo_hostapd_interface_deinit(iface);
++	return;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	hostapd_interface_deinit(iface);
+ 	wpa_printf(MSG_DEBUG, "%s: driver=%p drv_priv=%p -> hapd_deinit",
+ 		   __func__, driver, drv_priv);
+@@ -4136,6 +4176,15 @@ int hostapd_enable_iface(struct hostapd_iface *hapd_iface)
+ 				      hapd_iface);
+ 		return -1;
+ 	}
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_update_mld_config_iface(hapd_iface, NULL) < 0) {
++		hostapd_deinit_driver(hapd_iface->bss[0]->driver,
++				      hapd_iface->bss[0]->drv_priv,
++				      hapd_iface);
++		wpa_printf(MSG_ERROR, "%s: Failed to setup mld config during enable iface", __func__);
++		return -1;
++	}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 	return 0;
+ }
+@@ -4283,23 +4332,23 @@ fail_conf_arr_realloc:
+ 
+ static void hostapd_reconf_remove_bss(struct hostapd_iface *iface, int idx)
+ {
+-#ifdef CONFIG_IEEE80211BE_MLO
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
+ 	struct hostapd_data *sibling_hapd = NULL;
+-	if (iface->conf->bss[idx]->mlo_enable) {
+-		sibling_hapd = iface->bss[idx]->sibling_hapd;
++	if (iface->conf->bss[idx]->mxl_bss_conf.mlo_enable) {
++		sibling_hapd = iface->bss[idx]->mxl_data.sibling_hapd;
+ 		if (sibling_hapd)
+-			hostapd_remove_mld_vap(iface, idx);
++			mxl_hostapd_remove_mld_vap(iface, idx);
+ 
+-		if (hostapd_deinit_gmld(iface->bss[idx]))
++		if (mxl_hostapd_deinit_gmld(iface->bss[idx]))
+ 			wpa_printf(MSG_ERROR, "MLD deinit failed");
+ 	}
+-#endif
+ 	hostapd_remove_bss(iface, idx);
+-#ifdef CONFIG_IEEE80211BE_MLO
+ 	if (sibling_hapd) {
+ 		hostapd_remove_bss(sibling_hapd->iface, sibling_hapd->conf->bss_idx);
+ 	}
+-#endif
++#else
++	hostapd_remove_bss(iface, idx);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ }
+ 
+ static int hostapd_reconf_add_bss(struct hostapd_iface *iface, struct hostapd_config *newconf, int idx)
+@@ -4313,13 +4362,9 @@ static int hostapd_reconf_add_bss(struct hostapd_iface *iface, struct hostapd_co
+ 
+ 	idx = iface->num_bss - 1;
+ 	hostapd_flush_old_stations(iface->bss[idx], WLAN_REASON_PREV_AUTH_NOT_VALID);
+-#ifdef CONFIG_IEEE80211BE_MLO
+-	if (update_mld_config_iface(iface, NULL) < 0) {
+-		wpa_printf(MSG_ERROR, "%s: Failed to setup mld config", __func__);
+-		return -1;
+-	}
+-	mld_setup_interfaces(iface->interfaces);
+-#endif
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_mld_setup_interfaces(iface->interfaces);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 	if (start_ctrl_iface_bss(iface->bss[idx])){
+ 		wpa_printf(MSG_ERROR, "Failed adding new BSS (%s) to control interface",
+@@ -4475,8 +4520,14 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 	}
+ 	/* reset to default value */
+ 	hapd_iface->whm_if_fail = true;
+-
+-	wpa_msg(hapd_iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_DISABLED);
++#ifdef CONFIG_VENDOR_MXL
++	if(mxl_invalidate_rnr_in_beacon(hapd_iface->interfaces->iface[0])) {
++		wpa_printf(MSG_ERROR, "%d Failed to invalidate RNR IE", __LINE__);
++		return -1;
++	}
++#endif /* CONFIG_VENDOR_MXL */
++	for (j = 0; j < hapd_iface->num_bss; j++)
++		wpa_msg(hapd_iface->bss[j]->msg_ctx, MSG_INFO, AP_EVENT_DISABLED);
+ 	driver = hapd_iface->bss[0]->driver;
+ 	drv_priv = hapd_iface->bss[0]->drv_priv;
+ 
+@@ -4496,8 +4547,31 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 	/* same as hostapd_interface_deinit without deinitializing ctrl-iface */
+ 	for (j = 0; j < hapd_iface->num_bss; j++) {
+ 		struct hostapd_data *hapd = hapd_iface->bss[j];
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		struct hostapd_data *sibling_hapd = NULL;
++		if (hapd->conf->mxl_bss_conf.mlo_enable) {
++			sibling_hapd = hapd->mxl_data.sibling_hapd;
++			if (sibling_hapd) {
++				wpa_msg(sibling_hapd->msg_ctx, MSG_INFO, AP_EVENT_DISABLED);
++				hostapd_cleanup_cs_params(sibling_hapd);
++				hostapd_cleanup_cca_params(sibling_hapd);
++				mxl_hostapd_remove_mld_vap(hapd_iface, j);
++			}
++
++			if (mxl_hostapd_deinit_gmld(hapd_iface->bss[j])) {
++				wpa_printf(MSG_ERROR, "MLD deinit failed");
++				return -1;
++			}
++		}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 		hostapd_bss_deinit_no_free(hapd);
+ 		hostapd_free_hapd_data(hapd);
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		if (sibling_hapd) {
++			hostapd_bss_deinit_no_free(sibling_hapd);
++			hostapd_free_hapd_data(sibling_hapd);
++		}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	}
+ 
+ 	hostapd_deinit_driver(driver, drv_priv, hapd_iface);
+@@ -4510,6 +4584,12 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 	wpa_printf(MSG_DEBUG, "Interface %s disabled",
+ 		   hapd_iface->bss[0]->conf->iface);
+ 	hostapd_set_state(hapd_iface, HAPD_IFACE_DISABLED);
++#ifdef CONFIG_VENDOR_MXL
++	if (is_6ghz_op_class(hapd_iface->conf->op_class)) {
++		if (mxl_update_rnr_check(hapd_iface))
++			return -1;
++	}
++#endif /* CONFIG_VENDOR_MXL */
+ 	return 0;
+ }
+ 
+@@ -4770,6 +4850,12 @@ int hostapd_add_iface(struct hapd_interfaces *interfaces, char *buf)
+ 	}
+ 	conf = NULL;
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_update_mld_config_iface(hapd_iface, NULL) < 0) {
++		wpa_printf(MSG_ERROR, "%s: Failed to setup mld config", __func__);
++		goto fail;
++	}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	if (start_ctrl_iface(hapd_iface) < 0)
+ 		goto fail;
+ 
+@@ -4794,6 +4880,9 @@ fail:
+ 				wpa_printf(MSG_DEBUG, "%s: free hapd %p (%s)",
+ 					   __func__, hapd_iface->bss[i],
+ 					   hapd->conf->iface);
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++				mxl_hosatpd_mld_free_from_affiliated_link(hapd);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 				hostapd_cleanup(hapd);
+ 				os_free(hapd);
+ 				hapd_iface->bss[i] = NULL;
+@@ -4839,7 +4928,14 @@ static int hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx)
+ 
+ 	iface->conf->num_bss--;
+ 	for (i = idx; i < iface->conf->num_bss; i++)
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	{
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 		iface->conf->bss[i] = iface->conf->bss[i + 1];
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		iface->bss[i]->conf->bss_idx--;
++	}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ 	return 0;
+ }
+@@ -4855,6 +4951,15 @@ int hostapd_remove_iface(struct hapd_interfaces *interfaces, char *buf)
+ 		if (hapd_iface == NULL)
+ 			return -1;
+ 		if (!os_strcmp(hapd_iface->conf->bss[0]->iface, buf)) {
++#ifdef CONFIG_VENDOR_MXL
++			bool mxl_freq_6g;
++			if(mxl_invalidate_rnr_in_beacon(interfaces->iface[0])) {
++				wpa_printf(MSG_ERROR, "%d Failed to invalidate RNR IE", __LINE__);
++				return -1;
++			}
++			mxl_freq_6g = is_6ghz_freq(hapd_iface->freq);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 			wpa_printf(MSG_INFO, "Remove interface '%s'", buf);
+ 			hapd_iface->driver_ap_teardown =
+ 				!!(hapd_iface->drv_flags &
+@@ -4868,6 +4973,15 @@ int hostapd_remove_iface(struct hapd_interfaces *interfaces, char *buf)
+ 				k++;
+ 			}
+ 			interfaces->count--;
++#ifdef CONFIG_VENDOR_MXL
++			if (mxl_freq_6g) {
++				if (interfaces->count && mxl_auto_update_rnr_db(interfaces->iface[0])) {
++					wpa_printf(MSG_ERROR, "%d Failed to update RNR IE", __LINE__);
++					return -1;
++				}
++				mxl_update_beacon_after_rnr(interfaces);
++			}
++#endif /* CONFIG_VENDOR_MXL */
+ 			return 0;
+ 		}
+ 
+@@ -4876,7 +4990,11 @@ int hostapd_remove_iface(struct hapd_interfaces *interfaces, char *buf)
+ 				hapd_iface->driver_ap_teardown =
+ 					!(hapd_iface->drv_flags &
+ 					  WPA_DRIVER_FLAGS_AP_TEARDOWN_SUPPORT);
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++				return mxl_hostapd_remove_iface(hapd_iface, j);
++#else
+ 				return hostapd_remove_bss(hapd_iface, j);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 			}
+ 		}
+ 	}
+@@ -5969,6 +6087,26 @@ void hostapd_unconnected_sta_scan_fail_handle_cb (void *eloop_ctx, void *timeout
+ 	hapd->iface->in_unconnected_sta_scan = 0;
+ }
+ 
+-#ifdef CONFIG_VENDOR_MXL
++#ifdef CONFIG_VENDOR_MXL 
+ int mxl_setup_interface2(struct hostapd_iface *iface) { return setup_interface2(iface); }
++
++void mxl_channel_list_update_timeout(void *eloop_ctx, void *timeout_ctx)
++{
++	channel_list_update_timeout(eloop_ctx, timeout_ctx);
++}
++
++void mxl_hostapd_bss_deinit(struct hostapd_data *hapd)
++{
++	hostapd_bss_deinit(hapd);
++}
++
++int mxl_hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx)
++{
++	return hostapd_remove_bss(iface, idx);
++}
++
++void mxl_hostapd_clear_drv_priv(struct hostapd_data *hapd)
++{
++	return hostapd_clear_drv_priv(hapd);
++}
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index bb276fca6..55b100869 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -20,6 +20,7 @@
+ #include "drivers/driver.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_hostapd.h"
++#include "mxl_mld.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #ifdef UBUS_SUPPORT
+ #include "ubus.h"
+@@ -110,6 +111,9 @@ struct hapd_interfaces {
+ 	char *dpp_pb_cmd;
+ #endif /* CONFIG_DPP3 */
+ #endif /* CONFIG_DPP */
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	struct mxl_hapd_interfaces mxl_interfaces;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ #ifdef UBUS_SUPPORT
+ 	struct ubus_object ubus;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index f770db5b2..ffe072095 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -61,6 +61,7 @@
+ #include "mxl_hostapd.h"
+ #include "mxl_coexistence.h"
+ #include "mxl_wds.h"
++#include "mxl_beacon.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #ifdef CONFIG_WDS_WPA
+ #include "wds_wpa.h"
+@@ -8062,6 +8063,13 @@ u8 * hostapd_eid_rnr(struct hostapd_data *hapd, u8 *eid, u32 type)
+ 	enum colocation_mode mode = get_colocation_mode(hapd);
+ 	bool ap_mld = false;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	eid = mxl_hostapd_eid_rnr(hapd, eid);
++	/* Fallback to OS RNR flow if no contribution to RNR IE from legacy implemetation */
++	if (eid != eid_start)
++		return eid;
++#endif /* CONFIG_VENDOR_MXL */
++
+ #ifdef CONFIG_IEEE80211BE
+ 	ap_mld = !!hapd->conf->mld_ap;
+ #endif /* CONFIG_IEEE80211BE */
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index e97255614..425f6b016 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -376,7 +376,13 @@ static void hostapd_ext_capab_byte(struct hostapd_data *hapd, u8 *pos, int idx,
+ 
+ 	switch (idx) {
+ 	case 0: /* Bits 0-7 */
++#ifdef CONFIG_VENDOR_MXL
++		if ((hapd->iconf->obss_interval) && (hapd->iconf->ieee80211n ||
++		    hapd->iconf->ieee80211ac || hapd->conf->vendor_vht ||
++		    hapd->iconf->ieee80211ax || hapd->iconf->ieee80211be))
++#else /* CONFIG_VENDOR_MXL */
+ 		if (hapd->iconf->obss_interval)
++#endif /* CONFIG_VENDOR_MXL */
+ 			*pos |= 0x01; /* Bit 0 - Coexistence management */
+ 		if (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA)
+ 			*pos |= 0x04; /* Bit 2 - Extended Channel Switching */
+diff --git a/src/ap/mxl_beacon.c b/src/ap/mxl_beacon.c
+new file mode 100644
+index 000000000..ac2a04877
+--- /dev/null
++++ b/src/ap/mxl_beacon.c
+@@ -0,0 +1,727 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
++#include "ieee802_11.h"
++#include "mxl_mld.h"
++#include "hostapd.h"
++#include "ap_config.h"
++#include "ap_drv_ops.h"
++#include "beacon.h"
++#include "sta_info.h"
++#include "hs20.h"
++#include "wmm.h"
++#include "wpa_auth.h"
++#include "wpa_auth_glue.h"
++#include "mxl_beacon.h"
++#include "crc32.h"
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++size_t mxl_hostapd_eid_ml_probe_len(struct hostapd_data *hapd, const u8 *probe_req_mle)
++{
++	size_t buflen = 0;
++	if (!mxl_is_mlo_enabled(hapd->conf))
++		return 0;
++
++	if (hapd->iconf->ieee80211be && hapd->conf->mxl_bss_conf.mlo_enable && hapd->conf->mxl_bss_conf.ml_ie_add) {
++		if (probe_req_mle) {
++			buflen += mxl_hostapd_multilink_ie_len(hapd, ML_PROBE);
++		}
++		else {
++			buflen += mxl_hostapd_multilink_ie_len(hapd, ML_BASIC);
++		}
++	}
++	return buflen;
++}
++
++u8 * mxl_hostapd_eid_ml_probe(struct hostapd_data *hapd, const u8 *probe_req_mle, u8 *pos)
++{
++	if (hapd->iconf->ieee80211be && hapd->conf->mxl_bss_conf.mlo_enable && hapd->conf->mxl_bss_conf.ml_ie_add) {
++		if (probe_req_mle && hapd->conf->mxl_bss_conf.mld_num_simul_links) {
++			pos = mxl_hostapd_eid_multilink(hapd, NULL, pos, ML_PROBE, 0, false);
++		} else {
++			pos = mxl_hostapd_eid_multilink(hapd, NULL, pos, ML_BASIC, 0, false);
++		}
++	}
++	return pos;
++}
++
++size_t mxl_hostapd_multilink_ie_len_is_mlo(struct hostapd_data *hapd)
++{
++	if (hapd->iconf->ieee80211be && hapd->conf->mxl_bss_conf.mlo_enable && hapd->conf->mxl_bss_conf.ml_ie_add) {
++		return mxl_hostapd_multilink_ie_len(hapd, 0);
++	}
++
++	return 0;
++}
++
++u8 * mxl_hostapd_eid_multilink_is_mlo(struct hostapd_data *hapd, u8 *pos)
++{
++	if (hapd->iconf->ieee80211be && hapd->conf->mxl_bss_conf.mlo_enable && hapd->conf->mxl_bss_conf.ml_ie_add) {
++		pos = mxl_hostapd_eid_multilink(hapd, NULL, pos, ML_BASIC, 0, false);
++	}
++	return pos;
++}
++
++bool mxl_check_ml_probe_type_address_check(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt)
++{
++	if (hapd->conf->mxl_bss_conf.mlo_enable &&
++			(!os_memcmp(hapd->own_addr, mgmt->da, ETH_ALEN) ||
++			 !os_memcmp(hapd->own_addr, mgmt->bssid, ETH_ALEN)))
++		return true;
++	if (hapd->iconf->multibss_enable) {
++		for (int i = (MULTIBSS_REFERENCE_BSS_IDX + 1); i < hapd->iconf->num_bss; i++) {
++			struct hostapd_data *bss = hapd->iface->bss[i];
++			if (bss && bss->conf->mxl_bss_conf.mlo_enable &&
++					(!os_memcmp(bss->own_addr, mgmt->da, ETH_ALEN) ||
++					 !os_memcmp(bss->own_addr, mgmt->bssid, ETH_ALEN)))
++				return true;
++		}
++	}
++
++	return false;
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++static u8 mxl_count_same_ssid_vap(int radio, struct hostapd_data *hapd)
++{
++	int j=0, count=0;
++	u8 empty_bssid[ETH_ALEN] = {'\0'};
++
++	for (j = 0; j < sizeof(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info)/sizeof(neigh_ap_info_field_t); j++) {
++		if (!os_memcmp(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].bssid, empty_bssid, ETH_ALEN))
++			continue; // not valid entry, skip
++		if (RNR_TBTT_INFO_BSS_PARAM_SAME_SSID & hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].BssParams)
++			count++;
++	}
++	return count;
++}
++
++static u8 mxl_count_different_ssid_vap(int radio, struct hostapd_data *hapd)
++{
++	int j=0, count=0;
++	u8 empty_bssid[ETH_ALEN] = {'\0'};
++
++	for (j = 0; j < sizeof(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info)/sizeof(neigh_ap_info_field_t); j++) {
++		if (!os_memcmp(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].bssid, empty_bssid, ETH_ALEN))
++			continue; // not valid entry, skip
++		if (!(RNR_TBTT_INFO_BSS_PARAM_SAME_SSID & hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].BssParams))
++			count++;
++	}
++	return count;
++}
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++static void mxl_create_rnr_mld_vap (u8 **pos, struct hostapd_data *hapd, bool same_mld, u8 *len, u8 rnr_padding_bytes)
++{
++	struct ieee80211_neighbor_vap_info *rnr_vap;
++	u8 bss_params = 0;
++	u8 shortSsid[4] = {'\0'};
++	u8 psd_20mhz = 0;
++	u8 mld_params[3] = {0};
++	u8 *temp_pos = *pos;
++
++	if (hostapd_get_psd_val(hapd->iface, &psd_20mhz) < 0)
++			return;
++
++	rnr_vap = (struct ieee80211_neighbor_vap_info *)*pos;
++	rnr_vap->neighbor_ap_tbtt_offset |= TBTT_OFFSET_UNKNOWN;
++	/* BSSID */
++	memcpy_s(rnr_vap->neighbor_ap_bssid, ETH_ALEN, hapd->own_addr, ETH_ALEN);
++	*pos += sizeof(*rnr_vap);
++	/* Short SSID */
++	WPA_PUT_LE32(shortSsid, ieee80211_crc32(hapd->conf->ssid.ssid, hapd->conf->ssid.ssid_len));
++	memcpy_s(*pos, sizeof(shortSsid), shortSsid, sizeof(shortSsid));
++	*pos += sizeof(shortSsid);
++
++	bss_params |= RNR_TBTT_INFO_BSS_PARAM_COLOC_AP;
++
++	if (same_mld)
++		bss_params |= RNR_TBTT_INFO_BSS_PARAM_SAME_SSID;
++
++	if (hapd->iconf->multibss_enable) {
++		bss_params |= RNR_TBTT_INFO_BSS_PARAM_MULTIPLE_BSSID;
++		if (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)
++			bss_params |= RNR_TBTT_INFO_BSS_PARAM_TRANSMITTED_BSSID;
++	}
++
++	if (hapd->conf->unsol_bcast_probe_resp_interval)
++		 bss_params |= RNR_TBTT_INFO_BSS_PARAM_20TU_PROBE_RES;
++
++	/* Bss Param */
++	*(*pos)++ = bss_params;
++	/* PSD 20MHZ */
++	*(*pos)++ = psd_20mhz;
++
++	/* MLD Parameters */
++	if (same_mld) {
++		/* same mld as reporting ap */
++		mld_params[0] = 0; /* same mld */
++	} else {
++		/* mbbsid idx */
++		mld_params[0] = (hapd->conf->bss_idx - MULTIBSS_REFERENCE_BSS_IDX);
++	}
++	mld_params[1] = hapd->conf->mxl_bss_conf.link_id;
++	mld_params[1] |= ((hapd->conf->mxl_bss_conf.mld_bpcc_count & 0xF) << 4);
++	mld_params[2] = ((hapd->conf->mxl_bss_conf.mld_bpcc_count >> 4) & 0xF);
++
++	memcpy_s(*pos, sizeof(mld_params), mld_params, sizeof(mld_params));
++	*pos += sizeof(mld_params);
++	if (rnr_padding_bytes) {
++		os_memset(*pos, 0xFF, rnr_padding_bytes);
++		*pos += rnr_padding_bytes;
++	}
++	*len += *pos - temp_pos;
++}
++
++static u8 mxl_validate_and_update_6g_op_class(struct hostapd_data *hapd, u8 OperatingClass)
++{
++	if (OperatingClass == 137 && !hapd->iconf->mxl_conf.rnr_6g_op_class_137_allowed)
++		return 134;
++
++	return OperatingClass;
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++static void mxl_create_rnr_tbtt_hdr(u8 **pos, int radio, struct hostapd_data *hapd, bool is_same_ssid)
++{
++	struct ieee80211_neighbor_ap_info *rnr;
++	rnr = (struct ieee80211_neighbor_ap_info *)*pos;
++
++	rnr->tbtt_info_hdr = 0; /* Initialize */
++	rnr->tbtt_info_hdr |=  hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].Reserved;
++	rnr->tbtt_info_hdr |=  hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].TbttInfoFieldType;
++	rnr->channel = hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].ChanNum;
++	rnr->op_class = hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].OperatingClass;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	rnr->op_class = mxl_validate_and_update_6g_op_class(hapd, rnr->op_class);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++	rnr->tbtt_info_len = is_same_ssid ? RNR_TBTT_INFO_LEN_SAME_SSID : RNR_TBTT_INFO_LEN_DIFFERENT_SSID;
++
++	*pos += sizeof(*rnr);
++}
++
++static u8 * mxl_create_rnr_vap(u8 **pos, int radio, struct hostapd_data *hapd, bool is_same_ssid, u8 *len, struct ieee80211_neighbor_ap_info *rnr)
++{
++	u8 empty_bssid[ETH_ALEN] = {'\0'};
++	size_t j, count = 0;
++	struct ieee80211_neighbor_vap_info *rnr_vap;
++	u8 *temp_pos = *pos;
++
++	for (j = 0; j < sizeof(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info)/sizeof(neigh_ap_info_field_t); j++) {
++		if (!os_memcmp(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].bssid, empty_bssid, ETH_ALEN))
++			continue; // not valid entry, skip
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++		bool matchfound = false;
++		if (hapd->iconf->multibss_enable) {
++			if (hapd->conf->mxl_bss_conf.mlo_enable && hapd->mxl_data.sibling_hapd) {
++				if (!os_memcmp(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].bssid,
++							hapd->mxl_data.sibling_hapd->own_addr, ETH_ALEN)) {
++					continue;
++				}
++			}
++			/* For NonTx BSS */
++			for (int i = (MULTIBSS_REFERENCE_BSS_IDX + 1); i < hapd->iconf->num_bss; i++)  {
++				struct hostapd_data *bss = hapd->iface->bss[i];
++				if (bss && bss->conf->mxl_bss_conf.mlo_enable && bss->mxl_data.sibling_hapd) {
++					if (!os_memcmp(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].bssid,
++								bss->mxl_data.sibling_hapd->own_addr, ETH_ALEN)) {
++						matchfound = true;
++						break;
++					}
++				}
++			}
++			if (matchfound)
++				continue;
++#if 0
++		#ToDo: Need to optimize the rnr ie wrt MLD
++		} else if (hapd->conf->mlo_enable && hapd->sibling_hapd) {
++			if (!os_memcmp(hapd->iconf->coloc_6g_ap_info[radio].bss_info[j].bssid,
++						hapd->sibling_hapd->own_addr, ETH_ALEN)) {
++				continue;
++			}
++#endif
++
++		}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++		if (!is_same_ssid  &&
++			(RNR_TBTT_INFO_BSS_PARAM_SAME_SSID & hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].BssParams)) {
++			continue;
++		}
++
++		if (is_same_ssid
++			&& !(RNR_TBTT_INFO_BSS_PARAM_SAME_SSID & hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].BssParams)) {
++			continue;
++		}
++
++		if (count == RNR_TBTT_INFO_COUNT_MAX) { //TBTT info count - 4 bits (can accomodate only 16 vaps info)
++			rnr->tbtt_info_hdr |= ((count - 1) << RNR_TBTT_INFO_COUNT_OFFSET);
++			rnr = (struct ieee80211_neighbor_ap_info *)*pos;
++			mxl_create_rnr_tbtt_hdr(pos, radio, hapd, is_same_ssid);
++			count = 0;
++		}
++
++		if (*len + RNR_TBTT_HEADER_LEN + RNR_TBTT_INFO_LEN_DIFFERENT_SSID > MAX_IE_LEN) {
++			rnr->tbtt_info_hdr |= ((count - 1) << RNR_TBTT_INFO_COUNT_OFFSET);
++			**pos = WLAN_EID_REDUCED_NEIGHBOR_REPORT;
++			len = *pos + 1;
++			*pos += 2;
++			rnr = (struct ieee80211_neighbor_ap_info *)*pos;
++			mxl_create_rnr_tbtt_hdr(pos, radio, hapd, is_same_ssid);
++
++			*len = sizeof(*rnr);
++			temp_pos = *pos;
++			count = 0;
++		}
++
++		rnr_vap = (struct ieee80211_neighbor_vap_info *)*pos;
++		rnr_vap->neighbor_ap_tbtt_offset |= hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].NeighApTbttOffset;
++		os_memcpy(rnr_vap->neighbor_ap_bssid,hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].bssid, ETH_ALEN);
++		*pos += sizeof(*rnr_vap);
++
++		if (!is_same_ssid) {
++			os_memcpy(*pos, hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].ShortSsid,
++			sizeof(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].ShortSsid));
++			*pos += sizeof(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].ShortSsid);
++		}
++		os_memcpy(*pos, &hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].BssParams, sizeof(u8));
++		*pos += sizeof(u8);
++
++		os_memcpy(*pos, &hapd->iconf->mxl_conf.coloc_6g_ap_info[radio].bss_info[j].psd_20MHz, sizeof(u8));
++		*pos += sizeof(u8);
++		*len += *pos - temp_pos;
++		temp_pos = *pos;
++
++		count++;
++	}
++	rnr->tbtt_info_hdr |= ((count - 1) << RNR_TBTT_INFO_COUNT_OFFSET);
++	return len;
++}
++
++static u8 * mxl_create_rnr(u8 **pos, int radio, struct hostapd_data *hapd, bool is_same_ssid, u8 *len)
++{
++	struct ieee80211_neighbor_ap_info *rnr;
++	rnr = (struct ieee80211_neighbor_ap_info *)*pos;
++	mxl_create_rnr_tbtt_hdr(pos, radio, hapd, is_same_ssid);
++	*len += sizeof(*rnr);
++
++	return mxl_create_rnr_vap(pos, radio, hapd, is_same_ssid, len, rnr);
++}
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++#define MLD_IE_LEN (sizeof(struct ieee80211_neighbor_ap_info) + sizeof(struct ieee80211_neighbor_vap_info) + (9 * sizeof(u8)))
++
++static u8 * mxl_create_rnr_mld(u8 **pos, struct hostapd_data *hapd, bool same_mld, u8 *len)
++{
++	struct ieee80211_neighbor_ap_info *rnr;
++	struct hostapd_data *sibling_hapd = hapd->mxl_data.sibling_hapd;
++	u8 rnr_padding_bytes = hapd->iconf->mxl_conf.rnr_tbtt_mld_non_zero_pad;
++	u8 op_class, channel;
++
++	if (!sibling_hapd)
++		return len;
++
++	if (*len + MLD_IE_LEN > MAX_IE_LEN) {
++		**pos = WLAN_EID_REDUCED_NEIGHBOR_REPORT;
++		len = *pos + 1;
++		*len = 0;
++		*pos += 2;
++	}
++	rnr = (struct ieee80211_neighbor_ap_info *)*pos;
++	rnr->tbtt_info_hdr = 0; /* Initialize */
++	rnr->tbtt_info_hdr |= 0; /* Reserved */
++	rnr->tbtt_info_hdr |= 0; /*TbttInfoFieldType*/
++
++	rnr->channel = sibling_hapd->iconf->channel;
++	if (ieee80211_freq_to_channel_ext(sibling_hapd->iface->freq,
++				sibling_hapd->iconf->secondary_channel,
++				hostapd_get_oper_chwidth(sibling_hapd->iconf),
++				&op_class, &channel) == NUM_HOSTAPD_MODES) {
++		wpa_printf(MSG_ERROR, "ieee80211_freq_to_channel_ext failed in mxl_create_rnr_mld!");
++	}
++	rnr->op_class = op_class;
++	rnr->op_class = mxl_validate_and_update_6g_op_class(hapd, rnr->op_class);
++	rnr->tbtt_info_hdr |= 0; /* TbttInfocount, always 1 */;
++
++
++	/* TBTT offset + BSSID + Short SSID + BSS param + 20MHzPSD + MLD Parameters*/
++	rnr->tbtt_info_len = RNR_TBTT_INFO_LEN_MLD + rnr_padding_bytes;
++	*pos += sizeof(*rnr);
++	*len += sizeof(*rnr);
++
++	mxl_create_rnr_mld_vap(pos, sibling_hapd, same_mld, len, rnr_padding_bytes);
++	return len;
++}
++
++static u8 mxl_get_num_coloc_6g_ap(struct hostapd_data *hapd)
++{
++	if (is_6ghz_op_class(hapd->iface->conf->op_class))
++		return 0;
++
++	if (hapd->mxl_data.sibling_hapd && is_6ghz_op_class(hapd->mxl_data.sibling_hapd->iface->conf->op_class))
++		return hapd->mxl_data.sibling_hapd->iconf->num_bss - 1;
++
++	return 255;
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
++/*
++ * Add Reduced Neighbor Report element to Beacons and Probe Responses
++ */
++u8 * mxl_hostapd_eid_rnr(struct hostapd_data *hapd, u8 *eid)
++{
++	u8 *pos = eid;
++	u8 *len;
++	size_t i,same_ssid_vap, different_ssid_vap;
++
++	*pos++ = WLAN_EID_REDUCED_NEIGHBOR_REPORT;
++	len = pos++;
++	*len = 0;
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (hapd->iconf->multibss_enable) {
++		/* Reorting AP is always the Tx BSS */
++		if (hapd->conf->mxl_bss_conf.mlo_enable)
++			len = mxl_create_rnr_mld (&pos, hapd, true, len);
++
++		/* For NonTx BSS */
++		for (i = (MULTIBSS_REFERENCE_BSS_IDX + 1); i < hapd->iconf->num_bss; i++)  {
++			struct hostapd_data *bss = hapd->iface->bss[i];
++			if (bss && bss->conf->mxl_bss_conf.mlo_enable) {
++				len = mxl_create_rnr_mld (&pos, bss, false, len);
++			}
++		}
++	} else if (hapd->conf->mxl_bss_conf.mlo_enable) {
++		len = mxl_create_rnr_mld (&pos, hapd, true, len);
++	}
++	/*
++	 * To-Do:
++	 * This is a hack done to counter the WFA script which returns the op_class
++	 * for each AP neighbor
++	 */
++
++	if (hapd->conf->mxl_bss_conf.mlo_enable && (mxl_get_num_coloc_6g_ap(hapd) < 2))
++		goto end;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++	if (hapd->conf->mxl_bss_conf.rnr_auto_update) {
++		for(i = 0;  i < sizeof(hapd->iconf->mxl_conf.coloc_6g_ap_info)/sizeof(colocated_6g_ap_info_t) ; i++) {
++			same_ssid_vap = mxl_count_same_ssid_vap(i, hapd);
++			different_ssid_vap = mxl_count_different_ssid_vap(i, hapd);
++			if (!same_ssid_vap && !different_ssid_vap)
++				continue;
++			if (different_ssid_vap)
++				len = mxl_create_rnr(&pos, i, hapd, false, len);
++			if (same_ssid_vap)
++				len = mxl_create_rnr(&pos, i, hapd, true, len);
++		}
++	}
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++end:
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++	/* don't add empty IE */
++	if (pos - eid - 2 == 0)
++		return eid;
++
++	return pos;
++}
++
++int mxl_update_rnr_in_beacon(struct hostapd_data *hapd, struct update_rnr rnr, int radio_index, int vap_index)
++{
++	int ret = 0;
++	errno_t err = EOK;
++
++	wpa_printf(MSG_DEBUG, "CTRL: entry update_rnr_in_beacon %d radio %d vap",
++				radio_index, vap_index);
++
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].ChanNum = rnr.Channel;
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].OperatingClass = rnr.OperatingClass;
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].Reserved = 0;
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].TbttInfoFieldType = 0; /* TODO (6GHz) Dynamic , possible 0,1,2,3 (1,2,3 are reserverd) */
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].NeighApTbttOffset = TBTT_OFFSET_UNKNOWN; /* TODO (6GHz) Dynamic, 255=unknown */
++
++
++	if (os_memcmp(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].bssid , rnr.bssid, ETH_ALEN)) {
++		hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].TbttInfoCount++;
++		wpa_printf(MSG_DEBUG,"CTRL: update_rnr_in_beacon: Increase the tbtt count %d",
++			hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].TbttInfoCount);
++	}
++	else
++		wpa_printf(MSG_DEBUG,"CTRL: update_rnr_in_beacon: Not increase the tbtt count %d",
++			hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].TbttInfoCount);
++	/*
++	OCT Recommended 0
++	Same SSID  x
++	Multiple BSSID x
++	Transmitted BSSID x
++	Member of ESS with 2.4/5GHz Co-located AP(#20024) 0
++	20 TU Probe Response Active x
++	Co-Located AP 1
++	Reserved 0
++	0 1 x 0 x x x 0
++	*/
++
++	err = memcpy_s(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].bssid, ETH_ALEN, rnr.bssid, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR,"CTRL: memcpy_s error %d", err);
++		return -1;
++	}
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams = 0; /* clear */
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams
++		 |= RNR_TBTT_INFO_BSS_PARAM_COLOC_AP; /*TODO (6GHz) Dynamic */
++
++	if (rnr.unsolicited_frame_support) {
++		wpa_printf(MSG_DEBUG,"CTRL: update_rnr_in_beacon: 20TU probe response enabled");
++		hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams
++			|= RNR_TBTT_INFO_BSS_PARAM_20TU_PROBE_RES;
++	} else {
++		wpa_printf(MSG_DEBUG,"CTRL: update_rnr_in_beacon: 20TU probe response disabled");
++		hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams
++			&= ~RNR_TBTT_INFO_BSS_PARAM_20TU_PROBE_RES;
++	}
++
++	if (rnr.multibss_enable) {
++		hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams
++			|=  RNR_TBTT_INFO_BSS_PARAM_MULTIPLE_BSSID;
++		if (rnr.is_transmitted_bssid) {
++			hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams
++				|=  RNR_TBTT_INFO_BSS_PARAM_TRANSMITTED_BSSID;
++		}
++	}
++
++	if (!os_memcmp(hapd->conf->ssid.ssid, rnr.ssid, hapd->conf->ssid.ssid_len) && !rnr.hidden_mode) {
++		wpa_printf(MSG_DEBUG, "CTRL: set_beacon_with_snr: Same ssid field set in RNR");
++		hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].BssParams |= RNR_TBTT_INFO_BSS_PARAM_SAME_SSID;
++	}
++
++	err = memcpy_s(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].Ssid, SSID_MAX_LEN, rnr.ssid, strnlen_s((const char *)rnr.ssid, SSID_MAX_LEN));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR,"CTRL: memcpy_s error %d", err);
++		return -1;
++	}
++	/*
++	 * Short SSID calculation is identical to FCS and it is defined in
++	 * IEEE802.11-REVmd/D2.2 9.4.2.170.3
++	 */
++	WPA_PUT_LE32(hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].ShortSsid,
++			ieee80211_crc32(rnr.ssid, strnlen_s((const char *)rnr.ssid, SSID_MAX_LEN)));
++
++	hapd->iconf->mxl_conf.coloc_6g_ap_info[radio_index].bss_info[vap_index].psd_20MHz = rnr.psd_20MHz;
++
++	wpa_printf(MSG_DEBUG, "CTRL: exit update_rnr_in_beacon");
++
++	return ret;
++}
++
++int mxl_invalidate_rnr_in_beacon(struct hostapd_iface *iface)
++{
++	int radio_idx;
++	struct hostapd_iface *radio;
++	struct hapd_interfaces *interfaces = iface->interfaces;
++
++	if (!interfaces) {
++		wpa_printf(MSG_ERROR, "%d interface not available", __LINE__);
++		return -1;
++	}
++
++	for(radio_idx = 0; radio_idx < interfaces->count; radio_idx++) {
++		radio = interfaces->iface[radio_idx];
++		wpa_printf(MSG_DEBUG, "%d cleaning for radio:%d", __LINE__, radio_idx);
++		if (!os_memset(radio->conf->mxl_conf.coloc_6g_ap_info, 0,
++			  sizeof(radio->conf->mxl_conf.coloc_6g_ap_info)))
++			return -1;
++	}
++	return 0;
++}
++
++int mxl_auto_update_rnr_db(struct hostapd_iface *iface)
++{
++	size_t i, radio_idx, vap_idx;
++	size_t six_ghz_iface_idx = 0;
++	size_t six_ghz_vap_idx;
++	int ret = 0;
++	u8 psd = 0;
++	struct hapd_interfaces *interfaces;
++
++	if (!iface) {
++		wpa_printf(MSG_ERROR, "%d iface not available", __LINE__);
++		return -1;
++	}
++
++	interfaces = iface->interfaces;
++	if (!interfaces) {
++		wpa_printf(MSG_ERROR, "%d interface not available", __LINE__);
++		return -1;
++	}
++
++	struct update_rnr rnr[MAX_SUPPORTED_6GHZ_RADIO][MAX_SUPPORTED_6GHZ_VAP_PER_RADIO] = {0};
++	struct update_rnr *rnr_entry;
++
++	if (interfaces->count < MIN_COLOCATED_RADIO_COUNT) {
++		wpa_printf(MSG_DEBUG, "number of radios %zd is less than minimum %d",
++			interfaces->count, MIN_COLOCATED_RADIO_COUNT);
++		return 0;
++	}
++
++	/* Prepare an RNR element of 6GHz capable interfaces */
++	for (i = 0; i < interfaces->count &&
++		(six_ghz_iface_idx < MAX_SUPPORTED_6GHZ_RADIO); i++) {
++		struct hostapd_iface *iface = interfaces->iface[i];
++
++		if (!iface->bss[MASTER_VAP_BSS_IDX]->drv_priv ||
++			!iface->bss[MASTER_VAP_BSS_IDX]->started) {
++			wpa_printf(MSG_DEBUG, "%d - radio:%zd not enabled", __LINE__, i);
++			continue;
++		}
++
++		/* RNR will be updated after ACS if needed */
++		if (!iface->conf->channel) {
++			wpa_printf(MSG_INFO, "%d ACS running on radio %zd, skip RNR update",
++				   __LINE__, i);
++			return 0;
++		}
++
++		if (hostapd_get_psd_val(iface, &psd) < 0)
++			return -1;
++
++		if (SIX_GHZ_CAPABILITY_INVALID != iface->hw_features->he_capab[IEEE80211_MODE_AP].he_6ghz_capa) {
++			for (six_ghz_vap_idx = MASTER_VAP_BSS_IDX + 1;
++				six_ghz_vap_idx < iface->num_bss; six_ghz_vap_idx++) {
++
++				/* do not update rnr info of this VAP in beacon or probe response
++				 * if VAP is not started */
++				if (iface->bss[six_ghz_vap_idx]->conf->start_disabled)
++					continue;
++
++				wpa_printf(MSG_DEBUG, "%d - radio:%zd vap:%zd",
++						__LINE__, i, six_ghz_vap_idx);
++
++				rnr_entry = &rnr[six_ghz_iface_idx][six_ghz_vap_idx];
++				os_memcpy(rnr_entry->bssid,
++					iface->bss[six_ghz_vap_idx]->conf->bssid, ETH_ALEN);
++				rnr_entry->OperatingClass = 
++					iface->bss[six_ghz_vap_idx]->iconf->op_class;
++
++				rnr_entry->Channel =
++					iface->conf->channel;
++
++				os_memcpy(rnr_entry->ssid,
++					iface->bss[six_ghz_vap_idx]->conf->ssid.ssid, SSID_MAX_LEN);
++
++				rnr_entry->multibss_enable =
++					iface->bss[six_ghz_vap_idx]->iconf->multibss_enable;
++
++				rnr_entry->is_transmitted_bssid =
++					(MULTIBSS_REFERENCE_BSS_IDX ==
++						iface->bss[six_ghz_vap_idx]->conf->bss_idx);
++
++				rnr_entry->unsolicited_frame_support =
++					(iface->bss[six_ghz_vap_idx]->conf->unsol_bcast_probe_resp_interval != 0);
++
++				rnr_entry->hidden_mode =
++					!(iface->bss[six_ghz_vap_idx]->conf->ignore_broadcast_ssid == IGNORE_BROADCAST_SSID_DISABLED);
++
++				rnr_entry->psd_20MHz = psd;
++			}
++			six_ghz_iface_idx++;
++		}
++	}
++
++	if (0 == six_ghz_iface_idx)
++		return 0;
++
++	for (radio_idx = 0; radio_idx < interfaces->count; radio_idx++) {
++
++		/* For all enabled and non-6ghz radios */
++		if (!interfaces->iface[radio_idx]->bss[MASTER_VAP_BSS_IDX]->drv_priv ||
++			!interfaces->iface[radio_idx]->bss[MASTER_VAP_BSS_IDX]->started) {
++			wpa_printf(MSG_DEBUG, "%d - radio:%zd not enabled",
++					__LINE__, radio_idx);
++			continue;
++		}
++
++		/* For all non-6ghz radios */
++		if (SIX_GHZ_CAPABILITY_INVALID != interfaces->iface[radio_idx]->hw_features->he_capab[IEEE80211_MODE_AP].he_6ghz_capa)
++			continue;
++
++		for (vap_idx = MASTER_VAP_BSS_IDX + 1; vap_idx < interfaces->iface[radio_idx]->num_bss; vap_idx++) {
++			if ((NULL == interfaces->iface[radio_idx]->bss[vap_idx]->drv_priv) ||
++					!interfaces->iface[radio_idx]->bss[vap_idx]->conf->mxl_bss_conf.rnr_auto_update ||
++					!interfaces->iface[radio_idx]->bss[vap_idx]->started) {
++				wpa_printf(MSG_DEBUG, "%d - Disabled or not feasible for radio:%zd vap:%zd",
++						__LINE__, radio_idx, vap_idx);
++				wpa_printf(MSG_DEBUG, "%d - beacon_set_done:%d started:%d",
++						__LINE__, interfaces->iface[radio_idx]->bss[vap_idx]->beacon_set_done,
++						interfaces->iface[radio_idx]->bss[vap_idx]->started);
++				continue;
++			}
++			/* And every slave VAP */
++			for (six_ghz_iface_idx = 0; six_ghz_iface_idx < MAX_SUPPORTED_6GHZ_RADIO; six_ghz_iface_idx++) {
++				for (six_ghz_vap_idx = 0; six_ghz_vap_idx < MAX_SUPPORTED_6GHZ_VAP_PER_RADIO; six_ghz_vap_idx++) {
++					rnr_entry = &rnr[six_ghz_iface_idx][six_ghz_vap_idx];
++					if (rnr_entry->OperatingClass && rnr_entry->Channel) {
++						wpa_printf(MSG_DEBUG,
++						"\n\tUpdating for radio=%s vap=%s\n\tRNR parameters"
++						"- Channel=%d, OperatingClass=%d, bssid=" MACSTR 
++						" is_transmitted_bssid=%d, multibss_enable=%d, ssid=%s, "
++						"unsolicited_frame_support=%d" "hidden_mode=%d",
++						interfaces->iface[radio_idx]->phy,
++						interfaces->iface[radio_idx]->bss[vap_idx]->conf->iface,
++						rnr_entry->Channel,
++						rnr_entry->OperatingClass,
++						MAC2STR(rnr_entry->bssid),
++						rnr_entry->is_transmitted_bssid,
++						rnr_entry->multibss_enable,
++						rnr_entry->ssid,
++						rnr_entry->unsolicited_frame_support,
++						rnr_entry->hidden_mode);
++						/* Set the found RNR entry */
++						if ((ret = mxl_update_rnr_in_beacon(
++						     interfaces->iface[radio_idx]->bss[vap_idx],
++						     rnr[six_ghz_iface_idx][six_ghz_vap_idx],
++						     six_ghz_iface_idx, six_ghz_vap_idx)))
++							return ret;
++					}
++				}
++			}
++		}
++	}
++
++	return ret;
++}
++
++void mxl_update_beacon_after_rnr (struct hapd_interfaces *interfaces)
++{
++	int radio_idx, vap_idx;
++	if (interfaces == NULL)
++		return;
++
++	for (radio_idx = 0; radio_idx < interfaces->count; radio_idx++) {
++		if ((HAPD_IFACE_ENABLED == interfaces->iface[radio_idx]->state) &&
++		    interfaces->iface[radio_idx]->hw_features &&
++		    (SIX_GHZ_CAPABILITY_INVALID == interfaces->iface[radio_idx]->hw_features->he_capab[IEEE80211_MODE_AP].he_6ghz_capa)) {
++			for (vap_idx = 0; vap_idx < interfaces->iface[radio_idx]->num_bss; vap_idx++) {
++				if (interfaces->iface[radio_idx]->bss[vap_idx]->conf->mxl_bss_conf.rnr_auto_update) {
++					if (ieee802_11_update_beacon(interfaces->iface[radio_idx]->bss[vap_idx])) {
++						wpa_printf(MSG_ERROR, "Set Beacon failed");
++						return;
++					}
++				}
++			}
++		}
++	}
++	return;
++}
+diff --git a/src/ap/mxl_beacon.h b/src/ap/mxl_beacon.h
+new file mode 100644
+index 000000000..0c0064ca6
+--- /dev/null
++++ b/src/ap/mxl_beacon.h
+@@ -0,0 +1,34 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_BEACON_H
++#define MXL_BEACON_H
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++size_t mxl_hostapd_eid_ml_probe_len(struct hostapd_data *hapd, const u8 *probe_req_mle);
++u8 * mxl_hostapd_eid_ml_probe(struct hostapd_data *hapd, const u8 *probe_req_mle, u8 *pos);
++size_t mxl_hostapd_multilink_ie_len_is_mlo(struct hostapd_data *hapd);
++u8 * mxl_hostapd_eid_multilink_is_mlo(struct hostapd_data *hapd, u8 *pos);
++bool mxl_check_ml_probe_type_address_check(struct hostapd_data *hapd, const struct ieee80211_mgmt *mgmt);
++size_t mxl_hostapd_multilink_ie_len_is_mlo(struct hostapd_data *hapd);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++u8 * mxl_hostapd_eid_rnr(struct hostapd_data *hapd, u8 *eid);
++int mxl_auto_update_rnr_db(struct hostapd_iface *iface);
++void mxl_update_beacon_after_rnr (struct hapd_interfaces *interfaces);
++int mxl_invalidate_rnr_in_beacon(struct hostapd_iface *iface);
++u8 * mxl_hostapd_eid_ds_params(struct hostapd_data *hapd, u8 *eid);
++u8 * mxl_hostapd_eid_erp_info(struct hostapd_data *hapd, u8 *eid);
++u8 * mxl_hostapd_eid_country(struct hostapd_data *hapd, u8 *eid, int max_len);
++u8 * mxl_hostapd_eid_supported_op_classes(struct hostapd_data *hapd, u8 *eid);
++
++#endif /* MXL_BEACON_H */
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 01ce02832..a5940d4a4 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -250,6 +250,34 @@ struct eht_override_hw_capab {
+ 	int eht_ppe_thresholds_ppet8_for_nss4_for_ru4;
+ };
+ 
++
++#define SHORT_SSID_LEN 4
++typedef struct neigh_ap_info_field {
++	u8 NeighApTbttOffset;
++	u8 bssid[ETH_ALEN];
++	u8 ShortSsid[SHORT_SSID_LEN];
++	u8 Ssid[SSID_MAX_LEN];
++	u8 BssParams;
++	u8 psd_20MHz;
++} neigh_ap_info_field_t;
++
++#define MAX_SUPPORTED_6GHZ_VAP_PER_RADIO 32
++#define MAX_SUPPORTED_6GHZ_RADIO 2 /* Max number of 6GHz radios */
++
++typedef struct colocated_6g_ap_info {
++	u8 TbttInfoFieldType;
++	u8 Reserved;
++	u8 TbttInfoCount;
++	u8 TbttInfoLen;
++	u8 OperatingClass;
++	u8 ChanNum;
++	neigh_ap_info_field_t bss_info[MAX_SUPPORTED_6GHZ_VAP_PER_RADIO];
++} colocated_6g_ap_info_t;
++
++#define EML_CAPAB_TRANSITION_TIMEOUT_MIN 0
++#define EML_CAPAB_TRANSITION_TIMEOUT_MAX 11
++#define EML_CAPAB_TRANSITION_TIMEOUT_DEFAULT 4 /* 1TU default transition timeout */
++
+ typedef u8 macaddr[ETH_ALEN];
+ 
+ #define PROBE_REQUEST_TIME_MIN 0
+@@ -270,6 +298,7 @@ struct mxl_hostapd_config {
+ 	u8 ap_retry_limit;
+ 	u8 ap_retry_limit_data;
+ 	u8 ap_retry_limit_probe_resp;
++	colocated_6g_ap_info_t coloc_6g_ap_info[MAX_SUPPORTED_6GHZ_RADIO];
+ 
+ 	int allow_scan_during_cac;
+ 	int sub_band_dfs;
+@@ -297,6 +326,12 @@ struct mxl_hostapd_config {
+ 	u8 eht_default_pe_duration;
+ 	u8 enable_eht_debug_mode;
+ 	struct ieee80211_eht_capabilities eht_capab_dbg;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	enum multi_link_support_e mlo_supported;
++	int eht_mld_tsf_diff;
++	u8 rnr_tbtt_mld_non_zero_pad;
++	bool rnr_6g_op_class_137_allowed;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* CONFIG_IEEE80211BE */
+ 	int sProbeReqCltMode;
+ 	int ProbeReqListTimer;
+@@ -321,6 +356,21 @@ struct mxl_hostapd_bss_config {
+ 	int sBridgeMode;
+ 	macaddr *sAddPeerAP;
+ 	int num_sAddPeerAP;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	bool mlo_enable;
++	bool switch_initial_active_link;
++	bool ml_ie_add;
++	u8 link_id;
++	u8 ap_mld_mac[ETH_ALEN];
++	bool mld_num_simul_links;
++	u16 eml_transition_timeout;
++	bool mld_mediumsync_present;
++	u8 mld_mediumsync_duration;
++	u8 mld_mediumsync_ofdmedthresh;
++	u8 mld_mediumsync_maxtxop;
++	u8 mld_bpcc_count;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++	int rnr_auto_update;
+ };
+ 
+ struct hostapd_config;
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 29bd6aa12..b39d889fd 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -27,7 +27,7 @@
+ #include "hw_features.h"
+ #include "common/hw_features_common.h"
+ #include "common/wpa_ctrl.h"
+-
++#include "mxl_beacon.h"
+ 
+ #define COC_POWER_1x1_STATE 1
+ #define COC_POWER_2x2_STATE 2
+@@ -1515,6 +1515,13 @@ int mxl_hostapd_setup_bss_pre(struct hostapd_data *hapd)
+ 	struct intel_vendor_sb_timer_acl_cfg sb_timer_acl_cfg = { 0 };
+ 	(void)mxl_bss_conf;
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	if (mxl_update_mld_config_iface(hapd->iface, NULL) < 0) {
++		wpa_printf(MSG_ERROR, "%s: Failed to setup mld config", __func__);
++		return -1;
++	}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
+ 	if (mxl_hostapd_setup_interface(hapd))
+ 		return -1;
+ 
+@@ -2215,6 +2222,10 @@ int mxl_hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface)
+ 
+ 	wpa_printf(MSG_INFO, "hostapd_no_ir_channel_list_updated %d", iface->state);
+ 	if (iface->state == HAPD_IFACE_ENABLED) {
++		if (mxl_invalidate_rnr_in_beacon(iface->interfaces->iface[0])) {
++			wpa_printf(MSG_ERROR, "%d Failed to invalidate RNR IE", __LINE__);
++			return -1;
++		}
+ 		hostapd_set_state(iface, HAPD_IFACE_NO_IR);
+ 		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_NO_IR);
+ 		iface->is_no_ir = true;
+@@ -2227,6 +2238,8 @@ int mxl_hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface)
+ 		}
+ 
+ 		hostapd_cleanup_iface_partial(iface);
++		if (mxl_update_rnr_check(iface))
++			return -1;
+ 	}
+ 
+ 	if (iface->state == HAPD_IFACE_NO_IR) {
+@@ -2294,3 +2307,138 @@ int mxl_hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface)
+ 	mxl_setup_interface2(iface);
+ 	return 0;
+ }
++
++int mxl_update_rnr_check(struct hostapd_iface *iface)
++{
++	if (mxl_auto_update_rnr_db(iface->interfaces->iface[0])) {
++		wpa_printf(MSG_ERROR, "%d Failed to update RNR IE",
++					__LINE__);
++		return -1;
++	}
++	mxl_update_beacon_after_rnr(iface->interfaces);
++	return 0;
++}
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++void mxl_hostapd_remove_mld_vap(struct hostapd_iface *iface, unsigned int idx)
++{
++	hostapd_free_stas(iface->bss[idx]);
++	hostapd_free_stas(iface->bss[idx]->mxl_data.sibling_hapd);
++	mxl_hostapd_mld_remove(iface->bss[idx], 0);
++	mxl_hostapd_mld_remove(iface->bss[idx]->mxl_data.sibling_hapd, 1);
++}
++
++int mxl_hostapd_deinit_gmld(struct hostapd_data *hapd)
++{
++	struct p_ap_mld *gmld =  NULL;
++	int mld_id;
++
++	if (hapd == NULL)
++		return -1;
++
++	if (hapd->conf->mld_id == INVALID_MLD_ID)
++		return 0;
++
++	if (hapd->conf->mld_id >= MAX_SUPPORTED_MLDS) {
++		wpa_printf(MSG_ERROR, "Invalid MLD id %d. Cannot deinit gmld", hapd->conf->mld_id);
++		return -1;
++	}
++
++	mld_id = hapd->conf->mld_id;
++	gmld = &(hapd->iface->interfaces->mxl_interfaces.g_ap_mld[mld_id]);
++	os_memset(gmld, 0, sizeof(struct p_ap_mld));
++
++	wpa_printf(MSG_INFO, "MLD id %d deinitialized", hapd->conf->mld_id);
++
++	return 0;
++}
++
++int mxl_hostapd_remove_iface(struct hostapd_iface *hapd_iface, unsigned int idx)
++{
++	struct hostapd_data *sibling_hapd = NULL;
++
++	if (hapd_iface->conf->bss[idx]->mxl_bss_conf.mlo_enable) {
++		sibling_hapd = hapd_iface->bss[idx]->mxl_data.sibling_hapd;
++		if (sibling_hapd)
++			mxl_hostapd_remove_mld_vap(hapd_iface, idx);
++
++		if (mxl_hostapd_deinit_gmld(hapd_iface->bss[idx])) {
++			wpa_printf(MSG_ERROR, "MLD deinit failed");
++			return -1;
++		}
++	}
++
++	mxl_hostapd_remove_bss(hapd_iface, idx);
++	if (sibling_hapd) {
++		mxl_hostapd_remove_bss(sibling_hapd->iface, sibling_hapd->conf->bss_idx);
++		sibling_hapd = NULL;
++	}
++
++	return 0;
++}
++
++void mxl_mlo_hostapd_interface_deinit(struct hostapd_iface *iface)
++{
++	int j;
++	const struct wpa_driver_ops *driver;
++	void *drv_priv;
++	struct hostapd_data *sibling_hapd = NULL;
++
++	wpa_printf(MSG_DEBUG, "%s(%p)", __func__, iface);
++	if (iface == NULL)
++		return;
++
++	hostapd_set_state(iface, HAPD_IFACE_DISABLED);
++
++	eloop_cancel_timeout(mxl_channel_list_update_timeout, iface, NULL);
++	iface->wait_channel_update = 0;
++
++#ifdef CONFIG_FST
++	if (iface->fst) {
++		fst_detach(iface->fst);
++		iface->fst = NULL;
++	}
++#endif /* CONFIG_FST */
++
++	for (j = (int) iface->num_bss - 1; j >= 0; j--) {
++		if (!iface->bss)
++			break;
++		if(iface->conf->bss[j]->mxl_bss_conf.mlo_enable) {
++			sibling_hapd = iface->bss[j]->mxl_data.sibling_hapd;
++			if (sibling_hapd)
++				mxl_hostapd_remove_mld_vap(iface, j);
++
++			if (mxl_hostapd_deinit_gmld(iface->bss[j]))
++				wpa_printf(MSG_ERROR, "MLD deinit failed");
++		}
++
++		mxl_hostapd_bss_deinit(iface->bss[j]);
++		if (sibling_hapd) {
++			mxl_hostapd_remove_bss(sibling_hapd->iface, sibling_hapd->conf->bss_idx);
++			sibling_hapd = NULL;
++		}
++	}
++
++#ifdef NEED_AP_MLME
++	hostapd_stop_setup_timers(iface);
++	eloop_cancel_timeout(ap_ht2040_timeout, iface, NULL);
++#endif /* NEED_AP_MLME */
++	driver = iface->bss[0]->driver;
++	drv_priv = iface->bss[0]->drv_priv;
++	wpa_printf(MSG_DEBUG, "%s: driver=%p drv_priv=%p -> hapd_deinit",
++			__func__, driver, drv_priv);
++	if (driver && driver->hapd_deinit && drv_priv) {
++		if (!iface->bss[0]->mld_first_bss)
++			driver->hapd_deinit(drv_priv);
++		mxl_hostapd_clear_drv_priv(iface->bss[0]);
++	}
++	hostapd_interface_free(iface);
++}
++
++void mxl_hostapd_deinit_mld_params(struct hostapd_data *hapd)
++{
++	hapd->conf->mxl_bss_conf.ml_ie_add = 0;
++	hapd->conf->mld_id = INVALID_MLD_ID;
++	hapd->mxl_data.sibling_hapd = NULL;
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 9412d28c6..a8d9641db 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -18,6 +18,10 @@
+ #include "../drivers/driver.h"
+ #include "mxl_sub_band_dfs.h"
+ #include "mxl_zwdfs.h"
++#include "sta_info.h"
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++#include "mxl_mld.h"
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 
+ #define MXL_AID_MAX				447
+ #define MXL_AID_OFFSET			191
+@@ -111,8 +115,17 @@ struct mxl_hostapd_data {
+ 	u8 channel_load_token;
+ 	u8 noise_histogram_token;
+ 	u8 sta_statistics_token;
++	struct hostapd_data *sibling_hapd;
+ };
+ 
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++struct mxl_hapd_interfaces {
++	struct p_ap_mld g_ap_mld[MAX_SUPPORTED_MLDS];
++#define ML_AID_WORDS ((128 + 31) / 32)
++	u32 non_ap_mld_aid[ML_AID_WORDS];
++};
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
+ int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
+ 			unsigned int vendor_id, unsigned int subcmd,
+ 			void *input_data, size_t input_data_size,
+@@ -134,6 +147,7 @@ int mxl_hostapd_drv_get_vendor_data_at_least(struct hostapd_data *hapd,
+ 
+ struct hostapd_iface;
+ struct sta_info;
++struct hapd_interfaces;
+ 
+ int mxl_hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_hostapd_free_aid(struct hostapd_data *hapd, struct sta_info *sta);
+@@ -175,4 +189,15 @@ const char * mxl_he_6ghz_pwr_mode_text(enum he_6ghz_ap_type pwr_mode);
+ int mxl_hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface);
+ int mxl_setup_interface2(struct hostapd_iface *iface);
+ 
++void mxl_mlo_hostapd_interface_deinit(struct hostapd_iface *iface);
++void mxl_hostapd_remove_mld_vap(struct hostapd_iface *iface, unsigned int idx);
++int mxl_hostapd_deinit_gmld(struct hostapd_data *hapd);
++int mxl_mld_setup_interfaces (struct hapd_interfaces *interfaces);
++void mxl_hostapd_deinit_mld_params(struct hostapd_data *hapd);
++int mxl_hostapd_remove_iface(struct hostapd_iface *hapd_iface, unsigned int j);
++void mxl_channel_list_update_timeout(void *eloop_ctx, void *timeout_ctx);
++void mxl_hostapd_bss_deinit(struct hostapd_data *hapd);
++int mxl_hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx);
++void mxl_hostapd_clear_drv_priv(struct hostapd_data *hapd);
++int mxl_update_rnr_check(struct hostapd_iface *iface);
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/ap/mxl_mld.c b/src/ap/mxl_mld.c
+new file mode 100644
+index 000000000..0524dc6a5
+--- /dev/null
++++ b/src/ap/mxl_mld.c
+@@ -0,0 +1,1181 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
++#include "common/mxl_ieee802_11_common.h"
++#include "ieee802_11.h"
++#include "mxl_mld.h"
++#include "hostapd.h"
++#include "ap_config.h"
++#include "ap_drv_ops.h"
++#include "beacon.h"
++#include "sta_info.h"
++#include "hs20.h"
++#include "wmm.h"
++#include "wpa_auth.h"
++#include "wpa_auth_glue.h"
++#include "mxl_wpa_auth_glue.h"
++#include "mxl_wds.h"
++#include "mxl_beacon.h"
++
++static void mxl_set_link_id(struct hostapd_data *hapd)
++{
++	if (is_6ghz_op_class(hapd->iconf->op_class))
++		hapd->conf->mxl_bss_conf.link_id = LINK_ID_6G;
++	else if (hapd->iface->freq >= 5180 && hapd->iface->freq <= 5900)
++		hapd->conf->mxl_bss_conf.link_id = LINK_ID_5G;
++	else
++		hapd->conf->mxl_bss_conf.link_id = LINK_ID_2G;
++}
++
++static void mxl_update_mld_info(struct hostapd_data *hapd, int mld_id, bool set_ap_mld_mac)
++{
++	struct p_ap_mld *p_ap_mld = NULL;
++
++	if (!hapd || (mld_id >= MAX_SUPPORTED_MLDS))
++		return;
++
++	p_ap_mld = &(hapd->iface->interfaces->mxl_interfaces.g_ap_mld[mld_id]);
++	if (p_ap_mld->num_links >= MAX_NUM_LINKS)
++		return;
++
++	p_ap_mld->affiliated_links[p_ap_mld->num_links++] = hapd;
++	if (set_ap_mld_mac)
++		memcpy_s(p_ap_mld->ap_mld_mac, ETH_ALEN, hapd->conf->mxl_bss_conf.ap_mld_mac, ETH_ALEN);
++
++	hapd->conf->mld_id = mld_id;
++}
++
++static bool mxl_is_ap_mld_mac_duplicate(struct hostapd_data *hapd, struct p_ap_mld *p_ap_mld)
++{
++	int link, mld_configured_count = 0;
++
++	for (link = 0; link < p_ap_mld->num_links; link++) {
++		if (!hostapd_mac_comp(p_ap_mld->affiliated_links[link]->conf->mxl_bss_conf.ap_mld_mac, hapd->conf->mxl_bss_conf.ap_mld_mac)) {
++			mld_configured_count++;
++		}
++	}
++
++	if (mld_configured_count == MAX_NUM_LINKS)
++		return true;
++	else
++		return false;
++}
++
++int mxl_update_mld_config_iface(struct hostapd_iface *iface, void *ctx)
++{
++#define SET_AP_MLD_MAC true
++#define DO_NOT_SET_AP_MLD_MAC false
++
++	struct hostapd_data *hapd = NULL;
++	struct p_ap_mld *p_ap_mld = NULL;
++	bool ap_mld_found;
++	u8 first_free_mld_idx;
++	int i, j;
++
++	for (i = 0; i < iface->num_bss; i++) {
++		ap_mld_found = false;
++		first_free_mld_idx = INVALID_MLD_ID;
++		hapd = iface->bss[i];
++
++		if (hapd->conf->mxl_bss_conf.mlo_enable && (hapd->conf->mld_id == INVALID_MLD_ID)) {
++			/* Find if there exists an affiliated link with AP MLD */
++			for (j = 0; j < MAX_SUPPORTED_MLDS; j++) {
++				p_ap_mld = &(iface->interfaces->mxl_interfaces.g_ap_mld[j]);
++				if (p_ap_mld->num_links && !hostapd_mac_comp(p_ap_mld->ap_mld_mac, hapd->conf->mxl_bss_conf.ap_mld_mac)) {
++					if (mxl_is_ap_mld_mac_duplicate(hapd, p_ap_mld)) {
++						wpa_printf(MSG_ERROR, "The duplicate AP MLD mac address("MACSTR") detected !!",
++						  MAC2STR(p_ap_mld->ap_mld_mac));
++						return -1;
++					}
++					ap_mld_found = true;
++					mxl_update_mld_info(hapd, j, DO_NOT_SET_AP_MLD_MAC);
++					break;
++				} else if (!p_ap_mld->num_links && (first_free_mld_idx == INVALID_MLD_ID)) {
++					first_free_mld_idx = j; /* Store the first free index in the AP MLD array */
++					break;
++				}
++			}
++
++			if (!ap_mld_found && first_free_mld_idx != INVALID_MLD_ID)
++				mxl_update_mld_info(hapd, first_free_mld_idx, SET_AP_MLD_MAC);
++
++			if (j == MAX_SUPPORTED_MLDS) {
++				wpa_printf(MSG_ERROR, "No free MLD id available");
++				return -1;
++			}
++		}
++	}
++
++#undef SET_AP_MLD_MAC
++#undef DO_NOT_SET_AP_MLD_MAC
++
++	return 0;
++}
++
++void mxl_hostapd_set_eml_capab(struct hostapd_iface *iface)
++{
++	struct hostapd_hw_modes *mode = iface->hw_features;
++	iface->conf->mxl_conf.mlo_supported = mode->eml_capa.ml_support;
++}
++
++void mxl_hosatpd_mld_free_from_affiliated_link(struct hostapd_data *hapd)
++{
++	struct p_ap_mld *p_ap_mld;
++	u8 mld_id, i;
++
++	if (!hapd || !hapd->conf->mxl_bss_conf.mlo_enable)
++		return;
++
++	mld_id = hapd->conf->mld_id;
++	if (mld_id >= MAX_SUPPORTED_MLDS)
++		return;
++
++	p_ap_mld = &hapd->iface->interfaces->mxl_interfaces.g_ap_mld[mld_id];
++
++	for (i = 0; i < MAX_NUM_LINKS; i++) {
++		if (p_ap_mld->affiliated_links[i] == hapd) {
++			p_ap_mld->affiliated_links[i] = NULL;
++			p_ap_mld->num_links--;
++			break;
++		}
++	}
++}
++
++int mxl_mld_global_init(struct hapd_interfaces *interfaces)
++{
++	return interfaces->for_each_interface(interfaces, mxl_update_mld_config_iface, NULL);
++}
++
++int mxl_mld_global_deinit(struct hapd_interfaces *interfaces)
++{
++	os_memset(interfaces->mxl_interfaces.g_ap_mld, 0, sizeof(interfaces->mxl_interfaces.g_ap_mld));
++	return 0;
++}
++
++bool mxl_hostapd_verify_mld_config(struct p_ap_mld *mld)
++{
++	struct hostapd_data *link1 = mld->affiliated_links[LINK1];
++	struct hostapd_data *link2 = mld->affiliated_links[LINK2];
++	bool is_sae_link1, is_sae_link2;
++
++	if (link1 == NULL || link2 == NULL)
++		return false;
++
++	/* possible key-mgmts for MLD are only OWE and SAE */
++	is_sae_link1 = !(link1->conf->wpa_key_mgmt & WPA_KEY_MGMT_OWE);
++	is_sae_link2 = !(link2->conf->wpa_key_mgmt & WPA_KEY_MGMT_OWE);
++
++	if (hostapd_mac_comp(link1->conf->mxl_bss_conf.ap_mld_mac, link2->conf->mxl_bss_conf.ap_mld_mac) ||
++			(link1->conf->mld_id != link2->conf->mld_id) ||
++			(link1->conf->ieee80211w != link2->conf->ieee80211w) ||
++			(is_sae_link1 && is_sae_link2 && (link1->conf->sae_pwe != link2->conf->sae_pwe)) ||
++			(!(link1->conf->wpa_key_mgmt & link2->conf->wpa_key_mgmt)) ||
++			(link1->conf->wpa != link2->conf->wpa) ||
++			(link1->conf->wpa_pairwise != link2->conf->wpa_pairwise) ||
++			(link1->conf->rsn_pairwise != link2->conf->rsn_pairwise) ||
++			(os_strncmp((const char *)link1->conf->ssid.ssid, (const char *)link2->conf->ssid.ssid, MAX(link1->conf->ssid.ssid_len, link2->conf->ssid.ssid_len)))) {
++		wpa_printf(MSG_ERROR,"MLD mxl_hostapd_verify_mld_config failed");
++		return false;
++	}
++
++	return true;
++}
++
++static int mxl_setup_link(struct p_ap_mld *mld)
++{
++#define VAPID_OFFSET_6G 32
++#define VAPID_OFFSET_2G 16
++#define VAPID_OFFSET_5G 0
++	struct hostapd_data *link1 = mld->affiliated_links[LINK1];
++	struct hostapd_data *link2 = mld->affiliated_links[LINK2];
++	struct _mxl_vendor_mld_info *mld_info;
++	struct _mxl_vendor_mld_link_info *mld_link_info;
++	struct hostapd_data *hapd = NULL;
++	int ret = -1;
++
++	if (!link1 || !link2)
++		return -1;
++
++	mld_info = os_malloc(sizeof(struct _mxl_vendor_mld_info));
++	if (!mld_info)
++		return -1;
++
++	mld_link_info = os_malloc(sizeof(struct _mxl_vendor_mld_link_info));
++	if (!mld_link_info) {
++		os_free(mld_info);
++		return -1;
++	}
++
++	os_memset(mld_info, 0, sizeof(struct _mxl_vendor_mld_info));
++	os_memset(mld_link_info, 0, sizeof(struct _mxl_vendor_mld_link_info));
++
++	if (link1->conf->mld_id == link2->conf->mld_id) {
++		/* update sibling hapd context */
++		link1->mxl_data.sibling_hapd = link2;
++		link2->mxl_data.sibling_hapd = link1;
++
++		/* update flag to carry ML IE in beacon*/
++		link1->conf->mxl_bss_conf.ml_ie_add = 1;
++		link2->conf->mxl_bss_conf.ml_ie_add = 1;
++
++		/* create vendor info */
++		mld_info->mld_id = link1->conf->mld_id;
++		memcpy_s(mld_info->link1_bssid, ETH_ALEN, link1->conf->bssid, ETH_ALEN);
++		memcpy_s(mld_info->ap_mld_mac, ETH_ALEN, link1->conf->mxl_bss_conf.ap_mld_mac, ETH_ALEN);
++
++		if (is_6ghz_op_class(link2->iconf->op_class))
++			mld_info->link2_vapid = (link2->conf->bss_idx -1) + VAPID_OFFSET_6G;
++		else if (link2->iface->freq >= 5180 && link2->iface->freq <= 5900)
++			mld_info->link2_vapid = (link2->conf->bss_idx -1) + VAPID_OFFSET_5G;
++		else
++			mld_info->link2_vapid = (link2->conf->bss_idx -1) + VAPID_OFFSET_2G;
++
++		mld_link_info->mld_id = link1->conf->mld_id;
++		memcpy_s(mld_link_info->ap_mld_mac, ETH_ALEN, link1->conf->mxl_bss_conf.ap_mld_mac, ETH_ALEN);
++		wpa_printf(MSG_DEBUG, "mxl_setup_link for mld_id %d mld_mac="MACSTR"link1_bssid ="MACSTR"link2_vapid= %d",
++				mld_info->mld_id, MAC2STR(mld_info->ap_mld_mac),
++				MAC2STR(mld_info->link1_bssid), mld_info->link2_vapid);
++	}
++
++	/* Initialize wpa encryption parameters for the MLD VAPs */
++	mxl_hostapd_setup_mlo_wpa(link1);
++
++	mxl_set_link_id(link1);
++	mxl_set_link_id(link2);
++	/* set_beacon for each affiliated links */
++	ret = ieee802_11_set_beacon(link1);
++	if (ret < 0)
++		goto err;
++
++	ret = ieee802_11_set_beacon(link2);
++	if (ret < 0)
++		goto err;
++
++	if (link1->iconf->multibss_enable && (MULTIBSS_REFERENCE_BSS_IDX != link1->conf->bss_idx)) {
++		hapd = link1->iface->bss[MULTIBSS_REFERENCE_BSS_IDX];
++		ieee802_11_set_beacon(hapd);
++		if (hapd->mxl_data.sibling_hapd)
++			ieee802_11_set_beacon(hapd->mxl_data.sibling_hapd);
++
++	}
++	if (link2->iconf->multibss_enable && (MULTIBSS_REFERENCE_BSS_IDX != link2->conf->bss_idx)) {
++		hapd = link2->iface->bss[MULTIBSS_REFERENCE_BSS_IDX];
++		ieee802_11_set_beacon(hapd);
++		if (hapd->mxl_data.sibling_hapd)
++			ieee802_11_set_beacon(hapd->mxl_data.sibling_hapd);
++	}
++
++	hapd = link1;
++	/* sending mld_info on link1 context for ADD_MLD */
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SETUP_MLD, mld_info, sizeof(struct _mxl_vendor_mld_info))) {
++		wpa_printf(MSG_ERROR, "sending vendor mld_info failed !!!");
++		os_free(mld_info);
++		os_free(mld_link_info);
++		return -1;
++	}
++
++	hapd = link2;
++	/* This will update the ML parameters in link VAP-DB */
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_MLD_INFO, mld_link_info, sizeof(struct _mxl_vendor_mld_link_info))) {
++		wpa_printf(MSG_ERROR, "sending vendor mld_link_info failed on link2!!!");
++		os_free(mld_info);
++		os_free(mld_link_info);
++		return -1;
++	}
++
++	os_free(mld_info);
++	os_free(mld_link_info);
++
++	/* setup WDS if required */
++	if(!mxl_wds_setup(link1))
++		ret = mxl_wds_setup(link2);
++
++	return ret;
++
++err:
++	wpa_printf(MSG_ERROR, "MLD link setup failed mld_id %d "
++					"mld_mac="MACSTR" link1_bssid ="MACSTR" link2_bssid= "MACSTR"",
++					link1->conf->mld_id, MAC2STR(link1->conf->mxl_bss_conf.ap_mld_mac),
++					MAC2STR(link1->conf->bssid), MAC2STR(link2->conf->bssid));
++	link2->mxl_data.sibling_hapd = NULL;
++	link2->conf->mxl_bss_conf.ml_ie_add = 0;
++	link1->conf->mxl_bss_conf.ml_ie_add = 0;
++	mxl_hostapd_clear_mlo_wpa(link1);
++	link1->mxl_data.sibling_hapd = NULL;
++	os_free(mld_info);
++	os_free(mld_link_info);
++
++	return -1;
++}
++
++int mxl_mld_link_setup(struct p_ap_mld *mld)
++{
++	if (!mxl_hostapd_verify_mld_config(mld))
++		return -1;
++
++	if (mxl_setup_link(mld))
++		return -1;
++	return 0;
++}
++
++int mxl_mld_setup_interfaces(struct hapd_interfaces *interfaces)
++{
++	struct p_ap_mld *p_ap_mld = NULL;
++	struct hostapd_data *hapd1 = NULL, *hapd2 = NULL;
++
++	if (interfaces->count <= 1)
++		return 0;
++
++	for (int i = 0; i < MAX_SUPPORTED_MLDS; i++) {
++		p_ap_mld = &(interfaces->mxl_interfaces.g_ap_mld[i]);
++		if (p_ap_mld->num_links) {
++			hapd1 = p_ap_mld->affiliated_links[LINK1];
++			hapd2 = p_ap_mld->affiliated_links[LINK2];
++			if (hapd1 && hapd1->iface->set_freq_done &&
++					!hapd1->beacon_set_done &&
++					hapd2 && hapd2->iface->set_freq_done &&
++					!hapd2->beacon_set_done) {
++				if (mxl_mld_link_setup(p_ap_mld)) {
++					wpa_printf(MSG_ERROR, "MLD setup failed for mld id %d", i);
++					return -1;
++				}
++			}
++		}
++	}
++
++	return 0;
++}
++
++int mxl_hostapd_multilink_ie_len(struct hostapd_data *hapd, bool is_probe_req)
++{
++	if (!is_probe_req)
++		return BASIC_MULTILINK_IE_LEN;
++	else
++		return BASIC_MULTILINK_IE_LEN + PER_STA_PROFILE_LENGTH;
++
++}
++
++static u8 * mxl_hostapd_add_eht_ies(struct hostapd_data *hapd, u8 *eid)
++{
++	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
++		eid = hostapd_eid_eht_capab(hapd, eid, IEEE80211_MODE_AP);
++		eid = hostapd_eid_eht_operation(hapd, eid);
++	}
++	return eid;
++}
++
++static u8 * mxl_hostapd_eid_ml_non_inheritance(struct hostapd_data *hapd, u8 *eid, bool frame_type)
++{
++	u8 *pos = eid;
++	u8 eid_len = 0, eid_ext_len = 0;
++	u8 *ie_len_ptr, *data_pos;
++	u8 *eid_len_ptr;
++	u8 *eid_ext_len_ptr;
++
++	*pos++ = WLAN_EID_EXTENSION;
++	ie_len_ptr = pos;
++	*pos++ = 0; /* Length not known */
++	data_pos = pos;
++	*pos++ = WLAN_EID_EXT_NON_INHERITANCE;
++	eid_len_ptr = pos;
++	*pos++ = 0; /* Length not known */
++
++	/* Popultate eid. Need to remove these IEs if inlcuded in per STA profile */
++	if (frame_type == PROBE_FRAME) {
++		if (hapd->mxl_data.sibling_hapd->iface->current_mode &&
++				hapd->mxl_data.sibling_hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G) {
++			*pos++ = WLAN_EID_DS_PARAMS;
++			eid_len++;
++			*pos++ = WLAN_EID_ERP_INFO;
++			eid_len++;
++		}
++	}
++	if (!hapd->iconf->ieee80211n || hapd->conf->disable_11n) {
++		if (hapd->mxl_data.sibling_hapd->iconf->ieee80211n && !hapd->mxl_data.sibling_hapd->conf->disable_11n) {
++			*pos++ = WLAN_EID_HT_CAP;
++			eid_len++;
++			*pos++ = WLAN_EID_HT_OPERATION;
++			eid_len++;
++		}
++	}
++	if (!hapd->iconf->ieee80211ac || hapd->conf->disable_11ac) {
++		if ((hapd->mxl_data.sibling_hapd->iconf->ieee80211ac || hapd->mxl_data.sibling_hapd->conf->vendor_vht) &&
++			!hapd->mxl_data.sibling_hapd->conf->disable_11ac) {
++			*pos++ = WLAN_EID_VHT_CAP;
++			eid_len++;
++			*pos++ = WLAN_EID_VHT_OPERATION;
++			eid_len++;
++			if (!is_6ghz_op_class(hapd->iconf->op_class)) {
++				*pos++ = WLAN_EID_TRANSMIT_POWER_ENVELOPE;
++				eid_len++;
++			}
++		}
++	}
++
++	*eid_len_ptr = eid_len;
++
++	/* Popultate eid extention. Need to remove these IEs if inlcuded in per STA profile */
++	eid_ext_len_ptr = pos;
++	*pos++ = 0;
++
++	if (is_6ghz_op_class(hapd->mxl_data.sibling_hapd->iconf->op_class)) {
++		*pos++ = WLAN_EID_EXT_HE_6GHZ_BAND_CAP;
++		eid_ext_len++;
++	}
++
++	*eid_ext_len_ptr = eid_ext_len;
++
++	*ie_len_ptr = pos - data_pos;
++
++	return pos;
++}
++
++static u8 * mxl_hostapd_eid_mld_staprof_probe(struct hostapd_data *hapd, u8 *eid)
++{
++	struct hostapd_hw_modes *mode;
++
++	mode = hapd->iface->current_mode;
++
++	/* capability info */
++	WPA_PUT_LE16(eid, hostapd_own_capab_info(hapd));
++	eid += sizeof(le16);
++
++	/* Supported rates */
++	eid = hostapd_eid_supp_rates(hapd, eid);
++
++	if ((hapd->iface->freq >= 2412) && (hapd->iface->freq <= 2472))
++		eid = mxl_hostapd_eid_ds_params(hapd, eid);
++
++	/* Country info
++	 * Max len is calculated as below
++	 * each channel need 3 bytes info mode->num_channels * 3
++	 * Min length 6 (Tag number, len, country(3) and environment)
++	 * 3 bytes for Operating Extension Identifier for 6G.
++	 * Max one byte of padding with total of 10 bytes.
++	 */
++	eid = mxl_hostapd_eid_country(hapd, eid, (mode->num_channels * 3) + 10);
++
++	/* ERP Information element */
++	eid = mxl_hostapd_eid_erp_info(hapd, eid);
++
++	/* Extended supported rates */
++	eid = hostapd_eid_ext_supp_rates(hapd, eid);
++
++	eid = mxl_hostapd_eid_supported_op_classes(hapd, eid);
++	eid = hostapd_eid_ht_capabilities(hapd, eid, NULL);
++	if (!eid) {
++		wpa_printf(MSG_ERROR, "hostapd_eid_ht_capabilities failed");
++		goto done;
++	}
++	eid = hostapd_eid_ht_operation(hapd, eid);
++	eid = hostapd_eid_ext_capab(hapd, eid, false);
++#ifdef CONFIG_IEEE80211AC
++	if ((hapd->conf->vendor_vht || hapd->iconf->ieee80211ac) &&
++			!hapd->conf->disable_11ac && !is_6ghz_op_class(hapd->iconf->op_class)) { /* IOP with STA transmitting directly VHT IE */
++		eid = hostapd_eid_vht_capabilities(hapd, eid, 0);
++		if (!eid) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_vht_capabilities failed");
++			goto done;
++		}
++		eid = hostapd_eid_vht_operation(hapd, eid);
++	}
++	if (hapd->iconf->ieee80211ac && !hapd->conf->disable_11ac)
++		eid = hostapd_eid_txpower_envelope(hapd, eid);
++#endif /* CONFIG_IEEE80211AC */
++#ifdef CONFIG_IEEE80211AX
++	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax &&
++			is_6ghz_op_class(hapd->iconf->op_class))
++		eid = hostapd_eid_txpower_envelope(hapd, eid);
++#endif /* CONFIG_IEEE80211AX */
++	if ((hapd->iconf->ieee80211ac && !hapd->conf->disable_11ac) ||
++			(hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax))
++		eid = hostapd_eid_wb_chsw_wrapper(hapd, eid);
++
++#ifdef CONFIG_IEEE80211AX
++	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax) {
++		if (!hapd->iconf->ieee80211n_acax_compat) {
++			eid = hostapd_eid_he_capab(hapd, eid, IEEE80211_MODE_AP);
++			if (!eid) {
++				wpa_printf(MSG_ERROR, "hostapd_eid_he_capab failed");
++				goto done;
++			}
++			eid = hostapd_eid_he_operation(hapd, eid);
++			if (!eid) {
++				wpa_printf(MSG_ERROR, "hostapd_eid_he_operation failed");
++				goto done;
++			}
++
++			if(hapd->iconf->he_spatial_reuse_ie_present_in_probe_response) {
++				eid = hostapd_eid_spatial_reuse(hapd, eid);
++				if (!eid) {
++					wpa_printf(MSG_ERROR, "hostapd_eid_he_spatial_reuse_parameter_set failed");
++					goto done;
++				}
++			}
++
++			if(hapd->iconf->he_mu_edca_ie_present) {
++				eid = hostapd_eid_he_mu_edca_parameter_set(hapd, eid);
++				if (!eid) {
++					wpa_printf(MSG_ERROR, "hostapd_eid_he_mu_edca_parameter_set failed");
++					goto done;
++				}
++			}
++
++			eid = hostapd_eid_he_6ghz_band_cap(hapd,eid);
++			if (!eid) {
++				wpa_printf(MSG_ERROR, "hostapd_eid_he_6ghz_band_cap failed");
++				goto done;
++			}
++		}
++	}
++#endif /* CONFIG_IEEE80211AX */
++
++	eid = mxl_hostapd_add_eht_ies(hapd, eid);
++	if (!eid) {
++		wpa_printf(MSG_ERROR, "mxl_hostapd_add_eht_ies failed");
++		goto done;
++	}
++
++#ifdef CONFIG_IEEE80211AC
++	if (hapd->conf->vendor_vht && !hapd->conf->disable_11ac) {
++		eid = hostapd_eid_vendor_vht(hapd, eid);
++		if (!eid) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_vendor_vht failed");
++			goto done;
++		}
++	}
++#endif /* CONFIG_IEEE80211AC */
++
++	/* RSNE,RSNXE,WPS,WMM,DPP etc should be same in both links, and will be in-herited */
++
++	eid = mxl_hostapd_eid_ml_non_inheritance(hapd, eid, PROBE_FRAME);
++	/* To-do: Need to handle the IEs which cannot be Inherited and also not be present here.
++	 * need to explicitly mentioned as part of Non-Inheitance IE
++	 */
++done:
++	return eid;
++}
++
++/*
++ * mxl_hostapd_eid_mld_frag - API to adopt fragments for ML IE/per sta profile
++ * if MultiLink IE exceeds max IE length 255, because of the per sta
++ * profile size.
++ *
++ * ml_ie_data_start - MultiLink IE data start
++ * common_info_len - length of common info
++ * per_sta_prof_total_len - Total per sta profile length that need to be
++ *				packed as fragments
++ *
++ * TODO - rework the fragmentation logic to avoid in-place buffer updation
++ */
++u8 * mxl_hostapd_eid_mld_frag(u8 *ml_ie_data_start,
++			  u8 common_info_len, u16 per_sta_prof_total_len)
++{
++	u8 ml_ie_data_len;
++	u8 *eid = ml_ie_data_start, *buf_pos, *ml_frag_len;
++	u8 *per_sta_prof_buf;
++	u16 per_sta_cur_frag_len, per_sta_rem_frag_len;
++	u16 per_sta_rem_total = per_sta_prof_total_len;
++
++	per_sta_prof_buf = os_malloc(PER_STA_PROFILE_LENGTH * sizeof(u8));
++	if (!per_sta_prof_buf) {
++		wpa_printf(MSG_ERROR, "os_malloc fails for per_sta_prof_buf");
++		return NULL;
++	}
++
++	/* Length of Multilink IE except per sta prof subelement
++	 * ext eid(107) + multilink control len + common info len
++	 */
++	ml_ie_data_len = (1 + MULTILINK_CTRL_LEN + common_info_len);
++
++	/* per sta profile fragment length that can be packed in 1st ML IE */
++	per_sta_cur_frag_len = (MAX_IE_LEN - ml_ie_data_len - EID_HDR_LEN);
++
++	if (per_sta_prof_total_len < per_sta_cur_frag_len) {
++		wpa_printf(MSG_ERROR, "ml ie frag tx error: per_sta_prof_total_len %d, per_sta_cur_frag_len %d",
++				per_sta_prof_total_len, per_sta_cur_frag_len);
++		goto frag_done;
++	}
++
++	/* per sta profile data remaining */
++	per_sta_rem_total = (per_sta_prof_total_len - per_sta_cur_frag_len);
++
++	/* per sta profile remaining fragment to be packed in start of 2nd ML fragment IE */
++	per_sta_rem_frag_len = (MAX_IE_LEN - per_sta_cur_frag_len);
++
++	/* Check if there is a need for per sta profile fragmentation */
++	if (per_sta_rem_frag_len > per_sta_rem_total)
++		per_sta_rem_frag_len = per_sta_rem_total;
++
++	eid += (ml_ie_data_len + EID_HDR_LEN + per_sta_cur_frag_len);
++	memcpy_s(per_sta_prof_buf, per_sta_rem_total, eid, per_sta_rem_total);
++	buf_pos = per_sta_prof_buf;
++
++	while (per_sta_rem_frag_len) {
++
++		*eid++ = WLAN_EID_FRAGMENT;
++		ml_frag_len = eid++;
++
++		memcpy_s(eid, per_sta_rem_frag_len, buf_pos, per_sta_rem_frag_len);
++		eid += per_sta_rem_frag_len;
++		buf_pos += per_sta_rem_frag_len;
++		per_sta_rem_total -= per_sta_rem_frag_len;
++
++		/* Case 1: Additional per sta profile fragments required */
++		if (per_sta_rem_total > (MAX_IE_LEN - EID_HDR_LEN - per_sta_rem_frag_len)) {
++			per_sta_cur_frag_len = (MAX_IE_LEN - EID_HDR_LEN - per_sta_rem_frag_len);
++			per_sta_rem_frag_len = (MAX_IE_LEN - per_sta_cur_frag_len);
++			*ml_frag_len = MAX_IE_LEN;
++		/* Case 2: current per sta profile fragment with length less than 255 is enough */
++		} else if (per_sta_rem_total) {
++			per_sta_cur_frag_len = per_sta_rem_total;
++			*ml_frag_len = (per_sta_rem_frag_len + EID_HDR_LEN + per_sta_cur_frag_len);
++			per_sta_rem_frag_len = 0;
++		/* Case 3: No more per sta profile fragments required, current current ML frag length */
++		} else {
++			*ml_frag_len = per_sta_rem_frag_len;
++			goto frag_done;
++		}
++
++		*eid++ = PER_STA_FRAG_SUB_ELEM_ID;
++		*eid++ = (per_sta_cur_frag_len + per_sta_rem_frag_len);
++
++		memcpy_s(eid, per_sta_cur_frag_len, buf_pos, per_sta_cur_frag_len);
++		eid += per_sta_cur_frag_len;
++		buf_pos += per_sta_cur_frag_len;
++		per_sta_rem_total -= per_sta_cur_frag_len;
++	}
++
++frag_done:
++	os_free(per_sta_prof_buf);
++	return eid;
++}
++
++u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta, u8 *eid,
++		enum multilink_type ml_type, u16 link_sta_status, bool is_auth)
++{
++	u16 multilink_ctrl = 0;
++	u16 msd_info = 0;
++	u16 eml_capab = 0;
++	u16 mld_capab = 0;
++	u16 sta_ctrl = 0;
++	u16 beacon_intr = 0;
++	u64 tsf = 0;
++	u8 *size_pos = NULL;
++	u8 *link_info_len = NULL;
++	u8 *sta_info_size_pos = NULL;
++	u8 *data_pos = NULL;
++	u8 *link_info_data_pos = NULL;
++	u8 common_info_len;
++	u8 fw_ie_len = 0;
++	struct hostapd_data *sibling_hapd;
++	bool mld_num_simul_links = hapd->conf->mxl_bss_conf.mld_num_simul_links;
++	bool mld_mediumsync_present = hapd->conf->mxl_bss_conf.mld_mediumsync_present;
++
++	*eid++ = WLAN_EID_EXTENSION;
++	size_pos = eid;
++
++	/* size not known yet */
++	*eid++ = 0;
++	data_pos = eid;
++
++	*eid++ = WLAN_EID_EXT_MULTI_LINK;
++
++	/* Multi-Link control element */
++	/* B0..B2 */
++	multilink_ctrl |= MULTI_LINK_CONTROL_TYPE_BASIC;
++
++	/* B4, B5, B7, B8 */
++	if (!is_auth) {
++		multilink_ctrl |= (MLO_LINK_ID_INFO_PRESENT | MLO_BSS_PARAM_CHANGE_COUNT_PRESENT |
++				MLO_MLD_CAPAB_PRESENT);
++		if (mld_num_simul_links) {
++			multilink_ctrl |= MLO_EML_CAPAB_PRESENT;
++		}
++		if (mld_mediumsync_present && ml_type != ML_BASIC)
++			multilink_ctrl |= MLO_MSDI_PRESENT;
++	}
++
++	WPA_PUT_LE16(eid, multilink_ctrl);
++	eid += sizeof(multilink_ctrl);
++
++	/* Multi-Link Common info */
++	if (is_auth)
++		common_info_len = COMMON_INFO_LEN_AUTH;
++	else {
++		if (mld_num_simul_links) {
++			common_info_len = COMMON_INFO_LEN;
++		} else {
++			common_info_len = COMMON_INFO_LEN_SINGLE_LINK;
++		}
++		if (multilink_ctrl & MLO_MLD_ID_PRESENT)
++			common_info_len += 1;
++		if (mld_mediumsync_present && ml_type != ML_BASIC)
++			common_info_len += MULTILINK_MSD_LEN;
++	}
++	*eid++ = common_info_len;
++
++	memcpy_s(eid, ETH_ALEN, hapd->conf->mxl_bss_conf.ap_mld_mac, ETH_ALEN);
++	eid += ETH_ALEN;
++	if (!is_auth) {
++		*eid++ =  hapd->conf->mxl_bss_conf.link_id;
++		/* BSS Parameters Change Count */
++		*eid++ = 0;
++		/* Medium Synchronization Delay Information */
++		if (mld_mediumsync_present && ml_type != ML_BASIC) {
++			msd_info = hapd->conf->mxl_bss_conf.mld_mediumsync_duration;
++			msd_info |= hapd->conf->mxl_bss_conf.mld_mediumsync_ofdmedthresh << MLO_MEDIUM_SYNC_OFDMED_THRESH_START_POSITION;
++			msd_info |= hapd->conf->mxl_bss_conf.mld_mediumsync_maxtxop << MLO_MEDIUM_SYNC_MAX_TXOP_START_POSITION;
++			WPA_PUT_LE16(eid, msd_info);
++			eid += sizeof(msd_info);
++		}
++		if (mld_num_simul_links) {
++			if (hapd->iconf->mxl_conf.mlo_supported == MULTILINK_EMLSR)
++				eml_capab |= MLO_EMLSR;
++			else if (hapd->iconf->mxl_conf.mlo_supported == MULTILINK_EMLMR)
++				eml_capab |= MLO_EMLMR;
++			eml_capab |= hapd->mxl_data.sibling_hapd->conf->mxl_bss_conf.eml_transition_timeout << MLO_TRANSITION_TIMEOUT_MASK;
++			WPA_PUT_LE16(eid, eml_capab);
++			eid += sizeof(eml_capab);
++		}
++		mld_capab |= mld_num_simul_links;
++		WPA_PUT_LE16(eid, mld_capab);
++		eid += sizeof(mld_capab);
++		/* MLD ID */
++		if (multilink_ctrl & MLO_MLD_ID_PRESENT)
++			*eid++ = hapd->conf->bss_idx - 1; /* BSSID IDX */
++	}
++
++	/* Multi-Link Link Info(Per-STA) */
++	if (ml_type != ML_BASIC) {
++		sibling_hapd = hapd->mxl_data.sibling_hapd;
++		if (!sibling_hapd) {
++			wpa_printf(MSG_ERROR,"MLD: sibling hapd is NULL!!!");
++			return eid;
++		}
++		fw_ie_len = 0;
++		*eid++ = WLAN_EID_SUBELEMENT_MLO_PER_STA_PROFILE;
++		link_info_len = eid;
++		/* size not known yet */
++		*eid++ = 0;
++		link_info_data_pos = eid;
++		sta_ctrl |= (sibling_hapd->conf->mxl_bss_conf.link_id | MLO_LINK_INFO_COMPLETE_PROFILE | MLO_LINK_INFO_MACADDR_PRESENT |
++				MLO_LINK_INFO_BI_PRESENT | MLO_LINK_INFO_TSF_OFFSET_PRESENT | MLO_LINK_INFO_DTIM_INFO_PRESENT);
++		if (ml_type == ML_ASSOC)
++			sta_ctrl |= (MLO_LINK_INFO_BSS_PARAM_CHANGE_CNT_PRESENT);
++
++		/* CSA Multilink case, beacons to add partial profile with CSA/ECSA/MCST IE */
++		if (ml_type == ML_BASIC)
++			sta_ctrl &= ~MLO_LINK_INFO_COMPLETE_PROFILE;
++
++		WPA_PUT_LE16(eid, sta_ctrl);
++		eid += sizeof(sta_ctrl);
++		/* sta_info */
++		/* sta_info len */
++		sta_info_size_pos = eid;
++		*eid++ = 0;
++		memcpy_s(eid, ETH_ALEN, sibling_hapd->own_addr, ETH_ALEN);
++		eid += ETH_ALEN;
++		beacon_intr = sibling_hapd->iconf->beacon_int;
++		WPA_PUT_LE16(eid, beacon_intr);
++		eid += sizeof(beacon_intr);
++#ifdef CONFIG_WIFI_CERTIFICATION
++		if((hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211B ||
++				 hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G) ||
++				 (sibling_hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211B ||
++				  sibling_hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211G))
++			tsf = hapd->iconf->mxl_conf.eht_mld_tsf_diff;
++#endif /* CONFIG_WIFI_CERTIFICATION */
++		WPA_PUT_LE64(eid, tsf);
++		eid += sizeof(tsf);
++		WPA_PUT_LE16(eid, (sibling_hapd->conf->dtim_period << 8));
++		eid += sizeof(le16);
++		if (ml_type == ML_ASSOC) {
++			*eid++ = 0;
++		}
++
++		*sta_info_size_pos = eid - sta_info_size_pos;
++		/* Per-STA profile */
++		switch (ml_type) {
++			case ML_BASIC:
++				break;
++			case ML_PROBE:
++				/* TODO
++				 * include the CSA related IEs in the Probe Response
++				 * during a CSA on the affiliated link
++				 */
++				eid = mxl_hostapd_eid_mld_staprof_probe(sibling_hapd, eid);
++				break;
++
++			default:
++				wpa_printf(MSG_ERROR,"MLD: NO valid ML type!!!");
++				return eid;
++		}
++
++		if ((eid - link_info_data_pos) <= MAX_IE_LEN) {
++			/* fw_ie_len is the total length of CSA/CSW/ECSA IEs to be
++			 * added by fw in per STA profile during CSA. Host updates
++			 * the per STA profile length factoring in the fw adding IEs
++			 */
++			*link_info_len = (eid - link_info_data_pos) + (fw_ie_len);
++		} else {
++			*link_info_len = MAX_IE_LEN;
++		}
++
++		/* Check if fragmentation needed */
++		if ((eid - data_pos) > MAX_IE_LEN) {
++			*size_pos = MAX_IE_LEN;
++			eid = mxl_hostapd_eid_mld_frag(data_pos,
++				common_info_len, (eid - link_info_data_pos));
++		}
++	}
++	if (size_pos && (*size_pos == 0)) {
++		*size_pos = (eid - data_pos);
++		wpa_hexdump(MSG_DEBUG, "mxl_hostapd_eid_multilink", data_pos, *size_pos);
++	}
++	return eid;
++}
++
++u16 mxl_check_assoc_ies_linked_sta(struct hostapd_data *hapd, struct sta_info *sta, const u8 *ies, size_t ies_len)
++{
++	struct ieee802_11_elems elems;
++	u16 resp;
++	u8 *pos;
++	size_t elem_id_len;
++	u8 elem_id;
++
++	if (ieee802_11_parse_elems(ies, ies_len, &elems, 1) == ParseFailed) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Station sent an invalid "
++				"association request");
++		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++
++	/* Parse Non-Inheritance Tag and do not inherit these IEs from STA to Linked TSA*/
++	if (elems.non_inheritance && elems.non_inheritance_len > 0) {
++		pos = (u8 *)elems.non_inheritance;
++		elem_id_len = *pos++;
++		while (elem_id_len) {
++			elem_id = *pos++;
++			switch (elem_id) {
++				case WLAN_EID_EXT_SUPP_RATES:
++					if (elems.supp_rates) {
++						sta->supported_rates_len = merge_byte_arrays(
++							sta->supported_rates, sizeof(sta->supported_rates),
++							elems.supp_rates, elems.supp_rates_len,
++							NULL, 0);
++					}
++					wpa_printf(MSG_DEBUG, "Multilink IE per STA profile extended supported rates parsed");
++					break;
++				case WLAN_EID_HT_CAP:
++					if (sta->ht_capabilities) {
++						sta->flags &= ~WLAN_STA_HT;
++						os_free(sta->ht_capabilities);
++						sta->ht_capabilities = NULL;
++					}
++					break;
++				case WLAN_EID_HT_OPERATION:
++					if (sta->ht_operation) {
++						os_free(sta->ht_operation);
++						sta->ht_operation = NULL;
++					}
++					break;
++				case WLAN_EID_VHT_CAP:
++					if (sta->vht_capabilities) {
++						sta->flags &= ~WLAN_STA_VHT;
++						os_free(sta->vht_capabilities);
++						sta->vht_capabilities = NULL;
++					}
++					break;
++				case WLAN_EID_VHT_OPERATION:
++					if (sta->vht_operation) {
++						os_free(sta->vht_operation);
++						sta->vht_operation = NULL;
++					}
++					break;
++				default:
++					wpa_printf(MSG_ERROR, "MLD: Invalid Non-Inheritance element ID");
++					break;
++			}
++			elem_id_len--;
++		}
++		elem_id_len = *pos++;
++		/* Parse Element ID extension list */
++		while (elem_id_len) {
++			elem_id = *pos++;
++			switch (elem_id) {
++				case WLAN_EID_EXT_HE_6GHZ_BAND_CAP:
++					if (sta->he_6ghz_capab) {
++						sta->flags &= ~WLAN_STA_6GHZ;
++						os_free(sta->he_6ghz_capab);
++						sta->he_6ghz_capab = NULL;
++					}
++					break;
++				default:
++					wpa_printf(MSG_ERROR, "MLD: Invalid Non-Inheritance element ID extension");
++			}
++			elem_id_len--;
++		}
++	}
++
++	resp = check_ext_capab(hapd, sta, elems.ext_capab, elems.ext_capab_len);
++	if (resp != WLAN_STATUS_SUCCESS)
++		return resp;
++
++	/* If the IE is present in per STA profile, use it for linked STA instead of inheriting from STA */
++	if (elems.supp_rates) {
++		resp = mxl_copy_supp_rates(hapd, sta, &elems);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++
++	/* Free ht capabilities when STA has ht capabilities and Linked STA also has ht capabilities */
++	if (elems.ht_capabilities) {
++		if (sta->ht_capabilities != NULL) {
++			os_free(sta->ht_capabilities);
++			sta->ht_capabilities = NULL;
++		}
++		resp = copy_sta_ht_capab(hapd, sta, elems.ht_capabilities);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++
++	if (sta->ht_operation != NULL && elems.ht_operation) {
++		os_free(sta->ht_operation);
++		sta->ht_operation = NULL;
++	}
++	if (elems.ht_capabilities && elems.ht_operation) {
++		resp = copy_sta_ht_operation(hapd, sta, elems.ht_operation);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++	if (hapd->iconf->ieee80211n && hapd->iconf->require_ht &&
++			!(sta->flags & WLAN_STA_HT)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Station does not support "
++				"mandatory HT PHY - reject association");
++		return WLAN_STATUS_ASSOC_DENIED_NO_HT;
++	}
++
++#ifdef CONFIG_IEEE80211AC
++	if (hapd->iconf->ieee80211ac) {
++		/* Free vht capabilities when STA has vht capabilities and Linked STA also has vht capabilities */
++		if (elems.vht_capabilities) {
++			if (sta->vht_capabilities != NULL) {
++				os_free(sta->vht_capabilities);
++				sta->vht_capabilities = NULL;
++			}
++			resp = copy_sta_vht_capab(hapd, sta, elems.vht_capabilities);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++
++		/* Free vht operation when STA has vht operation and Linked STA also has vht operation */
++		if (sta->vht_operation != NULL && elems.vht_operation) { /* set by copy_sta_vht_capab, don't reorder */
++			os_free(sta->vht_operation);
++			sta->vht_operation = NULL;
++		}
++		if (elems.vht_capabilities && elems.vht_operation) {
++			resp = copy_sta_vht_oper(hapd, sta, elems.vht_operation);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++
++		resp = set_sta_vht_opmode(hapd, sta, elems.opmode_notif);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++
++	if (hapd->iconf->ieee80211ac && hapd->iconf->require_vht &&
++			!(sta->flags & WLAN_STA_VHT)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Station does not support "
++				"mandatory VHT PHY - reject association");
++		return WLAN_STATUS_ASSOC_DENIED_NO_VHT;
++	}
++
++	if (hapd->conf->vendor_vht && !elems.vht_capabilities && elems.vendor_vht) {
++		if (sta->vht_capabilities) {
++			os_free(sta->vht_capabilities);
++			sta->vht_capabilities = NULL;
++		}
++		resp = copy_sta_vendor_vht(hapd, sta, elems.vendor_vht,
++				elems.vendor_vht_len);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++	if (hapd->conf->vendor_vht && elems.vht_capabilities && !hapd->iconf->ieee80211ac) {
++		if (sta->vht_capabilities) {
++			os_free(sta->vht_capabilities);
++			sta->vht_capabilities = NULL;
++		}
++		resp = copy_sta_vendor2_vht(hapd, sta, elems.vht_capabilities);
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	}
++#endif /* CONFIG_IEEE80211AC */
++
++#ifdef CONFIG_IEEE80211AX
++	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax) {
++		/* Free he capabilities when STA has he caabilities and Linked STA also has he capabilities */
++		if (elems.he_capabilities) {
++			if (sta->he_capab != NULL) {
++				os_free(sta->he_capab);
++				sta->he_capab = NULL;
++			}
++			resp = copy_sta_he_capab(hapd, sta, IEEE80211_MODE_AP, elems.he_capabilities, elems.he_capabilities_len);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++
++		if (is_6ghz_op_class(hapd->iconf->op_class)) {
++			resp = copy_sta_he_6ghz_capab(hapd, sta,
++					elems.he_6ghz_band_cap);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++
++		if (resp != WLAN_STATUS_SUCCESS)
++			return resp;
++	} else {
++		wpa_printf(MSG_DEBUG, "ieee80211ax is not set !");
++	}
++	if (hapd->iconf->ieee80211ax && hapd->iconf->require_he &&
++			!(sta->flags & WLAN_STA_HE)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++				HOSTAPD_LEVEL_INFO, "Station does not support "
++				"mandatory HE PHY - reject association");
++		return WLAN_STATUS_DENIED_HE_NOT_SUPPORTED;
++	}
++#endif /* CONFIG_IEEE80211AX */
++
++	if (hapd->iconf->ieee80211be && !hapd->conf->disable_11be) {
++		/* Free eht capabilities when STA has eht capabilities and Linked STA also has eht capabilities */
++		if (elems.eht_capabilities) {
++			if (sta->eht_capab != NULL) {
++				os_free(sta->eht_capab);
++				sta->eht_capab = NULL;
++			}
++			resp = copy_sta_eht_capab(hapd, sta, IEEE80211_MODE_AP,
++					elems.he_capabilities,
++					elems.he_capabilities_len,
++					elems.eht_capabilities,
++					elems.eht_capabilities_len);
++			if (resp != WLAN_STATUS_SUCCESS)
++				return resp;
++		}
++	}
++
++	ap_copy_sta_supp_op_classes(sta, elems.supp_op_classes,
++			elems.supp_op_classes_len);
++
++	if ((sta->capability & WLAN_CAPABILITY_RADIO_MEASUREMENT) &&
++			elems.rrm_enabled &&
++			elems.rrm_enabled_len >= sizeof(sta->rrm_enabled_capa))
++		memcpy_s(sta->rrm_enabled_capa, sizeof(sta->rrm_enabled_capa), elems.rrm_enabled,
++				sizeof(sta->rrm_enabled_capa));
++
++	if (elems.power_capab) {
++		sta->min_tx_power = elems.power_capab[0];
++		sta->max_tx_power = elems.power_capab[1];
++		sta->power_capab = 1;
++	} else {
++		sta->power_capab = 0;
++	}
++
++	return WLAN_STATUS_SUCCESS;
++}
++
++int mxl_get_ml_probe_type_mld_id(const u8 * ml_ie, size_t ml_ie_len)
++{
++	const u8 *ie;
++	if (!ml_ie || ml_ie_len < MIN_ML_PROBE_IE_LEN) {
++		wpa_printf(MSG_ERROR, "invalid ML IE in probe request %d", (int) ml_ie_len);
++		return -1;
++	}
++	/* ML_CTRL */
++	ie = ml_ie;
++	if ((*ie & ML_CTRL_PROBE_TYPE_POS) == MULTI_LINK_CONTROL_TYPE_PROBE_REQ) {
++		if (*ie & ML_CTRL_MLD_ID_POS) {
++			/* Common Info Len */
++			ie = (ie + MULTILINK_CTRL_LEN);
++			/* MLD_ID */
++			return *(ie + 1);
++		}
++	}
++	return -1;
++}
++
++bool mxl_is_ml_probe(const u8 * ml_ie, size_t ml_ie_len)
++{
++	const u8 *ie;
++	if (!ml_ie || ml_ie_len < MIN_ML_PROBE_IE_LEN) {
++		wpa_printf(MSG_ERROR, "invalid ML IE in probe request %d", (int) ml_ie_len);
++		return false;
++	}
++
++	/* ML_CTRL */
++	ie = ml_ie;
++
++	if ((*ie & ML_CTRL_PROBE_TYPE_POS) == MULTI_LINK_CONTROL_TYPE_PROBE_REQ) {
++		/* ML_CTRL Probe type is set */
++
++		/* check for MLD_ID
++		 * 0: if for the AP associated to same MLD
++		 * non-zero: the mbssid idx of the AP */
++
++		/* To-do: handles only for same MLD
++		 * need to handle MBSSID case */
++#if 0
++		/* To-Do: Validation for ML probe per STA profile */
++		if (*ie & ML_CTRL_MLD_ID_POS) {
++			/* Common Info Len */
++			ie = (ie + MULTILINK_CTRL_LEN);
++			/* MLD_ID */
++			if ((*ie == 1) && *(ie + 1) > 0) {
++				wpa_printf(MSG_ERROR, "ML Probe request for MLDID %d, will drop", *(ie + 1));
++				return false;
++			}
++			/* LinkInfo = CommonInfoLen + MLDID */
++			ie = (ie + 2);
++		} else {
++			/* LinkInfo = ML_CTRL + CommonInfoLen*/
++			ie = (ie + MULTILINK_CTRL_LEN + 1);
++		}
++		if (*ie != WLAN_EID_SUBELEMENT_MLO_PER_STA_PROFILE) {
++			wpa_printf(MSG_ERROR, "ML Probe request without PerSta element");
++		}
++#endif
++		return true;
++	}
++	wpa_printf(MSG_DEBUG, " Recieved Probe Request with basic ML IE");
++	return false;
++}
++
++int mxl_hostapd_mld_remove(struct hostapd_data *hapd, u8 sendto_fw)
++{
++	struct mxl_mld_remove mld_rem;
++	mld_rem.mld_id = hapd->conf->mld_id;
++	mld_rem.sendto_fw = sendto_fw;
++	wpa_printf(MSG_INFO, "Removing MLD sendto_fw %u", sendto_fw);
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_MLD_REMOVE, &mld_rem, sizeof(struct mxl_mld_remove))) {
++		wpa_printf(MSG_ERROR, "LTQ_NL80211_VENDOR_SUBCMD_MLD_REMOVE failed!!!");
++		return -1;
++	}
++	return 0;
++}
++
+diff --git a/src/ap/mxl_mld.h b/src/ap/mxl_mld.h
+new file mode 100644
+index 000000000..e50ba6dd4
+--- /dev/null
++++ b/src/ap/mxl_mld.h
+@@ -0,0 +1,169 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_MLD_H
++#define MXL_MLD_H
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++#include "ap/ap_config.h"
++
++#define MAX_SUPPORTED_MLDS 30
++#define ML_BSS_LIMIT_PER_RADIO 16
++#define INVALID_MLD_ID 31
++/* IE ID + Len + Ext ID */
++#define MULTILINK_IE_HDR_LEN 3
++#define MULTILINK_CTRL_LEN 2
++#define MULTILINK_MLD_CAPAB_OPER_LEN 2
++#define MULTILINK_MSDI_LEN 2
++#define MULTILINK_EML_CAPAB_LEN 2
++#define MULTILINK_MSD_LEN 2
++/* Len + MLD-MAC + LINK_ID + EML_CAP + MLD_CAP + BPCC*/
++#define COMMON_INFO_LEN                 13
++/* Len + MLD-MAC */
++#define COMMON_INFO_LEN_AUTH            7
++/* Len + MLD-MAC + LINK_ID + MLD_CAP + MLD_ID */
++#define COMMON_INFO_LEN_SINGLE_LINK     11
++/* len + MULTILINK_CTRL_LEN + COMMON_INFO_LEN */
++#define BASIC_MULTILINK_IE_TAG_LEN      (1 + MULTILINK_CTRL_LEN + COMMON_INFO_LEN)
++#define BASIC_MULTILINK_IE_LEN (MULTILINK_IE_HDR_LEN + MULTILINK_CTRL_LEN + COMMON_INFO_LEN)
++
++#define LINK_INFO_STA_CTRL_LEN 2
++/* SubEleID + Len + STACtrl */
++#define LINK_INFO_HDR_LEN 4
++
++#define STA_CTRL_LINK_ID_MASK                   (BIT(0) | BIT(1) | BIT(2))
++#define STA_CTRL_MAC_ADDR_PRESENT_MASK          (BIT(5))
++
++#define ML_CTRL_PROBE_TYPE_POS                  (BIT(0) | BIT(1) | BIT(2))
++#define ML_CTRL_MLD_ID_POS                      (BIT(4))
++/* MULTILINK_IE_HDR_LEN + MULTILINK_CTRL_LEN + COMMON_INFO_LEN(1) + LINK_INFO_HDR_LEN */
++#define MIN_ML_PROBE_IE_LEN 3
++
++
++/* MULTILINK_IE_HDR_LEN + MULTILINK_CTRL_LEN + COMMON_INFO_LEN(1) + MLD_MAC(6) */
++#define MIN_BASIC_MULTILINK_IE_LEN 9
++
++/* MULTILINK_IE_HDR_LEN + MULTILINK_CTRL_LEN + COMMON_INFO(11) */
++#define MULTILINK_IE_LEN 16
++/* MULTILINK_IE_HDR_LEN + MULTILINK_CTRL_LEN + COMMON_INFO(7) */
++#define MULTILINK_IE_LEN_AUTH 10
++/* To-do: this is place holder */
++#define PER_STA_PROFILE_LENGTH 500
++
++/* To-do: For EMLSR,Max numer of simultaneous links is 1
++ * this may chnage for EMLMR */
++#define MAX_NUM_MLD_SIMUL_LINKS                 1
++
++/* Fragmentation support per STA profile definitions */
++#define PER_STA_FRAG_SUB_ELEM_ID                254
++
++/* elem id + elem len */
++#define EID_HDR_LEN                             2
++
++/* MLD parametres bitmap */
++#define MLD_PARAMS_ALL_UPDATES_FLAG             0x10
++
++/* BSS critical update bitmap */
++#define BSS_CRITICAL_UPDATE_COMMON              0x1
++#define BSS_CRITICAL_UPDATE_CSA                 0x2
++#define ML_BCN_PER_STA_PROF_MAX_SWITCH_TIME     0x4
++#define NON_TX_BSS_CRITICAL_UPDATE_COMMON       0x8
++
++/* Maximum channel switch time in TU's */
++#define MAX_CHAN_SWITCH_TIME_DEFAULT            1000
++
++/* Total IE length including header */
++#define CSA_IE_LEN                              5
++#define MAX_CHAN_SWITCH_TIME_IE_LEN             6
++#define CSW_IE_LEN                              7
++#define BWI_IE_LEN                              9
++#define BWI_IE_NO_DSB_LEN                       7
++
++/* Medium Synchronization Delay Information */
++#define MLO_MEDIUM_SYNC_OFDMED_THRESH_START_POSITION  8
++#define MLO_MEDIUM_SYNC_MAX_TXOP_START_POSITION       12
++
++#define PROBE_FRAME 0
++#define ASSOC_FRAME 1
++
++enum ml_links {
++	LINK1,
++	LINK2,
++	MAX_NUM_LINKS
++};
++
++struct p_ap_mld {
++	u8 ap_mld_mac[ETH_ALEN];
++	u16 num_links;
++	struct hostapd_data *affiliated_links[MAX_NUM_LINKS];
++};
++
++enum multilink_type {
++	ML_BASIC,
++	ML_PROBE,
++	ML_ASSOC,
++};
++
++static inline bool mxl_is_mlo_enabled(struct hostapd_bss_config *conf)
++{
++	return (conf->mxl_bss_conf.mlo_enable != 0);
++}
++
++struct hapd_interfaces;
++
++int mxl_get_ml_probe_type_mld_id(const u8 * ml_ie, size_t ml_ie_len);
++int mxl_hostapd_mld_remove(struct hostapd_data *hapd, u8 sendto_fw);
++
++/* Multi-Link element length */
++int mxl_hostapd_multilink_ie_len(struct hostapd_data *hapd, bool is_probe_req);
++
++/* Multi-Link Element */
++u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
++				u8 *eid, enum multilink_type ml_type, u16 link_sta_status, bool is_auth);
++
++/* Initialize to store MLDs during hostapd start*/
++int mxl_mld_global_init(struct hapd_interfaces *interfaces);
++/* Deallocate memory used to store MLDs */
++int mxl_mld_global_deinit(struct hapd_interfaces *interfaces);
++/* Free affliated link info for an MLD
++ * hapd: hapd of a link affiliated to AP MLD
++ */
++void mxl_hosatpd_mld_free_from_affiliated_link(struct hostapd_data *hapd);
++
++/* Populate affiliated links info for an MLD
++ * iface : hostapd_iface of an affiliated link
++ */
++int mxl_update_mld_config_iface(struct hostapd_iface *iface, void *ctx);
++
++/* Validation of each affiliated links and their configurations (Security param, bssid etc.)
++ * before MLD Setup
++ * mld: it carries affiliated links info
++ */
++bool mxl_hostapd_verify_mld_config(struct p_ap_mld *mld);
++
++/* Validation of each affiliated links and their configurations (Security param, bssid etc.)
++ * before MLD Setup
++ * mld: it carries affiliated links info
++ */
++bool mxl_hostapd_verify_mld_config(struct p_ap_mld *mld);
++
++/* Setting up all AP MLDs created */
++int mxl_mld_setup_interfaces(struct hapd_interfaces *interfaces);
++/* validate ML STA Info (affiliated STA) */
++u16 mxl_check_assoc_ies_linked_sta(struct hostapd_data *hapd, struct sta_info *sta,
++					const u8 *ies, size_t ies_len);
++void mxl_hostapd_set_eml_capab(struct hostapd_iface *iface);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++#endif /* MXL_MLD_H */
++
++
+diff --git a/src/ap/mxl_wpa_auth.c b/src/ap/mxl_wpa_auth.c
+new file mode 100644
+index 000000000..a0eac4244
+--- /dev/null
++++ b/src/ap/mxl_wpa_auth.c
+@@ -0,0 +1,66 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++
++#include "utils/common.h"
++#include "utils/eloop.h"
++#include "utils/state_machine.h"
++#include "utils/bitfield.h"
++#include "common/ieee802_11_defs.h"
++#include "common/ocv.h"
++#include "common/dpp.h"
++#include "common/wpa_ctrl.h"
++#include "crypto/aes.h"
++#include "crypto/aes_wrap.h"
++#include "crypto/aes_siv.h"
++#include "crypto/crypto.h"
++#include "crypto/sha1.h"
++#include "crypto/sha256.h"
++#include "crypto/sha384.h"
++#include "crypto/sha512.h"
++#include "crypto/random.h"
++#include "eapol_auth/eapol_auth_sm.h"
++#include "drivers/driver.h"
++#include "ap_config.h"
++#include "ieee802_11.h"
++#include "sta_info.h"
++#include "wpa_auth.h"
++#include "mxl_wpa_auth.h"
++#include "pmksa_cache_auth.h"
++#include "wpa_auth_i.h"
++#include "wpa_auth_ie.h"
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++void mxl_hostapd_wpa_auth_mlo(struct wpa_authenticator *wpa1, struct wpa_authenticator *wpa2)
++{
++	wpa1->mlo_conf.link2_linkid = wpa2->mlo_conf.link1_linkid;
++	memcpy_s(wpa1->mlo_conf.link2_mac, ETH_ALEN, wpa2->mlo_conf.link1_mac, ETH_ALEN);
++	wpa2->mlo_conf.link2_linkid = wpa1->mlo_conf.link1_linkid;
++	memcpy_s(wpa2->mlo_conf.link2_mac, ETH_ALEN, wpa1->mlo_conf.link1_mac, ETH_ALEN);
++
++	wpa1->sibling_wpa_auth = wpa2;
++	wpa2->sibling_wpa_auth = wpa1;
++}
++
++void mxl_hostapd_wpa_auth_mlo_clear(struct wpa_authenticator *wpa1, struct wpa_authenticator *wpa2)
++{
++
++	os_memset(&wpa1->mlo_conf, 0, sizeof(wpa1->mlo_conf));
++	os_memset(&wpa2->mlo_conf, 0, sizeof(wpa2->mlo_conf));
++
++	wpa1->sibling_wpa_auth = NULL;
++	wpa2->sibling_wpa_auth = NULL;
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++
+diff --git a/src/ap/mxl_wpa_auth.h b/src/ap/mxl_wpa_auth.h
+new file mode 100644
+index 000000000..dc4c52c21
+--- /dev/null
++++ b/src/ap/mxl_wpa_auth.h
+@@ -0,0 +1,37 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_WPA_AUTH_H
++#define MXL_WPA_AUTH_H
++
++#include "common/defs.h"
++#include "common/eapol_common.h"
++#include "common/wpa_common.h"
++#include "common/ieee802_11_defs.h"
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++struct wpa_authenticator;
++
++struct wpa_auth_mlo_conf {
++	u8 link1_linkid;
++	u8 link2_linkid;
++	u8 ap_mld_mac[ETH_ALEN];
++	u8 link1_mac[ETH_ALEN];
++	u8 link2_mac[ETH_ALEN];
++};
++
++void mxl_hostapd_wpa_auth_mlo(struct wpa_authenticator *wpa1, struct wpa_authenticator *wpa2);
++void mxl_hostapd_wpa_auth_mlo_clear(struct wpa_authenticator *wpa1, struct wpa_authenticator *wpa2);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++#endif /* MXL_WPA_AUTH_H */
++
+diff --git a/src/ap/mxl_wpa_auth_glue.c b/src/ap/mxl_wpa_auth_glue.c
+new file mode 100644
+index 000000000..a8816f6d8
+--- /dev/null
++++ b/src/ap/mxl_wpa_auth_glue.c
+@@ -0,0 +1,70 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++
++#include "utils/common.h"
++#include "utils/eloop.h"
++#include "utils/list.h"
++#include "common/ieee802_11_defs.h"
++#include "common/sae.h"
++#include "common/wpa_ctrl.h"
++#include "common/ptksa_cache.h"
++#include "crypto/sha1.h"
++#include "eapol_auth/eapol_auth_sm.h"
++#include "eapol_auth/eapol_auth_sm_i.h"
++#include "eap_server/eap.h"
++#include "l2_packet/l2_packet.h"
++#include "eth_p_oui.h"
++#include "hostapd.h"
++#include "ieee802_1x.h"
++#include "preauth_auth.h"
++#include "sta_info.h"
++#include "tkip_countermeasures.h"
++#include "ap_drv_ops.h"
++#include "ap_config.h"
++#include "ieee802_11.h"
++#include "ieee802_11_auth.h"
++#include "pmksa_cache_auth.h"
++#include "wpa_auth.h"
++#include "mxl_wpa_auth.h"
++#include "wpa_auth_glue.h"
++#include "mxl_wpa_auth_glue.h"
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++void mxl_hostapd_setup_mlo_wpa(struct hostapd_data *hapd)
++{
++	mxl_hostapd_wpa_auth_mlo(hapd->wpa_auth, hapd->mxl_data.sibling_hapd->wpa_auth);
++}
++
++void mxl_hostapd_clear_mlo_wpa(struct hostapd_data *hapd)
++{
++	mxl_hostapd_wpa_auth_mlo_clear(hapd->wpa_auth, hapd->mxl_data.sibling_hapd->wpa_auth);
++}
++
++void mxl_hostapd_setup_wpa_mlo(struct hostapd_data *hapd, struct wpa_auth_config *conf)
++{
++	conf->mlo_conf.link1_linkid = INVALID_LINK_ID;
++	conf->mlo_conf.link2_linkid = INVALID_LINK_ID;
++
++	if (hapd->conf->mxl_bss_conf.mlo_enable) {
++		memcpy_s(conf->mlo_conf.ap_mld_mac, ETH_ALEN, hapd->conf->mxl_bss_conf.ap_mld_mac, ETH_ALEN);
++		memcpy_s(conf->mlo_conf.link1_mac, ETH_ALEN, hapd->own_addr, ETH_ALEN);
++		conf->mlo_conf.link1_linkid = hapd->conf->mxl_bss_conf.link_id;
++		if (hapd->mxl_data.sibling_hapd) {
++			memcpy_s(conf->mlo_conf.link2_mac, ETH_ALEN, hapd->mxl_data.sibling_hapd->own_addr, ETH_ALEN);
++			conf->mlo_conf.link2_linkid = hapd->mxl_data.sibling_hapd->conf->mxl_bss_conf.link_id;
++		}
++	}
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+diff --git a/src/ap/mxl_wpa_auth_glue.h b/src/ap/mxl_wpa_auth_glue.h
+new file mode 100644
+index 000000000..5838b93ae
+--- /dev/null
++++ b/src/ap/mxl_wpa_auth_glue.h
+@@ -0,0 +1,22 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_WPA_AUTH_GLUE_H
++#define MXL_WPA_AUTH_GLUE_H
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++void mxl_hostapd_setup_mlo_wpa(struct hostapd_data *hapd);
++void mxl_hostapd_clear_mlo_wpa(struct hostapd_data *hapd);
++void mxl_hostapd_setup_wpa_mlo(struct hostapd_data *hapd, struct wpa_auth_config *conf);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++#endif /* MXL_WPA_AUTH_GLUE_H */
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index 3a9e0fc26..2f9448e91 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -535,6 +535,9 @@ struct wpa_authenticator * wpa_init(const u8 *addr,
+ 	if (!wpa_auth)
+ 		return NULL;
+ 	os_memcpy(wpa_auth->addr, addr, ETH_ALEN);
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	wpa_auth->mlo_conf = conf->mlo_conf; /* struct copy */
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	os_memcpy(&wpa_auth->conf, conf, sizeof(*conf));
+ 	wpa_auth->cb = cb;
+ 	wpa_auth->cb_ctx = cb_ctx;
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index b7806ea5d..ced45519d 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -13,6 +13,9 @@
+ #include "common/eapol_common.h"
+ #include "common/wpa_common.h"
+ #include "common/ieee802_11_defs.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_wpa_auth.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ struct vlan_description;
+ struct mld_info;
+@@ -293,6 +296,9 @@ struct wpa_auth_config {
+ 	 * Set only in nontransmitted BSSs, i.e., is NULL for transmitted BSS
+ 	 * and in BSSs that are not part of a Multi-BSSID set. */
+ 	struct wpa_authenticator *tx_bss_auth;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	struct wpa_auth_mlo_conf mlo_conf;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ };
+ 
+ typedef enum {
+diff --git a/src/ap/wpa_auth_glue.c b/src/ap/wpa_auth_glue.c
+index 44d19687d..d11390b25 100644
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -33,7 +33,9 @@
+ #include "pmksa_cache_auth.h"
+ #include "wpa_auth.h"
+ #include "wpa_auth_glue.h"
+-
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_wpa_auth_glue.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
+ 				  struct hostapd_config *iconf,
+@@ -1683,8 +1685,11 @@ int hostapd_setup_wpa(struct hostapd_data *hapd)
+ 	const u8 *wpa_ie;
+ 	size_t wpa_ie_len;
+ 	struct hostapd_data *tx_bss;
+-
+ 	hostapd_wpa_auth_conf(hapd->conf, hapd->iconf, &_conf);
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_hostapd_setup_wpa_mlo(hapd, &_conf);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	_conf.msg_ctx = hapd->msg_ctx;
+ 	tx_bss = hostapd_mbssid_get_tx_bss(hapd);
+ 	if (tx_bss != hapd)
+diff --git a/src/ap/wpa_auth_i.h b/src/ap/wpa_auth_i.h
+index 8c9cb71c6..8851d8094 100644
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -10,6 +10,9 @@
+ #define WPA_AUTH_I_H
+ 
+ #include "utils/list.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_wpa_auth.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ /* max(dot11RSNAConfigGroupUpdateCount,dot11RSNAConfigPairwiseUpdateCount) */
+ #define RSNA_MAX_EAPOL_RETRIES 4
+@@ -264,6 +267,10 @@ struct wpa_authenticator {
+ #ifdef CONFIG_P2P
+ 	struct bitfield *ip_pool;
+ #endif /* CONFIG_P2P */
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	struct wpa_auth_mlo_conf mlo_conf;
++	struct wpa_authenticator *sibling_wpa_auth;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ };
+ 
+ 
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index 17a336080..c9b9f500b 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -16,6 +16,9 @@
+ #include "ieee802_11_defs.h"
+ #include "ieee802_11_common.h"
+ 
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_ieee802_11_common.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ static int ieee802_11_parse_vendor_specific(const u8 *pos, size_t elen,
+ 					    struct ieee802_11_elems *elems,
+@@ -206,6 +209,10 @@ static int ieee802_11_parse_mle(const u8 *pos, size_t elen, size_t **total_len,
+ {
+ 	u8 mle_type = pos[0] & MULTI_LINK_CONTROL_TYPE_MASK;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	elems->multilink_ie = pos;
++	elems->multilink_ie_len = elen;
++#endif /* CONFIG_VENDOR_MXL */
+ 	switch (mle_type) {
+ 	case MULTI_LINK_CONTROL_TYPE_BASIC:
+ 		elems->basic_mle = pos;
+@@ -392,6 +399,12 @@ static int ieee802_11_parse_extension(const u8 *pos, size_t elen,
+ 		elems->mbssid_known_bss = pos;
+ 		elems->mbssid_known_bss_len = elen;
+ 		break;
++#ifdef CONFIG_VENDOR_MXL
++	case WLAN_EID_EXT_NON_INHERITANCE:
++		elems->non_inheritance = pos;
++		elems->non_inheritance_len = elen;
++		break;
++#endif /* CONFIG_VENDOR_MXL */
+ 	default:
+ 		if (show_errors) {
+ 			wpa_printf(MSG_MSGDUMP,
+@@ -3010,33 +3023,12 @@ int ieee802_11_parse_candidate_list(const char *pos, u8 *nei_rep,
+ 		end = os_strchr(pos, ' ');
+ 		tmp = os_strchr(pos, ',');
+ 		if (tmp && (!end || tmp < end)) {
+-			/* Optional Neighbor Preference */
+-			pos = os_strchr(pos, ',');
+-			pos ++;
+-
+-			/* Check if Neighbor preference is valid. */
+-			/* More than 3 characters indicates the last parameter is the sub-elements hexdump and not preference */
+-			char * next_delim = os_strchr(pos, ',');
+-			rsize_t poslen = strnlen_s(pos, RSIZE_MAX_STR);
+-			if (!IS_VALID_RANGE(poslen, AP_MIN_VALID_CHAR, RSIZE_MAX_STR - 1)) {
+-				wpa_printf(MSG_ERROR, "ieee802_11_parse_candidate_list - wrong len");
++#ifdef CONFIG_VENDOR_MXL
++			if (mxl_parse_optional_neighbor_fields(&tmp, &end, &nei_pos, &pos, &nei_rep, nei_rep_len) != 0) {
++				wpa_printf(MSG_ERROR, "parse_candidate_list - failed");
+ 				return -1;
+ 			}
+-			if ((poslen<=3) || (end && (end - (tmp) <= 4)) || (next_delim && (next_delim - tmp <=4))){
+-
+-				int cand_pref = atoi(pos);
+-				if (cand_pref < 0 || cand_pref > 255){
+-					wpa_printf(MSG_DEBUG, "Invalid BSS Transition Candidate Preference value");
+-					return -1;
+-				}
+-
+-				*nei_pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
+-				*nei_pos++ = 1;
+-				*nei_pos++ = cand_pref;
+-
+-				tmp = os_strchr(pos, ',');
+-			}
+-
++#endif /* CONFIG_VENDOR_MXL */
+ 			if (tmp && (!end || tmp < end)) {
+ 				/* Optional Subelements (hexdump) */
+ 				size_t len;
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index b5d207a13..a8b106a65 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -110,6 +110,10 @@ struct ieee802_11_elems {
+ 	const u8 *tdls_mle;
+ 	const u8 *prior_access_mle;
+ 	const u8 *mbssid_known_bss;
++#ifdef CONFIG_VENDOR_MXL
++	const u8 *multilink_ie;
++	const u8 *non_inheritance;
++#endif /* CONFIG_VENDOR_MXL */
+ 	const u8 *multiple_bssid_index;
+ 
+ 	u8 ssid_len;
+@@ -174,6 +178,10 @@ struct ieee802_11_elems {
+ 	size_t tdls_mle_len;
+ 	size_t prior_access_mle_len;
+ 	u8 mbssid_known_bss_len;
++#ifdef CONFIG_VENDOR_MXL
++	u8 multilink_ie_len;
++	u8 non_inheritance_len;
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	struct mb_ies_info mb_ies;
+ 
+diff --git a/src/common/mxl_ieee802_11_common.c b/src/common/mxl_ieee802_11_common.c
+index 744b50d96..cdf624579 100644
+--- a/src/common/mxl_ieee802_11_common.c
++++ b/src/common/mxl_ieee802_11_common.c
+@@ -16,6 +16,9 @@
+ #include "utils/common.h"
+ #include "mxl_ieee802_11_common.h"
+ 
++#define MLO_TYPE_BASIC 0
++#define WNM_NEIGHBOR_BASIC_MULTILINK 201
++
+ void mxl_scan_res_set_rssi_threshold(struct wpa_scan_results *scan_res, int rssi_threshold)
+ {
+ 	scan_res->mxl_cfg.rssi_threshold = rssi_threshold;
+@@ -29,3 +32,111 @@ bool mxl_scan_res_bss_below_threshold(struct wpa_scan_results *scan_res, int bss
+ 
+ 	return false;
+ }
++
++int mxl_parse_optional_neighbor_fields(char **tmp_o, const char **end_o, u8 **nei_pos_o, const char **pos_o, u8 **nei_rep_o, size_t nei_rep_len)
++{
++	const char *pos = *pos_o;
++	const char *end = *end_o;
++	u8 *nei_pos = *nei_pos_o;
++	u8 *nei_rep = *nei_rep_o;
++	char *tmp = *tmp_o;
++
++	if (nei_pos + 15 > nei_rep + nei_rep_len) {
++		wpa_printf(MSG_DEBUG,
++				"Not enough room for optional neighbor values");
++		return -1;
++	}
++
++	/* Optional Neighbor Preference */
++	pos = os_strchr(pos, ',');
++	pos ++;
++
++	/* Check if Neighbor preference is valid. */
++	/* More than 3 characters indicates the last parameter is the sub-elements hexdump and not preference */
++	char * next_delim = os_strchr(pos, ',');
++	rsize_t poslen = strnlen_s(pos, RSIZE_MAX_STR);
++	if (!IS_VALID_RANGE(poslen, AP_MIN_VALID_CHAR, RSIZE_MAX_STR - 1)) {
++		wpa_printf(MSG_ERROR, "ieee802_11_parse_candidate_list - wrong len");
++		return -1;
++	}
++	if ((poslen<=3) || (end && ((end - tmp) <= 4)) || (next_delim && ((next_delim - tmp) <= 4))) {
++
++		int cand_pref = atoi(pos);
++		if (cand_pref < 0 || cand_pref > 255){
++			wpa_printf(MSG_DEBUG, "Invalid BSS Transition Candidate Preference value");
++			return -1;
++		}
++
++		*nei_pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
++		*nei_pos++ = 1;
++		*nei_pos++ = cand_pref;
++
++		tmp = os_strchr(pos, ',');
++	}
++
++	if (tmp && (!end || tmp < end)) {
++		/* Optional Subelement - Basic multilink */
++		pos = tmp + 1;
++		u8 nei_mld_addr[ETH_ALEN], *tmp_nei_pos;
++		if (!hwaddr_aton(pos, nei_mld_addr)) {
++			u8 *common_info_len, *ml_subie_start;
++			u16 multilink_ctrl = 0;
++
++			*nei_pos++ = WNM_NEIGHBOR_BASIC_MULTILINK;
++			common_info_len = nei_pos++;
++			ml_subie_start = nei_pos;
++
++			/* Presence bitmap fields should be 0 */
++			multilink_ctrl |= MLO_TYPE_BASIC;
++			tmp_nei_pos = nei_pos;
++			WPA_PUT_LE16(nei_pos, multilink_ctrl);
++			nei_pos += sizeof(multilink_ctrl);
++
++			/* Common info should contain only the neighbor mld mac address */
++			*nei_pos++ = 7; /* Length of length field in common info + ETH_ALEN */
++			memcpy_s(nei_pos, ETH_ALEN, nei_mld_addr, ETH_ALEN);
++			nei_pos += ETH_ALEN;
++
++			tmp = os_strchr(pos, ',');
++			if (tmp && (!end || tmp < end)) {
++				pos = os_strchr(pos, ',');
++				pos++;
++
++				char * next_delim = os_strchr(pos, ',');
++				poslen = strnlen_s(pos, RSIZE_MAX_STR);
++				if (!IS_VALID_RANGE(poslen, AP_MIN_VALID_CHAR, RSIZE_MAX_STR - 1)) {
++					wpa_printf(MSG_ERROR, "ieee802_11_parse_candidate_list - wrong len");
++					return -1;
++				}
++
++				if ((poslen<=2) || (end && ((end - tmp) <= 3)) || (next_delim && ((next_delim - tmp) <= 3))){
++					int link_id = atoi(pos);
++					if (link_id < 0 || link_id > 14) {
++						wpa_printf(MSG_DEBUG, "Invalid neighbor link id value");
++						return -1;
++					}
++					*nei_pos++ = (u8) link_id;
++					multilink_ctrl |= MLO_LINK_ID_INFO_PRESENT;
++					WPA_PUT_LE16(tmp_nei_pos, multilink_ctrl);
++					tmp_nei_pos += sizeof(multilink_ctrl);
++					*tmp_nei_pos = 8;
++					tmp = os_strchr(pos, ',');
++				}
++			}
++			*common_info_len = nei_pos - ml_subie_start;
++		} else {
++			char *tmp_str = os_strchr(pos, ',');
++			if (tmp_str && (!end || tmp_str < end)) {
++				wpa_printf(MSG_DEBUG, "Invalid Neighbor MLD MAC");
++				return -1;
++			}
++		}
++	}
++	*tmp_o=tmp;
++	*end_o=end;
++	*nei_pos_o=nei_pos;
++	*pos_o=pos;
++	*nei_rep_o=nei_rep;
++
++	return 0;
++}
+diff --git a/src/common/mxl_ieee802_11_common.h b/src/common/mxl_ieee802_11_common.h
+index 8f0df8db3..bba312a5a 100644
+--- a/src/common/mxl_ieee802_11_common.h
++++ b/src/common/mxl_ieee802_11_common.h
+@@ -18,5 +18,6 @@
+ 
+ void mxl_scan_res_set_rssi_threshold(struct wpa_scan_results *scan_res, int rssi_threshold);
+ bool mxl_scan_res_bss_below_threshold(struct wpa_scan_results *scan_res, int bss_rssi);
++int mxl_parse_optional_neighbor_fields(char **tmp_o, const char **end_o, u8 **nei_pos_o, const char **pos_o, u8 **nei_rep_o, size_t nei_rep_len);
+ 
+ #endif /* MXL_IEEE802_11_COMMON_H */
+diff --git a/src/common/mxl_ieee802_11_defs.h b/src/common/mxl_ieee802_11_defs.h
+index 875a51b21..ee2049b4c 100644
+--- a/src/common/mxl_ieee802_11_defs.h
++++ b/src/common/mxl_ieee802_11_defs.h
+@@ -59,6 +59,29 @@ struct rnr_neighbor_ap_info {
+ 	u8 channel;
+ } STRUCT_PACKED;
+ 
++#define MAX_IE_LEN 255
++
++#define WLAN_EID_EXT_MAX_CHAN_SWITCH_TIME 52
++#define WLAN_EID_SUBELEMENT_MLO_PER_STA_PROFILE 0
++#define RNR_TBTT_INFO_HDR_FILTERED BIT(2)
++#define RNR_TBTT_INFO_BSS_PARAM_COLOC_AP BIT(6)
++#define RNR_TBTT_INFO_COUNT_OFFSET 4
++#define RNR_TBTT_INFO_BSS_PARAM_SAME_SSID BIT(1)
++#define RNR_TBTT_INFO_BSS_PARAM_MULTIPLE_BSSID BIT(2)
++#define RNR_TBTT_INFO_BSS_PARAM_TRANSMITTED_BSSID BIT(3)
++#define RNR_TBTT_INFO_BSS_PARAM_COLOC_ESS BIT(4)
++#define RNR_TBTT_INFO_BSS_PARAM_20TU_PROBE_RES BIT(5)
++
++
++#define RNR_TBTT_PADDING_BYTES_MIN       0
++#define RNR_TBTT_PADDING_BYTES_MAX       4
++#define TBTT_OFFSET_UNKNOWN              255
++#define RNR_TBTT_HEADER_LEN              4
++#define RNR_TBTT_INFO_COUNT_MAX          16
++#define RNR_TBTT_INFO_LEN_SAME_SSID      9
++#define RNR_TBTT_INFO_LEN_DIFFERENT_SSID 13
++#define RNR_TBTT_INFO_LEN_MLD            16
++
+ /* According to IEEE80211-2016 "The subfields of the
+  * VHT Operation Information field are defined in Table 9-252.*/
+ #define VHT_OPER_CHANWIDTH_20_40MHZ                     0
+@@ -66,6 +89,13 @@ struct rnr_neighbor_ap_info {
+ #define VHT_OPER_CHANWIDTH_160MHZ                       2
+ #define VHT_OPER_CHANWIDTH_80P80MHZ                     3
+ 
++struct ieee80211_neighbor_vap_info {
++	/* The Neighbor AP TBTT Offset subfield is always present */
++	u8 neighbor_ap_tbtt_offset;
++	/* The Neighbor AP TBTT bssid */
++	u8 neighbor_ap_bssid[ETH_ALEN];
++} STRUCT_PACKED;
++
+ struct multi_ap_blacklist {
+ 	struct dl_list list;
+ 	u8 addr[ETH_ALEN];
+@@ -123,6 +153,12 @@ struct dmg_link_adaptation_ack {
+ 	le32 ref_timestamp;
+ } STRUCT_PACKED;
+ 
++enum multi_link_support_e {
++	MULTILINK_DISABLED,
++	MULTILINK_EMLSR,
++	MULTILINK_EMLMR
++};
++
+ /* According to IEEE80211-2016 "The subfields of the
+  * VHT Operation Information field are defined in Table 9-252.*/
+ #define VHT_OPER_CHANWIDTH_20_40MHZ			0
+@@ -472,5 +508,45 @@ struct dmg_link_adaptation_ack {
+ #define EHT_MCS_RX_MASK         0x0f
+ #define EHT_MCS_TX_MASK         0xf0
+ 
++/* Multi-Link control Presence Bitmap bit map corresponds to the Basic type */
++#define MLO_LINK_ID_INFO_PRESENT                        BIT(4)
++#define MLO_BSS_PARAM_CHANGE_COUNT_PRESENT              BIT(5)
++#define MLO_MSDI_PRESENT                                BIT(6)
++#define MLO_EML_CAPAB_PRESENT                           BIT(7)
++#define MLO_MLD_CAPAB_PRESENT                           BIT(8)
++#define MLO_MLD_ID_PRESENT                              BIT(9)
++/* B10...B15 reserved */
++/* EML Capab */
++#define MLO_EMLSR                                       BIT(0)
++#define MLO_EMLSR_PADDING_DELAY                         (BIT(1) | BIT(2) | BIT(3))
++#define MLO_EMLSR_TRANSITION_DELAY                      (BIT(4) | BIT(5) | BIT(6))
++#define MLO_EMLMR                                       BIT(7)
++#define MLO_EMLMR_DELAY                                 (BIT(8) | BIT(9) | BIT(10))
++#define MLO_TRANSITION_TIMEOUT                          (BIT(11) | BIT(12) | BIT(13) | BIT(14))
++
++#define MLO_EMLSR_PADDING_DELAY_MASK                    1
++#define MLO_EMLSR_TRANSITION_DELAY_MASK                 4
++#define MLO_TRANSITION_TIMEOUT_MASK                     11
++/* B12...B15 reserved */
++#define MLO_EMLMR_RX_NSS                                (BIT(0) | BIT(1) | BIT(2) | BIT(3))
++#define MLO_EMLMR_TX_NSS                                (BIT(4) | BIT(5) | BIT(6) | BIT(7))
++/* MLD Capab */
++#define MLO_MAX_NUM_SIMUL_LINKS                         (BIT(0) | BIT(1) | BIT(2) | BIT(3))
++#define MLO_SRS                                         BIT(4)
++#define MLO_T2LM_NEGOTIATION_SUPPORT_MAP_ALL_TID_TO_SAME_LINK           BIT(5) /* DL and UL */
++#define MLO_FREQ_SEP_STR                                (BIT(7) | BIT(8) | BIT(9) | BIT(10) | BIT(11))
++/* B12...B15 reserved */
++/* Multi-Link Link Info (STA Info) Element */
++#define MLO_LINK_INFO_LINK_ID                           (BIT(0) | BIT(1) | BIT(2) | BIT(3))
++#define MLO_LINK_INFO_COMPLETE_PROFILE                  BIT(4)
++#define MLO_LINK_INFO_MACADDR_PRESENT                   BIT(5)
++#define MLO_LINK_INFO_BI_PRESENT                        BIT(6)
++#define MLO_LINK_INFO_TSF_OFFSET_PRESENT                BIT(7)
++#define MLO_LINK_INFO_DTIM_INFO_PRESENT                 BIT(8)
++#define MLO_LINK_INFO_NSTR_PRESENT                      BIT(9)
++#define MLO_LINK_INFO_NSTR_BITMAP                       BIT(10)
++#define MLO_LINK_INFO_BSS_PARAM_CHANGE_CNT_PRESENT      BIT(11)
++/* reserved B12...B15 */
++
+ #endif /* MXL_IEEE802_11_DEFS_H */
+ 
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 414fdf221..82485f5ed 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -405,8 +405,8 @@ enum ltq_nl80211_vendor_subcmds {
+   LTQ_NL80211_VENDOR_SUBCMD_SCS_REM_REQ,
+   LTQ_NL80211_VENDOR_SUBCMD_GET_LINK_ADAPT_MU_GROUPS_COUNTERS_STATS,
+   LTQ_NL80211_VENDOR_SUBCMD_ML_SEND_T2LM_TEARDOWN_FRAME,
+-  LTQ_NL80211_VENDOR_SUBCMD_GET_ML_LINKSWITCH_STATS,
+-  LTQ_NL80211_VENDOR_SUBCMD_SET_ML_LINKSWITCH_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ML_LINK_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ML_LINK_STATS,
+   LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_EDCA,
+   LTQ_NL80211_VENDOR_SUBCMD_SET_STR_TID_LINK_SPREADING,
+   LTQ_NL80211_VENDOR_SUBCMD_REG_UPDATE_6GHZ_OPER_POWER_MODE,
+@@ -624,6 +624,35 @@ struct _mxl_vendor_bcast_twt_config_t {
+   struct _mxl_vendor_btwt_params_t btwt_params[MAX_NUM_BCAST_TWT_SP_TO_ADD];
+ } __attribute__ ((packed));
+ 
++/* MLO params */
++#define MAX_NUM_OF_LINKS          3
++#define INVALID_LINK_ID         128
++#define LINK_ID_6G                2
++#define LINK_ID_5G                1
++#define LINK_ID_2G                0
++
++struct _mxl_vendor_mld_info {
++  int mld_id;
++  u8 ap_mld_mac[ETH_ALEN];
++  u8 link1_bssid[ETH_ALEN];
++  u8 link2_vapid;
++} __attribute__ ((packed));
++
++struct _mxl_vendor_mld_link_info {
++  int mld_id;
++  u8 ap_mld_mac[ETH_ALEN];
++} __attribute__ ((packed));
++
++struct mxl_ml_mainVapId {
++  u8 sta_addr[ETH_ALEN];
++  u8 mainVapId;
++} __attribute__ ((packed));
++
++struct mxl_mld_remove {
++  u8 mld_id;
++  u8 sendto_fw;
++} __attribute__ ((packed));
++
+ /* Data for channel switch vendor implementation */
+ struct intel_vendor_channel_switch_cfg {
+   u8 csaDeauthMode; /* 0-disabled, 1-unicast, 2-multicast */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index ca327b70e..fe859157a 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -321,6 +321,9 @@ struct hostapd_hw_modes {
+ 	 * eht_capab - EHT (IEEE 802.11be) capabilities
+ 	 */
+ 	struct eht_capabilities eht_capab[IEEE80211_MODE_NUM];
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	struct ieee80211_multilink_capa eml_capa;
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ };
+ 
+ 
+diff --git a/src/drivers/driver_nl80211_capa.c b/src/drivers/driver_nl80211_capa.c
+index 9afea394b..1d7b4f194 100644
+--- a/src/drivers/driver_nl80211_capa.c
++++ b/src/drivers/driver_nl80211_capa.c
+@@ -2147,6 +2147,9 @@ static int phy_info_band(struct phy_info_arg *phy_info, struct nlattr *nl_band)
+ 			 tb_band[NL80211_BAND_ATTR_HT_MCS_SET]);
+ 	phy_info_vht_capa(mode, tb_band[NL80211_BAND_ATTR_VHT_CAPA],
+ 			  tb_band[NL80211_BAND_ATTR_VHT_MCS_SET]);
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	mxl_phy_info_eml_capa(mode, tb_band[NL80211_BAND_ATTR_MULTILINK_CAPA]);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 	ret = phy_info_edmg_capa(mode,
+ 				 tb_band[NL80211_BAND_ATTR_EDMG_BW_CONFIG],
+ 				 tb_band[NL80211_BAND_ATTR_EDMG_CHANNELS]);
+diff --git a/src/drivers/mxl_driver.h b/src/drivers/mxl_driver.h
+index 61985d8e5..03e148bc4 100644
+--- a/src/drivers/mxl_driver.h
++++ b/src/drivers/mxl_driver.h
+@@ -26,7 +26,26 @@ struct mxl_chan_data {
+ 	unsigned int nop_time_passed_min;
+ };
+ 
++struct update_rnr {
++	u8 bssid[ETH_ALEN];
++	u8 OperatingClass;
++	u8 Channel;
++	u8 ssid[SSID_MAX_LEN];
++	u8 psd_20MHz;
++	bool multibss_enable;
++	bool is_transmitted_bssid;
++	bool unsolicited_frame_support;
++	bool hidden_mode;
++};
++
++struct ieee80211_multilink_capa {
++	enum multi_link_support_e ml_support;
++};
++
+ /** Driver supports background CAC */
+ #define MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC	0x0000000000000001ULL
+ 
++#define HOSTAP_6GHZ_CHANNEL_FIRST 1
++#define HOSTAP_6GHZ_CHANNEL_LAST 233
++
+ #endif /* MXL_DRIVER_H */
+diff --git a/src/drivers/mxl_driver_nl80211.c b/src/drivers/mxl_driver_nl80211.c
+index 2c827b2de..e560aecdf 100644
+--- a/src/drivers/mxl_driver_nl80211.c
++++ b/src/drivers/mxl_driver_nl80211.c
+@@ -91,3 +91,13 @@ void mxl_nl80211_update_capa(struct nlattr **tb, struct wpa_driver_capa *capa)
+ 	if (tb[NL80211_ATTR_WIPHY_DFS_ANTENNA])
+ 		capa->mxl_flags |= MXL_WPA_DRIVER_FLAGS_BACKGROUND_CAC;
+ }
++
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++void mxl_phy_info_eml_capa(struct hostapd_hw_modes *mode, struct nlattr *eml_capa)
++{
++	if (!eml_capa)
++		return;
++	mode->eml_capa.ml_support = nla_get_u8(eml_capa);
++	wpa_printf(MSG_DEBUG, "%s: mode->eml_capa.ml_support %d", __func__, mode->eml_capa.ml_support);
++}
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+diff --git a/src/drivers/mxl_driver_nl80211.h b/src/drivers/mxl_driver_nl80211.h
+index 9b268c8a6..5398de1e2 100644
+--- a/src/drivers/mxl_driver_nl80211.h
++++ b/src/drivers/mxl_driver_nl80211.h
+@@ -25,5 +25,6 @@ int mxl_nl80211_set_channel_dfs_state(void *priv, enum nl80211_dfs_state dfs_sta
+ 				      int freq, int dfs_time, int dfs_debug);
+ int mxl_nl80211_set_antenna(void *priv, u32 tx_ant, u32 rx_ant);
+ void mxl_nl80211_update_capa(struct nlattr **tb, struct wpa_driver_capa *capa);
++void mxl_phy_info_eml_capa(struct hostapd_hw_modes *mode, struct nlattr *eml_capa);
+ 
+ #endif /* MXL_DRIVER_NL80211_H */
+-- 
+2.43.0
+

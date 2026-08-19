@@ -1,0 +1,540 @@
+From 165f28efc5da615693d7164e9d1dfe20eaf3fee7 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Fri, 3 Mar 2023 10:34:24 +0100
+Subject: [PATCH] WLANRTSYS-53529: 802.11ax: Add support for the broadcast TWT
+ configuration
+
+---
+ hostapd/config_file.c         | 78 ++++++++++++++++++++++++++++++
+ src/ap/ap_config.c            |  7 ++-
+ src/ap/ap_config.h            | 54 +++++++++++++++++++++
+ src/ap/hostapd.c              | 90 +++++++++++++++++++++++++++++++++++
+ src/ap/hostapd.h              |  5 ++
+ src/ap/ieee802_11_shared.c    |  6 ---
+ src/common/ieee802_11_defs.h  | 56 ++++++++++++++++++++++
+ src/common/vendor_cmds_copy.h | 17 +++++++
+ src/utils/common.h            |  8 ++++
+ wpa_supplicant/scan.c         |  4 --
+ 10 files changed, 314 insertions(+), 11 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 2e1beadd7..cbee24122 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -23,6 +23,7 @@
+ #include "radius/radius_client.h"
+ #include "ap/wpa_auth.h"
+ #include "ap/ap_config.h"
++#include "ap/hostapd.h"
+ #include "config_file.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "ap/mxl_config.h"
+@@ -4827,6 +4828,47 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		}
+ 		bss->wpa_ie_required_for_mbss = val;
+ #endif
++#ifdef CONFIG_IEEE80211AX
++	} else if (os_strcmp(buf, "btwt_config_enable") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid bcast twt config value %d", line, val);
++			return 1;
++		} else if (bss->bss_idx != MULTIBSS_REFERENCE_BSS_IDX) {
++			wpa_printf(MSG_ERROR, "line %d: bcast twt not supported for bss idx %d", line, bss->bss_idx);
++			return 1;
++		}
++		bss->bcast_twt_config_enable = val;
++	} else if (os_strcmp(buf, "bcast_twt_params") == 0) {
++		if (bss->bss_idx != MULTIBSS_REFERENCE_BSS_IDX) {
++			wpa_printf(MSG_ERROR, "line %d: bcast twt not supported for bss idx %d", line, bss->bss_idx);
++			return 1;
++		}
++		int num_sched = bss->broadcast_twt_schedules.num_btwt_schedules;
++		int btwt_id, flow_type, wake_int, wake_dur;
++		struct _btwt_params_t *p_btwt_params = &bss->broadcast_twt_schedules.btwt_params[num_sched];
++
++		if (NUM_CONFIGURABLE_PARAMS_PER_BTWT_SCHED != sscanf(pos, "%d %d %d %d",
++				&btwt_id, &flow_type, &wake_dur, &wake_int)) {
++			wpa_printf(MSG_ERROR, "Line %d: Bcast TWT: invalid number of parameters %s", line, pos);
++			return 1;
++		}
++		if (!IS_VALID_RANGE(btwt_id, MIN_BCAST_TWT_ID, MAX_BCAST_TWT_ID) ||
++		    !IS_VALID_BOOL_RANGE(flow_type) ||
++		    !IS_VALID_U8_RANGE(wake_dur) || !IS_VALID_U16_RANGE(wake_int)) {
++			wpa_printf(MSG_ERROR, "Line %d: Bcast TWT: invalid parameters", line);
++			return 1;
++		}
++		if (num_sched < MAX_BCAST_TWT_SCHEDULES_PER_VAP_SUPPORTED) {
++			p_btwt_params->btwt_id = btwt_id;
++			p_btwt_params->flow_type = flow_type;
++			p_btwt_params->nominal_min_wake_dur = wake_dur;
++			p_btwt_params->wake_interval_mantissa = wake_int;
++			bss->broadcast_twt_schedules.num_btwt_schedules++;
++		} else {
++			wpa_printf(MSG_ERROR, "Num of BTWT schedules exceeds the limit %d", num_sched);
++		}
++#endif
+ #ifdef CONFIG_VENDOR_MXL
+ 	} else if (mxl_hostapd_config_fill(conf, bss, buf, pos, line)) {
+ #endif /* CONFIG_VENDOR_MXL */
+@@ -4927,6 +4969,42 @@ struct hostapd_config * hostapd_config_read(const char *fname)
+ 	}
+ #endif /* WPA_IGNORE_CONFIG_ERRORS */
+ 
++#ifdef CONFIG_IEEE80211AX
++	/* Broadcast TWT configuration for the first operational VAP */
++	if (conf && (conf->num_bss >= MIN_NUM_BSS_IN_NON_MBSSID_SET) &&
++	    conf->bss[MULTIBSS_REFERENCE_BSS_IDX]->bcast_twt_config_enable) {
++		int i;
++		bool default_btwt_schedules = false;
++		u32 default_btwt_id[NUM_BCAST_TWT_SCHEDULES_DEFAULT] = {BCAST_TWT_ID_0, BCAST_TWT_ID_1};
++		u32 default_wake_dur[NUM_BCAST_TWT_SCHEDULES_DEFAULT] = {BCAST_TWT_ID0_MIN_WAKE_DUR, BCAST_TWT_ID1_MIN_WAKE_DUR};
++		u32 default_wake_int[NUM_BCAST_TWT_SCHEDULES_DEFAULT] = {BCAST_TWT_ID0_WAKE_INT_MANT, BCAST_TWT_ID1_WAKE_INT_MANT};
++		struct hostapd_bss_config *bss = conf->bss[MULTIBSS_REFERENCE_BSS_IDX];
++		btwt_params_t *p_btwt_params = &bss->broadcast_twt_schedules.btwt_params[0];
++
++		if (!bss->broadcast_twt_schedules.num_btwt_schedules) {
++			bss->broadcast_twt_schedules.num_btwt_schedules = NUM_BCAST_TWT_SCHEDULES_DEFAULT;
++			default_btwt_schedules = true;
++		}
++
++		for (i = 0; i < bss->broadcast_twt_schedules.num_btwt_schedules; i++) {
++			p_btwt_params[i].wake_interval_exponent = BCAST_TWT_WAKE_INT_EXP;
++			p_btwt_params[i].trigger = BCAST_TWT_TRIGGER_ENABLED;
++
++			if (default_btwt_schedules) {
++				p_btwt_params[i].btwt_id = default_btwt_id[i];
++				p_btwt_params[i].flow_type = BCAST_TWT_FLOW_TYPE_ANNOUNCED;
++				p_btwt_params[i].nominal_min_wake_dur = default_wake_dur[i];
++				p_btwt_params[i].wake_interval_mantissa = default_wake_int[i];
++			} else if (!p_btwt_params[i].nominal_min_wake_dur || !p_btwt_params[i].wake_interval_mantissa ||
++				   ((p_btwt_params[i].nominal_min_wake_dur * TWT_WAKE_DUR_UNIT_256US_IN_US) >=
++				    (p_btwt_params[i].wake_interval_mantissa * TWT_WAKE_DUR_UNIT_TU_IN_US))) {
++					wpa_printf(MSG_ERROR, "Bad BTWT configuration");
++					bss->bcast_twt_config_enable = false;
++			}
++		}
++	}
++#endif
++
+ 	return conf;
+ }
+ 
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index d4d6967e4..d1a6ce246 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -177,7 +177,12 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	bss->pasn_noauth = 1;
+ #endif /* CONFIG_PASN */
+ 	bss->wpa_ie_required_for_mbss = 0;
+-
++	/* Broadcast TWT default configuration*/
++#ifdef CONFIG_IEEE80211AX
++	bss->bcast_twt_config_enable = false;
++	bss->bcast_twt_config_sent = false;
++	os_memset((void *)&bss->broadcast_twt_schedules, 0, sizeof(broadcast_twt_schedules_t));
++#endif
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_config_defaults_bss(bss);
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index df43adbcd..59d3b8b52 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -15,6 +15,7 @@
+ #include "common/wpa_common.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/ieee802_11_common.h"
++#include "common/vendor_cmds_copy.h"
+ #include "crypto/sha256.h"
+ #include "wps/wps.h"
+ #include "fst/fst.h"
+@@ -277,6 +278,42 @@ struct airtime_sta_weight {
+ 	u8 addr[ETH_ALEN];
+ };
+ 
++/*Broadcast TWT related constants and data structures */
++/* Ref: Sec 9.4.2.199 of IEEE P802.11ax/D7.0, September 2020 */
++#ifdef CONFIG_IEEE80211AX
++#define MAX_BCAST_TWT_SCHEDULES_PER_VAP 32
++#define MAX_BCAST_TWT_SCHEDULES_PER_VAP_SUPPORTED MAX_NUM_BCAST_TWT_SP_TO_ADD
++#define NUM_BCAST_TWT_SCHEDULES_DEFAULT 2
++#define MIN_BCAST_TWT_ID 0
++#define MAX_BCAST_TWT_ID 31
++#define BCAST_TWT_ID_0 0
++#define BCAST_TWT_ID_1 1
++#define BCAST_TWT_TRIGGER_ENABLED 1
++#define BCAST_TWT_FLOW_TYPE_ANNOUNCED 0
++#define BCAST_TWT_WAKE_INT_EXP 10
++#define BCAST_TWT_ID0_MIN_WAKE_DUR 128  /* 128 * 256us = 32 TU*/
++#define BCAST_TWT_ID1_MIN_WAKE_DUR 64   /*  64 * 256us = 16 TU*/
++#define BCAST_TWT_ID0_WAKE_INT_MANT 112 /* 112 TU */
++#define BCAST_TWT_ID1_WAKE_INT_MANT 32  /* 32 TU */
++#define NUM_BTWT_SCHEDULES MIN(MAX_BCAST_TWT_SCHEDULES_PER_VAP, MAX_BCAST_TWT_SCHEDULES_PER_VAP_SUPPORTED)
++#define NUM_CONFIGURABLE_PARAMS_PER_BTWT_SCHED 4 /*btwt_id, flow_type, nominal_min_wake_dur, wake_interval_mantissa*/
++typedef struct _btwt_params_t
++{
++	u8 trigger;
++	u8 flow_type;
++	u8 wake_interval_exponent;
++	u8 nominal_min_wake_dur;
++	u16 wake_interval_mantissa;
++	u8 btwt_id;
++} btwt_params_t;
++
++typedef struct _broadcast_twt_schedules_t
++{
++	u8 num_btwt_schedules;
++	btwt_params_t btwt_params[NUM_BTWT_SCHEDULES];
++} broadcast_twt_schedules_t;
++#endif
++
+ #define EXT_CAPA_MAX_LEN 15
+ 
+ /**
+@@ -956,6 +993,11 @@ struct hostapd_bss_config {
+ 	int wnm_bss_trans_query_auto_resp;
+ 	int bss_idx;
+ 	int wpa_ie_required_for_mbss;
++#ifdef  CONFIG_IEEE80211AX
++	bool bcast_twt_config_enable;
++	bool bcast_twt_config_sent;
++	broadcast_twt_schedules_t broadcast_twt_schedules;
++#endif
+ #ifdef CONFIG_VENDOR_MXL
+ 	struct mxl_hostapd_bss_config mxl_bss_conf;
+ #endif /* CONFIG_VENDOR_MXL */
+@@ -1002,6 +1044,15 @@ enum multibss_aid_offset {
+ 	MULTIBSS_AID_OFFSET = 64
+ };
+ 
++#ifdef CONFIG_IEEE80211AX
++enum bcast_twt_wake_duration_unit {
++	TWT_WAKE_DURATION_UNIT_256US,
++	TWT_WAKE_DURATION_UNIT_TU
++};
++#define TWT_WAKE_DUR_UNIT_256US_IN_US	256
++#define TWT_WAKE_DUR_UNIT_TU_IN_US		1024
++#endif
++
+ /**
+  * struct eht_phy_capabilities_info - EHT PHY capabilities
+  */
+@@ -1203,6 +1254,9 @@ struct hostapd_config {
+ 		ENHANCED_MBSSID_ENABLED = 2,
+ 	} mbssid;
+ 	u8 owl; /* Forwarding incoming probe reqests to upper layers */
++#ifdef CONFIG_IEEE80211AX
++	enum bcast_twt_wake_duration_unit btwt_wake_dur_unit;
++#endif
+ #ifdef CONFIG_VENDOR_MXL
+ 	struct mxl_hostapd_config mxl_conf;
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 6e99f4564..0f9f56d48 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1344,6 +1344,94 @@ static int hostapd_start_beacon(struct hostapd_data *hapd,
+ }
+ 
+ 
++#ifdef CONFIG_IEEE80211AX
++/*Broadcast TWT default configuration sent to the Driver/FW for operational VAP and only in case of      *
++ *single operational VAP or multiple operational VAPs with multi-bss enabled, BTWT config, TWT responder *
++ *support and Broadcast TWT support are all enabled. In case more VAPs get added while a BTWT config     *
++ *was sent earlier then a BTWT Terminate command is issued to terminate all the BTWT schedules           */
++
++bool hostapd_can_send_btwt_config(struct hostapd_data *hapd)
++{
++#define BTWT_DEFAULT_PERSISTENCE_VALUE 5
++	struct hostapd_hw_modes *mode = hapd->iface->current_mode;
++	int persistence = BTWT_DEFAULT_PERSISTENCE_VALUE;
++
++	if ((hapd->conf->bcast_twt_config_enable) &&
++		(hapd->conf->bss_idx == MULTIBSS_REFERENCE_BSS_IDX) &&
++		((hapd->iconf->num_bss == MIN_NUM_BSS_IN_NON_MBSSID_SET) || (hapd->iconf->multibss_enable)) &&
++		(mode->he_capab[IEEE80211_MODE_AP].mac_cap[HE_MACCAP_CAP0_IDX] & HE_MAC_CAP0_TWT_RESPONDER_SUPPORT) &&
++		(mode->he_capab[IEEE80211_MODE_AP].mac_cap[HE_MACCAP_CAP2_IDX] & HE_MAC_CAP2_BROADCAST_TWT_SUPPORT)) {
++		return true;
++	} else if ((hapd->iconf->num_bss > MIN_NUM_BSS_IN_NON_MBSSID_SET) &&
++			(!hapd->iconf->multibss_enable) &&
++			(hapd->iconf->bss[MULTIBSS_REFERENCE_BSS_IDX]->bcast_twt_config_sent)) {
++		if (hostapd_drv_vendor_cmd(hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX], OUI_LTQ,
++			LTQ_NL80211_VENDOR_SUBCMD_TERMINATE_BTWT_SCHEDULE,
++			(const u8 *)&persistence, sizeof(int),
++			NESTED_ATTR_NOT_USED, NULL)) {
++			wpa_printf(MSG_ERROR, "send LTQ_NL80211_VENDOR_SUBCMD_TERMINATE_BTWT_SCHEDULE failed!!!");
++		} else {
++			hapd->iconf->bss[MULTIBSS_REFERENCE_BSS_IDX]->bcast_twt_config_sent = false;
++		}
++	}
++	return false;
++#undef BTWT_DEFAULT_PERSISTENCE_VALUE
++}
++
++static void hostapd_send_btwt_configuration(struct hostapd_data *hapd)
++{
++#define BTWT_SP_PARAMS_SIZE	(sizeof(struct _mxl_vendor_btwt_params_t))
++#define BTWT_CFG_HDR_SIZE	(sizeof(struct _mxl_vendor_bcast_twt_config_t) - (MAX_NUM_BCAST_TWT_SP_TO_ADD * BTWT_SP_PARAMS_SIZE))
++
++	int idx = 0;
++	size_t size = 0;
++	u32 num_schedules = hapd->conf->broadcast_twt_schedules.num_btwt_schedules;
++	struct _mxl_vendor_bcast_twt_config_t btwt_config;
++	struct _mxl_vendor_btwt_params_t *params_out = &btwt_config.btwt_params[0];
++	btwt_params_t *params_in = &hapd->conf->broadcast_twt_schedules.btwt_params[0];
++
++	if (!hostapd_can_send_btwt_config(hapd))
++		return;
++
++	if (num_schedules > MAX_NUM_BCAST_TWT_SP_TO_ADD) {
++		wpa_printf(MSG_ERROR, "num of bcast TWT schedules exceeds the limit ! Aborting BTWT config send...");
++		return;
++	}
++
++	btwt_config.number_of_sps_to_add = num_schedules;
++	btwt_config.wake_duration_unit = hapd->iconf->btwt_wake_dur_unit;
++	for (idx = 0; idx < num_schedules; idx++) {
++		params_out[idx].broadcast_twt_id = params_in[idx].btwt_id;
++		params_out[idx].flow_type = params_in[idx].flow_type;
++		params_out[idx].trigger = params_in[idx].trigger;
++		params_out[idx].twt_wake_duration = params_in[idx].nominal_min_wake_dur;
++		params_out[idx].twt_wake_interval_mantissa = params_in[idx].wake_interval_mantissa;
++		params_out[idx].wake_interval_exp = params_in[idx].wake_interval_exponent;
++	}
++
++	size = BTWT_CFG_HDR_SIZE + (num_schedules * BTWT_SP_PARAMS_SIZE);
++	if (hostapd_drv_vendor_cmd(hapd, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_ADVERTISE_BTWT_SCHEDULE,
++	                           (const u8 *)&btwt_config.number_of_sps_to_add, size,
++				   NESTED_ATTR_NOT_USED, NULL)) {
++		wpa_printf(MSG_ERROR, "send LTQ_NL80211_VENDOR_SUBCMD_ADVERTISE_BTWT_SCHEDULE failed!!!");
++	} else {
++		hapd->conf->bcast_twt_config_sent = true;
++	}
++#undef BTWT_CFG_HDR_SIZE
++#undef BTWT_SP_PARAMS_SIZE
++}
++#endif /* CONFIG_IEEE80211AX */
++
++static void hostapd_post_up_vendor_vap_cmd(struct hostapd_data *hapd, struct hostapd_bss_config *conf)
++{
++	UNUSED_VAR(conf);
++#ifdef CONFIG_IEEE80211AX
++	/*Broadcast TWT default configuration sent to the Driver/FW for operational VAP and only in case there is a  *
++	 *single beaconing VAP, and if BTWT config, TWT Responder support and Broadcast TWT support are all enabled  */
++	hostapd_send_btwt_configuration(hapd);
++#endif
++}
++
+ /**
+  * hostapd_setup_bss - Per-BSS setup (initialization)
+  * @hapd: Pointer to BSS data
+@@ -1678,6 +1766,8 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 	if (hapd->wpa_auth && wpa_init_keys(hapd->wpa_auth) < 0)
+ 		return -1;
+ 
++	hostapd_post_up_vendor_vap_cmd(hapd, conf);
++
+ #ifdef CONFIG_VENDOR_MXL
+ 	if (mxl_hostapd_setup_bss_post(hapd))
+ 		return -1;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index e7928b8ef..31a8c0976 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -29,6 +29,10 @@
+ 	((hapd->conf->oce & OCE_AP) && \
+ 	 (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_OCE_AP))
+ 
++#define MIN_NUM_BSS_IN_NON_MBSSID_SET	2 /* Non MultiBSS : Master(Dummy VAP) + one or more operational VAPs */
++#define MIN_NUM_BSS_IN_MBSSID_SET		3 /* MultiBSS: Master(Dummy VAP) + one TX VAP + one or more Non TX VAPs */
++#define NUM_NON_TX_VAPS(num_bss)		(num_bss - MIN_NUM_BSS_IN_NON_MBSSID_SET)
++
+ struct wpa_ctrl_dst;
+ struct radius_server_data;
+ struct upnp_wps_device_sm;
+@@ -735,6 +739,7 @@ void hostapd_cleanup_cs_params(struct hostapd_data *hapd);
+ void hostapd_periodic_iface(struct hostapd_iface *iface);
+ int hostapd_owe_trans_get_info(struct hostapd_data *hapd);
+ void hostapd_ocv_check_csa_sa_query(void *eloop_ctx, void *timeout_ctx);
++bool hostapd_can_send_btwt_config(struct hostapd_data *hapd);
+ 
+ void hostapd_switch_color(struct hostapd_data *hapd, u64 bitmap);
+ void hostapd_cleanup_cca_params(struct hostapd_data *hapd);
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index c8eaaca4c..692da65b7 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -1228,10 +1228,7 @@ static int get_non_tx_bss_len(struct hostapd_data *bss, bool is_beacon)
+     is_beacon = false;  /*dummy update*/
+ #else
+ 	/* check for Non Inheritance of TWT IE */
+-#if 0
+-	/* todo: broadcast twt (btwt) */
+ 	non_inherit_ie_inclusion = (is_beacon && hostapd_can_send_btwt_config(bss));
+-#endif
+ 	if (non_inherit_ie_inclusion) {
+ 		len = len + NON_TX_NON_INHERIT_TWT_IE_SIZE;
+ 	}
+@@ -1332,11 +1329,8 @@ u8 * hostapd_eid_multiple_bssid(struct hostapd_data *hapd, u8 *eid, bool is_beac
+ 	is_beacon = false;  /*dummy update*/
+ #else
+ 	/* check for Non Inheritance of TWT IE */
+-#if 0
+-	/* todo: broadcast twt (btwt) */
+ 	non_inherit_ie_inclusion = (is_beacon && hostapd_can_send_btwt_config(hapd));
+ #endif
+-#endif
+ 
+ 
+ 	wpa_ie = os_malloc(WPA_IE_MAX_LEN);
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 516927deb..744b17e2c 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -2992,4 +2992,60 @@ struct ieee80211_neighbor_ap_info {
+ #pragma pack(pop)
+ #endif /* _MSC_VER */
+ 
++/* IEEE 802.11AX DRAFT VER 4.3
++ * HE MAC Capabilities Information field defines
++ */
++#define HE_MACCAP_CAP0_IDX 0
++#define HE_MAC_CAP0_HTC_HE_SUPPORT ((u8) BIT(0))
++#define HE_MAC_CAP0_TWT_REQUESTER_SUPPORT ((u8) BIT(1))
++#define HE_MAC_CAP0_TWT_RESPONDER_SUPPORT ((u8) BIT(2))
++#define HE_MAC_CAP0_FRAGMENTATION_SUPPORT ((u8) (BIT(3) | BIT(4)))
++#define HE_MAC_CAP0_MAX_NUM_OF_FRAG_MSDU ((u8) (BIT(5) | BIT(6) | BIT(7)))
++
++#define HE_MACCAP_CAP1_IDX 1
++#define HE_MAC_CAP1_MINIMUM_FRAGMENT_SIZE ((u8) (BIT(0) | BIT(1)))
++#define HE_MAC_CAP1_TRIGGER_FRAME_MAC_PAD_DUR ((u8) (BIT(2) | BIT(3)))
++#define HE_MAC_CAP1_MULTI_TID_AGGR_RX_SUPPORT ((u8) (BIT(4) | BIT(5) | BIT(6)))
++/* HE_MACCAP_HE_LINK_ADAPTION_SUPPORT  B15, B16 */
++#define HE_MAC_CAP1_HE_LINK_ADAPTION_SUPPORT ((u8) BIT(7))
++
++#define HE_MACCAP_CAP2_IDX 2
++#define HE_MAC_CAP2_HE_LINK_ADAPTION_SUPPORT ((u8) BIT(0))
++#define HE_MAC_CAP2_ALL_ACK_SUPPORT ((u8) BIT(1))
++#define HE_MAC_CAP2_TRS_SUPPORT ((u8) BIT(2))
++#define HE_MAC_CAP2_BSR_SUPPORT ((u8) BIT(3))
++#define HE_MAC_CAP2_BROADCAST_TWT_SUPPORT ((u8) BIT(4))
++#define HE_MAC_CAP2_32BIT_BA_BITMAP_SUPPORT ((u8) BIT(5))
++#define HE_MAC_CAP2_MU_CASCADING_SUPPORT ((u8) BIT(6))
++#define HE_MAC_CAP2_ACK_ENABLED_AGGREGATION_SUPPORT ((u8) BIT(7))
++
++#define HE_MACCAP_CAP3_IDX 3
++#define HE_MAC_CAP3_GROUP_ADD_MULTI_STA_BA_IN_DL_MU_SUP ((u8) BIT(0))
++#define HE_MAC_CAP3_OM_CONTROL_SUPPORT ((u8) BIT(1))
++#define HE_MAC_CAP3_OFDMA_RA_SUPPORT ((u8) BIT(2))
++#define HE_MAC_CAP3_MAX_AMPDU_LEN_EXP_EXT ((u8) (BIT(3) | BIT(4)))
++#define HE_MAC_CAP3_AMSDU_FRGMENTATION_SUPPORT ((u8) BIT(5))
++#define HE_MAC_CAP3_FLEXIBLE_TWT_SCHEDULE_SUPPORT ((u8) BIT(6))
++#define HE_MAC_CAP3_RX_CONTROL_FRAME_TO_MULTIBSS ((u8) BIT(7))
++
++#define HE_MACCAP_CAP4_IDX 4
++#define HE_MAC_CAP4_BSRP_BQRP_AMPDU_AGGREGATION ((u8) BIT(0))
++#define HE_MAC_CAP4_QTP_SUPPORT ((u8) BIT(1))
++#define HE_MAC_CAP4_BQR_SUPPORT ((u8) BIT(2))
++#define HE_MAC_CAP4_SRP_RESPONDER ((u8) BIT(3))
++#define HE_MAC_CAP4_NDP_FEEDBACK_REPORT_SUPPORT ((u8) BIT(4))
++#define HE_MAC_CAP4_OPS_SUPPORT ((u8) BIT(5))
++#define HE_MAC_CAP4_AMSDU_IN_AMPDU_SUPPORT ((u8) BIT(6))
++/* HE_MACCAP_MULTI_TID_AGGREGATION_TX_SUPPORT B39, B40, B41 */
++#define HE_MAC_CAP4_MULTI_TID_AGGR_TX_SUPPORT ((u8) (BIT(7)))
++
++#define HE_MACCAP_CAP5_IDX 5
++#define HE_MAC_CAP5_MULTI_TID_AGGR_TX_SUPPORT ((u8) (BIT(0) | BIT(1)))
++#define HE_MAC_CAP5_HE_SUBCHANNEL_SELE_TRANS_SUP ((u8) BIT(2))
++#define HE_MAC_CAP5_UL_2X996TONE_RU_SUPPORT ((u8) BIT(3))
++#define HE_MAC_CAP5_OM_CONTROL_UL_MU_DATA_DIS_RX_SUP ((u8) BIT(4))
++#define HE_MAC_CAP5_HE_DYNAMIC_SM_POWER_SAVE ((u8) BIT(5))
++#define HE_MAC_CAP5_PUNCTURED_SOUNDING_SUPPORT ((u8) BIT(6))
++#define HE_MAC_CAP5_HT_VHT_TRIGGER_FRAME_RX_SUPPORT ((u8) BIT(7))
++
+ #endif /* IEEE802_11_DEFS_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index b43f93536..bd12b595c 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -574,6 +574,23 @@ struct intel_vendor_steer_cfg {
+   u16 status;
+ } __attribute__ ((packed));
+ 
++/* Broadcast TWT configuration vendor structure */
++#define MAX_NUM_BCAST_TWT_SP_TO_ADD 8
++struct _mxl_vendor_btwt_params_t {
++  u32 broadcast_twt_id;
++  u32 flow_type;
++  u32 trigger;
++  u32 twt_wake_duration;
++  u32 twt_wake_interval_mantissa;
++  u32 wake_interval_exp;
++} __attribute__ ((packed));
++
++struct _mxl_vendor_bcast_twt_config_t {
++  u32 number_of_sps_to_add;
++  u32 wake_duration_unit;
++  struct _mxl_vendor_btwt_params_t btwt_params[MAX_NUM_BCAST_TWT_SP_TO_ADD];
++} __attribute__ ((packed));
++
+ /*******************************************************************************
+ *                           Event structures                                   *
+ *******************************************************************************/
+diff --git a/src/utils/common.h b/src/utils/common.h
+index bede21e57..1a9fd145b 100644
+--- a/src/utils/common.h
++++ b/src/utils/common.h
+@@ -608,4 +608,12 @@ void * __hide_aliasing_typecast(void *foo);
+ #define WPA_MEM_DEFINED(ptr, len) do { } while (0)
+ #endif /* CONFIG_VALGRIND */
+ 
++#ifndef MIN
++   #define MIN(x,y) ((x)<(y)?(x):(y))
++#endif
++
++#ifndef MAX
++   #define MAX(x,y) ((x)>(y)?(x):(y))
++#endif
++
+ #endif /* COMMON_H */
+diff --git a/wpa_supplicant/scan.c b/wpa_supplicant/scan.c
+index 4ed20b62d..99a1481fa 100644
+--- a/wpa_supplicant/scan.c
++++ b/wpa_supplicant/scan.c
+@@ -2253,7 +2253,6 @@ static int wpas_channel_width_offset(enum chan_width cw)
+ static int wpas_channel_width_tx_pwr(const u8 *ies, size_t ies_len,
+ 				     enum chan_width cw)
+ {
+-#define MIN(a, b) (a < b ? a : b)
+ 	int offset = wpas_channel_width_offset(cw);
+ 	const struct element *elem;
+ 	int max_tx_power = TX_POWER_NO_CONSTRAINT, tx_pwr = 0;
+@@ -2329,7 +2328,6 @@ static int wpas_channel_width_tx_pwr(const u8 *ies, size_t ies_len,
+ 	}
+ 
+ 	return max_tx_power;
+-#undef MIN
+ }
+ 
+ 
+@@ -2371,7 +2369,6 @@ int wpas_adjust_snr_by_chanwidth(const u8 *ies, size_t ies_len,
+  * better. */
+ static int wpa_scan_result_compar(const void *a, const void *b)
+ {
+-#define MIN(a,b) a < b ? a : b
+ 	struct wpa_scan_res **_wa = (void *) a;
+ 	struct wpa_scan_res **_wb = (void *) b;
+ 	struct wpa_scan_res *wa = *_wa;
+@@ -2475,7 +2472,6 @@ static int wpa_scan_result_compar(const void *a, const void *b)
+ 	if (snr_b_full == snr_a_full)
+ 		return wb->qual - wa->qual;
+ 	return snr_b_full - snr_a_full;
+-#undef MIN
+ }
+ 
+ 
+-- 
+2.43.0
+

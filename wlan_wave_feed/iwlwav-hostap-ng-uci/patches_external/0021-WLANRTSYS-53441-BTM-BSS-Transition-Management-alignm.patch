@@ -1,0 +1,1299 @@
+From 242f013ea427ae8d6fdf6f88080a0ea9d8b8bc72 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Tue, 28 Feb 2023 16:29:58 +0100
+Subject: [PATCH] WLANRTSYS-53441: BTM: BSS Transition Management alignment
+
+---
+ hostapd/config_file.c          |   2 +
+ hostapd/ctrl_iface.c           | 188 ++++++++++++++++++++++++--
+ hostapd/hostapd_cli.c          |  65 +++++++++
+ src/ap/ap_config.c             |   1 +
+ src/ap/ap_config.h             |   2 +
+ src/ap/ctrl_iface_ap.c         | 177 +++++++++++++++----------
+ src/ap/ctrl_iface_ap.h         |   2 +-
+ src/ap/drv_callbacks.c         |   5 +
+ src/ap/hostapd.h               |   1 +
+ src/ap/ieee802_11.c            |   5 +-
+ src/ap/ieee802_11_shared.c     |   5 +
+ src/ap/mbo_ap.c                |   1 +
+ src/ap/sta_info.c              |  12 ++
+ src/ap/sta_info.h              |   2 +
+ src/ap/wnm_ap.c                | 234 +++++++++++++++++++++++++++++----
+ src/ap/wnm_ap.h                |   6 +-
+ src/common/ieee802_11_common.c |  67 +++++++---
+ src/common/ieee802_11_defs.h   |  26 ++++
+ 18 files changed, 672 insertions(+), 129 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index eef4d0d03..2e1beadd7 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4443,6 +4443,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 				WLAN_RRM_CAPS_BEACON_REPORT_PASSIVE |
+ 				WLAN_RRM_CAPS_BEACON_REPORT_ACTIVE |
+ 				WLAN_RRM_CAPS_BEACON_REPORT_TABLE;
++	} else if (os_strcmp(buf, "wnm_bss_trans_query_auto_resp") == 0) {
++		bss->wnm_bss_trans_query_auto_resp = atoi(pos);
+ 	} else if (os_strcmp(buf, "gas_address3") == 0) {
+ 		bss->gas_address3 = atoi(pos);
+ 	} else if (os_strcmp(buf, "stationary_ap") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 315442fb7..84650be23 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -3320,6 +3320,121 @@ fail:
+ 	return ret;
+ }
+ 
++static int hostapd_ctrl_iface_set_neighbor_per_vap(struct hostapd_data *hapd, char *buf)
++{
++	struct wpa_ssid_value ssid;
++	u8 bssid[ETH_ALEN];
++	struct wpabuf *nr, *lci = NULL, *civic = NULL;
++	int stationary = 0;
++	char *tmp;
++	int ret;
++
++	hapd = mxl_get_bss_index(buf, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++			   "CTRL: SET_NEIGHBOR_PER_VAP - there is no iface with the given name");
++		return -1;
++	}
++
++	if (!(hapd->conf->radio_measurements[0] &
++	      WLAN_RRM_CAPS_NEIGHBOR_REPORT)) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: SET_NEIGHBOR_PER_VAP: Neighbor report is not enabled");
++		return -1;
++	}
++
++	buf = os_strchr(buf, ' ');
++	if (buf)
++		buf++;
++	else {
++		wpa_printf(MSG_INFO,
++			   "CTRL: SET_NEIGHBOR_PER_VAP - neighbor BSSID is missing");
++		return -1;
++	}
++
++	if (hwaddr_aton(buf, bssid)) {
++		wpa_printf(MSG_ERROR, "CTRL: SET_NEIGHBOR_PER_VAP: Bad BSSID");
++		return -1;
++	}
++
++	tmp = os_strstr(buf, "ssid=");
++	if (!tmp || ssid_parse(tmp + 5, &ssid)) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: SET_NEIGHBOR_PER_VAP: Bad or missing SSID");
++		return -1;
++	}
++	buf = os_strchr(tmp + 6, tmp[5] == '"' ? '"' : ' ');
++	if (!buf)
++		return -1;
++
++	tmp = os_strstr(buf, "nr=");
++	if (!tmp) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: SET_NEIGHBOR_PER_VAP: Missing Neighbor Report element");
++		return -1;
++	}
++
++	buf = os_strchr(tmp, ' ');
++	if (buf)
++		*buf++ = '\0';
++
++	nr = wpabuf_parse_bin(tmp + 3);
++	if (!nr) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: SET_NEIGHBOR_PER_VAP: Bad Neighbor Report element");
++		return -1;
++	}
++
++	if (!buf)
++		goto set;
++
++	tmp = os_strstr(buf, "lci=");
++	if (tmp) {
++		buf = os_strchr(tmp, ' ');
++		if (buf)
++			*buf++ = '\0';
++		lci = wpabuf_parse_bin(tmp + 4);
++		if (!lci) {
++			wpa_printf(MSG_ERROR,
++				   "CTRL: SET_NEIGHBOR_PER_VAP: Bad LCI subelement");
++			wpabuf_free(nr);
++			return -1;
++		}
++	}
++
++	if (!buf)
++		goto set;
++
++	tmp = os_strstr(buf, "civic=");
++	if (tmp) {
++		buf = os_strchr(tmp, ' ');
++		if (buf)
++			*buf++ = '\0';
++		civic = wpabuf_parse_bin(tmp + 6);
++		if (!civic) {
++			wpa_printf(MSG_ERROR,
++				   "CTRL: SET_NEIGHBOR_PER_VAP: Bad civic subelement");
++			wpabuf_free(nr);
++			wpabuf_free(lci);
++			return -1;
++		}
++	}
++
++	if (!buf)
++		goto set;
++
++	if (os_strstr(buf, "stat"))
++		stationary = 1;
++
++set:
++	ret = hostapd_neighbor_set(hapd, bssid, &ssid, nr, lci, civic, stationary, 0);
++
++	wpabuf_free(nr);
++	wpabuf_free(lci);
++	wpabuf_free(civic);
++
++	return ret;
++}
+ 
+ static int hostapd_ctrl_iface_remove_neighbor(struct hostapd_data *hapd,
+ 					      char *buf)
+@@ -3347,6 +3462,56 @@ static int hostapd_ctrl_iface_remove_neighbor(struct hostapd_data *hapd,
+ 	return hostapd_neighbor_remove(hapd, bssid, ssidp);
+ }
+ 
++static int hostapd_ctrl_iface_remove_neighbor_per_vap(struct hostapd_data *hapd,
++					      char *buf)
++{
++	struct wpa_ssid_value ssid;
++	u8 bssid[ETH_ALEN];
++	char *tmp;
++
++	hapd = mxl_get_bss_index(buf, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++				"CTRL: REMOVE_NEIGHBOR_PER_VAP - there is no iface with the given name");
++		return -1;
++	}
++
++	buf = os_strchr(buf, ' ');
++	if (buf)
++		buf++;
++	else {
++		wpa_printf(MSG_INFO,
++				"CTRL: REMOVE_NEIGHBOR_PER_VAP - neighbor BSSID is missing");
++		return -1;
++	}
++
++	if (hwaddr_aton(buf, bssid)) {
++		wpa_printf(MSG_ERROR, "CTRL: REMOVE_NEIGHBOR_PER_VAP: Bad BSSID");
++		return -1;
++	}
++
++	tmp = os_strstr(buf, "ssid=");
++	if (!tmp || ssid_parse(tmp + 5, &ssid)) {
++		wpa_printf(MSG_ERROR,
++			   "CTRL: REMOVE_NEIGHBOR_PER_VAP: Bad or missing SSID");
++		return -1;
++	}
++
++	return hostapd_neighbor_remove(hapd, bssid, &ssid);
++}
++
++static int hostapd_ctrl_iface_clean_neighbordb_per_vap(struct hostapd_data *hapd,
++					      char *buf)
++{
++	hapd = mxl_get_bss_index(buf, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CLEAN_NEIGHBOR_DB_PER_VAP - there is no iface with the given name");
++		return -1;
++	}
++	hostapd_free_neighbor_db(hapd);
++	return 0;
++}
+ 
+ static int hostapd_ctrl_driver_flags(struct hostapd_iface *iface, char *buf,
+ 				     size_t buflen)
+@@ -3564,12 +3729,7 @@ static int hostapd_ctrl_iface_sta_steer(struct hostapd_data *hapd, const char *c
+ 		}
+ 	}
+ 
+-#if 0
+ 	if (!sta || !sta->btm_supported) {
+-#else
+-	if (!sta) {
+-		UNUSED_VAR(btm_parameters);
+-#endif
+ 		/*Station is not associated or does not support BSS Transition Management.
+ 		 Use black list mechanism .*/
+ 
+@@ -3601,9 +3761,7 @@ static int hostapd_ctrl_iface_sta_steer(struct hostapd_data *hapd, const char *c
+ 				mxl_ieee802_11_multi_ap_blacklist_remove(bss, &entry);
+ 			}
+ 		}
+-	}
+-#if 0 // ToDo: BTM
+-	else {
++	} else {
+ 		int res;
+ 		/* Station supports 802.11v BTM, send BSS Transition Management
+ 		 Request instead of black listing station. */
+@@ -3622,7 +3780,6 @@ static int hostapd_ctrl_iface_sta_steer(struct hostapd_data *hapd, const char *c
+ 		if (ret > 0)
+ 			ret = 0;
+ 	}
+-#endif
+ 
+ 	return ret;
+ }
+@@ -4793,8 +4950,8 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (hostapd_ctrl_iface_ess_disassoc(hapd, buf + 13))
+ 			reply_len = -1;
+ 	} else if (os_strncmp(buf, "BSS_TM_REQ ", 11) == 0) {
+-		if (hostapd_ctrl_iface_bss_tm_req(hapd, buf + 11))
+-			reply_len = -1;
++		reply_len = hostapd_ctrl_iface_bss_tm_req(hapd, buf + 11,
++			reply, reply_size);
+ 	} else if (os_strncmp(buf, "COLOC_INTF_REQ ", 15) == 0) {
+ 		if (hostapd_ctrl_iface_coloc_intf_req(hapd, buf + 15))
+ 			reply_len = -1;
+@@ -4932,12 +5089,21 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "SET_NEIGHBOR ", 13) == 0) {
+ 		if (hostapd_ctrl_iface_set_neighbor(hapd, buf + 13))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "SET_NEIGHBOR_PER_VAP ", 21) == 0) {
++		if (hostapd_ctrl_iface_set_neighbor_per_vap(hapd, buf + 21))
++			reply_len = -1;
+ 	} else if (os_strcmp(buf, "SHOW_NEIGHBOR") == 0) {
+ 		reply_len = hostapd_ctrl_iface_show_neighbor(hapd, reply,
+ 							     reply_size);
+ 	} else if (os_strncmp(buf, "REMOVE_NEIGHBOR ", 16) == 0) {
+ 		if (hostapd_ctrl_iface_remove_neighbor(hapd, buf + 16))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "REMOVE_NEIGHBOR_PER_VAP ", 24) == 0) {
++		if (hostapd_ctrl_iface_remove_neighbor_per_vap(hapd, buf + 24))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "CLEAN_NEIGHBOR_DB_PER_VAP ", 26) == 0) {
++		if (hostapd_ctrl_iface_clean_neighbordb_per_vap(hapd, buf + 26))
++			reply_len = -1;
+ 	} else if (os_strncmp(buf, "REQ_LCI ", 8) == 0) {
+ 		if (hostapd_ctrl_iface_req_lci(hapd, buf + 8))
+ 			reply_len = -1;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 14041f6d0..7318ccbef 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1378,6 +1378,26 @@ static int hostapd_cli_cmd_set_neighbor(struct wpa_ctrl *ctrl, int argc,
+ 	return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++static int hostapd_cli_cmd_set_neighbor_per_vap(struct wpa_ctrl *ctrl, int argc,
++					char *argv[])
++{
++	char cmd[2048];
++	int res;
++
++	if (argc < 4 || argc > 7) {
++		printf("Invalid set_neighbor_per_vap command: needs 4-7 arguments\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "SET_NEIGHBOR_PER_VAP %s %s %s %s %s %s %s",
++			argv[0], argv[1], argv[2], argv[3], argc >= 5 ? argv[4] : "",
++			argc >= 6 ? argv[5] : "", argc == 7 ? argv[6] : "");
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
+ 
+ static int hostapd_cli_cmd_show_neighbor(struct wpa_ctrl *ctrl, int argc,
+ 					 char *argv[])
+@@ -1392,6 +1412,44 @@ static int hostapd_cli_cmd_remove_neighbor(struct wpa_ctrl *ctrl, int argc,
+ 	return hostapd_cli_cmd(ctrl, "REMOVE_NEIGHBOR", 1, argc, argv);
+ }
+ 
++static int hostapd_cli_cmd_remove_neighbor_per_vap(struct wpa_ctrl *ctrl, int argc,
++					   char *argv[])
++{
++	char cmd[400];
++	int res;
++
++	if (argc != 3) {
++		printf("Invalid remove_neighbor_per_vap command: needs 3 arguments\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "REMOVE_NEIGHBOR_PER_VAP %s %s %s",
++			argv[0], argv[1], argv[2]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
++static int hostapd_cli_cmd_clean_neighbordb_per_vap(struct wpa_ctrl *ctrl, int argc,
++					   char *argv[])
++{
++	char cmd[400];
++	int res;
++
++	if (argc != 1) {
++		printf("Invalid clean_neighbordb_per_vap command: needs 1 arguments\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "CLEAN_NEIGHBOR_DB_PER_VAP %s", argv[0]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
+ 
+ static int hostapd_cli_cmd_req_lci(struct wpa_ctrl *ctrl, int argc,
+ 				   char *argv[])
+@@ -2120,10 +2178,17 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "set_neighbor", hostapd_cli_cmd_set_neighbor, NULL,
+ 	  "<addr> <ssid=> <nr=> [lci=] [civic=] [stat]\n"
+ 	  "  = add AP to neighbor database" },
++	{ "set_neighbor_per_vap", hostapd_cli_cmd_set_neighbor_per_vap, NULL,
++	  " <bss> <addr> <ssid=> <nr=> [lci=] [civic=] [stat]\n"
++	  "  = add AP to vap neighbor database" },
+ 	{ "show_neighbor", hostapd_cli_cmd_show_neighbor, NULL,
+ 	  "  = show neighbor database entries" },
+ 	{ "remove_neighbor", hostapd_cli_cmd_remove_neighbor, NULL,
+ 	  "<addr> [ssid=<hex>] = remove AP from neighbor database" },
++	{ "remove_neighbor_per_vap", hostapd_cli_cmd_remove_neighbor_per_vap, NULL,
++	  "<bss> <addr> <ssid=> = remove AP from vap neighbor database" },
++	{ "clean_neighbor_db_per_vap", hostapd_cli_cmd_clean_neighbordb_per_vap, NULL,
++	  "<bss> = remove all APs from vap neighbor database" },
+ 	{ "req_lci", hostapd_cli_cmd_req_lci, hostapd_complete_stations,
+ 	  "<addr> = send LCI request to a station"},
+ 	{ "req_range", hostapd_cli_cmd_req_range, NULL,
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 46ddcd891..d4d6967e4 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -142,6 +142,7 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 
+ #ifdef CONFIG_MBO
+ 	bss->mbo_cell_data_conn_pref = -1;
++	bss->mbo_cell_aware = 1;
+ #endif /* CONFIG_MBO */
+ 
+ 	/* Disable TLS v1.3 by default for now to avoid interoperability issue.
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 74bc77783..df43adbcd 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -733,6 +733,7 @@ struct hostapd_bss_config {
+ 	 */
+ 	unsigned int oce;
+ 	int mbo_cell_data_conn_pref;
++	int mbo_cell_aware;
+ #endif /* CONFIG_MBO */
+ 
+ 	int ftm_responder;
+@@ -952,6 +953,7 @@ struct hostapd_bss_config {
+ 	/* The AP's MLD MAC address within the AP MLD */
+ 	u8 mld_addr[ETH_ALEN];
+ #endif /* CONFIG_IEEE80211BE */
++	int wnm_bss_trans_query_auto_resp;
+ 	int bss_idx;
+ 	int wpa_ie_required_for_mbss;
+ #ifdef CONFIG_VENDOR_MXL
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 0403c9e8a..5da8c4906 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -1294,27 +1294,35 @@ int hostapd_ctrl_iface_ess_disassoc(struct hostapd_data *hapd,
+ 
+ 
+ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+-				  const char *cmd)
++				  const char *cmd, char *buf, size_t buflen)
+ {
+ 	u8 addr[ETH_ALEN];
+ 	const char *pos, *end;
+ 	int disassoc_timer = 0;
+-	struct sta_info *sta;
+-	u8 req_mode = 0, valid_int = 0x01, dialog_token = 0x01;
++	struct sta_info *sta = NULL;
++	u8 req_mode = 0, valid_int = 0x01;
+ 	u8 bss_term_dur[12];
+ 	char *url = NULL;
+-	int ret;
++	int i, ret;
+ 	u8 nei_rep[1000];
+ 	int nei_len;
+ 	u8 mbo[10];
+ 	size_t mbo_len = 0;
++	int dialog_token_to_send = 0, ret_dialog_token = -1;
+ 
+ 	if (hwaddr_aton(cmd, addr)) {
+ 		wpa_printf(MSG_DEBUG, "Invalid STA MAC address");
+ 		return -1;
+ 	}
+ 
+-	sta = ap_get_sta(hapd, addr);
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		sta = ap_get_sta(hapd->iface->bss[i], addr);
++		if (sta) {
++			hapd = hapd->iface->bss[i];
++			break;
++		}
++	}
++
+ 	if (sta == NULL) {
+ 		wpa_printf(MSG_DEBUG, "Station " MACSTR
+ 			   " not found for BSS TM Request message",
+@@ -1322,6 +1330,16 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		return -1;
+ 	}
+ 
++	pos = os_strstr(cmd, " dialog_token=");
++	if (pos) {
++		pos += 14;
++		dialog_token_to_send = atoi(pos);
++		if (dialog_token_to_send < 0 || dialog_token_to_send > 0xff) {
++			wpa_printf(MSG_DEBUG, "Invalid dialog_token");
++			return -1;
++		}
++	}
++
+ 	pos = os_strstr(cmd, " disassoc_timer=");
+ 	if (pos) {
+ 		pos += 16;
+@@ -1338,12 +1356,6 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		valid_int = atoi(pos);
+ 	}
+ 
+-	pos = os_strstr(cmd, " dialog_token=");
+-	if (pos) {
+-		pos += 14;
+-		dialog_token = atoi(pos);
+-	}
+-
+ 	pos = os_strstr(cmd, " bss_term=");
+ 	if (pos) {
+ 		pos += 10;
+@@ -1351,14 +1363,24 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ 		/* TODO: TSF configurable/learnable */
+ 		bss_term_dur[0] = 4; /* Subelement ID */
+ 		bss_term_dur[1] = 10; /* Length */
+-		os_memset(&bss_term_dur[2], 0, 8);
++
++		/* BSS Termination TSF (value of the TSF timer when BSS termination will occur) */
++		errno = 0;
++		u64 tsf = strtoull (pos, NULL, 10);
++		if (errno) {
++			wpa_printf(MSG_DEBUG, "Invalid TSF value in bss_term data");
++			return -1;
++		}
++		WPA_PUT_LE64(&bss_term_dur[2], tsf);
++
++		/* Duration (unsigned 2-octet integer that indicates the number of minutes for which the BSS is not present). */
+ 		end = os_strchr(pos, ',');
+ 		if (end == NULL) {
+ 			wpa_printf(MSG_DEBUG, "Invalid bss_term data");
+ 			return -1;
+ 		}
+ 		end++;
+-		WPA_PUT_LE16(&bss_term_dur[10], atoi(end));
++		WPA_PUT_LE16(&bss_term_dur[10], (short)atoi(end));
+ 	}
+ 
+ 	nei_len = ieee802_11_parse_candidate_list(cmd, nei_rep,
+@@ -1393,73 +1415,90 @@ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+ #ifdef CONFIG_MBO
+ 	pos = os_strstr(cmd, "mbo=");
+ 	if (pos) {
+-		unsigned int mbo_reason, cell_pref, reassoc_delay;
+-		u8 *mbo_pos = mbo;
+-
+-		ret = sscanf(pos, "mbo=%u:%u:%u", &mbo_reason,
+-			     &reassoc_delay, &cell_pref);
+-		if (ret != 3) {
+-			wpa_printf(MSG_DEBUG,
+-				   "MBO requires three arguments: mbo=<reason>:<reassoc_delay>:<cell_pref>");
+-			ret = -1;
+-			goto fail;
+-		}
+-
+-		if (mbo_reason > MBO_TRANSITION_REASON_PREMIUM_AP) {
+-			wpa_printf(MSG_DEBUG,
+-				   "Invalid MBO transition reason code %u",
+-				   mbo_reason);
+-			ret = -1;
+-			goto fail;
+-		}
+-
+-		/* Valid values for Cellular preference are: 0, 1, 255 */
+-		if (cell_pref != 0 && cell_pref != 1 && cell_pref != 255) {
+-			wpa_printf(MSG_DEBUG,
+-				   "Invalid MBO cellular capability %u",
+-				   cell_pref);
+-			ret = -1;
+-			goto fail;
+-		}
+-
+-		if (reassoc_delay > 65535 ||
+-		    (reassoc_delay &&
+-		     !(req_mode & WNM_BSS_TM_REQ_DISASSOC_IMMINENT))) {
++		if (hapd->conf->mbo_enabled && sta->mbo_supported) {
++			unsigned int mbo_reason, reassoc_delay;
++			int cell_pref;
++			u8 *mbo_pos = mbo;
++
++			ret = sscanf(pos, "mbo=%u:%u:%u", &mbo_reason,
++				     &reassoc_delay, &cell_pref);
++			if (ret != 3) {
++				wpa_printf(MSG_DEBUG,
++					   "MBO requires three arguments: mbo=<reason>:<reassoc_delay>:<cell_pref>");
++				ret = -1;
++				goto fail;
++			}
++
++			if (mbo_reason > MBO_TRANSITION_REASON_PREMIUM_AP) {
++				wpa_printf(MSG_DEBUG,
++					   "Invalid MBO transition reason code %u",
++					   mbo_reason);
++				ret = -1;
++				goto fail;
++			}
++
++			/* Valid values for Cellular preference are: 0, 1, 255 */
++			/* A value of -1 indicates that Cellular Data Connection Preference Attribute will not be added to MBO IE */
++			if (cell_pref != -1 && cell_pref != MBO_CELL_PREF_EXCLUDED &&
++				cell_pref != MBO_CELL_PREF_NO_USE && cell_pref != MBO_CELL_PREF_USE) {
++				wpa_printf(MSG_DEBUG,
++					   "Invalid MBO cellular capability %u",
++					   cell_pref);
++				ret = -1;
++				goto fail;
++			}
++
++			if (reassoc_delay > 65535 ||
++			    (reassoc_delay &&
++			     !(req_mode & WNM_BSS_TM_REQ_DISASSOC_IMMINENT))) {
++				wpa_printf(MSG_DEBUG,
++					   "MBO: Assoc retry delay is only valid in disassoc imminent mode");
++				ret = -1;
++				goto fail;
++			}
++
++			*mbo_pos++ = MBO_ATTR_ID_TRANSITION_REASON;
++			*mbo_pos++ = 1;
++			*mbo_pos++ = mbo_reason;
++			if (cell_pref != -1) {
++				if (!hapd->conf->mbo_cell_aware) {
++					wpa_printf(MSG_DEBUG, "BTM request (MBO) Cell preference set, but VAP is not cellular aware");
++				} else {
++					*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
++					*mbo_pos++ = 1;
++					*mbo_pos++ = cell_pref;
++				}
++			}
++
++			if (reassoc_delay) {
++				*mbo_pos++ = MBO_ATTR_ID_ASSOC_RETRY_DELAY;
++				*mbo_pos++ = 2;
++				WPA_PUT_LE16(mbo_pos, reassoc_delay);
++				mbo_pos += 2;
++			}
++
++			mbo_len = mbo_pos - mbo;
++		} else {
+ 			wpa_printf(MSG_DEBUG,
+-				   "MBO: Assoc retry delay is only valid in disassoc imminent mode");
+-			ret = -1;
+-			goto fail;
+-		}
+-
+-		*mbo_pos++ = MBO_ATTR_ID_TRANSITION_REASON;
+-		*mbo_pos++ = 1;
+-		*mbo_pos++ = mbo_reason;
+-		*mbo_pos++ = MBO_ATTR_ID_CELL_DATA_PREF;
+-		*mbo_pos++ = 1;
+-		*mbo_pos++ = cell_pref;
+-
+-		if (reassoc_delay) {
+-			*mbo_pos++ = MBO_ATTR_ID_ASSOC_RETRY_DELAY;
+-			*mbo_pos++ = 2;
+-			WPA_PUT_LE16(mbo_pos, reassoc_delay);
+-			mbo_pos += 2;
++					"BTM request: MBO set but VAP is not MBO enabled or STA does not support MBO.");
+ 		}
+-
+-		mbo_len = mbo_pos - mbo;
+ 	}
+ #endif /* CONFIG_MBO */
+ 
+-	ret = wnm_send_bss_tm_req(hapd, sta, req_mode, disassoc_timer,
+-				  valid_int, bss_term_dur, dialog_token, url,
+-				  nei_len ? nei_rep : NULL, nei_len,
+-				  mbo_len ? mbo : NULL, mbo_len);
++	ret_dialog_token = wnm_send_bss_tm_req(hapd, sta, dialog_token_to_send,
++			req_mode, disassoc_timer, valid_int, bss_term_dur, url,
++			nei_len ? nei_rep : NULL, nei_len,
++			mbo_len ? mbo : NULL, mbo_len);
+ #ifdef CONFIG_MBO
+ fail:
+ #endif /* CONFIG_MBO */
+ 	os_free(url);
+-	return ret;
++	if (ret_dialog_token < 0)
++		return -1;
++	return sprintf_s(buf, buflen, "dialog_token=%d\n", ret_dialog_token);
+ }
+ 
++
+ #endif /* CONFIG_WNM_AP */
+ 
+ 
+diff --git a/src/ap/ctrl_iface_ap.h b/src/ap/ctrl_iface_ap.h
+index b1c2015cd..2e8005f97 100644
+--- a/src/ap/ctrl_iface_ap.h
++++ b/src/ap/ctrl_iface_ap.h
+@@ -42,7 +42,7 @@ int hostapd_ctrl_iface_disassoc_imminent(struct hostapd_data *hapd,
+ int hostapd_ctrl_iface_ess_disassoc(struct hostapd_data *hapd,
+ 				    const char *cmd);
+ int hostapd_ctrl_iface_bss_tm_req(struct hostapd_data *hapd,
+-				  const char *cmd);
++				  const char *cmd, char *buf, size_t buflen);
+ int hostapd_ctrl_iface_acl_add_mac(struct mac_acl_entry **acl, int *num,
+ 				   const char *cmd);
+ int hostapd_ctrl_iface_acl_del_mac(struct mac_acl_entry **acl, int *num,
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 479d5ea31..3906c0b7b 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -458,6 +458,11 @@ int hostapd_notif_assoc(struct hostapd_data *hapd, const u8 *addr,
+ 		sta->mb_ies = NULL;
+ #endif /* CONFIG_FST */
+ 
++	if (elems.ext_capab && elems.ext_capab_len > 2) {
++		if (elems.ext_capab[2] & 0x08)
++			sta->btm_supported = 1;
++	}
++
+ 	mbo_ap_check_sta_assoc(hapd, sta, &elems);
+ 
+ 	ap_copy_sta_supp_op_classes(sta, elems.supp_op_classes,
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index e6a61e5f0..e7928b8ef 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -411,6 +411,7 @@ struct hostapd_data {
+ 	u8 beacon_req_token;
+ 	u8 lci_req_token;
+ 	u8 range_req_token;
++	u8 bss_transition_token;
+ 	unsigned int lci_req_active:1;
+ 	unsigned int range_req_active:1;
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index fa3899fe9..367666e76 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -5057,7 +5057,10 @@ rsnxe_done:
+ 		p = hostapd_eid_p2p_manage(hapd, p);
+ #endif /* CONFIG_P2P_MANAGER */
+ 
+-	p = hostapd_eid_mbo(hapd, p, buf + buflen - p);
++#ifdef CONFIG_MBO
++	if (sta && sta->mbo_supported)
++		p = hostapd_eid_mbo(hapd, p, buf + buflen - p);
++#endif /* CONFIG_MBO */
+ 
+ 	if (hapd->conf->assocresp_elements &&
+ 	    (size_t) (buf + buflen - p) >=
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index 277baf44d..c8eaaca4c 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -1141,6 +1141,11 @@ u16 check_ext_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 	}
+ #endif /* CONFIG_INTERWORKING */
+ 
++	if (ext_capab_ie_len >= 3) {
++		if (ext_capab_ie[2] & 0x08)
++			sta->btm_supported = 1;
++	}
++
+ 	if (ext_capab_ie_len > 0) {
+ 		sta->ecsa_supported = !!(ext_capab_ie[0] & BIT(2));
+ 		os_free(sta->ext_capability);
+diff --git a/src/ap/mbo_ap.c b/src/ap/mbo_ap.c
+index 43b0bf169..dfe2184e8 100644
+--- a/src/ap/mbo_ap.c
++++ b/src/ap/mbo_ap.c
+@@ -93,6 +93,7 @@ void mbo_ap_check_sta_assoc(struct hostapd_data *hapd, struct sta_info *sta,
+ 	len = elems->mbo_len - 4;
+ 	wpa_hexdump(MSG_DEBUG, "MBO: Association Request attributes", pos, len);
+ 
++	sta->mbo_supported = 1;
+ 	attr = get_ie(pos, len, MBO_ATTR_ID_CELL_DATA_CAPA);
+ 	if (attr && attr[1] >= 1)
+ 		sta->cell_capa = attr[2];
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 3412e2602..5ee17f319 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1553,6 +1553,18 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 			}
+ 		}
+ 
++		ret = sprintf_s(pos, end - pos,
++				" nr_enabled=%u btm_supported=%u ",
++				sta->rrm_enabled_capa[0] & WLAN_RRM_CAPS_NEIGHBOR_REPORT ? 1 : 0,
++				sta->btm_supported);
++		if (os_snprintf_error(end - pos, ret)) {
++			os_free(rates);
++			os_free(capabilities);
++			os_free(assoc_req);
++			goto free_alloc;
++		}
++		pos += ret;
++
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s%s%s",
+ 			buf, ip_addr, signal_strength, rates, capabilities, keyid_buf, dpp_pkhash_buf);
+ 
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index deecff1e2..8f6a7d474 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -159,6 +159,7 @@ struct sta_info {
+ 	unsigned int ft_over_ds:1;
+ 	unsigned int external_dh_updated:1;
+ 	unsigned int post_csa_sa_query:1;
++	unsigned int btm_supported:1;
+ 
+ 	u16 auth_alg;
+ 
+@@ -262,6 +263,7 @@ struct sta_info {
+ 		       * enum mbo_cellular_capa values */
+ 	struct mbo_non_pref_chan_info *non_pref_chan;
+ 	int auth_rssi; /* Last Authentication frame RSSI */
++	unsigned int mbo_supported:1;
+ #endif /* CONFIG_MBO */
+ 
+ 	u8 *supp_op_classes; /* Supported Operating Classes element, if
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 153ee4033..27377b0d5 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -363,14 +363,17 @@ static void ieee802_11_rx_wnmsleep_req(struct hostapd_data *hapd,
+ 
+ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 						  const u8 *addr,
+-						  u8 dialog_token)
++						  u8 dialog_token,
++						  const u8 *nei_rep, int nei_rep_len,
++						  const u8 *mbo_attrs, size_t mbo_len)
+ {
+ 	struct ieee80211_mgmt *mgmt;
+ 	size_t len;
+ 	u8 *pos;
+ 	int res;
++	errno_t err;
+ 
+-	mgmt = os_zalloc(sizeof(*mgmt));
++	mgmt = os_zalloc(sizeof(*mgmt) + nei_rep_len + mbo_len);
+ 	if (mgmt == NULL)
+ 		return -1;
+ 	os_memcpy(mgmt->da, addr, ETH_ALEN);
+@@ -386,13 +389,28 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
+ 	mgmt->u.action.u.bss_tm_req.validity_interval = 1;
+ 	pos = mgmt->u.action.u.bss_tm_req.variable;
+ 
++	if (nei_rep){
++		mgmt->u.action.u.bss_tm_req.req_mode |= WNM_BSS_TM_REQ_PREF_CAND_LIST_INCLUDED;
++		err = memcpy_s(pos, nei_rep_len, nei_rep, nei_rep_len);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			os_free(mgmt);
++			return -1;
++		}
++		pos += nei_rep_len;
++	}
++
++	if (mbo_len > 0) {
++		pos += mbo_add_ie(pos, mbo_len + MBO_IE_HEADER, mbo_attrs, mbo_len);
++	}
++
+ 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+ 		   MACSTR " dialog_token=%u req_mode=0x%x disassoc_timer=%u "
+-		   "validity_interval=%u",
++		   "validity_interval=%u, mbo_len=%zu",
+ 		   MAC2STR(addr), dialog_token,
+ 		   mgmt->u.action.u.bss_tm_req.req_mode,
+ 		   le_to_host16(mgmt->u.action.u.bss_tm_req.disassoc_timer),
+-		   mgmt->u.action.u.bss_tm_req.validity_interval);
++		   mgmt->u.action.u.bss_tm_req.validity_interval, mbo_len);
+ 
+ 	len = pos - &mgmt->u.action.category;
+ 	res = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
+@@ -406,11 +424,21 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 					       const u8 *addr, const u8 *frm,
+ 					       size_t len)
+ {
++	errno_t err;
+ 	u8 dialog_token, reason;
+ 	const u8 *pos, *end;
+ 	int enabled = hapd->conf->bss_transition;
+ 	char *hex = NULL;
+ 	size_t hex_len;
++	char candidates_str[1024];/* would typically be able to report more than 20 candidates */
++	u32 bssid_info;
++	u8 regulatory_class, channel_number, phy_type;
++	struct hostapd_neighbor_entry *nr;
++	/* Neighbor report buffer - Maximum candidate list size assuming there are no other optional fields */
++	u8 nei_rep [IEEE80211_MAX_MMPDU_SIZE - 7] = { 0 };
++	size_t btm_req_nr_list_len = 0;
++	u8 mbo_attributes[3];
++	size_t mbo_len = 0;
+ 
+ #ifdef CONFIG_MBO
+ 	if (hapd->conf->mbo_enabled)
+@@ -437,11 +465,97 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 	reason = *pos++;
+ 
+ 	wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
+-		   MACSTR " dialog_token=%u reason=%u",
+-		   MAC2STR(addr), dialog_token, reason);
++			MACSTR " dialog_token=%u reason=%u len=%zu",
++			MAC2STR(addr), dialog_token, reason, len);
++
++	/* Control interface event. Format:
++	 *
++	 *	BSS-TM-QUERY <sta mac addr> reason=<number, 1-5>
++	 *	[candidate=<BSSID>,<BSSID Information>,<Operating Class>,<Channel Number>,<PHY Type>,
++	 *	<priority for this BSS, 1-255> [candidate=<BSSID>,<BSSID Information>,<Operating Class>,
++	 *	<Channel Number>,<PHY Type>,<priority for this BSS, 1-255>]...]
++	 *
++	 */
++	candidates_str[0] = '\0';
++	if (reason == WNM_BSS_TM_REASON_CANDIDATE_LIST_INCLUDED) {
++		if (pos == end){
++			wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
++					MACSTR ". Reason is set to Preferred candidate " \
++							"list included but no candidate list found", MAC2STR(addr));
++		} else {
++			int nei_element_len, ret;
++			char * candidates_str_pos = candidates_str;
++			char * candidates_str_end = candidates_str + sizeof(candidates_str);
++
++			while (pos < end) {
++				if (end - pos < 15) {
++					wpa_printf(MSG_DEBUG, "WNM: BSS TM Query, neighbor report element in candidate list is too short");
++					break;
++				}
++
++				if (*pos++ != WLAN_EID_NEIGHBOR_REPORT) {
++					wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
++										MACSTR ". Expected Neighbor report Element ID", MAC2STR(addr));
++					break;
++				}
++
++				nei_element_len = *pos++;
++				if (pos + nei_element_len > end) {
++					wpa_printf(MSG_DEBUG, "WNM: BSS Transition Management Query from "
++										MACSTR ". Expected Neighbor report invalid", MAC2STR(addr));
++					break;
++				}
++
++				/* BSSID */
++				ret = sprintf_s(candidates_str_pos,
++						candidates_str_end - candidates_str_pos,
++						" candidate=" MACSTR, MAC2STR(pos));
++				if (ret <= 0)
++					break;
++
++				candidates_str_pos += ret;
++				pos +=6;
++				nei_element_len -=6;
++				bssid_info = WPA_GET_LE32(pos);
++				regulatory_class = pos[4];
++				channel_number = pos[5];
++				phy_type = pos[6];
++				ret = sprintf_s(candidates_str_pos,
++						candidates_str_end - candidates_str_pos, ",%u,%u,%u,%u",
++						bssid_info,regulatory_class, channel_number,phy_type);
++				if (ret <= 0)
++					break;
++
++				candidates_str_pos += ret;
++				pos +=7;
++				nei_element_len -= 7;
++
++				/* Priority (optional sub-element) */
++				if ((nei_element_len >=3) &&
++					(*pos == WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE)) {
++					ret = sprintf_s(candidates_str_pos,
++							candidates_str_end - candidates_str_pos, ",%u",
++							pos[2]);
++					if (ret <= 0)
++						break;
++
++					candidates_str_pos += ret;
++					pos +=3;
++					nei_element_len -=3;
++				}
++
++				/* Additional optional sub-elements may follow, skip to next candidate */
++				pos += nei_element_len;
++			}
++		}
++	}
+ 
+-	wpa_hexdump(MSG_DEBUG, "WNM: BSS Transition Candidate List Entries",
+-		    pos, end - pos);
++	if (!hapd->conf->wnm_bss_trans_query_auto_resp) {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, BSS_TM_QUERY MACSTR
++			" dialog_token=%u reason=%u%s",
++			MAC2STR(addr), dialog_token, reason, candidates_str);
++		return; /* the user (ap manager) is in charge of sending the btm request */
++	}
+ 
+ 	hex_len = 2 * (end - pos) + 1;
+ 	if (hex_len > 1) {
+@@ -454,7 +568,46 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 		MAC2STR(addr), reason, hex ? " neighbor=" : "", hex);
+ 	os_free(hex);
+ 
+-	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token);
++	/* Add candidate list to BSS TM Request */
++	u8* nei_rep_tmp = nei_rep;
++	dl_list_for_each(nr, &hapd->nr_db, struct hostapd_neighbor_entry, list) {
++		if ((nei_rep_tmp - nei_rep) + wpabuf_len(nr->nr) + 2 > sizeof (nei_rep))
++			break;
++
++		*nei_rep_tmp++ = WLAN_EID_NEIGHBOR_REPORT;
++		*nei_rep_tmp++ = wpabuf_len(nr->nr);
++
++		err = memcpy_s(nei_rep_tmp, wpabuf_len(nr->nr), wpabuf_head(nr->nr), wpabuf_len(nr->nr));
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return;
++		}
++		nei_rep_tmp += wpabuf_len(nr->nr);
++	}
++
++	btm_req_nr_list_len = nei_rep_tmp - nei_rep;
++
++#ifdef CONFIG_MBO
++#if 0
++	/* ToDo: MBO */
++
++	/* MBO: Add Cellular Preference value for Multimode stations */
++	if (hapd->conf->mbo_enabled && hapd->conf->mbo_cell_aware) {
++		struct sta_info *sta = ap_get_sta(hapd, addr);
++		if (sta && sta->mbo_supported &&
++		   (sta->cell_capa == MBO_CELL_CAPA_AVAILABLE)) {
++			mbo_attributes[0] = MBO_ATTR_ID_CELL_DATA_PREF;
++			mbo_attributes[1] = 1;
++			mbo_attributes[2] = hapd->mbo_cell_pref;
++			mbo_len = 3;
++		}
++	}
++#endif
++#endif /* CONFIG_MBO */
++
++	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token,
++			btm_req_nr_list_len > 0 ? nei_rep : NULL, btm_req_nr_list_len,
++			mbo_len ? mbo_attributes : NULL, mbo_len);
+ }
+ 
+ 
+@@ -473,12 +626,16 @@ void ap_sta_reset_steer_flag_timer(void *eloop_ctx, void *timeout_ctx)
+ 
+ static void ieee802_11_rx_bss_trans_mgmt_resp(struct hostapd_data *hapd,
+ 					      const u8 *addr, const u8 *frm,
+-					      size_t len)
++					      size_t len,
++						  const u8 *frm_raw, size_t len_raw)
+ {
+ 	u8 dialog_token, status_code, bss_termination_delay;
+ 	const u8 *pos, *end;
+ 	int enabled = hapd->conf->bss_transition;
+ 	struct sta_info *sta;
++	char *buf_str = NULL;
++	size_t len_str = (len_raw * 2) + 1;
++	int ret;
+ 
+ #ifdef CONFIG_MBO
+ 	if (hapd->conf->mbo_enabled)
+@@ -518,9 +675,25 @@ static void ieee802_11_rx_bss_trans_mgmt_resp(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
++	buf_str = os_malloc(len_str);
++	if (buf_str == NULL) {
++		wpa_printf(MSG_ERROR, "WMM: BSS Transition Management Response malloc failed");
++		return;
++	}
++
++	ret = wpa_snprintf_hex_uppercase(buf_str, len_str, frm_raw, len_raw);
++	if (ret != (len_str - 1)) {
++		wpa_printf(MSG_ERROR,
++			   "WMM: Failed to copy all BSS Transition Management Response bytes: copied %d, expected %zu",
++			   ret, len_str);
++		os_free(buf_str);
++		return;
++	}
++
+ 	if (status_code == WNM_BSS_TM_ACCEPT) {
+ 		if (end - pos < ETH_ALEN) {
+ 			wpa_printf(MSG_DEBUG, "WNM: not enough room for Target BSSID field");
++			os_free(buf_str);
+ 			return;
+ 		}
+ 		sta->agreed_to_steer = 1;
+@@ -530,18 +703,19 @@ static void ieee802_11_rx_bss_trans_mgmt_resp(struct hostapd_data *hapd,
+ 		wpa_printf(MSG_DEBUG, "WNM: Target BSSID: " MACSTR,
+ 			   MAC2STR(pos));
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, BSS_TM_RESP MACSTR
+-			" status_code=%u bss_termination_delay=%u target_bssid="
+-			MACSTR,
+-			MAC2STR(addr), status_code, bss_termination_delay,
+-			MAC2STR(pos));
++			" dialog_token=%u status_code=%u bss_termination_delay=%u target_bssid="
++			MACSTR "raw_len=%zu raw_frame=%s",
++			MAC2STR(addr), dialog_token, status_code, bss_termination_delay,
++			MAC2STR(pos), len_raw*2, buf_str);
+ 		pos += ETH_ALEN;
+ 	} else {
+ 		sta->agreed_to_steer = 0;
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, BSS_TM_RESP MACSTR
+-			" status_code=%u bss_termination_delay=%u",
+-			MAC2STR(addr), status_code, bss_termination_delay);
++			" dialog_token=%u status_code=%u bss_termination_delay=%u raw_len=%zu raw_frame=%s",
++			MAC2STR(addr), dialog_token, status_code, bss_termination_delay, len_raw*2, buf_str);
+ 	}
+ 
++	os_free(buf_str);
+ 	wpa_hexdump(MSG_DEBUG, "WNM: BSS Transition Candidate List Entries",
+ 		    pos, end - pos);
+ }
+@@ -776,6 +950,8 @@ int ieee802_11_rx_wnm_action_ap(struct hostapd_data *hapd,
+ 	u8 action;
+ 	const u8 *payload;
+ 	size_t plen;
++	const u8 *payload_raw;
++	size_t plen_raw;
+ 
+ 	if (len < IEEE80211_HDRLEN + 2)
+ 		return -1;
+@@ -794,8 +970,10 @@ int ieee802_11_rx_wnm_action_ap(struct hostapd_data *hapd,
+ 						   plen);
+ 		return 0;
+ 	case WNM_BSS_TRANS_MGMT_RESP:
++		payload_raw = ((const u8 *) mgmt) + IEEE80211_HDRLEN;
++		plen_raw = len - IEEE80211_HDRLEN;
+ 		ieee802_11_rx_bss_trans_mgmt_resp(hapd, mgmt->sa, payload,
+-						  plen);
++						  plen, payload_raw, plen_raw);
+ 		return 0;
+ 	case WNM_SLEEP_MODE_REQ:
+ 		ieee802_11_rx_wnmsleep_req(hapd, mgmt->sa, payload, plen);
+@@ -931,9 +1109,9 @@ int wnm_send_ess_disassoc_imminent(struct hostapd_data *hapd,
+ 
+ 
+ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+-			u8 req_mode, int disassoc_timer, u8 valid_int,
+-			const u8 *bss_term_dur, u8 dialog_token,
+-			const char *url, const u8 *nei_rep, size_t nei_rep_len,
++			u8 dialog_token, u8 req_mode, int disassoc_timer, u8 valid_int,
++			const u8 *bss_term_dur, const char *url,
++			const u8 *nei_rep, size_t nei_rep_len,
+ 			const u8 *mbo_attrs, size_t mbo_len)
+ {
+ 	u8 *buf, *pos;
+@@ -941,13 +1119,19 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 	size_t url_len;
+ 
+ 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
+-		   MACSTR
+-		   " req_mode=0x%x disassoc_timer=%d valid_int=0x%x dialog_token=%u",
+-		   MAC2STR(sta->addr), req_mode, disassoc_timer, valid_int,
+-		   dialog_token);
++		   MACSTR " dialog_token=%u req_mode=0x%x disassoc_timer=%d valid_int=0x%x",
++		   MAC2STR(sta->addr), dialog_token, req_mode, disassoc_timer,
++		   valid_int);
+ 	buf = os_zalloc(1000 + nei_rep_len + mbo_len);
+ 	if (buf == NULL)
+ 		return -1;
++
++	if (!dialog_token) {
++		dialog_token = ++hapd->bss_transition_token;
++		if (!hapd->bss_transition_token) /* For wraparounds */
++			dialog_token = ++hapd->bss_transition_token;
++	}
++
+ 	mgmt = (struct ieee80211_mgmt *) buf;
+ 	mgmt->frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT,
+ 					   WLAN_FC_STYPE_ACTION);
+@@ -1006,7 +1190,7 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+ 		set_disassoc_timer(hapd, sta, disassoc_timer);
+ 	}
+ 
+-	return 0;
++	return dialog_token;
+ }
+ 
+ 
+diff --git a/src/ap/wnm_ap.h b/src/ap/wnm_ap.h
+index f86c6b2af..224cc364f 100644
+--- a/src/ap/wnm_ap.h
++++ b/src/ap/wnm_ap.h
+@@ -19,9 +19,9 @@ int wnm_send_ess_disassoc_imminent(struct hostapd_data *hapd,
+ 				   struct sta_info *sta, const char *url,
+ 				   int disassoc_timer);
+ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
+-			u8 req_mode, int disassoc_timer, u8 valid_int,
+-			const u8 *bss_term_dur, u8 dialog_token,
+-			const char *url, const u8 *nei_rep, size_t nei_rep_len,
++			u8 dialog_token, u8 req_mode, int disassoc_timer, u8 valid_int,
++			const u8 *bss_term_dur, const char *url,
++			const u8 *nei_rep, size_t nei_rep_len,
+ 			const u8 *mbo_attrs, size_t mbo_len);
+ void ap_sta_reset_steer_flag_timer(void *eloop_ctx, void *timeout_ctx);
+ int wnm_send_coloc_intf_req(struct hostapd_data *hapd, struct sta_info *sta,
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index 227cd9fcf..d4ebb747b 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -2908,28 +2908,57 @@ int ieee802_11_parse_candidate_list(const char *pos, u8 *nei_rep,
+ 		end = os_strchr(pos, ' ');
+ 		tmp = os_strchr(pos, ',');
+ 		if (tmp && (!end || tmp < end)) {
+-			/* Optional Subelements (hexdump) */
+-			size_t len;
+-
+-			pos = tmp + 1;
+-			end = os_strchr(pos, ' ');
+-			if (end)
+-				len = end - pos;
+-			else
+-				len = os_strlen(pos);
+-			if (nei_pos + len / 2 > nei_rep + nei_rep_len) {
+-				wpa_printf(MSG_DEBUG,
+-					   "Not enough room for neighbor subelements");
++			/* Optional Neighbor Preference */
++			pos = os_strchr(pos, ',');
++			pos ++;
++
++			/* Check if Neighbor preference is valid. */
++			/* More than 3 characters indicates the last parameter is the sub-elements hexdump and not preference */
++			char * next_delim = os_strchr(pos, ',');
++			rsize_t poslen = strnlen_s(pos, RSIZE_MAX_STR);
++			if (!IS_VALID_RANGE(poslen, AP_MIN_VALID_CHAR, RSIZE_MAX_STR - 1)) {
++				wpa_printf(MSG_ERROR, "ieee802_11_parse_candidate_list - wrong len");
+ 				return -1;
+ 			}
+-			if (len & 0x01 ||
+-			    hexstr2bin(pos, nei_pos, len / 2) < 0) {
+-				wpa_printf(MSG_DEBUG,
+-					   "Invalid neighbor subelement info");
+-				return -1;
++			if ((poslen<=3) || (end && (end - (tmp) <= 4)) || (next_delim && (next_delim - tmp <=4))){
++
++				int cand_pref = atoi(pos);
++				if (cand_pref < 0 || cand_pref > 255){
++					wpa_printf(MSG_DEBUG, "Invalid BSS Transition Candidate Preference value");
++					return -1;
++				}
++
++				*nei_pos++ = WNM_NEIGHBOR_BSS_TRANSITION_CANDIDATE;
++				*nei_pos++ = 1;
++				*nei_pos++ = cand_pref;
++
++				tmp = os_strchr(pos, ',');
++			}
++
++			if (tmp && (!end || tmp < end)) {
++				/* Optional Subelements (hexdump) */
++				size_t len;
++
++				pos = tmp + 1;
++				end = os_strchr(pos, ' ');
++				if (end)
++					len = end - pos;
++				else
++					len = os_strlen(pos);
++				if (nei_pos + len / 2 > nei_rep + nei_rep_len) {
++					wpa_printf(MSG_DEBUG,
++						   "Not enough room for neighbor subelements");
++					return -1;
++				}
++				if (len & 0x01 ||
++				    hexstr2bin(pos, nei_pos, len / 2) < 0) {
++					wpa_printf(MSG_DEBUG,
++						   "Invalid neighbor subelement info");
++					return -1;
++				}
++				nei_pos += len / 2;
++				pos = end;
+ 			}
+-			nei_pos += len / 2;
+-			pos = end;
+ 		}
+ 
+ 		nei_start[1] = nei_pos - nei_start - 2;
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 0e655dec9..516927deb 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1908,6 +1908,31 @@ enum bss_trans_mgmt_status_code {
+ 	WNM_BSS_TM_REJECT_LEAVING_ESS = 8
+ };
+ 
++/* IEEE Std 802.11-2015 - Table 8-171 - Transition and Transition Query Reasons */
++enum bss_trans_mgmt_reason_code {
++	WNM_BSS_TM_REASON_UNSPECIFIED = 0,
++	WNM_BSS_TM_REASON_EXESSIVE_FRAME_LOSS = 1,
++	WNM_BSS_TM_REASON_EXESSIVE_DELAY = 2,
++	WNM_BSS_TM_REASON_TSPEC_REJECTED = 3,
++	WNM_BSS_TM_REASON_FIRST_ASSOCIATION_TO_ESS = 4,
++	WNM_BSS_TM_REASON_LOAD_BALANCING = 5,
++	WNM_BSS_TM_REASON_BETTER_AP_FOUND = 6,
++	WNM_BSS_TM_REASON_DEAUTH_FROM_PREV_AP = 7,
++	WNM_BSS_TM_REASON_AP_FAILED_EAP_AUTH = 8,
++	WNM_BSS_TM_REASON_AP_FAILED_4WAY_HANDSHAKE = 9,
++	WNM_BSS_TM_REASON_TOO_MANY_REPLAY_COUNTER_FAILURES = 10,
++	WNM_BSS_TM_REASON_TOO_MANY_MIC_FAILURES = 11,
++	WNM_BSS_TM_REASON_EXCEEDED_MAX_RETRANSMISSIONS = 12,
++	WNM_BSS_TM_REASON_TOO_MANY_BCAST_DISASSOCIATIONS = 13,
++	WNM_BSS_TM_REASON_TOO_MANY_BCAST_DEAUTHENTICATIONS = 14,
++	WNM_BSS_TM_REASON_PREVIOUS_TRANSITION_FAILED = 15,
++	WNM_BSS_TM_REASON_LOW_RSSI = 16,
++	WNM_BSS_TM_REASON_ROAM_FROM_NON_80211_SYSTEM = 17,
++	WNM_BSS_TM_REASON_RECV_BSS_TM_REQUEST = 18,
++	WNM_BSS_TM_REASON_CANDIDATE_LIST_INCLUDED = 19,
++	WNM_BSS_TM_REASON_LEAVING_ESS = 20
++};
++
+ /*
+  * IEEE P802.11-REVmc/D5.0 Table 9-150 - Optional subelement IDs for
+  * neighbor report
+@@ -2060,6 +2085,7 @@ enum reg_6g_client_type {
+ };
+ 
+ #define RRM_CAPABILITIES_IE_LEN 5
++#define MBO_IE_HEADER 6 /* type + length + oui + oui type */
+ 
+ /* IEEE Std 802.11-2012, 8.5.7.4 - Link Measurement Request frame format */
+ struct rrm_link_measurement_request {
+-- 
+2.43.0
+

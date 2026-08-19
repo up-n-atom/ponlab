@@ -1,0 +1,1084 @@
+From c421b19ea721d112386bbbcb7e74b743e3d05862 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Fri, 2 Sep 2022 16:37:19 +0300
+Subject: [PATCH] WLANRTSYS-45977: OneWiFi - Open source hostapd integration
+
+- support for get/free AID
+---
+ hostapd/Makefile              |   5 +
+ src/ap/hostapd.h              |   8 +
+ src/ap/ieee802_11.c           |   7 +
+ src/ap/mxl_hostapd.c          | 201 ++++++++++++++++
+ src/ap/mxl_hostapd.h          |  46 ++++
+ src/ap/sta_info.c             |  12 +
+ src/common/vendor_cmds_copy.h | 434 ++++++++++++++++++++++++++++++++++
+ src/drivers/driver.h          |  25 ++
+ src/drivers/driver_nl80211.c  |  94 ++++++++
+ src/drivers/drivers.mak       |   3 +
+ src/utils/includes.h          |   9 +
+ src/utils/mxl_common.h        |  24 ++
+ wpa_supplicant/Makefile       |   4 +
+ 13 files changed, 872 insertions(+)
+ create mode 100644 src/ap/mxl_hostapd.c
+ create mode 100644 src/ap/mxl_hostapd.h
+ create mode 100644 src/common/vendor_cmds_copy.h
+ create mode 100644 src/utils/mxl_common.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 51702439c..f52090167 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -356,6 +356,11 @@ CFLAGS += -DCONFIG_MBO
+ OBJS += ../src/ap/mbo_ap.o
+ endif
+ 
++ifdef CONFIG_VENDOR_MXL
++CFLAGS+= -DCONFIG_VENDOR_MXL
++OBJS += ../src/ap/mxl_hostapd.o
++endif
++
+ include ../src/drivers/drivers.mak
+ OBJS += $(DRV_AP_OBJS)
+ CFLAGS += $(DRV_AP_CFLAGS)
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 3dba121c6..e3e464e11 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -18,6 +18,9 @@
+ #include "utils/list.h"
+ #include "ap_config.h"
+ #include "drivers/driver.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_hostapd.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #define OCE_STA_CFON_ENABLED(hapd) \
+ 	((hapd->conf->oce & OCE_STA_CFON) && \
+@@ -670,6 +673,11 @@ struct hostapd_iface {
+ 
+ 	/* Configured freq of interface is NO_IR */
+ 	bool is_no_ir;
++
++#ifdef CONFIG_VENDOR_MXL
++	struct mxl_hostapd_iface mxl_iface;
++#endif /* CONFIG_VENDOR_MXL */
++
+ };
+ 
+ /* hostapd.c */
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 701acaffd..51035f4ba 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -57,6 +57,9 @@
+ #include "gas_query_ap.h"
+ #include "comeback_token.h"
+ #include "pasn/pasn_common.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_hostapd.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ #ifdef CONFIG_FILS
+@@ -3319,6 +3322,10 @@ int hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+ 	int i, j = 32, aid;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	return mxl_hostapd_get_aid(hapd, sta);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	/* Transmitted and non-transmitted BSSIDs share the same AID pool, so
+ 	 * use the shared storage in the transmitted BSS to find the next
+ 	 * available value. */
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+new file mode 100644
+index 000000000..3c48ef3a1
+--- /dev/null
++++ b/src/ap/mxl_hostapd.c
+@@ -0,0 +1,201 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "hostapd.h"
++#include "ap_drv_ops.h"
++#include "ap_config.h"
++#include "sta_info.h"
++#include "mxl_hostapd.h"
++#include "common/vendor_cmds_copy.h"
++
++static void ap_sta_remove_in_other_bss_now(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	size_t i;
++
++	for (i = 0; i < iface->num_bss; i++) {
++		struct hostapd_data *bss = iface->bss[i];
++		struct sta_info *sta2;
++		/* bss should always be set during operation, but it may be
++		 * NULL during reconfiguration. Assume the STA is not
++		 * associated to another BSS in that case to avoid NULL pointer
++		 * dereferences. */
++		if (bss == hapd || bss == NULL)
++			continue;
++
++		sta2 = ap_get_sta(bss, sta->addr);
++		if (!sta2)
++			continue;
++
++		wpa_printf(MSG_DEBUG, "Removing station " MACSTR
++				   " with AID=%d from kernel driver.", MAC2STR(sta2->addr), sta2->aid);
++
++		ap_free_sta(bss, sta2);
++	}
++}
++
++int mxl_hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct mxl_hostapd_iface *mxl_iface = &hapd->iface->mxl_iface;
++	int i, j = 32, aid, res;
++
++	if ((hapd->iface->hw_features != NULL) && (hapd->iface->hw_features->eht_capab[IEEE80211_MODE_AP].eht_supported)) {
++		int aid_offset = MXL_AID_OFFSET;
++		int aid_words = MXL_AID_WORDS;
++		int aid_max = is_6ghz_op_class(hapd->iconf->op_class) ?
++				MXL_AID_MAX - 1 : MXL_LOWER_BAND_AID_MAX - 1; /* Last AID is reserved for work around needed for TimGen module */
++		u32 *aid_pool = mxl_iface->sta_aid_link;
++
++		/* get a unique AID */
++		if (sta->aid > 0) {
++			wpa_printf(MSG_ERROR, "  old AID %d", sta->aid);
++			return 0;
++		}
++
++#if defined(WPA_TRACE_BFD) && defined(CONFIG_TESTING_OPTIONS)
++		if (TEST_FAIL())
++			return -1;
++#endif
++
++		for (i = 0; i < aid_words; i++) {
++			if (aid_pool[i] == (u32) -1)
++				continue;
++			for (j = 0; j < 32; j++) {
++				if (!(aid_pool[i] & BIT(j)))
++					break;
++			}
++			if (j < 32)
++				break;
++		}
++		if (j == 32)
++			return -1;
++		aid = i * 32 + j + 1;
++		aid += aid_offset;
++		if (aid > aid_max)
++			return -1;
++		sta->aid = aid;
++		aid_pool[i] |= BIT(j);
++
++		if (hapd->driver->get_aid) {
++			u16 sid = 0;
++			struct mxl_ml_sta_info ml_sta_info = { 0 };
++			ap_sta_remove_in_other_bss_now(hapd, sta);
++			res = (*hapd->driver->get_aid)(hapd->drv_priv, &sid, sta->addr);
++			if (res) {
++				wpa_printf(MSG_ERROR, "get_aid failed");
++				return res;
++			}
++			/* set SID for the WAVE700 legacy STA */
++			/* Using the same ML wrapper to set SID-AID mapping */
++			os_memcpy(ml_sta_info.addr, sta->addr, ETH_ALEN);
++			ml_sta_info.sid = sid;
++			ml_sta_info.aid = sta->aid;
++			res = MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_ML_SID, &ml_sta_info, sizeof(ml_sta_info));
++			if (res) {
++				wpa_printf(MSG_ERROR, "SET_ML_SID failed");
++				return res;
++			}
++			wpa_printf(MSG_ERROR, "  new AID %d", sta->aid);
++			return 0;
++		}
++		wpa_printf(MSG_ERROR, "get AID failed for EHT STA");
++		return -1;
++	}
++
++	if (hapd->driver->get_aid) {
++		ap_sta_remove_in_other_bss_now(hapd, sta);
++		/* check if STA already has AID - reuse it */
++		if (sta->aid > 0) {
++			wpa_printf(MSG_DEBUG, " old AID %d", sta->aid);
++			return 0;
++		}
++		res = (*hapd->driver->get_aid)(hapd->drv_priv, &sta->aid, sta->addr);
++		return res;
++	}
++
++	return 0;
++}
++
++void mxl_hostapd_free_aid(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct mxl_hostapd_iface *mxl_iface = &hapd->iface->mxl_iface;
++
++	if ((sta->aid <= 0) || (!hapd->driver->free_aid))
++		return;
++
++	if ((hapd->iface->hw_features != NULL) && (hapd->iface->hw_features->eht_capab[IEEE80211_MODE_AP].eht_supported)) {
++		/* New AID scheme + MultiLink */
++		int aid_offset = MXL_AID_OFFSET;
++		u32 *aid_pool = mxl_iface->sta_aid_link;
++		aid_pool[(sta->aid - aid_offset - 1) / 32]
++				&= ~BIT((sta->aid - aid_offset - 1) % 32);
++		/* Free SID */
++		(*hapd->driver->free_aid)(hapd->drv_priv, &sta->aid);
++	} else {
++		/* Legacy */
++		(*hapd->driver->free_aid)(hapd->drv_priv, &sta->aid);
++	}
++
++	sta->aid = 0;
++}
++
++
++int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
++			unsigned int vendor_id, unsigned int subcmd,
++			void *input_data, size_t input_data_size,
++			void *out_data, size_t out_data_size)
++{
++	int ret;
++	errno_t err;
++	struct wpabuf *rsp;
++
++	if (!out_data || !out_data_size) {
++		wpa_printf(MSG_ERROR, "subcmd id: %d "
++			"out_data %p out_data_size %zu", subcmd, out_data, out_data_size);
++		return -ENOBUFS;
++	}
++
++	rsp = wpabuf_alloc(out_data_size);
++	if (!rsp) {
++		return -ENOBUFS;
++	}
++
++	ret = hostapd_drv_vendor_cmd(hapd, vendor_id,
++				subcmd, input_data, input_data_size, NESTED_ATTR_NOT_USED, rsp);
++	if (ret) {
++		wpa_printf(MSG_ERROR, "subcmd id: %d "
++			"failed: %i (%s)", subcmd, ret, strerror(-ret));
++		goto out;
++	}
++	if (rsp->used != out_data_size) {
++		ret = -EMSGSIZE;
++		wpa_printf(MSG_ERROR, "subcmd id: %d returned %zu bytes instead of %zu",
++			subcmd, rsp->used, out_data_size);
++		goto out;
++	}
++
++	err = memcpy_s(out_data, out_data_size, rsp->buf, rsp->used);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		ret = -ENOBUFS;
++		goto out;
++	}
++
++	wpa_printf(MSG_EXCESSIVE, "subcmd id: %d processed", subcmd);
++
++out:
++	wpabuf_free(rsp);
++	return ret;
++}
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+new file mode 100644
+index 000000000..c7e351295
+--- /dev/null
++++ b/src/ap/mxl_hostapd.h
+@@ -0,0 +1,46 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_HOSTAPD_H
++#define MXL_HOSTAPD_H
++
++#include "../utils/mxl_common.h"
++
++#define MXL_AID_MAX				447
++#define MXL_AID_OFFSET			191
++#define MXL_LOWER_BAND_AID_MAX	319
++#define MXL_AID_RANGE			256
++#define MXL_AID_WORDS	((MXL_AID_RANGE + 31) / 32)
++
++struct mxl_hostapd_iface {
++	u32 sta_aid_link[MXL_AID_WORDS];
++};
++
++int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
++			unsigned int vendor_id, unsigned int subcmd,
++			void *input_data, size_t input_data_size,
++			void *out_data, size_t out_data_size);
++
++#define MXL_DRV_VENDOR_SET(cmd__, ptr__, size__) \
++	hostapd_drv_vendor_cmd(hapd, OUI_LTQ, (cmd__), (u8*)(ptr__), (size__), NESTED_ATTR_NOT_USED, NULL)
++
++#define MXL_DRV_VENDOR_GET(cmd__, in_ptr__, in_size__, out_ptr__, out_size__) \
++	mxl_hostapd_drv_get_vendor_data(hapd, OUI_LTQ, (cmd__), (void*)(in_ptr__), (in_size__), (void*)(out_ptr__), (out_size__))
++
++struct hostapd_iface;
++struct sta_info;
++
++int mxl_hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta);
++void mxl_hostapd_free_aid(struct hostapd_data *hapd, struct sta_info *sta);
++
++#endif /* MXL_HOSTAPD_H */
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 4f84839e3..67e6774e3 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -39,6 +39,9 @@
+ #include "sta_info.h"
+ #include "vlan.h"
+ #include "wps_hostapd.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_hostapd.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ static void ap_sta_remove_in_other_bss(struct hostapd_data *hapd,
+ 				       struct sta_info *sta);
+@@ -207,8 +210,12 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 		hostapd_drv_br_delete_ip_neigh(hapd, 4, (u8 *) &sta->ipaddr);
+ 	ap_sta_ip6addr_del(hapd, sta);
+ 
++#if 0
+ 	if (!hapd->iface->driver_ap_teardown &&
+ 	    !(sta->flags & WLAN_STA_PREAUTH)) {
++#else
++	if (!(sta->flags & WLAN_STA_PREAUTH)) {
++#endif
+ 		hostapd_drv_sta_remove(hapd, sta->addr);
+ 		sta->added_unassoc = 0;
+ 	}
+@@ -216,10 +223,15 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	ap_sta_hash_del(hapd, sta);
+ 	ap_sta_list_del(hapd, sta);
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_free_aid(hapd, sta);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (sta->aid > 0)
+ 		hapd->sta_aid[(sta->aid - 1) / 32] &=
+ 			~BIT((sta->aid - 1) % 32);
+ 
++
+ 	hapd->num_sta--;
+ 	if (sta->nonerp_set) {
+ 		sta->nonerp_set = 0;
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+new file mode 100644
+index 000000000..9dfff192c
+--- /dev/null
++++ b/src/common/vendor_cmds_copy.h
+@@ -0,0 +1,434 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef _VENDOR_CMDS_H_
++#define _VENDOR_CMDS_H_
++
++/*
++ * This file is a registry of identifier assignments from the Lantiq
++ * OUI AC:9A:96 for purposes other than MAC address assignment. New identifiers
++ * can be assigned through normal review process for changes to the upstream
++ * hostap.git repository.
++ */
++
++#define OUI_LTQ 0xAC9A96
++
++/**
++ * enum ltq_nl80211_vendor_subcmds - LTQ nl80211 vendor command identifiers
++ *
++ * @LTQ_NL80211_VENDOR_SUBCMD_UNSPEC: Reserved value 0
++ *
++ * @LTQ_NL80211_VENDOR_SUBCMD_GET_AID: Get AID request.
++ *
++ * @LTQ_NL80211_VENDOR_SUBCMD_FREE_AID: Free AID request.
++ */
++enum ltq_nl80211_vendor_subcmds {
++  LTQ_NL80211_VENDOR_SUBCMD_UNSPEC,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AID,
++  LTQ_NL80211_VENDOR_SUBCMD_FREE_AID,
++  LTQ_NL80211_VENDOR_SUBCMD_SYNC_DONE,
++  LTQ_NL80211_VENDOR_SUBCMD_TX_EAPOL,
++  LTQ_NL80211_VENDOR_SUBCMD_INITIAL_DATA,
++  LTQ_NL80211_VENDOR_SUBCMD_DFS_DEBUG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DENY_MAC,
++  LTQ_NL80211_VENDOR_SUBCMD_STA_STEER,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_UNCONNECTED_STA,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_VAP_MEASUREMENTS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_INFO,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ATF_QUOTAS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_WDS_WPA_STA,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_BSS_LOAD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MESH_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_CHECK_4ADDR_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SOFTBLOCK_THRESHOLDS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SOFTBLOCK_DISABLE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_11H_RADAR_DETECT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_11H_RADAR_DETECT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_11H_BEACON_COUNT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_11H_BEACON_COUNT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_11H_CH_CHECK_TIME,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_11H_CH_CHECK_TIME,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_NON_OCCUPATED_PRD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_NON_OCCUPATED_PRD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_11H_EMULAT_RADAR,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ADD_PEERAP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DEL_PEERAP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PEERAP_KEY_IDX,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEERAP_KEY_IDX,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEERAP_LIST,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MAC_WATCHDOG_TIMEOUT_MS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MAC_WATCHDOG_TIMEOUT_MS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MAC_WATCHDOG_PERIOD_MS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MAC_WATCHDOG_PERIOD_MS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_BRIDGE_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_BRIDGE_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RELIABLE_MULTICAST,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RELIABLE_MULTICAST,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_AP_FORWARDING,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AP_FORWARDING,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FW_LOG_SEVERITY,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_WDS_HOST_TIMEOUT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_WDS_HOST_TIMEOUT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_EEPROM,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DCDP_API_LITEPATH,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DCDP_API_LITEPATH,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DCDP_API_LITEPATH_COMP,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DCDP_API_LITEPATH_COMP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UDMA_API,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_UDMA_API,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UDMA_API_EXT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_UDMA_API_EXT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UDMA_VLAN_ID,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_UDMA_VLAN_ID,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UDMA_VLAN_ID_EXT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_UDMA_VLAN_ID_EXT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_COC_POWER_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_COC_POWER_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_COC_AUTO_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_COC_AUTO_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PCOC_POWER_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PCOC_POWER_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PCOC_AUTO_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PCOC_AUTO_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PCOC_PMCU_DEBUG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PRM_ID_TPC_LOOP_TYPE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PRM_ID_TPC_LOOP_TYPE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_INTERFER_THRESH,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_INTERFER_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AP_CAPABILITIES_MAX_STAs,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AP_CAPABILITIES_MAX_VAPs,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_11B_ANTENNA_SELECTION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_11B_ANTENNA_SELECTION,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DBG_CLI,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FW_DEBUG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_TA_TIMER_RESOLUTION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TA_TIMER_RESOLUTION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TA_DBG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FW_RECOVERY,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FW_RECOVERY,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SCAN_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_SCAN_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SCAN_PARAMS_BG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_SCAN_PARAMS_BG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SCAN_MODIFS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_SCAN_MODIFS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SCAN_PAUSE_BG_CACHE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_SCAN_PAUSE_BG_CACHE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SCAN_EXP_TIME,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_SCAN_EXP_TIME,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_GENL_FAMILY_ID,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_TASKLET_LIMITS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TASKLET_LIMITS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RADIO_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_AGGR_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AGGR_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_AMSDU_NUM,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AMSDU_NUM,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_AGG_RATE_LIMIT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AGG_RATE_LIMIT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ADMISSION_CAPACITY,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ADMISSION_CAPACITY,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RX_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RX_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RX_DUTY_CYCLE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RX_DUTY_CYCLE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_TX_POWER_LIMIT_OFFSET,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TX_POWER_LIMIT_OFFSET,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PROTECTION_METHOD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PROTECTION_METHOD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_BEAMFORM_EXPLICIT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_TEMPERATURE_SENSOR,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TEMPERATURE_SENSOR,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_QAMPLUS_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_QAMPLUS_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ACS_UPDATE_TO,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ACS_UPDATE_TO,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MU_OPERATION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MU_OPERATION,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CCA_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CCA_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CCA_ADAPT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CCA_ADAPT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RADAR_RSSI_TH,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADAR_RSSI_TH,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FILS_BEACON_FLAG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FILS_BEACON_FLAG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CPU_DMA_LATENCY,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CPU_DMA_LATENCY,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RTS_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RTS_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MAX_MPDU_LENGTH,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MAX_MPDU_LENGTH,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_BF_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_BF_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FIXED_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ACTIVE_ANT_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ACTIVE_ANT_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_4ADDR_STA_ADD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_4ADDR_STA_DEL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_4ADDR_STA_LIST,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_TXOP_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TXOP_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SSB_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_SSB_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_COEX_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_COEX_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PROBING_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PROBING_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MCAST_RANGE_SETUP,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MCAST_RANGE_SETUP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MCAST_RANGE_SETUP_IPV6,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MCAST_RANGE_SETUP_IPV6,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ONLINE_CALIBRATION_ALGO_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ONLINE_CALIBRATION_ALGO_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CALIBRATION_ALGO_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CALIBRATION_ALGO_MASK,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FIXED_POWER,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FIXED_POWER,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UNCONNECTED_STA_SCAN_TIME,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_UNCONNECTED_STA_SCAN_TIME,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RESTRICTED_AC_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RESTRICTED_AC_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PD_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PD_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FAST_DROP,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FAST_DROP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ERP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FAST_DYNAMIC_MC_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_COUNTERS_SRC,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_COUNTERS_SRC,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FIXED_LTF_AND_GI,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FIXED_LTF_AND_GI,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_STATIC_PLAN_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_WDS_WEP_ENC_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PVT_SENSOR,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ENABLE_TEST_BUS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_HE_MU_OPERATION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_HE_MU_OPERATION,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RTS_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RTS_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DBG_ASSERT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MBSSID_VAP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MBSSID_NUM_VAPS_IN_GROUP,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RCVRY_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ASSOCIATED_DEV_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ASSOCIATED_DEV_RATE_INFO_RX_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ASSOCIATED_DEV_RATE_INFO_TX_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CHANNEL_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_STATS_POLL_PERIOD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_STATS_POLL_PERIOD,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ASSOCIATED_DEV_TID_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_LIST,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_FLOW_STATUS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_CAPABILITIES,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_RATE_INFO,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RECOVERY_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_HW_FLOW_STATUS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TR181_WLAN_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TR181_HW_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TR181_PEER_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_NFRP_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MGMT_FRAMES_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_MU_TYPE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DYNAMIC_MU_TYPE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_HE_MU_FIXED_PARAMETERS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_HE_MU_FIXED_PARAMETERS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_HE_MU_DURATION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_HE_MU_DURATION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PHY_INBAND_POWER,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_HE_OPERATION,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_HE_NON_ADVERTISED,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ZWDFS_ANT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ZWDFS_ANT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TWT_PARAMETERS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AX_DEFAULT_PARAMS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_STATIONS_STATISTICS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_STATIONS_STATISTICS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ETSI_PPDU_LIMITS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ETSI_PPDU_LIMITS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DEV_DIAG_RESULT2,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DEV_DIAG_RESULT3,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DCDP_DATAPATH_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RTS_THRESHOLD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PIE_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PIE_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_HE_NON_ADVERTISED,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_AP_RETRY_LIMIT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AP_RETRY_LIMIT,
++  LTQ_NL80211_VENDOR_SUBCMD_CHANNEL_SWITCH_DEAUTH_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CTS_TO_SELF_TO,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CTS_TO_SELF_TO,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ERP_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_TX_AMPDU_DENSITY,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TX_AMPDU_DENSITY,
++  LTQ_NL80211_VENDOR_SUBCMD_ADD_BACKHAUL_VRT_IFACE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_OUT_OF_SCAN_CACHING,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_OUT_OF_SCAN_CACHING,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PRIORITY_GPIO,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_HE_DEBUG_DATA,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ALLOW_SCAN_DURING_CAC,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ALLOW_SCAN_DURING_CAC,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PHY_CHAN_STATUS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UNSOLICITED_FRAME_TX,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DBG_CMD_FW,
++  LTQ_NL80211_VENDOR_SUBCMD_SEND_FILS_DISCOVERY_FRAME,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_HOST_IF_QOS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_HOST_IF,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_RX_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_UL_BSRC_TID_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_BAA_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LINK_ADAPTION_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PLAN_MANAGER_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_TWT_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PER_CLIENT_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_PHY_RX_STATUS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_INFO,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_WLAN_HOST_IF_QOS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_WLAN_HOST_IF,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_WLAN_RX_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_WLAN_BAA_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_RX_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_BAA_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TSMAN_INIT_TID_GL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TSMAN_INIT_STA_GL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TSMAN_RCPT_TID_GL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TSMAN_RCPT_STA_GL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_LINK_ADAPT_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MULTICAST_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_TRAINING_MAN_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_GROUP_MAN_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_GENERAL_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CUR_CHANNEL_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_PHY_RX_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_DYNAMIC_BW_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LA_MU_VHT_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_HE_BEACON,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_UNPROTECTED_DEAUTH,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MU_OFDMA_BF,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MU_OFDMA_BF,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_START_CCA_MSR_OFF_CHAN,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CCA_MSR_OFF_CHAN,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CCA_STATS_CURRENT_CHAN,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LAST_PROBE_REQS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CLT_PROBE_REQS_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CLT_PROBE_REQS_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CCA_PREAMBLE_PUNCTURE_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CCA_PREAMBLE_PUNCTURE_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_USAGE_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FORWARD_UNKNOWN_MCAST_FLAG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FORWARD_UNKNOWN_MCAST_FLAG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_PN_RESET,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ASSOCIATED_STATIONS_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_EMULATE_INTERFERER,
++  LTQ_NL80211_VENDOR_SUBCMD_ADVERTISE_BTWT_SCHEDULE,
++  LTQ_NL80211_VENDOR_SUBCMD_TERMINATE_BTWT_SCHEDULE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ADVERTISED_BTWT_SCHEDULE,
++  LTQ_NL80211_VENDOR_SUBCMD_TX_TWT_TEARDOWN,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_SB_TIMER_ACL_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MTLK_LOG_LEVEL,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_WHM_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_WHM_RESET,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_WHM_TRIGGER,
++  LTQ_NL80211_VENDOR_SUBCMD_RESET_STATISTICS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_INTRA_VAP_MCAST,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_AP_EXCE_RETRY_LIMIT,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_AP_EXCE_RETRY_LIMIT,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_FIXED_RATE_THERMAL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_FIXED_RATE_THERMAL,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MGMT_FRAME_PWR_CTRL,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MGMT_FRAME_PWR_CTRL,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_RSSI_IGNORE_PROBE_REQ,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CSI_ENABLE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CSI_ENABLE,
++  LTQ_NL80211_VENDOR_SUBCMD_CSI_SEND_NDP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_CSI_AUTO_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CSI_AUTO_RATE,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CSI_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CSI_COUNTERS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PEER_MIXED_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LINK_ADAPT_MU_OFDMA_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ALLOW_3ADDR_MCAST,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ALLOW_3ADDR_MCAST,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LINK_ADAPT_SU_MU_RU_OFDMA_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_20MHZ_TX_POWER,
++  MXL_NL80211_VENDOR_SUBCMD_SET_EHT_DEBUG_DATA,
++  MXL_NL80211_VENDOR_SUBCMD_SET_EHT_OPERATION,
++  MXL_NL80211_VENDOR_SUBCMD_GET_EHT_OPERATION,
++  MXL_NL80211_VENDOR_SUBCMD_SET_EHT_NON_ADVERTISED,
++  MXL_NL80211_VENDOR_SUBCMD_GET_EHT_NON_ADVERTISED,
++  MXL_NL80211_VENDOR_SUBCMD_GET_LOGGER_FIFO_MUX_CFG,
++  MXL_NL80211_VENDOR_SUBCMD_SET_LOGGER_FIFO_MUX_CFG,
++  LTQ_NL80211_VENDOR_SUBCMD_SETUP_MLD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MLD_INFO,
++  LTQ_NL80211_VENDOR_SUBCMD_REQUEST_ML_SID,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ML_SID,
++  LTQ_NL80211_VENDOR_SUBCMD_ML_STA_ADD,
++  LTQ_NL80211_VENDOR_SUBCMD_FREE_STA,
++  LTQ_NL80211_VENDOR_SUBCMD_ML_SET_MAIN_VAPID,
++  LTQ_NL80211_VENDOR_SUBCMD_MLD_REMOVE,
++  LTQ_NL80211_VENDOR_SUBCMD_REMOVE_STA_MLD,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ML_STA_LINK,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ML_STA_LINK,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_CSI_CAPABILITY,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_PROP_PHY_CAP,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_MU_GROUPS_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_MU_GROUPS_CONFIG,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_OBSS_BSSCOLOR_INFO,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_BSS_CRITICAL_UPDATE_INFO,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LA_MU_HE_EHT_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_WMM,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_PEER_LIST,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LINK_ADAPT_MIMO_OFDMA_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SCS_ADD_REQ,
++  LTQ_NL80211_VENDOR_SUBCMD_SCS_REM_REQ,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_LINK_ADAPT_MU_GROUPS_COUNTERS_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_ML_SEND_T2LM_TEARDOWN_FRAME,
++  LTQ_NL80211_VENDOR_SUBCMD_GET_ML_LINKSWITCH_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_ML_LINKSWITCH_STATS,
++  /* add new iw sub commands here */
++
++  /* used to define LTQ_NL80211_VENDOR_SUBCMD_MAX below */
++  __LTQ_NL80211_VENDOR_SUBCMD_AFTER_LAST,
++  LTQ_NL80211_VENDOR_SUBCMD_MAX = __LTQ_NL80211_VENDOR_SUBCMD_AFTER_LAST - 1
++};
++
++enum ltq_nl80211_vendor_events {
++  LTQ_NL80211_VENDOR_EVENT_RX_EAPOL            = 0,
++  LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS      = 1,
++  LTQ_NL80211_VENDOR_EVENT_CHAN_DATA           = 2,
++  LTQ_NL80211_VENDOR_EVENT_UNCONNECTED_STA     = 3,
++  LTQ_NL80211_VENDOR_EVENT_WDS_CONNECT         = 4,
++  LTQ_NL80211_VENDOR_EVENT_WDS_DISCONNECT      = 5,
++  LTQ_NL80211_VENDOR_EVENT_CSA_RECEIVED        = 6,
++  LTQ_NL80211_VENDOR_EVENT_RADAR_DETECTED      = 7,
++  LTQ_NL80211_VENDOR_EVENT_ASSERT_DUMP_READY   = 8,
++  LTQ_NL80211_VENDOR_EVENT_NO_DUMP             = 9,
++  LTQ_NL80211_VENDOR_EVENT_UNRECOVARABLE_ERROR = 10,
++  LTQ_NL80211_VENDOR_EVENT_MAC_ERROR           = 11,
++  LTQ_NL80211_VENDOR_EVENT_SOFTBLOCK_DROP      = 12,
++  LTQ_NL80211_VENDOR_EVENT_CAL_FILE            = 13,
++  LTQ_NL80211_VENDOR_EVENT_COC_BEACON_UPDATE   = 14,
++  LTQ_NL80211_VENDOR_EVENT_WHM                 = 15,
++  LTQ_NL80211_VENDOR_EVENT_CSI_STATS           = 16,
++};
++
++
++struct mxl_ml_sta_info {
++  u8 addr[ETH_ALEN];
++  u16 sid;
++  u16 aid;
++} __attribute__ ((packed));
++
++#endif /* _VENDOR_CMDS_H_ */
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 9e4df1d78..5c2b932d1 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -22,6 +22,7 @@
+ #include "common/defs.h"
+ #include "common/ieee802_11_defs.h"
+ #include "common/wpa_common.h"
++#include "common/vendor_cmds_copy.h"
+ #ifdef CONFIG_MACSEC
+ #include "pae/ieee802_1x_kay.h"
+ #endif /* CONFIG_MACSEC */
+@@ -4580,6 +4581,30 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*status)(void *priv, char *buf, size_t buflen);
+ 
++	/**
++	 * get_aid - Receive a new association ID for a station
++	 * @priv: Private driver interface data
++	 * @aid: Memory address for storing the received AID
++	 * @addr: MAC address of the station
++	 * Returns: 0 on success, -1 on failure
++	 *
++	 * This function is used to receive a new AID from the kernel driver,
++	 * which may in turn ask it from the FW, and that from the HW.
++	 * This AID is tied to SID and will need to be freed eventually.
++	*/
++	int (*get_aid)(void *priv, u16 *aid, const u8 *addr);
++
++	/**
++	 * free_aid - Release an association ID
++	 * @priv: Private driver interface data
++	 * @aid: AID to release
++	 * Returns: 0 on success, -1 on failure
++	 *
++	 * This function is used to release an AID back to the kernel driver,
++	 * which may release it to the FW, and that to the HW.
++	 */
++	int (*free_aid)(void *priv, u16 *aid);
++
+ 	/**
+ 	 * roaming - Set roaming policy for driver-based BSS selection
+ 	 * @priv: Private driver interface data
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 03d54222b..db9208124 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11389,6 +11389,34 @@ static int cmd_reply_handler(struct nl_msg *msg, void *arg)
+ }
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++#ifdef CONFIG_DRIVER_NL80211_MXL
++static int vendor_mxl_reply_handler(struct nl_msg *msg, void *arg)
++{
++	struct nlattr *tb[NL80211_ATTR_MAX + 1];
++	struct nlattr *nl_vendor_reply;
++	struct genlmsghdr *gnlh = nlmsg_data(nlmsg_hdr(msg));
++	struct wpabuf *buf = arg;
++
++	if (!buf)
++		return NL_SKIP;
++
++	nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
++		  genlmsg_attrlen(gnlh, 0), NULL);
++	nl_vendor_reply = tb[NL80211_ATTR_VENDOR_DATA];
++
++	if (!nl_vendor_reply)
++		return NL_SKIP;
++
++	if ((size_t) nla_len(nl_vendor_reply) > wpabuf_tailroom(buf)) {
++		wpa_printf(MSG_INFO, "nl80211: Vendor command: insufficient buffer space for reply");
++		return NL_SKIP;
++	}
++
++	wpabuf_put_data(buf, nla_data(nl_vendor_reply), nla_len(nl_vendor_reply));
++
++	return NL_SKIP;
++}
++#endif /* CONFIG_DRIVER_NL80211_MXL */
+ 
+ static int vendor_reply_handler(struct nl_msg *msg, void *arg)
+ {
+@@ -11491,6 +11519,13 @@ static int nl80211_vendor_cmd(void *priv, unsigned int vendor_id,
+ 		     data_len, data)))
+ 		goto fail;
+ 
++#ifdef CONFIG_DRIVER_NL80211_MXL
++	if (OUI_LTQ == vendor_id)
++		ret = send_and_recv_msgs(drv, msg, vendor_mxl_reply_handler, buf,
++					 NULL, NULL, NULL);
++	else
++#endif /* CONFIG_DRIVER_NL80211_MXL */
++
+ 	ret = send_and_recv_msgs(drv, msg, vendor_reply_handler, buf,
+ 				 NULL, NULL, NULL);
+ 	if (ret)
+@@ -13870,6 +13905,59 @@ static int testing_nl80211_radio_disable(void *priv, int disabled)
+ 
+ #endif /* CONFIG_TESTING_OPTIONS */
+ 
++#ifdef CONFIG_DRIVER_NL80211_MXL
++int nl80211_get_aid_vendor_mxl(void *priv, u16 *aid, const u8 *addr)
++{
++	int res = 0;
++	struct wpabuf *rsp_aid;
++	int aid_size = sizeof(u16);
++
++	if (*aid) {
++		wpa_printf(MSG_DEBUG, "Reusing old AID %hu", *aid);
++		return 0;
++	}
++
++	rsp_aid = wpabuf_alloc(aid_size);
++	if (!rsp_aid) {
++		return -ENOBUFS;
++	}
++
++	res = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_GET_AID,
++							 addr, ETH_ALEN, NESTED_ATTR_NOT_USED, (struct wpabuf *) rsp_aid);
++	if (res) {
++		wpa_printf(MSG_ERROR, "nl80211: sending/receiving GET_AID failed: %i "
++			   "(%s)", res, strerror(-res));
++		*aid = 0;
++	} else {
++		memcpy(aid, rsp_aid->buf, aid_size);
++		wpa_printf(MSG_DEBUG, "Received a new AID %hu", *aid);
++	}
++
++	rsp_aid = wpabuf_alloc(aid_size);
++	return res;
++}
++
++int nl80211_free_aid_vendor_mxl(void *priv, u16 *aid)
++{
++	int res = 0;
++
++	if (0 == *aid) {
++		return 0;
++	}
++
++	res = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_FREE_AID,
++							 (u8*) aid, sizeof(*aid), NESTED_ATTR_NOT_USED, NULL);
++	if (res) {
++		wpa_printf(MSG_ERROR, "nl80211: sending FREE_AID failed: %i "
++				   "(%s)", res, strerror(-res));
++	} else {
++		wpa_printf(MSG_DEBUG, "AID %hu released", *aid);
++		*aid = 0;
++	}
++
++	return res;
++}
++#endif /* CONFIG_DRIVER_NL80211_MXL */
+ 
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+@@ -13944,6 +14032,12 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.set_p2p_powersave = nl80211_set_p2p_powersave,
+ 	.start_dfs_cac = nl80211_start_radar_detection,
+ 	.stop_ap = wpa_driver_nl80211_stop_ap,
++
++#ifdef CONFIG_DRIVER_NL80211_MXL
++	.get_aid = nl80211_get_aid_vendor_mxl,
++	.free_aid = nl80211_free_aid_vendor_mxl,
++#endif /* CONFIG_DRIVER_NL80211_MXL */
++
+ #ifdef CONFIG_TDLS
+ 	.send_tdls_mgmt = nl80211_send_tdls_mgmt,
+ 	.tdls_oper = nl80211_tdls_oper,
+diff --git a/src/drivers/drivers.mak b/src/drivers/drivers.mak
+index a03d4a034..b538d8bdd 100644
+--- a/src/drivers/drivers.mak
++++ b/src/drivers/drivers.mak
+@@ -50,6 +50,9 @@ DRV_OBJS += ../src/drivers/driver_nl80211_scan.o
+ ifdef CONFIG_DRIVER_NL80211_QCA
+ DRV_CFLAGS += -DCONFIG_DRIVER_NL80211_QCA
+ endif
++ifdef CONFIG_DRIVER_NL80211_MXL
++DRV_CFLAGS += -DCONFIG_DRIVER_NL80211_MXL
++endif
+ NEED_SME=y
+ NEED_AP_MLME=y
+ NEED_NETLINK=y
+diff --git a/src/utils/includes.h b/src/utils/includes.h
+index 741fc9c14..a2cfa224e 100644
+--- a/src/utils/includes.h
++++ b/src/utils/includes.h
+@@ -43,4 +43,13 @@
+ #endif /* __vxworks */
+ #endif /* CONFIG_NATIVE_WINDOWS */
+ 
++#ifdef CONFIG_VENDOR_MXL
++#if defined YOCTO
++#include <puma_safe_libc.h>
++#else
++#include "libsafec/safe_str_lib.h"
++#include "libsafec/safe_mem_lib.h"
++#endif
++#endif /* CONFIG_VENDOR_MXL */
++
+ #endif /* INCLUDES_H */
+diff --git a/src/utils/mxl_common.h b/src/utils/mxl_common.h
+new file mode 100644
+index 000000000..f6cf71282
+--- /dev/null
++++ b/src/utils/mxl_common.h
+@@ -0,0 +1,24 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_COMMON_H
++#define MXL_COMMON_H
++
++#ifndef EOK
++#define EOK 0
++#endif
++#ifndef ENOK
++#define ENOK -1
++#endif
++
++#endif /* MXL_COMMON_H */
+diff --git a/wpa_supplicant/Makefile b/wpa_supplicant/Makefile
+index 8adbc3b41..43b5cb34d 100644
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -1951,6 +1951,10 @@ ifdef CONFIG_NO_TKIP
+ CFLAGS += -DCONFIG_NO_TKIP
+ endif
+ 
++ifdef CONFIG_VENDOR_MXL
++CFLAGS += -DCONFIG_VENDOR_MXL
++endif
++
+ dynamic_eap_methods: $(EAPDYN)
+ 
+ _OBJS_VAR := OBJS_priv
+-- 
+2.43.0
+

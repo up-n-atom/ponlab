@@ -1,0 +1,172 @@
+From 859620943e0c9a3107659e48e2eddf65b2ba7ead Mon Sep 17 00:00:00 2001
+From: mmuthusamy <mmuthusamy@maxlinear.com>
+Date: Thu, 8 Aug 2024 19:31:16 +0530
+Subject: [PATCH] WLANRTSYS-83833 Use MLD MAC for PMKSA caching for MLD STA.
+
+Issues:
+1) PMK cache displays link mac address of the MLD STA(multilink)
+in one of the AP MLD links in which OWE encryption is
+configured.
+
+Fix:
+1) Use mld mac address while caching and cleanup of the PMK ID
+for an MLD STA which supports multilink.
+
+Cleanups:
+1) As caching is supported in both links of the AP MLD include
+pmk cache check failure. Which reverts iwlwav-hostapd commit
+c3c0c2af8b7.
+2) Make use of existing pmksa_cache_auth_get() as
+mxl_pmksa_cache_auth_get() replicates the same functionality.
+
+FIXUP to WLANRTSYS-62845 MLO changes: MLO Auth Assoc, WPA3 and eapol changes
+---
+ src/ap/ieee802_11.c   | 11 +++++++++--
+ src/ap/mxl_wpa_auth.c |  9 ---------
+ src/ap/mxl_wpa_auth.h |  2 --
+ src/ap/wnm_ap.c       | 13 ++++++++++---
+ src/ap/wpa_auth_ie.c  | 25 ++++++++-----------------
+ 5 files changed, 27 insertions(+), 33 deletions(-)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 8fc0deaf3..8db141384 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3907,7 +3907,8 @@ static u16 owe_process_assoc_req(struct hostapd_data *hapd,
+ 	wpa_hexdump_key(MSG_DEBUG, "OWE: PMK", sta->owe_pmk, sta->owe_pmk_len);
+ 	wpa_hexdump(MSG_DEBUG, "OWE: PMKID", pmkid, PMKID_LEN);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-	u8 *spa_addr;
++	u8 *spa_addr = sta->addr;
++
+ 	/* If the ML STA supports more than one link, add the same PMK in each link's PMK cache. */
+ 	if (mxl_is_mlo_enabled(hapd->conf) && mxl_mlo_is_ml_sta(sta)) {
+ 		spa_addr = sta->mxl_sta_info.non_ap_mld_mac;
+@@ -3917,7 +3918,13 @@ static u16 owe_process_assoc_req(struct hostapd_data *hapd,
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+-	wpa_auth_pmksa_add2(hapd->wpa_auth, sta->addr, sta->owe_pmk,
++	wpa_auth_pmksa_add2(hapd->wpa_auth,
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++			    spa_addr,
++#else /* CONFIG_IEEE80211BE_MXL_MLO */
++			    sta->addr,
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++			    sta->owe_pmk,
+ 			    sta->owe_pmk_len, pmkid, 0, WPA_KEY_MGMT_OWE, NULL);
+ 
+ 	return WLAN_STATUS_SUCCESS;
+diff --git a/src/ap/mxl_wpa_auth.c b/src/ap/mxl_wpa_auth.c
+index 3c949950d..8af7537b3 100644
+--- a/src/ap/mxl_wpa_auth.c
++++ b/src/ap/mxl_wpa_auth.c
+@@ -751,15 +751,6 @@ void mxl_ml_wpa_ptkstart (struct wpa_state_machine *sm)
+ 			sm->ANonce, kde, kde_len, 0, 0);
+ }
+ 
+-struct rsn_pmksa_cache_entry *mxl_pmksa_cache_auth_get(struct wpa_state_machine *sm, struct rsn_pmksa_cache *pmksa,
+-						u8 *spa, const u8 *pmkid)
+-{
+-	u8 *spa_addr = spa;
+-	if (sm->mxl_sm.is_ml_sta)
+-		spa_addr = sm->mxl_sm.non_ap_mld_mac;
+-	return pmksa_cache_auth_get(pmksa, spa_addr, pmkid);
+-}
+-
+ void mxl_wpa_auth_pmksa_add_sae_sibling(struct wpa_authenticator *wpa_auth, const u8 *addr,
+ 			   const u8 *pmk, size_t pmk_len, const u8 *pmkid,
+ 			   int akmp)
+diff --git a/src/ap/mxl_wpa_auth.h b/src/ap/mxl_wpa_auth.h
+index 2c1977c4a..9feb1321a 100644
+--- a/src/ap/mxl_wpa_auth.h
++++ b/src/ap/mxl_wpa_auth.h
+@@ -57,8 +57,6 @@ void mxl_ml_wpa_ptkinitnegotiating(struct wpa_state_machine *sm);
+ void mxl_ml_wpa_ptk_group_rekeynegotiating(struct wpa_state_machine *sm);
+ int mxl_ml_error_handling(struct wpa_eapol_ie_parse kde, struct wpa_state_machine *sm);
+ void mxl_ml_wpa_ptkstart (struct wpa_state_machine *sm);
+-struct rsn_pmksa_cache_entry *mxl_pmksa_cache_auth_get(struct wpa_state_machine *sm, struct rsn_pmksa_cache *pmksa,
+-						u8 *spa, const u8 *pmkid);
+ void mxl_wpa_auth_pmksa_add_sae_sibling(struct wpa_authenticator *wpa_auth, const u8 *addr,
+ 						const u8 *pmk, size_t pmk_len, const u8 *pmkid, int akmp);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 832d3994a..f4a532c71 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -1090,15 +1090,22 @@ static void set_disassoc_timer(struct hostapd_data *hapd, struct sta_info *sta,
+ 	 * decide to reject the connection),
+ 	 */
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-	u8 *spa_addr;
+-	if (mxl_is_mlo_enabled(hapd->conf) && mxl_mlo_is_ml_sta(sta)){
++	u8 *spa_addr = sta->addr;
++
++	if (mxl_is_mlo_enabled(hapd->conf) && mxl_mlo_is_ml_sta(sta)) {
+ 		spa_addr = sta->mxl_sta_info.non_ap_mld_mac;
+ 		if (sta->mxl_sta_info.linked_sta) {
+ 			wpa_auth_pmksa_remove(hapd->mxl_data.sibling_hapd->wpa_auth, spa_addr);
+ 		}
+ 	}
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+-	wpa_auth_pmksa_remove(hapd->wpa_auth, sta->addr);
++	wpa_auth_pmksa_remove(hapd->wpa_auth,
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++			spa_addr
++#else /* CONFIG_IEEE80211BE_MXL_MLO */
++			sta->addr
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++			);
+ 
+ 	beacon_int = hostapd_get_beacon_int(hapd);
+ 	if (beacon_int < 1)
+diff --git a/src/ap/wpa_auth_ie.c b/src/ap/wpa_auth_ie.c
+index c91e41195..da521baaf 100644
+--- a/src/ap/wpa_auth_ie.c
++++ b/src/ap/wpa_auth_ie.c
+@@ -1004,16 +1004,18 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
+ 		wpa_hexdump(MSG_DEBUG, "RSN IE: STA PMKID",
+ 			    &data.pmkid[i * PMKID_LEN], PMKID_LEN);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+-		u8 *spa_addr;
+-		spa_addr = sm->addr;
++		u8 *spa_addr = sm->addr;
++
+ 		if (sm->mxl_sm.is_ml_sta)
+ 			spa_addr = sm->mxl_sm.non_ap_mld_mac;
+-		sm->pmksa = mxl_pmksa_cache_auth_get(sm, wpa_auth->pmksa, spa_addr,
+-						 &data.pmkid[i * PMKID_LEN]);
++#endif /* CONFIG_IEEE80211BE_MXL_MLO */
++		sm->pmksa = pmksa_cache_auth_get(wpa_auth->pmksa,
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++						 spa_addr,
+ #else /* CONFIG_IEEE80211BE_MXL_MLO */
+-		sm->pmksa = pmksa_cache_auth_get(wpa_auth->pmksa, sm->addr,
+-						 &data.pmkid[i * PMKID_LEN]);
++						 sm->addr,
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++						 &data.pmkid[i * PMKID_LEN]);
+ 		if (sm->pmksa) {
+ 			pmkid = sm->pmksa->pmkid;
+ 			break;
+@@ -1067,17 +1069,6 @@ wpa_validate_wpa_ie(struct wpa_authenticator *wpa_auth,
+ 		if (!ap_sae_offload && data.num_pmkid && !sm->pmksa) {
+ 			wpa_auth_vlogger(wpa_auth, sm->addr, LOGGER_DEBUG,
+ 					 "No PMKSA cache entry found for SAE");
+-#ifdef CONFIG_IEEE80211BE_MXL_MLO
+-			/* IN ML assoc, PMK is not cached in other link
+-			 * in case of double link ML association
+-			 * Do not fail assoc for missing PMKID in cache
+-			 * for double link ML association
+-			 * TODO - to revisit the implementation to check
+-			 * add/remove PMKID in sibling link cache as well
+-			 */
+-			if (!sm->mxl_sm.is_ml_sta ||
+-					(sm->mxl_sm.is_ml_sta && sm->mxl_sm.is_single_link_ml_sta))
+-#endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ 			return WPA_INVALID_PMKID;
+ 		}
+ 	}
+-- 
+2.43.0
+

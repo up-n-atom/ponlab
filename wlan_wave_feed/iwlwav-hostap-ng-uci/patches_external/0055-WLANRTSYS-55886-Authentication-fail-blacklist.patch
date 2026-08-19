@@ -1,0 +1,266 @@
+From 093ddbc92a2f37aef472a0010c10c93c17ca9672 Mon Sep 17 00:00:00 2001
+From: Dmitrijs Martinovs <dmartinovs@maxlinear.com>
+Date: Mon, 12 Jun 2023 09:40:24 +0200
+Subject: [PATCH] WLANRTSYS-55886: Authentication fail blacklist
+
+---
+ hostapd/config_file.c        |  4 ++
+ src/ap/ap_config.c           |  2 +
+ src/ap/ap_config.h           |  7 +++
+ src/ap/hostapd.c             |  1 +
+ src/ap/hostapd.h             |  2 +
+ src/ap/ieee802_11_auth.c     | 92 ++++++++++++++++++++++++++++++++++++
+ src/ap/ieee802_11_auth.h     |  3 ++
+ src/ap/sta_info.c            | 15 ++++++
+ src/common/ieee802_11_defs.h |  7 +++
+ 9 files changed, 133 insertions(+)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 1022a6a7a..f50f247c5 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -2902,6 +2902,10 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		bss->openssl_ecdh_curves = os_strdup(pos);
+ 	} else if (os_strcmp(buf, "fragment_size") == 0) {
+ 		bss->fragment_size = atoi(pos);
++	} else if (os_strcmp(buf, "auth_fail_blacklist_duration") == 0) {
++		bss->auth_fail_blacklist_duration = atoi(pos);
++	} else if (os_strcmp(buf, "max_eap_failure") == 0) {
++		bss->max_eap_failure = atoi(pos);
+ 	} else if (os_strcmp(buf, "eap_req_id_retry_interval") == 0) {
+ 		bss->eap_req_id_retry_interval = atoi(pos);
+ 	} else if (os_strcmp(buf, "eap_aaa_req_retries") == 0) {
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 1383efe4e..71a71cc8f 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -108,6 +108,8 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	bss->assoc_sa_query_max_timeout = 1000;
+ 	bss->assoc_sa_query_retry_timeout = 201;
+ 	bss->group_mgmt_cipher = WPA_CIPHER_AES_128_CMAC;
++	bss->max_eap_failure = 0;
++	bss->auth_fail_blacklist_duration = 24 * 60 * 60;
+ 	bss->eap_req_id_retry_interval = 0;
+ 	bss->pmksa_interval = 0;
+ 	bss->auth_quiet_period = 0;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index b14765dd3..098d5133a 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -380,6 +380,13 @@ struct hostapd_bss_config {
+ 	int eap_aaa_req_retries; /* Number of retries for Radius requests */
+ 	int eap_aaa_req_timeout; /* Radius request timeout in seconds after which
+ 			the request must be retransmitted for the # of retries available */
++	int max_eap_failure; /* Number of time a client can attempt to
++				login with incorrect credentials. When this limit is reached,
++				the client is blacklisted and not allowed to attempt loging
++				into the network. Settings this parameter to 0 (zero) disables
++				the blacklisting feature.*/
++	int auth_fail_blacklist_duration; /* Time interval in seconds for which a
++				client will continue to be blacklisted once it is marked so.*/
+ 	int auth_quiet_period; /* The enforced quiet period (time interval) in
+ 				seconds following failed authentication.A value of 0 (zero)
+ 				disables it.*/
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 31ccdd46d..c2f9dac54 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3400,6 +3400,7 @@ hostapd_alloc_bss_data(struct hostapd_iface *hapd_iface,
+ 	hapd->ctrl_sock = -1;
+ 	dl_list_init(&hapd->ctrl_dst);
+ 	dl_list_init(&hapd->nr_db);
++	dl_list_init(&hapd->auth_fail_list);
+ 	hapd->dhcp_sock = -1;
+ #ifdef CONFIG_IEEE80211R_AP
+ 	dl_list_init(&hapd->l2_queue);
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index e4487be78..11536c06a 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -441,6 +441,8 @@ struct hostapd_data {
+ 
+ 	int dhcp_sock; /* UDP socket used with the DHCP server */
+ 
++	/* Auth fail list */
++	struct dl_list auth_fail_list;
+ 	struct ptksa_cache *ptksa;
+ 
+ #ifdef CONFIG_DPP
+diff --git a/src/ap/ieee802_11_auth.c b/src/ap/ieee802_11_auth.c
+index 4277d82cb..8e045819c 100644
+--- a/src/ap/ieee802_11_auth.c
++++ b/src/ap/ieee802_11_auth.c
+@@ -197,6 +197,95 @@ static int hostapd_radius_acl_query(struct hostapd_data *hapd, const u8 *addr,
+ }
+ #endif /* CONFIG_NO_RADIUS */
+ 
++static void ieee802_11_auth_fail_list_flush(struct hostapd_data *hapd)
++{
++	struct auth_fail_list *iter;
++
++	while ((iter = dl_list_first(&hapd->auth_fail_list, struct auth_fail_list,
++		list)) != NULL)
++	{
++		dl_list_del(&iter->list);
++		os_free(iter);
++	}
++}
++
++void ieee802_11_auth_fail_blacklist_flush(void *eloop_ctx, void *user_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	struct auth_fail_list *iter;
++
++	while ((iter = dl_list_first(&hapd->auth_fail_list, struct auth_fail_list,
++		list)) != NULL)
++	{
++		if (iter->auth_fail_count == hapd->conf->max_eap_failure)
++		{
++			dl_list_del(&iter->list);
++			os_free(iter);
++		}
++	}
++	eloop_cancel_timeout(ieee802_11_auth_fail_blacklist_flush, hapd, NULL);
++	eloop_register_timeout(hapd->conf->auth_fail_blacklist_duration, 0,
++					ieee802_11_auth_fail_blacklist_flush, hapd, NULL);
++}
++
++static int ieee802_11_auth_fail_blacklist_find(struct hostapd_data *hapd,
++		const u8 *addr)
++{
++	struct auth_fail_list *iter;
++
++	dl_list_for_each(iter, &hapd->auth_fail_list, struct auth_fail_list, list)
++		if ((os_memcmp(addr, iter->addr, ETH_ALEN) == 0) &&
++				(iter->auth_fail_count == hapd->conf->max_eap_failure))
++			return 0;
++	return -1;
++}
++
++int ieee802_11_auth_fail_entry_add(struct hostapd_data *hapd,
++		u8 *addr)
++{
++	errno_t err;
++	struct auth_fail_list *entry = NULL;
++
++	dl_list_for_each(entry, &hapd->auth_fail_list, struct auth_fail_list, list)
++	{
++		if (os_memcmp(addr, entry->addr, ETH_ALEN) == 0)
++		{
++			if (entry->auth_fail_count < hapd->conf->max_eap_failure)
++			{
++				entry->auth_fail_count++;
++			} else {
++				entry->auth_fail_count = hapd->conf->max_eap_failure;
++			}
++			return 0;
++		}
++	}
++	entry = os_malloc(sizeof(*entry));
++	if (!entry)
++	{
++		wpa_printf(MSG_ERROR, "Failed to allocate memory for Auth fail entry");
++		return -1;
++	}
++	os_memset(entry, 0, sizeof(*entry));
++	err = memcpy_s(entry->addr, sizeof(entry->addr), addr, sizeof(entry->addr));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: __func__memcpy_s error %d", __func__, err);
++		os_free(entry);
++		return -1;
++	}
++
++	DL_LIST_ADD(&hapd->auth_fail_list, entry, list);
++	return 0;
++}
++
++void hostapd_clean_auth_fail_list(struct hostapd_data *hapd)
++{
++	if(!hapd->conf->ieee802_1x && !hapd->conf->max_eap_failure)
++		return;
++	ieee802_11_auth_fail_list_flush(hapd);
++	if (eloop_is_timeout_registered(ieee802_11_auth_fail_blacklist_flush,
++					hapd, NULL))
++		eloop_cancel_timeout(ieee802_11_auth_fail_blacklist_flush, hapd, NULL);
++}
+ 
+ /**
+  * hostapd_check_acl - Check a specified STA against accept/deny ACLs
+@@ -251,6 +340,9 @@ int hostapd_allowed_address(struct hostapd_data *hapd, const u8 *addr,
+ 	int res;
+ 
+ 	os_memset(out, 0, sizeof(*out));
++	if ((hapd->conf->ieee802_1x) && (hapd->conf->max_eap_failure) &&
++		!(ieee802_11_auth_fail_blacklist_find(hapd, addr)))
++		return HOSTAPD_ACL_REJECT;
+ 
+ 	res = hostapd_check_acl(hapd, addr, &out->vlan_id);
+ 	if (res != HOSTAPD_ACL_PENDING)
+diff --git a/src/ap/ieee802_11_auth.h b/src/ap/ieee802_11_auth.h
+index 7d1aa9341..7747963ac 100644
+--- a/src/ap/ieee802_11_auth.h
++++ b/src/ap/ieee802_11_auth.h
+@@ -39,6 +39,9 @@ void hostapd_copy_psk_list(struct hostapd_sta_wpa_psk_short **psk,
+ void hostapd_acl_req_radius_psk(struct hostapd_data *hapd, const u8 *addr,
+ 				int key_mgmt, const u8 *anonce,
+ 				const u8 *eapol, size_t eapol_len);
++int ieee802_11_auth_fail_entry_add(struct hostapd_data *hapd, u8 *addr);
++void ieee802_11_auth_fail_blacklist_flush(void *eloop_ctx, void *user_ctx);
++void hostapd_clean_auth_fail_list(struct hostapd_data *hapd);
+ 
+ int mxl_ieee802_11_multi_ap_set_deny_mac(struct hostapd_data *hapd,
+ 	struct multi_ap_blacklist* entry, const u8 remove);
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index bdb526bad..dfe4c14be 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1878,6 +1878,21 @@ void ap_sta_delayed_1x_auth_fail_disconnect(struct hostapd_data *hapd,
+ 					    struct sta_info *sta,
+ 					    unsigned timeout)
+ {
++	/* Update the failure station count in auth fail blacklist DB */
++	if(hapd->conf->max_eap_failure && !(sta->flags & WLAN_STA_WPS))
++	{
++		wpa_dbg(hapd->msg_ctx, MSG_DEBUG,
++			"ADD STA entry to auth fail list");
++		ieee802_11_auth_fail_entry_add(hapd, sta->addr);
++		if (!eloop_is_timeout_registered(ieee802_11_auth_fail_blacklist_flush,
++					hapd, NULL)) {
++			wpa_dbg(hapd->msg_ctx, MSG_DEBUG,
++				"ADD timeout for auth fail list");
++			eloop_register_timeout(hapd->conf->auth_fail_blacklist_duration, 0,
++					ieee802_11_auth_fail_blacklist_flush, hapd, NULL);
++		}
++	}
++
+ 	wpa_dbg(hapd->msg_ctx, MSG_DEBUG,
+ 		"IEEE 802.1X: Force disconnection of " MACSTR
+ 		" after EAP-Failure in %u ms", MAC2STR(sta->addr), timeout);
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 91b9f280e..3e5e5646c 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -11,6 +11,7 @@
+ #define IEEE802_11_DEFS_H
+ 
+ #include <utils/common.h>
++#include "utils/list.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_ieee802_11_defs.h"
+ #endif /* CONFIG_VENDOR_MXL */
+@@ -1231,6 +1232,12 @@ struct ieee80211_ampe_ie {
+ } STRUCT_PACKED;
+ 
+ 
++struct auth_fail_list {
++	struct dl_list list;
++	u8 addr[ETH_ALEN];
++	u16 auth_fail_count;
++};
++
+ #define ERP_INFO_NON_ERP_PRESENT BIT(0)
+ #define ERP_INFO_USE_PROTECTION BIT(1)
+ #define ERP_INFO_BARKER_PREAMBLE_MODE BIT(2)
+-- 
+2.43.0
+

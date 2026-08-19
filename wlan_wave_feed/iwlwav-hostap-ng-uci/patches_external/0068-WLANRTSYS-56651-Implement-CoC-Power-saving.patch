@@ -1,0 +1,217 @@
+From 2ac45c1d0af392da2f4056b93360d09d75d3933f Mon Sep 17 00:00:00 2001
+From: mvulsx <mvuls@maxlinear.com>
+Date: Mon, 3 Jul 2023 11:14:38 +0000
+Subject: [PATCH] WLANRTSYS-56651: Implement CoC Power saving
+
+Signed-off-by: mvulsx <mvuls@maxlinear.com>
+---
+ src/ap/ap_config.h                 |  8 ++++
+ src/ap/beacon.c                    | 14 ++++++
+ src/ap/hostapd.h                   |  2 +
+ src/ap/ieee802_11.h                |  3 ++
+ src/ap/ieee802_11_ht.c             |  1 -
+ src/ap/mxl_hostapd.c               | 71 +++++++++++++++++++++++++++++-
+ src/drivers/driver_nl80211_event.c |  1 +
+ 7 files changed, 97 insertions(+), 3 deletions(-)
+
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 6dd9e3e4b..f7606a79c 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1098,6 +1098,14 @@ struct spatial_reuse {
+ 	u8 srg_partial_bssid_bitmap[8];
+ };
+ 
++typedef struct coc_chan {
++	int primary;
++	int secondary;
++	int width;
++	int seg0_idx;
++	int seg1_idx;
++} coc_chan;
++
+ enum unii4_config_type
+ {
+ 	UNII4_DISABLED,
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 1ddefe72e..4e129450d 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -2760,6 +2760,7 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	struct hostapd_config *iconf = iface->conf;
+ 	struct hostapd_hw_modes *cmode = iface->current_mode;
+ 	struct wpabuf *beacon, *proberesp, *assocresp;
++	struct csa_settings csa_settings;
+ 	int res, ret = -1, i;
+ 	struct hostapd_hw_modes *mode;
+ 
+@@ -2858,6 +2859,19 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 						 true, &params.allowed_freqs);
+ 	}
+ 
++	if (iface->require_csa != 0) {
++		iface->require_csa = 0;
++		os_memset(&csa_settings, 0, sizeof(csa_settings));
++		csa_settings.cs_count = DEFAULT_CS_COUNT;
++		csa_settings.block_tx = 0;
++		csa_settings.freq_params = freq;
++		res = hostapd_switch_channel(hapd, &csa_settings);
++		if (res) {
++			wpa_printf(MSG_ERROR, "Unable to switch channel ret = %d \n", res);
++			goto fail;
++		}
++	}
++
+ 	res = hostapd_drv_set_ap(hapd, &params);
+ 	hostapd_free_ap_extra_ies(hapd, beacon, proberesp, assocresp);
+ 	if (res)
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index b8743a16a..f8faaa8e7 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -726,6 +726,8 @@ struct hostapd_iface {
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	int set_freq_done;
++	u8 require_csa; /* Variable to keep track whether CSA IE should be added or not */
++	struct coc_chan coc_chan_restore;
+ 	int block_tx; /* Is TX block on or off */
+ 
+ 	bool whm_if_fail;
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index dadd8e030..1da08514e 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -9,6 +9,9 @@
+ #ifndef IEEE802_11_H
+ #define IEEE802_11_H
+ 
++#define BW_MOVE_DOWN 1
++#define BW_MOVE_UP 2
++
+ struct hostapd_iface;
+ struct hostapd_data;
+ struct sta_info;
+diff --git a/src/ap/ieee802_11_ht.c b/src/ap/ieee802_11_ht.c
+index 0eeeae37b..c2a390c39 100644
+--- a/src/ap/ieee802_11_ht.c
++++ b/src/ap/ieee802_11_ht.c
+@@ -373,7 +373,6 @@ void hostapd_2040_coex_action(struct hostapd_data *hapd,
+ 	}
+ }
+ 
+-
+ u16 copy_sta_ht_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 		      const u8 *ht_capab)
+ {
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 925cd9c4d..b3bf77f96 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -21,6 +21,7 @@
+ #include "beacon.h"
+ #include "mxl_hostapd.h"
+ #include "common/vendor_cmds_copy.h"
++#include "ieee802_11.h"
+ 
+ 
+ #define COC_POWER_1x1_STATE 1
+@@ -554,7 +555,7 @@ void mxl_hostapd_cleanup_iface(struct hostapd_iface *iface)
+ 		os_free(iface->mxl_iface.zwdfs_info.csa_settings);
+ }
+ 
+-static void mxl_ap_max_nss_omn_elem_timeout(void *eloop_data, void *user_data)
++void mxl_ap_max_nss_omn_elem_timeout(void *eloop_data, void *user_data)
+ {
+ 	struct hostapd_iface *iface = eloop_data;
+ 
+@@ -573,7 +574,73 @@ void mxl_hostapd_update_coc(struct hostapd_iface *iface, const u8 *data, size_t
+ 		return;
+ 	}
+ 
+-	/* Should we send OMN IE continuesly or for certain period need to check */
++	/*
++	 * COC: Code of coduct feature is usefull for power save in idle state.
++	 * We should switch to 20Mhz BW from the confiured higher BW value(40/80/160).
++	 * Antenna should move to 1x1 and send OMN IE's in the beacons to
++	 * reflect the chnage in antenna configuration because of COC.
++	 * CSA unicast and Braodcast should be send to that connnected Station.
++	 * CSA should be sent while reducing BW and also during Restoring BW.
++	 * OMN IE should be sent only during  moving to 1x1, while coming back to 4x4
++	 * no need to send the OMN IE Station will understand the antenna switch without OMN IE's also.
++	 * */
++
++	if (bw_params->coc_BW == BW_MOVE_DOWN) {
++		/*
++		 * Store the current channel and switch to 20Mhz channel
++		 * make sure RNR ie and opclass also updated properly
++		 * to reflect the new BW
++		 * */
++		iface->coc_chan_restore.primary = iface->conf->channel;
++		iface->coc_chan_restore.secondary = iface->conf->secondary_channel;
++		iface->coc_chan_restore.width = hostapd_get_oper_chwidth(iface->conf);
++		iface->coc_chan_restore.seg0_idx = hostapd_get_oper_centr_freq_seg0_idx(iface->conf);
++		iface->coc_chan_restore.seg1_idx = hostapd_get_oper_centr_freq_seg1_idx(iface->conf);
++		wpa_printf(MSG_DEBUG," COC : Backup channel coc_prim = %d, coc_sec = %d, coc_width = %d, seg0_idx = %d, seg1-idx = %d, omn_ie = %d \n",
++				iface->coc_chan_restore.primary, iface->coc_chan_restore.secondary, iface->coc_chan_restore.width,
++				hostapd_get_oper_centr_freq_seg0_idx(iface->conf), hostapd_get_oper_centr_freq_seg1_idx(iface->conf), bw_params->coc_omn_IE);
++
++		/* ping issue with 2.4G when  CSA in place if ping doesnot work after switch then remove this flag later */
++		iface->require_csa = 1;
++		iface->conf->secondary_channel = 0;
++		hostapd_set_oper_chwidth(iface->conf, CONF_OPER_CHWIDTH_USE_HT);
++		hostapd_set_oper_centr_freq_seg0_idx(iface->conf, iface->conf->channel);
++		hostapd_set_oper_centr_freq_seg1_idx(iface->conf, 0);
++
++		/* RNR will be automatically updated via ieee802_11_update_beacons() below */
++		if (is_6ghz_op_class(iface->conf->op_class))
++			iface->conf->op_class = HOSTAP_6GHZ_20MHZ_OP_CLASS;
++
++	} else if ((bw_params->coc_BW == BW_MOVE_UP) && (iface->coc_chan_restore.primary)) {
++		/*
++		 * Restore the Original channel and BW
++		 * make sure RNR ie and opclass are also updated properly
++		 * to reflect the new BW
++		 * */
++		u8 seg0 = iface->coc_chan_restore.seg0_idx;
++		u8 seg1 = iface->coc_chan_restore.seg1_idx;
++		iface->conf->channel = iface->coc_chan_restore.primary;
++		iface->conf->secondary_channel = iface->coc_chan_restore.secondary;
++		hostapd_set_oper_chwidth(iface->conf, iface->coc_chan_restore.width);
++		hostapd_set_oper_centr_freq_seg0_idx(iface->conf, seg0);
++		hostapd_set_oper_centr_freq_seg1_idx(iface->conf, seg1);
++		iface->require_csa = 1;
++		os_memset(&iface->coc_chan_restore, 0, sizeof(iface->coc_chan_restore));
++
++		/* RNR will be automatically updated via ieee802_11_update_beacons() below */
++		if (is_6ghz_op_class(iface->conf->op_class))
++			iface->conf->op_class = HOSTAP_6GHZ_20MHZ_OP_CLASS + center_idx_to_bw_6ghz(seg0);
++
++		wpa_printf(MSG_DEBUG," COC : Restore channel coc_prim = %d, coc_sec = %d, coc_width = %d, seg0_idx = %d, seg1-idx = %d, bw_params->coc_omn_IE = %d \n",
++				iface->conf->channel, iface->conf->secondary_channel, hostapd_get_oper_chwidth(iface->conf),
++				seg0, seg1, bw_params->coc_omn_IE);
++	}
++
++	wpa_printf(MSG_DEBUG," COC : BW = %d, prim = %d, sec_chan = %d, width = %d op_class = %d  \n",
++			bw_params->coc_BW, iface->conf->channel, iface->conf->secondary_channel,
++			hostapd_get_oper_chwidth(iface->conf), iface->conf->op_class);
++
++	/*Should we send OMN IE continuesly or for certain period need to check */
+ 	iface->mxl_iface.require_omn = bw_params->coc_omn_IE;
+ 	eloop_cancel_timeout(mxl_ap_max_nss_omn_elem_timeout, iface, NULL);
+ 
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 72399dd8f..a30aef5a6 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3260,6 +3260,7 @@ static void mxl_nl80211_handle_softblock_drop(struct wpa_driver_nl80211_data *dr
+ 	mxl_drv_event_softblock_drop(drv->ctx, data, len);
+ }
+ 
++
+ #endif /* CONFIG_DRIVER_NL80211_MXL */
+ 
+ /******************************************************************************/
+-- 
+2.43.0
+

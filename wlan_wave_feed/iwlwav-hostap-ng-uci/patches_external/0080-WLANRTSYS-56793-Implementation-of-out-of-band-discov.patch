@@ -1,0 +1,204 @@
+From 4b8b0d3a82c6f4fb7d530d14014cb14c2c812c27 Mon Sep 17 00:00:00 2001
+From: mvulsx <mvuls@maxlinear.com>
+Date: Fri, 7 Jul 2023 09:03:55 +0000
+Subject: [PATCH] WLANRTSYS-56793: Implementation of out of band discovery of a
+ 6 GHz BSS for Neighbor Report for STA
+
+Signed-off-by: mvulsx <mvuls@maxlinear.com>
+---
+ src/common/ieee802_11_common.c | 101 +++++++++++++++++++++++++++++++++
+ src/common/ieee802_11_common.h |  10 ++++
+ wpa_supplicant/ctrl_iface.c    |  22 ++++++-
+ 3 files changed, 132 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index 6067457df..17a336080 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -408,6 +408,107 @@ static int ieee802_11_parse_extension(const u8 *pos, size_t elen,
+ 	return 0;
+ }
+ 
++#define BITS_PER_LONG (sizeof(u64) * 8)
++static void gen_new_bssid(const u8 *bssid, u8 max_bssid, u8 mbssid_index, u8 *new_bssid)
++{
++	u64 new_bssid_u64;
++	u64 bssid_u64 = 0;
++	int i;
++
++	for (i = 0; i < ETH_ALEN; i++)
++		bssid_u64 = bssid_u64 << 8 | bssid[i];
++
++	u64 mask = (((~0ULL) << (0)) &
++		(~0ULL >> (BITS_PER_LONG - 1 - (max_bssid - 1))));
++
++	new_bssid_u64 = bssid_u64 & ~mask;
++
++	new_bssid_u64 |= ((bssid_u64 & mask) + mbssid_index) & mask;
++
++	for (i = ETH_ALEN - 1; i >= 0; i--) {
++		new_bssid[i] = new_bssid_u64 & 0xff;
++		new_bssid_u64 = new_bssid_u64 >> 8;
++	}
++}
++
++/**
++ * parse_mbssid_data - Parse MBSSID Information Element
++ * @ie: Pointer to the start of IE
++ * @ielen: Length of IE buffer in octets
++ * @ref_bssid: Reference BSSID for MBSSID Information Element
++ * @non_tx_data: 2D array of non_tx_bss structs. The caller is responsible
++ * for freeing the internally allocated non_tx_data
++ * @out_non_tx_data_cnt: contains number of non_tx_data structs in non_tx_data
++ * Returns: Parsing result
++ */
++ParseRes parse_mbssid_data(const u8 *ie, size_t ielen, const u8 *ref_bssid,
++			   struct non_tx_bss ***non_tx_data, size_t *out_non_tx_data_cnt)
++{
++	const u8 *mbssid_index_ie;
++	const struct element *elem, *sub;
++
++	*out_non_tx_data_cnt = 0;
++
++	if (!get_ie(ie, ielen, WLAN_EID_MULTIPLE_BSSID))
++		return ParseUnknown;
++
++	for_each_element_id(elem, WLAN_EID_MULTIPLE_BSSID, ie, ielen) {
++		if (elem->datalen < 4)
++			continue;
++		for_each_element(sub, elem->data + 1, elem->datalen - 1) {
++			if (sub->id != 0 || sub->datalen < 4) {
++				/* not a valid BSS profile */
++				continue;
++			}
++
++			if (sub->data[0] != WLAN_EID_NONTRANSMITTED_BSSID_CAPA ||
++			    sub->data[1] != 2) {
++				/* The first element within the Nontransmitted
++				 * BSSID Profile is not the Nontransmitted
++				 * BSSID Capability element.
++				 */
++				continue;
++			}
++
++			/* found a Nontransmitted BSSID Profile */
++			mbssid_index_ie = get_ie(sub->data,
++						 sub->datalen,
++						 WLAN_EID_MULTIPLE_BSSID_INDEX);
++
++			if (!mbssid_index_ie || mbssid_index_ie[1] < 1 ||
++			    mbssid_index_ie[2] == 0) {
++				/* No valid Multiple BSSID-Index element */
++				continue;
++			}
++
++			struct non_tx_bss *p = os_malloc(sizeof *p);
++			if (!p)
++			  goto fail_nontx_arr_realloc;
++
++			p->max_bssid_indicator = elem->data[0];
++			p->bssid_index = mbssid_index_ie[2];
++			gen_new_bssid(ref_bssid, p->max_bssid_indicator,
++					      p->bssid_index, p->bssid);
++			p->capability = sub->data[2] << 8 | sub->data[3];
++
++			struct non_tx_bss **tmp =
++			    realloc(*non_tx_data, (*out_non_tx_data_cnt + 1) * sizeof *tmp);
++
++			if (!tmp)
++			    goto fail_nontx_arr_realloc;
++			*non_tx_data = tmp;
++			(*non_tx_data)[*out_non_tx_data_cnt] = p;
++			(*out_non_tx_data_cnt)++;
++
++		}
++	}
++
++	return ParseOK;
++
++fail_nontx_arr_realloc:
++	wpa_printf(MSG_ERROR, "%s: failed to allocate memory for MBSSID IE", __func__);
++	return ParseFailed;
++}
+ 
+ static ParseRes __ieee802_11_parse_elems(const u8 *start, size_t len,
+ 					 struct ieee802_11_elems *elems,
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index 1792f5a4a..b5d207a13 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -199,6 +199,16 @@ ParseRes ieee802_11_parse_link_assoc_req(const u8 *start, size_t len,
+ 					 struct ieee802_11_elems *elems,
+ 					 struct wpabuf *mlbuf,
+ 					 u8 link_id, bool show_errors);
++
++struct non_tx_bss {
++	u8 max_bssid_indicator;
++	u8 bssid_index;
++	u8 bssid[ETH_ALEN];
++	u16 capability;
++};
++
++ParseRes parse_mbssid_data(const u8 *ie, size_t ielen, const u8 *bssid,
++			   struct non_tx_bss ***non_tx_data, size_t *out_non_tx_data_cnt);
+ int ieee802_11_ie_count(const u8 *ies, size_t ies_len);
+ struct wpabuf * ieee802_11_vendor_ie_concat(const u8 *ies, size_t ies_len,
+ 					    u32 oui_type);
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index b806d5c4e..a4caa72e1 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -61,6 +61,7 @@
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_supplicant.h"
+ #include "drivers/mxl_driver_nl80211.h"
++#include "common/mxl_wpa_ctrl.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ #ifdef __NetBSD__
+@@ -10830,8 +10831,9 @@ static int wpas_ctrl_vendor_elem_remove(struct wpa_supplicant *wpa_s, char *cmd)
+ static void wpas_ctrl_neighbor_rep_cb(void *ctx, struct wpabuf *neighbor_rep)
+ {
+ 	struct wpa_supplicant *wpa_s = ctx;
+-	size_t len;
++	size_t len, i, non_tx_data_cnt = 0;
+ 	const u8 *data;
++	struct non_tx_bss **non_tx_bss_data = NULL;
+ 
+ 	/*
+ 	 * Neighbor Report element (IEEE P802.11-REVmc/D5.0)
+@@ -10909,6 +10911,14 @@ static void wpas_ctrl_neighbor_rep_cb(void *ctx, struct wpabuf *neighbor_rep)
+ 				}
+ 			}
+ 
++			if (s_id == WLAN_EID_MULTIPLE_BSSID) {
++				if (parse_mbssid_data(pos - 2, len + 2,
++						      nr, &non_tx_bss_data,
++						      &non_tx_data_cnt) == ParseFailed) {
++					goto out;
++				}
++			}
++
+ 			pos += s_len;
+ 		}
+ 
+@@ -10921,6 +10931,16 @@ static void wpas_ctrl_neighbor_rep_cb(void *ctx, struct wpabuf *neighbor_rep)
+ 			lci[0] ? " lci=" : "", lci,
+ 			civic[0] ? " civic=" : "", civic);
+ 
++		for(i = 0; i < non_tx_data_cnt; i++) {
++			wpa_msg(wpa_s, MSG_INFO, RRM_EVENT_NEIGHBOR_REP_MBSSID_RXED
++				"bssid=" MACSTR " bssid_index=0x%x max_bssid_indicator=0x%x capability=0x%x",
++				MAC2STR(non_tx_bss_data[i]->bssid),
++				non_tx_bss_data[i]->bssid_index,
++				non_tx_bss_data[i]->max_bssid_indicator,
++				non_tx_bss_data[i]->capability);
++			os_free(non_tx_bss_data[i]);
++		}
++
+ 		data = end;
+ 		len -= 2 + nr_len;
+ 	}
+-- 
+2.43.0
+

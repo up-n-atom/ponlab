@@ -1,0 +1,923 @@
+From 78a061365bf141834302bf31563967374069a0fc Mon Sep 17 00:00:00 2001
+From: mvulsx <mvuls@maxlinear.com>
+Date: Tue, 4 Jul 2023 11:59:19 +0000
+Subject: [PATCH] WLANRTSYS-56697: wpa_supplicant: Beerock implementation
+
+This changeset includes the following functionality:
+get_radio_info
+set_data_routing_mode
+get_data_routing_mode
+unconnected_sta_rssi
+
+Signed-off-by: mvulsx <mvuls@maxlinear.com>
+---
+ src/common/vendor_cmds_copy.h      |   9 +
+ src/common/wpa_ctrl.h              |   1 +
+ src/drivers/driver.h               |  23 ++
+ src/drivers/driver_common.c        |  19 ++
+ src/drivers/driver_nl80211_event.c |  21 ++
+ wpa_supplicant/Makefile            |   1 +
+ wpa_supplicant/ctrl_iface.c        | 416 ++++++++++++++++++++++++++++-
+ wpa_supplicant/driver_i.h          |   8 +
+ wpa_supplicant/events.c            |  41 +++
+ wpa_supplicant/mxl_supplicant.c    |  74 +++++
+ wpa_supplicant/mxl_supplicant.h    |  28 ++
+ wpa_supplicant/wpa_cli.c           |  37 +++
+ 12 files changed, 669 insertions(+), 9 deletions(-)
+ create mode 100644 wpa_supplicant/mxl_supplicant.c
+ create mode 100644 wpa_supplicant/mxl_supplicant.h
+
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index c158892c8..aaea09eb2 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -620,6 +620,15 @@ struct mxl_vendor_prop_phy_cap {
+ *                           Event structures                                   *
+ *******************************************************************************/
+ 
++/* Data for EVENT_LTQ_CSA_RECEIVED */
++struct intel_vendor_csa_received {
++  u32 bandwidth;
++  u32 freq;
++  u32 center_freq1;
++  u32 center_freq2;
++  u32 count; /* the number of TBTT's until the channel switch event */
++} __attribute__ ((packed));
++
+ /* Data for EVENT_LTQ_RADAR events */
+ struct intel_vendor_radar {
+   s32 width; /* enum nl80211_chan_width (drv) -> enum chan_width (hostap) */
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index d96579444..686b6abed 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -455,6 +455,7 @@ extern "C" {
+ 
+ #define HOSTAPD_DISCONNECTED "HOSTAPD-DISCONNECTED"
+ #define UNCONNECTED_STA_RSSI "UNCONNECTED-STA-RSSI "
++#define CSA_RECEIVED "CSA-RECEIVED "
+ #define AP_PROBE_REQ_RECEIVED "AP-PROBE-REQ-RECEIVED "
+ 
+ #define AP_STA_WNM_NOTIF "AP-STA-WNM-NOTIF "
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 1767fff24..2c402b36b 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5952,6 +5952,7 @@ enum wpa_event_type {
+ 	EVENT_LINK_RECONFIG,
+ 
+ 	EVENT_LTQ_UNCONNECTED_STA_RX,
++	EVENT_LTQ_CSA_RECEIVED,
+ };
+ 
+ 
+@@ -6596,6 +6597,8 @@ union wpa_event_data {
+ 		int link_id;
+ 	} eapol_rx;
+ 
++	struct intel_vendor_csa_received csa_received;
++
+ 	/**
+ 	 * signal_change - Data for EVENT_SIGNAL_CHANGE events
+ 	 */
+@@ -7012,6 +7015,25 @@ static inline void drv_event_eapol_rx2(void *ctx, const u8 *src, const u8 *data,
+ 	wpa_supplicant_event(ctx, EVENT_EAPOL_RX, &event);
+ }
+ 
++static inline void drv_event_ltq_csa_received (void *ctx, const u8 *data, size_t data_len)
++{
++	errno_t err;
++	union wpa_event_data event;
++	os_memset(&event, 0, sizeof(event));
++
++	if (!data || (data_len != sizeof(event.csa_received))) {
++		wpa_printf(MSG_ERROR, "Received LTQ vendor CSA received wrong data size");
++		return;
++	}
++
++	err = memcpy_s(&event.csa_received, sizeof(event.csa_received), data, data_len);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return;
++	}
++	wpa_supplicant_event(ctx, EVENT_LTQ_CSA_RECEIVED, &event);
++}
++
+ static inline void drv_event_ltq_unconnected_sta(void *ctx, const u8 *data, size_t data_len)
+ {
+ 	errno_t err;
+@@ -7039,6 +7061,7 @@ const char * event_to_string(enum wpa_event_type event);
+ 
+ /* Convert chan_width to a string for logging and control interfaces */
+ const char * channel_width_to_string(enum chan_width width);
++const char * channel_width_to_string2(enum chan_width width);
+ 
+ int channel_width_to_int(enum chan_width width);
+ 
+diff --git a/src/drivers/driver_common.c b/src/drivers/driver_common.c
+index afd5ff637..7c2636d60 100644
+--- a/src/drivers/driver_common.c
++++ b/src/drivers/driver_common.c
+@@ -52,6 +52,7 @@ const char * event_to_string(enum wpa_event_type event)
+ 	E2S(RX_PROBE_REQ);
+ 	E2S(NEW_STA);
+ 	E2S(EAPOL_RX);
++	E2S(LTQ_CSA_RECEIVED);
+ 	E2S(SIGNAL_CHANGE);
+ 	E2S(INTERFACE_ENABLED);
+ 	E2S(INTERFACE_DISABLED);
+@@ -130,6 +131,24 @@ const char * channel_width_to_string(enum chan_width width)
+ 	}
+ }
+ 
++const char * channel_width_to_string2(enum chan_width width)
++{
++	switch (width) {
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++		return "20";
++	case CHAN_WIDTH_40:
++		return "40";
++	case CHAN_WIDTH_80:
++		return "80";
++	case CHAN_WIDTH_80P80:
++		return "80+80";
++	case CHAN_WIDTH_160:
++		return "160";
++	default:
++		return "unknown";
++	}
++}
+ 
+ int channel_width_to_int(enum chan_width width)
+ {
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index cad60acc6..7082c1d02 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3286,6 +3286,24 @@ static void ltq_nl80211_handle_unconnected_sta(struct wpa_driver_nl80211_data *d
+ 	drv_event_ltq_unconnected_sta(drv->ctx, data, len);
+ }
+ 
++/******************************************************************************/
++/*! \brief      Handle CSA Received vendor event from driver
++ *
++ *  \param[in]  drv      pointer to wpa_driver_nl80211_data
++ *  \param[in]  data     pointer to data, must not be NULL
++ *  \param[in]  len      data size, must be sizeof(struct intel_vendor_csa_received)
++ *
++ *  \note       \a drv is not NULL
++ *
++ *  \return     void
++ */
++static void ltq_nl80211_handle_csa_received(struct wpa_driver_nl80211_data *drv,
++					    const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive LTQ vendor event: CSA received, ctx=%p", drv->ctx);
++	drv_event_ltq_csa_received(drv->ctx, data, len);
++}
++
+ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 				     u32 subcmd, u8 *data, size_t len)
+ {
+@@ -3293,6 +3311,9 @@ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 		case LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS:
+ 			mxl_nl80211_handle_flush_stations(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_CSA_RECEIVED:
++			ltq_nl80211_handle_csa_received(drv, data, len);
++			break;
+ 		case LTQ_NL80211_VENDOR_EVENT_RADAR_DETECTED:
+ 			mxl_nl80211_handle_radar(drv, data, len);
+ 			break;
+diff --git a/wpa_supplicant/Makefile b/wpa_supplicant/Makefile
+index f5dd3b3ae..0cc61c639 100644
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -1955,6 +1955,7 @@ ifdef CONFIG_VENDOR_MXL
+ CFLAGS += -DCONFIG_VENDOR_MXL
+ CFLAGS += -DCONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT
+ OBJS += ../src/common/mxl_ieee802_11_common.o
++OBJS += mxl_supplicant.o
+ OBJS += mxl_events.o
+ endif
+ 
+diff --git a/wpa_supplicant/ctrl_iface.c b/wpa_supplicant/ctrl_iface.c
+index 52c6a4399..b7ccfe7b3 100644
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -58,6 +58,10 @@
+ #include "mesh.h"
+ #include "dpp_supplicant.h"
+ #include "sme.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_supplicant.h"
++#include "drivers/mxl_driver_nl80211.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #ifdef __NetBSD__
+ #include <net/if_ether.h>
+@@ -3058,10 +3062,13 @@ static int wpa_supplicant_ctrl_iface_scan_result(
+ 	pos = buf;
+ 	end = buf + buflen;
+ 
+-	ret = os_snprintf(pos, end - pos, MACSTR "\t%d\t%d\t",
++	ret = sprintf_s(pos, end - pos, "bssid=" MACSTR " frequency=%d"
++			" signal_level=%d flags=",
+ 			  MAC2STR(bss->bssid), bss->freq, bss->level);
+-	if (os_snprintf_error(end - pos, ret))
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 		return -1;
++	}
+ 	pos += ret;
+ 	ie = wpa_bss_get_vendor_ie(bss, WPA_IE_VENDOR_TYPE);
+ 	if (ie)
+@@ -3192,7 +3199,7 @@ static int wpa_supplicant_ctrl_iface_scan_result(
+ 		pos += ret;
+ 	}
+ 
+-	ret = os_snprintf(pos, end - pos, "\t%s",
++	ret = os_snprintf(pos, end - pos, " ssid=%s",
+ 			  wpa_ssid_txt(bss->ssid, bss->ssid_len));
+ 	if (os_snprintf_error(end - pos, ret))
+ 		return -1;
+@@ -3216,12 +3223,6 @@ static int wpa_supplicant_ctrl_iface_scan_results(
+ 
+ 	pos = buf;
+ 	end = buf + buflen;
+-	ret = os_snprintf(pos, end - pos, "bssid / frequency / signal level / "
+-			  "flags / ssid\n");
+-	if (os_snprintf_error(end - pos, ret))
+-		return pos - buf;
+-	pos += ret;
+-
+ 	dl_list_for_each(bss, &wpa_s->bss_id, struct wpa_bss, list_id) {
+ 		ret = wpa_supplicant_ctrl_iface_scan_result(wpa_s, bss, pos,
+ 							    end - pos);
+@@ -8703,6 +8704,391 @@ static int wpa_supplicant_vendor_cmd(struct wpa_supplicant *wpa_s, char *cmd,
+ 	return ret;
+ }
+ 
++static int wpas_ctrl_iface_get_radio_info(struct wpa_supplicant *wpa_s,
++		char *cmd, char *buf, size_t buflen)
++{
++	int ret;
++	struct intel_vendor_radio_info radio_info;
++	char *pos, *end;
++	enum wpa_states state = wpa_s->wpa_state;
++
++	pos = buf;
++	end = buf + buflen;
++
++	ret = MXL_SUPP_DRV_VENDOR_GET(LTQ_NL80211_VENDOR_SUBCMD_GET_RADIO_INFO, NULL, 0, &radio_info, sizeof(radio_info));
++	if (ret)
++		return -1;
++
++	ret = sprintf_s(pos, end - pos, "Name=%s\n", wpa_s->ifname);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "WpaSupplicantEnabled=%d\n",
++			state <= WPA_INTERFACE_DISABLED ? 0 : 1);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "TxEnabled=%d\n", radio_info.Enable);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "Channel=%d\n", radio_info.Channel);
++	if (ret < 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "BytesSent=%llu\n",
++			radio_info.traffic_stats.BytesSent);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "BytesReceived=%llu\n",
++			radio_info.traffic_stats.BytesReceived);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "PacketsSent=%llu\n",
++			radio_info.traffic_stats.PacketsSent);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "PacketsReceived=%llu\n",
++			radio_info.traffic_stats.PacketsReceived);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "ErrorsSent=%d\n",
++			radio_info.error_stats.ErrorsSent);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "ErrorsReceived=%d\n",
++			radio_info.error_stats.ErrorsReceived);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "DiscardPacketsSent=%d\n",
++			radio_info.error_stats.DiscardPacketsSent);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "DiscardPacketsReceived=%d\n",
++			radio_info.error_stats.DiscardPacketsReceived);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "PLCPErrorCount=UNKNOWN\n");
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "FCSErrorCount=%d\n",
++			radio_info.FCSErrorCount);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "InvalidMACCount=UNKNOWN\n");
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "PacketsOtherReceived=UNKNOWN\n");
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "Noise=%d\n", radio_info.Noise);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "BSS load=%d\n", radio_info.load);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "TxPower=%.2f\n",
++			radio_info.tx_pwr_cfg / 100.);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "RxAntennas=%d\n",
++			radio_info.num_rx_antennas);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	ret = sprintf_s(pos, end - pos, "TxAntennas=%d\n",
++			radio_info.num_tx_antennas);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	if (!radio_info.primary_center_freq) {
++		ret = sprintf_s(pos, end - pos, "Freq=UNKNOWN\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++
++		ret = sprintf_s(pos, end - pos, "OperatingChannelBandwidt=UNKNOWN\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++
++		ret = sprintf_s(pos, end - pos, "Cf1=UNKNOWN\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++
++		ret = sprintf_s(pos, end - pos, "Dfs_chan=UNKNOWN\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++	} else {
++		ret = sprintf_s(pos, end - pos, "Freq=%d\n",
++				radio_info.primary_center_freq);
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++
++		ret = sprintf_s(pos, end - pos, "OperatingChannelBandwidt=%d\n",
++				radio_info.width);
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++
++		ret = sprintf_s(pos, end - pos, "Cf1=%d\n", radio_info.center_freq1);
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++
++		ret = sprintf_s(pos, end - pos, "Dfs_chan=%d\n",
++				ieee80211_is_dfs(radio_info.primary_center_freq,wpa_s->hw.modes, wpa_s->hw.num_modes));
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return -1;
++		}
++		pos += ret;
++	}
++
++	return pos - buf;
++}
++
++static int wpa_supplicant_ctrl_iface_set_data_routing_mode(
++		struct wpa_supplicant *wpa_s, char *cmd)
++{
++	char *pos;
++	int four_addr_mode = 0;
++
++	/* cmd: mode=<3_ADDRESS_MODE/4_ADDRESS_MODE> */
++	pos = os_strstr(cmd, "mode=");
++	if (pos == NULL) {
++		wpa_printf(MSG_ERROR,
++				"CTRL_IFACE: usage  mode=<3_ADDRESS_MODE/4_ADDRESS_MODE>");
++		return -1;
++	}
++	pos += sizeof("mode=") - 1;
++	if (os_strstr(pos, "3_ADDRESS_MODE"))
++		four_addr_mode = 0;
++	else {
++		if (os_strstr(pos, "4_ADDRESS_MODE"))
++			four_addr_mode = 1;
++		else {
++			wpa_printf(MSG_ERROR,
++					"CTRL_IFACE: invalid data routing mode specified [%s]",
++					pos);
++			return -1;
++		}
++	}
++	wpa_printf(MSG_DEBUG, "CTRL_IFACE: %s address mode",
++			four_addr_mode ? "4" : "3");
++
++	wpa_s->conf->wds = four_addr_mode;
++	return 0;
++}
++
++static int wpa_supplicant_ctrl_iface_get_data_routing_mode(
++		struct wpa_supplicant *wpa_s, char *cmd, char *buf, size_t buflen)
++{
++	int ret;
++	char *pos, *end;
++
++	pos = buf;
++	end = buf + buflen;
++
++	ret = sprintf_s(pos, end - pos, "mode=%s_ADDRESS_MODE\n",
++			wpa_s->conf->wds ? "4" : "3");
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++	pos += ret;
++
++	return pos - buf;
++}
++
++static int wpa_supplicant_ctrl_iface_unconnected_sta(
++		struct wpa_supplicant *wpa_s, const char *cmd)
++{
++	struct intel_vendor_unconnected_sta_req_cfg req;
++	char *pos;
++
++	os_memset(&req, 0, sizeof(req));
++
++	if (hwaddr_aton(cmd, req.addr))
++		return -1;
++
++	pos = os_strstr(cmd, " ");
++	if (pos) {
++		pos++;
++		req.freq = atoi(pos);
++		if (req.freq == 0) {
++			wpa_printf(MSG_ERROR, "unconnected_sta: invalid freq provided");
++			return -1;
++		}
++	} else {
++		wpa_printf(MSG_ERROR, "unconnected_sta: freq not specified");
++		return -1;
++	}
++
++	pos = os_strstr(cmd, "center_freq1=");
++	if (pos) {
++		pos += sizeof("center_freq1=") - 1;
++		req.center_freq1 = atoi(pos);
++		if (req.center_freq1 == 0) {
++			wpa_printf(MSG_ERROR,
++					"unconnected_sta: invalid center_freq1 provided");
++			return -1;
++		}
++	} else {
++		wpa_printf(MSG_ERROR, "unconnected_sta: center_freq1 not specified");
++		return -1;
++	}
++
++	pos = os_strstr(cmd, "center_freq2=");
++	if (pos) {
++		pos += sizeof("center_freq2=") - 1;
++		req.center_freq2 = atoi(pos);
++		if (req.center_freq2 == 0) {
++			wpa_printf(MSG_ERROR,
++					"unconnected_sta: invalid center_freq2 provided");
++			return -1;
++		}
++	}
++
++	pos = os_strstr(cmd, "bandwidth=");
++	if (pos) {
++		pos += sizeof("bandwidth=") - 1;
++		req.bandwidth = atoi(pos);
++		if (req.bandwidth == 0) {
++			wpa_printf(MSG_ERROR,
++					"unconnected_sta: invalid bandwidth provided");
++			return -1;
++		}
++	} else {
++		wpa_printf(MSG_ERROR, "unconnected_sta: bandwidth not specified");
++		return -1;
++	}
++	switch (req.bandwidth) {
++	case 20:
++		req.bandwidth = NL80211_CHAN_WIDTH_20;
++		break;
++	case 40:
++		req.bandwidth = NL80211_CHAN_WIDTH_40;
++		break;
++	case 80:
++		if (req.center_freq2)
++			req.bandwidth = NL80211_CHAN_WIDTH_80P80;
++		else
++			req.bandwidth = NL80211_CHAN_WIDTH_80;
++		break;
++	case 160:
++		req.bandwidth = NL80211_CHAN_WIDTH_160;
++		break;
++	default:
++		wpa_printf(MSG_ERROR, "unconnected_sta: invalid bandwidth provided");
++		return -1;
++	}
++
++	if (wpa_s->wpa_state >= WPA_ASSOCIATED &&
++	os_memcmp(req.addr, wpa_s->bssid, sizeof(wpa_s->bssid)) == 0) {
++		wpa_printf(MSG_ERROR,
++				"unconnected_sta: disconnect from AP "MACSTR" first",
++				MAC2STR(req.addr));
++		return -1;
++	}
++
++	return wpa_drv_unconnected_sta(wpa_s, &req);
++}
+ 
+ static void wpa_supplicant_ctrl_iface_flush(struct wpa_supplicant *wpa_s)
+ {
+@@ -12820,6 +13206,18 @@ char * wpa_supplicant_ctrl_iface_process(struct wpa_supplicant *wpa_s,
+ 	} else if (os_strncmp(buf, "GET_PREF_FREQ_LIST ", 19) == 0) {
+ 		reply_len = wpas_ctrl_iface_get_pref_freq_list(
+ 			wpa_s, buf + 19, reply, reply_size);
++	} else if (os_strncmp(buf, "GET_RADIO_INFO", 14) == 0) {
++		reply_len = wpas_ctrl_iface_get_radio_info(wpa_s, NULL, reply,
++				reply_size);
++	} else if (os_strncmp(buf, "DATA_ROUTING_MODE_SET ", 22) == 0) {
++		if (wpa_supplicant_ctrl_iface_set_data_routing_mode(wpa_s, buf + 22))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "DATA_ROUTING_MODE_GET", 21) == 0) {
++		reply_len = wpa_supplicant_ctrl_iface_get_data_routing_mode(wpa_s, NULL,
++				reply, reply_size);
++	} else if (os_strncmp(buf, "UNCONNECTED_STA_RSSI ", 21) == 0) {
++		if (wpa_supplicant_ctrl_iface_unconnected_sta(wpa_s, buf + 21))
++			reply_len = -1;
+ #ifdef CONFIG_FILS
+ 	} else if (os_strncmp(buf, "FILS_HLP_REQ_ADD ", 17) == 0) {
+ 		if (wpas_ctrl_iface_fils_hlp_req_add(wpa_s, buf + 17))
+diff --git a/wpa_supplicant/driver_i.h b/wpa_supplicant/driver_i.h
+index 1778afa7e..6f73900ae 100644
+--- a/wpa_supplicant/driver_i.h
++++ b/wpa_supplicant/driver_i.h
+@@ -1183,4 +1183,12 @@ wpas_drv_get_sta_mlo_info(struct wpa_supplicant *wpa_s,
+ 	return wpa_s->driver->get_sta_mlo_info(wpa_s->drv_priv, mlo_info);
+ }
+ 
++static inline int wpa_drv_unconnected_sta(struct wpa_supplicant *wpa_s,
++					  struct intel_vendor_unconnected_sta_req_cfg *req)
++{
++	if (!wpa_s->driver->unconnected_sta)
++		return -1;
++	return wpa_s->driver->unconnected_sta(wpa_s->drv_priv, req);
++}
++
+ #endif /* DRIVER_I_H */
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index a72ece681..9ecbbeb50 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -51,6 +51,7 @@
+ #include "mesh_mpm.h"
+ #include "wmm_ac.h"
+ #include "dpp_supplicant.h"
++#include "drivers/driver_nl80211.h"
+ 
+ 
+ #define MAX_OWE_TRANSITION_BSS_SELECT_COUNT 5
+@@ -5847,6 +5848,40 @@ static void wpas_event_unprot_beacon(struct wpa_supplicant *wpa_s,
+ 	wpabuf_free(buf);
+ }
+ 
++static void wpa_supplicant_event_ltq_unconnected_sta_rx(struct wpa_supplicant *wpa_s,
++							struct intel_vendor_unconnected_sta *unc_sta)
++{
++	int ret;
++	char buf[30];
++
++	ret = sprintf_s(buf, sizeof(buf), MACSTR, MAC2STR(unc_sta->addr));
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return;
++	}
++	wpa_msg(wpa_s, MSG_INFO, UNCONNECTED_STA_RSSI "%s %s rx_bytes=%llu rx_packets=%u "
++		"rssi=%d %d %d %d SNR=%d %d %d %d rate=%d",
++		wpa_s->ifname, buf, unc_sta->rx_bytes, unc_sta->rx_packets,
++		unc_sta->rssi[0], unc_sta->rssi[1], unc_sta->rssi[2], unc_sta->rssi[3],
++		unc_sta->noise[0] ? unc_sta->rssi[0] - unc_sta->noise[0] : 0, /* RSSI and noise to SNR */
++		unc_sta->noise[1] ? unc_sta->rssi[1] - unc_sta->noise[1] : 0, /* RSSI and noise to SNR */
++		unc_sta->noise[2] ? unc_sta->rssi[2] - unc_sta->noise[2] : 0, /* RSSI and noise to SNR */
++		unc_sta->noise[3] ? unc_sta->rssi[3] - unc_sta->noise[3] : 0, /* RSSI and noise to SNR */
++		unc_sta->rate);
++}
++
++static void wpa_supplicant_event_csa_received(struct wpa_supplicant *wpa_s,
++					      struct intel_vendor_csa_received *csa)
++{
++	wpa_msg(wpa_s, MSG_INFO, CSA_RECEIVED
++		"freq=%u ch_width=%s cf1=%u cf2=%u count=%u",
++		csa->freq,
++		channel_width_to_string2(convert2width(csa->bandwidth)),
++		csa->center_freq1,
++		csa->center_freq2,
++		csa->count);
++}
++
+ 
+ static const char * bitmap_to_str(u8 value, char *buf)
+ {
+@@ -6886,6 +6921,12 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 		if (data)
+ 			wpas_tid_link_map(wpa_s, &data->t2l_map_info);
+ 		break;
++	case EVENT_LTQ_UNCONNECTED_STA_RX:
++		wpa_supplicant_event_ltq_unconnected_sta_rx(wpa_s, &data->unconnected_sta);
++		break;
++	case EVENT_LTQ_CSA_RECEIVED:
++		wpa_supplicant_event_csa_received(wpa_s, &data->csa_received);
++		break;
+ 	case EVENT_CCA_STARTED_NOTIFY:
+ 		wpa_msg(wpa_s, MSG_INFO, WPA_EVENT_CCA_STARTED_NOTIFY
+ 				"cca_color:%u cca_count:%u ifname:%s BSSID=" MACSTR,
+diff --git a/wpa_supplicant/mxl_supplicant.c b/wpa_supplicant/mxl_supplicant.c
+new file mode 100644
+index 000000000..3985aa7e2
+--- /dev/null
++++ b/wpa_supplicant/mxl_supplicant.c
+@@ -0,0 +1,74 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "includes.h"
++#include <stdbool.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include "utils/common.h"
++#include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
++#include "common/mxl_ieee802_11_common.h"
++#include "ap/mxl_hostapd.h"
++#include "mxl_supplicant.h"
++#include "driver_i.h"
++
++
++int mxl_supplicant_drv_get_vendor_data(struct wpa_supplicant *wpa_s,
++			int vendor_id, int subcmd,
++			void *input_data, size_t input_data_size,
++			void *out_data, size_t out_data_size)
++{
++	int ret;
++	errno_t err;
++	struct wpabuf *rsp;
++
++	if (!out_data || !out_data_size) {
++		wpa_printf(MSG_ERROR, "subcmd id: %d "
++			"out_data %p out_data_size %zu", subcmd, out_data, out_data_size);
++		return -ENOBUFS;
++	}
++
++	rsp = wpabuf_alloc(out_data_size);
++	if (!rsp) {
++		return -ENOBUFS;
++	}
++
++	ret = wpa_drv_vendor_cmd(wpa_s, vendor_id,
++				 subcmd, input_data, input_data_size, NESTED_ATTR_NOT_USED, rsp);
++	if (ret) {
++		wpa_printf(MSG_ERROR, "subcmd id: %d "
++			"failed: %i (%s)", subcmd, ret, strerror(-ret));
++		goto out;
++	}
++	if (rsp->used != out_data_size) {
++		ret = -EMSGSIZE;
++		wpa_printf(MSG_ERROR, "subcmd id: %d returned %zu bytes instead of %zu",
++			subcmd, rsp->used, out_data_size);
++		goto out;
++	}
++
++	err = memcpy_s(out_data, out_data_size, rsp->buf, rsp->used);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		ret = -ENOBUFS;
++		goto out;
++	}
++
++	wpa_printf(MSG_EXCESSIVE, "subcmd id: %d processed", subcmd);
++
++out:
++	wpabuf_free(rsp);
++	return ret;
++}
+diff --git a/wpa_supplicant/mxl_supplicant.h b/wpa_supplicant/mxl_supplicant.h
+new file mode 100644
+index 000000000..ac31d082b
+--- /dev/null
++++ b/wpa_supplicant/mxl_supplicant.h
+@@ -0,0 +1,28 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_SUPPLICANT_H
++#define MXL_SUPPLICANT_H
++
++#include "utils/includes.h"
++#include "wpa_supplicant_i.h"
++
++int mxl_supplicant_drv_get_vendor_data(struct wpa_supplicant *wpa_s,
++			int vendor_id, int subcmd,
++			void *input_data, size_t input_data_size,
++			void *out_data, size_t out_data_size);
++
++#define MXL_SUPP_DRV_VENDOR_GET(cmd__, in_ptr__, in_size__, out_ptr__, out_size__) \
++	mxl_supplicant_drv_get_vendor_data(wpa_s, OUI_LTQ, (cmd__), (void*)(in_ptr__), (in_size__), (void*)(out_ptr__), (out_size__))
++
++#endif
+diff --git a/wpa_supplicant/wpa_cli.c b/wpa_supplicant/wpa_cli.c
+index 6438966f9..00d510258 100644
+--- a/wpa_supplicant/wpa_cli.c
++++ b/wpa_supplicant/wpa_cli.c
+@@ -2860,6 +2860,29 @@ static int wpa_cli_cmd_wmm_ac_delts(struct wpa_ctrl *ctrl, int argc,
+ 	return wpa_cli_cmd(ctrl, "WMM_AC_DELTS", 1, argc, argv);
+ }
+ 
++static int wpa_cli_cmd_radio_info(struct wpa_ctrl *ctrl, int argc,
++				  char *argv[])
++{
++	return wpa_cli_cmd(ctrl, "GET_RADIO_INFO", 0, argc, argv);
++}
++
++static int wpa_cli_cmd_data_routing_mode_set(struct wpa_ctrl *ctrl, int argc,
++					     char *argv[])
++{
++	return wpa_cli_cmd(ctrl, "DATA_ROUTING_MODE_SET", 1, argc, argv);
++}
++
++static int wpa_cli_cmd_data_routing_mode_get(struct wpa_ctrl *ctrl, int argc,
++					     char *argv[])
++{
++	return wpa_cli_cmd(ctrl, "DATA_ROUTING_MODE_GET", 0, argc, argv);
++}
++
++static int wpa_cli_cmd_unconnected_sta(struct wpa_ctrl *ctrl, int argc,
++				       char *argv[])
++{
++	return wpa_cli_cmd(ctrl, "UNCONNECTED_STA_RSSI", 4, argc, argv);
++}
+ 
+ static int wpa_cli_cmd_wmm_ac_status(struct wpa_ctrl *ctrl, int argc,
+ 				    char *argv[])
+@@ -3981,6 +4004,20 @@ static const struct wpa_cli_cmd wpa_cli_commands[] = {
+ 	{ "p2p_lo_stop", wpa_cli_cmd_p2p_lo_stop, NULL,
+ 	  cli_cmd_flag_none,
+ 	  "= stop P2P listen offload" },
++	{ "radio_info", wpa_cli_cmd_radio_info, NULL,
++	  cli_cmd_flag_none,
++	  "= get radio info" },
++	{ "data_routing_mode_set", wpa_cli_cmd_data_routing_mode_set, NULL,
++	  cli_cmd_flag_none,
++	  "mode=<3_ADDRESS_MODE/4_ADDRESS_MODE> "
++	  "= set data routing mode" },
++	{ "data_routing_mode_get", wpa_cli_cmd_data_routing_mode_get, NULL,
++	  cli_cmd_flag_none,
++	  "= get data routing mode" },
++	{ "unconnected_sta", wpa_cli_cmd_unconnected_sta, NULL,
++	  cli_cmd_flag_none,
++	  "<addr> <freq> <center_freq1=> [center_freq2=] <bandwidth=> "
++	  "= get unconnected station statistics" },
+ #ifdef CONFIG_DPP
+ 	{ "dpp_qr_code", wpa_cli_cmd_dpp_qr_code, NULL, cli_cmd_flag_none,
+ 	  "report a scanned DPP URI from a QR Code" },
+-- 
+2.43.0
+

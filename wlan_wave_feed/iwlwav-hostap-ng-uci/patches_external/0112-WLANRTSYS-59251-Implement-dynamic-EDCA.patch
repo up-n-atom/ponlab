@@ -1,0 +1,162 @@
+From 52916b54884ff61c0fdbbd5af77230f5278b3c31 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Thu, 5 Oct 2023 14:36:55 +0300
+Subject: [PATCH] WLANRTSYS-59251: Implement dynamic EDCA
+
+---
+ hostapd/ctrl_iface.c          |  7 +++++++
+ hostapd/mxl_config.c          |  7 +++++++
+ hostapd/mxl_ctrl_iface.c      | 26 ++++++++++++++++++++++++++
+ hostapd/mxl_ctrl_iface.h      |  1 +
+ src/ap/drv_callbacks.c        |  2 +-
+ src/ap/mxl_config.h           |  1 +
+ src/ap/mxl_hostapd.c          |  4 ++++
+ src/common/vendor_cmds_copy.h |  1 +
+ 8 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 00f50643b..5c0e61a98 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -81,6 +81,10 @@
+ #ifdef CONFIG_RADIUS_GREYLIST
+ #include "ap/greylist.h"
+ #endif /* CONFIG_RADIUS_GREYLIST */
++#ifdef CONFIG_VENDOR_MXL
++#include "ap/mxl_config.h"
++#include "mxl_ctrl_iface.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
+ 
+@@ -1435,6 +1439,9 @@ static int hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd)
+ 		} else if (os_strcasecmp(cmd, "transition_disable") == 0) {
+ 			wpa_auth_set_transition_disable(hapd->wpa_auth,
+ 							hapd->conf->transition_disable);
++#ifdef CONFIG_VENDOR_MXL
++		} else if(mxl_hostapd_ctrl_iface_set(hapd, cmd, &ret)) {
++#endif /* CONFIG_VENDOR_MXL */
+ 		}
+ 
+ #ifdef CONFIG_TESTING_OPTIONS
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index a52a2452a..96eccb0f4 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -884,6 +884,13 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 	} else if (mxl_conf_fill_he_txrx_mcs_support(mxl_conf, buf, pos)) {
+ 	} else if (mxl_conf_fill_he_ppe_thresholds(mxl_conf, buf, pos)) {
+ #endif /* CONFIG_IEEE80211AX */
++	} else if (os_strcmp(buf, "dynamic_edca") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid dynamic_edca value %d", line, val);
++			return 0;
++		}
++		mxl_conf->dynamic_edca = val;
+ 	} else
+ 		return 0;
+ 
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 323869f99..4e5705692 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -2868,6 +2868,32 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	return 1;
+ }
+ 
++int mxl_hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd, int *ret)
++{
++	struct mxl_hostapd_config *mxl_conf = &hapd->iconf->mxl_conf;
++
++	if (os_strcasecmp(cmd, "dynamic_edca") == 0) {
++		hapd = hapd->iface->bss[0];
++		if (!MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_EDCA,
++			    &mxl_conf->dynamic_edca, sizeof(mxl_conf->dynamic_edca))) {
++			int i;
++			for (i = 0; i < hapd->iface->num_bss; i++) {
++				if (hapd->iface->bss[i]->beacon_set_done && hapd->iface->bss[i]->started) {
++					hapd->iface->bss[i]->parameter_set_count++;
++					ieee802_11_set_beacon(hapd->iface->bss[i]);
++				}
++			}
++		}
++		else {
++			*ret = -1;
++		}
++	/* add new config item here as "} else if...{" */
++	} else
++		return 0;
++
++	return 1;
++}
++
+ int mxl_hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd,
+ 				 char *cmd, char *reply,
+ 				 size_t reply_size)
+diff --git a/hostapd/mxl_ctrl_iface.h b/hostapd/mxl_ctrl_iface.h
+index 49e4c49e6..02db0438e 100644
+--- a/hostapd/mxl_ctrl_iface.h
++++ b/hostapd/mxl_ctrl_iface.h
+@@ -26,5 +26,6 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      int *reply_len);
+ char * mxl_dfs_info(struct hostapd_channel_data *chan);
+ int mxl_hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd, char *reply, size_t reply_size);
++int mxl_hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd, int *ret);
+ 
+ #endif /* MXL_CTRL_IFACE_H */
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index aa0cf239c..9155b6048 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -43,7 +43,7 @@
+ #include "fils_hlp.h"
+ #include "neighbor_db.h"
+ #include "../hostapd/mxl_ctrl_iface.h"
+-
++#include "ap/mxl_config.h"
+ 
+ #ifdef CONFIG_FILS
+ void hostapd_notify_assoc_fils_finish(struct hostapd_data *hapd,
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index db3dd2d9f..7b23afea2 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -169,6 +169,7 @@ struct mxl_hostapd_config {
+ 	struct he_override_hw_capab override_hw_capab;
+ 	struct ieee80211_he_capabilities he_capab_dbg;
+ #endif /* CONFIG_IEEE80211AX */
++	int dynamic_edca;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 558c79140..65b532e35 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -1128,6 +1128,10 @@ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface)
+ 					(u8*)&iface->conf->sInterferDetThresh, sizeof(iface->conf->sInterferDetThresh),
+ 					NESTED_ATTR_NOT_USED,NULL))
+ 		wpa_printf(MSG_WARNING, "set sInterferDetThresh failed");
++
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_EDCA,
++			       &mxl_conf->dynamic_edca, sizeof(mxl_conf->dynamic_edca)))
++		wpa_printf(MSG_WARNING, "set dynamic_edca failed");
+ }
+ 
+ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx)
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 904fcdf4c..6a4167597 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -407,6 +407,7 @@ enum ltq_nl80211_vendor_subcmds {
+   LTQ_NL80211_VENDOR_SUBCMD_ML_SEND_T2LM_TEARDOWN_FRAME,
+   LTQ_NL80211_VENDOR_SUBCMD_GET_ML_LINKSWITCH_STATS,
+   LTQ_NL80211_VENDOR_SUBCMD_SET_ML_LINKSWITCH_STATS,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_EDCA,
+   /* add new iw sub commands here */
+ 
+   /* used to define LTQ_NL80211_VENDOR_SUBCMD_MAX below */
+-- 
+2.43.0
+
