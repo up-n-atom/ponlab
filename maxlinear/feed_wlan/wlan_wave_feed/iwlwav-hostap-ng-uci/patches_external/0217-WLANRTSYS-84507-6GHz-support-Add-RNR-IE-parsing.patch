@@ -1,0 +1,417 @@
+From cb487e74d6cead221830f25dad59238ff11d530f Mon Sep 17 00:00:00 2001
+From: spatel <spatel@maxlinear.com>
+Date: Mon, 14 Oct 2024 16:04:20 +0530
+Subject: [PATCH] WLANRTSYS-84507 6GHz support: Add RNR IE parsing
+
+---
+ src/ap/ap_config.h               |   3 +-
+ src/ap/mxl_hostapd.c             | 223 +++++++++++++++++++++++++++++++
+ src/ap/mxl_hostapd.h             |   1 +
+ src/common/ieee802_11_common.h   |   2 +
+ src/common/mxl_ieee802_11_defs.h | 100 ++++++--------
+ 5 files changed, 268 insertions(+), 61 deletions(-)
+
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 4afbc67f7..9e40ae08b 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1616,7 +1616,8 @@ hostapd_set_oper_centr_freq_seg0_idx(struct hostapd_config *conf,
+ #ifdef CONFIG_IEEE80211BE
+ 	if (conf->ieee80211be)
+ 		conf->eht_oper_centr_freq_seg0_idx = oper_centr_freq_seg0_idx;
+-	if (center_idx_to_bw_6ghz(oper_centr_freq_seg0_idx) == 4)
++	if (is_6ghz_op_class(conf->op_class) &&
++		center_idx_to_bw_6ghz(oper_centr_freq_seg0_idx) == 4)
+ 		oper_centr_freq_seg0_idx +=
+ 			conf->channel > oper_centr_freq_seg0_idx ? 16 : -16;
+ #endif /* CONFIG_IEEE80211BE */
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 18c795f82..84e58dcfa 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -3091,3 +3091,226 @@ void mxl_hostapd_init(struct hostapd_iface * hapd_iface)
+ {
+ 	mxl_hostapd_update_user_conf_cw(hapd_iface);
+ }
++void mxl_parse_rnr(struct ieee802_11_elems *elems, struct dl_list *rnr_scan_6g_ap_info)
++{
++	struct rnr_neighbor_ap_info *ap_info;
++	rnr_scan_ap_info_t *scan_ap_info;
++	rnr_scan_ap_info_t *scan_ap_info_tmp;
++	const u8 *pos, *end;
++	int err = EOK;
++	u8 bss_param = 0;
++	u8 i, count;
++	u8 bssid[ETH_ALEN] = {0};
++	u32 short_ssid = 0;
++	pos = elems->rnr;
++	end = pos + elems->rnr_len;
++
++	/* parse and fill the required fields from RNR to do 6G Active/Passive scan */
++	/*
++	 * RNR IE :
++	 * The Reduced Neighbor Report element contains channel and other information related to neighbor APs
++	 * format is specified on draft 802.11-2020 (9.4.2.170.1).
++
++	 * The Neighbor AP Information Fields field contains one or more of the Neighbor AP Information field
++	 * described in 9.4.2.170.2
++	 * Neighbor AP Information field format
++	 |---------------------------------------------------------------------|
++	 Bytes |       2    |        1        |        1       |      Variable       |
++	 |---------------------------------------------------------------------|
++	 Descr | TBTT Header| operating class | channel number |TBTT information set |
++	 |---------------------------------------------------------------------|
++
++	 * TBTT Information Header subfield format
++	 |-------------------------------------------------------------------------------------|
++	 Bits  |          2            |     1      |     1    |          4            |       8     |
++	 |-------------------------------------------------------------------------------------|
++	 Descr | TBTT Information type | Filtered AP | Reserved |TBTT information count | TBTT length|
++	 |-------------------------------------------------------------------------------------|
++
++	 * The TBTT Information Field Type subfield identifies, together with the TBTT Information Length subfield,
++	 * the format of the TBTT Information field. It is set to 0.. Values 1, 2, and 3 are reserved.
++
++	 * The Filtered Neighbor AP subfield is reserved except when the Reduced Neighbor Report element is carried
++	 * in a Probe Response frame transmitted by a TVHT AP.
++
++	 * In a Probe Response frame transmitted by a TVHT AP, the Filtered Neighbor AP subfield is set to 1 if the
++	 * specific SSID corresponding to every BSS of the APs in this Neighbor AP Information field matches the
++	 * SSID in the corresponding Probe Request frame; otherwise it is set to 0.
++
++	 * The TBTT Information Count subfield contains the number of TBTT Information fields included in the
++	 * TBTT Information Set field of the Neighbor AP Information field, minus one.
++
++	 * The TBTT Information Length subfield indicates the length of each TBTT Information field included in the
++	 * TBTT Information Set field of the Neighbor AP Information field. When the TBTT Information Field Type
++	 * subfield is set to 0, the TBTT Information Length subfield
++
++	 * TBTT Information set field format
++	 |-------------------------------------------------------------------------------------------------|
++	 Bytes |          1            |     0or6        |     0or4             |     0or1      |         0or1   |
++	 |-------------------------------------------------------------------------------------------------|
++	 Descr | Neighbor TBTT offset  | BSSID(optional) | Short-SSID(optional) |BSS parameters | 20Mhz PSD      |
++	 |-------------------------------------------------------------------------------------------------|
++
++	 * The format of the BSS parameters can be refered from IEEE P802.11ax/D7.0 (Figure 9-632a)
++	 * */
++	while (pos + sizeof(*ap_info) <= end) {
++		ap_info = (struct rnr_neighbor_ap_info*) pos;
++		count = (ap_info->tbtt_info_hdr & RNR_INFO_TBTT_HDR_COUNT) + 1;
++		pos += sizeof(*ap_info);
++
++		if (end - pos < count * ap_info->tbtt_info_len)
++			break;
++
++		for (i = 0; i < count; i++) {
++			/* if we have only TBTT skip parsing and go to next ap info*/
++			if (ap_info->tbtt_info_len == RNR_TBTT_INFO_OFFSET_TBTT_PARAM)
++				continue;
++			scan_ap_info = (rnr_scan_ap_info_t *)os_malloc(sizeof(rnr_scan_ap_info_t));
++			if (!scan_ap_info) {
++				wpa_printf(MSG_ERROR, "%s: Malloc failed", __func__);
++				return;
++			}
++			memset(scan_ap_info, 0, sizeof(rnr_scan_ap_info_t));
++			/* skip the TBTT offset */
++			pos++;
++			switch (ap_info->tbtt_info_len) {
++				case RNR_TBTT_INFO_OFFSET_BSS_PARAM:
++					bss_param = *pos;
++					break;
++				case RNR_TBTT_INFO_OFFSET_SSSID_PARAM:
++					err = memcpy_s(&short_ssid, sizeof(short_ssid), pos, sizeof(short_ssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(short_ssid);
++					break;
++				case RNR_TBTT_INFO_OFFSET_SSSID_BSS_PARAM:
++					err = memcpy_s(&short_ssid, sizeof(short_ssid), pos, sizeof(short_ssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(short_ssid);
++					bss_param = *pos;
++					break;
++				case RNR_TBTT_INFO_OFFSET_BSSID_PARAM:
++					err = memcpy_s(bssid, sizeof(bssid), pos, sizeof(bssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(bssid);
++					break;
++				case RNR_TBTT_INFO_OFFSET_BSSID_BSS_PARAM:
++				case RNR_TBTT_INFO_OFFSET_BSSID_BSS_PSD_PARAM:
++					err = memcpy_s(bssid, sizeof(bssid), pos, sizeof(bssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(bssid);
++					bss_param = *pos;
++					break;
++				case RNR_TBTT_INFO_OFFSET_BSSID_SSSID_PARAM:
++					err = memcpy_s(bssid, sizeof(bssid), pos, sizeof(bssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(bssid);
++					err = memcpy_s(&short_ssid, sizeof(short_ssid), pos, sizeof(short_ssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(short_ssid);
++					break;
++				case RNR_TBTT_INFO_OFFSET_BSSID_SSSID_BSS_PARAM:
++				case RNR_TBTT_INFO_OFFSET_BSSID_SSSID_BSS_PSD_PARAM:
++					err = memcpy_s(bssid, sizeof(bssid), pos, sizeof(bssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(bssid);
++					err = memcpy_s(&short_ssid, sizeof(short_ssid), pos, sizeof(short_ssid));
++					if (EOK != err) {
++						goto error;
++					}
++					pos += sizeof(short_ssid);
++					bss_param = *pos;
++					break;
++			}
++
++			if (bss_param) {
++				if (bss_param & RNR_TBTT_PARAMS_PROBE_ACTIVE) {
++					scan_ap_info->flag = RNR_AOCS_SCAN_PASSIVE_CHANNEL;
++					scan_ap_info->freq = hostapd_chan_to_freq(ap_info->channel, ap_info->op_class);
++				} else {
++					scan_ap_info->flag = RNR_AOCS_SCAN_ACTIVE_CHANNEL;
++					scan_ap_info->freq = hostapd_chan_to_freq(ap_info->channel, ap_info->op_class);
++					if (bss_param & RNR_TBTT_PARAMS_SAME_SSID) {
++						scan_ap_info->flag |= RNR_AOCS_SCAN_SSID;
++						scan_ap_info->ssid_len = elems->ssid_len;
++						err = memcpy_s(scan_ap_info->u.ssid, elems->ssid_len, elems->ssid, elems->ssid_len);
++						if (EOK != err) {
++							goto error;
++						}
++					} else if (short_ssid) {
++						scan_ap_info->flag |= RNR_AOCS_SCAN_SHORT_SSID;
++						scan_ap_info->ssid_len = RNR_SHORT_SSID_LEN;
++						err = memcpy_s(&scan_ap_info->u.short_ssid, RNR_SHORT_SSID_LEN, &short_ssid, RNR_SHORT_SSID_LEN);
++						if (EOK != err) {
++							goto error;
++						}
++					} else {
++						scan_ap_info->flag |= RNR_AOCS_SCAN_BSSID;
++						err = memcpy_s(scan_ap_info->u.bssid, ETH_ALEN, bssid, ETH_ALEN);
++						if (EOK != err) {
++							goto error;
++						}
++					}
++				}
++			}
++
++			/*
++			 * As same RNR info can be present on both 2.4G/5G co-located AP
++			 * possible duplicate RNR entries can be present skip adding
++			 * such rnr entries to the list
++			 * */
++			dl_list_for_each(scan_ap_info_tmp, rnr_scan_6g_ap_info, rnr_scan_ap_info_t, list) {
++				if (scan_ap_info_tmp->flag & RNR_AOCS_SCAN_PASSIVE_CHANNEL) {
++					if (scan_ap_info_tmp->freq == scan_ap_info->freq) {
++						wpa_printf(MSG_MSGDUMP, "%s: skip duplicate RNR entry", __func__);
++						goto skip;
++					}
++				} else {
++					if (scan_ap_info_tmp->freq == scan_ap_info->freq) {
++						if (scan_ap_info_tmp->flag & RNR_AOCS_SCAN_SSID) {
++							if (!os_memcmp(scan_ap_info_tmp->u.ssid, scan_ap_info->u.ssid,
++										sizeof(scan_ap_info_tmp->ssid_len))) {
++								wpa_printf(MSG_MSGDUMP, "%s: skip duplicate RNR entry", __func__);
++								goto skip;
++							}
++						} else if (scan_ap_info_tmp->flag & RNR_AOCS_SCAN_SHORT_SSID) {
++							if (scan_ap_info_tmp->u.short_ssid == scan_ap_info->u.short_ssid) {
++								wpa_printf(MSG_MSGDUMP, "%s: skip duplicate RNR entry", __func__);
++								goto skip;
++							}
++						} else {
++							if (!os_memcmp(scan_ap_info_tmp->u.bssid, scan_ap_info->u.bssid, ETH_ALEN)) {
++								wpa_printf(MSG_MSGDUMP, "%s: skip duplicate RNR entry", __func__);
++								goto skip;
++							}
++						}
++					}
++				}
++			}
++
++			dl_list_add(rnr_scan_6g_ap_info, &scan_ap_info->list);
++			/* Do not clear the scan_ap_info once we add to list as this will be cleaned later */
++			goto next;
++error:
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++skip:
++			os_free(scan_ap_info);
++next:
++			pos += ap_info->tbtt_info_len;
++		}
++	}
++}
++
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 3d03c5cf5..d5f3f4b73 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -251,4 +251,5 @@ void mxl_mlo_cleanup_mld_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_mlo_hostapd_prune_associations_mld_mac(struct hostapd_data *hapd, struct sta_info *new_sta);
+ void mxl_mlo_hostapd_prune_associations_mld(struct hostapd_data *hapd, const u8 *addr);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++void mxl_parse_rnr(struct ieee802_11_elems *elems, struct dl_list *rnr_scan_6g_ap_info);
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index f208d6374..02eef36cf 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -110,6 +110,7 @@ struct ieee802_11_elems {
+ 	const u8 *tdls_mle;
+ 	const u8 *prior_access_mle;
+ 	const u8 *mbssid_known_bss;
++	const u8 *rnr;
+ #ifdef CONFIG_VENDOR_MXL
+ 	const u8 *multilink_ie;
+ 	const u8 *non_inheritance;
+@@ -179,6 +180,7 @@ struct ieee802_11_elems {
+ 	size_t tdls_mle_len;
+ 	size_t prior_access_mle_len;
+ 	u8 mbssid_known_bss_len;
++	u8 rnr_len;
+ #ifdef CONFIG_VENDOR_MXL
+ 	u8 multilink_ie_len;
+ 	u8 non_inheritance_len;
+diff --git a/src/common/mxl_ieee802_11_defs.h b/src/common/mxl_ieee802_11_defs.h
+index c61194131..4fc3d5e6f 100644
+--- a/src/common/mxl_ieee802_11_defs.h
++++ b/src/common/mxl_ieee802_11_defs.h
+@@ -16,42 +16,52 @@
+ 
+ #include "utils/list.h"
+ 
+-#define EHT_OPER_CHANWIDTH_320	4
+-
+-#define STARTING_6G_FREQ_IN_MHZ				5950
+-#define RNR_INFO_TBTT_HDR_TYPE		0x03
+-#define RNR_INFO_TBTT_HDR_FILTERED	0x04
+-#define RNR_INFO_TBTT_HDR_COLOC		0x08
+-#define RNR_INFO_TBTT_HDR_COUNT		0xF0
+-
+-#define RNR_TBTT_INFO_OFFSET_TBTT_PARAM					1
+-#define RNR_TBTT_INFO_OFFSET_BSS_PARAM					2
+-#define RNR_TBTT_INFO_OFFSET_SSSID_PARAM				5
+-#define RNR_TBTT_INFO_OFFSET_SSSID_BSS_PARAM			6
+-#define RNR_TBTT_INFO_OFFSET_BSSID_PARAM				7
+-#define RNR_TBTT_INFO_OFFSET_BSSID_BSS_PARAM			8
+-#define RNR_TBTT_INFO_OFFSET_BSSID_BSS_PSD_PARAM		9
+-#define RNR_TBTT_INFO_OFFSET_BSSID_SSSID_PARAM			11
+-#define RNR_TBTT_INFO_OFFSET_BSSID_SSSID_BSS_PARAM		12
+-#define RNR_TBTT_INFO_OFFSET_BSSID_SSSID_BSS_PSD_PARAM	13
+-
+-#define RNR_TBTT_PARAMS_OCT_RECOMMENDED		0x01
+-#define RNR_TBTT_PARAMS_SAME_SSID			0x02
+-#define RNR_TBTT_PARAMS_MULTI_BSSID			0x04
+-#define RNR_TBTT_PARAMS_TRANSMITTED_BSSID	0x08
+-#define RNR_TBTT_PARAMS_COLOC_ESS			0x10
+-#define RNR_TBTT_PARAMS_PROBE_ACTIVE		0x20
+-#define RNR_TBTT_PARAMS_COLOC_AP			0x40
++#define STARTING_6G_FREQ_IN_MHZ                         5950
++#define RNR_INFO_TBTT_HDR_TYPE                          0x03
++#define RNR_INFO_TBTT_HDR_FILTERED                      0x04
++#define RNR_INFO_TBTT_HDR_COLOC                         0x08
++#define RNR_INFO_TBTT_HDR_COUNT                         0xF0
++
++#define RNR_TBTT_INFO_OFFSET_TBTT_PARAM                 1
++#define RNR_TBTT_INFO_OFFSET_BSS_PARAM                  2
++#define RNR_TBTT_INFO_OFFSET_SSSID_PARAM                5
++#define RNR_TBTT_INFO_OFFSET_SSSID_BSS_PARAM            6
++#define RNR_TBTT_INFO_OFFSET_BSSID_PARAM                7
++#define RNR_TBTT_INFO_OFFSET_BSSID_BSS_PARAM            8
++#define RNR_TBTT_INFO_OFFSET_BSSID_BSS_PSD_PARAM        9
++#define RNR_TBTT_INFO_OFFSET_BSSID_SSSID_PARAM          11
++#define RNR_TBTT_INFO_OFFSET_BSSID_SSSID_BSS_PARAM      12
++#define RNR_TBTT_INFO_OFFSET_BSSID_SSSID_BSS_PSD_PARAM  13
++
++#define RNR_TBTT_PARAMS_OCT_RECOMMENDED                 0x01
++#define RNR_TBTT_PARAMS_SAME_SSID                       0x02
++#define RNR_TBTT_PARAMS_MULTI_BSSID                     0x04
++#define RNR_TBTT_PARAMS_TRANSMITTED_BSSID               0x08
++#define RNR_TBTT_PARAMS_COLOC_ESS                       0x10
++#define RNR_TBTT_PARAMS_PROBE_ACTIVE                    0x20
++#define RNR_TBTT_PARAMS_COLOC_AP                        0x40
+ 
+ /* RNR scanned freq flag */
+-#define RNR_AOCS_SCAN_PASSIVE_CHANNEL   0x01
+-#define RNR_AOCS_SCAN_ACTIVE_CHANNEL    0x02
++#define RNR_AOCS_SCAN_PASSIVE_CHANNEL                   0x01
++#define RNR_AOCS_SCAN_ACTIVE_CHANNEL                    0x02
+ #define RNR_AOCS_SCAN_SSID                              0x04
+-#define RNR_AOCS_SCAN_SHORT_SSID                0x08
++#define RNR_AOCS_SCAN_SHORT_SSID                        0x08
+ #define RNR_AOCS_SCAN_BSSID                             0x10
+ 
+ #define RNR_SHORT_SSID_LEN      4
+ 
++typedef struct rnr_scan_ap_info {
++	struct dl_list list;
++	u8 flag;
++	u8 ssid_len;
++	u16 freq;
++	union {
++		u8 ssid[SSID_MAX_LEN];
++		u8 bssid[ETH_ALEN];
++		u32 short_ssid;
++	} u;
++} rnr_scan_ap_info_t;
++
+ struct rnr_neighbor_ap_info {
+ 	u8 tbtt_info_hdr;
+ 	u8 tbtt_info_len;
+@@ -59,38 +69,8 @@ struct rnr_neighbor_ap_info {
+ 	u8 channel;
+ } STRUCT_PACKED;
+ 
+-#define MAX_IE_LEN 255
+-
+-#define WLAN_EID_EXT_MAX_CHAN_SWITCH_TIME 52
+-#define WLAN_EID_SUBELEMENT_MLO_PER_STA_PROFILE 0
+-#define RNR_TBTT_INFO_HDR_FILTERED BIT(2)
+-#define RNR_TBTT_INFO_BSS_PARAM_COLOC_AP BIT(6)
+-#define RNR_TBTT_INFO_COUNT_OFFSET 4
+-#define RNR_TBTT_INFO_BSS_PARAM_SAME_SSID BIT(1)
+-#define RNR_TBTT_INFO_BSS_PARAM_MULTIPLE_BSSID BIT(2)
+-#define RNR_TBTT_INFO_BSS_PARAM_TRANSMITTED_BSSID BIT(3)
+-#define RNR_TBTT_INFO_BSS_PARAM_COLOC_ESS BIT(4)
+-#define RNR_TBTT_INFO_BSS_PARAM_20TU_PROBE_RES BIT(5)
+-
+-
+-#define RNR_TBTT_PADDING_BYTES_MIN       0
+-#define RNR_TBTT_PADDING_BYTES_MAX       4
+-#define TBTT_OFFSET_UNKNOWN              255
+-#define RNR_TBTT_HEADER_LEN              4
+-#define RNR_TBTT_INFO_COUNT_MAX          16
+-#define RNR_TBTT_INFO_LEN_SAME_SSID      9
+-#define RNR_TBTT_INFO_LEN_DIFFERENT_SSID 13
+-#define RNR_TBTT_INFO_LEN_MLD            16
+-
+-#define WCE_IE_VENDOR_TYPE 0x506f9a23
+-#define WCE_OUI_TYPE 0x23
++#define EHT_OPER_CHANWIDTH_320	4
+ 
+-/* According to IEEE80211-2016 "The subfields of the
+- * VHT Operation Information field are defined in Table 9-252.*/
+-#define VHT_OPER_CHANWIDTH_20_40MHZ                     0
+-#define VHT_OPER_CHANWIDTH_80_160_80P80MHZ      1
+-#define VHT_OPER_CHANWIDTH_160MHZ                       2
+-#define VHT_OPER_CHANWIDTH_80P80MHZ                     3
+ #define MAX_IE_LEN 255
+ 
+ #define WLAN_EID_EXT_MAX_CHAN_SWITCH_TIME 52
+-- 
+2.43.0
+

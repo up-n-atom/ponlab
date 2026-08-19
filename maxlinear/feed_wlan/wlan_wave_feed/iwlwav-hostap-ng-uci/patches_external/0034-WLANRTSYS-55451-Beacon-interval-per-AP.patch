@@ -1,0 +1,217 @@
+From 5a7b762d3f3d3777744e93c195ab4156f59cc5e2 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Mon, 22 May 2023 11:42:49 +0200
+Subject: [PATCH] WLANRTSYS-55451: Beacon interval per AP
+
+---
+ hostapd/config_file.c  | 14 ++++++++++++++
+ hostapd/hostapd.conf   | 15 ++++++++++++++-
+ src/ap/ap_config.c     |  1 +
+ src/ap/ap_config.h     |  4 ++++
+ src/ap/beacon.c        |  6 +++---
+ src/ap/bss_load.c      |  2 +-
+ src/ap/ctrl_iface_ap.c |  4 ++++
+ src/ap/drv_callbacks.c |  5 -----
+ src/ap/ieee802_1x.c    |  2 +-
+ src/ap/wnm_ap.c        |  2 +-
+ 10 files changed, 43 insertions(+), 12 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 1d1d8afa2..7b35a8715 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3405,6 +3405,20 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		conf->beacon_int = val;
++	} else if (os_strcmp(buf, "bss_beacon_int") == 0) {
++		int val = atoi(pos);
++		/* MIB defines range as 1..65535, but very small values
++		 * cause problems with the current implementation.
++		 * Since it is unlikely that this small numbers are
++		 * useful in real life scenarios, do not allow beacon
++		 * period to be set below 10 TU. */
++		if (val != 0 && !IS_VALID_RANGE(val, BEACON_INTERVAL_MIN, BEACON_INTERVAL_MAX)) {
++			wpa_printf(MSG_ERROR,
++				   "Line %d: invalid bss_beacon_int %d (expected 0, 10..65535)",
++				   line, val);
++			return 1;
++		}
++		bss->beacon_int = (u16)val;
+ #ifdef CONFIG_ACS
+ 	} else if (os_strcmp(buf, "acs_num_scans") == 0) {
+ 		int val = atoi(pos);
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index 969d0f81f..326737887 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -239,9 +239,22 @@ channel=1
+ # (default 0, i.e., not constraint)
+ #min_tx_power=20
+ 
+-# Beacon interval in kus (1.024 ms) (default: 100; range 15..65535)
++# Flag to configure how ACS 'chanlist' behaves
++# 0: Only Primary channels from candidates are checked against 'chanlist'
++#    This allows specifying which Primary channel should be used without restricting any BW
++# 1: All channels from candidates are checked against 'chanlist'
++#    This allows to completely exclude from using non specified channels in the 'chanlist'
++# default: 0 (open source ACS/DFS default 'chanlist' behavior)
++#acs_chanlist_all_chans=0
++
++# Beacon interval in kus (1.024 ms) (default: 100; range 10..65535)
+ beacon_int=100
+ 
++# Per BSS beacon interval in kus (range 0, 10..655350)
++# 0: use global beacon_int.
++# 10..655350: override global beacon_int for this bss.
++bss_beacon_int=0
++
+ # DTIM (delivery traffic information message) period (range 1..255):
+ # number of beacons between DTIMs (1 = every beacon includes DTIM element)
+ # (default: 2)
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 7eafa9069..a255f0762 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -88,6 +88,7 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 
+ 	bss->max_num_sta = MAX_STA_COUNT;
+ 	bss->num_res_sta = 0;
++	bss->beacon_int = 0; /* use interface's global beacon interval */
+ 
+ 	bss->dtim_period = 2;
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index e02f578d6..5d0e4b106 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -334,6 +334,7 @@ struct hostapd_bss_config {
+ 	int max_num_sta; /* maximum number of STAs in station table */
+ 	int num_res_sta; /* number of reserved STAs in the BSS */
+ 
++	u16 beacon_int;
+ 	int dtim_period;
+ 	unsigned int bss_load_update_period;
+ 	unsigned int chan_util_avg_period;
+@@ -1042,6 +1043,9 @@ struct spatial_reuse {
+ 	u8 srg_partial_bssid_bitmap[8];
+ };
+ 
++#define BEACON_INTERVAL_MIN		10
++#define BEACON_INTERVAL_MAX		UINT16_MAX
++
+ #define BSS_COLOR_CHANGE_TIMEOUT_DEFAULT		DOT11BSS_COLOR_COLLISION_AP_PERIOD
+ #define BSS_COLOR_CHANGE_TIMEOUT_RANDOM			(UINT8_MAX)
+ #define BSS_COLOR_CHANGE_TIMEOUT_RANDOM_MIN		40
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 7f27f4a5c..64af2ce2f 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -1006,7 +1006,7 @@ void hostapd_gen_probe_resp(struct hostapd_data *hapd,
+ 
+ 	os_memcpy(params->resp->bssid, hapd->own_addr, ETH_ALEN);
+ 	params->resp->u.probe_resp.beacon_int =
+-		host_to_le16(hapd->iconf->beacon_int);
++		host_to_le16(hostapd_get_beacon_int(hapd));
+ 
+ 	/* hardware or low-level driver will setup seq_ctrl and timestamp */
+ 	params->resp->u.probe_resp.capab_info =
+@@ -2330,7 +2330,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	os_memcpy(head->sa, hapd->own_addr, ETH_ALEN);
+ 	os_memcpy(head->bssid, hapd->own_addr, ETH_ALEN);
+ 	head->u.beacon.beacon_int =
+-		host_to_le16(hapd->iconf->beacon_int);
++		host_to_le16(hostapd_get_beacon_int(hapd));
+ 
+ 	/* hardware or low-level driver will setup seq_ctrl and timestamp */
+ 	capab_info = hostapd_own_capab_info(hapd);
+@@ -2623,7 +2623,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	params->proberesp = resp;
+ 	params->proberesp_len = resp_len;
+ 	params->dtim_period = hapd->conf->dtim_period;
+-	params->beacon_int = hapd->iconf->beacon_int;
++	params->beacon_int = hostapd_get_beacon_int(hapd);
+ 	params->basic_rates = hapd->iface->basic_rates;
+ 	params->beacon_rate = hapd->iconf->beacon_rate;
+ 	params->rate_type = hapd->iconf->rate_type;
+diff --git a/src/ap/bss_load.c b/src/ap/bss_load.c
+index 5da910a3f..8f80eee6a 100644
+--- a/src/ap/bss_load.c
++++ b/src/ap/bss_load.c
+@@ -20,7 +20,7 @@ static int get_bss_load_update_timeout(struct hostapd_data *hapd,
+ 				       unsigned int *sec, unsigned int *usec)
+ {
+ 	unsigned int update_period = hapd->conf->bss_load_update_period;
+-	unsigned int beacon_int = hapd->iconf->beacon_int;
++	unsigned int beacon_int = hostapd_get_beacon_int(hapd);
+ 	unsigned int update_timeout;
+ 
+ 	if (!update_period || !beacon_int) {
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 19592e4d2..2f734599e 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -1014,12 +1014,16 @@ int hostapd_ctrl_iface_status(struct hostapd_data *hapd, char *buf,
+ 				  "bss[%d]=%s\n"
+ 				  "bssid[%d]=" MACSTR "\n"
+ 				  "ssid[%d]=%s\n"
++				  "beacon_int[%d]=%u\n"
++				  "beacon_set_done[%d]=%d\n"
+ 				  "num_sta[%d]=%d\n",
+ 				  (int) i, bss->conf->iface,
+ 				  (int) i, MAC2STR(bss->own_addr),
+ 				  (int) i,
+ 				  wpa_ssid_txt(bss->conf->ssid.ssid,
+ 					       bss->conf->ssid.ssid_len),
++				  (int) i, hostapd_get_beacon_int(bss),
++				  (int) i, bss->beacon_set_done,
+ 				  (int) i, bss->num_sta);
+ 		if (os_snprintf_error(buflen - len, ret))
+ 			return len;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 578d17ba1..3699c41a9 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2670,13 +2670,8 @@ _Static_assert(HAPD_BROADCAST == MXL_HAPD_BROADCAST, "open source and MXL macros
+ 
+ u16 hostapd_get_beacon_int(const struct hostapd_data *hapd)
+ {
+-#if 0
+-	// ToDo: beacon_int per BSS
+ 	return hapd->conf->beacon_int ? hapd->conf->beacon_int :
+ 					hapd->iconf->beacon_int;
+-#else
+-	return hapd->iconf->beacon_int;
+-#endif
+ }
+ 
+ #endif /* HOSTAPD */
+diff --git a/src/ap/ieee802_1x.c b/src/ap/ieee802_1x.c
+index 052231e34..54ac8af30 100644
+--- a/src/ap/ieee802_1x.c
++++ b/src/ap/ieee802_1x.c
+@@ -1836,7 +1836,7 @@ static void ieee802_1x_hs20_session_info(struct hostapd_data *hapd,
+ 	else
+ 		warning_time = session_timeout - swt * 60;
+ 
+-	beacon_int = hapd->iconf->beacon_int;
++	beacon_int = hostapd_get_beacon_int(hapd);
+ 	if (beacon_int < 1)
+ 		beacon_int = 100; /* best guess */
+ 	sta->hs20_disassoc_timer = swt * 60 * 1000 / beacon_int * 125 / 128;
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 68c2391a9..b0e6e104a 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -989,7 +989,7 @@ static void set_disassoc_timer(struct hostapd_data *hapd, struct sta_info *sta,
+ 	 */
+ 	wpa_auth_pmksa_remove(hapd->wpa_auth, sta->addr);
+ 
+-	beacon_int = hapd->iconf->beacon_int;
++	beacon_int = hostapd_get_beacon_int(hapd);
+ 	if (beacon_int < 1)
+ 		beacon_int = 100; /* best guess */
+ 	/* Calculate timeout in ms based on beacon_int in TU */
+-- 
+2.43.0
+

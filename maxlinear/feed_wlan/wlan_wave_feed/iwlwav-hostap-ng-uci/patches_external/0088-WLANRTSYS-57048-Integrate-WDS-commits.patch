@@ -1,0 +1,1398 @@
+From d0b984d6d0c68c1b46d98d35aeeec119bce971db Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Fri, 21 Jul 2023 12:38:22 +0200
+Subject: [PATCH] WLANRTSYS-57048: Integrate WDS commits
+
+- WDS with WPA
+---
+ hostapd/Makefile              |  44 +++
+ hostapd/config_file.c         |   9 +
+ src/ap/ap_config.c            |   5 +
+ src/ap/ap_config.h            |   5 +-
+ src/ap/ap_drv_ops.h           |  11 +
+ src/ap/drv_callbacks.c        |  26 ++
+ src/ap/hostapd.c              |  13 +
+ src/ap/ieee802_11.c           |  52 ++-
+ src/ap/ieee802_1x.c           |   9 +-
+ src/ap/mxl_wds.c              |   2 +-
+ src/ap/mxl_wds.h              |   1 +
+ src/ap/sta_info.c             |   7 +
+ src/ap/sta_info.h             |   1 +
+ src/ap/wds_wpa.c              | 598 ++++++++++++++++++++++++++++++++++
+ src/ap/wds_wpa.h              |  20 ++
+ src/ap/wpa_auth_ie.c          |  23 ++
+ src/ap/wpa_auth_ie.h          |   3 +
+ src/common/vendor_cmds_copy.h |   4 +
+ src/common/wpa_common.c       | 113 +++++++
+ src/common/wpa_common.h       |   3 +
+ src/drivers/driver.h          |  11 +
+ src/drivers/driver_nl80211.c  |  31 ++
+ wpa_supplicant/Makefile       |  36 ++
+ 23 files changed, 1022 insertions(+), 5 deletions(-)
+ create mode 100644 src/ap/wds_wpa.c
+ create mode 100644 src/ap/wds_wpa.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index af82e8fcd..a04956b55 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -284,6 +284,9 @@ endif
+ ifdef CONFIG_IEEE80211R
+ CFLAGS += -DCONFIG_IEEE80211R -DCONFIG_IEEE80211R_AP
+ OBJS += ../src/ap/wpa_auth_ft.o
++ifdef CONFIG_WDS_WPA
++OBJS += ../src/rsn_supp/wpa_ft.o
++endif
+ NEED_AES_UNWRAP=y
+ NEED_AES_SIV=y
+ NEED_ETH_P_OUI=y
+@@ -1316,11 +1319,52 @@ ifdef CONFIG_NO_TKIP
+ CFLAGS += -DCONFIG_NO_TKIP
+ endif
+ 
++ifdef CONFIG_WDS_WPA
++CFLAGS += -DCONFIG_WDS_WPA
++OBJS += ../src/ap/wds_wpa.o
++OBJS += ../src/rsn_supp/wpa.o
++OBJS += ../src/rsn_supp/preauth.o
++OBJS += ../src/rsn_supp/pmksa_cache.o
++OBJS += ../src/rsn_supp/wpa_ie.o
++endif
++
+ $(DESTDIR)$(BINDIR)/%: %
+ 	install -D $(<) $(@)
+ 
+ install: $(addprefix $(DESTDIR)$(BINDIR)/,$(ALL))
+ 
++../src/rsn_supp/build.hostapd:
++	@if [ -f ../src/rsn_supp/build.wpa_supplicant ]; then \
++		$(MAKE) -C ../src/rsn_supp clean; \
++	fi
++	@touch ../src/rsn_supp/build.hostapd
++
++../src/common/build.hostapd:
++	@if [ -f ../src/common/build.wpa_supplicant ]; then \
++		$(MAKE) -C ../src/common clean; \
++	fi
++	@touch ../src/common/build.hostapd
++
++../src/wps/build.hostapd:
++	@if [ -f ../src/wps/build.wpa_supplicant ]; then \
++		$(MAKE) -C ../src/wps clean; \
++	fi
++	@touch ../src/wps/build.hostapd
++
++../src/crypto/build.hostapd:
++	@if [ -f ../src/crypto/build.wpa_supplicant ]; then \
++		$(MAKE) -C ../src/crypto clean; \
++	fi
++	@touch ../src/crypto/build.hostapd
++
++../src/utils/build.hostapd:
++	@if [ -f ../src/utils/build.wpa_supplicant ]; then \
++		$(MAKE) -C ../src/utils clean; \
++	fi
++	@touch ../src/utils/build.hostapd
++
++BCHECK=../src/rsn_supp/build.hostapd ../src/common/build.hostapd ../src/wps/build.hostapd ../src/crypto/build.hostapd ../src/utils/build.hostapd
++
+ _OBJS_VAR := OBJS
+ include ../src/objs.mk
+ 
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index c4e0407ad..47254b9a8 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5873,6 +5873,15 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			wpa_printf(MSG_ERROR, "Error Reading whm config file");
+ 	} else if (os_strcmp(buf, "assoc_rsp_rx_mcs_mask") == 0) {
+ 		conf->assoc_rsp_rx_mcs_mask = atoi(pos);
++#ifdef CONFIG_WDS_WPA
++	} else if (os_strcmp(buf, "wds_wpa_sta_file") == 0) {
++		if (hostapd_config_read_maclist(pos, &bss->wds_wpa_sta,
++						&bss->num_wds_wpa_sta)) {
++			wpa_printf(MSG_ERROR, "Line %d: Failed to read wds_wpa_sta_file '%s'",
++					line, pos);
++			return 1;
++		}
++#endif /* CONFIG_WDS_WPA */
+ #ifdef CONFIG_VENDOR_MXL
+ 	} else if (mxl_hostapd_config_fill(conf, bss, buf, pos, line)) {
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 4f8e93bf6..9f95c206f 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -1087,6 +1087,11 @@ void hostapd_config_free_bss(struct hostapd_bss_config *conf)
+ #ifdef CONFIG_PASN
+ 	os_free(conf->pasn_groups);
+ #endif /* CONFIG_PASN */
++
++#ifdef CONFIG_WDS_WPA
++  os_free(conf->wds_wpa_sta);
++#endif
++
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_config_free_bss(conf);
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index d57f6613b..bbb0c79e0 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -884,7 +884,10 @@ struct hostapd_bss_config {
+ #define BACKHAUL_BSS 1
+ #define FRONTHAUL_BSS 2
+ 	int multi_ap; /* bitmap of BACKHAUL_BSS, FRONTHAUL_BSS */
+-
++#ifdef CONFIG_WDS_WPA
++	struct mac_acl_entry *wds_wpa_sta;
++	int num_wds_wpa_sta;
++#endif
+ 	int *sAggrConfig; /*amsdu_mode ba_mode window_size*/
+ 	int sAggrConfigSize;
+ 	int s11nProtection;
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index d642801ef..828842a14 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -555,6 +555,17 @@ static inline int hostapd_drv_br_port_set_hairpin(struct hostapd_data *hapd,
+ 	return hapd->driver->br_port_set_hairpin(hapd->drv_priv, val);
+ }
+ 
++#ifdef CONFIG_WDS_WPA
++static inline int hostapd_drv_set_wds_wpa_sta(struct hostapd_data *hapd,
++  const u8 *addr, const u8 remove)
++{
++  if (hapd->driver == NULL || hapd->driver->set_wds_wpa_sta == NULL)
++    return -ENOTSUP;
++
++  return hapd->driver->set_wds_wpa_sta(hapd->drv_priv, addr, remove);
++}
++#endif /* CONFIG_WDS_WPA */
++
+ #ifdef ANDROID
+ static inline int hostapd_drv_driver_cmd(struct hostapd_data *hapd,
+ 					 char *cmd, char *buf, size_t buf_len)
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index ff8503827..958f8ba78 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1738,7 +1738,33 @@ static int hostapd_mgmt_rx(struct hostapd_data *hapd, struct rx_mgmt *rx_mgmt)
+ 		    WLAN_FC_GET_STYPE(fc) == WLAN_FC_STYPE_BEACON)
+ 			hapd = iface->bss[0];
+ 		else
++#ifdef CONFIG_WDS_WPA
++		{
++			errno_t err;
++			/* set BSSID from destination address */
++			struct ieee80211_mgmt *mgmt = (struct ieee80211_mgmt *) rx_mgmt->frame;
++
++			bssid = mgmt->da;
++			hapd = get_hapd_bssid(iface, bssid);
++
++			if ((hapd == NULL) || (hapd == HAPD_BROADCAST)) {
++				return 0;
++			}
++
++			if (!hostapd_maclist_found(hapd->conf->wds_wpa_sta,
++							hapd->conf->num_wds_wpa_sta, mgmt->sa, NULL))
+ 			return 0;
++
++			/* Replace BSSID for WDS mode */
++			err = memcpy_s(mgmt->bssid, sizeof(mgmt->bssid), mgmt->da, ETH_ALEN);
++			if (EOK != err) {
++				wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++				return 0;
++			}
++		}
++#else
++		return 0;
++#endif /* CONFIG_WDS_WPA */
+ 	}
+ 
+ 	os_memset(&fi, 0, sizeof(fi));
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index f3146756e..bbf2842a9 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -64,6 +64,9 @@
+ #include "drivers/driver_nl80211.h"
+ #include "drivers/mxl_driver_nl80211.h"
+ #include "limits.h"
++#ifdef CONFIG_WDS_WPA
++#include "wds_wpa.h"
++#endif
+ 
+ 
+ static int hostapd_flush_old_stations(struct hostapd_data *hapd, u16 reason);
+@@ -506,6 +509,9 @@ void hostapd_free_hapd_data(struct hostapd_data *hapd)
+ 	hapd->beacon_set_done = 0;
+ 
+ 	wpa_printf(MSG_DEBUG, "%s(%s)", __func__, hapd->conf->iface);
++#ifdef CONFIG_WDS_WPA
++	ltq_wds_wpa_deinit(hapd);
++#endif
+ 	accounting_deinit(hapd);
+ 	hostapd_deinit_wpa(hapd);
+ 	vlan_deinit(hapd);
+@@ -1895,6 +1901,13 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 	if (hapd->wpa_auth && wpa_init_keys(hapd->wpa_auth) < 0)
+ 		return -1;
+ 
++#ifdef CONFIG_WDS_WPA
++	if (ltq_wds_wpa_init(hapd)) {
++		wpa_printf(MSG_ERROR, "WDS WPA initialization failed");
++		return -1;
++	}
++#endif
++
+ 	hostapd_neighbor_set_own_report(hapd);
+ 
+ 	if (hapd->iface->conf->autonomous_color_change) {
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index dd916c72c..248f8885b 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -60,7 +60,11 @@
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_hostapd.h"
+ #include "mxl_coexistence.h"
++#include "mxl_wds.h"
+ #endif /* CONFIG_VENDOR_MXL */
++#ifdef CONFIG_WDS_WPA
++#include "wds_wpa.h"
++#endif
+ 
+ 
+ #ifdef CONFIG_FILS
+@@ -3527,6 +3531,37 @@ static u16 check_multi_ap(struct hostapd_data *hapd, struct sta_info *sta,
+ 	return WLAN_STATUS_SUCCESS;
+ }
+ 
++#ifdef CONFIG_WDS_WPA
++static u16 check_wmm_wds(struct hostapd_data *hapd, struct sta_info *sta,
++         const u8 *wmm_ie, size_t wmm_ie_len)
++{
++	sta->flags &= ~WLAN_STA_WMM;
++	sta->qosinfo = 0;
++	if (wmm_ie && hapd->conf->wmm_enabled) {
++		struct wmm_information_element *wmm;
++
++		if (!mxl_wds_hostapd_eid_wmm_valid(hapd, wmm_ie, wmm_ie_len)) {
++			hostapd_logger(hapd, sta->addr,
++				HOSTAPD_MODULE_WPA,
++				HOSTAPD_LEVEL_DEBUG,
++				"invalid WMM element in association "
++				"request");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	}
++
++	sta->flags |= WLAN_STA_WMM;
++	wmm = (struct wmm_information_element *) wmm_ie;
++	sta->qosinfo = wmm->qos_info;
++
++	/* clear UAPSD if it unsupported by BSS */
++	if (!hapd->conf->wmm_uapsd)
++		sta->qosinfo &= ~WMM_QOSINFO_STA_AC_MASK;
++
++	}
++
++	return WLAN_STATUS_SUCCESS;
++}
++#endif /* CONFIG_WDS_WPA */
+ 
+ static u16 copy_supp_rates(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   struct ieee802_11_elems *elems)
+@@ -3974,6 +4009,12 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 	resp = check_ssid(hapd, sta, elems->ssid, elems->ssid_len);
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
++#ifdef CONFIG_WDS_WPA
++	if (hostapd_maclist_found(hapd->conf->wds_wpa_sta,
++		hapd->conf->num_wds_wpa_sta, sta->addr, NULL))
++		resp = check_wmm_wds(hapd, sta, elems->wmm, elems->wmm_len);
++	else
++#endif
+ 	resp = check_wmm(hapd, sta, elems->wmm, elems->wmm_len);
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
+@@ -4472,7 +4513,7 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ }
+ 
+ 
+-static int check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
++int check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   const u8 *ies, size_t ies_len, int reassoc)
+ {
+ 	struct ieee802_11_elems elems;
+@@ -7280,11 +7321,18 @@ void ieee802_11_rx_from_unknown(struct hostapd_data *hapd, const u8 *src,
+ 		return;
+ 	}
+ 
+-	if (sta && (sta->flags & WLAN_STA_AUTH))
++	if (sta && (sta->flags & WLAN_STA_AUTH)) {
+ 		hostapd_drv_sta_disassoc(
+ 			hapd, src,
+ 			WLAN_REASON_CLASS3_FRAME_FROM_NONASSOC_STA);
++		return;
++	}
++#ifdef CONFIG_WDS_WPA
++	if (hostapd_maclist_found(hapd->conf->wds_wpa_sta,
++					hapd->conf->num_wds_wpa_sta, src, NULL))
++		ltq_wds_wpa_add(hapd, src);
+ 	else
++#endif
+ 		hostapd_drv_sta_deauth(
+ 			hapd, src,
+ 			WLAN_REASON_CLASS3_FRAME_FROM_NONASSOC_STA);
+diff --git a/src/ap/ieee802_1x.c b/src/ap/ieee802_1x.c
+index a7579a443..d777be7c8 100644
+--- a/src/ap/ieee802_1x.c
++++ b/src/ap/ieee802_1x.c
+@@ -38,7 +38,9 @@
+ #include "ieee802_11.h"
+ #include "ieee802_1x.h"
+ #include "wpa_auth_kay.h"
+-
++#ifdef CONFIG_WDS_WPA
++#include "rsn_supp/wpa.h"
++#endif
+ #ifdef CONFIG_RADIUS_GREYLIST
+ #include "ap/greylist.h"
+ #endif /* CONFIG_RADIUS_GREYLIST */
+@@ -1226,6 +1228,11 @@ void ieee802_1x_receive(struct hostapd_data *hapd, const u8 *sa, const u8 *buf,
+ 	    hdr->type == IEEE802_1X_TYPE_EAPOL_KEY &&
+ 	    (key->type == EAPOL_KEY_TYPE_WPA ||
+ 	     key->type == EAPOL_KEY_TYPE_RSN)) {
++#ifdef CONFIG_WDS_WPA
++		if (sta->wpa)
++			wpa_sm_rx_eapol(sta->wpa, sa, (u8 *) hdr, sizeof(*hdr) + datalen, encrypted);
++		else
++#endif
+ 		wpa_receive(hapd->wpa_auth, sta->wpa_sm, (u8 *) hdr,
+ 			    sizeof(*hdr) + datalen);
+ 		return;
+diff --git a/src/ap/mxl_wds.c b/src/ap/mxl_wds.c
+index aa6798aa5..a30cdfdf3 100644
+--- a/src/ap/mxl_wds.c
++++ b/src/ap/mxl_wds.c
+@@ -25,7 +25,7 @@
+ #include "../../hostapd/mxl_ctrl_iface.h"
+ #include "wpa_auth.h"
+ 
+-static int mxl_wds_hostapd_eid_wmm_valid(struct hostapd_data *hapd, const u8 *eid,
++int mxl_wds_hostapd_eid_wmm_valid(struct hostapd_data *hapd, const u8 *eid,
+ 		size_t len)
+ {
+ 	struct wmm_information_element *wmm;
+diff --git a/src/ap/mxl_wds.h b/src/ap/mxl_wds.h
+index 7b9a9c2a8..f443b924c 100644
+--- a/src/ap/mxl_wds.h
++++ b/src/ap/mxl_wds.h
+@@ -17,5 +17,6 @@
+ int mxl_wds_setup(struct hostapd_data *hapd);
+ void mxl_wds_event_connect(struct hostapd_data *hapd, const u8 *data, size_t data_len);
+ void mxl_wds_event_disconnect(struct hostapd_data *hapd, const u8 *data, size_t data_len);
++int mxl_wds_hostapd_eid_wmm_valid(struct hostapd_data *hapd, const u8 *eid, size_t len);
+ 
+ #endif /* MXL_WDS_H */
+\ No newline at end of file
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 21c0a7e75..067e1a982 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -42,6 +42,10 @@
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_hostapd.h"
+ #endif /* CONFIG_VENDOR_MXL */
++#ifdef CONFIG_WDS_WPA
++#include "rsn_supp/wpa.h"
++#endif
++
+ 
+ #define UPPER_24G_FREQ_VALUE	2500
+ 
+@@ -334,6 +338,9 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
+ 	wpa_auth_sta_deinit(sta->wpa_sm);
+ #endif /* CONFIG_IEEE80211BE */
+ 
++#ifdef CONFIG_WDS_WPA
++	wpa_sm_deinit(sta->wpa);
++#endif
+ 	rsn_preauth_free_station(hapd, sta);
+ #ifndef CONFIG_NO_RADIUS
+ 	if (hapd->radius)
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index afdef6021..10281562f 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -210,6 +210,7 @@ struct sta_info {
+ 	u8 *challenge; /* IEEE 802.11 Shared Key Authentication Challenge */
+ 
+ 	struct wpa_state_machine *wpa_sm;
++	struct wpa_sm *wpa;
+ 	struct rsn_preauth_interface *preauth_iface;
+ 
+ 	int vlan_id; /* 0: none, >0: VID */
+diff --git a/src/ap/wds_wpa.c b/src/ap/wds_wpa.c
+new file mode 100644
+index 000000000..88a33a520
+--- /dev/null
++++ b/src/ap/wds_wpa.c
+@@ -0,0 +1,598 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++#include "includes.h"
++#include "common.h"
++#include "drivers/driver.h"
++#include "hostapd.h"
++#include "sta_info.h"
++#include "ap_drv_ops.h"
++#include "ieee802_11.h"
++#include "accounting.h"
++#include "beacon.h"
++#include "ap_mlme.h"
++#include "wpa_auth.h"
++#include "wpa_auth_i.h"
++#include "wpa_auth_ie.h"
++#include "rsn_supp/wpa.h"
++#include "utils/eloop.h"
++#include "wds_wpa.h"
++
++#ifndef MIN
++#define MIN(x,y) ((x)<(y)?(x):(y))
++#endif
++
++struct ltq_wpa_supplicant {
++	enum wpa_states wpa_state;
++	struct hostapd_data *hapd;
++	struct sta_info *sta;
++};
++
++int check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
++		const u8 *ies, size_t ies_len, int reassoc);
++
++
++/**
++ * wpa_supplicant_state_txt - Get the connection state name as a text string
++ * @state: State (wpa_state; WPA_*)
++ * Returns: The state name as a printable text string
++ */
++const char * ltq_wds_wpa_state_txt(enum wpa_states state)
++{
++	switch (state) {
++		case WPA_DISCONNECTED:
++			return "DISCONNECTED";
++		case WPA_INACTIVE:
++			return "INACTIVE";
++		case WPA_INTERFACE_DISABLED:
++			return "INTERFACE_DISABLED";
++		case WPA_SCANNING:
++			return "SCANNING";
++		case WPA_AUTHENTICATING:
++			return "AUTHENTICATING";
++		case WPA_ASSOCIATING:
++			return "ASSOCIATING";
++		case WPA_ASSOCIATED:
++			return "ASSOCIATED";
++		case WPA_4WAY_HANDSHAKE:
++			return "4WAY_HANDSHAKE";
++		case WPA_GROUP_HANDSHAKE:
++			return "GROUP_HANDSHAKE";
++		case WPA_COMPLETED:
++			return "COMPLETED";
++		default:
++			return "UNKNOWN";
++	}
++}
++
++static void ltq_supplicant_timeout(void *eloop_ctx, void *timeout_ctx)
++{
++	struct ltq_wpa_supplicant *supplicant = eloop_ctx;
++	struct hostapd_data *hapd = supplicant->hapd;
++	struct sta_info *sta = supplicant->sta;
++
++	wpa_msg(hapd, MSG_INFO, "Authentication with " MACSTR " timed out.",
++		MAC2STR(sta->addr));
++	ap_sta_disconnect(hapd, sta, sta->addr, WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT);
++#if 0
++	/* implementation without STA disconnect */
++	hostapd_drv_sta_deauth(hapd, sta->addr, WLAN_REASON_DEAUTH_LEAVING);
++	wpa_sm_key_request(sta->wpa, 0, 1);
++	hostapd_drv_poll_client(hapd, hapd->own_addr, sta->addr,
++	sta->flags & WLAN_STA_WMM);
++	eloop_register_timeout(5, 0, ltq_supplicant_timeout, supplicant, NULL);
++#endif
++}
++
++
++static void ltq_supplicant_sta_check(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	int i;
++
++	for(i = 0; i < hapd->conf->num_wds_wpa_sta; i++) {
++		ltq_wds_wpa_add(hapd, hapd->conf->wds_wpa_sta[i].addr);
++	}
++	eloop_register_timeout(10, 0, ltq_supplicant_sta_check, hapd, NULL);
++}
++
++
++static enum wpa_states ltq_wds_wpa_get_state(void *ctx)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++
++	return supplicant->wpa_state;
++}
++
++static void ltq_wds_wpa_set_state(void *ctx, enum wpa_states state)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++
++	wpa_printf(MSG_DEBUG, "SUPP: %s addr=" MACSTR " wpa_state: %s",
++		__func__, MAC2STR(supplicant->sta->addr),
++	ltq_wds_wpa_state_txt(state));
++	supplicant->wpa_state = state;
++}
++
++static void ltq_wds_wpa_deauthenticate(void * ctx, u16 reason_code)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++	struct hostapd_data *hapd = supplicant->hapd;
++	struct sta_info *sta = supplicant->sta;
++
++	wpa_msg(hapd, MSG_INFO, "Deauthenticate " MACSTR,
++		MAC2STR(sta->addr));
++	ap_sta_disconnect(hapd, sta, sta->addr, WLAN_REASON_4WAY_HANDSHAKE_TIMEOUT);
++}
++
++static void * ltq_wds_wpa_get_network_ctx(void *ctx)
++{
++	return ctx;
++}
++
++static u8 * ltq_wds_wpa_alloc_eapol(void *ctx, u8 type,
++	const void *data, u16 data_len,
++	size_t *msg_len, void **data_pos)
++{
++	errno_t err;
++	struct ieee802_1x_hdr *hdr;
++
++	*msg_len = sizeof(*hdr) + data_len;
++	hdr = os_malloc(*msg_len);
++	if (hdr == NULL)
++		return NULL;
++
++	hdr->version = 2;
++	hdr->type = type;
++	hdr->length = host_to_be16(data_len);
++
++	if (data) {
++		err = memcpy_s(hdr + 1, data_len, data, data_len);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			os_free(hdr);
++			return NULL;
++		}
++	}
++	else
++		os_memset(hdr + 1, 0, data_len);
++
++	if (data_pos)
++		*data_pos = hdr + 1;
++
++	return (u8 *) hdr;
++}
++
++static int ltq_wds_wpa_get_bssid(void *ctx, u8 *bssid)
++{
++	errno_t err;
++	struct ltq_wpa_supplicant *supplicant = ctx;
++
++	wpa_printf(MSG_DEBUG, "ltq_wds_wpa_get_bssid: " MACSTR,
++		MAC2STR(supplicant->sta->addr));
++	err = memcpy_s(bssid, ETH_ALEN, supplicant->sta->addr, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++	}
++
++	return 0;
++}
++
++static int ltq_wds_wpa_eth_send(void *ctx, const u8 *dest, u16 proto,
++	const u8 *buf, size_t len)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++	struct hostapd_data *hapd = supplicant->hapd;
++	struct sta_info *sta = supplicant->sta;
++
++	return hostapd_drv_hapd_send_eapol(hapd, dest, buf, len,
++		0, hostapd_sta_flags_to_drv(sta->flags), -1);
++}
++
++static int ltq_wds_wpa_get_beacon_ie(void *ctx)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++static int ltq_wds_wpa_set_key(void *ctx, int link_id, enum wpa_alg alg,
++	const u8 *addr, int key_idx, int set_tx,
++	const u8 *seq, size_t seq_len,
++	const u8 *key, size_t key_len, enum key_flag key_flag)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++	struct hostapd_data *hapd = supplicant->hapd;
++	const char *ifname = hapd->conf->iface;
++
++	wpa_printf(MSG_DEBUG, "SUPP: %s(alg=%d addr=" MACSTR " key_idx=%d "
++		"set_tx=%d)", __func__, alg, MAC2STR(addr), key_idx, set_tx);
++	if (key_idx != 0) {
++	wpa_printf(MSG_INFO, "SUPP: %s. Ignoring broadcast key set request",
++		__func__);
++		return 0;
++	}
++	return hostapd_drv_set_key(ifname, hapd, alg, addr, key_idx, 0, set_tx, seq,
++		seq_len, key, key_len, KEY_FLAG_DEFAULT);
++}
++
++static int ltq_wds_wpa_set_protection(void *ctx, const u8 *addr,
++	int protection_type, int key_type)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++	struct hostapd_data *hapd = supplicant->hapd;
++	struct sta_info *sta = supplicant->sta;
++
++	wpa_printf(MSG_DEBUG, "SUPP: %s(addr=" MACSTR " protection_type=%d "
++		"key_type=%d)",
++		__func__, MAC2STR(addr), protection_type, key_type);
++
++	return hostapd_set_authorized(hapd, sta, 1);
++}
++
++static void ltq_wds_wpa_cancel_auth_timeout(void *ctx)
++{
++	struct ltq_wpa_supplicant *supplicant = ctx;
++	struct sta_info *sta = supplicant->sta;
++	UNUSED_VAR(sta);
++
++	wpa_printf(MSG_DEBUG, "SUPP: Cancelling authentication timeout (addr=" MACSTR")",
++		MAC2STR(sta->addr));
++
++	eloop_cancel_timeout(ltq_supplicant_timeout, ctx, NULL);
++}
++
++static int ltq_wds_wpa_add_pmkid(void *_wpa_s, void *network_ctx,
++		const u8 *bssid, const u8 *pmkid,
++		const u8 *fils_cache_id,
++		const u8 *pmk, size_t pmk_len,
++		u32 pmk_lifetime, u8 pmk_reauth_threshold,
++		int akmp)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++
++static int ltq_wds_wpa_remove_pmkid(void *ctx, void *network_ctx, const u8 *bssid,
++		const u8 *pmkid, const u8 *fils_cache_id)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++static void ltq_wds_wpa_set_config_blob(void *ctx, struct wpa_config_blob *blob)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++}
++
++static const struct wpa_config_blob* ltq_wds_wpa_get_config_blob(void *ctx, const char *name)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return NULL;
++}
++
++static int ltq_wds_wpa_update_ft_ies(void *ctx, const u8 *md, const u8 *ies,
++	size_t ies_len)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++static int ltq_wds_wpa_send_ft_action(void *ctx, u8 action, const u8 *target_ap,
++	const u8 *ies, size_t ies_len)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++static int ltq_wds_wpa_mark_authenticated(void *ctx, const u8 *target_ap)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++static void ltq_wds_wpa_set_rekey_offload(void *ctx, const u8 *kek, size_t kek_len,
++	const u8 *kck, size_t kck_len,
++	const u8 *replay_ctr)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++}
++
++static int ltq_wds_wpa_key_mgmt_set_pmk(void *ctx, const u8 *pmk, size_t pmk_len)
++{
++	wpa_printf(MSG_DEBUG, "SUPP: %s NOT IMPLEMENTED!!!", __func__);
++	return -1;
++}
++
++int ltq_wds_wpa_add(struct hostapd_data *hapd, const u8 *src)
++{
++	errno_t err;
++	struct sta_info *sta;
++	struct wpa_driver_ap_params params;
++	struct ieee80211_ht_capabilities ht_cap;
++	struct ieee80211_vht_capabilities vht_cap;
++	struct ieee80211_he_capabilities he_cap;
++	struct ieee80211_mgmt *head;
++	u8 *body;
++	size_t head_len;
++	struct wpa_sm_ctx *wctx = NULL;
++	struct ltq_wpa_supplicant *supplicant = NULL;
++	u8 wpa_ie[80];
++	size_t wpa_ie_len;
++	int wps_state;
++	u8 *ext_capab = NULL;
++	struct ieee802_11_elems elems;
++
++	/* Check that station doesn't exist. We are allocating several
++	 * structures here. If we would call it with existing station,
++	 * memory leak would occur. */
++	sta = ap_get_sta(hapd, src);
++	if (sta)
++		return 0;
++
++	wpa_printf(MSG_DEBUG, "ltq_wds_wpa_add: adding WDS WPA station " MACSTR,
++		MAC2STR(src));
++
++	sta = ap_sta_add(hapd, src);
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "Unable to handle new sta");
++		return -1;
++	}
++	sta->flags |= WLAN_STA_ASSOC | WLAN_STA_ASSOC_REQ_OK;
++
++	if (ieee802_11_build_ap_params(hapd, &params) < 0)
++		goto free_sta;
++	/* length of variable part of beacon head */
++	head = (struct ieee80211_mgmt *)params.head;
++	head_len = params.head_len - ((size_t)&head->u.beacon.variable[0] - (size_t)head);
++	body = os_zalloc(head_len + params.tail_len);
++	if (body == NULL) {
++		wpa_printf(MSG_ERROR, "Out of memory");
++		goto free_ap_params;
++	}
++	err = memcpy_s(body, head_len+params.tail_len, &head->u.beacon.variable[0], head_len);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto free_ap_params; 
++	}
++	err = memcpy_s(body + head_len, params.tail_len, params.tail, params.tail_len);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto free_ap_params;
++	}
++	wpa_hexdump(MSG_DEBUG, "Beacon head and tail", body,
++		head_len + params.tail_len);
++	/* disable WPS temporary, otherwise wpa_sm won't be created */
++	wps_state = hapd->conf->wps_state;
++	hapd->conf->wps_state = 0;
++	if (ieee802_11_parse_elems(body, head_len + params.tail_len, &elems, 1) == ParseFailed) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_INFO, "Station sent an invalid"
++			"association request");
++		goto free_ap_params;
++	}
++
++	check_assoc_ies(hapd, sta, body, head_len + params.tail_len, 0);
++	hapd->conf->wps_state = wps_state;
++
++	if (hapd->conf->wpa &&
++		os_memcmp(hapd->own_addr, src, sizeof(hapd->own_addr)) < 0) {
++		/* we are supplicant */
++		wctx = os_zalloc(sizeof(*wctx));
++		if (wctx == NULL) {
++			wpa_printf(MSG_ERROR, "Out of memory");
++			goto free_body;
++		}
++		supplicant = os_zalloc(sizeof(*supplicant));
++		if (supplicant == NULL) {
++			wpa_printf(MSG_ERROR, "Out of memory");
++			os_free(wctx);
++			goto free_body;
++		}
++		supplicant->hapd = hapd;
++		supplicant->sta = sta;
++		wctx->ctx = supplicant;
++		wctx->msg_ctx = hapd;
++		wctx->get_state = ltq_wds_wpa_get_state;
++		wctx->set_state = ltq_wds_wpa_set_state;
++		wctx->deauthenticate = ltq_wds_wpa_deauthenticate;
++		wctx->get_network_ctx = ltq_wds_wpa_get_network_ctx;
++		wctx->alloc_eapol = ltq_wds_wpa_alloc_eapol;
++		wctx->get_bssid = ltq_wds_wpa_get_bssid;
++		wctx->ether_send = ltq_wds_wpa_eth_send;
++		wctx->get_beacon_ie = ltq_wds_wpa_get_beacon_ie;
++		wctx->set_key = ltq_wds_wpa_set_key;
++		wctx->mlme_setprotection = ltq_wds_wpa_set_protection;
++		wctx->cancel_auth_timeout = ltq_wds_wpa_cancel_auth_timeout;
++		wctx->add_pmkid = ltq_wds_wpa_add_pmkid;
++		wctx->remove_pmkid = ltq_wds_wpa_remove_pmkid;
++		wctx->set_config_blob = ltq_wds_wpa_set_config_blob;
++		wctx->get_config_blob = ltq_wds_wpa_get_config_blob;
++		wctx->update_ft_ies = ltq_wds_wpa_update_ft_ies;
++		wctx->send_ft_action = ltq_wds_wpa_send_ft_action;
++		wctx->mark_authenticated = ltq_wds_wpa_mark_authenticated;
++		wctx->set_rekey_offload = ltq_wds_wpa_set_rekey_offload;
++		wctx->key_mgmt_set_pmk = ltq_wds_wpa_key_mgmt_set_pmk;
++		sta->wpa = wpa_sm_init(wctx);
++		if (sta->wpa == NULL) {
++			wpa_printf(MSG_ERROR, "Out of memory");
++			os_free(wctx);
++			os_free(supplicant);
++			goto free_body;
++		}
++		/* wpa_sm_set_param(sta->wpa, WPA_PARAM_PROTO, hapd->conf->wpa); */
++		wpa_sm_set_param(sta->wpa, WPA_PARAM_PROTO, WPA_PROTO_RSN);
++		wpa_sm_set_param(sta->wpa, WPA_PARAM_RSN_ENABLED,
++			!!(hapd->conf->wpa & (WPA_PROTO_RSN | WPA_PROTO_OSEN)));
++		wpa_sm_set_param(sta->wpa, WPA_PARAM_KEY_MGMT, hapd->conf->wpa_key_mgmt);
++		/* wpa_sm_set_param(sta->wpa, WPA_PARAM_PAIRWISE, hapd->conf->wpa_pairwise); */
++		wpa_sm_set_param(sta->wpa, WPA_PARAM_PAIRWISE, WPA_CIPHER_CCMP);
++		/* wpa_sm_set_param(sta->wpa, WPA_PARAM_GROUP, hapd->conf->wpa_group);*/
++		wpa_sm_set_param(sta->wpa, WPA_PARAM_GROUP, WPA_CIPHER_CCMP);
++		wpa_sm_set_own_addr(sta->wpa, hapd->own_addr);
++		wpa_ie_len = sizeof(wpa_ie);
++		os_memset(wpa_ie, 0, wpa_ie_len);
++		wpa_sm_set_assoc_wpa_ie_default(sta->wpa, wpa_ie, &wpa_ie_len);
++		if (wpa_modify_wpa_ie_rsn(wpa_ie, wpa_ie_len, RSN_SELECTOR(0x00, 0x10, 0x18, 0), 0))
++			goto free_body;
++		wpa_ie[1] -= 2;
++		wpa_ie_len -= 2;
++		if (wpa_sm_set_assoc_wpa_ie(sta->wpa, wpa_ie, MIN(wpa_ie_len, sizeof(wpa_ie))))
++			goto free_body;
++		if (wpa_sm_set_ap_wpa_ie(sta->wpa, wpa_ie, MIN(wpa_ie_len, sizeof(wpa_ie))))
++			goto free_body;
++		wpa_sm_set_pmk(sta->wpa, hapd->conf->ssid.wpa_psk->psk, PMK_LEN, NULL, NULL);
++	}
++
++	if (hostapd_get_aid(hapd, sta) < 0) {
++		hostapd_logger(hapd, src, HOSTAPD_MODULE_IEEE80211,
++		HOSTAPD_LEVEL_INFO, "No room for more AIDs");
++		goto free_body;
++	}
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++		HOSTAPD_LEVEL_DEBUG,
++		"association OK (aid %d)", sta->aid);
++	/* Stop previous accounting session, if one is started, and allocate
++	 * new session id for the new session. */
++	accounting_sta_stop(hapd, sta);
++	hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++		HOSTAPD_LEVEL_INFO,
++		"associated (aid %d)",
++		sta->aid);
++
++	sta->capability = le_to_host16(head->u.beacon.capab_info);
++
++	mlme_associate_indication(hapd, sta);
++	sta->sa_query_timed_out = 0;
++
++	if (sta->flags & WLAN_STA_HT)
++		hostapd_get_ht_capab(hapd, sta->ht_capabilities, &ht_cap);
++#ifdef CONFIG_IEEE80211AC
++	if (sta->flags & WLAN_STA_VHT)
++		hostapd_get_vht_capab(hapd, sta->vht_capabilities, &vht_cap);
++#endif /* CONFIG_IEEE80211AC */
++#ifdef CONFIG_IEEE80211AX
++	if (sta->flags & WLAN_STA_HE) {
++		hostapd_get_he_capab(hapd, sta->he_capab, &he_cap, sta->he_capab_len);
++	}
++#endif /* CONFIG_IEEE80211AX */
++	if (sta->ext_capability) {
++		ext_capab = os_malloc(1 + sta->ext_capability[0]);
++		if (ext_capab) {
++			err = memcpy_s(ext_capab, 1 + sta->ext_capability[0], sta->ext_capability, 1 + sta->ext_capability[0]);
++			if (EOK != err) {
++				wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++				goto free_ext_capab;
++			}
++		}
++	}
++
++	sta->ssi_signal = -5000;
++	if (sta->wpa_sm == NULL)
++		sta->flags |= WLAN_STA_AUTHORIZED;
++	else if (sta->wpa != NULL) {
++		/* Free authenticator SM, if we are supplicant. */
++		wpa_auth_sta_deinit(sta->wpa_sm);
++		sta->wpa_sm = NULL;
++		wpa_printf(MSG_DEBUG, "ltq_wds_wpa_add: working with WDS WPA station "
++			MACSTR " as supplicant",
++			MAC2STR(src));
++	} else {
++		wpa_printf(MSG_DEBUG, "ltq_wds_wpa_add: working with WDS WPA station "
++			MACSTR " as authenticator",
++			MAC2STR(src));
++	}
++
++	if (hostapd_sta_add(hapd, sta->addr, sta->aid, sta->capability,
++			sta->supported_rates, sta->supported_rates_len,
++			sta->listen_interval,
++			sta->flags & WLAN_STA_HT ? &ht_cap : NULL,
++			sta->flags & WLAN_STA_VHT ? &vht_cap : NULL,
++			sta->flags & WLAN_STA_HE ? &he_cap : NULL,
++			sta->flags & WLAN_STA_HE ? sta->he_capab_len : 0,
++			NULL,
++			0,
++			sta->he_6ghz_capab,
++			sta->flags, sta->qosinfo, sta->vht_opmode,
++			sta->p2p_ie ? 1 : 0, 0, sta->last_assoc_req,
++			sta->last_assoc_req_len, sta->ssi_signal,
++			NULL, false
++	  )) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_NOTICE,
++			"Could not add STA to kernel driver");
++		goto free_ext_capab;
++	}
++	os_free(ext_capab);
++	if (sta->wpa_sm &&
++		wpa_modify_wpa_ie(sta->wpa_sm, RSN_SELECTOR(0x00, 0x10, 0x18, 0), 0, -2)) {
++		hostapd_logger(hapd, sta->addr, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_NOTICE,
++			"Could not modify WPA RSN IE");
++		goto sta_remove;
++	}
++	os_free(body);
++	ieee802_11_free_ap_params(&params);
++
++	wpa_auth_sm_event(sta->wpa_sm, WPA_ASSOC);
++	if (sta->wpa && supplicant) {
++		supplicant->wpa_state = WPA_ASSOCIATED;
++		wpa_printf(MSG_DEBUG, "Setting authentication timeout: 5 sec");
++		eloop_cancel_timeout(ltq_supplicant_timeout, supplicant, NULL);
++		eloop_register_timeout(20, 0, ltq_supplicant_timeout, supplicant, NULL);
++	}
++	wpa_sm_notify_assoc(sta->wpa, src);
++	if (sta->wpa_sm)
++		hapd->new_assoc_sta_cb(hapd, sta, 1);
++	if (sta->wpa)
++		wpa_sm_key_request(sta->wpa, 0, 1);
++	hostapd_drv_poll_client(hapd, hapd->own_addr, src, sta->flags & WLAN_STA_WMM);
++
++	return 0;
++
++sta_remove:
++	hostapd_drv_sta_remove(hapd, src);
++free_ext_capab:
++	os_free(ext_capab);
++free_body:
++	os_free(body);
++free_ap_params:
++	ieee802_11_free_ap_params(&params);
++free_sta:
++	ap_free_sta(hapd, sta);
++	return -1;
++}
++
++int ltq_wds_wpa_init(struct hostapd_data *hapd)
++{
++	int i, ret;
++
++	wpa_printf(MSG_DEBUG, "wds_wpa_init");
++
++	for(i = 0; i < hapd->conf->num_wds_wpa_sta; i++) {
++		ret = hostapd_drv_set_wds_wpa_sta(hapd, hapd->conf->wds_wpa_sta[i].addr, 0);
++		if (ret)
++		return ret;
++	}
++	return eloop_register_timeout(10, 0, ltq_supplicant_sta_check, hapd, NULL);
++}
++
++void ltq_wds_wpa_deinit(struct hostapd_data *hapd)
++{
++	int i;
++
++	wpa_printf(MSG_DEBUG, "wds_wpa_deinit");
++
++	eloop_cancel_timeout(ltq_supplicant_sta_check, hapd, NULL);
++	for(i = 0; i < hapd->conf->num_wds_wpa_sta; i++)
++		hostapd_drv_set_wds_wpa_sta(hapd, hapd->conf->wds_wpa_sta[i].addr, 1);
++}
+diff --git a/src/ap/wds_wpa.h b/src/ap/wds_wpa.h
+new file mode 100644
+index 000000000..078d3aec7
+--- /dev/null
++++ b/src/ap/wds_wpa.h
+@@ -0,0 +1,20 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++#ifndef WDS_WPA_H
++#define WDS_WPA_H
++
++int ltq_wds_wpa_init(struct hostapd_data *hapd);
++void ltq_wds_wpa_deinit(struct hostapd_data *hapd);
++int ltq_wds_wpa_add(struct hostapd_data *hapd, const u8 *src);
++
++#endif /* WDS_WPA_H */
+diff --git a/src/ap/wpa_auth_ie.c b/src/ap/wpa_auth_ie.c
+index 8593e00ae..9fb09c314 100644
+--- a/src/ap/wpa_auth_ie.c
++++ b/src/ap/wpa_auth_ie.c
+@@ -1328,3 +1328,26 @@ int wpa_auth_conf_gen_multibss_wpa_ie(struct wpa_auth_config *conf, u8 **wpa_ie,
+ 	}
+ 	return -1;
+ }
++
++#ifdef CONFIG_WDS_WPA
++/**
++ * wpa_modify_wpa_ie - Modify RSN IE
++ * @sm: WPA state machine
++ * @group_suite: Group Cipher suite
++ * @capab: Capabilities
++ * @size: Size modification of RSN IE
++ * Returns: 0 on success, <0 on failure
++ * Function modifies Group Cipher suite and RSN Capabilities of wpa_ie of WPA
++ * state machine passed in sm with values group_suite and capab passed as
++ * parameters. Modifies size of wpa_ie as well. size parameter is added to
++ * existing size.
++ */
++int wpa_modify_wpa_ie(struct wpa_state_machine *sm, u32 group_suite, u16 capab, int size)
++{
++	if (wpa_modify_wpa_ie_rsn(sm->wpa_ie, sm->wpa_ie_len, group_suite, capab))
++		return -1;
++	sm->wpa_ie[1] += size;
++	sm->wpa_ie_len += size;
++	return 0;
++}
++#endif /* CONFIG_WDS_WPA */
+diff --git a/src/ap/wpa_auth_ie.h b/src/ap/wpa_auth_ie.h
+index 527f92c3c..edf799234 100644
+--- a/src/ap/wpa_auth_ie.h
++++ b/src/ap/wpa_auth_ie.h
+@@ -13,5 +13,8 @@ u8 * wpa_add_kde(u8 *pos, u32 kde, const u8 *data, size_t data_len,
+ 		 const u8 *data2, size_t data2_len);
+ int wpa_auth_gen_wpa_ie(struct wpa_authenticator *wpa_auth);
+ int wpa_auth_conf_gen_multibss_wpa_ie(struct wpa_auth_config *conf, u8 **wpa_ie, size_t *wpa_ie_len);
++#ifdef CONFIG_WDS_WPA
++int wpa_modify_wpa_ie(struct wpa_state_machine *sm, u32 group_suite, u16 capab, int size);
++#endif
+ 
+ #endif /* WPA_AUTH_IE_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 84beeb0e8..1aee2976e 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -626,6 +626,10 @@ struct mxl_vendor_prop_phy_cap {
+   u32 ht_bf;
+ } __attribute__ ((packed));
+ 
++struct intel_vendor_mac_addr_list_cfg {
++  DEF_IEEE_ADDR(addr);
++  u8 remove;
++} __attribute__ ((packed));
+ 
+ /*******************************************************************************
+ *                           Event structures                                   *
+diff --git a/src/common/wpa_common.c b/src/common/wpa_common.c
+index e4930a291..45d0e447e 100644
+--- a/src/common/wpa_common.c
++++ b/src/common/wpa_common.c
+@@ -2164,6 +2164,111 @@ int wpa_default_rsn_cipher(int freq)
+ 	return WPA_CIPHER_CCMP;
+ }
+ 
++#ifdef CONFIG_WDS_WPA
++/**
++ * wpa_modify_wpa_ie_rsn - Modify RSN IE
++ * @rsn_ie: Buffer containing RSN IE
++ * @rsn_ie_len: RSN IE buffer length (including IE number and length octets)
++ * @group_suite: Group Cipher suite
++ * @capab: Capabilities
++ * Returns: 0 on success, <0 on failure
++ * Function modifies Group Cipher suite and RSN Capabilities of RSN IE passed in
++ * rsn_ie with values group_suite and capab passed as parameters.
++ */
++int wpa_modify_wpa_ie_rsn(u8 *rsn_ie, size_t rsn_ie_len, u32 group_suite, u16 capab)
++{
++	u8 *pos;
++	int left;
++	int i, count;
++
++	if (rsn_ie_len == 0) {
++		/* No RSN IE - fail silently */
++		return -1;
++	}
++
++	if (rsn_ie_len < sizeof(struct rsn_ie_hdr)) {
++		wpa_printf(MSG_DEBUG, "%s: ie len too short %lu",
++			__func__, (unsigned long) rsn_ie_len);
++		return -1;
++	}
++
++	if (rsn_ie_len >= 6 && rsn_ie[1] >= 4 &&
++		rsn_ie[1] == rsn_ie_len - 2 &&
++		WPA_GET_BE32(&rsn_ie[2]) == OSEN_IE_VENDOR_TYPE) {
++		pos = rsn_ie + 6;
++		left = rsn_ie_len - 6;
++	} else {
++		const struct rsn_ie_hdr *hdr;
++		hdr = (const struct rsn_ie_hdr *) rsn_ie;
++		if (hdr->elem_id != WLAN_EID_RSN ||
++			hdr->len != rsn_ie_len - 2 ||
++				WPA_GET_LE16(hdr->version) != RSN_VERSION) {
++			wpa_printf(MSG_DEBUG, "%s: malformed ie or unknown version",
++				__func__);
++			return -2;
++		}
++
++		pos = (u8 *) (hdr + 1);
++		left = rsn_ie_len - sizeof(*hdr);
++	}
++
++	if (left >= RSN_SELECTOR_LEN) {
++		RSN_SELECTOR_PUT(pos, group_suite);
++		pos += RSN_SELECTOR_LEN;
++		left -= RSN_SELECTOR_LEN;
++	} else if (left > 0) {
++		wpa_printf(MSG_DEBUG, "%s: ie length mismatch, %u too much",
++			__func__, left);
++		return -3;
++	}
++
++	if (left >= 2) {
++		count = WPA_GET_LE16(pos);
++		pos += 2;
++		left -= 2;
++		if (count == 0 || count > left / RSN_SELECTOR_LEN) {
++			wpa_printf(MSG_DEBUG, "%s: ie count botch (pairwise), "
++				"count %u left %u", __func__, count, left);
++			return -4;
++		}
++		for (i = 0; i < count; i++) {
++			pos += RSN_SELECTOR_LEN;
++			left -= RSN_SELECTOR_LEN;
++		}
++	} else if (left == 1) {
++		wpa_printf(MSG_DEBUG, "%s: ie too short (for key mgmt)",
++			__func__);
++		return -5;
++	}
++
++	if (left >= 2) {
++		count = WPA_GET_LE16(pos);
++		pos += 2;
++		left -= 2;
++		if (count == 0 || count > left / RSN_SELECTOR_LEN) {
++			wpa_printf(MSG_DEBUG, "%s: ie count botch (key mgmt), "
++			"count %u left %u", __func__, count, left);
++			return -6;
++		}
++		for (i = 0; i < count; i++) {
++			pos += RSN_SELECTOR_LEN;
++			left -= RSN_SELECTOR_LEN;
++		}
++	} else if (left == 1) {
++		wpa_printf(MSG_DEBUG, "%s: ie too short (for capabilities)",
++			__func__);
++		return -7;
++	}
++
++	if (left >= 2) {
++		WPA_PUT_LE16(pos, capab);
++		pos += 2;
++		left -= 2;
++	}
++
++	return 0;
++}
++#endif /* CONFIG_WDS_WPA */
+ 
+ #ifdef CONFIG_IEEE80211R
+ 
+@@ -2889,6 +2994,14 @@ int wpa_compare_rsn_ie(int ft_initial_assoc,
+ 	}
+ #endif /* CONFIG_IEEE80211R */
+ 
++#ifdef CONFIG_WDS_WPA_SUPPLICANT
++	/* fix for WDS STA that some vendor system set unsupported RSN IE in 3/4 EAPOL
++	 * handshake */
++	if (ie1len == ie2len + 2 && ie2len > 8 &&
++	  RSN_SELECTOR_GET(&ie2[4]) == RSN_SELECTOR(0x00, 0x10, 0x18, 0) &&
++	  os_memcmp(&ie1[8], &ie2[8], ie2len - 8) == 0)
++	  return 0;
++#endif /* CONFIG_WDS_WPA_SUPPLICANT */
+ 	return -1;
+ }
+ 
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 13beb552f..30b57b5e2 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -744,6 +744,9 @@ int wpa_use_akm_defined(int akmp);
+ int wpa_use_cmac(int akmp);
+ int wpa_use_aes_key_wrap(int akmp);
+ int fils_domain_name_hash(const char *domain, u8 *hash);
++#ifdef CONFIG_WDS_WPA
++int wpa_modify_wpa_ie_rsn(u8 *rsn_ie, size_t rsn_ie_len, u32 group_suite, u16 capab);
++#endif
+ 
+ bool pasn_use_sha384(int akmp, int cipher);
+ int pasn_pmk_to_ptk(const u8 *pmk, size_t pmk_len,
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 61293f211..acf78193e 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5318,6 +5318,17 @@ struct wpa_driver_ops {
+ 	 */
+ 	int(*set_bss_load)(void *priv, const u8 enable);
+ 
++#ifdef CONFIG_WDS_WPA
++	/**
++	 * set_deny_mac_addr - Add/remove MAC address to/from WDS WPA station list
++	 * @priv: Private driver interface data
++	 * @addr: MAC address to use
++	 * @remove: 1 - remove address from list, 0 - add address to list
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int (*set_wds_wpa_sta)(void *priv, const u8 *addr, const u8 remove);
++#endif /* CONFIG_WDS_WPA */
++
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	int (*register_frame)(void *priv, u16 type,
+ 			      const u8 *match, size_t match_len,
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index fa4278bc4..f7fecf01f 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14513,6 +14513,34 @@ static int nl80211_set_bss_load(void *priv, const u8 is_enable)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_WDS_WPA
++int nl80211_set_wds_wpa_sta(void *priv, const u8 *addr, const u8 remove)
++{
++	int ret;
++	errno_t err;
++	struct intel_vendor_mac_addr_list_cfg wds_wpa_cfg;
++
++	err = memcpy_s(wds_wpa_cfg.addr, sizeof(wds_wpa_cfg.addr), addr, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return -ENOBUFS;
++	}
++	wds_wpa_cfg.remove = remove;
++	ret = nl80211_vendor_cmd(priv, OUI_LTQ,
++		LTQ_NL80211_VENDOR_SUBCMD_SET_WDS_WPA_STA, (u8*) &wds_wpa_cfg,
++		sizeof(wds_wpa_cfg), NESTED_ATTR_NOT_USED, NULL);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_WDS_WPA_STA failed: %i (%s)",
++			ret, strerror(-ret));
++	else
++		wpa_printf(MSG_DEBUG, MACSTR " %s WDS WPA station list", MAC2STR(addr),
++			remove ? "removed from" : "added to");
++
++	return ret;
++}
++#endif /* CONFIG_WDS_WPA */
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -14674,6 +14702,9 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.get_tx_power_20mhz = nl80211_get_tx_power_20mhz,
+ 	.set_bss_load = nl80211_set_bss_load,
+ 	.set_dynamic_mc_mode_rate = nl80211_set_dynamic_mc_mode_rate,
++#ifdef CONFIG_WDS_WPA
++	.set_wds_wpa_sta = nl80211_set_wds_wpa_sta,
++#endif
+ #ifdef CONFIG_DPP
+ 	.dpp_listen = nl80211_dpp_listen,
+ #endif /* CONFIG_DPP */
+diff --git a/wpa_supplicant/Makefile b/wpa_supplicant/Makefile
+index b4a3f38eb..d34dd9d4a 100644
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -1944,6 +1944,10 @@ OBJS_t2 += $(FST_OBJS)
+ OBJS_nfc += $(FST_OBJS)
+ endif
+ 
++ifdef CONFIG_WDS_WPA_SUPPLICANT
++CFLAGS += -DCONFIG_WDS_WPA_SUPPLICANT
++endif
++
+ ifdef CONFIG_WEP
+ CFLAGS += -DCONFIG_WEP
+ endif
+@@ -1962,6 +1966,38 @@ endif
+ 
+ dynamic_eap_methods: $(EAPDYN)
+ 
++../src/rsn_supp/build.wpa_supplicant:
++	@if [ -f ../src/rsn_supp/build.hostapd ]; then \
++		$(MAKE) -C ../src/rsn_supp clean; \
++	fi
++	@touch ../src/rsn_supp/build.wpa_supplicant
++
++../src/common/build.wpa_supplicant:
++	@if [ -f ../src/common/build.hostapd ]; then \
++		$(MAKE) -C ../src/common clean; \
++	fi
++	@touch ../src/common/build.wpa_supplicant
++
++../src/wps/build.wpa_supplicant:
++	@if [ -f ../src/wps/build.hostapd ]; then \
++		$(MAKE) -C ../src/wps clean; \
++	fi
++	@touch ../src/wps/build.wpa_supplicant
++
++../src/crypto/build.wpa_supplicant:
++	@if [ -f ../src/crypto/build.hostapd ]; then \
++		$(MAKE) -C ../src/crypto clean; \
++	fi
++	@touch ../src/crypto/build.wpa_supplicant
++
++../src/utils/build.wpa_supplicant:
++	@if [ -f ../src/utils/build.hostapd ]; then \
++		$(MAKE) -C ../src/utils clean; \
++	fi
++	@touch ../src/utils/build.wpa_supplicant
++
++BCHECK=../src/rsn_supp/build.wpa_supplicant ../src/common/build.wpa_supplicant ../src/wps/build.wpa_supplicant ../src/crypto/build.wpa_supplicant ../src/utils/build.wpa_supplicant
++
+ _OBJS_VAR := OBJS_priv
+ include ../src/objs.mk
+ wpa_priv: $(BCHECK) $(OBJS_priv)
+-- 
+2.43.0
+

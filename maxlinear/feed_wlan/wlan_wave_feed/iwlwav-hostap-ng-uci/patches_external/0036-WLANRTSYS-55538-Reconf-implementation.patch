@@ -1,0 +1,397 @@
+From 8ca3229401426bc647d800cb509667313801f571 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Thu, 25 May 2023 09:18:47 +0200
+Subject: [PATCH] WLANRTSYS-55538: Reconf implementation
+
+---
+ hostapd/ctrl_iface.c  |  46 +++++++++
+ hostapd/hostapd_cli.c |  32 ++++++
+ src/ap/hostapd.c      | 231 ++++++++++++++++++++++++++++++++++++++++++
+ src/ap/hostapd.h      |   1 +
+ 4 files changed, 310 insertions(+)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 1c8e8f650..f5b8c76e8 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1400,6 +1400,49 @@ static int hostapd_ctrl_iface_reload(struct hostapd_iface *iface)
+ 	return 0;
+ }
+ 
++static int hostapd_ctrl_iface_reconf(struct hostapd_iface *iface,
++		char *param)
++{
++	int i, bss_idx = -1;
++	rsize_t len;
++
++	while (param[0] == ' ')
++		param++;
++
++	if (iface->state == HAPD_IFACE_UNINITIALIZED) {
++		wpa_printf(MSG_ERROR, "Reconfig cannot be done before interface is initialized");
++		return -1;
++	}
++
++	len = strnlen_s(param, IFNAMSIZ);
++	if (len) {
++		if (!IS_VALID_RANGE(len, AP_MIN_VALID_CHAR, IFNAMSIZ - 1)) {
++			wpa_printf(MSG_ERROR, "wrong interface name len");
++			return -1;
++		}
++
++		for (i = 0; i < iface->num_bss; i++) {
++			struct hostapd_data *bss = iface->bss[i];
++
++			if (!strncmp(bss->conf->iface, param, IFNAMSIZ)) {
++				bss_idx = i;
++				break;
++			}
++		}
++
++		if (bss_idx == 0) {
++			wpa_printf(MSG_ERROR, "Reconfig of master BSS is illegal");
++			return -1;
++		}
++	}
++
++	if (hostapd_reconf_iface(iface, bss_idx) < 0) {
++		wpa_printf(MSG_ERROR, "Reconfig of interface failed");
++		return -1;
++	}
++
++	return 0;
++}
+ 
+ static int hostapd_ctrl_iface_reload_bss(struct hostapd_data *bss)
+ {
+@@ -5201,6 +5244,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "RELOAD", 6) == 0) {
+ 		if (hostapd_ctrl_iface_reload(hapd->iface))
+ 			reply_len = -1;
++	} else if (os_strncmp(buf, "RECONF", 6) == 0) {
++		if (hostapd_ctrl_iface_reconf(hapd->iface, buf + 6))
++			reply_len = -1;
+ 	} else if (os_strncmp(buf, "DISABLE", 7) == 0) {
+ 		if (hostapd_ctrl_iface_disable(hapd->iface))
+ 			reply_len = -1;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index cca0c4dce..f5a27e888 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -2104,6 +2104,33 @@ static int hostapd_cli_cmd_set_bss_load(struct wpa_ctrl *ctrl, int argc,
+ 	return -1;
+ }
+ 
++static int hostapd_cli_cmd_reconf(struct wpa_ctrl *ctrl, int argc,
++				      char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc == 0) {
++		res = sprintf_s(cmd, sizeof(cmd), "RECONF");
++		if (res <= 0) {
++			printf("%s: sprintf_s error %d", __func__, res);
++			return -1;
++		}
++	} else if (argc == 1) {
++		res = sprintf_s(cmd, sizeof(cmd), "RECONF %s",
++				  argv[0]);
++		if (res <= 0) {
++			printf("%s: sprintf_s error %d", __func__, res);
++			return -1;
++		}
++	} else {
++		printf("Invalid reconf command: needs 0-1 arguments\n");
++		return -1;
++	}
++
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2372,6 +2399,11 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ #endif /* CONFIG_IEEE80211AX */
+ 	{ "set_bss_load", hostapd_cli_cmd_set_bss_load, NULL,
+ 	  "<BSS name> <1/0> = set BSS Load IE in beacon and probe resp" },
++	{ "reconf", hostapd_cli_cmd_reconf, NULL,
++	  "[BSS name] = reconfigure interface (add/remove BSS's while other BSS "
++	  "are unaffected)\n"
++	  "  if BSS name is given, that BSS will be reloaded (main BSS isn't "
++	  "supported)" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index b4aeb8884..48f35dd2e 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1856,6 +1856,8 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 	if (hapd->wpa_auth && wpa_init_keys(hapd->wpa_auth) < 0)
+ 		return -1;
+ 
++	hostapd_neighbor_set_own_report(hapd);
++
+ 	if (hapd->iface->conf->autonomous_color_change) {
+ 		u8 current_color, color_disabled;
+ 		current_color = hapd->iface->conf->he_op.he_bss_color;
+@@ -3768,6 +3770,229 @@ int hostapd_enable_iface(struct hostapd_iface *hapd_iface)
+ 	return 0;
+ }
+ 
++static int hostapd_config_get_missing_bss(struct hostapd_config *conf,
++		struct hostapd_config *new_conf)
++{
++	size_t i, j;
++	bool found;
++
++	for (i = 0; i < conf->num_bss; i++) {
++		found = false;
++		for (j = 0; j < new_conf->num_bss; j++) {
++			if (os_strcmp(conf->bss[i]->iface, new_conf->bss[j]->iface) == 0) {
++				found = true;
++				break;
++			}
++		}
++
++		if (!found)
++			return i;
++	}
++
++	return -1;
++}
++
++static int hostapd_remove_bss(struct hostapd_iface *iface, unsigned int idx);
++
++static int hostapd_add_bss(struct hostapd_iface *iface,
++		struct hostapd_config *new_conf, int new_bss_idx)
++{
++	struct hostapd_bss_config **tmp_conf_arr;
++	struct hostapd_data **tmp_bss_arr;
++	struct hostapd_data *hapd;
++	int i, res;
++	const char *ifname;
++
++	UNUSED_VAR(ifname);
++	ifname = new_conf->bss[new_bss_idx]->iface;
++	wpa_printf(MSG_INFO, "%s, ifname=%s", __func__, ifname);
++
++	/* Reallocate conf & bss arrays for new BSS */
++	tmp_conf_arr = os_realloc_array(
++			iface->conf->bss, iface->conf->num_bss + 1,
++			sizeof(struct hostapd_bss_config *));
++	if (tmp_conf_arr == NULL) {
++		res = -ENOMEM;
++		goto fail_conf_arr_realloc;
++	}
++	iface->conf->bss = tmp_conf_arr;
++	iface->conf->num_bss++;
++
++	tmp_bss_arr = os_realloc_array(iface->bss, iface->num_bss + 1,
++			sizeof(struct hostapd_data *));
++
++	if (tmp_bss_arr == NULL) {
++		res = -ENOMEM;
++		goto fail_bss_arr_realloc;
++	}
++	iface->bss = tmp_bss_arr;
++	iface->num_bss++;
++
++	/* Move bss_config from new conf to current conf */
++	iface->conf->bss[iface->conf->num_bss - 1] = new_conf->bss[new_bss_idx];
++
++	iface->conf->last_bss = new_conf->bss[new_bss_idx];
++	new_conf->num_bss--;
++	for (i = new_bss_idx; i < new_conf->num_bss; i++)
++		new_conf->bss[i] = new_conf->bss[i + 1];
++
++	for (i = 0; i < NUM_TX_QUEUES; i++){
++		iface->conf->tx_queue[i] = new_conf->tx_queue[i];
++		iface->conf->wmm_ac_params[i]= new_conf->wmm_ac_params[i];
++	}
++
++	/* allocating new bss data */
++	hapd = hostapd_alloc_bss_data(iface, iface->conf,
++			iface->conf->last_bss);
++	if (hapd == NULL){
++		res = -ENOMEM;
++		goto fail_bss_data_alloc;
++	}
++
++	hapd->msg_ctx = hapd;
++	iface->bss[iface->num_bss - 1] = hapd;
++
++	/* Set up BSS will be done after interface enabled */
++	if (iface->state != HAPD_IFACE_ENABLED) {
++#ifdef CONFIG_ACS
++		return 0;
++#endif /* CONFIG_ACS */
++	}
++
++	if (hostapd_setup_bss(hapd, false, true)) {
++		res = -EINVAL;
++		goto fail_setup_bss;
++	}
++
++	/* send set WMM to driver for new BSS */
++	hostapd_tx_queue_params(iface->bss[0]);
++
++	if (hostapd_init_wps_complete(hapd)) {
++		res = -EINVAL;
++		goto fail_setup_bss;
++	}
++
++	return 0;
++
++fail_setup_bss:
++	hostapd_free_hapd_data(hapd);
++	os_free(hapd);
++fail_bss_data_alloc:
++	iface->bss[iface->num_bss - 1] = NULL;
++	iface->num_bss--;
++fail_bss_arr_realloc:
++	iface->conf->bss[iface->conf->num_bss - 1] = NULL;
++	iface->conf->num_bss--;
++fail_conf_arr_realloc:
++	return res;
++}
++
++int hostapd_reconf_iface(struct hostapd_iface *hapd_iface, int changed_idx)
++{
++	struct hostapd_config *new_conf = NULL;
++	int idx, res;
++	bool found_missing_bss;
++#ifdef CONFIG_IEEE80211BE_MLO
++	struct hostapd_data *sibling_hapd = NULL;
++#endif
++
++	wpa_printf(MSG_DEBUG, "Reconf interface %s", hapd_iface->conf->bss[0]->iface);
++	if (hapd_iface->interfaces == NULL ||
++		hapd_iface->interfaces->config_read_cb == NULL)
++		return -1;
++	new_conf = hapd_iface->interfaces->config_read_cb(hapd_iface->config_fname);
++	if (new_conf == NULL)
++		return -EINVAL;
++
++	if (changed_idx > 0) {
++		/* changed_idx is a BSS index that needs to be modified.
++		 * Instead of really modifying, we will just remove and add the BSS.
++		 * This is better because some BSS configurations must be set
++		 * to firmware before add VAP is made.
++		 */
++#ifdef CONFIG_IEEE80211BE_MLO
++		if(hapd_iface->conf->bss[changed_idx]->mlo_enable) {
++			sibling_hapd = hapd_iface->bss[changed_idx]->sibling_hapd;
++			if (sibling_hapd)
++				hostapd_remove_mld_vap(hapd_iface, changed_idx);
++
++			if (hostapd_deinit_gmld(hapd_iface->bss[changed_idx]))
++				wpa_printf(MSG_ERROR, "MLD deinit failed");
++		}
++#endif
++		hostapd_remove_bss(hapd_iface, changed_idx);
++#ifdef CONFIG_IEEE80211BE_MLO
++		if(sibling_hapd) {
++			hostapd_remove_bss(sibling_hapd->iface, sibling_hapd->conf->bss_idx);
++			sibling_hapd = NULL;
++		}
++#endif
++	}
++
++	/* Find BSS needed to be removed */
++	do {
++		idx = hostapd_config_get_missing_bss(hapd_iface->conf, new_conf);
++		/* zero isn't a valid index because we don't support
++		 * removing master BSS */
++		found_missing_bss = idx > 0;
++		if (found_missing_bss) {
++#ifdef CONFIG_IEEE80211BE_MLO
++			if (hapd_iface->conf->bss[idx]->mlo_enable) {
++				sibling_hapd = hapd_iface->bss[idx]->sibling_hapd;
++				if (sibling_hapd)
++					hostapd_remove_mld_vap(hapd_iface, idx);
++
++				if (hostapd_deinit_gmld(hapd_iface->bss[idx]))
++					wpa_printf(MSG_ERROR, "MLD deinit failed");
++			}
++#endif
++			hostapd_remove_bss(hapd_iface, idx);
++#ifdef CONFIG_IEEE80211BE_MLO
++			if (sibling_hapd) {
++				hostapd_remove_bss(sibling_hapd->iface, sibling_hapd->conf->bss_idx);
++				sibling_hapd = NULL;
++			}
++#endif
++		}
++	} while (found_missing_bss);
++
++	/* Find BSS needed to be added */
++	do {
++		idx = hostapd_config_get_missing_bss(new_conf, hapd_iface->conf);
++		/* zero isn't a valid index because there must be at least 1 BSS */
++		found_missing_bss = idx > 0;
++		if (found_missing_bss) {
++			res = hostapd_add_bss(hapd_iface, new_conf, idx);
++			if (res) {
++				wpa_printf(MSG_ERROR, "Failed adding new BSS (%s), res=%d",
++						new_conf->bss[idx]->iface, res);
++				hostapd_config_free(new_conf);
++				return -1;
++			}
++
++			idx = hapd_iface->num_bss - 1;
++			hostapd_flush_old_stations(hapd_iface->bss[idx], WLAN_REASON_PREV_AUTH_NOT_VALID);
++#ifdef CONFIG_IEEE80211BE_MLO
++			if (update_mld_config_iface(hapd_iface, NULL) < 0) {
++				wpa_printf(MSG_ERROR, "%s: Failed to setup mld config", __func__);
++				return -1;
++			}
++			mld_setup_interfaces(hapd_iface->interfaces);
++#endif
++
++			if (start_ctrl_iface_bss(hapd_iface->bss[idx])){
++				wpa_printf(MSG_ERROR, "Failed adding new BSS (%s) to control interface",
++						new_conf->bss[idx]->iface);
++				hostapd_config_free(new_conf);
++				return -1;
++			}
++		}
++	} while (found_missing_bss);
++
++	hostapd_config_free(new_conf);
++
++	return 0;
++}
+ 
+ int hostapd_reload_iface(struct hostapd_iface *hapd_iface)
+ {
+@@ -4089,6 +4314,12 @@ int hostapd_add_iface(struct hapd_interfaces *interfaces, char *buf)
+ 		if (conf && conf->bss)
+ 			os_strlcpy(conf->bss[0]->iface, buf,
+ 				   sizeof(conf->bss[0]->iface));
++		new_iface->config_fname = os_strdup(conf_file);
++		if (new_iface->config_fname == NULL) {
++			wpa_printf(MSG_ERROR, "%s: Failed to allocate memory "
++				  "for conf file name", __func__);
++			goto fail;
++		}
+ 	} else {
+ 		char *driver = os_strchr(ptr, ' ');
+ 
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 4c7d444ff..67dbcfe1a 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -747,6 +747,7 @@ void hostapd_new_assoc_sta(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   int reassoc);
+ void hostapd_interface_deinit_free(struct hostapd_iface *iface);
+ int hostapd_enable_iface(struct hostapd_iface *hapd_iface);
++int hostapd_reconf_iface(struct hostapd_iface *hapd_iface, int changed_idx);
+ int hostapd_reload_iface(struct hostapd_iface *hapd_iface);
+ int hostapd_reload_bss_only(struct hostapd_data *bss);
+ int hostapd_disable_iface(struct hostapd_iface *hapd_iface);
+-- 
+2.43.0
+

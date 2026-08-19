@@ -1,0 +1,292 @@
+From 45ee51d931871bcca988e2932a929fd03a35349d Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Fri, 9 Jun 2023 09:10:11 +0200
+Subject: [PATCH] WLANRTSYS-55969: Add support for hairpin settings
+
+---
+ hostapd/config_file.c        |  8 ++++
+ src/ap/ap_config.h           |  1 +
+ src/ap/ap_drv_ops.h          | 10 ++++
+ src/ap/hostapd.c             | 11 +++++
+ src/ap/x_snoop.c             |  5 +-
+ src/common/wpa_ctrl.h        |  2 +
+ src/drivers/driver.h         |  9 ++++
+ src/drivers/driver_nl80211.c | 90 ++++++++++++++++++++++++++++++++++++
+ src/drivers/netlink.c        |  8 ++++
+ src/drivers/netlink.h        |  2 +
+ 10 files changed, 143 insertions(+), 3 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 09fa1fd24..d847d9215 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5534,6 +5534,14 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		conf->ext_cap_max_num_msdus_in_amsdu = (u8)val;
+ 	} else if (os_strcmp(buf, "he_phy_channel_width_set") == 0) {
+ 		wpa_printf(MSG_WARNING, "Line %d: he_phy_channel_width_set is deprecated and will be removed soon", line);
++	} else if (os_strcmp(buf, "enable_hairpin") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid enable_hairpin %d",
++				line, val);
++			return 1;
++		}
++		bss->enable_hairpin = val;
+ #ifdef CONFIG_VENDOR_MXL
+ 	} else if (mxl_hostapd_config_fill(conf, bss, buf, pos, line)) {
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 4360b337a..2e098bae7 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -406,6 +406,7 @@ struct hostapd_bss_config {
+ 	int wds_sta;
+ 	int isolate;
+ 	int start_disabled;
++	int enable_hairpin;
+ 
+ 	int auth_algs; /* bitfield of allowed IEEE 802.11 authentication
+ 			* algorithms, WPA_AUTH_ALG_{OPEN,SHARED,LEAP} */
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index e634b81ad..e34ff6879 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -521,6 +521,16 @@ static inline int hostapd_drv_set_bss_load(struct hostapd_data *hapd,
+ 	return hapd->driver->set_bss_load(hapd->drv_priv, is_enable);
+ }
+ 
++static inline int hostapd_drv_br_port_set_hairpin(struct hostapd_data *hapd,
++									unsigned int val)
++{
++	if (hapd->driver == NULL || hapd->drv_priv == NULL ||
++		hapd->driver->br_port_set_hairpin == NULL)
++		return -1;
++
++	return hapd->driver->br_port_set_hairpin(hapd->drv_priv, val);
++}
++
+ #ifdef ANDROID
+ static inline int hostapd_drv_driver_cmd(struct hostapd_data *hapd,
+ 					 char *cmd, char *buf, size_t buf_len)
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 44d305155..757f8c543 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1528,6 +1528,15 @@ static void hostapd_post_up_vendor_vap_cmd(struct hostapd_data *hapd, struct hos
+ #endif
+ }
+ 
++static void hostapd_handle_hairpin_mode (struct hostapd_data *hapd)
++{
++	if (hostapd_drv_br_port_set_hairpin(hapd, hapd->conf->enable_hairpin))
++		wpa_printf(MSG_INFO, "%s: failed to set hairpin_mode to %d on the bridge port",
++			   hapd->conf->iface, hapd->conf->enable_hairpin);
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, AP_ENABLE_HAIRPIN_MODE "enable=%d", hapd->conf->enable_hairpin);
++}
++
+ /**
+  * hostapd_setup_bss - Per-BSS setup (initialization)
+  * @hapd: Pointer to BSS data
+@@ -1882,6 +1891,8 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 		return -1;
+ #endif /* CONFIG_VENDOR_MXL */
+ 
++	hostapd_handle_hairpin_mode(hapd);
++
+ 	return 0;
+ }
+ 
+diff --git a/src/ap/x_snoop.c b/src/ap/x_snoop.c
+index 029f4de23..414d8f011 100644
+--- a/src/ap/x_snoop.c
++++ b/src/ap/x_snoop.c
+@@ -33,8 +33,7 @@ int x_snoop_init(struct hostapd_data *hapd)
+ 
+ 	hapd->x_snoop_initialized = true;
+ 
+-	if (hostapd_drv_br_port_set_attr(hapd, DRV_BR_PORT_ATTR_HAIRPIN_MODE,
+-					 1)) {
++	if (hostapd_drv_br_port_set_hairpin(hapd, 1)) {
+ 		wpa_printf(MSG_DEBUG,
+ 			   "x_snoop: Failed to enable hairpin_mode on the bridge port");
+ 		return -1;
+@@ -131,6 +130,6 @@ void x_snoop_deinit(struct hostapd_data *hapd)
+ 		return;
+ 	hostapd_drv_br_set_net_param(hapd, DRV_BR_NET_PARAM_GARP_ACCEPT, 0);
+ 	hostapd_drv_br_port_set_attr(hapd, DRV_BR_PORT_ATTR_PROXYARP, 0);
+-	hostapd_drv_br_port_set_attr(hapd, DRV_BR_PORT_ATTR_HAIRPIN_MODE, 0);
++	hostapd_drv_br_port_set_hairpin(hapd, 0);
+ 	hapd->x_snoop_initialized = false;
+ }
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index b63a7eb2d..0c537d31c 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -449,6 +449,8 @@ extern "C" {
+ #define WPA_EVENT_CCA_ABORTED_NOTIFY "CTRL-EVENT-CCA-ABORTED-NOTIFY "
+ #define WPA_EVENT_CCA_NOTIFY "CTRL-EVENT-CCA-NOTIFY "
+ 
++#define AP_ENABLE_HAIRPIN_MODE "AP-ENABLE-HAIRPIN-MODE "
++
+ #ifndef BIT
+ #define BIT(x) (1U << (x))
+ #endif
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 0400fb714..0db388182 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -4269,6 +4269,15 @@ struct wpa_driver_ops {
+ 	int (*br_port_set_attr)(void *priv, enum drv_br_port_attr attr,
+ 				unsigned int val);
+ 
++	/**
++	 * br_port_set_hairpin - Set/Reset hairpin mode
++	 * @priv: Private driver interface data
++	 * @val: Value to be set
++	 * Returns: 0 on success, negative (<0) on failure
++	 */
++
++	int (*br_port_set_hairpin)(void *priv, unsigned int val);
++
+ 	/**
+ 	 * br_port_set_attr - Set a bridge network parameter
+ 	 * @param: Bridge parameter to set
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 90c03b73d..fc4dc9618 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -12386,6 +12386,95 @@ static int wpa_driver_br_port_set_attr(void *priv, enum drv_br_port_attr attr,
+ 	return 0;
+ }
+ 
++#define NLA_TAIL(n)     ((struct rtattr *) \
++	(((char *) (n)) + NLMSG_ALIGN((n)->nlmsg_len)))
++
++#define MAX_DATA_LEN	256
++
++int nla_put_hapd(struct nlmsghdr *n, __u32 maxlen, int type,
++				const void *data, int alen)
++{
++	int len = RTA_LENGTH(alen);
++	struct rtattr *rta;
++
++	if (NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len) > maxlen) {
++		return -1;
++	}
++
++	rta = NLA_TAIL(n);
++	rta->rta_type = type;
++	rta->rta_len = len;
++	if (alen)
++		memcpy_s(RTA_DATA(rta), RTA_ALIGN(len), data, alen);
++	n->nlmsg_len = NLMSG_ALIGN(n->nlmsg_len) + RTA_ALIGN(len);
++
++	return 0;
++}
++
++static int nla_put_u8_hapd(struct nlmsghdr *n, int type, __u8 data)
++{
++	return nla_put_hapd(n, MAX_DATA_LEN, type, &data, sizeof(__u8));
++}
++
++static int nla_nest_end_hapd(struct nlmsghdr *n, struct rtattr *nest)
++{
++	nest->rta_len = (char *)NLA_TAIL(n) - (char *)nest;
++	return n->nlmsg_len;
++}
++
++static struct rtattr *nla_nest_start_hapd(struct nlmsghdr *n, __u32 maxlen, int type)
++{
++	struct rtattr *nest = NLA_TAIL(n);
++
++	nla_put_hapd(n, maxlen, type, NULL, 0);
++	return nest;
++}
++
++static int wpa_driver_br_port_set_hairpin(void *priv, unsigned int val)
++{
++	struct iovec iov;
++	struct nl_req_t {
++		struct nlmsghdr nh;	/**< Netlink message header */
++		struct ifinfomsg ifi;	/**< Link level specific information */
++		char buf[MAX_DATA_LEN];	/**< Netlink attribute information */
++	};
++
++	struct sockaddr_nl nladdr = {
++		.nl_family = AF_NETLINK
++	};
++	struct msghdr msg = {
++		.msg_name = &nladdr,
++		.msg_namelen = sizeof(nladdr),
++		.msg_iov = &iov,
++		.msg_iovlen = 1,
++	};
++	struct i802_bss *bss = priv;
++	struct nl_req_t nl_req;
++	struct rtattr *brport = NULL;
++	struct rtattr *linkinfo = NULL;
++	struct nlmsghdr	*nh = &nl_req.nh;
++	struct wpa_driver_nl80211_data *drv = bss->drv;
++
++	bzero(&nl_req, sizeof(nl_req));
++	nh->nlmsg_len = NLMSG_LENGTH(sizeof(nl_req.ifi));
++	nh->nlmsg_type = RTM_NEWLINK;
++	nh->nlmsg_flags = NLM_F_REQUEST;
++	nl_req.ifi.ifi_family = AF_UNSPEC;
++	nl_req.ifi.ifi_index = bss->ifindex;
++
++	linkinfo = nla_nest_start_hapd(nh, sizeof(nl_req), IFLA_LINKINFO);
++	nla_put_hapd(nh, sizeof(nl_req), IFLA_INFO_KIND,
++			"bridge_slave", sizeof("bridge_slave") - 1);
++	brport = nla_nest_start_hapd(nh, sizeof(nl_req), IFLA_INFO_SLAVE_DATA);
++	nla_put_u8_hapd(nh, IFLA_BRPORT_MODE, val);
++	nla_nest_end_hapd(nh, brport);
++	nla_nest_end_hapd(nh, linkinfo);
++
++	iov.iov_base = nh;
++	iov.iov_len = nh->nlmsg_len;
++
++	return netlink_set_hairpin(drv->global->netlink, (void *) &msg);
++}
+ 
+ static const char * drv_br_net_param_str(enum drv_br_net_param param)
+ {
+@@ -14332,6 +14421,7 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.br_add_ip_neigh = wpa_driver_br_add_ip_neigh,
+ 	.br_delete_ip_neigh = wpa_driver_br_delete_ip_neigh,
+ 	.br_port_set_attr = wpa_driver_br_port_set_attr,
++	.br_port_set_hairpin = wpa_driver_br_port_set_hairpin,
+ 	.br_set_net_param = wpa_driver_br_set_net_param,
+ 	.add_tx_ts = nl80211_add_ts,
+ 	.del_tx_ts = nl80211_del_ts,
+diff --git a/src/drivers/netlink.c b/src/drivers/netlink.c
+index 7780479c3..74de59305 100644
+--- a/src/drivers/netlink.c
++++ b/src/drivers/netlink.c
+@@ -226,3 +226,11 @@ int netlink_send_oper_ifla(struct netlink_data *netlink, int ifindex,
+ 
+ 	return ret < 0 ? -1 : 0;
+ }
++
++int netlink_set_hairpin(struct netlink_data *netlink, void *msg)
++{
++	if (sendmsg(netlink->sock, msg, 0) < 0)
++		return -1;
++
++	return 0;
++}
+diff --git a/src/drivers/netlink.h b/src/drivers/netlink.h
+index 3a7340e51..8c993be7f 100644
+--- a/src/drivers/netlink.h
++++ b/src/drivers/netlink.h
+@@ -25,4 +25,6 @@ void netlink_deinit(struct netlink_data *netlink);
+ int netlink_send_oper_ifla(struct netlink_data *netlink, int ifindex,
+ 			   int linkmode, int operstate);
+ 
++int netlink_set_hairpin(struct netlink_data *netlink, void *msg);
++
+ #endif /* NETLINK_H */
+-- 
+2.43.0
+

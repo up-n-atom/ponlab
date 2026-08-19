@@ -1,0 +1,1583 @@
+From e7373f9aa3a596e98f9b0acb1c0ed931566648b3 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Tue, 10 Jan 2023 16:22:25 +0100
+Subject: [PATCH] WLANRTSYS-51465: Thresholds based SoftBlock implementation
+
+---
+ hostapd/mxl_config.c               |  18 +
+ hostapd/mxl_ctrl_iface.c           | 208 +++++++++++
+ hostapd/mxl_hostapd_cli.c          |  69 ++++
+ hostapd/mxl_hostapd_cli.h          |  10 +-
+ src/ap/beacon.c                    |  15 +
+ src/ap/drv_callbacks.c             |   5 +
+ src/ap/hostapd.c                   |   7 +
+ src/ap/hostapd.h                   |   3 +
+ src/ap/ieee802_11.c                |  37 ++
+ src/ap/mxl_config.h                |   7 +
+ src/ap/mxl_events.c                |  42 +++
+ src/ap/mxl_hostapd.c               |  10 +
+ src/ap/mxl_hostapd.h               |  24 ++
+ src/ap/mxl_softblock.c             | 562 +++++++++++++++++++++++++++++
+ src/ap/mxl_softblock.h             |  31 ++
+ src/common/mxl_ieee802_11_defs.h   |  10 +
+ src/common/mxl_vendor.h            |   1 +
+ src/common/mxl_wpa_ctrl.h          |   3 +
+ src/common/vendor_cmds_copy.h      |  26 ++
+ src/drivers/driver_nl80211_event.c |  21 ++
+ src/utils/mxl_common.h             |  13 +
+ tests/fuzzing/ap-mgmt/ap-mgmt.c    |   3 +
+ 22 files changed, 1124 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index f1f4a7a15..5a6359f21 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -154,6 +154,22 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_bss_conf->soft_block_acl_on_auth_req = val;
++	} else if (os_strcmp(buf, "sDisableSoftblock") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid sDisableSoftblock %d",
++				line, val);
++			return 0;
++		}
++		mxl_bss_conf->sDisableSoftblock = val;
++	} else if (os_strcmp(buf, "event_cache_interval") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, 0, MAX_EVENT_CACHE_INTERVAL)) {
++			wpa_printf(MSG_ERROR, "line %d: event_cache_interval value %d outside of valid range",
++			line, val);
++			return 0;
++		}
++		mxl_conf->event_cache_interval = val;
+ 	} else
+ 		return 0;
+ 
+@@ -186,6 +202,8 @@ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+ 	mxl_conf->scan_activity_threshold = SCAN_ACTIVITY_THRESHOLD_DEFAULT;
+ 	mxl_conf->obss_beacon_rssi_threshold = -60;
+ 
++	mxl_conf->event_cache_interval = 1;
++
+ }
+ 
+ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss)
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 2dc387df0..1d56c7a2f 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -21,6 +21,7 @@
+ #include "ap/beacon.h"
+ #include "ap/ap_drv_ops.h"
+ #include "ap/sta_info.h"
++#include "ap/ieee802_11_auth.h"
+ #include "ap/mxl_config.h"
+ #include "ap/mxl_hostapd.h"
+ #include "drivers/mxl_driver_nl80211.h"
+@@ -447,6 +448,208 @@ static int mxl_hostapd_ctrl_iface_soft_block_acl_get_params(struct hostapd_data
+ 	return  (os_snprintf_error(buflen, ret)) ? 0 : ret;
+ }
+ 
++static int mxl_hostapd_ctrl_iface_sta_softblock(struct hostapd_data *hapd, const char *cmd)
++{
++	const char *pos;
++	u8 remove = 0, snr;
++	int ret, status;
++	struct multi_ap_blacklist entry;
++
++	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++			"sta_softblock - there is no iface with the given name");
++		return -1;
++	}
++
++	if (hapd->conf->mxl_bss_conf.sDisableSoftblock) {
++		wpa_printf(MSG_INFO,
++			"sta_softblock - softblock is disabled");
++		return -1;
++	}
++
++	cmd = os_strchr(cmd, ' ');
++	if (cmd)
++		cmd++;
++	else {
++		wpa_printf(MSG_INFO,
++			"sta_softblock - BSS is missing");
++		return -1;
++	}
++
++	os_memset(&entry, 0, sizeof(entry));
++	if (hwaddr_aton(cmd, entry.addr))
++		return -1;
++
++	pos = os_strstr(cmd, "remove=");
++	if (pos) {
++		pos += sizeof("remove=") - 1;
++		status = atoi(pos);
++		if (status < 0) {
++			wpa_printf(MSG_ERROR, "sta_softblock: invalid remove");
++			return -1;
++		}
++		remove = status;
++	} else {
++		wpa_printf(MSG_ERROR, "sta_softblock: missing parameter(s)");
++		return -1;
++	}
++
++	if (remove)
++		goto end;
++
++	pos = os_strstr(cmd, "reject_sta=");
++	if (pos) {
++		pos += sizeof("reject_sta=") - 1;
++		status = atoi(pos);
++		if (status < 0) {
++			wpa_printf(MSG_ERROR, "sta_softblock: invalid reject status code");
++			return -1;
++		}
++		entry.status = status;
++	} else {
++		wpa_printf(MSG_ERROR, "sta_softblock: missing parameter(s)");
++		return -1;
++	}
++
++	pos = os_strstr(cmd, "snrProbeHWM=");
++	if (pos) {
++		pos += sizeof("snrProbeHWM=") - 1;
++		snr = atoi(pos);
++		entry.snrProbeHWM = snr;
++	} else {
++		wpa_printf(MSG_ERROR, "sta_softblock: missing parameter(s)");
++		return -1;
++	}
++
++	pos = os_strstr(cmd, "snrProbeLWM=");
++	if (pos) {
++		pos += sizeof("snrProbeLWM=") - 1;
++		int val = atoi(pos);
++		if (!IS_VALID_U8_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "sta_softblock: invalid snrProbeHWM");
++			return -1;
++		}
++		entry.snrProbeLWM = (u8)val;
++	} else {
++		wpa_printf(MSG_ERROR, "sta_softblock: missing parameter(s)");
++		return -1;
++	}
++
++	pos = os_strstr(cmd, "snrAuthHWM=");
++	if (pos) {
++		pos += sizeof("snrAuthHWM=") - 1;
++		int val = atoi(pos);
++		if (!IS_VALID_U8_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "sta_softblock: invalid snrAuthHWM");
++			return -1;
++		}
++		entry.snrAuthHWM = (u8)val;
++	} else {
++		wpa_printf(MSG_ERROR, "sta_softblock: missing parameter(s)");
++		return -1;
++	}
++
++	pos = os_strstr(cmd, "snrAuthLWM=");
++	if (pos) {
++		pos += sizeof("snrAuthLWM=") - 1;
++		int val = atoi(pos);
++		if (!IS_VALID_U8_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "sta_softblock: invalid snrAuthLWM");
++			return -1;
++		}
++		entry.snrAuthLWM = (u8)val;
++	} else {
++		wpa_printf(MSG_ERROR, "sta_softblock: missing parameter(s)");
++		return -1;
++	}
++
++end:
++	if (remove) {
++		wpa_printf(MSG_DEBUG, "sta_softblock: bss=%s, " MACSTR ", remove=%u ",
++			hapd->conf->iface, MAC2STR(entry.addr), remove);
++	} else {
++		wpa_printf(MSG_DEBUG, "sta_softblock: bss=%s, " MACSTR ", remove=%u, reject_sta=%u, snrProbeHWM=%u, snrProbeLWM=%u,"
++			"snrAuthHWM=%u, snrAuthLWM=%u", hapd->conf->iface, MAC2STR(entry.addr), remove, entry.status,
++			entry.snrProbeHWM, entry.snrProbeLWM, entry.snrAuthHWM, entry.snrAuthLWM);
++	}
++
++	ret = mxl_ieee802_11_multi_ap_set_softblock_thresholds(hapd, &entry, remove);
++	if (ret < 0)
++		return ret;
++
++	return 0;
++}
++
++static int mxl_hostapd_ctrl_iface_get_sta_softblock(struct hostapd_data *hapd, const char *cmd, char *reply, size_t reply_len)
++{
++	int ret;
++	struct multi_ap_blacklist *entry;
++	u8 sta_mac[ETH_ALEN];
++	os_memset(&sta_mac, 0, sizeof(sta_mac));
++
++	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	if (!hapd) {
++		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - there is no iface with the given name\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	if (hapd->conf->mxl_bss_conf.sDisableSoftblock) {
++		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - softblock is disabled\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	cmd = os_strchr(cmd, ' ');
++	if (cmd)
++		cmd++;
++	else {
++		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - MAC address is missing\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	if (hwaddr_aton(cmd, sta_mac)) {
++		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - Invalid MAC address passed\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	entry = mxl_ieee802_11_multi_ap_blacklist_find(hapd, sta_mac);
++
++	if (!entry)
++	{
++		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - MAC address is not softblocked\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - status=%u, snrProbeHWM=%u, snrProbeLWM=%u,"
++			" snrAuthHWM=%u, snrAuthLWM=%u\n", entry->status, entry->snrProbeHWM, entry->snrProbeLWM,
++			entry->snrAuthHWM, entry->snrAuthLWM);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return 0;
++	}
++	return ret;
++}
++
+ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -576,6 +779,11 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 				*reply_len = -1;
+ 			}
+ 		}
++	} else if (os_strncmp(buf, "STA_SOFTBLOCK ", 14) == 0) {
++		if (mxl_hostapd_ctrl_iface_sta_softblock(hapd, buf + 14))
++			*reply_len = -1;
++	} else if (os_strncmp(buf, "GET_STA_SOFTBLOCK ", 18) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_sta_softblock(hapd, buf + 18, reply, reply_size);
+ 	} else {
+ 		return 0;
+ 	}
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index fb874bc61..6549ba576 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -155,3 +155,72 @@ int mxl_hostapd_cli_cmd_get_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char
+ 	}
+ 	return mxl_wpa_ctrl_command(ctrl, cmd);
+ }
++
++int mxl_hostapd_cli_cmd_sta_softblock(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++	char *tmp;
++	int total;
++	int i;
++
++	if ((argc != 3) && (argc != 8)) {
++		printf("Invalid STA_SOFTBLOCK command \n"
++			"usage: <bss> <STA addr> <remove=x> 1 = remove, 0 = add \n"
++			" [following are required only for 'add' \n"
++			" <reject_sta=x> reject status code \n"
++			" <snrProbeHWM=> Probe Req SNR High Water Mark \n"
++			" <snrProbeLWM=> Probe Req SNR Low Water Mark \n"
++			" <snrAuthHWM=> Auth Req SNR High Water Mark \n"
++			" <snrAuthLWM=> Auth Req SNR Low Water Mark \n]");
++		return -1;
++	}
++	res = sprintf_s(cmd, sizeof(cmd), "STA_SOFTBLOCK %s", argv[0]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	total = res;
++	for (i = 1; i < argc; i++) {
++		tmp = &cmd[total];
++		res = sprintf_s(tmp, sizeof(cmd) - total, " %s", argv[i]);
++		if (res <= 0) {
++			printf("%s: sprintf_s error %d", __func__, res);
++			return -1;
++		}
++		total += res;
++	}
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
++
++int mxl_hostapd_cli_cmd_get_sta_softblock(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++	char *tmp;
++	int total;
++	int i;
++
++	if (argc != 2){
++		printf("Invalid GET_STA_SOFTBLOCK command \n"
++			"usage: <bss> <STA addr>\n");
++		return -1;
++	}
++	res = sprintf_s(cmd, sizeof(cmd), "GET_STA_SOFTBLOCK %s", argv[0]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	total = res;
++	for (i = 1; i < argc; i++) {
++		tmp = &cmd[total];
++		res = sprintf_s(tmp, sizeof(cmd) - total, " %s", argv[i]);
++		if (res <= 0) {
++			printf("%s: sprintf_s error %d", __func__, res);
++			return -1;
++		}
++		total += res;
++	}
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
++
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index 2425892eb..05af65db0 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -37,7 +37,13 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 	{ "accept_acl", mxl_hostapd_cli_cmd_accept_macacl, NULL,\
+ 	  "<BSS_name> <ADD_MAC/DEL_MAC/DIS_MAC/DIS_ALL/SHOW/CLEAR> = accept MAC ACL" }, \
+ 	{ "deny_acl", mxl_hostapd_cli_cmd_deny_macacl, NULL, \
+-	  "<BSS_name> <ADD_MAC/DEL_MAC/SHOW/CLEAR> = deny MAC ACL" },
++	  "<BSS_name> <ADD_MAC/DEL_MAC/SHOW/CLEAR> = deny MAC ACL" }, \
++	{ "sta_softblock", mxl_hostapd_cli_cmd_sta_softblock, NULL,			\
++	  "<bss> <addr> <remove=x> [<reject_sta=x>"					\
++	  "<snrProbeHWM=x> <snrProbeLWM=x>"						\
++	  "<snrAuthHWM=x> <snrAuthLWM=x>]" },						\
++	{ "get_sta_softblock", mxl_hostapd_cli_cmd_get_sta_softblock, NULL,		\
++	  "<bss> <addr>" },								\
+ 
+ int mxl_hostapd_cli_cmd_get_hw_features(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_set_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -45,5 +51,7 @@ int mxl_hostapd_cli_cmd_get_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char
+ int mxl_hostapd_cli_cmd_get_dfs_stats(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_set_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_get_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_sta_softblock(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_sta_softblock(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ 
+ #endif /* MXL_HOSTAPD_CLI_H */
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 50bb2ed3e..1fe965b93 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -1304,6 +1304,10 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 		      const struct ieee80211_mgmt *mgmt, size_t len,
+ 		      int ssi_signal)
+ {
++#ifdef CONFIG_VENDOR_MXL
++	struct intel_vendor_event_msg_drop msg_dropped;
++	int softblock_res;
++#endif /* CONFIG_VENDOR_MXL */
+ 	struct ieee802_11_elems elems;
+ 	const u8 *ie;
+ 	size_t ie_len;
+@@ -1326,6 +1330,13 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 
+ 	if (len < IEEE80211_HDRLEN)
+ 		return;
++
++#ifdef CONFIG_VENDOR_MXL
++	softblock_res = mxl_check_softblock_tresholds(hapd, mgmt->sa, mgmt->da, hapd->iface->mxl_iface.snr_db_current_frame, &msg_dropped);
++	if (softblock_res == HOSTAPD_SOFTBLOCK_DROP || softblock_res == HOSTAPD_MULTI_AP_BLACKLIST_FOUND)
++		return; /* should be harmless. no allocs done to free */
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	ie = ((const u8 *) mgmt) + IEEE80211_HDRLEN;
+ 	if (hapd->iconf->track_sta_max_num)
+ 		sta_track_add(hapd->iface, mgmt->sa, ssi_signal);
+@@ -1606,6 +1617,10 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 
+ 	if (ret < 0)
+ 		wpa_printf(MSG_INFO, "handle_probe_req: send failed");
++#ifdef CONFIG_VENDOR_MXL
++	if (ret >= 0 && softblock_res == HOSTAPD_SOFTBLOCK_ALLOWED)
++		mxl_hostapd_event_softblock_drop(hapd, &msg_dropped);
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	os_free(params.resp);
+ 
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index abf29ab0a..04c0ee0e5 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2463,6 +2463,9 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 		break;
+ 	case EVENT_INTERFACE_DISABLED:
+ 		hostapd_free_stas(hapd);
++#ifdef CONFIG_VENDOR_MXL
++		mxl_hostapd_free_cached_events(hapd);
++#endif /* CONFIG_VENDOR_MXL */
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, INTERFACE_DISABLED);
+ 		hapd->disabled = 1;
+ 		break;
+@@ -2547,6 +2550,8 @@ void wpa_supplicant_event_global(void *ctx, enum wpa_event_type event,
+ #ifdef CONFIG_VENDOR_MXL
+ /* wrapper to access static functions from MXL code */
+ struct hostapd_channel_data * mxl_hostapd_get_mode_channel(struct hostapd_iface *iface, unsigned int freq) { return hostapd_get_mode_channel(iface, freq); }
++struct hostapd_data * mxl_get_hapd_bssid(struct hostapd_iface *iface, const u8 *bssid) { return get_hapd_bssid(iface, bssid); }
++_Static_assert(HAPD_BROADCAST == MXL_HAPD_BROADCAST, "open source and MXL macros not aligned!");
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ #endif /* HOSTAPD */
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 0cf5c8be2..4448af2eb 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -763,6 +763,9 @@ static int hostapd_flush_old_stations(struct hostapd_data *hapd, u16 reason)
+ void hostapd_bss_deinit_no_free(struct hostapd_data *hapd)
+ {
+ 	hostapd_free_stas(hapd);
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_free_cached_events(hapd);
++#endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_flush_old_stations(hapd, WLAN_REASON_DEAUTH_LEAVING);
+ #ifdef CONFIG_WEP
+ 	hostapd_clear_wep(hapd);
+@@ -2773,6 +2776,10 @@ hostapd_alloc_bss_data(struct hostapd_iface *hapd_iface,
+ 	dl_list_init(&hapd->sae_commit_queue);
+ #endif /* CONFIG_SAE */
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_alloc_bss_data(hapd);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	return hapd;
+ }
+ 
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 727de97ce..dc0d74883 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -161,6 +161,9 @@ struct hostapd_neighbor_entry {
+ struct hostapd_sae_commit_queue {
+ 	struct dl_list list;
+ 	int rssi;
++#ifdef CONFIG_VENDOR_MXL
++	int snr_db;
++#endif /* CONFIG_VENDOR_MXL */
+ 	size_t len;
+ 	u8 msg[];
+ };
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index eb647ea11..39f08fcbf 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -1626,6 +1626,9 @@ void auth_sae_process_commit(void *eloop_ctx, void *user_ctx)
+ 	wpa_printf(MSG_DEBUG,
+ 		   "SAE: Process next available message from queue");
+ 	dl_list_del(&q->list);
++#ifdef CONFIG_VENDOR_MXL
++	hapd->mxl_data.snr_db_from_sae_queue = q->snr_db;
++#endif /* CONFIG_VENDOR_MXL */
+ 	handle_auth(hapd, (const struct ieee80211_mgmt *) q->msg, q->len,
+ 		    q->rssi, 1);
+ 	os_free(q);
+@@ -1661,6 +1664,9 @@ static void auth_sae_queue(struct hostapd_data *hapd,
+ 	if (!q)
+ 		return;
+ 	q->rssi = rssi;
++#ifdef CONFIG_VENDOR_MXL
++	q->snr_db = hapd->iface->mxl_iface.snr_db_current_frame;
++#endif /* CONFIG_VENDOR_MXL */
+ 	q->len = len;
+ 	os_memcpy(q->msg, mgmt, len);
+ 
+@@ -2794,6 +2800,11 @@ static void handle_auth(struct hostapd_data *hapd,
+ 			const struct ieee80211_mgmt *mgmt, size_t len,
+ 			int rssi, int from_queue)
+ {
++#ifdef CONFIG_VENDOR_MXL
++	int softblock_res = HOSTAPD_SOFTBLOCK_ACCEPT;
++	struct intel_vendor_event_msg_drop msg_dropped;
++	int snr_db = from_queue ? hapd->mxl_data.snr_db_from_sae_queue : hapd->iface->mxl_iface.snr_db_current_frame;
++#endif /* CONFIG_VENDOR_MXL */
+ 	u16 auth_alg, auth_transaction, status_code;
+ 	u16 resp = WLAN_STATUS_SUCCESS;
+ 	struct sta_info *sta = NULL;
+@@ -2996,6 +3007,19 @@ static void handle_auth(struct hostapd_data *hapd,
+ 			goto fail;
+ 		/* continue if SOFT_BLOCK_ACL_ALLOW */
+ 	}
++
++	softblock_res = mxl_hostapd_check_softblock(hapd, mgmt->sa, &resp, WLAN_FC_STYPE_AUTH,
++				snr_db, &msg_dropped);
++
++	if (softblock_res == HOSTAPD_SOFTBLOCK_DROP) {
++		mxl_hostapd_event_softblock_drop(hapd, &msg_dropped);
++		return;
++	} else if ((softblock_res == HOSTAPD_SOFTBLOCK_REJECT)
++		|| (softblock_res == HOSTAPD_MULTI_AP_BLACKLIST_FOUND)) {
++ 		wpa_printf(MSG_INFO, "Station " MACSTR " not allowed to authenticate",
++			MAC2STR(mgmt->sa));
++		goto fail;
++	}
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ 	res = ieee802_11_allowed_address(hapd, sa, (const u8 *) mgmt, len,
+@@ -3268,6 +3292,14 @@ static void handle_auth(struct hostapd_data *hapd,
+ 				    resp, resp_ies, resp_ies_len,
+ 				    "handle-auth");
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (softblock_res == HOSTAPD_SOFTBLOCK_REJECT) {
++		/* Notify the app now */
++		msg_dropped.reason = resp;
++		mxl_hostapd_event_softblock_drop(hapd, &msg_dropped);
++	}
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (sta && sta->added_unassoc && (resp != WLAN_STATUS_SUCCESS ||
+ 					  reply_res != WLAN_STATUS_SUCCESS)) {
+ 		hostapd_drv_sta_remove(hapd, sta->addr);
+@@ -5486,6 +5518,11 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 		goto fail;
+ 	omit_rsnxe = !get_ie(pos, left, WLAN_EID_RSNX);
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (!mxl_hostapd_check_softblock_connect(hapd, mgmt->sa, &resp))
++		goto fail;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (hostapd_get_aid(hapd, sta) < 0) {
+ 		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_INFO, "No room for more AIDs");
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 4c1e605d0..3909a249e 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -34,6 +34,8 @@ struct mxl_hostapd_config {
+ 	char *dfs_channels_state_file;
+ 	int process_radar_slave_events;
+ 	int background_cac;
++
++	u32 event_cache_interval;
+ };
+ 
+ /**
+@@ -48,6 +50,8 @@ struct mxl_hostapd_bss_config {
+ 	unsigned soft_block_acl_allow_time;
+ 	int soft_block_acl_on_probe_req;
+ 	int soft_block_acl_on_auth_req;
++
++	int sDisableSoftblock;
+ };
+ 
+ struct hostapd_config;
+@@ -78,4 +82,7 @@ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss);
+ #define OBSS_BEACON_RSSI_TH_MIN (-100)
+ #define OBSS_BEACON_RSSI_TH_MAX 0
+ 
++
++#define MAX_EVENT_CACHE_INTERVAL 3600
++
+ #endif /* MXL_CONFIG_H */
+diff --git a/src/ap/mxl_events.c b/src/ap/mxl_events.c
+index 4e075ec8a..f29d86447 100644
+--- a/src/ap/mxl_events.c
++++ b/src/ap/mxl_events.c
+@@ -21,6 +21,7 @@ enum mxl_event_type {
+ 	EVENT_MXL_FLUSH_STATIONS_RX,
+ 	EVENT_MXL_RADAR,
+ 	EVENT_MXL_COC,
++	EVENT_MXL_SOFTBLOCK_DROP,
+ };
+ 
+ union mxl_event_data {
+@@ -40,6 +41,11 @@ union mxl_event_data {
+ 		const u8 *data;
+ 		size_t data_len;
+ 	} coc;
++
++	struct {
++		const u8 *data;
++		size_t data_len;
++	} softblock_drop;
+ };
+ 
+ static const char * mxl_event_to_string(enum mxl_event_type event)
+@@ -49,6 +55,7 @@ static const char * mxl_event_to_string(enum mxl_event_type event)
+ 	E2S(MXL_FLUSH_STATIONS_RX);
+ 	E2S(MXL_RADAR);
+ 	E2S(MXL_COC);
++	E2S(MXL_SOFTBLOCK_DROP);
+ 	}
+ 
+ 	return "UNKNOWN";
+@@ -106,6 +113,29 @@ static void mxl_event_coc(struct hostapd_data *hapd, const u8 *data, size_t data
+ 	mxl_hostapd_update_coc(iface, data, data_len);
+ }
+ 
++static void mxl_event_ltq_softblock_drop(struct hostapd_data *hapd, const u8 *data, size_t data_len)
++{
++	struct intel_vendor_event_msg_drop *msg_dropped = (struct intel_vendor_event_msg_drop*)data;
++	if (data_len != sizeof *msg_dropped) {
++		wpa_printf(MSG_ERROR, "bad channel data event, size %zu expected %zu",
++			   data_len, sizeof *msg_dropped);
++		return;
++	}
++
++	if (hapd->iface->state != HAPD_IFACE_ENABLED) {
++		wpa_printf(MSG_DEBUG, "discard driver event (%s) - interface not initialized yet", __FUNCTION__);
++		return;
++	}
++
++	hapd = mxl_get_hapd_bssid(hapd->iface, msg_dropped->bssid);
++	if (hapd == NULL || hapd == MXL_HAPD_BROADCAST) {
++		wpa_printf(MSG_ERROR, "SoftBlock event from unknown BSSID="MACSTR, MAC2STR(msg_dropped->bssid));
++		return;
++	}
++
++	mxl_hostapd_event_softblock_drop(hapd, msg_dropped);
++}
++
+ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 			  union mxl_event_data *data)
+ {
+@@ -126,6 +156,9 @@ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 	case EVENT_MXL_COC:
+ 		mxl_event_coc(hapd, data->coc.data, data->coc.data_len);
+ 		break;
++	case EVENT_MXL_SOFTBLOCK_DROP:
++		mxl_event_ltq_softblock_drop(hapd, data->softblock_drop.data, data->softblock_drop.data_len);
++		break;
+ 	
+ 	default:
+ 		wpa_printf(MSG_ERROR, "Unknown MXL event %d", event);
+@@ -160,3 +193,12 @@ void mxl_drv_event_coc(void *ctx, const u8 *data, size_t data_len)
+ 	event.radar.data_len = data_len;
+ 	mxl_process_event(ctx, EVENT_MXL_COC, &event);
+ }
++
++void mxl_drv_event_softblock_drop(void *ctx, u8 *data, size_t data_len)
++{
++	union mxl_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.softblock_drop.data = data;
++	event.softblock_drop.data_len = data_len;
++	mxl_process_event(ctx, EVENT_MXL_SOFTBLOCK_DROP, &event);
++}
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 2e93553b4..61657fa08 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -189,6 +189,11 @@ int mxl_hostapd_setup_bss_pre(struct hostapd_data *hapd)
+ 			(u8*)&sb_timer_acl_cfg, sizeof(sb_timer_acl_cfg)))
+ 		wpa_printf(MSG_WARNING, "SET_SB_TIMER_ACL_CFG failed");
+ 
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_SOFTBLOCK_DISABLE,
++			(u8*)&hapd->conf->mxl_bss_conf.sDisableSoftblock,
++			sizeof(hapd->conf->mxl_bss_conf.sDisableSoftblock)))
++		wpa_printf(MSG_WARNING, "set sDisableSoftblock failed");
++
+ 	return 0;
+ }
+ 
+@@ -503,3 +508,8 @@ void mxl_hostapd_interface_deinit(struct hostapd_iface *iface)
+ {
+ 	eloop_cancel_timeout(mxl_ap_max_nss_omn_elem_timeout, iface, NULL);
+ }
++
++void mxl_hostapd_alloc_bss_data(struct hostapd_data *hapd)
++{
++	dl_list_init(&hapd->mxl_data.multi_ap_blacklist);
++}
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index c71e1ae76..10a2ed54b 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -73,6 +73,17 @@ struct mxl_hostapd_iface {
+ 	struct mxl_zwdfs_settings zwdfs_info;
+ 	u64 drv_flags;
+ 	u8 require_omn; /* Variable to keep track whether OMN IE should be added or not */
++	int snr_db_current_frame; /* SNR value for the currently processed frame */
++};
++
++#define MAX_EVENT_MSG_LEN			512
++#define MAX_CACHED_EVENT_COUNT		128
++
++struct event_info {
++	struct event_info *next; /* next entry in event list */
++	struct event_info *hnext; /* next entry in hash table list */
++	u8 addr[6];
++	char msg_string[MAX_EVENT_MSG_LEN];
+ };
+ 
+ struct mxl_hostapd_data {
+@@ -80,6 +91,17 @@ struct mxl_hostapd_data {
+ 		HAPD_CHAN_SWITCH_OTHER,
+ 		HAPD_CHAN_SWITCH_RADAR_DETECTED,
+ 	} chan_switch_reason;
++	/* Special field only for purpose of handle_auth when called from SAE queue,
++	do not use for anything else */
++	int snr_db_from_sae_queue;
++
++#define MXL_STA_HASH_SIZE 256
++	struct event_info *event_list; /* event info list head */
++	struct event_info *event_hash[MXL_STA_HASH_SIZE];
++	u32 cached_event_count;
++
++	/* Multi-AP blacklist */
++	struct dl_list multi_ap_blacklist;
+ };
+ 
+ int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
+@@ -118,9 +140,11 @@ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface);
+ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx);
+ struct hostapd_channel_data * mxl_hostapd_get_mode_channel(struct hostapd_iface *iface, unsigned int freq);
+ enum oper_chan_width mxl_get_oper_width(int width);
++struct hostapd_data * mxl_get_hapd_bssid(struct hostapd_iface *iface, const u8 *bssid);
+ void mxl_hostapd_cleanup_iface(struct hostapd_iface *iface);
+ void mxl_hostapd_update_coc(struct hostapd_iface *iface, const u8 *data, size_t data_len);
+ u8 * mxl_hostapd_eid_opmodenotif(struct hostapd_data *hapd, u8 *eid);
+ void mxl_hostapd_interface_deinit(struct hostapd_iface *iface);
++void mxl_hostapd_alloc_bss_data(struct hostapd_data *hapd);
+ 
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/ap/mxl_softblock.c b/src/ap/mxl_softblock.c
+index 9fc9b536b..df20814f5 100644
+--- a/src/ap/mxl_softblock.c
++++ b/src/ap/mxl_softblock.c
+@@ -14,8 +14,12 @@
+ #include "utils/includes.h"
+ #include "utils/common.h"
+ #include "utils/list.h"
++#include "hostapd.h"
++#include "ap_drv_ops.h"
+ #include "mxl_softblock.h"
++#include "common/mxl_wpa_ctrl.h"
+ #include "hostapd.h"
++#include "sta_info.h"
+ 
+ static void mxl_softblock_cancel_timeout(eloop_timeout_handler handler, void *eloop_ctx, void *user_ctx)
+ {
+@@ -266,3 +270,561 @@ int mxl_hostapd_acl_drop_auth(struct hostapd_data *hapd, const u8 sa[ETH_ALEN],
+ 		MAC2STR(sa));
+ 	return SOFT_BLOCK_ACL_ALLOW;
+ }
++
++
++static void mxl_ap_event_hash_add(struct hostapd_data *hapd, struct event_info *e)
++{
++	e->hnext = hapd->mxl_data.event_hash[STA_HASH(e->addr)];
++	hapd->mxl_data.event_hash[STA_HASH(e->addr)] = e;
++}
++
++static bool mxl_is_same_softblock_event(char const *msg_str1, char const *msg_str2)
++{
++	char *pos1, *pos2;
++
++	/* compare event strings excluding ' snr=%d' */
++	pos1 = os_strstr(msg_str1, " snr=");
++	pos2 = os_strstr(msg_str2, " snr=");
++	if (!pos1 || !pos2){
++		wpa_printf(MSG_ERROR, "%s event comparison error", __FUNCTION__);
++		return false;
++	}
++	if ((pos1 - msg_str1) != (pos2 - msg_str2))
++		return false;
++
++	if (os_strncmp(msg_str1, msg_str2, pos1 - msg_str1) != 0)
++		return false;
++
++	pos1 = os_strstr(pos1 + 5, " ");
++	pos2 = os_strstr(pos2 + 5, " ");
++
++	if (!pos1 || !pos2){
++		wpa_printf(MSG_ERROR, "%s event format error", __FUNCTION__);
++		return false;
++	}
++
++	if (os_strncmp(pos1, pos2, MAX_EVENT_MSG_LEN) != 0)
++		return false;
++
++	return true;
++}
++
++
++static struct event_info * mxl_ap_find_event(struct hostapd_data *hapd, const u8 *sta_mac,
++				  const char *msg_str)
++{
++	struct event_info *e;
++
++	e = hapd->mxl_data.event_hash[STA_HASH(sta_mac)];
++	while (e != NULL){
++		if ((os_memcmp(e->addr, sta_mac, ETH_ALEN) == 0) &&
++		    mxl_is_same_softblock_event(msg_str, e->msg_string))
++			break;
++		e = e->hnext;
++	}
++	return e;
++}
++
++static void mxl_ap_event_hash_del(struct hostapd_data *hapd, struct event_info *event)
++{
++	struct event_info *e;
++
++	e = hapd->mxl_data.event_hash[STA_HASH(event->addr)];
++	if (e == NULL) return;
++	if (os_memcmp(e->addr, event->addr, ETH_ALEN) == 0) {
++		if (mxl_is_same_softblock_event(event->msg_string, e->msg_string)){
++			hapd->mxl_data.event_hash[STA_HASH(event->addr)] = e->hnext;
++			return;
++		}
++	}
++
++	while (e->hnext != NULL){
++		if ((os_memcmp(e->hnext->addr, event->addr, ETH_ALEN) == 0) &&
++			(mxl_is_same_softblock_event(e->hnext->msg_string, event->msg_string)))
++			break;
++		e = e->hnext;
++	}
++
++	if (e->hnext != NULL)
++		e->hnext = e->hnext->hnext;
++	else
++		wpa_printf(MSG_DEBUG, "AP: could not remove event for mac " MACSTR
++			   " from hash table", MAC2STR(event->addr));
++}
++
++static void mxl_ap_event_list_del(struct hostapd_data *hapd, struct event_info *event)
++{
++	struct event_info *tmp;
++
++	if (hapd->mxl_data.event_list == event) {
++		hapd->mxl_data.event_list = event->next;
++		return;
++	}
++
++	tmp = hapd->mxl_data.event_list;
++	while (tmp != NULL && tmp->next != event)
++		tmp = tmp->next;
++	if (tmp == NULL) {
++		wpa_printf(MSG_DEBUG, "Could not remove event for mac " MACSTR " from "
++			   "list.", MAC2STR(event->addr));
++	} else
++		tmp->next = event->next;
++}
++
++static void mxl_remove_event_from_cache(struct hostapd_data *hapd, struct event_info *event)
++{
++
++	if (event == NULL){
++		wpa_printf(MSG_ERROR, "%s event no longer exists in cache", __FUNCTION__);
++		return;
++	}
++
++	mxl_ap_event_hash_del(hapd, event);
++	mxl_ap_event_list_del(hapd, event);
++	os_free(event);
++	hapd->mxl_data.cached_event_count--;
++}
++
++static void mxl_handle_cached_event_expired(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	struct event_info *event = timeout_ctx;
++
++	mxl_remove_event_from_cache(hapd, event);
++}
++
++void mxl_hostapd_free_cached_events(struct hostapd_data *hapd)
++{
++	struct event_info *event, *prev;
++
++	event = hapd->mxl_data.event_list;
++
++	while (event) {
++		prev = event;
++		event = event->next;
++
++		wpa_printf(MSG_DEBUG, "Removing event for mac " MACSTR,
++			   MAC2STR(prev->addr));
++
++		if (eloop_is_timeout_registered(mxl_handle_cached_event_expired, hapd, prev))
++			eloop_cancel_timeout(mxl_handle_cached_event_expired, hapd, prev);
++
++		mxl_remove_event_from_cache(hapd, prev);
++	}
++}
++
++static void mxl_send_event_buffered (struct hostapd_data *hapd, const u8 addr[6],
++		const char *msg_str)
++{
++	struct event_info *event;
++
++	/* Send event and keep it in cache to make sure future
++	 * events are not sent again during the set interval.
++	 */
++	event = mxl_ap_find_event(hapd, addr, msg_str);
++	if (event)
++		wpa_printf(MSG_DEBUG,
++		   "Event already exists in cache for " MACSTR
++		   " event will not be sent." , MAC2STR(addr));
++	else {
++		/* new event, send and add to event cache */
++		wpa_msg(hapd->msg_ctx, MSG_INFO, "%s", msg_str);
++
++		if (hapd->mxl_data.cached_event_count >= MAX_CACHED_EVENT_COUNT){
++			wpa_printf(MSG_ERROR, "Maximum number of cached events reached");
++			return;
++		}
++
++		event = os_zalloc(sizeof(struct event_info));
++		if (event == NULL) {
++			wpa_printf(MSG_ERROR, "malloc failed");
++			return;
++		}
++
++		if (EOK != strncpy_s(event->msg_string, MAX_EVENT_MSG_LEN, msg_str, MAX_EVENT_MSG_LEN)){
++			wpa_printf(MSG_ERROR, "%s Adding a new event to cache failed, strncpy_s returned an error", __FUNCTION__);
++			os_free(event);
++			return;
++		}
++
++		if (EOK != memcpy_s(event->addr, ETH_ALEN, addr, ETH_ALEN)){
++			wpa_printf(MSG_ERROR, "%s Adding a new event to cache failed, memcpy_s returned an error", __FUNCTION__);
++			os_free(event);
++			return;
++		}
++
++		event->next = hapd->mxl_data.event_list;
++		hapd->mxl_data.event_list = event;
++		mxl_ap_event_hash_add(hapd, event);
++		hapd->mxl_data.cached_event_count++;
++
++		eloop_register_timeout(hapd->iconf->mxl_conf.event_cache_interval, 0,
++				       mxl_handle_cached_event_expired, hapd, event);
++	}
++}
++
++void mxl_hostapd_event_softblock_drop(struct hostapd_data *hapd,
++		struct intel_vendor_event_msg_drop *msg_dropped)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	char msg_str[MAX_EVENT_MSG_LEN];
++	int ret;
++
++	/* Discard event if interface didn't finished initialization.
++	 * This may happen when driver sends irrelevant events due to station mode actions
++	 */
++	if (iface->state != HAPD_IFACE_ENABLED) {
++		wpa_printf(MSG_DEBUG, "discard driver event (%s) - interface not initialized yet", __FUNCTION__);
++		return;
++	}
++
++	ret = sprintf_s (msg_str, MAX_EVENT_MSG_LEN, LTQ_SOFTBLOCK_DROP
++		" VAP=%s VAP_BSSID="MACSTR" msg_type=%d addr="MACSTR" snr=%d blocked=%d rejected=%d "
++		"broadcast=%d reason=%d", hapd->conf->iface, MAC2STR(hapd->conf->bssid), msg_dropped->msgtype,
++		MAC2STR(msg_dropped->addr), msg_dropped->rx_snr, msg_dropped->blocked,
++		msg_dropped->rejected, msg_dropped->broadcast, msg_dropped->reason);
++	if (ret <= 0){
++		wpa_printf(MSG_ERROR, "%s event message format error", __FUNCTION__);
++		return;
++	}
++
++	if (hapd->iconf->mxl_conf.event_cache_interval == 0)
++		wpa_msg(hapd->msg_ctx, MSG_INFO, "%s", msg_str);
++	else
++		mxl_send_event_buffered(hapd, msg_dropped->addr, msg_str);
++}
++
++
++
++struct multi_ap_blacklist * mxl_ieee802_11_multi_ap_blacklist_find(struct hostapd_data *hapd, const u8 addr[ETH_ALEN])
++{
++	struct multi_ap_blacklist *iter;
++
++	dl_list_for_each(iter, &hapd->mxl_data.multi_ap_blacklist, struct multi_ap_blacklist, list)
++		if (os_memcmp(addr, iter->addr, ETH_ALEN) == 0)
++			return iter;
++	return NULL;
++}
++
++int mxl_hostapd_check_softblock(struct hostapd_data *hapd, const u8 addr[ETH_ALEN], u16 *status, u16 msgtype, int snr_db,
++	struct intel_vendor_event_msg_drop *msg_dropped)
++{
++	errno_t err;
++	int ret = HOSTAPD_SOFTBLOCK_ACCEPT;
++	struct multi_ap_blacklist *found = NULL;
++
++	found = mxl_ieee802_11_multi_ap_blacklist_find(hapd, addr);
++
++	if (found) {
++		struct sta_info *sta;
++		sta = ap_get_sta(hapd, addr);
++		if (sta && (sta->flags & WLAN_STA_AUTHORIZED)) {
++			wpa_printf(MSG_DEBUG,
++				"SoftBlock: station is connected, allow");
++			return ret;
++		}
++		*status = found->status;
++		if ((found->snrAuthHWM == 0) && (found->snrAuthLWM == 0)) {
++			ret = HOSTAPD_MULTI_AP_BLACKLIST_FOUND;
++		} else {
++			/* Check if Softblock is disabled */
++			if (hapd->conf->mxl_bss_conf.sDisableSoftblock) {
++				wpa_printf(MSG_DEBUG,
++					"softblock is disabled");
++				return ret;
++			}
++			/* Check if the STA is candidate for softblock */
++			switch(msgtype) {
++				case WLAN_FC_STYPE_ASSOC_REQ:
++					*status = WLAN_STATUS_SUCCESS;
++					break; /* dont block on thresholds as of now */
++				case WLAN_FC_STYPE_AUTH:
++					if ((found->snrAuthHWM < snr_db) || (found->snrAuthLWM > snr_db)) {
++						msg_dropped->blocked = true;
++						msg_dropped->rx_snr = snr_db;
++						msg_dropped->msgtype = WLAN_FC_STYPE_AUTH;
++						err = memcpy_s(msg_dropped->addr, sizeof(msg_dropped->addr),
++							 addr, ETH_ALEN);
++						if (EOK != err) {
++							wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++							msg_dropped->reason = 0;
++							msg_dropped->rejected = false;
++							return HOSTAPD_SOFTBLOCK_DROP;
++						}
++						msg_dropped->broadcast = 0;
++						if (!found->status) {
++							/* Silently Ignore the message from STA and
++								consturct the msg to notify app of the drop event */
++							wpa_printf(MSG_DEBUG, "Softblock: Auth Req dropped, snr_db = %d",
++								snr_db);
++							msg_dropped->reason = 0; 
++							msg_dropped->rejected = false; /* Rejection not sent to STA */
++							ret = HOSTAPD_SOFTBLOCK_DROP;
++						}
++						else {
++							/* Notification will be done once the mesage is sent
++								to STA after all the subsequent checks */
++							wpa_printf(MSG_DEBUG, "Softblock: Auth Req reject, snr_db = %d",
++								snr_db);
++							msg_dropped->rejected = true; /* Rejection sent to STA */
++							ret = HOSTAPD_SOFTBLOCK_REJECT;
++						}
++					} else {
++						*status = WLAN_STATUS_SUCCESS;
++						wpa_printf(MSG_DEBUG, "Softblock: Auth Req allowed, snr_db = %d",
++							snr_db);
++						ret = HOSTAPD_SOFTBLOCK_ALLOWED;
++					}
++					break;
++				case WLAN_FC_STYPE_PROBE_REQ:
++					msg_dropped->broadcast = false;
++					msg_dropped->rx_snr = snr_db;
++					msg_dropped->msgtype = WLAN_FC_STYPE_PROBE_REQ;
++					msg_dropped->reason = 0;
++					msg_dropped->rejected = 0;
++					err = memcpy_s(msg_dropped->addr, sizeof(msg_dropped->addr),
++						 addr, ETH_ALEN);
++					if (EOK != err) {
++						wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++						msg_dropped->reason = 0;
++						msg_dropped->rejected = false;
++						return HOSTAPD_SOFTBLOCK_DROP;
++					}
++					if ((found->snrProbeHWM < snr_db) || (found->snrProbeLWM > snr_db)) {
++						/* Silently Ignore the message to STA and
++							construct the msg to notify app of the drop event */
++						wpa_printf(MSG_DEBUG, "SoftBlock: Probe Req dropped, snr_db = %d",
++						   snr_db);
++						msg_dropped->blocked = true;
++						mxl_hostapd_event_softblock_drop(hapd, msg_dropped);
++						ret = HOSTAPD_SOFTBLOCK_DROP;
++					} else {
++						wpa_printf(MSG_DEBUG, "SoftBlock: Probe Req allowed snr_db = %d",
++						   snr_db);
++						msg_dropped->blocked = false;
++						*status = WLAN_STATUS_SUCCESS;
++						ret = HOSTAPD_SOFTBLOCK_ALLOWED;
++					}
++					break;
++			}
++		}
++	}
++
++	return ret;
++}
++
++int mxl_ieee802_11_multi_ap_blacklist_add(struct hostapd_data *hapd,
++	struct multi_ap_blacklist *entry)
++{
++	errno_t err;
++	struct multi_ap_blacklist *found, *new_entry;
++
++	found = mxl_ieee802_11_multi_ap_blacklist_find(hapd, entry->addr);
++
++	if (found) {
++		found->status = entry->status;
++		found->snrProbeHWM = entry->snrProbeHWM;
++		found->snrProbeLWM = entry->snrProbeLWM;
++		found->snrAuthHWM = entry->snrAuthHWM;
++		found->snrAuthLWM = entry->snrAuthLWM;
++		return 0;
++	}
++
++	new_entry = os_malloc(sizeof(*entry));
++	if (!new_entry) {
++		wpa_printf(MSG_ERROR, "Failed to allocate memory for Multi-AP blacklist entry.");
++		return -1;
++	}
++	err = memcpy_s(new_entry, sizeof(*new_entry), entry, sizeof(*entry));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(new_entry);
++		return -1;
++	}
++
++	DL_LIST_ADD(&hapd->mxl_data.multi_ap_blacklist, new_entry, list);
++	return 0;
++}
++
++void mxl_ieee802_11_multi_ap_blacklist_remove(struct hostapd_data *hapd,
++	struct multi_ap_blacklist *entry)
++{
++	struct multi_ap_blacklist *found;
++
++	found = mxl_ieee802_11_multi_ap_blacklist_find(hapd, entry->addr);
++	if (found) {
++		dl_list_del(&found->list);
++		os_free(found);
++	}
++}
++
++static void mxl_ieee802_11_multi_ap_blacklist_flush(struct hostapd_data *hapd)
++{
++	struct multi_ap_blacklist *iter;
++
++	while ((iter = dl_list_first(&hapd->mxl_data.multi_ap_blacklist, struct multi_ap_blacklist,
++		list)) != NULL) {
++		dl_list_del(&iter->list);
++		os_free(iter);
++	}
++}
++
++int mxl_ieee802_11_multi_ap_blacklist_print(struct hostapd_data *hapd, char *buf,
++	size_t buflen)
++{
++	struct multi_ap_blacklist *iter;
++	int ret = 0, len = 0;
++
++	dl_list_for_each(iter, &hapd->mxl_data.multi_ap_blacklist, struct multi_ap_blacklist, list) {
++		ret = sprintf_s(buf + len, buflen - len, MACSTR" %hu\n", MAC2STR(iter->addr),
++			iter->status);
++		if (ret <= 0)
++			break;
++		len += ret;
++	}
++	return len;
++}
++
++static int mxl_drv_set_deny_mac_addr(struct hostapd_data *hapd,
++	const struct multi_ap_blacklist *entry, const u8 remove)
++{
++	int ret;
++	errno_t err;
++	struct intel_vendor_blacklist_cfg blacklist;
++
++	os_memset(&blacklist, 0, sizeof(blacklist));
++	err = memcpy_s(blacklist.addr, sizeof(blacklist.addr), entry->addr, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return -ENOBUFS;
++	}
++
++	blacklist.status = entry->status;
++	blacklist.remove = remove;
++	ret = MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_DENY_MAC, &blacklist, sizeof blacklist);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_DENY_MAC failed: %i (%s)",
++			ret, strerror(-ret));
++	else
++		wpa_printf(MSG_DEBUG, MACSTR " %s blacklist", MAC2STR(entry->addr),
++			remove ? "removed from" : "added to");
++
++	return ret;
++}
++
++static int mxl_drv_set_sta_softblock_thresholds(struct hostapd_data *hapd,
++	const struct multi_ap_blacklist *entry, const u8 remove)
++{
++	int ret;
++	errno_t err;
++	struct intel_vendor_blacklist_cfg blacklist;
++
++	err = memcpy_s(blacklist.addr, sizeof(blacklist.addr), entry->addr, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return -ENOBUFS;
++	}
++
++	blacklist.status = entry->status;
++	blacklist.remove = remove;
++	blacklist.snrProbeHWM = entry->snrProbeHWM;
++	blacklist.snrProbeLWM = entry->snrProbeLWM;
++	ret = MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_SOFTBLOCK_THRESHOLDS, &blacklist, sizeof blacklist);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_SOFTBLOCK failed: %i (%s)",
++			ret, strerror(-ret));
++	else
++		wpa_printf(MSG_DEBUG, MACSTR " %s Softblocklist", MAC2STR(entry->addr),
++			remove ? "removed from" : "added to");
++
++	return ret;
++}
++
++int mxl_ieee802_11_multi_ap_set_deny_mac(struct hostapd_data *hapd,
++	struct multi_ap_blacklist* entry, const u8 remove)
++{
++	int ret = mxl_drv_set_deny_mac_addr(hapd, entry, remove);
++	if (ret < 0)
++		return ret;
++	if (remove) {
++		if (!is_zero_ether_addr(entry->addr))
++			mxl_ieee802_11_multi_ap_blacklist_remove(hapd, entry);
++		else
++			mxl_ieee802_11_multi_ap_blacklist_flush(hapd);
++	} else
++		ret = mxl_ieee802_11_multi_ap_blacklist_add(hapd, entry);
++	return ret;
++}
++
++int mxl_ieee802_11_multi_ap_set_softblock_thresholds(struct hostapd_data *hapd,
++	struct multi_ap_blacklist* entry, const u8 remove)
++{
++	int ret;
++
++	if (!is_valid_ether_addr(entry->addr)) {
++		wpa_printf(MSG_DEBUG, "Softblock: Zero or multicast or broadcast eth addr not allowed");
++		return -1;
++	}
++
++	ret = mxl_drv_set_sta_softblock_thresholds(hapd, entry, remove);
++
++	if (ret < 0)
++		return ret;
++
++	if (remove) {
++		mxl_ieee802_11_multi_ap_blacklist_remove(hapd, entry);
++	} else {
++		ret = mxl_ieee802_11_multi_ap_blacklist_add(hapd, entry);
++	}
++
++	return ret;
++}
++
++int mxl_check_softblock_tresholds(struct hostapd_data *hapd, const u8 sa[ETH_ALEN], const u8 da[ETH_ALEN], int snr_db, struct intel_vendor_event_msg_drop *msg_dropped)
++{
++	u16 status;
++	/* Check for softblock thresholds now */
++	int softblock_res = mxl_hostapd_check_softblock(hapd, sa, &status, WLAN_FC_STYPE_PROBE_REQ,
++				snr_db, msg_dropped);
++
++	switch (softblock_res) {
++		case HOSTAPD_SOFTBLOCK_DROP:
++			if (is_multicast_ether_addr(da)) {
++				msg_dropped->broadcast = true; /* Its a bcast probe req */
++			}
++			mxl_hostapd_event_softblock_drop(hapd, msg_dropped);
++			break;
++		case HOSTAPD_SOFTBLOCK_ALLOWED:
++			/* Update the broadcast flag and notify the app once the Prb resp is sent */
++			if (is_multicast_ether_addr(da)) {
++				msg_dropped->broadcast = true; /* Its a bcast probe req */
++			}
++			break;
++		case HOSTAPD_MULTI_AP_BLACKLIST_FOUND:
++			/* Case when the STA is in blacklist not by softblock */
++			break;
++	}
++	return softblock_res;
++}
++
++bool mxl_hostapd_check_softblock_connect(struct hostapd_data *hapd, const u8 addr[ETH_ALEN], int *status)
++{
++	u16 status_u16 = *status;
++	int result = mxl_hostapd_check_softblock(hapd, addr, &status_u16, WLAN_FC_STYPE_ASSOC_REQ, 0, NULL);
++	*status = status_u16;
++	if (result == HOSTAPD_MULTI_AP_BLACKLIST_FOUND) {
++		wpa_printf(MSG_INFO, "STA " MACSTR " not allowed to connect", MAC2STR(addr));
++		return false;
++	} else {
++		return true;
++	}
++}
++
++void mxl_set_snr_db_for_current_frame(void *hapd, int snr_db)
++{
++	if (hapd) {
++		((struct hostapd_data*)hapd)->iface->mxl_iface.snr_db_current_frame = snr_db;
++	}
++}
+diff --git a/src/ap/mxl_softblock.h b/src/ap/mxl_softblock.h
+index 4eb63d616..ce15e7191 100644
+--- a/src/ap/mxl_softblock.h
++++ b/src/ap/mxl_softblock.h
+@@ -64,4 +64,35 @@ int mxl_hostapd_acl_drop_auth(struct hostapd_data *hapd, const u8 sa[ETH_ALEN],
+ #define SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_DEFAULT	WLAN_STATUS_UNSPECIFIED_FAILURE
+ #define SOFT_BLOCK_ON_PROBE_REQ_DEFAULT			SOFT_BLOCK_ON_PROBE_REQ_REJECT_BLOCKED
+ 
++enum {
++	HOSTAPD_SOFTBLOCK_ACCEPT = 0,
++	HOSTAPD_SOFTBLOCK_DROP = 1,
++	HOSTAPD_SOFTBLOCK_REJECT = 2,
++	HOSTAPD_MULTI_AP_BLACKLIST_FOUND = 3,
++	HOSTAPD_SOFTBLOCK_ALLOWED = 4
++};
++
++struct intel_vendor_event_msg_drop;
++struct multi_ap_blacklist;
++
++int mxl_ieee802_11_multi_ap_set_softblock_thresholds(struct hostapd_data *hapd,
++	struct multi_ap_blacklist* entry, const u8 remove);
++void mxl_ieee802_11_multi_ap_blacklist_remove(struct hostapd_data *hapd,
++	struct multi_ap_blacklist *entry);
++int mxl_ieee802_11_multi_ap_blacklist_add(struct hostapd_data *hapd,
++	struct multi_ap_blacklist *entry);
++struct multi_ap_blacklist * mxl_ieee802_11_multi_ap_blacklist_find(struct hostapd_data *hapd,
++	const u8 addr[ETH_ALEN]);
++int mxl_hostapd_check_softblock(struct hostapd_data *hapd, const u8 addr[ETH_ALEN], u16 *status,
++	u16 msgtype, int snr_db, struct intel_vendor_event_msg_drop *msg_dropped);
++bool mxl_hostapd_check_softblock_connect(struct hostapd_data *hapd, const u8 addr[ETH_ALEN], int *status);
++int mxl_check_softblock_tresholds(struct hostapd_data *hapd, const u8 sa[ETH_ALEN], const u8 da[ETH_ALEN],
++	int snr_db, struct intel_vendor_event_msg_drop *msg_dropped);
++
++void mxl_hostapd_event_softblock_drop(struct hostapd_data *hapd,
++		struct intel_vendor_event_msg_drop *msg_dropped);
++void mxl_hostapd_free_cached_events(struct hostapd_data *hapd);
++
++void mxl_set_snr_db_for_current_frame(void *hapd, int snr_db);
++
+ #endif /* MXL_SOFTBLOCK_H */
+diff --git a/src/common/mxl_ieee802_11_defs.h b/src/common/mxl_ieee802_11_defs.h
+index 9e6e431d8..e235fa9fe 100644
+--- a/src/common/mxl_ieee802_11_defs.h
++++ b/src/common/mxl_ieee802_11_defs.h
+@@ -66,5 +66,15 @@ struct rnr_neighbor_ap_info {
+ #define VHT_OPER_CHANWIDTH_160MHZ			2
+ #define VHT_OPER_CHANWIDTH_80P80MHZ			3
+ 
++struct multi_ap_blacklist {
++	struct dl_list list;
++	u8 addr[ETH_ALEN];
++	u16 status;
++	u8 snrProbeHWM;
++	u8 snrProbeLWM;
++	u8 snrAuthHWM;
++	u8 snrAuthLWM;
++};
++
+ #endif /* MXL_IEEE802_11_DEFS_H */
+ 
+diff --git a/src/common/mxl_vendor.h b/src/common/mxl_vendor.h
+index 4758ccf14..171f04efc 100644
+--- a/src/common/mxl_vendor.h
++++ b/src/common/mxl_vendor.h
+@@ -43,5 +43,6 @@ MXL_EXPORT_EVENT_API(mxl_drv_event_radar)
+ 
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_flush_stations)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_coc)
++MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_softblock_drop)
+ 
+ #endif /* MXL_VENDOR_H */
+diff --git a/src/common/mxl_wpa_ctrl.h b/src/common/mxl_wpa_ctrl.h
+index 9557c59d2..8d807cd35 100644
+--- a/src/common/mxl_wpa_ctrl.h
++++ b/src/common/mxl_wpa_ctrl.h
+@@ -23,4 +23,7 @@
+ #define ZWDFS_ANT_ENABLE "ZWDFS-ANT-ENABLE"
+ #define ZWDFS_ANT_DISABLE "ZWDFS-ANT-DISABLE"
+ 
++/* Event to indicate Sogtblock drop */
++#define LTQ_SOFTBLOCK_DROP "LTQ-SOFTBLOCK-DROP"
++
+ #endif /* MXL_WPA_CTRL_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 8f06131f9..80f3b835e 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -14,6 +14,13 @@
+ #ifndef _VENDOR_CMDS_H_
+ #define _VENDOR_CMDS_H_
+ 
++#ifdef __KERNEL__
++#define DEF_IEEE_ADDR(name) IEEE_ADDR name
++#else
++#define DEF_IEEE_ADDR(name) u8 name[ETH_ALEN]
++#endif
++
++
+ /*
+  * This file is a registry of identifier assignments from the Lantiq
+  * OUI AC:9A:96 for purposes other than MAC address assignment. New identifiers
+@@ -445,6 +452,14 @@ struct intel_vendor_sb_timer_acl_cfg {
+   int timer_acl_probe_drop;
+ } __attribute__ ((packed));
+ 
++struct intel_vendor_blacklist_cfg {
++  DEF_IEEE_ADDR(addr);
++  u16 status;
++  u8 remove;
++  u8 snrProbeHWM;
++  u8 snrProbeLWM;
++} __attribute__ ((packed));
++
+ /*******************************************************************************
+ *                           Event structures                                   *
+ *******************************************************************************/
+@@ -465,4 +480,15 @@ struct intel_vendor_event_coc {
+   u8 coc_is_max_nss;
+ } __attribute__ ((packed));
+ 
++struct intel_vendor_event_msg_drop {
++  DEF_IEEE_ADDR(addr);          /**< Client MAC Address         */
++  DEF_IEEE_ADDR(bssid);         /**< bssid of the vap           */
++  u8 msgtype;                   /**  Msgtype                    */
++  u8 rx_snr;                    /**< SNR in DB                  */
++  u8 blocked;                   /**< True if response blocked   */
++  u8 rejected;                  /**< True if Auth Resp with rejection sent to STA       */
++  u8 broadcast;                 /**< True if broadcast probe    */
++  u8 reason;                    /**< Ignore for Probe Req       */
++} __attribute__ ((packed));
++
+ #endif /* _VENDOR_CMDS_H_ */
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index d450efd28..e67027e60 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -24,6 +24,7 @@
+ #include "ap/mxl_hostapd.h"
+ #include "mxl_driver_nl80211.h"
+ #include "ap/mxl_dfs_common.h"
++#include "ap/mxl_softblock.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+@@ -3249,6 +3250,16 @@ static void mxl_nl80211_handle_coc(struct wpa_driver_nl80211_data *drv, const u8
+ 	mxl_drv_event_coc(drv->ctx, data, len);
+ }
+ 
++
++static void mxl_nl80211_handle_softblock_drop(struct wpa_driver_nl80211_data *drv,
++				const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive MXL vendor event:Softblock Drop, ctx=%p",
++		drv->ctx);
++
++	mxl_drv_event_softblock_drop(drv->ctx, data, len);
++}
++
+ #endif /* CONFIG_DRIVER_NL80211_MXL */
+ 
+ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+@@ -3261,6 +3272,9 @@ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 		case LTQ_NL80211_VENDOR_EVENT_RADAR_DETECTED:
+ 			mxl_nl80211_handle_radar(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_SOFTBLOCK_DROP:
++			mxl_nl80211_handle_softblock_drop(drv, data, len);
++			break;
+ 		case LTQ_NL80211_VENDOR_EVENT_COC_BEACON_UPDATE:
+ 			mxl_nl80211_handle_coc(drv, data, len);
+ 			break;
+@@ -4239,6 +4253,13 @@ int process_bss_event(struct nl_msg *msg, void *arg)
+ 
+ 	switch (gnlh->cmd) {
+ 	case NL80211_CMD_FRAME:
++#if defined(CONFIG_VENDOR_MXL) && !defined(CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT)
++		if (tb[NL80211_ATTR_RX_SNR_DB])
++			mxl_set_snr_db_for_current_frame(bss->drv->ctx, nla_get_u32(tb[NL80211_ATTR_RX_SNR_DB]));
++		else
++			mxl_set_snr_db_for_current_frame(bss->drv->ctx, 0);
++#endif /* CONFIG_VENDOR_MXL */
++	/* fallthrough */
+ 	case NL80211_CMD_FRAME_TX_STATUS:
+ 		mlme_event(bss, gnlh->cmd, tb[NL80211_ATTR_FRAME],
+ 			   tb[NL80211_ATTR_MAC], tb[NL80211_ATTR_TIMED_OUT],
+diff --git a/src/utils/mxl_common.h b/src/utils/mxl_common.h
+index 34fdc2f1c..01637eb5c 100644
+--- a/src/utils/mxl_common.h
++++ b/src/utils/mxl_common.h
+@@ -38,4 +38,17 @@ static inline void __dl_list_add_obj(struct dl_list *list, void *obj, struct dl_
+ 	dl_list_add(list, item);
+ }
+ 
++static inline int is_valid_ether_addr(const u8 *a)
++{
++	/* FF:FF:FF:FF:FF:FF is a multicast address so we
++	 * don't need to explicitly check for it here.
++	 */
++	return !is_multicast_ether_addr(a) && !is_zero_ether_addr(a);
++}
++
++#define MXL_HAPD_BROADCAST ((struct hostapd_data *) -1)
++
++#define IS_VALID_U8_RANGE(val) IS_VALID_RANGE(val, 0, UINT8_MAX)
++
++#define UNUSED_VAR(var) ((void)(var))
+ #endif /* MXL_COMMON_H */
+diff --git a/tests/fuzzing/ap-mgmt/ap-mgmt.c b/tests/fuzzing/ap-mgmt/ap-mgmt.c
+index d49ac5f08..4168ed35d 100644
+--- a/tests/fuzzing/ap-mgmt/ap-mgmt.c
++++ b/tests/fuzzing/ap-mgmt/ap-mgmt.c
+@@ -154,6 +154,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
+ 	eloop_run();
+ 	wpa_printf(MSG_DEBUG, "eloop done");
+ 	hostapd_free_stas(&ctx.hapd);
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_free_cached_events(&ctx.hapd);
++#endif /* CONFIG_VENDOR_MXL */
+ 	hostapd_free_hw_features(ctx.hapd.iface->hw_features,
+ 				 ctx.hapd.iface->num_hw_features);
+ 
+-- 
+2.43.0
+

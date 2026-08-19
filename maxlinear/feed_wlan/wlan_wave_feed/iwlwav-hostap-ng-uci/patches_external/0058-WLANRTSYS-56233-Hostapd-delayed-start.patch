@@ -1,0 +1,270 @@
+From e8f9e6b67199e66c7090256c30ebdcb650fb8b86 Mon Sep 17 00:00:00 2001
+From: Dmitrijs Martinovs <dmartinovs@maxlinear.com>
+Date: Mon, 19 Jun 2023 12:39:04 +0200
+Subject: [PATCH] WLANRTSYS-56233: Hostapd delayed start
+
+---
+ hostapd/config_file.c |  18 ++++++
+ hostapd/ctrl_iface.c  |  15 +++++
+ src/ap/ap_config.c    |   2 +
+ src/ap/ap_config.h    |   6 ++
+ src/ap/hostapd.c      | 131 ++++++++++++++++++++++++++++++++++++++++++
+ 5 files changed, 172 insertions(+)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index 0878a7415..d3789dc83 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -5645,6 +5645,24 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		conf->adv_proto_query_resp_len = (unsigned)val;
++	} else if (os_strcmp(buf, "start_after") == 0) {
++		os_strlcpy(conf->start_after, pos, IFNAMSIZ);
++	} else if (os_strcmp(buf, "start_after_delay") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, IFACE_START_DELAY_MIN, IFACE_START_DELAY_MAX)) {
++			wpa_printf(MSG_ERROR, "line %d: start_after_delay value %d outside of valid range %d..%d",
++			line, val, IFACE_START_DELAY_MIN, IFACE_START_DELAY_MAX);
++			return 1;
++		}
++		conf->start_after_delay = val;
++	} else if (os_strcmp(buf, "start_after_watchdog_time") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, IFACE_START_DELAY_MIN, IFACE_START_DELAY_MAX)) {
++			wpa_printf(MSG_ERROR, "line %d: start_after_watchdog_time value %d outside of valid range %d..%d",
++			line, val, IFACE_START_DELAY_MIN, IFACE_START_DELAY_MAX);
++			return 1;
++		}
++		conf->start_after_watchdog_time = val;
+ 	} else if (os_strcmp(buf, "owl") == 0) {
+ 		int val = atoi(pos);
+ 		if (!IS_VALID_BOOL_RANGE(val)) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index db971c559..a90057027 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1384,6 +1384,21 @@ static int hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd)
+ 	} else if (os_strcasecmp(cmd, "dpp_resp_retry_time") == 0) {
+ 		hapd->dpp_resp_retry_time = atoi(value);
+ #endif /* CONFIG_DPP */
++	} else if (os_strcasecmp(cmd, "start_disabled") == 0) {
++		int val;
++
++		val = atoi(value);
++		if (val < 0 || val > 1) {
++			wpa_printf(MSG_DEBUG,
++				"start_disabled value is out of range (can be 0 or 1)");
++			return -1;
++		}
++
++		hapd->conf->start_disabled = val;
++
++		if (hapd->started && !hapd->conf->start_disabled &&
++		    ieee802_11_set_beacon(hapd) < 0)
++		    return -1;
+ 	} else if (os_strcasecmp(cmd, "setband") == 0) {
+ 		ret = hostapd_ctrl_iface_set_band(hapd, value);
+ 	} else {
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index d64ed4252..f230ed2c2 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -375,6 +375,8 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 
+ 	conf->sMuOperation = DEFAULT_MU_OPERATION;
+ 	conf->override_6g_mbssid_default_mode = 0;
++	conf->start_after_delay = 30;
++	conf->start_after_watchdog_time = 120;
+ 	conf->mbssid_aid_offset = NON_MULTIBSS_AID_OFFSET;
+ 	conf->ext_cap_max_num_msdus_in_amsdu = EXT_CAP_MAX_NUM_MSDU_IN_AMSDU_DEFAULT;
+ 	conf->sFilsBeaconFlag = 1; /* By Default we should receive/process the incoming Fils frame on 6G */
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 824be96b6..187ca23a1 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1404,6 +1404,9 @@ struct hostapd_config {
+ 	int sMuOperation;
+ 	int override_6g_mbssid_default_mode;
+ 	unsigned adv_proto_query_resp_len;	/* Advertisement protocol IE */
++	char start_after[IFNAMSIZ + 1];
++	int start_after_delay;
++	int start_after_watchdog_time;
+ 
+ 	u8 owl; /* Forwarding incoming probe reqests to upper layers */
+ #ifdef CONFIG_IEEE80211AX
+@@ -1521,6 +1524,9 @@ hostapd_set_oper_centr_freq_seg1_idx(struct hostapd_config *conf,
+ 	conf->vht_oper_centr_freq_seg1_idx = oper_centr_freq_seg1_idx;
+ }
+ 
++#define IFACE_START_DELAY_MIN 1
++#define IFACE_START_DELAY_MAX 600
++
+ /* Advertisement protocol IE*/
+ #define ADV_PROTO_QUERY_RESP_LEN_MIN		1u
+ #define ADV_PROTO_QUERY_RESP_LEN_MAX		0x7fu
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 4acfe4860..385db1504 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -3249,6 +3249,62 @@ fail:
+ 	return -1;
+ }
+ 
++#define DELAYED_START_FILENAME_FMT "/tmp/%s_start_after_%s"
++static int delayed_iface_file_create(struct hostapd_iface *hapd_iface) {
++	char filename[PATH_MAX + 1];
++
++	int ret = sprintf_s(filename, PATH_MAX,
++	DELAYED_START_FILENAME_FMT,
++	hapd_iface->bss[MASTER_VAP_BSS_IDX]->conf->iface,
++	hapd_iface->conf->start_after);
++
++	if (0 >= ret) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++
++	FILE *file = fopen(filename, "w");
++	if(NULL == file)
++		return -1;
++	fclose(file);
++	return 0;
++}
++
++static bool delayed_iface_file_present(struct hostapd_iface *hapd_iface) {
++	char filename[PATH_MAX + 1];
++
++	int ret = sprintf_s(filename, PATH_MAX, DELAYED_START_FILENAME_FMT,
++	hapd_iface->bss[MASTER_VAP_BSS_IDX]->conf->iface,
++	hapd_iface->conf->start_after);
++
++	if (0 >= ret) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return false;
++	}
++
++	return os_file_exists(filename);
++}
++
++void delayed_iface_watchdog_cb(void *eloop_ctx, void *user_data) {
++	struct hostapd_data *hapd = eloop_ctx;
++	eloop_cancel_timeout(delayed_iface_watchdog_cb, hapd, NULL);
++
++	if(HAPD_IFACE_ENABLED != hapd->iface->state) {
++		wpa_msg(hapd->msg_ctx, MSG_WARNING,
++		"Forcing enablement of interface on %d(s) timeout\n",
++		hapd->iface->conf->start_after_watchdog_time);
++		if(hostapd_setup_interface_complete_sync(hapd->iface, EOK))
++			wpa_msg(hapd->msg_ctx, MSG_ERROR, "Failed to enable interface\n");
++		else
++		{
++			if(delayed_iface_file_create(hapd->iface)) {
++				wpa_msg(hapd->msg_ctx, MSG_ERROR, "Failed to open control file for %s after %s started\n",
++				hapd->iface->bss[MASTER_VAP_BSS_IDX]->conf->iface, hapd->iface->conf->start_after);
++				return;
++			}
++		}
++	}
++}
+ 
+ /**
+  * hostapd_setup_interface_complete - Complete interface setup
+@@ -3265,6 +3321,20 @@ int hostapd_setup_interface_complete(struct hostapd_iface *iface, int err)
+ 	unsigned int i;
+ 	int not_ready_in_sync_ifaces = 0;
+ 
++	if(iface->conf->start_after[0] != 0 && !delayed_iface_file_present(iface)) {
++		wpa_printf(MSG_DEBUG, "%s:%d start of %s delayed until %s is up",
++		__func__, __LINE__, iface->bss[MASTER_VAP_BSS_IDX]->conf->iface, iface->conf->start_after);
++
++		if (!eloop_is_timeout_registered(delayed_iface_watchdog_cb, hapd, NULL)) {
++					eloop_register_timeout(iface->conf->start_after_watchdog_time,
++					0, delayed_iface_watchdog_cb, hapd, NULL);
++		} else {
++			wpa_printf(MSG_DEBUG, "%s:%d watchdog already registered for iface:%s",
++									__func__, __LINE__, hapd->conf->iface);
++		}
++		return 0;
++	}
++
+ 	if (!iface->need_to_start_in_sync)
+ 		return hostapd_setup_interface_complete_sync(iface, err);
+ 
+@@ -4612,12 +4682,73 @@ const char * hostapd_state_text(enum hostapd_iface_state s)
+ }
+ 
+ 
++void enable_iface_delayed_cb(void *eloop_ctx, void *user_data)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	struct hostapd_iface *iface = user_data;
++	eloop_cancel_timeout(enable_iface_delayed_cb, hapd, iface);
++
++	/* Already in DFS or Enabled state.
++	  Might happen due to watchdog timer expired
++	  on start_after_watchdog_time
++	  and enabled delayed interface already. */
++	if(iface->state > HAPD_IFACE_HT_SCAN)
++		return;
++
++	if(hostapd_setup_interface_complete_sync(iface, EOK)) {
++		wpa_msg(hapd->msg_ctx, MSG_ERROR,
++			"Failed to enable iface:%s\n",
++			iface->bss[MASTER_VAP_BSS_IDX]->conf->iface);
++	} else {
++		wpa_msg(hapd->msg_ctx, MSG_INFO, "Enabled iface %s after %s\n",
++			iface->bss[MASTER_VAP_BSS_IDX]->conf->iface, iface->conf->start_after);
++
++		if(delayed_iface_file_create(iface)) {
++			wpa_msg(hapd->msg_ctx, MSG_ERROR,
++					"Failed to open control file for %s after %s started\n",
++					iface->bss[MASTER_VAP_BSS_IDX]->conf->iface,
++					iface->conf->start_after);
++			return;
++		}
++	}
++}
++
++static void hostapd_enable_dependent_iface(struct hostapd_iface *iface)
++{
++	int i;
++
++	for (i = 0; i < iface->interfaces->count; i++) {
++		struct hostapd_iface *delayed_iface = iface->interfaces->iface[i];
++		if(delayed_iface->conf->start_after[0] != 0 && !delayed_iface_file_present(delayed_iface)) {
++			struct hostapd_data *current_hapd = iface->bss[MASTER_VAP_BSS_IDX];
++			int start_after_delay = delayed_iface->conf->start_after_delay;
++			if(!os_strcmp(delayed_iface->conf->start_after, current_hapd->conf->iface)) {
++#ifndef CONFIG_NO_STDOUT_DEBUG
++				struct hostapd_data *delayed_hapd = delayed_iface->bss[MASTER_VAP_BSS_IDX];
++#endif
++				wpa_printf(MSG_DEBUG, "%s:%d current iface:%s delayed:%s start_after_delay:%d",
++						__func__, __LINE__, current_hapd->conf->iface,
++							delayed_hapd->conf->iface, start_after_delay);
++				if (!eloop_is_timeout_registered(enable_iface_delayed_cb, current_hapd, delayed_iface))
++					eloop_register_timeout(start_after_delay, 0, enable_iface_delayed_cb,
++											current_hapd, delayed_iface);
++				else
++					wpa_printf(MSG_DEBUG, "%s:%d time out already registered for iface:%s",
++						__func__, __LINE__, delayed_hapd->conf->iface);
++			}
++		}
++	}
++}
++
+ void hostapd_set_state(struct hostapd_iface *iface, enum hostapd_iface_state s)
+ {
+ 	wpa_printf(MSG_INFO, "%s: interface state %s->%s",
+ 		   iface->conf ? iface->conf->bss[0]->iface : "N/A",
+ 		   hostapd_state_text(iface->state), hostapd_state_text(s));
+ 	iface->state = s;
++
++	if(HAPD_IFACE_ENABLED == s)
++		hostapd_enable_dependent_iface(iface);
+ }
+ 
+ 
+-- 
+2.43.0
+

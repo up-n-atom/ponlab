@@ -1,0 +1,898 @@
+From 0afd031e3f963235f012e75b26b16d32e9f1df9c Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Tue, 27 Dec 2022 10:31:21 +0100
+Subject: [PATCH] WLANRTSYS-51362: SoftBlock timer based ACL implementation
+
+---
+ hostapd/Makefile              |   1 +
+ hostapd/mxl_config.c          |  45 +++++-
+ hostapd/mxl_ctrl_iface.c      | 188 +++++++++++++++++++++---
+ src/ap/beacon.c               |   8 +
+ src/ap/hostapd.c              |  10 ++
+ src/ap/ieee802_11.c           |  10 ++
+ src/ap/mxl_config.h           |  10 ++
+ src/ap/mxl_hostapd.c          |  39 +++++
+ src/ap/mxl_hostapd.h          |   4 +
+ src/ap/mxl_softblock.c        | 268 ++++++++++++++++++++++++++++++++++
+ src/ap/mxl_softblock.h        |  67 +++++++++
+ src/common/vendor_cmds_copy.h |  15 ++
+ src/utils/mxl_common.h        |  10 ++
+ 13 files changed, 654 insertions(+), 21 deletions(-)
+ create mode 100644 src/ap/mxl_softblock.c
+ create mode 100644 src/ap/mxl_softblock.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 0fca86790..9370b4b5c 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -370,6 +370,7 @@ OBJS += ../src/ap/mxl_dfs_common.o
+ OBJS += ../src/ap/mxl_sub_band_dfs.o
+ OBJS += ../src/ap/mxl_dfs_file.o
+ OBJS += ../src/ap/mxl_zwdfs.o
++OBJS += ../src/ap/mxl_softblock.o
+ endif
+ 
+ include ../src/drivers/drivers.mak
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 1d41c5221..f1f4a7a15 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -119,8 +119,44 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->background_cac = val;
++	} else if (os_strcmp(buf, "soft_block_acl_enable") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid soft_block_acl_enable %d", line, val);
++			return 0;
++		}
++		mxl_bss_conf->soft_block_acl_enable = val;
++	} else if (os_strcmp(buf, "soft_block_acl_wait_time") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, SOFT_BLOCK_WAIT_TIME_MIN, SOFT_BLOCK_WAIT_TIME_MAX)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid soft_block_acl_wait_time %d", line, val);
++			return 0;
++		}
++		mxl_bss_conf->soft_block_acl_wait_time = (unsigned)val;
++	} else if (os_strcmp(buf, "soft_block_acl_allow_time") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, SOFT_BLOCK_ALLOW_TIME_MIN, SOFT_BLOCK_ALLOW_TIME_MAX)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid soft_block_acl_allow_time %d", line, val);
++			return 0;
++		}
++		mxl_bss_conf->soft_block_acl_allow_time = (unsigned)val;
++	} else if (os_strcmp(buf, "soft_block_acl_on_probe_req") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, SOFT_BLOCK_ON_PROBE_REQ_MIN, SOFT_BLOCK_ON_PROBE_REQ_MAX)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid soft_block_acl_on_probe_req %d", line, val);
++			return 0;
++		}
++		mxl_bss_conf->soft_block_acl_on_probe_req = val;
++	} else if (os_strcmp(buf, "soft_block_acl_on_auth_req") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_MIN, SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_MAX)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid soft_block_acl_on_auth_req %d", line, val);
++			return 0;
++		}
++		mxl_bss_conf->soft_block_acl_on_auth_req = val;
+ 	} else
+ 		return 0;
++
+ 	return 1;
+ }
+ 
+@@ -128,7 +164,13 @@ void mxl_hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ {
+ 	/* no need to initlize with 0 or NULL - this is done by hostapd with memset */
+ 	struct mxl_hostapd_bss_config *mxl_bss_conf = &bss->mxl_bss_conf;
+-	(void)mxl_bss_conf;
++
++	/* Soft Block ACL */
++	mxl_bss_conf->soft_block_acl_enable = SOFT_BLOCK_ENABLE_DEFAULT;
++	mxl_bss_conf->soft_block_acl_wait_time = SOFT_BLOCK_WAIT_TIME_DEFAULT;
++	mxl_bss_conf->soft_block_acl_allow_time = SOFT_BLOCK_ALLOW_TIME_DEFAULT;
++	mxl_bss_conf->soft_block_acl_on_probe_req = SOFT_BLOCK_ON_PROBE_REQ_DEFAULT;
++	mxl_bss_conf->soft_block_acl_on_auth_req = SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_DEFAULT;
+ }
+ 
+ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+@@ -149,6 +191,7 @@ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss)
+ {
+ 	struct mxl_hostapd_bss_config *mxl_bss_conf = &bss->mxl_bss_conf;
++	mxl_hostapd_soft_block_acl_clear_list(&mxl_bss_conf->deny_mac_sb);
+ 	(void)mxl_bss_conf;
+ }
+ 
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 0ab4f5231..2dc387df0 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -16,14 +16,17 @@
+ #include "utils/includes.h"
+ #include "utils/common.h"
+ #include "ap/ap_config.h"
++#include "config_file.h"
+ #include "ap/hostapd.h"
+ #include "ap/beacon.h"
+ #include "ap/ap_drv_ops.h"
++#include "ap/sta_info.h"
+ #include "ap/mxl_config.h"
+ #include "ap/mxl_hostapd.h"
+ #include "drivers/mxl_driver_nl80211.h"
+ #include "mxl_ctrl_iface.h"
+ #include "ap/ctrl_iface_ap.h"
++#include "ap/mxl_softblock.h"
+ 
+ struct hostapd_data *mxl_get_bss_index(const char *cmd, struct hostapd_iface *iface)
+ {
+@@ -320,6 +323,130 @@ static int mxl_hostapd_ctrl_iface_get_zwdfs_antenna(struct hostapd_data *hapd, c
+ 	return res;
+ }
+ 
++static int mxl_hostapd_soft_block_acl_comp(const void *a, const void *b)
++{
++	const struct soft_block_acl_entry * const *aa = a;
++	const struct soft_block_acl_entry * const *bb = b;
++	return os_memcmp((*aa)->addr, (*bb)->addr, sizeof(macaddr));
++}
++
++
++static int mxl_hostapd_soft_block_add_acl_maclist(struct soft_block_acl_db *acl, const u8 *addr)
++{
++	struct soft_block_acl_entry *newacl;
++	struct soft_block_acl_entry **newindexes;
++
++	if (acl->num == 0) {
++		dl_list_init(&acl->acls);
++	}
++
++	newacl = os_malloc(sizeof(struct soft_block_acl_entry));
++	if (!newacl) {
++		wpa_printf(MSG_ERROR, "Soft Block MAC new entry allocation failed");
++		return -1;
++	}
++
++	newindexes = os_realloc_array(acl->indexes, acl->num + 1, sizeof(acl->indexes[0]));
++	if (!newindexes) {
++		free(newacl);
++		wpa_printf(MSG_ERROR, "Soft Block MAC list reallocation failed");
++		return -1;
++	}
++
++	acl->indexes = newindexes;
++	memcpy_s(newacl->addr,ETH_ALEN, addr, ETH_ALEN);
++	newacl->wait_handler = NULL;
++	newacl->allow_handler = NULL;
++	newacl->eloop_ctx = NULL;
++	newacl->user_ctx = NULL;
++	DL_LIST_ADD(&acl->acls, newacl, list);
++	acl->indexes[acl->num] = newacl;
++	acl->num++;
++
++	return 0;
++}
++
++static void mxl_hostapd_soft_block_disassoc_deny_mac(struct hostapd_data *hapd)
++{
++	struct sta_info *sta;
++
++	for (sta = hapd->sta_list; sta; sta = sta->next) {
++		if (mxl_hostapd_soft_block_maclist_found(&hapd->conf->mxl_bss_conf.deny_mac_sb, sta->addr))
++			ap_sta_disconnect(hapd, sta, sta->addr, WLAN_REASON_UNSPECIFIED);
++	}
++}
++
++static int mxl_hostapd_ctrl_iface_soft_block_acl_add_mac(struct soft_block_acl_db *acl, const char *cmd)
++{
++	u8 addr[ETH_ALEN];
++	int ret = 0;
++
++	if (hwaddr_aton(cmd, addr))
++		return -1;
++
++	if (!mxl_hostapd_soft_block_maclist_found(acl, addr)) {
++		ret = mxl_hostapd_soft_block_add_acl_maclist(acl, addr);
++		if (ret != -1 && acl->indexes)
++			qsort(acl->indexes, acl->num, sizeof(acl->indexes), mxl_hostapd_soft_block_acl_comp);
++	}
++
++	return ret < 0 ? -1 : 0;
++}
++
++static int mxl_hostapd_ctrl_iface_soft_block_acl_del_mac(struct soft_block_acl_db *acl, const char *txtaddr)
++{
++	u8 addr[ETH_ALEN];
++
++	if (!(acl->num))
++		return 0;
++
++	if (hwaddr_aton(txtaddr, addr))
++		return -1;
++
++	if (mxl_hostapd_soft_block_maclist_found(acl, addr))
++		mxl_hostapd_soft_block_remove_acl_mac(acl, addr);
++
++	return 0;
++}
++
++static int mxl_hostapd_ctrl_iface_soft_block_acl_show_mac(struct soft_block_acl_db *acl, char *buf, size_t buflen)
++{
++	int i = 0, len = 0, ret = 0;
++
++	if (NULL == acl)
++		return 0;
++
++	while (i < acl->num) {
++		ret = sprintf_s(buf + len, buflen - len,
++				MACSTR"\n", MAC2STR(acl->indexes[i]->addr));
++		if (ret <= 0)
++			return len;
++		i++;
++		len += ret;
++	}
++	return len;
++}
++
++static int mxl_hostapd_ctrl_iface_soft_block_acl_get_params(struct hostapd_data *hapd, char *buf, size_t buflen)
++{
++
++	int ret;
++
++	ret = os_snprintf(buf, buflen,
++			  "soft_block_acl_enable=%d\n"
++			  "soft_block_acl_wait_time=%u\n"
++			  "soft_block_acl_allow_time=%u\n"
++			  "soft_block_acl_on_probe_req=%d\n"
++			  "soft_block_acl_on_auth_req=%d\n",
++			  hapd->conf->mxl_bss_conf.soft_block_acl_enable,
++			  hapd->conf->mxl_bss_conf.soft_block_acl_wait_time,
++			  hapd->conf->mxl_bss_conf.soft_block_acl_allow_time,
++			  hapd->conf->mxl_bss_conf.soft_block_acl_on_probe_req,
++			  hapd->conf->mxl_bss_conf.soft_block_acl_on_auth_req);
++
++	return  (os_snprintf_error(buflen, ret)) ? 0 : ret;
++}
++
+ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -393,7 +520,7 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			}
+ 		}
+ 	} else if (os_strncmp(buf, "DENY_ACL ", sizeof("DENY_ACL ") -1) == 0) {
+-		char *buf_start, *mac;
++		char *buf_start, *mac, *is_softblock;
+ 		int len;
+ 		struct hostapd_data *bss = mxl_get_bss_index(buf + sizeof("DENY_ACL ") - 1, hapd->iface);
+ 		if(!bss)
+@@ -403,26 +530,47 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			if (!IS_VALID_RANGE(len, AP_MIN_VALID_CHAR, len - 1)) {
+ 				buf_start = buf + sizeof("DENY_ACL ") - 1 + len + sizeof(" ") - 1;
+ 				mac = buf_start + sizeof("ADD_MAC ") - 1;
+-				if (os_strncmp(buf_start, "ADD_MAC ", sizeof("ADD_MAC ") - 1) == 0) {
+-					if (!mxl_hostapd_ctrl_iface_acl_add_mac(
++				is_softblock = os_strstr(buf_start, "TIMER");
++				if (is_softblock) { /* softblock deny list */
++					if (os_strncmp(buf_start, "ADD_MAC ", sizeof("ADD_MAC ") - 1) == 0) {
++						if (!mxl_hostapd_ctrl_iface_soft_block_acl_add_mac(
++								&bss->conf->mxl_bss_conf.deny_mac_sb, mac))
++							mxl_hostapd_soft_block_disassoc_deny_mac(bss);
++					} else if (os_strncmp(buf_start, "DEL_MAC ", sizeof("DEL_MAC ") - 1) == 0) {
++						mxl_hostapd_ctrl_iface_soft_block_acl_del_mac(
++							&bss->conf->mxl_bss_conf.deny_mac_sb, mac);
++					} else if (os_strncmp(buf_start, "SHOW", sizeof("SHOW") -1) == 0) {
++						*reply_len = mxl_hostapd_ctrl_iface_soft_block_acl_show_mac(
++							&bss->conf->mxl_bss_conf.deny_mac_sb, reply, reply_size);
++					} else if (os_strncmp(buf_start, "CLEAR", sizeof("CLEAR") -1) == 0) {
++						mxl_hostapd_soft_block_acl_clear_list(
++							&bss->conf->mxl_bss_conf.deny_mac_sb);
++					} else if (os_strncmp(buf_start, "GET_PARAMS", sizeof("GET_PARAMS") -1) == 0) {
++						*reply_len = mxl_hostapd_ctrl_iface_soft_block_acl_get_params(
++							bss, reply, reply_size);
++					}
++				} else { /* regular deny list */
++					if (os_strncmp(buf_start, "ADD_MAC ", sizeof("ADD_MAC ") - 1) == 0) {
++						if (!mxl_hostapd_ctrl_iface_acl_add_mac(
++								&bss->conf->deny_mac,
++								&bss->conf->num_deny_mac, mac))
++							mxl_hostapd_disassoc_deny_mac(bss);
++						else
++							*reply_len = -1;
++					} else if (os_strncmp(buf_start, "DEL_MAC ", sizeof("DEL_MAC ") - 1) == 0) {
++						if (mxl_hostapd_ctrl_iface_acl_del_mac(
++							   &bss->conf->deny_mac,
++							   &bss->conf->num_deny_mac, mac))
++							*reply_len = -1;
++					} else if (os_strncmp(buf_start, "SHOW", sizeof("SHOW") -1) == 0) {
++						*reply_len = mxl_hostapd_ctrl_iface_acl_show_mac(
++							bss->conf->deny_mac,
++							bss->conf->num_deny_mac, reply, reply_size);
++					} else if (os_strncmp(buf_start, "CLEAR", sizeof("CLEAR") -1) == 0) {
++						mxl_hostapd_ctrl_iface_acl_clear_list(
+ 							&bss->conf->deny_mac,
+-							&bss->conf->num_deny_mac, mac))
+-						mxl_hostapd_disassoc_deny_mac(bss);
+-					else
+-						*reply_len = -1;
+-				} else if (os_strncmp(buf_start, "DEL_MAC ", sizeof("DEL_MAC ") - 1) == 0) {
+-					if (mxl_hostapd_ctrl_iface_acl_del_mac(
+-						   &bss->conf->deny_mac,
+-						   &bss->conf->num_deny_mac, mac))
+-						*reply_len = -1;
+-				} else if (os_strncmp(buf_start, "SHOW", sizeof("SHOW") -1) == 0) {
+-					*reply_len = mxl_hostapd_ctrl_iface_acl_show_mac(
+-						bss->conf->deny_mac,
+-						bss->conf->num_deny_mac, reply, reply_size);
+-				} else if (os_strncmp(buf_start, "CLEAR", sizeof("CLEAR") -1) == 0) {
+-					mxl_hostapd_ctrl_iface_acl_clear_list(
+-						&bss->conf->deny_mac,
+-						&bss->conf->num_deny_mac);
++							&bss->conf->num_deny_mac);
++					}
+ 				}
+ 			} else {
+ 				*reply_len = -1;
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index df2920751..50bb2ed3e 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -1457,6 +1457,14 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	/* Soft Block ACL */
++	if (res == EXACT_SSID_MATCH) {
++		if(mxl_hostapd_acl_drop_probe(hapd, mgmt->sa))
++			return;
++	}
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (hapd->conf->ignore_broadcast_ssid && res == WILDCARD_SSID_MATCH) {
+ 		wpa_printf(MSG_MSGDUMP, "Probe Request from " MACSTR " for "
+ 			   "broadcast SSID ignored", MAC2STR(mgmt->sa));
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 20456c605..0cf5c8be2 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1344,6 +1344,11 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 			os_memcpy(hapd->own_addr, if_addr, ETH_ALEN);
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_hostapd_setup_bss_pre(hapd))
++		return -1;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (conf->wmm_enabled < 0)
+ 		conf->wmm_enabled = hapd->iconf->ieee80211n |
+ 			hapd->iconf->ieee80211ax;
+@@ -1582,6 +1587,11 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 	if (hapd->wpa_auth && wpa_init_keys(hapd->wpa_auth) < 0)
+ 		return -1;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (mxl_hostapd_setup_bss_post(hapd))
++		return -1;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	return 0;
+ }
+ 
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 739eda29d..eb647ea11 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -2988,6 +2988,16 @@ static void handle_auth(struct hostapd_data *hapd,
+ 		}
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	switch (mxl_hostapd_acl_drop_auth(hapd, sa, &resp)) {
++		case SOFT_BLOCK_ACL_DROP:
++			return;
++		case SOFT_BLOCK_ACL_AUTH_RESP_FORCED:
++			goto fail;
++		/* continue if SOFT_BLOCK_ACL_ALLOW */
++	}
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	res = ieee802_11_allowed_address(hapd, sa, (const u8 *) mgmt, len,
+ 					 &rad_info);
+ 	if (res == HOSTAPD_ACL_REJECT) {
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 7b93a5cb9..4c1e605d0 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -14,6 +14,8 @@
+ #ifndef MXL_CONFIG_H
+ #define MXL_CONFIG_H
+ 
++#include "mxl_softblock.h"
++
+ /**
+  * struct mxl_hostapd_config - Per-radio interface configuration
+  */
+@@ -38,6 +40,14 @@ struct mxl_hostapd_config {
+  * struct mxl_hostapd_bss_config - Per-BSS configuration
+  */
+ struct mxl_hostapd_bss_config {
++
++	/* Soft Block ACL */
++	struct soft_block_acl_db deny_mac_sb;
++	int soft_block_acl_enable;
++	unsigned soft_block_acl_wait_time;
++	unsigned soft_block_acl_allow_time;
++	int soft_block_acl_on_probe_req;
++	int soft_block_acl_on_auth_req;
+ };
+ 
+ struct hostapd_config;
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 003fc5911..2e93553b4 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -162,6 +162,45 @@ void mxl_hostapd_free_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ 	sta->aid = 0;
+ }
+ 
++int mxl_hostapd_setup_interface(struct hostapd_data *hapd)
++{
++	struct mxl_hostapd_config *mxl_conf = &hapd->iconf->mxl_conf;
++	struct mxl_hostapd_bss_config *mxl_bss_conf = &hapd->conf->mxl_bss_conf;
++	(void)mxl_conf;
++	(void)mxl_bss_conf;
++
++	/* Add next vendor command here */
++	return 0;
++}
++
++int mxl_hostapd_setup_bss_pre(struct hostapd_data *hapd)
++{
++	struct mxl_hostapd_bss_config *mxl_bss_conf = &hapd->conf->mxl_bss_conf;
++	struct intel_vendor_sb_timer_acl_cfg sb_timer_acl_cfg = { 0 };
++	(void)mxl_bss_conf;
++
++	if (mxl_hostapd_setup_interface(hapd))
++		return -1;
++
++	sb_timer_acl_cfg.timer_acl_on = mxl_bss_conf->soft_block_acl_enable;
++	sb_timer_acl_cfg.timer_acl_probe_drop =
++		(mxl_bss_conf->soft_block_acl_on_probe_req == SOFT_BLOCK_ON_PROBE_REQ_REJECT_ALL) ? 1 : 0;
++	if (MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_SET_SB_TIMER_ACL_CFG,
++			(u8*)&sb_timer_acl_cfg, sizeof(sb_timer_acl_cfg)))
++		wpa_printf(MSG_WARNING, "SET_SB_TIMER_ACL_CFG failed");
++
++	return 0;
++}
++
++
++int mxl_hostapd_setup_bss_post(struct hostapd_data *hapd)
++{
++	struct mxl_hostapd_bss_config *mxl_bss_conf = &hapd->conf->mxl_bss_conf;
++	struct mxl_hostapd_config *mxl_conf = &hapd->iconf->mxl_conf;
++	(void)mxl_bss_conf;
++	(void)mxl_conf;
++	return 0;
++}
+ 
+ int mxl_hostapd_drv_get_vendor_data(struct hostapd_data *hapd,
+ 			unsigned int vendor_id, unsigned int subcmd,
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index d83444cae..c71e1ae76 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -109,6 +109,10 @@ struct hostapd_channel_data* mxl_hostapd_hw_get_channel_data(struct hostapd_ifac
+ int hostapd_chan_to_freq(int channel, bool op_class_6g);
+ int is_24ghz_op_class(u8 op_class);
+ int is_5ghz_op_class(u8 op_class);
++int mxl_hostapd_setup_interface(struct hostapd_data *hapd);
++int mxl_hostapd_setup_bss_pre(struct hostapd_data *hapd);
++int mxl_hostapd_setup_bss_post(struct hostapd_data *hapd);
++
+ void mxl_hostapd_driver_init(struct hostapd_iface *iface, struct wpa_init_params *params);
+ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface);
+ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx);
+diff --git a/src/ap/mxl_softblock.c b/src/ap/mxl_softblock.c
+new file mode 100644
+index 000000000..9fc9b536b
+--- /dev/null
++++ b/src/ap/mxl_softblock.c
+@@ -0,0 +1,268 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "utils/list.h"
++#include "mxl_softblock.h"
++#include "hostapd.h"
++
++static void mxl_softblock_cancel_timeout(eloop_timeout_handler handler, void *eloop_ctx, void *user_ctx)
++{
++	if (handler) {
++		if (eloop_is_timeout_registered(handler, eloop_ctx, user_ctx)) {
++			eloop_cancel_timeout(handler, eloop_ctx, user_ctx);
++		}
++	}
++}
++
++void mxl_hostapd_soft_block_remove_acl_mac(struct soft_block_acl_db *acl, const u8 *addr)
++{
++	int i = 0;
++
++	while (i < acl->num) {
++		if (os_memcmp(acl->indexes[i]->addr, addr, ETH_ALEN) == 0) {
++			mxl_softblock_cancel_timeout(acl->indexes[i]->wait_handler, acl->indexes[i]->eloop_ctx, acl->indexes[i]->user_ctx);
++			mxl_softblock_cancel_timeout(acl->indexes[i]->allow_handler, acl->indexes[i]->eloop_ctx, acl->indexes[i]->user_ctx);
++			dl_list_del(&acl->indexes[i]->list);
++			os_free(acl->indexes[i]);
++			os_remove_in_array(acl->indexes, acl->num, sizeof(acl->indexes[0]), i);
++			acl->num--;
++		} else {
++			i++;
++		}
++	}
++}
++
++void mxl_hostapd_soft_block_acl_clear_list(struct soft_block_acl_db *acl)
++{
++	int i;
++
++	for (i = 0; i < acl->num; i++) {
++		mxl_softblock_cancel_timeout(acl->indexes[i]->wait_handler, acl->indexes[i]->eloop_ctx, acl->indexes[i]->user_ctx);
++		mxl_softblock_cancel_timeout(acl->indexes[i]->allow_handler, acl->indexes[i]->eloop_ctx, acl->indexes[i]->user_ctx);
++		os_free(acl->indexes[i]);
++	}
++	os_free(acl->indexes);
++	acl->indexes = NULL;
++	acl->num = 0;
++	dl_list_init(&acl->acls);
++}
++
++
++/**
++ * mxl_hostapd_soft_block_maclist_entry_get - Find an entry with specified MAC address from soft block list
++ * @acl: soft block MAC address list
++ * @addr: Address to search for
++ * Returns: pointer to the entry in the list or NULL.
++ *
++ * Perform a binary search for given MAC address from a pre-sorted list.
++ */
++static struct soft_block_acl_entry* mxl_hostapd_soft_block_maclist_entry_get(struct soft_block_acl_db *acl, const u8 *addr)
++{
++	int start, end, middle, res;
++	struct soft_block_acl_entry *found_entry = NULL;
++
++	start = 0;
++	end = acl->num - 1;
++
++	while (start <= end) {
++		middle = (start + end) / 2;
++		res = os_memcmp(acl->indexes[middle]->addr, addr, ETH_ALEN);
++		if (res == 0) {
++			found_entry = acl->indexes[middle];
++			break;
++		}
++		if (res < 0)
++			start = middle + 1;
++		else
++			end = middle - 1;
++	}
++
++	return found_entry;
++}
++
++/**
++ * hostapd_softblock_maclist_found - Find a MAC address from soft block list
++ * @acl: soft block MAC address list
++ * @addr: Address to search for
++ * Returns: 1 if address is in the list or 0 if not.
++ *
++ * Perform a binary search for given MAC address from a pre-sorted list.
++ */
++int mxl_hostapd_soft_block_maclist_found(struct soft_block_acl_db *acl,  const u8 *addr)
++{
++	return (mxl_hostapd_soft_block_maclist_entry_get(acl, addr) == NULL ? 0 : 1);
++}
++
++
++static void mxl_hostapd_soft_block_acl_allow_time_eloop(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	const u8 *addr = timeout_ctx;
++	struct soft_block_acl_entry *blocked;
++
++	/* might be removed already */
++	blocked = mxl_hostapd_soft_block_maclist_entry_get(&hapd->conf->mxl_bss_conf.deny_mac_sb, addr);
++	if (!blocked)
++		return;
++
++	eloop_cancel_timeout(mxl_hostapd_soft_block_acl_allow_time_eloop, hapd, blocked->addr);
++	/* block */
++	blocked->allow_handler = NULL;
++
++	wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " ALLOW_TIME elapsed",
++		MAC2STR(blocked->addr));
++}
++
++static void mxl_hostapd_soft_block_acl_wait_time_eloop(void *eloop_ctx, void *timeout_ctx)
++{
++	struct hostapd_data *hapd = eloop_ctx;
++	const u8 *addr = timeout_ctx;
++	struct soft_block_acl_entry *blocked;
++
++	/* might be removed already */
++	blocked = mxl_hostapd_soft_block_maclist_entry_get(&hapd->conf->mxl_bss_conf.deny_mac_sb, addr);
++	if (!blocked)
++		return;
++
++	/* unblock */
++	eloop_cancel_timeout(mxl_hostapd_soft_block_acl_wait_time_eloop, hapd, blocked->addr);
++	blocked->wait_handler = NULL;
++
++	wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " WAIT_TIME elapsed",
++		MAC2STR(blocked->addr));
++
++	/* no allow time means allow forever */
++	if (0 >= hapd->conf->mxl_bss_conf.soft_block_acl_allow_time)
++		return;
++
++	blocked->allow_handler = mxl_hostapd_soft_block_acl_allow_time_eloop;
++	blocked->eloop_ctx = hapd;
++	blocked->user_ctx = blocked->addr;
++	eloop_register_timeout(hapd->conf->mxl_bss_conf.soft_block_acl_allow_time / 1000u,
++		(hapd->conf->mxl_bss_conf.soft_block_acl_allow_time % 1000u) * 1000u,
++		mxl_hostapd_soft_block_acl_allow_time_eloop, hapd, blocked->addr);
++
++	wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " ALLOW_TIME started for %d ms",
++		MAC2STR(blocked->addr), hapd->conf->mxl_bss_conf.soft_block_acl_allow_time);
++
++}
++
++static int mxl_hostapd_soft_block_acl_allow(struct hostapd_data *hapd, struct soft_block_acl_entry *entry)
++{
++	if (0 >= hapd->conf->mxl_bss_conf.soft_block_acl_wait_time)
++		return 1;
++	if (!entry)
++		return 1;
++	if (entry->allow_handler)
++		return 1;
++
++	return 0;
++}
++
++static int mxl_hostapd_soft_block_acl_client_status(struct hostapd_data *hapd, const u8 *addr, u16 frame_type, u16 *status)
++{
++	struct soft_block_acl_entry *blocked;
++	int res = SOFT_BLOCK_ACL_ALLOW;
++
++	if (status)
++		*status = WLAN_STATUS_SUCCESS;
++
++	if (!hapd->conf->mxl_bss_conf.soft_block_acl_enable)
++		goto end;
++
++	if (frame_type == WLAN_FC_STYPE_PROBE_REQ) {
++		if (hapd->conf->mxl_bss_conf.soft_block_acl_on_probe_req == SOFT_BLOCK_ON_PROBE_REQ_REJECT_ALL) {
++			res = SOFT_BLOCK_ACL_DROP;
++			goto end;
++		}
++	}
++
++	blocked = mxl_hostapd_soft_block_maclist_entry_get(&hapd->conf->mxl_bss_conf.deny_mac_sb, addr);
++	if (mxl_hostapd_soft_block_acl_allow(hapd, blocked)) {
++		res = SOFT_BLOCK_ACL_ALLOW;
++		goto end;
++	}
++
++	switch (frame_type) {
++		case WLAN_FC_STYPE_PROBE_REQ:
++			res = SOFT_BLOCK_ACL_DROP;
++			if (hapd->conf->mxl_bss_conf.soft_block_acl_on_probe_req == SOFT_BLOCK_ON_PROBE_REQ_REPLY_ALL) {
++				res = SOFT_BLOCK_ACL_ALLOW;
++			}
++		break;
++		case WLAN_FC_STYPE_AUTH:
++			res = SOFT_BLOCK_ACL_AUTH_RESP_FORCED;
++			if (status)
++				*status = hapd->conf->mxl_bss_conf.soft_block_acl_on_auth_req;
++
++			if (hapd->conf->mxl_bss_conf.soft_block_acl_on_auth_req == SOFT_BLOCK_ON_AUTH_REQ_REJECT_ALL) {
++				res = SOFT_BLOCK_ACL_DROP;
++				if (status)
++					*status = WLAN_STATUS_UNSPECIFIED_FAILURE;
++			}
++		break;
++		default:
++			res = SOFT_BLOCK_ACL_ALLOW;
++			goto end;
++	}
++
++	if (!blocked->wait_handler) {
++		/* shouldn't happen, but just in case: cancel eloop */
++		if (eloop_is_timeout_registered(mxl_hostapd_soft_block_acl_wait_time_eloop, hapd, blocked->addr))
++			eloop_cancel_timeout(mxl_hostapd_soft_block_acl_wait_time_eloop, hapd, blocked->addr);
++
++		blocked->wait_handler = mxl_hostapd_soft_block_acl_wait_time_eloop;
++		blocked->eloop_ctx = hapd;
++		blocked->user_ctx = blocked->addr;
++		eloop_register_timeout(hapd->conf->mxl_bss_conf.soft_block_acl_wait_time / 1000u,
++			(hapd->conf->mxl_bss_conf.soft_block_acl_wait_time % 1000u) * 1000u,
++			mxl_hostapd_soft_block_acl_wait_time_eloop, hapd, blocked->addr);
++		wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " WAIT_TIME started for %u ms",
++			MAC2STR(blocked->addr), hapd->conf->mxl_bss_conf.soft_block_acl_wait_time);
++	}
++
++end:
++	return res;
++}
++
++bool mxl_hostapd_acl_drop_probe(struct hostapd_data *hapd, const u8 sa[ETH_ALEN])
++{
++	int sb_acl = mxl_hostapd_soft_block_acl_client_status(hapd, sa, WLAN_FC_STYPE_PROBE_REQ, NULL);
++	if (SOFT_BLOCK_ACL_DROP == sb_acl) {
++		wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " PROBE dropped",
++		MAC2STR(sa));
++		return true;
++	}
++	wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " PROBE accepted",
++	MAC2STR(sa));
++	return false;
++}
++
++int mxl_hostapd_acl_drop_auth(struct hostapd_data *hapd, const u8 sa[ETH_ALEN], u16 *resp) {
++	int sb_acl = mxl_hostapd_soft_block_acl_client_status(hapd, sa, WLAN_FC_STYPE_AUTH, resp);
++	if (SOFT_BLOCK_ACL_DROP == sb_acl) {
++		wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " AUTH is dropped",
++			MAC2STR(sa));
++		return SOFT_BLOCK_ACL_DROP;
++	}
++	if (SOFT_BLOCK_ACL_AUTH_RESP_FORCED == sb_acl) {
++		wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " AUTH STATUS forced to %d",
++			MAC2STR(sa), *resp);
++		return SOFT_BLOCK_ACL_AUTH_RESP_FORCED;
++	}
++	wpa_printf(MSG_DEBUG, "SofBLock ACL: STA " MACSTR " AUTH accepted",
++		MAC2STR(sa));
++	return SOFT_BLOCK_ACL_ALLOW;
++}
+diff --git a/src/ap/mxl_softblock.h b/src/ap/mxl_softblock.h
+new file mode 100644
+index 000000000..4eb63d616
+--- /dev/null
++++ b/src/ap/mxl_softblock.h
+@@ -0,0 +1,67 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_SOFTBLOCK_H
++#define MXL_SOFTBLOCK_H
++
++#include "utils/eloop.h"
++
++struct soft_block_acl_entry {
++	struct dl_list list;
++	u8 addr[ETH_ALEN];
++	eloop_timeout_handler wait_handler;
++	eloop_timeout_handler allow_handler;
++	void *eloop_ctx;
++	void *user_ctx;
++};
++
++struct soft_block_acl_db {
++	struct dl_list acls;
++	struct soft_block_acl_entry **indexes;
++	int num;
++};
++
++void mxl_hostapd_soft_block_remove_acl_mac(struct soft_block_acl_db *acl, const u8 *addr);
++void mxl_hostapd_soft_block_acl_clear_list(struct soft_block_acl_db *acl);
++
++enum {
++	SOFT_BLOCK_ACL_ALLOW,
++	SOFT_BLOCK_ACL_DROP,
++	SOFT_BLOCK_ACL_AUTH_RESP_FORCED
++};
++
++struct hostapd_data;
++int mxl_hostapd_soft_block_maclist_found(struct soft_block_acl_db *acl,  const u8 *addr);
++bool mxl_hostapd_acl_drop_probe(struct hostapd_data *hapd, const u8 sa[ETH_ALEN]);
++int mxl_hostapd_acl_drop_auth(struct hostapd_data *hapd, const u8 sa[ETH_ALEN], u16 *resp);
++
++#define SOFT_BLOCK_WAIT_TIME_MIN				0
++#define SOFT_BLOCK_WAIT_TIME_MAX				100000u
++#define SOFT_BLOCK_ALLOW_TIME_MIN				0
++#define SOFT_BLOCK_ALLOW_TIME_MAX				100000u
++#define SOFT_BLOCK_ON_AUTH_REQ_REJECT_ALL		0
++#define SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_MIN	SOFT_BLOCK_ON_AUTH_REQ_REJECT_ALL
++#define SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_MAX	WLAN_STATUS_SAE_HASH_TO_ELEMENT
++#define SOFT_BLOCK_ON_PROBE_REQ_REJECT_ALL		0
++#define SOFT_BLOCK_ON_PROBE_REQ_REJECT_BLOCKED	1
++#define SOFT_BLOCK_ON_PROBE_REQ_REPLY_ALL		2
++#define SOFT_BLOCK_ON_PROBE_REQ_MIN				SOFT_BLOCK_ON_PROBE_REQ_REJECT_ALL
++#define SOFT_BLOCK_ON_PROBE_REQ_MAX				SOFT_BLOCK_ON_PROBE_REQ_REPLY_ALL
++
++#define SOFT_BLOCK_ENABLE_DEFAULT				0
++#define SOFT_BLOCK_WAIT_TIME_DEFAULT			10000u
++#define SOFT_BLOCK_ALLOW_TIME_DEFAULT			15000u
++#define SOFT_BLOCK_ON_AUTH_REQ_STATUS_CODE_DEFAULT	WLAN_STATUS_UNSPECIFIED_FAILURE
++#define SOFT_BLOCK_ON_PROBE_REQ_DEFAULT			SOFT_BLOCK_ON_PROBE_REQ_REJECT_BLOCKED
++
++#endif /* MXL_SOFTBLOCK_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index c70b1042f..8f06131f9 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -428,12 +428,27 @@ enum ltq_nl80211_vendor_events {
+ };
+ 
+ 
++
++/*******************************************************************************
++*                           Command structures                                 *
++*******************************************************************************/
++
+ struct mxl_ml_sta_info {
+   u8 addr[ETH_ALEN];
+   u16 sid;
+   u16 aid;
+ } __attribute__ ((packed));
+ 
++/* SoftBlock Timer ACL configuration */
++struct intel_vendor_sb_timer_acl_cfg {
++  int timer_acl_on;
++  int timer_acl_probe_drop;
++} __attribute__ ((packed));
++
++/*******************************************************************************
++*                           Event structures                                   *
++*******************************************************************************/
++
+ /* Data for EVENT_LTQ_RADAR events */
+ struct intel_vendor_radar {
+   s32 width; /* enum nl80211_chan_width (drv) -> enum chan_width (hostap) */
+diff --git a/src/utils/mxl_common.h b/src/utils/mxl_common.h
+index c93fe9c53..34fdc2f1c 100644
+--- a/src/utils/mxl_common.h
++++ b/src/utils/mxl_common.h
+@@ -28,4 +28,14 @@
+ #define ENOK -1
+ #endif
+ 
++/* Helper function for correct Klocwork analysis.
++ * This function have to be added to KW database:
++ * __dl_list_add_obj - XMRF $2 : 0
++ */
++#define DL_LIST_ADD(list, obj, item)	__dl_list_add_obj(list, (obj), &(obj)->item)
++static inline void __dl_list_add_obj(struct dl_list *list, void *obj, struct dl_list *item)
++{
++	dl_list_add(list, item);
++}
++
+ #endif /* MXL_COMMON_H */
+-- 
+2.43.0
+

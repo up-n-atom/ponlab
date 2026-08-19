@@ -1,0 +1,1205 @@
+From 309ed927f8f14522676f9b5306ffe0c7e2cb01de Mon Sep 17 00:00:00 2001
+From: rportnikh <rportnikh@maxlinear.com>
+Date: Tue, 5 Sep 2023 12:57:56 +0300
+Subject: [PATCH] 
+ WLANRTSYS-58388-add-support-for-ctrl-interface-per-vap-to-updk-hosatapd
+
+---
+ hostapd/Makefile          |   4 +
+ hostapd/ctrl_iface.c      |  80 ++++--------
+ hostapd/hostapd_cli.c     | 269 +++++++++++++++++++++++++++++---------
+ hostapd/mxl_ctrl_iface.c  |  61 +++++----
+ hostapd/mxl_ctrl_iface.h  |   2 +-
+ hostapd/mxl_hostapd_cli.c |  12 +-
+ hostapd/mxl_hostapd_cli.h |  14 +-
+ src/ap/ctrl_iface_ap.c    |  24 +---
+ src/ap/mxl_wds.c          |   6 +-
+ 9 files changed, 306 insertions(+), 166 deletions(-)
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 9ebee8eaf..971fb9f7d 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -1337,6 +1337,10 @@ ifdef CONFIG_WIFI_CERTIFICATION
+ CFLAGS += -DCONFIG_WIFI_CERTIFICATION
+ endif
+ 
++ifdef CONFIG_CTRL_IFACE_PER_RADIO
++CFLAGS += -DCONFIG_CTRL_IFACE_PER_RADIO
++endif
++
+ $(DESTDIR)$(BINDIR)/%: %
+ 	install -D $(<) $(@)
+ 
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 6fab569f7..00f50643b 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -646,16 +646,14 @@ static int hostapd_ctrl_iface_hs20_wnm_notif(struct hostapd_data *hapd,
+ 	u8 addr[ETH_ALEN];
+ 	const char *url;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (NULL == hapd) {
+ 		return -1;
+ 	}
+-
+-	cmd = os_strchr(cmd, ' ');
++	
+ 	if (NULL == cmd) {
+ 		return -1;
+ 	}
+-	cmd++;
+ 
+ 	if (hwaddr_aton(cmd, addr))
+ 		return -1;
+@@ -683,17 +681,15 @@ static int hostapd_ctrl_iface_hs20_deauth_req(struct hostapd_data *hapd,
+ 	size_t url_len;
+ 	struct wpabuf *req;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (NULL == hapd) {
+ 		return -1;
+ 	}
+-
+-	cmd = os_strchr(cmd, ' ');
++	
+ 	if (NULL == cmd) {
+ 		return -1;
+ 	}
+-	cmd++;
+-
++	
+ 	/* <STA MAC Addr> <Code(0/1)> <Re-auth-Delay(sec)> [URL] */
+ 	if (hwaddr_aton(cmd, addr))
+ 		return -1;
+@@ -746,16 +742,14 @@ static int hostapd_ctrl_iface_set_qos_map_set(struct hostapd_data *hapd,
+ 	const char *pos = cmd;
+ 	int val, ret;
+ 
+-	hapd = mxl_get_bss_index(pos, hapd->iface);
++	hapd = mxl_get_bss_index(&pos, hapd, true, true);
+ 	if (NULL == hapd) {
+ 		return -1;
+ 	}
+ 
+-	pos = os_strchr(pos, ' ');
+ 	if (NULL == pos) {
+ 		return -1;
+ 	}
+-	pos++;
+ 
+ 	for (;;) {
+ 		if (count == sizeof(qos_map_set)) {
+@@ -804,16 +798,14 @@ static int hostapd_ctrl_iface_send_qos_map_conf(struct hostapd_data *hapd,
+ 	u8 qos_map_set_len = hapd->conf->qos_map_set_len;
+ 	int ret;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (NULL == hapd) {
+ 		return -1;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+ 	if (NULL == cmd) {
+ 		return -1;
+ 	}
+-	cmd++;
+ 
+ 	if (!qos_map_set_len) {
+ 		wpa_printf(MSG_INFO, "QoS Map Set is not set");
+@@ -4023,7 +4015,7 @@ static int hostapd_ctrl_iface_set_neighbor_per_vap(struct hostapd_data *hapd, ch
+ 	char *tmp;
+ 	int ret;
+ 
+-	hapd = mxl_get_bss_index(buf, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &buf, hapd, true, true);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_INFO,
+ 			   "CTRL: SET_NEIGHBOR_PER_VAP - there is no iface with the given name");
+@@ -4037,10 +4029,7 @@ static int hostapd_ctrl_iface_set_neighbor_per_vap(struct hostapd_data *hapd, ch
+ 		return -1;
+ 	}
+ 
+-	buf = os_strchr(buf, ' ');
+-	if (buf)
+-		buf++;
+-	else {
++	if(!buf) {
+ 		wpa_printf(MSG_INFO,
+ 			   "CTRL: SET_NEIGHBOR_PER_VAP - neighbor BSSID is missing");
+ 		return -1;
+@@ -4163,17 +4152,14 @@ static int hostapd_ctrl_iface_remove_neighbor_per_vap(struct hostapd_data *hapd,
+ 	u8 bssid[ETH_ALEN];
+ 	char *tmp;
+ 
+-	hapd = mxl_get_bss_index(buf, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &buf, hapd, true, true);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_INFO,
+ 				"CTRL: REMOVE_NEIGHBOR_PER_VAP - there is no iface with the given name");
+ 		return -1;
+ 	}
+ 
+-	buf = os_strchr(buf, ' ');
+-	if (buf)
+-		buf++;
+-	else {
++	if(!buf) {
+ 		wpa_printf(MSG_INFO,
+ 				"CTRL: REMOVE_NEIGHBOR_PER_VAP - neighbor BSSID is missing");
+ 		return -1;
+@@ -4197,7 +4183,7 @@ static int hostapd_ctrl_iface_remove_neighbor_per_vap(struct hostapd_data *hapd,
+ static int hostapd_ctrl_iface_clean_neighbordb_per_vap(struct hostapd_data *hapd,
+ 					      char *buf)
+ {
+-	hapd = mxl_get_bss_index(buf, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &buf, hapd, true, false);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_INFO,
+ 				"CTRL: CLEAN_NEIGHBOR_DB_PER_VAP - there is no iface with the given name");
+@@ -4569,7 +4555,7 @@ static int hostapd_ctrl_iface_get_sta_measurements(struct hostapd_data *hapd,
+ 	struct intel_vendor_sta_info sta_info;
+ 	struct sta_info *sta;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (hapd == NULL) {
+ 		ret = sprintf_s(buf, buflen, "FAIL\n");
+ 		if (ret <= 0) {
+@@ -4579,10 +4565,7 @@ static int hostapd_ctrl_iface_get_sta_measurements(struct hostapd_data *hapd,
+ 		return ret;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+-	if (cmd)
+-		cmd++;
+-	else {
++	if(!cmd) {
+ 		ret = sprintf_s(buf, buflen, "FAIL\n");
+ 		if (ret <= 0) {
+ 			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+@@ -4798,7 +4781,7 @@ static int hostapd_ctrl_iface_get_vap_measurements(struct hostapd_data *hapd,
+ 	int ret, len = 0;
+ 	struct intel_vendor_vap_info vap_info;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, false);
+ 	if (hapd == NULL) {
+ 		ret = sprintf_s(buf, buflen, "FAIL: bss index\n");
+ 		if (ret <= 0) {
+@@ -5539,7 +5522,7 @@ static int hostapd_ctrl_iface_set_csa_deauth(struct hostapd_data *hapd,
+ 	int ret;
+ 	char *str, *pos2;
+ 
+-	hapd = mxl_get_bss_index(pos, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &pos, hapd, true, false);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_INFO,
+ 				"CTRL: SET_CSA_DEAUTH - there is no iface with the given name");
+@@ -5583,7 +5566,7 @@ static int hostapd_ctrl_iface_get_csa_deauth (struct hostapd_data *hapd, const c
+ {
+ 	int ret, len = 0;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, false);
+ 	if (hapd == NULL) {
+ 		ret = sprintf_s(buf, buflen, "CTRL: GET_CSA_DEAUTH - there is no iface with the given name\n");
+ 		if (ret <= 0) {
+@@ -5620,7 +5603,8 @@ static int hostapd_ctrl_iface_set_bss_load(struct hostapd_data *hapd, const char
+ 	int ret;
+ 	int is_enable;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
++
+ 	if (hapd == NULL) {
+ 		ret = sprintf_s(buf, buflen, "FAIL\n");
+ 		if (ret <= 0) {
+@@ -5630,9 +5614,7 @@ static int hostapd_ctrl_iface_set_bss_load(struct hostapd_data *hapd, const char
+ 		return ret;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+ 	if (cmd) {
+-		cmd++;
+ 		is_enable = atoi(cmd);
+ 		if (!IS_VALID_BOOL_RANGE(is_enable)) {
+ 			wpa_printf(MSG_ERROR, "set_bss_load: invalid value");
+@@ -5665,17 +5647,13 @@ static int hostapd_ctrl_iface_get_sta_wpa_psk(struct hostapd_data *hapd, char *c
+ 	struct sta_info *sta;
+ 	const char *key_id, *wpa_passphrase;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &cmd, hapd, true, true);
+ 	if (hapd == NULL) {
+ 		wpa_printf(MSG_ERROR, "Could not find the provided BSS name");
+ 		return -1;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+-	if (cmd) {
+-		cmd++;
+-	}
+-	else {
++	if(!cmd) {
+ 		wpa_printf(MSG_ERROR, "No STA MAC address provided");
+ 		return -1;
+ 	}
+@@ -5711,19 +5689,18 @@ static int hostapd_ctrl_iface_send_action_frame(struct hostapd_data *hapd, char
+ 	char *tmp;
+ 	int ret;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &cmd, hapd, true, true);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_ERROR,
+ 				"CTRL: SEND_ACTION_FRAME - there is no iface with the given name");
+ 		return -1;
+ 	}
+-	cmd = os_strchr(cmd, ' ');
++	
+ 	if (!cmd) {
+ 		wpa_printf(MSG_ERROR,
+ 				"CTRL: SEND_ACTION_FRAME - mac address is missing");
+ 		return -1;
+ 	}
+-	cmd++;
+ 
+ 	if (hwaddr_aton(cmd, addr)) {
+ 		wpa_printf(MSG_ERROR,
+@@ -5775,16 +5752,14 @@ static int hostapd_ctrl_iface_update_wan_metrics(struct hostapd_data *hapd,
+ {
+ 	char buf[128];
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (NULL == hapd) {
+ 		return -1;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+ 	if (NULL == cmd) {
+ 		return -1;
+ 	}
+-	cmd++;
+ 
+ 	os_strlcpy(buf, cmd, 128);
+ 	wpa_printf(MSG_DEBUG, "hostapd_ctrl_iface_update_wan_metrics, bss=%s", hapd->conf->iface);
+@@ -5855,7 +5830,7 @@ static int hostapd_ctrl_iface_cellular_pref_set(struct hostapd_data *hapd, char
+ 	char *token, *context = NULL;
+ 	int val;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index((const char**)&cmd, hapd, true, true);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_INFO,
+ 				"CTRL: CELLULAR_PREF_SET - there is no iface with the given name");
+@@ -5874,10 +5849,7 @@ static int hostapd_ctrl_iface_cellular_pref_set(struct hostapd_data *hapd, char
+ 		return -1;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+-	if (cmd)
+-		cmd++;
+-	else {
++	if(!cmd) {
+ 		wpa_printf(MSG_INFO,
+ 				"CTRL: CELLULAR_PREF_SET - Cellular Preference is missing");
+ 		return -1;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 0ebb66053..7526723eb 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -384,16 +384,22 @@ static int hostapd_cli_cmd_deauthenticate(struct wpa_ctrl *ctrl, int argc,
+ 					  char *argv[])
+ {
+ 	char buf[64];
+-	if (argc < 2) {
+-		printf("Invalid 'deauthenticate' command - two arguments: "
+-		       "BSS name and STA address are required.\n");
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	if (argc < argc_num) {
++		printf("Invalid 'deauthenticate' command - %d argument(s): "
++		       "(%sSTA addr) %s required\n", argc_num,
++		       argc_num == 2 ? "BSS name and " : "", argc_num == 2 ? "are" : "is");
+ 		return -1;
+ 	}
+-	if (argc > 2)
++	if (argc > argc_num)
+ 		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s %s %s",
+-			    argv[0], argv[1], argv[2]);
++			    argv[0], argv[1], argc_num == 2 ? argv[2] : "");
+ 	else
+-		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s %s", argv[0], argv[1]);
++		os_snprintf(buf, sizeof(buf), "DEAUTHENTICATE %s %s",
++				argv[0], argc_num == 2 ? argv[1] : "");
+ 	return wpa_ctrl_command(ctrl, buf);
+ }
+ 
+@@ -402,16 +408,22 @@ static int hostapd_cli_cmd_disassociate(struct wpa_ctrl *ctrl, int argc,
+ 					char *argv[])
+ {
+ 	char buf[64];
+-	if (argc < 1) {
+-		printf("Invalid 'disassociate' command - two arguments: "
+-		       "BSS name and STA address are required.\n");
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	if (argc < argc_num) {
++		printf("Invalid 'disassociate' command - %d argument(s): "
++		       "(%sSTA addr) %s required\n", argc_num,
++		       argc_num == 2 ? "BSS name and " : "", argc_num == 2 ? "are" : "is");
+ 		return -1;
+ 	}
+-	if (argc > 2)
++	if (argc > argc_num)
+ 		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s %s %s",
+-			    argv[0], argv[1], argv[2]);
++			    argv[0], argv[1], argc_num == 2 ? argv[2] : "");
+ 	else
+-		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s %s", argv[0], argv[1]);
++		os_snprintf(buf, sizeof(buf), "DISASSOCIATE %s %s",
++				argv[0], argc_num == 2 ? argv[1] : "");
+ 	return wpa_ctrl_command(ctrl, buf);
+ }
+ 
+@@ -792,9 +804,13 @@ static int hostapd_cli_cmd_all_sta(struct wpa_ctrl *ctrl, int argc,
+ 	char addr[32], cmd[64];
+ 	int res, total;
+ 	char *tmp;
+-
+-	if (argc != 1) {
+-		printf("Invalid ALL_STA command\n usage: <BSS_name>\n");
++	int argc_num = 0;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	if (argc != argc_num) {
++		printf("Invalid ALL_STA command %s\n ",
++ 				argc_num == 1 ? "\nusage: <BSS_name>" : "");
+ 		return -1;
+ 	}
+ 
+@@ -806,7 +822,7 @@ static int hostapd_cli_cmd_all_sta(struct wpa_ctrl *ctrl, int argc,
+ 
+ 	total = res;
+ 	tmp = cmd + total;
+-	res = sprintf_s(tmp, sizeof(cmd) - total, " %s", argv[0]);
++	res = sprintf_s(tmp, sizeof(cmd) - total, " %s", argc_num == 1 ? argv[0] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -816,7 +832,8 @@ static int hostapd_cli_cmd_all_sta(struct wpa_ctrl *ctrl, int argc,
+ 		return 0;
+ 
+ 	do {
+-		res = sprintf_s(cmd, sizeof(cmd), "STA-NEXT %s %s", argv[0], addr);
++		res = sprintf_s(cmd, sizeof(cmd), "STA-NEXT %s%s%s", argc_num == 1 ? argv[0] : "",
++				argc_num == 1 ? " " : "", addr);
+ 		if (res <= 0) {
+ 			printf("%s: sprintf_s error %d", __func__, res);
+ 			return -1;
+@@ -879,15 +896,21 @@ static int hostapd_cli_cmd_set_qos_map_set(struct wpa_ctrl *ctrl,
+ {
+ 	char buf[200];
+ 	int res;
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
++	if (argc != argc_num) {
+ 		printf("Invalid 'set_qos_map_set' command - "
+-		       "two arguments (BSS name and comma delimited QoS map set) "
+-		       "are needed\n");
++		       "%d argument(s) (%scomma delimited QoS map set) "
++		       "%s needed\n", argc_num, argc_num == 2 ? "BSS name and " : "",
++		       argc_num == 2 ? "are" : "is");
+ 		return -1;
+ 	}
+ 
+-	res = os_snprintf(buf, sizeof(buf), "SET_QOS_MAP_SET %s %s", argv[0], argv[1]);
++	res = os_snprintf(buf, sizeof(buf), "SET_QOS_MAP_SET %s %s",
++		  		argv[0], argc_num == 2 ? argv[1] : "");
+ 	if (os_snprintf_error(sizeof(buf), res))
+ 		return -1;
+ 	return wpa_ctrl_command(ctrl, buf);
+@@ -899,14 +922,20 @@ static int hostapd_cli_cmd_send_qos_map_conf(struct wpa_ctrl *ctrl,
+ {
+ 	char buf[50];
+ 	int res;
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
++	if (argc != argc_num) {
+ 		printf("Invalid 'send_qos_map_conf' command - "
+-		       "two arguments (BSS name and STA addr) are needed\n");
++		       "%d argument(s) (%sSTA addr) %s needed\n",
++		       argc_num, argc_num == 2 ? "BSS name and " : "", argc_num == 2 ? "are" : "is");
+ 		return -1;
+ 	}
+ 
+-	res = os_snprintf(buf, sizeof(buf), "SEND_QOS_MAP_CONF %s %s", argv[0], argv[1]);
++	res = os_snprintf(buf, sizeof(buf), "SEND_QOS_MAP_CONF %s %s",
++			  argv[0], argc_num == 2 ? argv[1] : "");
+ 	if (os_snprintf_error(sizeof(buf), res))
+ 		return -1;
+ 	return wpa_ctrl_command(ctrl, buf);
+@@ -918,15 +947,20 @@ static int hostapd_cli_cmd_hs20_wnm_notif(struct wpa_ctrl *ctrl, int argc,
+ {
+ 	char buf[300];
+ 	int res;
++	int argc_num = 2;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 3;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc < 3) {
+-		printf("Invalid 'hs20_wnm_notif' command - three arguments ("
+-		       "BSS name, STA addr and URL) are needed\n");
++	if (argc < argc_num) {
++		printf("Invalid 'hs20_wnm_notif' command - %d arguments ("
++		       "%sSTA addr and URL) are needed\n", argc_num,
++		       argc_num == 3 ? "BSS name, " : "");
+ 		return -1;
+ 	}
+ 
+ 	res = os_snprintf(buf, sizeof(buf), "HS20_WNM_NOTIF %s %s %s",
+-			  argv[0], argv[1], argv[2]);
++			  argv[0], argv[1], argc_num == 3 ? argv[2] : "");
+ 	if (os_snprintf_error(sizeof(buf), res))
+ 		return -1;
+ 	return wpa_ctrl_command(ctrl, buf);
+@@ -938,21 +972,28 @@ static int hostapd_cli_cmd_hs20_deauth_req(struct wpa_ctrl *ctrl, int argc,
+ {
+ 	char buf[300];
+ 	int res;
++	int argc_num = 3;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 4;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc < 4) {
+-		printf("Invalid 'hs20_deauth_req' command - at least four arguments ("
+-		       "BSS name STA addr, Code, Re-auth Delay) are needed\n");
++	if (argc < argc_num) {
++		printf("Invalid 'hs20_deauth_req' command - at least %d arguments ("
++		       "%sSTA addr, Code, Re-auth Delay) are needed\n", argc_num,
++		       argc_num == 4 ? "BSS name, " : "");
+ 		return -1;
+ 	}
+ 
+-	if (argc > 4)
++	if (argc > argc_num)
+ 		res = os_snprintf(buf, sizeof(buf),
+ 				  "HS20_DEAUTH_REQ %s %s %s %s %s",
+-				  argv[0], argv[1], argv[2], argv[3], argv[4]);
++				  argv[0], argv[1], argv[2], argv[3],
++				  argc_num == 4 ? argv[4] : "");
+ 	else
+ 		res = os_snprintf(buf, sizeof(buf),
+ 				  "HS20_DEAUTH_REQ %s %s %s %s",
+-				  argv[0], argv[1], argv[2], argv[3]);
++				  argv[0], argv[1], argv[2],
++				  argc_num == 4 ? argv[3] : "");
+ 	if (os_snprintf_error(sizeof(buf), res))
+ 		return -1;
+ 	return wpa_ctrl_command(ctrl, buf);
+@@ -1392,14 +1433,20 @@ static int hostapd_cli_cmd_set_neighbor_per_vap(struct wpa_ctrl *ctrl, int argc,
+ {
+ 	char cmd[2048];
+ 	int res;
++	int min_argc = 3;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	min_argc = 4;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	int max_argc = min_argc + 3;
+ 
+-	if (argc < 4 || argc > 7) {
+-		printf("Invalid set_neighbor_per_vap command: needs 4-7 arguments\n");
++	if (argc < min_argc || argc > max_argc) {
++		printf("Invalid set_neighbor_per_vap command: needs %d-%d arguments\n",
++				min_argc, max_argc);
+ 		return -1;
+ 	}
+ 
+ 	res = sprintf_s(cmd, sizeof(cmd), "SET_NEIGHBOR_PER_VAP %s %s %s %s %s %s %s",
+-			argv[0], argv[1], argv[2], argv[3], argc >= 5 ? argv[4] : "",
++			argv[0], argv[1], argv[2], argc >= 4 ? argv[3] : "" , argc >= 5 ? argv[4] : "",
+ 			argc >= 6 ? argv[5] : "", argc == 7 ? argv[6] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+@@ -1426,14 +1473,18 @@ static int hostapd_cli_cmd_remove_neighbor_per_vap(struct wpa_ctrl *ctrl, int ar
+ {
+ 	char cmd[400];
+ 	int res;
++	int argc_num = 2;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 3;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 3) {
+-		printf("Invalid remove_neighbor_per_vap command: needs 3 arguments\n");
++	if (argc != argc_num) {
++		printf("Invalid remove_neighbor_per_vap command: needs %d arguments\n", argc_num);
+ 		return -1;
+ 	}
+ 
+ 	res = sprintf_s(cmd, sizeof(cmd), "REMOVE_NEIGHBOR_PER_VAP %s %s %s",
+-			argv[0], argv[1], argv[2]);
++			argv[0], argv[1], argc_num == 3 ? argv[2] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -1446,13 +1497,18 @@ static int hostapd_cli_cmd_clean_neighbordb_per_vap(struct wpa_ctrl *ctrl, int a
+ {
+ 	char cmd[400];
+ 	int res;
++	int argc_num = 0;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 1) {
+-		printf("Invalid clean_neighbordb_per_vap command: needs 1 arguments\n");
++	if (argc != argc_num) {
++		printf("Invalid clean_neighbordb_per_vap command%s\n",
++				argc_num == 1 ? ": needs 1 argument" : "");
+ 		return -1;
+ 	}
+ 
+-	res = sprintf_s(cmd, sizeof(cmd), "CLEAN_NEIGHBOR_DB_PER_VAP %s", argv[0]);
++	res = sprintf_s(cmd, sizeof(cmd), "CLEAN_NEIGHBOR_DB_PER_VAP %s", argc_num == 1 ? argv[0] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -1843,10 +1899,14 @@ static int hostapd_cli_cmd_sta_measurements(struct wpa_ctrl *ctrl, int argc,
+ {
+ 	char cmd[256];
+ 	int res, total, i;
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
++	if (argc != argc_num) {
+ 		printf("Invalid GET_STA_MEASUREMENTS command\n"
+-			"usage: <BSS_name> <addr>\n");
++			"usage: %s<addr>\n", argc_num == 2 ? "<BSS_name> " : "");
+ 	return -1;
+ 	}
+ 
+@@ -1885,10 +1945,14 @@ static int hostapd_cli_cmd_vap_measurements(struct wpa_ctrl *ctrl, int argc,
+ 	char cmd[256];
+ 	int res, total;
+ 	char *tmp;
++	int argc_num = 0;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 1) {
+-		printf("Invalid GET_VAP_MEASUREMENTS command\n"
+-			"usage: <BSS_name>\n");
++	if (argc != argc_num) {
++		printf("Invalid GET_VAP_MEASUREMENTS command%s\n",
++			argc_num == 1 ? "\nusage: <BSS_name>" : "");
+ 		return -1;
+ 	}
+ 
+@@ -1900,7 +1964,7 @@ static int hostapd_cli_cmd_vap_measurements(struct wpa_ctrl *ctrl, int argc,
+ 
+ 	total = res;
+ 	tmp = cmd + total;
+-	res = sprintf_s(tmp, sizeof(cmd) - total, " %s", argv[0]);
++	res = sprintf_s(tmp, sizeof(cmd) - total, " %s", argc_num == 1 ? argv[0] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -2084,10 +2148,14 @@ static int hostapd_cli_cmd_set_bss_load(struct wpa_ctrl *ctrl, int argc,
+ 	char cmd[256];
+ 	int res;
+ 	int total, i;
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
++	if (argc != argc_num) {
+ 		printf("Invalid SET_BSS_LOAD command\n"
+-				"usage: <BSS_name> <0/1>\n");
++				"usage: %s<0/1>\n", argc_num == 2 ? "<BSS_name> " : "");
+ 		return -1;
+ 	}
+ 
+@@ -2151,14 +2219,20 @@ static int hostapd_cli_cmd_get_sta_wpa_psk(struct wpa_ctrl *ctrl, int argc,
+ {
+ 	int res;
+ 	char cmd[64];
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
+-		printf("Invalid 'get_sta_wpa_psk' command: needs 2 arguments:\n"
+-				"- BSS name and STA MAC address from which to get PSK\n");
++	if (argc != argc_num) {
++		printf("Invalid 'get_sta_wpa_psk' command: needs %d arguments:\n"
++				"- %sSTA MAC address from which to get PSK\n",
++				argc_num, argc_num == 2 ? "BSS name and " : "");
+ 		return -1;
+ 	}
+ 
+-	res = sprintf_s(cmd, sizeof(cmd), "GET_STA_WPA_PSK %s %s", argv[0], argv[1]);
++	res = sprintf_s(cmd, sizeof(cmd), "GET_STA_WPA_PSK %s %s",
++			  argv[0], argc_num == 2 ? argv[1] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -2169,7 +2243,11 @@ static int hostapd_cli_cmd_get_sta_wpa_psk(struct wpa_ctrl *ctrl, int argc,
+ 
+ static int hostapd_cli_cmd_send_action_frame(struct wpa_ctrl *ctrl, int argc, char *argv[])
+ {
+-	return hostapd_cli_cmd(ctrl, "SEND_ACTION_FRAME", 4, argc, argv);
++	int argc_num = 3;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 4;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	return hostapd_cli_cmd(ctrl, "SEND_ACTION_FRAME", argc_num, argc, argv);
+ }
+ 
+ static int hostapd_cli_cmd_update_wan_metrics(struct wpa_ctrl *ctrl,
+@@ -2177,14 +2255,19 @@ static int hostapd_cli_cmd_update_wan_metrics(struct wpa_ctrl *ctrl,
+ {
+ 	char buf[200];
+ 	int res;
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
++	if (argc != argc_num) {
+ 		printf("Invalid 'update_wan_metrics' command - "
+-			   "two arguments are needed\n");
++			   "%d arguments are needed\n", argc_num);
+ 		return -1;
+ 	}
+ 
+-	res = sprintf_s(buf, sizeof(buf), "UPDATE_WAN_METRICS %s %s", argv[0], argv[1]);
++	res = sprintf_s(buf, sizeof(buf), "UPDATE_WAN_METRICS %s %s",
++			  argv[0], argc_num == 2 ? argv[1] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -2215,13 +2298,19 @@ static int hostapd_cli_cmd_cellular_pref_set(struct wpa_ctrl *ctrl, int argc, ch
+ {
+ 	char cmd[256];
+ 	int res;
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+-	if (argc != 2) {
+-		printf("Invalid cellular_pref_set command - requires <BSS_name> and pref <0 or 1 or 255>\n");
++	if (argc != argc_num) {
++		printf("Invalid cellular_pref_set command - requires %spref <0 or 1 or 255>\n",
++				argc_num == 2 ? "<BSS_name> and " : "");
+ 		return -1;
+ 	}
+ 
+-	res = sprintf_s(cmd, sizeof(cmd), "CELLULAR_PREF_SET %s %s", argv[0], argv[1]);
++	res = sprintf_s(cmd, sizeof(cmd), "CELLULAR_PREF_SET %s %s",
++			  argv[0], argc_num == 2 ? argv[1] : "");
+ 	if (res <= 0) {
+ 		printf("%s: sprintf_s error %d", __func__, res);
+ 		return -1;
+@@ -2394,17 +2483,29 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "sta", hostapd_cli_cmd_sta, hostapd_complete_stations,
+ 	  "<addr> = get MIB variables for one station" },
+ 	{ "all_sta", hostapd_cli_cmd_all_sta, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<bss> = get MIB variables for all stations for bss" },
++#else
++	  "= get MIB variables for all stations for bss" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "list_sta", hostapd_cli_cmd_list_sta, NULL,
+ 	   "= list all stations" },
+ 	{ "new_sta", hostapd_cli_cmd_new_sta, NULL,
+ 	  "<addr> = add a new station" },
+ 	{ "deauthenticate", hostapd_cli_cmd_deauthenticate,
+ 	  hostapd_complete_stations,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<bss> <addr> = deauthenticate a station" },
++#else
++	  "<addr> = deauthenticate a station" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "disassociate", hostapd_cli_cmd_disassociate,
+ 	  hostapd_complete_stations,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO	  
+ 	  "<bss> <addr> = disassociate a station" },
++#else
++	  "<addr> = disassociate a station" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ #ifdef CONFIG_TAXONOMY
+ 	{ "signature", hostapd_cli_cmd_signature, hostapd_complete_stations,
+ 	  "<addr> = get taxonomy signature for a station" },
+@@ -2469,7 +2570,11 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  "<arg,arg,...> = set QoS Map set element" },
+ 	{ "send_qos_map_conf", hostapd_cli_cmd_send_qos_map_conf,
+ 	  hostapd_complete_stations,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS name> <addr> = send QoS Map Configure frame" },
++#else
++	  "<addr> = send QoS Map Configure frame" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "chan_switch", hostapd_cli_cmd_chan_switch, NULL,
+ 	  "<cs_count> <freq> [sec_channel_offset=] [center_freq1=]\n"
+ 	  "  [center_freq2=] [bandwidth=] [blocktx] [ht|vht]\n"
+@@ -2477,10 +2582,18 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "notify_cw_change", hostapd_cli_cmd_notify_cw_change, NULL,
+ 	  "<channel_width> = 0 - 20 MHz, 1 - 40 MHz, 2 - 80 MHz, 3 - 160 MHz" },
+ 	{ "hs20_wnm_notif", hostapd_cli_cmd_hs20_wnm_notif, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS name> <addr> <url>\n"
++#else
++	  "<addr> <url>\n"
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	  "  = send WNM-Notification Subscription Remediation Request" },
+ 	{ "hs20_deauth_req", hostapd_cli_cmd_hs20_deauth_req, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS name> <addr> <code (0/1)> <Re-auth-Delay(sec)> [url]\n"
++#else
++	  "<addr> <code (0/1)> <Re-auth-Delay(sec)> [url]\n"
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	  "  = send WNM-Notification imminent deauthentication indication" },
+ 	{ "vendor", hostapd_cli_cmd_vendor, NULL,
+ 	  "<vendor id> <sub command id> [<hex formatted data>]\n"
+@@ -2507,16 +2620,28 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  "<addr> <ssid=> <nr=> [lci=] [civic=] [stat]\n"
+ 	  "  = add AP to neighbor database" },
+ 	{ "set_neighbor_per_vap", hostapd_cli_cmd_set_neighbor_per_vap, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  " <bss> <addr> <ssid=> <nr=> [lci=] [civic=] [stat]\n"
++#else
++	  " <addr> <ssid=> <nr=> [lci=] [civic=] [stat]\n"
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	  "  = add AP to vap neighbor database" },
+ 	{ "show_neighbor", hostapd_cli_cmd_show_neighbor, NULL,
+ 	  "  = show neighbor database entries" },
+ 	{ "remove_neighbor", hostapd_cli_cmd_remove_neighbor, NULL,
+ 	  "<addr> [ssid=<hex>] = remove AP from neighbor database" },
+ 	{ "remove_neighbor_per_vap", hostapd_cli_cmd_remove_neighbor_per_vap, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<bss> <addr> <ssid=> = remove AP from vap neighbor database" },
++#else
++	  "<addr> <ssid=> = remove AP from vap neighbor database" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "clean_neighbor_db_per_vap", hostapd_cli_cmd_clean_neighbordb_per_vap, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<bss> = remove all APs from vap neighbor database" },
++#else
++	  "= remove all APs from vap neighbor database" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "req_lci", hostapd_cli_cmd_req_lci, hostapd_complete_stations,
+ 	  "<addr> = send LCI request to a station"},
+ 	{ "req_range", hostapd_cli_cmd_req_range, NULL,
+@@ -2615,9 +2740,17 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  "<addr> <freq> <center_freq1=> [center_freq2=] <bandwidth=>\n"
+ 	  "get unconnected station statistics" },
+ 	{ "sta_measurements", hostapd_cli_cmd_sta_measurements, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS_name> <addr> get station measurements" },
++#else
++	  "<addr> get station measurements" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "vap_measurements", hostapd_cli_cmd_vap_measurements, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS_name> get VAP measurements" },
++#else
++	  "get VAP measurements" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "radio_info", hostapd_cli_cmd_radio_info, NULL,
+ 	  "get radio info" },
+ 	{ "set_restricted_chan", hostapd_cli_cmd_set_restricted_chan, NULL,
+@@ -2648,7 +2781,11 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  " Get bss used color table and collision history" },
+ #endif /* CONFIG_IEEE80211AX */
+ 	{ "set_bss_load", hostapd_cli_cmd_set_bss_load, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS name> <1/0> = set BSS Load IE in beacon and probe resp" },
++#else
++	  "<1/0> = set BSS Load IE in beacon and probe resp" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */	  
+ 	{ "reconf", hostapd_cli_cmd_reconf, NULL,
+ 	  "[BSS name] = reconfigure interface (add/remove BSS's while other BSS "
+ 	  "are unaffected)\n"
+@@ -2657,9 +2794,17 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	{ "get_sta_wpa_psk", hostapd_cli_cmd_get_sta_wpa_psk, NULL,
+ 	  "= get STAs key ID and passphrase if set in wpa_psk_file" },
+ 	{ "send_action_frame", hostapd_cli_cmd_send_action_frame, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<bss> <mac_addr> <freq> frame=<frame_buf>" },
++#else
++	  "<mac_addr> <freq> frame=<frame_buf>" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	{ "update_wan_metrics", hostapd_cli_cmd_update_wan_metrics, NULL,
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
+ 	  "<BSS name> <WAN Info>:<DL Speed>:<UL Speed>:<DL Load>:<UL Load>:<LMD> = update_wan_metrics" },
++#else
++	  "<WAN Info>:<DL Speed>:<UL Speed>:<DL Load>:<UL Load>:<LMD> = update_wan_metrics" },
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ #ifdef CONFIG_MBO
+ 	{ "mbo_bss_assoc_disallow", hostapd_cli_cmd_mbo_bss_assoc_disallow, NULL,
+ 	  " = set mbo bss assoc disallow"},
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 2fda5d841..323869f99 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -31,31 +31,42 @@
+ #include "ap/mxl_rrm.h"
+ 
+ 
+-struct hostapd_data *mxl_get_bss_index(const char *cmd, struct hostapd_iface *iface)
++struct hostapd_data *mxl_get_bss_index(const char **cmd, struct hostapd_data *hapd, bool ctrl_iface, bool delim)
+ {
++#ifndef CONFIG_CTRL_IFACE_PER_RADIO
++	if(ctrl_iface)
++		return hapd;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 	char *pos_end;
+ 	char bss_name[IFNAMSIZ + 1];
+ 	int i;
+ 	rsize_t len;
+ 	errno_t err;
+ 
+-	pos_end = os_strchr(cmd, ' ');
++	pos_end = os_strchr(*cmd, ' ');
+ 	if (!pos_end) {
+-		len = strnlen_s(cmd, RSIZE_MAX_STR);
++		len = strnlen_s(*cmd, RSIZE_MAX_STR);
+ 		if (!IS_VALID_RANGE(len, AP_MIN_VALID_CHAR, RSIZE_MAX_STR - 1)) {
+ 			wpa_printf(MSG_ERROR, "mxl_get_bss_index - wrong len");
+ 			return NULL;
+ 		}
+-		pos_end = (char *) cmd + len;
++		pos_end = (char *) *cmd + len;
+ 	}
+-	err = memcpy_s(bss_name, sizeof(bss_name), cmd, pos_end - cmd);
++	err = memcpy_s(bss_name, sizeof(bss_name), *cmd, pos_end - (*cmd));
+ 	if (EOK != err) {
+ 		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
+ 		return NULL;
+ 	}
+-	bss_name[pos_end - cmd] = '\0';
+-	for (i = 0; i < iface->num_bss; i++) {
+-		struct hostapd_data *bss = iface->bss[i];
++	bss_name[pos_end - (*cmd)] = '\0';
++
++	if (delim) {
++		*cmd = os_strchr(*cmd, ' ');
++		if(*cmd)
++			(*cmd)++;
++	}
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		struct hostapd_data *bss = hapd->iface->bss[i];
+ 
+ 		if (!strncmp(bss->conf->iface, bss_name, IFNAMSIZ))
+ 			return bss;
+@@ -457,7 +468,7 @@ static int mxl_hostapd_ctrl_iface_sta_softblock(struct hostapd_data *hapd, const
+ 	int ret, status;
+ 	struct multi_ap_blacklist entry;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (!hapd) {
+ 		wpa_printf(MSG_INFO,
+ 			"sta_softblock - there is no iface with the given name");
+@@ -470,10 +481,7 @@ static int mxl_hostapd_ctrl_iface_sta_softblock(struct hostapd_data *hapd, const
+ 		return -1;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+-	if (cmd)
+-		cmd++;
+-	else {
++	if (!cmd) {
+ 		wpa_printf(MSG_INFO,
+ 			"sta_softblock - BSS is missing");
+ 		return -1;
+@@ -590,7 +598,7 @@ static int mxl_hostapd_ctrl_iface_get_sta_softblock(struct hostapd_data *hapd, c
+ 	u8 sta_mac[ETH_ALEN];
+ 	os_memset(&sta_mac, 0, sizeof(sta_mac));
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (!hapd) {
+ 		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - there is no iface with the given name\n");
+ 		if (ret <= 0) {
+@@ -609,10 +617,7 @@ static int mxl_hostapd_ctrl_iface_get_sta_softblock(struct hostapd_data *hapd, c
+ 		return ret;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+-	if (cmd)
+-		cmd++;
+-	else {
++	if (!cmd) {
+ 		ret = sprintf_s(reply, reply_len, "CTRL: GET_STA_SOFTBLOCK - MAC address is missing\n");
+ 		if (ret <= 0) {
+ 			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+@@ -2740,16 +2745,19 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (mxl_hostapd_ctrl_iface_report_sta_statistics(hapd, buf + 22))
+ 			*reply_len = -1;
+ 	} else if (os_strncmp(buf, "ACCEPT_ACL ", sizeof("ACCEPT_ACL ") - 1 ) == 0) {
+-		char *buf_start,*mac;
+-		int len;
+-		struct hostapd_data *bss = mxl_get_bss_index(buf + sizeof("ACCEPT_ACL ") - 1, hapd->iface);
++		char *buf_start = buf + sizeof("ACCEPT_ACL ") - 1;
++		char *mac;
++		int len; 
++		struct hostapd_data *bss = mxl_get_bss_index((const char**) &buf_start, hapd, true, false);
+ 		if(!bss)
+ 			*reply_len = -1;
+ 		else{
+ 			//ACCEPT_ACL wlan0.3 ADD_MAC 11:22:33:44:55:66
+ 			len = strnlen_s(bss->conf->iface, sizeof(bss->conf->iface) - 1);
+ 			if (IS_VALID_RANGE(len, AP_MIN_VALID_CHAR, sizeof(bss->conf->iface) - 1)) {
+-				buf_start = buf + sizeof("ACCEPT_ACL ") - 1 + len + sizeof(" ") - 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++				buf_start = buf_start + len + sizeof(" ") - 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 				mac = buf_start + sizeof("ADD_MAC ") - 1 ;//ADD_MAC and DEL_MAC same len
+ 				if (os_strncmp(buf_start, "ADD_MAC ", sizeof("ADD_MAC ") - 1) == 0) {
+ 					if (mxl_hostapd_ctrl_iface_acl_add_mac(
+@@ -2790,15 +2798,18 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			}
+ 		}
+ 	} else if (os_strncmp(buf, "DENY_ACL ", sizeof("DENY_ACL ") -1) == 0) {
+-		char *buf_start, *mac, *is_softblock;
++		char *buf_start = buf + sizeof("DENY_ACL ") - 1;
++		char *mac, *is_softblock;
+ 		int len;
+-		struct hostapd_data *bss = mxl_get_bss_index(buf + sizeof("DENY_ACL ") - 1, hapd->iface);
++		struct hostapd_data *bss = mxl_get_bss_index((const char**) &buf_start, hapd, true, false);
+ 		if(!bss)
+ 			*reply_len = -1;
+ 		else {
+ 			len = strnlen_s(bss->conf->iface, sizeof(bss->conf->iface) - 1);
+ 			if (!IS_VALID_RANGE(len, AP_MIN_VALID_CHAR, len - 1)) {
+-				buf_start = buf + sizeof("DENY_ACL ") - 1 + len + sizeof(" ") - 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++				buf_start = buf_start + len + sizeof(" ") - 1;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 				mac = buf_start + sizeof("ADD_MAC ") - 1;
+ 				is_softblock = os_strstr(buf_start, "TIMER");
+ 				if (is_softblock) { /* softblock deny list */
+diff --git a/hostapd/mxl_ctrl_iface.h b/hostapd/mxl_ctrl_iface.h
+index 3be5b9d67..49e4c49e6 100644
+--- a/hostapd/mxl_ctrl_iface.h
++++ b/hostapd/mxl_ctrl_iface.h
+@@ -19,7 +19,7 @@ void mxl_hostapd_ctrl_iface_acl_clear_list(struct mac_acl_entry **acl, int *num)
+ void mxl_hostapd_disassoc_accept_mac(struct hostapd_data *hapd);
+ int mxl_hostapd_ctrl_iface_acl_show_mac(struct mac_acl_entry *acl, int num, char *buf, size_t buflen);
+ void mxl_hostapd_disassoc_deny_mac(struct hostapd_data *hapd);
+-struct hostapd_data *mxl_get_bss_index(const char *cmd, struct hostapd_iface *iface);
++struct hostapd_data *mxl_get_bss_index(const char **cmd, struct hostapd_data *hapd, bool ctrl_iface, bool delim);
+ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index 913e1765e..526835ddd 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -18,13 +18,21 @@
+ int mxl_hostapd_cli_cmd_accept_macacl(struct wpa_ctrl *ctrl, int argc,
+ 					 char *argv[])
+ {
+-	return mxl_hostapd_cli_cmd(ctrl, "ACCEPT_ACL", 2, argc, argv);
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	return mxl_hostapd_cli_cmd(ctrl, "ACCEPT_ACL", argc_num, argc, argv);
+ }
+ 
+ int mxl_hostapd_cli_cmd_deny_macacl(struct wpa_ctrl *ctrl, int argc,
+ 				       char *argv[])
+ {
+-	return mxl_hostapd_cli_cmd(ctrl, "DENY_ACL", 2, argc, argv);
++	int argc_num = 1;
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++	argc_num = 2;
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++	return mxl_hostapd_cli_cmd(ctrl, "DENY_ACL", argc_num, argc, argv);
+ }
+ 
+ #ifdef CONFIG_ACS
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index 1bc1e0bf8..712ca81d5 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -19,6 +19,14 @@ int mxl_hostapd_cli_cmd_accept_macacl(struct wpa_ctrl *ctrl, int argc, char *arg
+ int mxl_hostapd_cli_cmd_deny_macacl(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 
++#ifdef CONFIG_CTRL_IFACE_PER_RADIO
++#define MXL_ACCEPT_ACL_DESCR_STR "<BSS_name> <ADD_MAC/DEL_MAC/DIS_MAC/DIS_ALL/SHOW/CLEAR> = accept MAC ACL"
++#define MXL_DENY_ACL_DESCR_STR "<BSS_name> <ADD_MAC/DEL_MAC/SHOW/CLEAR> = deny MAC ACL"
++#else /* CONFIG_CTRL_IFACE_PER_RADIO */
++#define MXL_ACCEPT_ACL_DESCR_STR "<ADD_MAC/DEL_MAC/DIS_MAC/DIS_ALL/SHOW/CLEAR> = accept MAC ACL"
++#define MXL_DENY_ACL_DESCR_STR "<ADD_MAC/DEL_MAC/SHOW/CLEAR> = deny MAC ACL"
++#endif /* CONFIG_CTRL_IFACE_PER_RADIO */
++
+ #define MXL_HOSTAPD_ADD_VENDOR_CLI \
+ 	{ "get_hw_features", mxl_hostapd_cli_cmd_get_hw_features, NULL,			\
+ 	  " = get hardware features" },							\
+@@ -34,10 +42,10 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 	  " = Enable/Disable ZWDFS antenna"},						\
+ 	{ "get_zwdfs_antenna", mxl_hostapd_cli_cmd_get_zwdfs_antenna, NULL,		\
+ 	  " = get ZWDFS antenna Enabled/Disabled"},					\
+-	{ "accept_acl", mxl_hostapd_cli_cmd_accept_macacl, NULL,\
+-	  "<BSS_name> <ADD_MAC/DEL_MAC/DIS_MAC/DIS_ALL/SHOW/CLEAR> = accept MAC ACL" }, \
++	{ "accept_acl", mxl_hostapd_cli_cmd_accept_macacl, NULL, \
++	  MXL_ACCEPT_ACL_DESCR_STR }, \
+ 	{ "deny_acl", mxl_hostapd_cli_cmd_deny_macacl, NULL, \
+-	  "<BSS_name> <ADD_MAC/DEL_MAC/SHOW/CLEAR> = deny MAC ACL" }, \
++	  MXL_DENY_ACL_DESCR_STR }, \
+ 	{ "sta_softblock", mxl_hostapd_cli_cmd_sta_softblock, NULL,			\
+ 	  "<bss> <addr> <remove=x> [<reject_sta=x>"					\
+ 	  "<snrProbeHWM=x> <snrProbeLWM=x>"						\
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 2f734599e..46cc39696 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -33,7 +33,6 @@
+ #include "../hostapd/mxl_ctrl_iface.h"
+ //#endif /* CONFIG_VENDOR_MXL */
+ 
+-
+ static size_t hostapd_write_ht_mcs_bitmask(char *buf, size_t buflen,
+ 					   size_t curr_len, const u8 *mcs_set)
+ {
+@@ -441,7 +440,7 @@ int hostapd_ctrl_iface_sta_first(struct hostapd_data *hapd, const char *cmd,
+ {
+ 	int ret;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, false);
+ 	if (hapd == NULL) {
+ 		ret = sprintf_s(buf, buflen, "FAIL: bss index\n");
+ 		if (ret <= 0) {
+@@ -504,7 +503,7 @@ int hostapd_ctrl_iface_sta_next(struct hostapd_data *hapd, const char *cmd,
+ 	struct sta_info *sta;
+ 	int ret;
+ 
+-	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
+ 	if (hapd == NULL) {
+ 		ret = sprintf_s(buf, buflen, "FAIL\n");
+ 		if (ret <= 0) {
+@@ -514,10 +513,7 @@ int hostapd_ctrl_iface_sta_next(struct hostapd_data *hapd, const char *cmd,
+ 		return ret;
+ 	}
+ 
+-	cmd = os_strchr(cmd, ' ');
+-	if (cmd)
+-		cmd++;
+-	else {
++	if(!cmd) {
+ 		ret = sprintf_s(buf, buflen, "FAIL\n");
+ 		if (ret <= 0) {
+ 			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+@@ -604,14 +600,11 @@ int hostapd_ctrl_iface_deauthenticate(struct hostapd_data *hapd,
+ 	wpa_dbg(hapd->msg_ctx, MSG_DEBUG, "CTRL_IFACE DEAUTHENTICATE %s",
+ 		txtaddr);
+ 
+-	hapd = mxl_get_bss_index(txtaddr, hapd->iface);
++	hapd = mxl_get_bss_index(&txtaddr, hapd, true, true);
+ 	if (hapd == NULL)
+ 		return -1;
+ 
+-	txtaddr = os_strstr(txtaddr, " ");
+-	if (txtaddr)
+-		txtaddr++;
+-	else
++	if (!txtaddr)
+ 		return -1;
+ 
+ 	if (hwaddr_aton(txtaddr, addr))
+@@ -676,14 +669,11 @@ int hostapd_ctrl_iface_disassociate(struct hostapd_data *hapd,
+ 	wpa_dbg(hapd->msg_ctx, MSG_DEBUG, "CTRL_IFACE DISASSOCIATE %s",
+ 		txtaddr);
+ 
+-	hapd = mxl_get_bss_index(txtaddr, hapd->iface);
++	hapd = mxl_get_bss_index(&txtaddr, hapd, true, true);
+ 	if (hapd == NULL)
+ 		return -1;
+ 
+-	txtaddr = os_strstr(txtaddr, " ");
+-	if (txtaddr)
+-		txtaddr++;
+-	else
++	if (!txtaddr)
+ 		return -1;
+ 
+ 	if (hwaddr_aton(txtaddr, addr))
+diff --git a/src/ap/mxl_wds.c b/src/ap/mxl_wds.c
+index a30cdfdf3..bad64feda 100644
+--- a/src/ap/mxl_wds.c
++++ b/src/ap/mxl_wds.c
+@@ -241,6 +241,7 @@ void mxl_wds_event_connect(struct hostapd_data *hapd,
+ 	u8 *ext_capab1 = NULL;
+ 	errno_t err;
+ 	bool is_both_ml_sta_assoc_received = true;
++	char *pifname = wds_sta->ifname;
+ 
+ 	/* Discard event if interface didn't finished initialization.
+ 	 * This may happen when driver sends irrelevant events due to station mode actions
+@@ -260,7 +261,7 @@ void mxl_wds_event_connect(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
+-	hapd = mxl_get_bss_index(wds_sta->ifname, hapd->iface);
++	hapd = mxl_get_bss_index((const char**)&pifname, hapd, false, false);
+ 	if (hapd == NULL) {
+ 		wpa_printf(MSG_ERROR, "Hostapd BSS with name %s not found", wds_sta->ifname);
+ 		return;
+@@ -462,6 +463,7 @@ void mxl_wds_event_disconnect(struct hostapd_data *hapd,
+ 		const u8 *data, size_t data_len)
+ {
+ 	struct intel_vendor_wds_sta_info *wds_sta = (struct intel_vendor_wds_sta_info *) data;
++	char *pifname = wds_sta->ifname;
+ 
+ 	/* Discard event if interface didn't finished initialization.
+ 	 * This may happen when driver sends irrelevant events due to station mode actions
+@@ -481,7 +483,7 @@ void mxl_wds_event_disconnect(struct hostapd_data *hapd,
+ 		return;
+ 	}
+ 
+-	hapd = mxl_get_bss_index(wds_sta->ifname, hapd->iface);
++	hapd = mxl_get_bss_index((const char**) &pifname, hapd, false, false);
+ 	if (hapd == NULL) {
+ 		wpa_printf(MSG_ERROR, "Hostapd BSS with name %s not found", wds_sta->ifname);
+ 		return;
+-- 
+2.43.0
+

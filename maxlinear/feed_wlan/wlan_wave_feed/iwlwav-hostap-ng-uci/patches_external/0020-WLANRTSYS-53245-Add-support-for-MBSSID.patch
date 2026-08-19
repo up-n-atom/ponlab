@@ -1,0 +1,1255 @@
+From 8842ebe091ebf06d24ad45382c2ed8d17e30ea0a Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Thu, 23 Feb 2023 13:05:20 +0100
+Subject: [PATCH] WLANRTSYS-53245: Add support for MBSSID
+
+---
+ hostapd/config_file.c          |  27 ++-
+ hostapd/ctrl_iface.c           |  52 ++++++
+ hostapd/hostapd_cli.c          |  51 ++++++
+ src/ap/ap_config.c             |  12 ++
+ src/ap/ap_config.h             |  21 +++
+ src/ap/ap_drv_ops.h            |  19 +++
+ src/ap/beacon.c                | 110 ++++++++++++-
+ src/ap/hostapd.c               |  90 ++++++++++
+ src/ap/ieee802_11.h            |   5 +
+ src/ap/ieee802_11_shared.c     | 292 ++++++++++++++++++++++++++++++++-
+ src/ap/mxl_hostapd.c           |   2 +
+ src/ap/wpa_auth_glue.c         |   2 +-
+ src/ap/wpa_auth_glue.h         |   3 +
+ src/ap/wpa_auth_ie.c           |  48 ++++++
+ src/ap/wpa_auth_ie.h           |   1 +
+ src/common/defs.h              |  11 ++
+ src/common/ieee802_11_common.c |   3 +
+ src/common/ieee802_11_common.h |   1 +
+ src/common/ieee802_11_defs.h   |   3 +
+ src/common/wpa_common.h        |   4 +
+ src/drivers/driver.h           |  16 ++
+ src/drivers/driver_nl80211.c   |  30 ++++
+ 22 files changed, 795 insertions(+), 8 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index c38065225..eef4d0d03 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -902,6 +902,7 @@ static int hostapd_config_bss(struct hostapd_config *conf, const char *ifname)
+ 		return -1;
+ 	}
+ 
++	bss->bss_idx = conf->num_bss; /* Store BSS index */
+ 	conf->bss[conf->num_bss++] = bss;
+ 	conf->last_bss = bss;
+ 
+@@ -3332,7 +3333,13 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		else
+ 			conf->preamble = LONG_PREAMBLE;
+ 	} else if (os_strcmp(buf, "ignore_broadcast_ssid") == 0) {
+-		bss->ignore_broadcast_ssid = atoi(pos);
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, IGNORE_BROADCAST_SSID_DISABLED, IGNORE_BROADCAST_SSID_CLEAR_SSID)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid ignore_broadcast_ssid value %d",
++					line, val);
++			return 1;
++		}
++		bss->ignore_broadcast_ssid = val;
+ 	} else if (os_strcmp(buf, "no_probe_resp_if_max_sta") == 0) {
+ 		bss->no_probe_resp_if_max_sta = atoi(pos);
+ #ifdef CONFIG_WEP
+@@ -3660,6 +3667,8 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		conf->mbssid = mbssid;
++	} else if (os_strcmp(buf, "multibss_enable") == 0) {
++		conf->multibss_enable = atoi(pos);
+ #endif /* CONFIG_IEEE80211AX */
+ 	} else if (os_strcmp(buf, "max_listen_interval") == 0) {
+ 		bss->max_listen_interval = atoi(pos);
+@@ -4800,6 +4809,22 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		conf->owl = val;
++	} else if (os_strcmp(buf, "wpa_ie_required_for_mbss") == 0) {
++	/* todo: testbed_mode */
++#if 0
++		/* This is valid for Non-transmit BSS (MultiBSS scenario).
++		 * if this is set, Non transmit BSS will always carry Security IE (RSN/RSNX/WPA) etc.
++		 * irrespective of Security method is same as it's Transmit BSS or not.
++		 * And this can be set under testbed_mode only.
++		 */
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val) || (!conf->testbed_mode)) {
++				wpa_printf(MSG_ERROR, "Line %d: wpa_ie_required_for_mbss failed !!! %d",
++                line, val);
++				return 1;
++		}
++		bss->wpa_ie_required_for_mbss = val;
++#endif
+ #ifdef CONFIG_VENDOR_MXL
+ 	} else if (mxl_hostapd_config_fill(conf, bss, buf, pos, line)) {
+ #endif /* CONFIG_VENDOR_MXL */
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 9aeadbd24..315442fb7 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -4578,6 +4578,52 @@ static int hostapd_ctrl_iface_get_last_assoc_req (struct hostapd_data *hapd, con
+ 	return len;
+ }
+ 
++static int hostapd_ctrl_iface_get_multibss_enable(struct hostapd_data *hapd, char *reply,
++							size_t reply_size)
++{
++#define HOSTAPD_MULTIBSS_ENABLE 1
++#define HOSTAPD_MULTIBSS_DISABLE 0
++	int ret = 0;
++	if(hapd->iconf->multibss_enable)
++		ret = sprintf_s(reply, reply_size, "%d", HOSTAPD_MULTIBSS_ENABLE);
++	else
++		ret = sprintf_s(reply, reply_size, "%d", HOSTAPD_MULTIBSS_DISABLE);
++
++	return ret;
++
++}
++
++static int hostapd_ctrl_iface_is_transmitted_bssid(struct hostapd_data *hapd, char *reply,
++							size_t reply_size)
++{
++#define HOSTAPD_TRANSMITTED_BSSID 1
++#define HOSTAPD_NON_TRANSMITTED_BSSID 0
++	int ret = 0;
++	if(hapd->iconf->multibss_enable)
++	{
++		if (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)
++			ret = sprintf_s(reply, reply_size, "%d", HOSTAPD_TRANSMITTED_BSSID);
++		else
++			ret = sprintf_s(reply, reply_size, "%d", HOSTAPD_NON_TRANSMITTED_BSSID);
++	}
++	else
++		ret= sprintf_s(reply, reply_size, "%d", HOSTAPD_NON_TRANSMITTED_BSSID);
++
++	return ret;
++}
++
++static int hostapd_ctrl_iface_get_hidden_mode(struct hostapd_data *hapd, char *reply, size_t reply_size)
++{
++	int ret = 0;
++	ret = sprintf_s(reply, reply_size, "%d", hapd->conf->ignore_broadcast_ssid);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++
++	return ret;
++}
++
+ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -5176,6 +5222,12 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "GET_LAST_ASSOC_REQ ", sizeof("GET_LAST_ASSOC_REQ ") - 1) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_last_assoc_req(hapd,
+ 				buf + sizeof("GET_LAST_ASSOC_REQ ") - 1, reply, reply_size);
++	} else if (os_strncmp(buf, "GET_MULTIBSS_ENABLE", 19) == 0) {
++		reply_len = hostapd_ctrl_iface_get_multibss_enable(hapd,reply,reply_size);
++	} else if (os_strncmp(buf, "IS_TRANSMITTED_BSSID", 20) == 0) {
++		reply_len = hostapd_ctrl_iface_is_transmitted_bssid(hapd,reply,reply_size);
++	} else if (os_strncmp(buf, "GET_HIDDEN_MODE", 15) == 0) {
++		reply_len = hostapd_ctrl_iface_get_hidden_mode(hapd,reply,reply_size);
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index c9c9e295e..14041f6d0 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1942,6 +1942,51 @@ static int hostapd_cli_cmd_get_last_assoc_req (struct wpa_ctrl *ctrl, int argc,
+ 	return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++static int hostapd_cli_cmd_get_multibss_enable(struct wpa_ctrl *ctrl,int argc, char *argv[])
++{
++	char cmd[32];
++	int res = 0;
++
++	res = sprintf_s(cmd, sizeof(cmd), "GET_MULTIBSS_ENABLE");
++
++	if (res <= 0) {
++		printf("%s: get_multibss_enable command, snprintf error %d\n", __func__, res);
++		return -1;
++	}
++
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
++static int hostapd_cli_cmd_is_transmitted_bssid(struct wpa_ctrl *ctrl,int argc, char *argv[])
++{
++	char cmd[32];
++	int res = 0;
++
++	res = sprintf_s(cmd, sizeof(cmd), "IS_TRANSMITTED_BSSID");
++
++	if (res <= 0) {
++		printf("%s: is_tranmitted_bssid command, snprintf error %d\n", __func__, res);
++		return -1;
++	}
++
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
++static int hostapd_cli_cmd_get_hidden_mode(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[32];
++	int res = 0;
++
++	res = sprintf_s(cmd, sizeof(cmd), "GET_HIDDEN_MODE");
++
++	if (res <= 0) {
++		printf("%s: get_hidden_mode command, snprintf error %d\n", __func__, res);
++		return -1;
++	}
++
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2189,6 +2234,12 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  " get list of restricted channels" },
+ 	{ "get_last_assoc_req", hostapd_cli_cmd_get_last_assoc_req, NULL,
+ 	  "<MAC addr> = get last association request frame for specified STA" },
++	{ "get_multibss_enable", hostapd_cli_cmd_get_multibss_enable, NULL,
++	  " = get multibss_enable feature"},
++	{ "is_transmitted_bssid", hostapd_cli_cmd_is_transmitted_bssid, NULL,
++	  " = check interface is transmitted bssid"},
++	{ "get_hidden_mode", hostapd_cli_cmd_get_hidden_mode, NULL,
++	  " = get hidden_mode  value"},
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index c5e3fc37a..46ddcd891 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -175,6 +175,8 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 	bss->pasn_comeback_after = 10;
+ 	bss->pasn_noauth = 1;
+ #endif /* CONFIG_PASN */
++	bss->wpa_ie_required_for_mbss = 0;
++
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_config_defaults_bss(bss);
+ #endif /* CONFIG_VENDOR_MXL */
+@@ -301,6 +303,7 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->airtime_update_interval = AIRTIME_DEFAULT_UPDATE_INTERVAL;
+ #endif /* CONFIG_AIRTIME_POLICY */
+ 
++	conf->mbssid_aid_offset = NON_MULTIBSS_AID_OFFSET;
+ #ifdef CONFIG_VENDOR_MXL
+ 	mxl_hostapd_config_defaults(conf);
+ #endif /* CONFIG_VENDOR_MXL */
+@@ -1581,6 +1584,15 @@ int hostapd_config_check(struct hostapd_config *conf, int full_config)
+ 			return -1;
+ 	}
+ 
++	if(conf->multibss_enable) {
++		conf->mbssid_aid_offset = MULTIBSS_AID_OFFSET;
++		wpa_printf(MSG_DEBUG, "mbssid_aid_offset is set to (%d)", conf->mbssid_aid_offset);
++	} else if (is_6ghz_op_class(conf->op_class) &&
++			   (conf->num_bss >= 3)) {
++				conf->multibss_enable = 1;
++				conf->mbssid_aid_offset = MULTIBSS_AID_OFFSET;
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 1d78bb24f..74bc77783 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -952,6 +952,8 @@ struct hostapd_bss_config {
+ 	/* The AP's MLD MAC address within the AP MLD */
+ 	u8 mld_addr[ETH_ALEN];
+ #endif /* CONFIG_IEEE80211BE */
++	int bss_idx;
++	int wpa_ie_required_for_mbss;
+ #ifdef CONFIG_VENDOR_MXL
+ 	struct mxl_hostapd_bss_config mxl_bss_conf;
+ #endif /* CONFIG_VENDOR_MXL */
+@@ -993,6 +995,11 @@ struct spatial_reuse {
+ 	u8 srg_partial_bssid_bitmap[8];
+ };
+ 
++enum multibss_aid_offset {
++	NON_MULTIBSS_AID_OFFSET = 0,
++	MULTIBSS_AID_OFFSET = 64
++};
++
+ /**
+  * struct eht_phy_capabilities_info - EHT PHY capabilities
+  */
+@@ -1130,6 +1137,8 @@ struct hostapd_config {
+ 	int stationary_ap;
+ 
+ 	int ieee80211ax;
++	u8 multibss_enable;
++	u8 mbssid_aid_offset;
+ #ifdef CONFIG_IEEE80211AX
+ 	struct he_phy_capabilities_info he_phy_capab;
+ 	struct he_operation he_op;
+@@ -1319,4 +1328,16 @@ int hostapd_add_acl_maclist(struct mac_acl_entry **acl, int *num,
+ void hostapd_remove_acl_mac(struct mac_acl_entry **acl, int *num,
+ 			    const u8 *addr);
+ 
++
++/*
++ * Ignore Broadcast SSID:
++ *  0: disabled
++ *  1: send empty (length=0) SSID in beacon and ignore probe request for broadcast SSID
++ *  2: clear SSID (ASCII 0), but keep the original length (this may be required with some clients
++ *     that do not support empty SSID) and ignore probe requests for broadcast SSID
++ */
++#define IGNORE_BROADCAST_SSID_DISABLED		0
++#define IGNORE_BROADCAST_SSID_EMPTY_SSID	1
++#define IGNORE_BROADCAST_SSID_CLEAR_SSID	2
++
+ #endif /* HOSTAPD_CONFIG_H */
+diff --git a/src/ap/ap_drv_ops.h b/src/ap/ap_drv_ops.h
+index a120169ce..54733c762 100644
+--- a/src/ap/ap_drv_ops.h
++++ b/src/ap/ap_drv_ops.h
+@@ -458,6 +458,25 @@ static inline int hostapd_drv_get_capa(struct hostapd_data *hapd,
+ 	return hapd->driver->get_capa(hapd->drv_priv, capa);
+ }
+ 
++
++static inline int hostapd_drv_set_mbssid_vap_mode(struct hostapd_data *hapd,
++	const u8 mbssid_vap)
++{
++	if (hapd->driver == NULL || hapd->driver->set_mbssid_vap_mode == NULL)
++		return -ENOTSUP;
++
++	return hapd->driver->set_mbssid_vap_mode(hapd->drv_priv, mbssid_vap);
++}
++
++static inline int hostapd_drv_set_mbssid_num_vaps_in_group(struct hostapd_data *hapd,
++	const u8 mbssid_num_vaps_in_group)
++{
++	if (hapd->driver == NULL || hapd->driver->set_mbssid_num_vaps_in_group == NULL)
++		return -ENOTSUP;
++
++	return hapd->driver->set_mbssid_num_vaps_in_group(hapd->drv_priv, mbssid_num_vaps_in_group);
++}
++
+ #ifdef ANDROID
+ static inline int hostapd_drv_driver_cmd(struct hostapd_data *hapd,
+ 					 char *cmd, char *buf, size_t buf_len)
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index e058de068..0245e94a6 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -591,6 +591,16 @@ static size_t hostapd_probe_resp_elems_len(struct hostapd_data *hapd,
+ {
+ 	size_t buflen = 0;
+ 
++	/* if multibss is enabled, probe response is always sent from transmit bss */
++	if (hapd->iconf->multibss_enable) {
++		if (params->req || (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)) {
++			if (MULTIBSS_REFERENCE_BSS_IDX != hapd->conf->bss_idx) {
++				hapd = hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX];
++			}
++			buflen += multiple_bssid_ie_get_len(hapd, false);
++		}
++	}
++
+ #ifdef CONFIG_WPS
+ 	if (hapd->wps_probe_resp_ie)
+ 		buflen += wpabuf_len(hapd->wps_probe_resp_ie);
+@@ -667,12 +677,39 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 
+ 	epos = pos + len;
+ 
++	bool is_req_non_transmit_vap = false;
++	int multiple_bssid_ie_len = -1;
++	/* if multibss is enabled, probe response is always sent from transmit bss */
++	if (hapd->iconf->multibss_enable) {
++		if (params->req || (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)) {
++			if (MULTIBSS_REFERENCE_BSS_IDX != hapd->conf->bss_idx) {
++				is_req_non_transmit_vap = true;
++				hapd = hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX];
++			}
++			multiple_bssid_ie_len = multiple_bssid_ie_get_len(hapd, false);
++		}
++	}
++
+ 	if (!params->is_ml_sta_info) {
+ 		*pos++ = WLAN_EID_SSID;
+-		*pos++ = hapd->conf->ssid.ssid_len;
+-		os_memcpy(pos, hapd->conf->ssid.ssid,
+-			  hapd->conf->ssid.ssid_len);
+-		pos += hapd->conf->ssid.ssid_len;
++		/* For multibss case, if the transmitted VAP is hidden, it must not reveal its own ssid
++		 * while transmiting probe resp frame on behalf of a non-transmited vap
++		 */
++		if( hapd->iconf->multibss_enable && hapd->conf->ignore_broadcast_ssid && is_req_non_transmit_vap )
++		{
++			if ( hapd->conf->ignore_broadcast_ssid == IGNORE_BROADCAST_SSID_CLEAR_SSID ) {
++				/* clear the data, but keep the correct length of the SSID */
++				*pos++ = hapd->conf->ssid.ssid_len;
++				os_memset(pos, 0, hapd->conf->ssid.ssid_len);
++				pos += hapd->conf->ssid.ssid_len;
++			} else {
++				*pos++ = 0; /* empty SSID */
++			}
++		} else {
++			*pos++ = hapd->conf->ssid.ssid_len;
++			os_memcpy(pos, hapd->conf->ssid.ssid, hapd->conf->ssid.ssid_len);
++			pos += hapd->conf->ssid.ssid_len;
++		}
+ 	}
+ 
+ 	/* Supported rates */
+@@ -711,6 +748,21 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 				 NULL, params->known_bss, params->known_bss_len,
+ 				 NULL, NULL, NULL, 0);
+ 	pos = hostapd_eid_rm_enabled_capab(hapd, pos, epos - pos);
++
++	/* Multiple BSSID */
++	if (hapd->iconf->multibss_enable && (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)) {
++		if (multiple_bssid_ie_len > (epos - pos)) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_multiple_bssid failed for probe response, no space left !!!"
++				"required length %d", multiple_bssid_ie_len);
++			return NULL;
++		}
++		pos = hostapd_eid_multiple_bssid(hapd, pos, false);
++		if (!pos) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_multiple_bssid failed while probe resp template creation");
++			return NULL;
++		}
++	}
++
+ 	pos = hostapd_get_mde(hapd, pos, epos - pos);
+ 
+ 	/*
+@@ -869,6 +921,19 @@ void hostapd_gen_probe_resp(struct hostapd_data *hapd,
+ 
+ 	hapd = hostapd_mbssid_get_tx_bss(hapd);
+ 
++	/* if multibss is enabled, probe response is always sent from transmit bss */
++	if (hapd->iconf->multibss_enable) {
++		if (params->req || (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)) {
++			int multiple_bssid_ie_len = -1;
++			if (MULTIBSS_REFERENCE_BSS_IDX != hapd->conf->bss_idx) {
++				hapd = hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX];
++			}
++			multiple_bssid_ie_len = multiple_bssid_ie_get_len(hapd, false);
++			if (multiple_bssid_ie_len < 0)
++				return;
++		}
++	}
++
+ #define MAX_PROBERESP_LEN 768
+ 	buflen = MAX_PROBERESP_LEN;
+ 	buflen += hostapd_probe_resp_elems_len(hapd, params);
+@@ -904,6 +969,11 @@ void hostapd_gen_probe_resp(struct hostapd_data *hapd,
+ 	pos = hostapd_probe_resp_fill_elems(hapd, params,
+ 					    params->resp->u.probe_resp.variable,
+ 					    buflen);
++	if(pos == NULL) {
++		os_free(params->resp);
++		params->resp = NULL;
++		return;
++	}
+ 
+ 	params->resp_len = pos - (u8 *) params->resp;
+ }
+@@ -1639,7 +1709,8 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 				params.ecsa_pos - (u8 *) params.resp;
+ 	}
+ 
+-	ret = hostapd_drv_send_mlme(hapd, params.resp, params.resp_len, noack,
++	ret = hostapd_drv_send_mlme(hapd->iconf->multibss_enable ? hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX] : hapd,
++				    params.resp, params.resp_len, noack,
+ 				    csa_offs_len ? csa_offs : NULL,
+ 				    csa_offs_len, 0);
+ 
+@@ -2101,6 +2172,7 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	size_t head_len = 0, tail_len = 0;
+ 	u8 *resp = NULL;
+ 	size_t resp_len = 0;
++	int multiple_bssid_ie_len = -1;
+ #ifdef NEED_AP_MLME
+ 	u16 capab_info;
+ 	u8 *pos, *tailpos, *tailend, *csa_pos;
+@@ -2179,6 +2251,13 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	tail_len += hostapd_eid_owe_trans_len(hapd);
+ 	tail_len += hostapd_eid_dpp_cc_len(hapd);
+ 
++	if (hapd->iconf->multibss_enable && (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx)) {
++		multiple_bssid_ie_len = multiple_bssid_ie_get_len(hapd, true);
++		if (multiple_bssid_ie_len < 0)
++			goto fail;
++		tail_len += multiple_bssid_ie_len;
++	}
++
+ 	tailpos = tail = os_malloc(tail_len);
+ 	if (head == NULL || tail == NULL) {
+ 		wpa_printf(MSG_ERROR, "Failed to set beacon data");
+@@ -2248,6 +2327,21 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 	tailpos = hostapd_eid_bss_load(hapd, tailpos, tailend - tailpos);
+ 	tailpos = hostapd_eid_rm_enabled_capab(hapd, tailpos,
+ 					       tailend - tailpos);
++
++	/* Multiple BSSID */
++	if (hapd->iconf->multibss_enable && MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx) {
++		if (multiple_bssid_ie_len > (tailend - tailpos)) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_multiple_bssid failed for beacon, no space left !!!"
++				"required length %d", multiple_bssid_ie_len);
++			goto fail;
++		}
++		tailpos = hostapd_eid_multiple_bssid(hapd, tailpos, true);
++		if (!tailpos) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_multiple_bssid failed for beacon template creation");
++			goto fail;
++		}
++	}
++
+ 	tailpos = hostapd_get_mde(hapd, tailpos, tailend - tailpos);
+ 
+ 	/* eCSA IE */
+@@ -2546,6 +2640,12 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ #endif /* CONFIG_IEEE80211BE */
+ 
+ 	return 0;
++
++fail:
++	os_free(head);
++	os_free(tail);
++	return -1;
++
+ }
+ 
+ 
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 696e8cf3f..6e99f4564 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1229,6 +1229,90 @@ static int db_table_create_radius_attributes(sqlite3 *db)
+ 
+ #endif /* CONFIG_NO_RADIUS */
+ 
++/*
++	IEEE P802.11ax/D7.0, September 2020
++	9.4.2.45 Multiple BSSID element
++
++	The BSSID(i) value corresponding to the ith BSSID in the multiple BSSID set is derived from a reference BSSID (REF_BSSID) as follows:
++	BSSID(i) = BSSID_A | BSSID_B
++	where
++	BSSID_A is ( REF_BSSID & ZERO[(47-n+1):47] )
++	BSSID_B is ( ZERO[0:(47-n)] & bin[( ( dec(REF_BSSID[(47-n+1):47]) + i) mod 2n), n] )
++	and
++	ZERO[b:c] denotes bits b to c inclusive of a 48-bit address set to 0
++	REF_BSSID[b:c] denotes bits b to c inclusive of the REF_BSSID address
++
++	Example:
++	Suppose the maximum number of BSSIDs in the multiple BSSID set is 8 (i.e., the MaxBSSID Indicator field (n) is set to 3)
++	and the transmitted (reference) BSSID is 8c:fd:0f:7f:1e:f5
++
++	BSSID(0): 8c:fd:0f:7f:1e:f5, BSSID(1): 8c:fd:0f:7f:1e:f6, BSSID(2) : 8c:fd:0f:7f:1e:f7,
++	BSSID(3): 8c:fd:0f:7f:1e:f0, BSSID(4): 8c:fd:0f:7f:1e:f1, ..., BSSID(7) : 8c:fd:0f:7f:1e:f4
++*/
++static bool hostapd_validate_multibssid_mac_addr(struct hostapd_data *hapd)
++{
++	u8 max_bssid = (1 << round_pow2_up(hapd->iconf->num_bss - 1));
++	u8 bss_idx = hapd->conf->bss_idx;
++	u8 exp_addr_lsb;
++	u8 mask_l = (max_bssid - 1);
++	u8 mask_h = ~mask_l;
++	u8 exp_addr[ETH_ALEN];
++
++	if (MASTER_VAP_BSS_IDX == hapd->conf->bss_idx)
++		return true;
++	memcpy_s(exp_addr, ETH_ALEN, hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX]->own_addr, ETH_ALEN);
++	exp_addr_lsb = ((exp_addr[ETH_ALEN - 1] + (bss_idx - 1)) & mask_l);
++	exp_addr[ETH_ALEN - 1] &=  mask_h;
++	exp_addr[ETH_ALEN - 1] |= exp_addr_lsb;
++
++	if (!memcmp(exp_addr, hapd->own_addr, ETH_ALEN))
++		return true;
++	wpa_printf(MSG_ERROR, "Max BSSID = %d, Ref MAC addr is " MACSTR
++						   ", Received MAC addr is " MACSTR
++						   " but Expected MAC addr is " MACSTR
++						   " for bss_idx %d",
++						   max_bssid,
++						   MAC2STR(hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX]->own_addr),
++						   MAC2STR(hapd->own_addr), MAC2STR(exp_addr), bss_idx);
++	return false;
++}
++
++static int hostapd_pre_up_vendor_vap_cmd(struct hostapd_data *hapd)
++{
++	u8 multibss_vap_mode = NON_MULTIBSS_VAP_MODE;
++
++	/* Multiple BSSID */
++	if(hapd->iconf->multibss_enable) {
++		if (MULTIBSS_REFERENCE_BSS_IDX == hapd->conf->bss_idx) {
++					multibss_vap_mode = MULTIBSS_TRANSMITTED_VAP_MODE;
++		} else {
++					multibss_vap_mode = MULTIBSS_NON_TRANSMITTED_VAP_MODE;
++					if (!hostapd_validate_multibssid_mac_addr(hapd)) {
++						wpa_printf(MSG_ERROR, "MAC address validation failure for bss_idx %d",
++											   hapd->conf->bss_idx);
++						return -1;
++					}
++		}
++
++		if (hostapd_drv_set_mbssid_vap_mode(hapd, multibss_vap_mode) < 0) {
++					 wpa_printf(MSG_ERROR, "Failed to set MBSSID VAP");
++		}
++		if (hostapd_drv_set_mbssid_num_vaps_in_group(hapd, hapd->iconf->num_bss - 1) < 0) {
++					 wpa_printf(MSG_ERROR, "Failed to set MBSSID number of VAPs in group");
++		}
++	} else {
++		/* Update to default value otherwise */
++		if (hostapd_drv_set_mbssid_vap_mode(hapd, multibss_vap_mode) < 0) {
++					 wpa_printf(MSG_ERROR, "Failed to set MBSSID VAP");
++		}
++		if (hostapd_drv_set_mbssid_num_vaps_in_group(hapd, 0) < 0) {
++					 wpa_printf(MSG_ERROR, "Failed to set MBSSID number of VAPs in group");
++		}
++	}
++
++
++	return 0;
++}
+ 
+ static int hostapd_start_beacon(struct hostapd_data *hapd,
+ 				bool flush_old_stations)
+@@ -1348,6 +1432,9 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 			os_memcpy(hapd->own_addr, if_addr, ETH_ALEN);
+ 	}
+ 
++	if (hostapd_pre_up_vendor_vap_cmd(hapd))
++		return -1;
++
+ #ifdef CONFIG_VENDOR_MXL
+ 	if (mxl_hostapd_setup_bss_pre(hapd))
+ 		return -1;
+@@ -1918,6 +2005,9 @@ static int setup_interface(struct hostapd_iface *iface)
+ 	if (start_ctrl_iface(iface))
+ 		return -1;
+ 
++	if (hostapd_pre_up_vendor_vap_cmd(hapd))
++		return -1;
++
+ 	if (hapd->iconf->country[0] && hapd->iconf->country[1]) {
+ 		char country[4], previous_country[4];
+ 
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 3f89874e2..05bc6152c 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -256,4 +256,9 @@ const char * sae_get_password(struct hostapd_data *hapd,
+ 			      struct sae_password_entry **pw_entry,
+ 			      struct sae_pt **s_pt, const struct sae_pk **s_pk);
+ 
++u8 round_pow2_up(u8 x);
++int multiple_bssid_ie_get_len(struct hostapd_data *hapd, bool is_beacon);
++u8 * hostapd_eid_multiple_bssid(struct hostapd_data *hapd, u8 *eid, bool is_beacon);
++u8 * hostapd_eid_ssid(struct hostapd_data *hapd, u8 *eid);
++
+ #endif /* IEEE802_11_H */
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index eaeeba43e..277baf44d 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -18,6 +18,8 @@
+ #include "ap_drv_ops.h"
+ #include "wpa_auth.h"
+ #include "dpp_hostapd.h"
++#include "wpa_auth_glue.h"
++#include "wpa_auth_ie.h"
+ #include "ieee802_11.h"
+ 
+ 
+@@ -378,6 +380,8 @@ static void hostapd_ext_capab_byte(struct hostapd_data *hapd, u8 *pos, int idx,
+ 			*pos |= 0x08; /* Bit 19 - BSS Transition */
+ 		if (hapd->iconf->mbssid)
+ 			*pos |= 0x40; /* Bit 22 - Multiple BSSID */
++		if (hapd->iconf->multibss_enable)
++			*pos |= 0x40; /* Bit 22 - Multiple BSSID */
+ 		break;
+ 	case 3: /* Bits 24-31 */
+ #ifdef CONFIG_WNM_AP
+@@ -432,6 +436,8 @@ static void hostapd_ext_capab_byte(struct hostapd_data *hapd, u8 *pos, int idx,
+ #endif /* CONFIG_IEEE80211AX */
+ 		break;
+ 	case 10: /* Bits 80-87 */
++		if (hapd->iconf->multibss_enable)
++			*pos |= 0x01; /* Bit 80 */
+ #ifdef CONFIG_SAE
+ 		if (hapd->conf->wpa &&
+ 		    wpa_key_mgmt_sae(hapd->conf->wpa_key_mgmt)) {
+@@ -495,7 +501,7 @@ u8 * hostapd_eid_ext_capab(struct hostapd_data *hapd, u8 *eid,
+ 		 * otherwise association fails with some clients */
+ 		if (i == 10 && hapd->iconf->mbssid < ENHANCED_MBSSID_ENABLED)
+ 			*pos &= ~0x08;
+-		if (i == 2 && !hapd->iconf->mbssid)
++		if (i == 2 && !hapd->iconf->multibss_enable)
+ 			*pos &= ~0x40;
+ 	}
+ 
+@@ -1148,3 +1154,287 @@ u16 check_ext_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	return WLAN_STATUS_SUCCESS;
+ }
++
++u8 round_pow2_up(u8 x)
++{
++	int i;
++	u8  y = x;
++
++	if (x == 0) return 0;
++
++	for (i = 0; i < 8; i++) {
++		x = x >> 1u;
++		if (x == 0)
++			break;
++	}
++
++	if (y ^ (1 << i))
++		i++;
++
++	return i;
++}
++
++static bool is_security_ie_required(struct hostapd_data *nontx_bss, struct hostapd_data *tx_bss)
++{
++	if (nontx_bss->conf->wpa_ie_required_for_mbss)
++		return true;
++	if ((nontx_bss->conf->wpa != 0) &&
++		((nontx_bss->conf->wpa_key_mgmt != tx_bss->conf->wpa_key_mgmt) ||
++		(nontx_bss->conf->sae_pwe != tx_bss->conf->sae_pwe) ||
++		(nontx_bss->conf->wpa_pairwise != tx_bss->conf->wpa_pairwise) ||
++		(nontx_bss->conf->rsn_pairwise != tx_bss->conf->rsn_pairwise) ||
++		(nontx_bss->conf->group_cipher != tx_bss->conf->group_cipher) ||
++		(nontx_bss->conf->rsn_preauth != tx_bss->conf->rsn_preauth) ||
++		(nontx_bss->conf->group_mgmt_cipher != tx_bss->conf->group_mgmt_cipher) ||
++		(nontx_bss->conf->ieee80211w != tx_bss->conf->ieee80211w))) {
++		nontx_bss->conf->wpa_ie_required_for_mbss = 1;
++		return true;
++	}
++	return false;
++}
++
++
++/* IE ID + Len */
++#define IE_HDR_LEN 2
++/* Minimum MBSSID IE length (includes Max BSSID Indicator) */
++#define MIN_MBSSID_IE_ELEM_LEN (IE_HDR_LEN + 1)
++/* Non Transmit BSSID element */
++/* NON_TX_BSSID + LEN + NON_TX_BSS_CAPAB(4)+ NON_TX_MBSS_IND(3) + NON_TX_SSID(2) */
++#define MIN_MBSSID_IE_NON_TX_BSS_PROF_HDR_LEN 2
++#define MIN_MBSSID_IE_NON_TX_BSS_ELEM_LEN (MIN_MBSSID_IE_NON_TX_BSS_PROF_HDR_LEN + 9)
++#define MAX_MBSSID_IE_TAG_LEN 255
++#define MAX_MBSSID_IE_ELEM_LEN (IE_HDR_LEN + MAX_MBSSID_IE_TAG_LEN)
++#define NON_TX_NON_INHERIT_TWT_IE_SIZE 5
++static int get_non_tx_bss_len(struct hostapd_data *bss, bool is_beacon)
++{
++	int len = MIN_MBSSID_IE_NON_TX_BSS_ELEM_LEN;
++#ifdef CONFIG_IEEE80211AX
++	bool non_inherit_ie_inclusion = false;
++#endif
++	/* ssid length check */
++	if (!bss->conf->ignore_broadcast_ssid) {
++		len = len + bss->conf->ssid.ssid_len;
++	}
++
++	if (is_security_ie_required(bss, bss->iface->bss[MULTIBSS_REFERENCE_BSS_IDX])) {
++		len = len + WPA_IE_MAX_LEN;
++	}
++#ifndef CONFIG_IEEE80211AX  /* to avoid a KW warning/error */
++    is_beacon = false;  /*dummy update*/
++#else
++	/* check for Non Inheritance of TWT IE */
++#if 0
++	/* todo: broadcast twt (btwt) */
++	non_inherit_ie_inclusion = (is_beacon && hostapd_can_send_btwt_config(bss));
++#endif
++	if (non_inherit_ie_inclusion) {
++		len = len + NON_TX_NON_INHERIT_TWT_IE_SIZE;
++	}
++#endif
++	return len;
++}
++
++static u8 * hostapd_eid_multiple_bssid_idx(struct hostapd_data *hapd, u8 *eid, u8 idx)
++{
++	*eid++ = WLAN_EID_MULTIPLE_BSSID_INDEX;
++	*eid++ = sizeof(u8);
++	*eid++ = idx;
++	return eid;
++}
++
++static u8 * hostapd_eid_nontransmitted_bssid_capability(struct hostapd_data *hapd, u8 *eid)
++{
++	errno_t err;
++	u16 capab_info;
++	*eid++ = WLAN_EID_NONTRANSMITTED_BSSID_CAPA;
++	*eid++ = sizeof(capab_info);
++	capab_info = host_to_le16(hostapd_own_capab_info(hapd));
++	err = memcpy_s(eid, sizeof(capab_info), (const void*)&capab_info, sizeof(capab_info));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return NULL;
++	}
++	eid += sizeof(capab_info);
++	return eid;
++}
++
++int multiple_bssid_ie_get_len(struct hostapd_data *hapd, bool is_beacon)
++{
++	int i = 0;
++	int tot_len = MIN_MBSSID_IE_ELEM_LEN;
++	int mbssid_ie_len = MIN_MBSSID_IE_ELEM_LEN;
++    /* Iterate over each BSS */
++    for (i = MULTIBSS_REFERENCE_BSS_IDX + 1; i < hapd->iface->num_bss; i++) {
++        struct hostapd_data *bss = hapd->iface->bss[i];
++		int non_tx_bss_len = get_non_tx_bss_len(bss, is_beacon);
++		if(non_tx_bss_len >= MAX_MBSSID_IE_TAG_LEN) {
++			wpa_printf(MSG_ERROR,"Non-tx-bss size %d crossed max-size(254)",non_tx_bss_len);
++			return -1;
++		}
++		else if (mbssid_ie_len + non_tx_bss_len >= MAX_MBSSID_IE_ELEM_LEN) {
++			tot_len += MIN_MBSSID_IE_ELEM_LEN;
++			mbssid_ie_len = MIN_MBSSID_IE_ELEM_LEN;
++		}
++		tot_len += non_tx_bss_len;
++		mbssid_ie_len += non_tx_bss_len;
++
++    }
++
++	return tot_len;
++}
++
++u8 * hostapd_eid_ssid(struct hostapd_data *hapd, u8 *eid)
++{
++	errno_t err;
++	*eid++ = WLAN_EID_SSID;
++	if ( hapd->conf->ignore_broadcast_ssid == IGNORE_BROADCAST_SSID_CLEAR_SSID ) {
++		/* clear the data, but keep the correct length of the SSID */
++		*eid++ = hapd->conf->ssid.ssid_len;
++		os_memset(eid, 0, hapd->conf->ssid.ssid_len);
++		eid += hapd->conf->ssid.ssid_len;
++	} else if ( hapd->conf->ignore_broadcast_ssid ) {
++		*eid++ = 0; /* empty SSID */
++	} else {
++		*eid++ = hapd->conf->ssid.ssid_len;
++		err = memcpy_s(eid, hapd->conf->ssid.ssid_len, hapd->conf->ssid.ssid, hapd->conf->ssid.ssid_len);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return NULL;
++		}
++		eid += hapd->conf->ssid.ssid_len;
++	}
++	return eid;
++}
++
++#ifdef CONFIG_IEEE80211AX
++#define NUM_NON_INHERIT_IES 1
++#define EID_EXT_NON_INHERIT_IE_LEN (1 + 1 + NUM_NON_INHERIT_IES)
++#endif
++u8 * hostapd_eid_multiple_bssid(struct hostapd_data *hapd, u8 *eid, bool is_beacon)
++{
++	int i;
++	u8 *data_pos, *size_pos, *subelem_data_pos, *subelem_size_pos;
++	struct wpa_auth_config *wpa_auth_conf = NULL;
++	u8 *wpa_ie = NULL;
++	size_t wpa_ie_len = 0;
++	u8 max_idx = 0;
++	int ie_len = MIN_MBSSID_IE_ELEM_LEN;
++#ifdef CONFIG_IEEE80211AX
++	bool non_inherit_ie_inclusion = false;
++#endif
++
++#ifndef CONFIG_IEEE80211AX	/* to avoid a KW warning/error */
++	is_beacon = false;  /*dummy update*/
++#else
++	/* check for Non Inheritance of TWT IE */
++#if 0
++	/* todo: broadcast twt (btwt) */
++	non_inherit_ie_inclusion = (is_beacon && hostapd_can_send_btwt_config(hapd));
++#endif
++#endif
++
++
++	wpa_ie = os_malloc(WPA_IE_MAX_LEN);
++	if (wpa_ie == NULL) {
++		wpa_printf(MSG_ERROR,"%s memory allocation failed for wpa_ie",__func__);
++		return NULL;
++	}
++	wpa_auth_conf = os_malloc(sizeof(struct wpa_auth_config));
++	if (wpa_auth_conf == NULL) {
++		wpa_printf(MSG_ERROR,"%s memory allocation failed for wpa_auth_conf",__func__);
++		eid = NULL;
++		goto end;
++	}
++
++	*eid++ = WLAN_EID_MULTIPLE_BSSID;
++	size_pos = eid;
++	*eid++ = 0; /* Final size is not known yet */
++	data_pos = eid;
++	/* MaxBSSID Indicator computed excluding the Dummy VAP */
++	max_idx = round_pow2_up(hapd->iface->num_bss - 1);
++	*eid++ = max_idx;
++	/* Iterate over each BSS */
++	for (i = MULTIBSS_REFERENCE_BSS_IDX + 1; i < hapd->iface->num_bss; i++) {
++		struct hostapd_data *bss = hapd->iface->bss[i];
++		/* Separate MBSSID IE will be created if size is more than MAX_MBSSID_IE_ELEM_LEN */
++		if ((get_non_tx_bss_len(bss, non_inherit_ie_inclusion) + ie_len) > MAX_MBSSID_IE_ELEM_LEN) {
++			*size_pos = (eid - data_pos);
++			ie_len = MIN_MBSSID_IE_ELEM_LEN;
++			*eid++ = WLAN_EID_MULTIPLE_BSSID;
++			size_pos = eid;
++			*eid++ = 0;
++			data_pos = eid;
++			/* MaxBSSID Indicator computed excluding the Dummy VAP */
++			*eid++ = max_idx;
++		}
++		wpa_ie_len = 0;
++
++		os_memset(wpa_ie, 0, WPA_IE_MAX_LEN);
++
++		*eid++ = WLAN_EID_SUBELEMENT_NONTRANSMITTED_BSSID_PROFILE;
++		subelem_size_pos = eid;
++		*eid++ = 0; /* Final subelement size is not known yet */
++		subelem_data_pos = eid;
++		/* Nontransmitted BSSID capability element */
++		eid = hostapd_eid_nontransmitted_bssid_capability(bss, eid);
++		if (!eid) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_nontransmitted_bssid_capability failed");
++			goto end;
++		}
++		/* SSID element */
++		eid = hostapd_eid_ssid(bss, eid);
++		if (!eid) {
++			wpa_printf(MSG_ERROR, "hostapd_eid_multiple_bssid ssid failed");
++			goto end;
++		}
++		/* Multiple BSSID-Index */
++		eid = hostapd_eid_multiple_bssid_idx(bss, eid, i - 1);
++		if (!eid)
++			goto end;
++
++		/* Below IEs will be advertised if Non-Transmit BSS's security method
++		 * is not same as Transmited BSS.
++		 */
++		if (bss->conf->wpa_ie_required_for_mbss) {
++			/* create wpa_auth_conf from bss configuration */
++			hostapd_wpa_auth_conf(bss->conf, bss->iconf, wpa_auth_conf);
++			if (wpa_auth_conf_gen_multibss_wpa_ie(wpa_auth_conf, &wpa_ie, &wpa_ie_len) < 0) {
++				wpa_printf(MSG_ERROR,"Multibss WPA-IE create failed !!!");
++				eid = NULL;
++				goto end;
++			}
++
++			if (wpa_ie && wpa_ie_len) {
++				wpa_hexdump(MSG_DEBUG," Non-transmit BSS (MultiBSSID) wpa_ie dump", wpa_ie, wpa_ie_len);
++				os_memcpy(eid, wpa_ie, wpa_ie_len);
++				eid += wpa_ie_len;
++			}
++		}
++
++#ifdef CONFIG_IEEE80211AX
++		/* Include a Non Inheritance IE in case Broadcast TWT configuration is enabled */
++		/* The FW has the responsibility to include the BTWT IE in the Beacons */
++		if (non_inherit_ie_inclusion) {
++			*eid++ = WLAN_EID_EXTENSION;
++			*eid++ = EID_EXT_NON_INHERIT_IE_LEN;
++			*eid++ = WLAN_EID_EXT_NON_INHERITANCE;
++			*eid++ = NUM_NON_INHERIT_IES;
++			*eid++ = WLAN_EID_TWT;
++		}
++#endif
++
++		*subelem_size_pos = (eid - subelem_data_pos);
++		ie_len += (*subelem_size_pos + MIN_MBSSID_IE_NON_TX_BSS_PROF_HDR_LEN);
++	}
++
++	if (size_pos && (*size_pos == 0))
++		*size_pos = (eid - data_pos);
++
++end:
++	if(wpa_ie)
++		os_free(wpa_ie);
++	if(wpa_auth_conf)
++		os_free(wpa_auth_conf);
++
++	return eid;
++}
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index cb714ca73..651face30 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -133,6 +133,7 @@ int mxl_hostapd_get_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ 			return 0;
+ 		}
+ 		res = (*hapd->driver->get_aid)(hapd->drv_priv, &sta->aid, sta->addr);
++		sta->aid += hapd->iconf->mbssid_aid_offset;
+ 		return res;
+ 	}
+ 
+@@ -156,6 +157,7 @@ void mxl_hostapd_free_aid(struct hostapd_data *hapd, struct sta_info *sta)
+ 		(*hapd->driver->free_aid)(hapd->drv_priv, &sta->aid);
+ 	} else {
+ 		/* Legacy */
++		sta->aid -= hapd->iconf->mbssid_aid_offset;
+ 		(*hapd->driver->free_aid)(hapd->drv_priv, &sta->aid);
+ 	}
+ 
+diff --git a/src/ap/wpa_auth_glue.c b/src/ap/wpa_auth_glue.c
+index 742f6d419..419271ebd 100644
+--- a/src/ap/wpa_auth_glue.c
++++ b/src/ap/wpa_auth_glue.c
+@@ -35,7 +35,7 @@
+ #include "wpa_auth_glue.h"
+ 
+ 
+-static void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
++void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
+ 				  struct hostapd_config *iconf,
+ 				  struct wpa_auth_config *wconf)
+ {
+diff --git a/src/ap/wpa_auth_glue.h b/src/ap/wpa_auth_glue.h
+index 1b13ae7be..806527f57 100644
+--- a/src/ap/wpa_auth_glue.h
++++ b/src/ap/wpa_auth_glue.h
+@@ -12,5 +12,8 @@
+ int hostapd_setup_wpa(struct hostapd_data *hapd);
+ void hostapd_reconfig_wpa(struct hostapd_data *hapd);
+ void hostapd_deinit_wpa(struct hostapd_data *hapd);
++void hostapd_wpa_auth_conf(struct hostapd_bss_config *conf,
++				struct hostapd_config *iconf,
++				struct wpa_auth_config *wconf);
+ 
+ #endif /* WPA_AUTH_GLUE_H */
+diff --git a/src/ap/wpa_auth_ie.c b/src/ap/wpa_auth_ie.c
+index a5f2861c9..8593e00ae 100644
+--- a/src/ap/wpa_auth_ie.c
++++ b/src/ap/wpa_auth_ie.c
+@@ -1280,3 +1280,51 @@ bool wpa_auth_write_fd_rsn_info(struct wpa_authenticator *wpa_auth,
+ }
+ 
+ #endif /* CONFIG_FILS */
++
++int wpa_auth_conf_gen_multibss_wpa_ie(struct wpa_auth_config *conf, u8 **wpa_ie, size_t *wpa_ie_len)
++{
++	u8 *pos, buf[WPA_IE_MAX_LEN] = {0};
++	int res = -1;
++	pos = buf;
++	if (conf->wpa == WPA_PROTO_OSEN) {
++		pos = wpa_write_osen(conf, pos);
++	}
++	if (conf->wpa & WPA_PROTO_RSN) {
++		res = wpa_write_rsn_ie(conf,
++			pos, buf + sizeof(buf) - pos, NULL);
++		if (res < 0)
++			return res;
++		pos += res;
++		res = wpa_write_rsnxe(conf, pos,
++			buf + sizeof(buf) - pos);
++		if (res < 0)
++			return res;
++		pos += res;
++	}
++
++#ifdef CONFIG_IEEE80211R_AP
++	if (wpa_key_mgmt_ft(conf->wpa_key_mgmt)) {
++		res = wpa_write_mdie(conf, pos,
++			buf + sizeof(buf) - pos);
++		if (res < 0)
++			return res;
++		pos += res;
++	}
++#endif /* CONFIG_IEEE80211R_AP */
++	if (conf->wpa & WPA_PROTO_WPA) {
++		res = wpa_write_wpa_ie(conf,
++			pos, buf + sizeof(buf) - pos);
++		if (res < 0)
++			return res;
++		pos += res;
++	}
++
++	if (*wpa_ie &&
++		((buf[0] == WLAN_EID_RSN) ||
++		(buf[0] == WLAN_EID_VENDOR_SPECIFIC))) {
++		os_memcpy(*wpa_ie, buf, pos - buf);
++		*wpa_ie_len = pos - buf;
++		return 0;
++	}
++	return -1;
++}
+diff --git a/src/ap/wpa_auth_ie.h b/src/ap/wpa_auth_ie.h
+index dd44b9efe..527f92c3c 100644
+--- a/src/ap/wpa_auth_ie.h
++++ b/src/ap/wpa_auth_ie.h
+@@ -12,5 +12,6 @@
+ u8 * wpa_add_kde(u8 *pos, u32 kde, const u8 *data, size_t data_len,
+ 		 const u8 *data2, size_t data2_len);
+ int wpa_auth_gen_wpa_ie(struct wpa_authenticator *wpa_auth);
++int wpa_auth_conf_gen_multibss_wpa_ie(struct wpa_auth_config *conf, u8 **wpa_ie, size_t *wpa_ie_len);
+ 
+ #endif /* WPA_AUTH_IE_H */
+diff --git a/src/common/defs.h b/src/common/defs.h
+index d437d3b0a..def69b020 100644
+--- a/src/common/defs.h
++++ b/src/common/defs.h
+@@ -536,4 +536,15 @@ enum sae_pwe {
+ 	SAE_PWE_NOT_SET = 4,
+ };
+ 
++#define MASTER_VAP_BSS_IDX			0
++#define MULTIBSS_REFERENCE_BSS_IDX	1
++#define SIX_GHZ_CAPABILITY_INVALID	0
++#define MIN_COLOCATED_RADIO_COUNT	2
++
++enum multibss_vap_mode {
++	NON_MULTIBSS_VAP_MODE = 0,
++	MULTIBSS_TRANSMITTED_VAP_MODE,
++	MULTIBSS_NON_TRANSMITTED_VAP_MODE,
++};
++
+ #endif /* DEFS_H */
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index 06f82ce30..227cd9fcf 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -607,6 +607,9 @@ static ParseRes __ieee802_11_parse_elems(const u8 *start, size_t len,
+ 			elems->rrm_enabled = pos;
+ 			elems->rrm_enabled_len = elen;
+ 			break;
++		case WLAN_EID_MULTIPLE_BSSID_INDEX:
++			elems->multiple_bssid_index = pos;
++			break;
+ 		case WLAN_EID_CAG_NUMBER:
+ 			elems->cag_number = pos;
+ 			elems->cag_number_len = elen;
+diff --git a/src/common/ieee802_11_common.h b/src/common/ieee802_11_common.h
+index a7d407b65..5c4a9ec5e 100644
+--- a/src/common/ieee802_11_common.h
++++ b/src/common/ieee802_11_common.h
+@@ -109,6 +109,7 @@ struct ieee802_11_elems {
+ 	const u8 *tdls_mle;
+ 	const u8 *prior_access_mle;
+ 	const u8 *mbssid_known_bss;
++	const u8 *multiple_bssid_index;
+ 
+ 	u8 ssid_len;
+ 	u8 supp_rates_len;
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 58f5073cb..0e655dec9 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -473,6 +473,9 @@
+ #define WLAN_EID_RSNX 244
+ #define WLAN_EID_EXTENSION 255
+ 
++/* Optional subelement IDs for Multiple BSSID (IEEE Std 802.11-2016, 9.4.2.46, Table 9-158) */
++#define WLAN_EID_SUBELEMENT_NONTRANSMITTED_BSSID_PROFILE 0
++
+ /* Element ID Extension (EID 255) values */
+ #define WLAN_EID_EXT_ASSOC_DELAY_INFO 1
+ #define WLAN_EID_EXT_FILS_REQ_PARAMS 2
+diff --git a/src/common/wpa_common.h b/src/common/wpa_common.h
+index 1269bf95d..13beb552f 100644
+--- a/src/common/wpa_common.h
++++ b/src/common/wpa_common.h
+@@ -25,6 +25,10 @@
+ 
+ #define OWE_DH_GROUP 19
+ 
++/* Max Security IE length RSNE/OSEN/RSNXE/WPA_VENDOR_IE */
++/* Max can be WPAIE(28) + RSNXE(3) */
++#define WPA_IE_MAX_LEN 31
++
+ #ifdef CONFIG_NO_TKIP
+ #define WPA_ALLOWED_PAIRWISE_CIPHERS \
+ (WPA_CIPHER_CCMP | WPA_CIPHER_GCMP | WPA_CIPHER_NONE | \
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index e2f3c6b63..11edc16fc 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -5214,6 +5214,22 @@ struct wpa_driver_ops {
+ 	 */
+ 	int (*unconnected_sta)(void *priv, struct intel_vendor_unconnected_sta_req_cfg *req);
+ 
++	/**
++	 * set_mbssid_vap_mode - Set MBSSID mode on VAP
++	 * @priv: Private driver interface data
++	 * @mbssid_vap: 0 - VAP is legacy, 1 - is transmitted MBSSID VAP, 2 - is non-transmitted MBSSID VAP
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int(*set_mbssid_vap_mode)(void *priv, const u8 mbssid_vap);
++
++	/**
++	 * set_mbssid_num_vaps_in_group - Set number of VAPs in MultiBSSID group
++	 * @priv: Private driver interface data
++	 * @mbssid_num_vaps_in_group - number of VAPs in MBSSID group
++	 * Returns: 0 on success, -1 on failure
++	 */
++	int(*set_mbssid_num_vaps_in_group)(void *priv, const u8 mbssid_num_vaps_in_group);
++
+ #ifdef CONFIG_TESTING_OPTIONS
+ 	int (*register_frame)(void *priv, u16 type,
+ 			      const u8 *match, size_t match_len,
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 4106c2aec..162ca9317 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -14083,6 +14083,34 @@ static int nl80211_unconnected_sta(void *priv, struct intel_vendor_unconnected_s
+ 	return res;
+ }
+ 
++int nl80211_set_mbssid_vap(void *priv, const u8 mbssid_vap)
++{
++	int ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_MBSSID_VAP,
++				&mbssid_vap, 1, NESTED_ATTR_NOT_USED, NULL);
++
++	wpa_printf(MSG_ERROR, "nl80211: sending SET_NON_TRANSMIT_VAP: %i", mbssid_vap);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_NON_TRANSMIT_VAP failed: %i (%s)",
++			ret, strerror(-ret));
++
++	return ret;
++}
++
++int nl80211_set_mbssid_num_vaps_in_group(void *priv, const u8 mbssid_num_vaps_in_group)
++{
++	int ret = nl80211_vendor_cmd(priv, OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_SET_MBSSID_NUM_VAPS_IN_GROUP,
++				&mbssid_num_vaps_in_group, 1, NESTED_ATTR_NOT_USED, NULL);
++
++	wpa_printf(MSG_ERROR, "nl80211: sending SET_MBSSID_NUM_VAPS_IN_GROUP: %i", mbssid_num_vaps_in_group);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "nl80211: sending SET_MBSSID_NUM_VAPS_IN_GROUP failed: %i (%s)",
++			ret, strerror(-ret));
++
++	return ret;
++}
++
+ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.name = "nl80211",
+ 	.desc = "Linux nl80211/cfg80211",
+@@ -14236,6 +14264,8 @@ const struct wpa_driver_ops wpa_driver_nl80211_ops = {
+ 	.sta_steer = nl80211_sta_steer,
+ 	.sta_allow = nl80211_sta_allow,
+ 	.unconnected_sta = nl80211_unconnected_sta,
++	.set_mbssid_vap_mode = nl80211_set_mbssid_vap,
++	.set_mbssid_num_vaps_in_group = nl80211_set_mbssid_num_vaps_in_group,
+ #ifdef CONFIG_DPP
+ 	.dpp_listen = nl80211_dpp_listen,
+ #endif /* CONFIG_DPP */
+-- 
+2.43.0
+

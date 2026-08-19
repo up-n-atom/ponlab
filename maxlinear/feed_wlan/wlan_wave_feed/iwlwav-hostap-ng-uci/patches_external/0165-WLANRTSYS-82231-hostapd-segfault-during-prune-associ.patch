@@ -1,0 +1,148 @@
+From f4ffff9d86a0f37334172f6d4a000e2e8462b159 Mon Sep 17 00:00:00 2001
+From: hariharasudhan Rajkumar <hrajkumar@maxlinear.com>
+Date: Tue, 9 Jul 2024 17:09:34 +0800
+Subject: [PATCH] WLANRTSYS-82231 hostapd segfault during prune association mld
+ mac address
+
+Issue: while removing the station with same mld mac address the current station entry is removed.
+Root cause: Station sends a deauth, before it is
+getting removed  it sends new authentication request by updating it's
+MLO mode as single link association or by changing one of its link mac address.
+which results in stale station entry created during current association.
+Fix: During association if there is any station with same mac address is present in the
+sibling_hapd then it will be cleaned completely.
+Added code changes to remove the station with same mld mac address
+in all the radios during authentication phase.
+
+FIXUP to WLANRTSYS-62485 MLO Auth Assoc changes for wave700 in
+iwlwav-hostap-ng
+---
+ src/ap/ieee802_11.c     | 14 ++++++++++++++
+ src/ap/mxl_ieee802_11.c | 18 ++++++++++++++++++
+ src/ap/mxl_ieee802_11.h |  1 +
+ src/ap/mxl_sta_info.c   | 16 ++++++++++++++++
+ src/ap/mxl_sta_info.h   |  1 +
+ 5 files changed, 50 insertions(+)
+
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 4b994f78c..19de0f8cc 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -3136,6 +3136,8 @@ static void handle_auth(struct hostapd_data *hapd,
+ 	sta = ap_get_sta(hapd, sa);
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+ 	if (sta && (sta->flags & WLAN_STA_ASSOC)) {
++		mxl_auth_parse_ml_ie(hapd, mgmt, len, sta);
++		mxl_hostapd_cleanup_same_mld_mac_sta(hapd, sta);
+ 		mxl_hostapd_drv_cleanup_sta(hapd, sta);
+ 		sta = NULL;
+ 	}
+@@ -5644,6 +5646,9 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	const u8 *pos;
+ 	int left, i;
+ 	struct sta_info *sta;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	struct sta_info *unlinked_sta;
++#endif
+ 	u8 *tmp = NULL;
+ #ifdef CONFIG_FILS
+ 	int delay_assoc = 0;
+@@ -5910,6 +5915,15 @@ static void handle_assoc(struct hostapd_data *hapd,
+ 	sta->mxl_sta_info.sta_profile_status = WLAN_STATUS_SUCCESS;
+ 	if (mxl_mlo_check_assoc_ie(hapd, sta, pos, left, reassoc, capab_info))
+ 		goto fail;
++	/* Remove the unlinked sta in sibling hapd */
++	if (sta->mxl_sta_info.ext_flags & WLAN_STA_MULTILINK) {
++		unlinked_sta = mxl_ap_get_unlinked_sta(hapd->mxl_data.sibling_hapd, sta);
++		if (unlinked_sta) {
++			ap_free_sta(hapd->mxl_data.sibling_hapd, unlinked_sta);
++			wpa_printf(MSG_ERROR, "STA " MACSTR " Removing it's unlinked station ", MAC2STR(mgmt->sa));
++		}
++	}
++
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #ifdef CONFIG_VENDOR_MXL
+ 	if (!mxl_hostapd_check_softblock_connect(hapd, mgmt->sa, &resp))
+diff --git a/src/ap/mxl_ieee802_11.c b/src/ap/mxl_ieee802_11.c
+index 49ea5e3e1..03f576f61 100644
+--- a/src/ap/mxl_ieee802_11.c
++++ b/src/ap/mxl_ieee802_11.c
+@@ -1007,6 +1007,24 @@ void mxl_hostapd_drv_cleanup_sta(struct hostapd_data *hapd, struct sta_info *sta
+ 		ap_free_sta(hapd->mxl_data.sibling_hapd, sta1);
+ 	}
+ }
++
++void mxl_hostapd_cleanup_same_mld_mac_sta(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct sta_info *sta1 = NULL;
++
++	for (int i = 0; i < hapd->iface->interfaces->count; i++) {
++		struct hostapd_iface *iface = hapd->iface->interfaces->iface[i];
++		for (int j = 0; j < iface->num_bss; j++) {
++			struct hostapd_data *hapd = iface->bss[j];
++			sta1 = mxl_ap_get_sta_by_non_ap_mld_mac(hapd, sta->mxl_sta_info.non_ap_mld_mac);
++			if (sta1) {
++				if ((sta == sta1) || (sta->mxl_sta_info.linked_sta == sta1))
++					continue;
++				mxl_hostapd_drv_cleanup_sta(hapd, sta1);
++			}
++		}
++	}
++}
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ void mxl_cache_sta_deauth(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+diff --git a/src/ap/mxl_ieee802_11.h b/src/ap/mxl_ieee802_11.h
+index 5cb24b3df..599cd0d37 100644
+--- a/src/ap/mxl_ieee802_11.h
++++ b/src/ap/mxl_ieee802_11.h
+@@ -52,6 +52,7 @@ void mxl_ml_drv_remove_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ int mxl_pmksa_cache_handle(struct sta_info *sta);
+ void mxl_free_sta_profile(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_hostapd_drv_cleanup_sta(struct hostapd_data *hapd, struct sta_info *sta);
++void mxl_hostapd_cleanup_same_mld_mac_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_free_sta(struct hostapd_data *hapd, struct sta_info *sta);
+ void mxl_hostapd_eid_ml_critical_update(struct hostapd_data *hapd, u16 *capab_info);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+diff --git a/src/ap/mxl_sta_info.c b/src/ap/mxl_sta_info.c
+index df1ad691a..18d1c11e8 100644
+--- a/src/ap/mxl_sta_info.c
++++ b/src/ap/mxl_sta_info.c
+@@ -35,6 +35,22 @@ struct sta_info * mxl_ap_get_sta_by_non_ap_mld_mac(struct hostapd_data *hapd, co
+ 	return NULL;
+ }
+ 
++struct sta_info * mxl_ap_get_unlinked_sta(struct hostapd_data *hapd, struct sta_info *new_sta)
++{
++	struct sta_info *sta;
++
++	for (sta = hapd->sta_list; sta; sta = sta->next) {
++		if (new_sta->mxl_sta_info.linked_sta == sta)
++			continue;
++
++		if (sta->mxl_sta_info.linked_sta)
++			if (!os_memcmp(sta->mxl_sta_info.linked_sta->addr, new_sta->addr, ETH_ALEN))
++				return sta;
++	}
++
++	return NULL;
++}
++
+ void mxl_ml_ap_handle_timer(void *eloop_ctx, void *timeout_ctx)
+ {
+ 	struct hostapd_data *hapd = eloop_ctx;
+diff --git a/src/ap/mxl_sta_info.h b/src/ap/mxl_sta_info.h
+index 96826f7a1..6c522c696 100644
+--- a/src/ap/mxl_sta_info.h
++++ b/src/ap/mxl_sta_info.h
+@@ -46,6 +46,7 @@ struct mxl_sta_info {
+ 
+ void mxl_ml_ap_handle_timer(void *eloop_ctx, void *timeout_ctx);
+ struct sta_info * mxl_ap_get_sta_by_non_ap_mld_mac(struct hostapd_data *hapd, const u8 *mac);
++struct sta_info * mxl_ap_get_unlinked_sta(struct hostapd_data *hapd, struct sta_info *new_sta);
+ 
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* MXL_STA_INFO_H */
+-- 
+2.43.0
+

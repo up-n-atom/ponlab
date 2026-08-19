@@ -1,0 +1,1427 @@
+From 9150c4cf56e2e3d13db2d25616bc5107df64006f Mon Sep 17 00:00:00 2001
+From: Dmitrijs Martinovs <dmartinovs@maxlinear.com>
+Date: Tue, 13 Jun 2023 09:18:10 +0200
+Subject: [PATCH] WLANRTSYS-55992: Radius greylist access control part 2
+
+---
+ hostapd/Makefile               |   5 +
+ hostapd/config_file.c          |  60 +++-
+ hostapd/ctrl_iface.c           |  47 +++
+ hostapd/defconfig              |   3 +
+ hostapd/hostapd_cli.c          |  31 ++
+ hostapd/main.c                 |   7 +
+ src/ap/ap_config.h             |  12 +
+ src/ap/greylist.c              | 632 +++++++++++++++++++++++++++++++++
+ src/ap/greylist.h              |  18 +
+ src/ap/hostapd.c               |   4 +
+ src/ap/ieee802_11.c            |  17 +
+ src/ap/ieee802_1x.c            | 100 ++++++
+ src/ap/sta_info.h              |   3 +
+ src/eapol_auth/eapol_auth_sm.c |  11 +
+ src/eapol_auth/eapol_auth_sm.h |   3 +
+ src/radius/radius.c            |  34 +-
+ src/radius/radius.h            |  20 ++
+ src/radius/radius_das.c        |  31 ++
+ 18 files changed, 1027 insertions(+), 11 deletions(-)
+ create mode 100644 src/ap/greylist.c
+ create mode 100644 src/ap/greylist.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index 455d3a9b9..e726cac00 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -90,6 +90,11 @@ OBJS_c += ../src/common/wpa_ctrl.o
+ OBJS_c += ../src/utils/os_$(CONFIG_OS).o
+ OBJS_c += ../src/common/cli.o
+ 
++ifdef CONFIG_RADIUS_GREYLIST
++CFLAGS += -DCONFIG_RADIUS_GREYLIST
++OBJS += ../src/ap/greylist.o
++endif
++
+ NEED_RC4=y
+ NEED_AES=y
+ NEED_MD5=y
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index f50f247c5..2b3c2298f 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -618,20 +618,31 @@ static int hostapd_parse_das_client(struct hostapd_bss_config *bss, char *val)
+ 	char *secret;
+ 
+ 	secret = os_strchr(val, ' ');
++/* RADIUS greylist allows das secret to be null for open ssid */
++#ifndef CONFIG_RADIUS_GREYLIST
+ 	if (secret == NULL)
+ 		return -1;
+ 
++#else /* CONFIG_RADIUS_GREYLIST */
++	if (secret)
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	*secret++ = '\0';
+ 
+ 	if (hostapd_parse_ip_addr(val, &bss->radius_das_client_addr))
+ 		return -1;
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (secret) {
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	os_free(bss->radius_das_shared_secret);
+ 	bss->radius_das_shared_secret = (u8 *) os_strdup(secret);
+ 	if (bss->radius_das_shared_secret == NULL)
+ 		return -1;
+ 	bss->radius_das_shared_secret_len = os_strlen(secret);
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	return 0;
+ }
+ #endif /* CONFIG_NO_RADIUS */
+@@ -2815,6 +2826,45 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		conf->ieee80211h = atoi(pos);
+ 	} else if (os_strcmp(buf, "ieee8021x") == 0) {
+ 		bss->ieee802_1x = atoi(pos);
++#ifdef CONFIG_RADIUS_GREYLIST
++	} else if (os_strcmp(buf, "greylist") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid greylist %d",
++				line, val);
++			return 1;
++		}
++		bss->greylist = val;
++	} else if (os_strcmp(buf, "ap_vlan") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid ap_vlan %d",
++				line, val);
++			return 1;
++		}
++		bss->ap_vlan = val;
++	} else if (os_strcmp(buf, "cmmac") == 0) {
++		if (strnlen_s(pos, RSIZE_MAX_STR) != TXT_MAC_ADDR_LEN - 1) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid cmmac %s",
++				line, pos);
++			return 1;
++		}
++		memcpy_s(bss->cmmac, TXT_MAC_ADDR_LEN, pos, TXT_MAC_ADDR_LEN);
++	} else if (os_strcmp(buf, "greylist_logpath") == 0) {
++		if (!IS_VALID_RANGE(strnlen_s(pos, RSIZE_MAX_STR), 1,  GREYLIST_FILEPATH_MAX_LEN - 1)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid greylist_logpath %s",
++				line, pos);
++			return 1;
++		}
++		memcpy_s(bss->greylist_logpath, GREYLIST_FILEPATH_MAX_LEN - 1, pos, strnlen_s(pos, RSIZE_MAX_STR));
++	} else if (os_strcmp(buf, "greylist_file") == 0) {
++		if (!IS_VALID_RANGE(strnlen_s(pos, RSIZE_MAX_STR), 1,  GREYLIST_FILEPATH_MAX_LEN - 1)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid greylist_file %s",
++				line, pos);
++			return 1;
++		}
++		memcpy_s(bss->greylist_file, GREYLIST_FILEPATH_MAX_LEN - 1, pos, strnlen_s(pos, RSIZE_MAX_STR));
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	} else if (os_strcmp(buf, "eapol_version") == 0) {
+ 		int eapol_version = atoi(pos);
+ #ifdef CONFIG_MACSEC
+@@ -5690,16 +5740,6 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 			return 1;
+ 		}
+ 		bss->opmode_notif = val;
+-	} else if (os_strcmp(buf, "greylist") == 0) {
+-			wpa_printf(MSG_WARNING, "Line %d: greylist: greylist feature is not implemented yet", line);
+-	} else if (os_strcmp(buf, "ap_vlan") == 0) {
+-			wpa_printf(MSG_WARNING, "Line %d: ap_vlan: greylist feature is not implemented yet", line);
+-	} else if (os_strcmp(buf, "cmmac") == 0) {
+-			wpa_printf(MSG_WARNING, "Line %d: cmmac: greylist feature is not implemented yet", line);
+-	} else if (os_strcmp(buf, "greylist_logpath") == 0) {
+-			wpa_printf(MSG_WARNING, "Line %d: greylist_logpath: greylist feature is not implemented yet", line);
+-	} else if (os_strcmp(buf, "greylist_file") == 0) {
+-			wpa_printf(MSG_WARNING, "Line %d: greylist_file: greylist feature is not implemented yet", line);
+ 	} else if (os_strcmp(buf, "whm_config_file") == 0) {
+ 		os_free(conf->whm_config_file);
+ 		conf->whm_config_file = os_strdup(pos);
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 7de89162a..db971c559 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -77,6 +77,9 @@
+ #endif /* CONFIG_VENDOR_MXL */
+ #include "ap/hw_features.h"
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++#include "ap/greylist.h"
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ #define HOSTAPD_CLI_DUP_VALUE_MAX_LEN 256
+ 
+@@ -5371,6 +5374,41 @@ static int hostapd_ctrl_iface_cellular_pref_set(struct hostapd_data *hapd, char
+ 
+ #endif /* CONFIG_MBO */
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++static int hostapd_ctrl_add_to_greylist(struct hapd_interfaces *interfaces, char *txt)
++{
++		char *pos = txt;
++		char *mac, *ifname;
++
++		mac = pos;
++		pos = os_strchr(pos, ' ');
++		if (!pos) {
++				wpa_printf(MSG_ERROR, "Parsing greylist arguments failed  %s", txt);
++				return -1;
++		}
++		*pos++ = '\0';
++		ifname = pos;
++
++		if (os_strcmp(ifname, "dummy") == 0 ) {
++			if (greylist_add_filter_only(mac) < 0) {
++				wpa_printf(MSG_ERROR, "Adding %s to greylist filter failed", mac);
++				return -1;
++			}
++		} else {
++			if (greylist_add(interfaces, mac, ifname) < 0) {
++				wpa_printf(MSG_ERROR, "Adding %s from iterface %s to greylist failed", mac, ifname);
++				return -1;
++		}
++	}
++	return 0;
++}
++static int hostapd_ctrl_clear_greylist(struct hostapd_data *hapd)
++{
++	greylist_clear_all(hapd);
++	return 0;
++}
++#endif /* CONFIG_RADIUS_GREYLIST */
++
+ static int hostapd_ctrl_iface_get_he_phy_channel_width_set(struct hostapd_data *hapd, const char *cmd, char *reply, size_t reply_len)
+ {
+ 	int i, ret, len = 0;
+@@ -6120,6 +6158,15 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		if (hostapd_ctrl_iface_cellular_pref_set(hapd, buf + 18))
+ 			reply_len = -1;
+ #endif /* CONFIG_MBO */
++#ifdef CONFIG_RADIUS_GREYLIST
++	} else if (os_strncmp(buf, "ADD_TO_GREYLIST ", 16) == 0) {
++		if (hostapd_ctrl_add_to_greylist(hapd->iface->interfaces,
++						buf + 16))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "CLEAR_GREYLIST ", 15) == 0) {
++		if (hostapd_ctrl_clear_greylist(hapd))
++			reply_len = -1;
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	} else if (os_strncmp(buf, "GET_HE_PHY_CHANNEL_WIDTH_SET ", sizeof("GET_HE_PHY_CHANNEL_WIDTH_SET ") - 1) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_he_phy_channel_width_set(hapd,
+ 				buf + sizeof("GET_HE_PHY_CHANNEL_WIDTH_SET ") - 1, reply, reply_size);
+diff --git a/hostapd/defconfig b/hostapd/defconfig
+index 36c147682..c561f4e26 100644
+--- a/hostapd/defconfig
++++ b/hostapd/defconfig
+@@ -419,3 +419,6 @@ CONFIG_DPP2=y
+ # DPP version 3 support (experimental and still changing; do not enable for
+ # production use)
+ #CONFIG_DPP3=y
++
++# Radius GreyList Configuration
++CONFIG_RADIUS_GREYLIST=y
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 9ab0ccdca..d356df70a 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -2216,6 +2216,31 @@ static int hostapd_cli_cmd_cellular_pref_set(struct wpa_ctrl *ctrl, int argc, ch
+ }
+ #endif /* CONFIG_MBO */
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++static int hostapd_cli_add_to_greylist(struct wpa_ctrl *ctrl, int argc,
++									   char *argv[])
++{
++	char buf[64];
++	if (argc != 2) {
++		printf("Invalid 'add_to_greylist' command - exactly two arguments, STA "
++				"address and vap ifname are required.\n");
++		return -1;
++	}
++	sprintf_s(buf, sizeof(buf), "ADD_TO_GREYLIST %s %s", argv[0], argv[1]);
++	return wpa_ctrl_command(ctrl, buf);
++}
++
++static int hostapd_cli_clear_greylist(struct wpa_ctrl *ctrl, int argc, char *argv[]) {
++	char buf[54];
++	if (argc != 1) {
++		printf("Invalid 'clear_greylist' command - exactly one arguments, vap ifname is required\n");
++		return -1;
++	}
++	sprintf_s(buf, sizeof(buf), "CLEAR_GREYLIST %s", argv[0]);
++	return wpa_ctrl_command(ctrl, buf);
++}
++#endif /* CONFIG_RADIUS_GREYLIST */
++
+ static int hostapd_cli_cmd_get_he_phy_channel_width_set (struct wpa_ctrl *ctrl, int argc, char *argv[])
+ {
+ 	char cmd[64];
+@@ -2496,6 +2521,12 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  " = check interface is transmitted bssid"},
+ 	{ "get_hidden_mode", hostapd_cli_cmd_get_hidden_mode, NULL,
+ 	  " = get hidden_mode  value"},
++#ifdef CONFIG_RADIUS_GREYLIST
++	{ "add_to_greylist", hostapd_cli_add_to_greylist, NULL,
++	  "<addr> <vap_ifname> = add a station to greylist" },
++	{ "clear_greylist", hostapd_cli_clear_greylist, NULL,
++	  "<vap_ifname> = clean grylist for radio assosiated with ifname" },
++#endif /* CONFIG_RADIUS_GREYLIST */
+ #ifdef CONFIG_IEEE80211AX
+ 	{ "color_switch", hostapd_cli_cmd_color_switch, NULL,
+ 	  " <bss_color> [switch_time] = initate color switch" },
+diff --git a/hostapd/main.c b/hostapd/main.c
+index 72fc583c5..93cb68c78 100644
+--- a/hostapd/main.c
++++ b/hostapd/main.c
+@@ -32,6 +32,9 @@
+ #include "eap_register.h"
+ #include "ctrl_iface.h"
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++#include "ap/greylist.h"
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ struct hapd_global {
+ 	void **drv_priv;
+@@ -1019,6 +1022,10 @@ int main(int argc, char *argv[])
+ 
+ 	hostapd_global_ctrl_iface_init(&interfaces);
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++	greylist_load(&interfaces);
++#endif /* CONFIG_RADIUS_GREYLIST */
++
+ 	if (hostapd_global_run(&interfaces, daemonize, pid_file)) {
+ 		wpa_printf(MSG_ERROR, "Failed to start eloop");
+ 		goto out;
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 098d5133a..824be96b6 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -318,6 +318,11 @@ typedef struct _broadcast_twt_schedules_t
+ 
+ #define EXT_CAPA_MAX_LEN 15
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++#define TXT_MAC_ADDR_LEN 18 /* Including ending '\0' */
++#define GREYLIST_FILEPATH_MAX_LEN 64
++#endif /* CONFIG_RADIUS_GREYLIST */
++
+ /**
+  * struct hostapd_bss_config - Per-BSS configuration
+  */
+@@ -346,6 +351,13 @@ struct hostapd_bss_config {
+ 	int enable_bss_load_ie;
+ 
+ 	int ieee802_1x; /* use IEEE 802.1X */
++#ifdef CONFIG_RADIUS_GREYLIST
++	int greylist; /* Whether greylist is enabled */
++	int ap_vlan; /* vlan id */
++	char cmmac[TXT_MAC_ADDR_LEN];
++	char greylist_logpath[GREYLIST_FILEPATH_MAX_LEN];
++	char greylist_file[GREYLIST_FILEPATH_MAX_LEN];
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	int eapol_version;
+ 	int eap_server; /* Use internal EAP server instead of external
+ 			 * RADIUS server */
+diff --git a/src/ap/greylist.c b/src/ap/greylist.c
+new file mode 100644
+index 000000000..00b105131
+--- /dev/null
++++ b/src/ap/greylist.c
+@@ -0,0 +1,632 @@
++/*
++ * hostapd / RADIUS Greylist Access Control
++ * Copyright 2023 MaxLinear
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ */
++
++#define __USE_XOPEN
++#define _GNU_SOURCE
++#include <time.h>
++#include <sys/file.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <fcntl.h>
++#include <unistd.h>
++#include <string.h>
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "utils/eloop.h"
++#include "ap_config.h"
++#include "hostapd.h"
++#include "sta_info.h"
++#include "ap_drv_ops.h"
++#include "greylist.h"
++
++int hostapd_ctrl_iface_acl_add_mac(struct mac_acl_entry **acl, int *num,
++					  const char *cmd);
++int hostapd_ctrl_iface_acl_del_mac(struct mac_acl_entry **acl, int *num,
++					  const char *txtaddr);
++
++/* Timeout value from the client association time for deleting the
++ * mac entry from greylist_mac.txt, and deleting the mac from access
++ * control list of all greylist enabled vaps. */
++#define GREYLIST_TIMEOUT_IN_SECONDS (24 * 60 * 60)
++
++#define GREYLIST_MAX_NUM_OF_RECORDS 128
++
++#define INDEX_MAX_LEN 5
++
++#define LOC_SH_FILE(fd, iface) \
++	flock(fd, LOCK_SH); \
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: got shared file lock\n", __func__, iface);
++
++#define LOC_EX_FILE(fd, iface) \
++	flock(fd, LOCK_EX); \
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: got exclusive file lock\n", __func__, iface);
++
++#define UNLOC_FILE(fd, iface) \
++	flock(fd, LOCK_UN); \
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: released file lock\n", __func__, iface);
++
++
++struct greylist_data {
++	struct hapd_interfaces *interfaces;
++	char txtaddr[TXT_MAC_ADDR_LEN];
++};
++
++static struct hapd_interfaces *g_interfaces;
++
++/******************
++ * BEGIN HELP FUNCTIONS
++ ******************/
++
++/**
++ * greylist_log_to_file - Add the log for telemetry usage
++ */
++static void greylist_log_to_file(char *filepath, char *fmt, ...)
++{
++	FILE *fp = NULL;
++	va_list args;
++
++	fp = fopen(filepath, "a+");
++	if (fp == NULL) {
++		return;
++	}
++
++	va_start(args, fmt);
++	vfprintf(fp, fmt, args);
++	va_end(args);
++
++	fflush(fp);
++	fclose(fp);
++}
++
++#if 0
++/**
++ * greylist_get_index_from_ifname - get index (rpc index) from ifname to store in greylist file
++ */
++static int greylist_get_index_from_ifname(const char *ifname, char *index, int size)
++{
++	FILE *fp;
++	const char *cmd_template = "uci show | grep %s | head -n 1 | cut -d \".\" -f 2 | xargs -I _CONS_ uci show wireless._CONS_ | grep rpc_index | awk -F\\' '{printf($2+1)}'";
++	char cmd[256] = {0};
++	if (strnlen_s(ifname, IFNAMSIZ) > 10) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: ifname %s failed\n",__func__, ifname);
++		return -1;
++	}
++
++	sprintf_s(cmd, 255, cmd_template, ifname);
++
++	fp = popen(cmd, "r");
++	if (fp == NULL) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: popen failed\n",__func__);
++		return -1;
++	}
++
++	if (fgets(index, size, fp) == NULL) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: can not read index from command %s\n", __func__, cmd);
++		pclose(fp);
++		return -1;
++	}
++
++	pclose(fp);
++	return 0;
++}
++#endif
++
++/**
++ * greylist_delete_line - Delete the mac entry in memory
++ */
++static size_t greylist_delete_line(char *buffer, size_t size, const char *txtaddr)
++{
++	char *p = buffer, *q, *end = buffer + size;
++	char *mac_in_buf;
++
++	while (p < end) {
++		q = p;
++		while (q < end && *q != ' ') ++q; //skip date
++		++q;
++
++		while (q < end && *q != ' ') ++q; //skip time
++			if (++q >= end)
++				break;
++
++		mac_in_buf = q;
++		while (q < end && *q != ' ') ++q; //skip mac
++		++q;
++
++		while (q < end && *q != '\n') ++q; //skip index
++		++q; //q now points to beginning of next line or end
++
++		if (os_memcmp(mac_in_buf, txtaddr, TXT_MAC_ADDR_LEN - 1) == 0) { //found
++			size_t line_size = q - p;
++			size_t rest_size = buffer + size -  q;
++			os_memmove(p, q, rest_size);
++			return size - line_size;
++		}
++		 p = q;
++	}
++
++	return size;
++}
++
++/*
++ * greylist_delete_from_file - Delete the mac entry from /nvram/greylist_mac.txt
++ */
++static void greylist_delete_from_file(struct hapd_interfaces *interfaces, const char *txtaddr)
++{
++	struct stat st;
++	int fd;
++	char *buffer = NULL;
++	struct hostapd_bss_config *conf = interfaces->iface[0]->bss[0]->conf;
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s delete %s from %s\n", __func__, txtaddr, conf->greylist_file);
++
++	fd = open(conf->greylist_file, O_RDWR);
++	if (fd < 0) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: fail to open %s\n", __func__, conf->greylist_file);
++		return;
++	}
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: trying to get file lock\n", __func__, conf->iface);
++	LOC_EX_FILE(fd, conf->iface);
++
++	if (fstat(fd, &st) != 0) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: fail to get size of %s\n",	__func__, conf->greylist_file);
++		UNLOC_FILE(fd, conf->iface);
++		close(fd);
++		return;
++	}
++
++	buffer = os_malloc(st.st_size);
++	if (!buffer) {
++		wpa_printf(MSG_ERROR,"GREYLIST: %s: fail to allocate buffer\n", __func__);
++		UNLOC_FILE(fd, conf->iface);
++		close(fd);
++		return;
++	}
++
++	if (read(fd, buffer, st.st_size) == st.st_size) {
++		size_t new_size;
++
++		new_size = greylist_delete_line(buffer, st.st_size, txtaddr);
++
++		if (ftruncate(fd, 0) == 0) {
++			if (write(fd, buffer, new_size) != new_size) {
++				wpa_printf(MSG_ERROR,"GREYLIST: %s: fail to write to %s\n", __func__, conf->greylist_file);
++			}
++		}
++		else {
++			wpa_printf(MSG_ERROR,"GREYLIST: %s: fail to truncate %s\n", __func__, conf->greylist_file);
++		}
++	}
++	else {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: fail to read %s\n", __func__, conf->greylist_file);
++	}
++
++	fsync(fd);
++	UNLOC_FILE(fd, conf->iface);
++	close(fd);
++	os_free(buffer);
++}
++
++
++/**
++ * greylist_timeout - Timeout handler to remove client's mac from greylist
++ *
++ * The function is used to delete the mac entry from greylist_mac.txt and
++ * delete the mac from access control list of all greylist enabled vaps.
++ */
++static void greylist_timeout(void *eloop_ctx, void *timeout_ctx)
++{
++	struct greylist_data *data = eloop_ctx;
++	struct hapd_interfaces *interfaces = g_interfaces;
++	struct hostapd_iface *interface;
++	struct hostapd_bss_config *conf;
++
++	if (!data) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: invalid data\n", __func__);
++		return;
++	}
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: Timeout expires for client :%s\n", data->txtaddr);
++
++	/* Delete the entry from /nvram/greylist_mac.txt file */
++	greylist_delete_from_file(interfaces, data->txtaddr);
++
++	for (size_t i = 0; i < interfaces->count; i++) {
++		interface = interfaces->iface[i];
++		for (size_t j = 0; j < interface->num_bss; j++) {
++			conf = interface->bss[j]->conf;
++			if (conf->greylist) {
++				wpa_printf(MSG_DEBUG,
++						"GREYLIST: %s: remove %s on %s\n",
++						__func__,
++						data->txtaddr,
++						conf->iface);
++				hostapd_ctrl_iface_acl_del_mac(
++							&conf->deny_mac,
++							&conf->num_deny_mac, data->txtaddr);
++
++			}
++		}
++	}
++	os_free(data);
++}
++
++
++/**
++ * greylist_add_to_driver - Add mac to access control list of
++ * all greylist enabled vaps.
++ *
++ * The parameter 'txtaddr' can be a list of mac strings separated by space.
++ */
++static void greylist_add_to_driver(const char *txtaddr)
++{
++	struct hostapd_iface *interface;
++	struct hostapd_bss_config *conf;
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s\n",
++			__func__, txtaddr);
++
++	for (size_t i = 0; i < g_interfaces->count; i++) {
++		interface = g_interfaces->iface[i];
++		for (size_t j = 0; j < interface->num_bss; j++) {
++			conf = interface->bss[j]->conf;
++			if (conf->greylist) {
++				wpa_printf(MSG_DEBUG, "GREYLIST: %s: add %s to %s\n", __func__, txtaddr, conf->iface);
++				hostapd_ctrl_iface_acl_add_mac(
++							&conf->deny_mac,
++							&conf->num_deny_mac, txtaddr);
++
++			}
++		}
++	}
++}
++
++/*
++ * greylist_get_timeout - convert date and time strings in timeout
++ * RETURNS:
++ * -1 - in case of error
++ *  0 - need to remove mac address from file immediately
++ * >0 - timeout
++ */
++static int greylist_get_timeout(char *date_str, char *time_str) {
++	char time_buf[20] = {0};
++	time_t cur_t, reboot_t, t;
++	struct tm time_info;
++	int timeout;
++	FILE *fp;
++	char str[256];
++	const char *cmd = "last -F | grep reboot | cut -d\" \" -f8,9,10,12,11";
++
++	os_memset(&time_info, 0, sizeof(time_info));
++	sprintf_s(time_buf, sizeof(time_buf), "%s %s", date_str, time_str);
++	strptime(time_buf, "%Y-%m-%d %H:%M:%S", &time_info);
++	t = mktime(&time_info);
++	if (t == (time_t)-1) {
++		return -1;
++	}
++	//During boot the current time can be not update correctly yet
++	//so we used now and reboot time and compare and use MAX(reboot_t, now_t)
++	time(&cur_t);
++	if ((fp = popen(cmd, "r")) != NULL) {
++		if (fgets(str, sizeof(str), fp) != NULL) {
++			strptime(str, "%a %b %d %H:%M:%S %Y", &time_info);
++			reboot_t = mktime(&time_info);
++			if (reboot_t > cur_t) {
++				cur_t = reboot_t;
++			}
++		} else {
++			wpa_printf(MSG_ERROR, "GREYLIST: %s, fgets failed from command %s\n", __func__, cmd);
++		}
++		pclose(fp);
++	} else {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s, popen failed with command %s\n", __func__, cmd);
++	}
++
++	if ((t > cur_t) || (cur_t - t > GREYLIST_TIMEOUT_IN_SECONDS)) {
++		timeout = 0;
++	}
++	else {
++		timeout = GREYLIST_TIMEOUT_IN_SECONDS - (cur_t - t);
++	}
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s from %s %s to %d\n", __func__, date_str, time_str, timeout);
++	return timeout;
++}
++#if 0
++/**
++ * greylist_add_to_other_hostapd - Add the client to other hostapd's greylist
++ *
++ * This function is used to add the client mac to greylist of other hostapd
++ * instance(s) running for other radio(s), so other hostapd instance(s) will
++ * add the client's mac to all greylist enabled vaps controlled by it,
++ * and create a 24 hour timeout to delete the mac entry from driver
++ */
++static int greylist_add_to_other_hostapd(const char *txtaddr)
++{
++
++	int fd;
++	char str[256];
++	char *iface;
++	char *file_name = "/proc/self/cmdline";
++
++	fd = open(file_name, O_RDONLY);
++	if (fd < 0) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: %s failed\n",__func__, file_name);
++		return -1;
++	}
++	int size = read(fd, str, sizeof(str));
++	if (size <= 1) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: can not read from file %s\n",__func__, file_name);
++		close(fd);
++		return -1;
++	}
++	close(fd);
++	//cmdline is list of strings, separated with \0 bytes, so replace \0 with ' '
++	for (int i = 0; i<size-1; i++) if(str[i] == 0) str[i] = ' ';
++	//phy1 is wlan0 and phy0 is wlan2
++	//we need to call another hostapd
++	if (strstr(str, "-phy0")) {
++		iface = "wlan0";
++	} else if (strstr(str, "-phy1")) {
++		iface = "wlan2";
++	} else {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: unexpected config file %s\n",__func__, str);
++		return -1;
++	}
++
++	snprintf(str, sizeof(str),"hostapd_cli -i %s ADD_TO_GREYLIST %s dummy", iface, txtaddr);
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s\n", __func__, str);
++	SYSTEM(str);
++
++	return 0;
++}
++#endif
++/******************
++ *  END HELP FUNCTIONS
++ ******************/
++
++
++/**
++ * greylist_load - Read /nvram/greylist_mac.txt and handle each mac entry
++ *
++ * This function is used to parse /nvram/greylist_mac.txt at init time,
++ * add each mac to driver's acl, and register the timeout.
++ *
++ * The timeout handler removes the mac from driver's acl and greylist_mac.txt.
++ * The timeout value is 24 hour from the client's association time.
++ */
++void greylist_load(struct hapd_interfaces *interfaces)
++{
++	FILE *fp;
++	int fd, size = 0, max_size = GREYLIST_MAX_NUM_OF_RECORDS * TXT_MAC_ADDR_LEN;
++	char record_date[11] = {0}, record_time[9] = {0}, record_mac[TXT_MAC_ADDR_LEN] = {0}, record_ifname[IFNAMSIZ]={0};
++	char *macstr_list;
++	struct greylist_data *data;
++	int timeout;
++	struct hostapd_bss_config *conf = interfaces->iface[0]->bss[0]->conf;
++	g_interfaces = interfaces; //save for future use (don't need to pass it in every function)
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s\n", __func__);
++
++	/* each mac is speparated by space */
++	macstr_list = os_zalloc(max_size);
++	if (macstr_list == NULL) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: allocate %d bytes memory for macstrlist failed\n", __func__, max_size);
++		return;
++	}
++
++	if ((fp = fopen(conf->greylist_file, "r")) == NULL) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: %s does not exist\n",__func__, conf->greylist_file);
++		free(macstr_list);
++		return;
++	}
++	fd = fileno(fp);
++	if (fd == -1) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: fail to get fd\n", __func__);
++		free(macstr_list);
++		fclose(fp);
++		return;
++	}
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: trying to get file lock\n", __func__, conf->iface);
++	LOC_SH_FILE(fd, conf->iface);
++
++	while ((fscanf(fp, "%10s %8s %17s %16s", record_date, record_time, record_mac, record_ifname)) == 4) {
++		wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s %s %s %s\n",__func__, record_date, record_time, record_mac, record_ifname);
++
++		data = os_zalloc(sizeof(*data));
++		if (data == NULL) {
++			wpa_printf(MSG_ERROR, "GREYLIST: %s: %s: allocate memory for eloop data failed\n", __func__, record_mac);
++			continue;
++		}
++
++		timeout = greylist_get_timeout(record_date, record_time);
++		if (timeout < 0) {
++			wpa_printf(MSG_ERROR, "GREYLIST: %s: %s %s %s: time convert failed\n", __func__, record_date, record_time, record_mac);
++			//delete this item from list?
++			free(data);
++			continue;
++		}
++
++		memcpy_s(data->txtaddr, sizeof(data->txtaddr), record_mac, sizeof(data->txtaddr));
++		wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: timeout=%u\n", __func__, record_mac, timeout);
++		eloop_register_timeout(timeout, 0, greylist_timeout, data, NULL);
++		if (timeout != 0) { // don't need to add in filter list if timeout already expired
++			size += sprintf_s(macstr_list + size, max_size - size, "%s ", record_mac);
++		}
++	}
++	UNLOC_FILE(fd, conf->iface);
++
++	if (size > 0)
++		greylist_add_to_driver(macstr_list);
++	free(macstr_list);
++	fclose(fp);
++}
++
++
++/**
++ * greylist_add - Add client's mac to greylist
++ *
++ * This function is used to add a client's mac to /nvram/greylist_mac.txt
++ * and acl of all greylist enabled vaps, and register a 24 hour timeout.
++ * The timeout handler removes the mac from greylist.
++ */
++
++int greylist_add(struct hapd_interfaces *interfaces, const char *txtaddr, const char *ifname)
++{
++	FILE *fp;
++	int fd, num_of_records = 0;
++	char record_date[11] = {0}, record_time[9] = {0}, record_mac[TXT_MAC_ADDR_LEN] = {0}, record_ifname[IFNAMSIZ]={0};
++	char time_str[20] = {0};
++	time_t t_now;
++	struct tm time_info;
++	struct hostapd_bss_config *conf = interfaces->iface[0]->bss[0]->conf;
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s\n", __func__, txtaddr);
++
++	if ((fp = fopen(conf->greylist_file, "a+")) == NULL) {
++		wpa_printf(MSG_DEBUG, "GREYLIST: %s: fail to open %s\n", __func__, conf->greylist_file);
++		return -1;
++	}
++	fd = fileno(fp);
++	if (fd == -1) {
++		wpa_printf(MSG_DEBUG, "GREYLIST: %s: fail to get fd\n", __func__);
++		fclose(fp);
++		return -1;
++	}
++
++	/* When the client is rejected by the other hostapd instance
++	 * running on the other radio, this hostapd instance will
++	 * receive a message to add the client to greylist sent from
++	 * the other hostapd instance. We will do that through another function
++	 *
++	 * Also, in any unexpected case if we receive multiple reject messages
++	 * from the server for the same client, no need to
++	 * add the mac again to the file */
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: trying to get file lock\n",__func__, conf->iface);
++	LOC_SH_FILE(fd, conf->iface);
++
++	while ((fscanf(fp, "%10s %8s %17s %16s", record_date, record_time, record_mac, record_ifname) == 4)) {
++		num_of_records++;
++		if (strcmp(record_mac, txtaddr) == 0) {
++			wpa_printf(MSG_ERROR, "GREYLIST: %s: %s already exists in file\n",__func__, txtaddr);
++			UNLOC_FILE(fd, conf->iface);
++			fclose(fp);
++			//we should do nothing here. The mac address is in file
++			//so there is registered timeout and mac is added in filter
++			return 0;
++		}
++	}
++	UNLOC_FILE(fd, conf->iface);
++
++	if (num_of_records >= GREYLIST_MAX_NUM_OF_RECORDS) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: greylist is full\n", __func__);
++		fclose(fp);
++		return -1;
++	}
++
++
++	/* Get the current time and ifname and add the client mac, ifname  and current time to the file */
++	time(&t_now);
++	os_memset(&time_info, 0, sizeof(time_info));
++	localtime_r(&t_now, &time_info);
++	strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &time_info);
++#if 0
++	/* rpc_index is platform specific, hence removing, will add ifanme to the file */
++	greylist_get_index_from_ifname(ifname, index, INDEX_MAX_LEN);
++#endif
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: %s: trying to get file lock\n",__func__, conf->iface);
++	LOC_EX_FILE(fd, conf->iface);
++
++	fseek(fp, 0, SEEK_END); //In case file position is updated by other processes
++#if 0
++	/* rpc_index is platform specific, hence removing */
++	fprintf(fp, "%s %s %s\n", time_str, txtaddr, index);
++#endif
++	fprintf(fp, "%s %s %s\n", time_str, txtaddr, ifname);
++
++	fflush(fp);
++	UNLOC_FILE(fd, conf->iface);
++	fclose(fp);
++
++	greylist_add_filter_only(txtaddr);
++	greylist_log_to_file("%s Client added to grey list from RADIUS: %s\n", time_str, txtaddr);
++#if 0
++	/* this is not needed for single hostapd */
++	greylist_add_to_other_hostapd(txtaddr);
++#endif
++
++	return 0;
++}
++
++/**
++ *  This function is used to add a client's mac to driver and register a 24h timeout
++ *  The timeout handler removes the mac from greylist.
++ */
++int greylist_add_filter_only(const char *txtaddr) {
++	u32 timeout = GREYLIST_TIMEOUT_IN_SECONDS;
++	struct greylist_data *data;
++
++	data = os_zalloc(sizeof(*data));
++	if (data == NULL) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: allocate memory failed\n", __func__);
++		return -1;
++	}
++
++	/* add mac address to filters and start timer to remove it */
++	greylist_add_to_driver(txtaddr);
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: register %u seconds timeout for %s\n", __func__, timeout, txtaddr);
++	memcpy_s(data->txtaddr, sizeof(data->txtaddr), txtaddr, sizeof(data->txtaddr));
++	eloop_register_timeout(timeout, 0, greylist_timeout, data, NULL);
++
++	return 0;
++}
++
++/**
++ * greylist_get_client_snr - Get SNR of a client
++ * @hapd - hostapd BSS data
++ * @addr - station addr
++ */
++u8 greylist_get_client_snr(struct hostapd_data *hapd, struct sta_info *sta)
++{
++	struct intel_vendor_sta_info sta_info;
++	u8 snr = 0;
++
++	if (!sta) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: station is invalid\n", __func__);
++		return 0;
++	}
++
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: Client MAC is " MACSTR,
++			__func__, MAC2STR(sta->addr));
++
++	/* Use LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS to fill intel_vendor_sta_info structure */
++	if (MXL_DRV_VENDOR_GET(LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS, sta->addr, ETH_ALEN, &sta_info, sizeof(sta_info))) {
++		wpa_printf(MSG_ERROR, "GREYLIST: %s: LTQ_NL80211_VENDOR_SUBCMD_GET_STA_MEASUREMENTS failed\n",
++				__func__);
++		return 0;
++	}
++
++	snr = (u8)sta_info.snr[0];
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s: snr=%u\n",
++			__func__, snr);
++	return snr;
++}
++/**
++ * greylist_clear_all - remove all greylist mac from filtering, stop all timers and cleanup greylist file
++ *
++ */
++int greylist_clear_all(struct hostapd_data *hapd) {
++	wpa_printf(MSG_DEBUG, "GREYLIST: %s\n", __func__);
++	//this call will cause a samll memory leak. eloop interface doesn't provide api
++	//to get data pointes provided with eloop_register_timeout calls
++	//we can store those pointers locally but that will require more rework
++	eloop_cancel_timeout(greylist_timeout, ELOOP_ALL_CTX, ELOOP_ALL_CTX);
++	unlink(hapd->conf->greylist_file);
++	return 0;
++}
+diff --git a/src/ap/greylist.h b/src/ap/greylist.h
+new file mode 100644
+index 000000000..04d661e07
+--- /dev/null
++++ b/src/ap/greylist.h
+@@ -0,0 +1,18 @@
++/*
++ * hostapd / RADIUS Greylist Access Control
++ * Copyright 2023 MaxLinear
++ *
++ * This software may be distributed under the terms of the BSD license.
++ * See README for more details.
++ */
++
++#ifndef GREYLIST_H
++#define GREYLIST_H
++
++void greylist_load(struct hapd_interfaces *interfaces);
++int greylist_add(struct hapd_interfaces *interfaces, const char *txtaddr,const char *ifname);
++int greylist_add_filter_only(const char *txtaddr);
++u8 greylist_get_client_snr(struct hostapd_data *hapd, struct sta_info *sta);
++int greylist_clear_all(struct hostapd_data *hapd);
++
++#endif /* GREYLIST_H */
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index c2f9dac54..4acfe4860 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -1742,7 +1742,11 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 			return -1;
+ 		}
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++		if (conf->radius_das_port && conf->greylist) {
++#else /* CONFIG_RADIUS_GREYLIST */
+ 		if (conf->radius_das_port) {
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 			struct radius_das_conf das_conf;
+ 
+ 			os_memset(&das_conf, 0, sizeof(das_conf));
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 2081910cb..40b69d9d2 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -6275,6 +6275,16 @@ static void notify_mgmt_frame(struct hostapd_data *hapd, const u8 *buf,
+ 	}
+ }
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++void update_sta_mgmt_snr(struct hostapd_data *hapd,
++						const struct ieee80211_mgmt *mgmt, int rssi, int snr_db)
++{
++	struct sta_info *sta = NULL;
++	sta = ap_get_sta(hapd, mgmt->sa);
++	if (sta)
++		sta->mgmt_snr = snr_db;
++}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ /**
+  * ieee802_11_mgmt - process incoming IEEE 802.11 management frames
+@@ -6418,6 +6428,13 @@ int ieee802_11_mgmt(struct hostapd_data *hapd, const u8 *buf, size_t len,
+ 			       "unknown mgmt frame subtype %d", stype);
+ 		break;
+ 	}
++#ifdef CONFIG_RADIUS_GREYLIST
++	if ((stype == WLAN_FC_STYPE_ASSOC_REQ) ||
++		(stype == WLAN_FC_STYPE_REASSOC_REQ) ||
++		(stype == WLAN_FC_STYPE_AUTH)) {
++		update_sta_mgmt_snr(hapd, mgmt, ssi_signal, hapd->iface->mxl_iface.snr_db_current_frame);
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 	return ret;
+ }
+diff --git a/src/ap/ieee802_1x.c b/src/ap/ieee802_1x.c
+index e06c0f6de..e4002bab3 100644
+--- a/src/ap/ieee802_1x.c
++++ b/src/ap/ieee802_1x.c
+@@ -39,6 +39,9 @@
+ #include "ieee802_1x.h"
+ #include "wpa_auth_kay.h"
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++#include "ap/greylist.h"
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ #ifdef CONFIG_HS20
+ static void ieee802_1x_wnm_notif_send(void *eloop_ctx, void *timeout_ctx);
+@@ -900,6 +903,45 @@ void ieee802_1x_encapsulate_radius(struct hostapd_data *hapd,
+ 		}
+ 	}
+ #endif /* CONFIG_HS20 */
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (hapd->conf->greylist) {
++		char secure, snr, ap_vlan;
++		/* This only applicable to hotspots and only apply to greylist enabled interfaces */
++		u8 static_hotspot_vlanid[4] = {102,103,104,105};
++
++		secure = (hapd->conf->wpa == 0) ? 1 : 2;
++
++		//os_snprintf(txtaddr, sizeof(txtaddr), MACSTR, MAC2STR(sta->addr));
++		snr = greylist_get_client_snr(hapd, sta);
++
++		if (!snr) {
++			/* WAR to handle '0' SNR issue (RSSI from fw stats invalid). Use SNR during AUTH/Assoc/Re-assoc req frame from station */
++			snr = sta->mgmt_snr;
++		}
++
++		if (os_strcmp(hapd->conf->iface, "wlan0.2") == 0)
++			ap_vlan = static_hotspot_vlanid[0];
++		else if (os_strcmp(hapd->conf->iface, "wlan2.2") == 0)
++			ap_vlan = static_hotspot_vlanid[1];
++		else if (os_strcmp(hapd->conf->iface, "wlan0.4") == 0)
++			ap_vlan = static_hotspot_vlanid[2];
++		else if (os_strcmp(hapd->conf->iface, "wlan2.4") == 0)
++			ap_vlan = static_hotspot_vlanid[3];
++
++		radius_msg_add_greylist(
++			msg, RADIUS_VENDOR_ATTR_COMCAST_NETWORK_TYPE,
++			&secure, 1);
++		radius_msg_add_greylist(
++			msg, RADIUS_VENDOR_ATTR_COMCAST_CM_MAC,
++			hapd->conf->cmmac, TXT_MAC_ADDR_LEN - 1);
++		radius_msg_add_greylist(
++			msg, RADIUS_VENDOR_ATTR_COMCAST_AP_VLAN,
++			&ap_vlan, 1);
++		radius_msg_add_greylist(
++			msg, RADIUS_VENDOR_ATTR_COMCAST_AP_SNR,
++			&snr, 1);
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 	if (radius_client_send(hapd->radius, msg, RADIUS_AUTH, sta->addr) < 0)
+ 		goto fail;
+@@ -1054,6 +1096,10 @@ ieee802_1x_alloc_eapol_sm(struct hostapd_data *hapd, struct sta_info *sta)
+ 		if (wpa_auth_sta_get_pmksa(sta->wpa_sm))
+ 			flags |= EAPOL_SM_FROM_PMKSA_CACHE;
+ 	}
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (hapd->conf->greylist && !hapd->conf->ieee802_1x)
++		flags |= EAPOL_SM_SKIP_EAP;
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	return eapol_auth_alloc(hapd->eapol_auth, sta->addr, flags,
+ 				sta->wps_ie, sta->p2p_ie, sta,
+ 				sta->identity, sta->radius_cui);
+@@ -1331,6 +1377,16 @@ void ieee802_1x_new_station(struct hostapd_data *hapd, struct sta_info *sta)
+ 		force_1x = 1;
+ 	}
+ #endif /* CONFIG_WPS */
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (hapd->conf->greylist && !hapd->conf->ieee802_1x) {
++		/*
++		 * Need to use IEEE 802.1X/EAPOL state machines for authentication
++		 * in the greylist enabled BSS even if IEEE 802.1x/EAPOL is not
++		 * used.
++		 */
++		force_1x = 1;
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 	if (!force_1x && !hapd->conf->ieee802_1x && !hapd->conf->osen) {
+ 		wpa_printf(MSG_DEBUG,
+@@ -1386,6 +1442,19 @@ void ieee802_1x_new_station(struct hostapd_data *hapd, struct sta_info *sta)
+ #endif /* CONFIG_WPS */
+ 
+ 	sta->eapol_sm->eap_if->portEnabled = true;
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (hapd->conf->greylist && !hapd->conf->ieee802_1x) {
++		/*
++		 * Fake IEEE 802.1X/EAPOL state machines to send
++		 * Radius Access-Request.
++		 */
++		wpa_printf(MSG_DEBUG,
++			   "GREYLIST: Send Radius Access-Request w/o EAP Response");
++		sta->eapol_sm->eap_if->aaaEapResp = true;
++		eapol_auth_step(sta->eapol_sm);
++		return;
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+ 	if (sta->auth_alg == WLAN_AUTH_FT) {
+@@ -2141,6 +2210,37 @@ ieee802_1x_receive_auth(struct radius_msg *msg, struct radius_msg *req,
+ 				   MACSTR, reason_code, MAC2STR(sta->addr));
+ 			sta->disconnect_reason_code = reason_code;
+ 		}
++#ifdef CONFIG_RADIUS_GREYLIST
++		if (hapd->conf->greylist) {
++			u8 *reply;
++			size_t replylen;
++			char txtaddr[TXT_MAC_ADDR_LEN];
++
++			wpa_printf(MSG_DEBUG,
++				   "GREYLIST: Access-Reject for "MACSTR "  vap interface  %s" , MAC2STR(sta->addr), hapd->conf->iface);
++
++			reply = radius_msg_get_vendor_attr(msg, RADIUS_VENDOR_ID_COMCAST,
++					 RADIUS_VENDOR_ATTR_COMCAST_REPLY_MESSAGE,
++					 &replylen);
++			if (reply) {
++				if (os_memcmp_const(reply, "GREYLIST", replylen) == 0) {
++					wpa_printf(MSG_DEBUG,
++						   "RADIUS server indicated GREYLIST in Access-Reject for "
++						   MACSTR, MAC2STR(sta->addr));
++					sprintf_s(txtaddr, sizeof(txtaddr), MACSTR, MAC2STR(sta->addr));
++					greylist_add(hapd->iface->interfaces, txtaddr, hapd->conf->iface);
++
++				}
++			}
++			os_free(reply);
++			if (!hapd->conf->ieee802_1x) {
++				/* For the secure mode, EAPOL SM will handle the disconnect */
++				ap_sta_disconnect(hapd, sta, sta->addr,
++						WLAN_REASON_UNSPECIFIED);
++			}
++
++		}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 		break;
+ 	case RADIUS_CODE_ACCESS_CHALLENGE:
+ 		sm->eap_if->aaaEapReq = true;
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index 0cbfb3790..1f7142371 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -265,6 +265,9 @@ struct sta_info {
+ 	int auth_rssi; /* Last Authentication frame RSSI */
+ 	unsigned int mbo_supported:1;
+ #endif /* CONFIG_MBO */
++#ifdef CONFIG_RADIUS_GREYLIST
++	u8 mgmt_snr; /* SNR of STA during Auth/Assoc/Re-Assoc req frame from STA */
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 	u8 *supp_op_classes; /* Supported Operating Classes element, if
+ 			      * received, starting from the Length field */
+diff --git a/src/eapol_auth/eapol_auth_sm.c b/src/eapol_auth/eapol_auth_sm.c
+index 6a37e7a8b..1310dd5ce 100644
+--- a/src/eapol_auth/eapol_auth_sm.c
++++ b/src/eapol_auth/eapol_auth_sm.c
+@@ -955,6 +955,17 @@ restart:
+ 	}
+ 
+ 	if (eapol_sm_sta_entry_alive(eapol, addr) && sm->eap) {
++#ifdef CONFIG_RADIUS_GREYLIST
++		if ((sm->flags & EAPOL_SM_SKIP_EAP)) {
++			if (sm->eap_if->aaaEapResp) {
++				sm->eap_if->aaaEapResp = false;
++				sm->eapol->cb.aaa_send(
++					sm->eapol->conf.ctx, sm->sta,
++					NULL, 0);
++			}
++			return;
++		}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 		if (eap_server_sm_step(sm->eap)) {
+ 			if (--max_steps > 0)
+ 				goto restart;
+diff --git a/src/eapol_auth/eapol_auth_sm.h b/src/eapol_auth/eapol_auth_sm.h
+index d82833c9a..716762f44 100644
+--- a/src/eapol_auth/eapol_auth_sm.h
++++ b/src/eapol_auth/eapol_auth_sm.h
+@@ -13,6 +13,9 @@
+ #define EAPOL_SM_WAIT_START BIT(1)
+ #define EAPOL_SM_USES_WPA BIT(2)
+ #define EAPOL_SM_FROM_PMKSA_CACHE BIT(3)
++#ifdef CONFIG_RADIUS_GREYLIST
++#define EAPOL_SM_SKIP_EAP BIT(4)
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ struct eapol_auth_config {
+ 	const struct eap_config *eap_cfg;
+diff --git a/src/radius/radius.c b/src/radius/radius.c
+index be59a94a9..53765eca3 100644
+--- a/src/radius/radius.c
++++ b/src/radius/radius.c
+@@ -1042,7 +1042,10 @@ int radius_msg_make_authenticator(struct radius_msg *msg)
+  * The returned payload is allocated with os_malloc() and caller must free it
+  * by calling os_free().
+  */
+-static u8 *radius_msg_get_vendor_attr(struct radius_msg *msg, u32 vendor,
++#ifndef CONFIG_RADIUS_GREYLIST
++static
++#endif /* CONFIG_RADIUS_GREYLIST */
++u8 *radius_msg_get_vendor_attr(struct radius_msg *msg, u32 vendor,
+ 				      u8 subtype, size_t *alen)
+ {
+ 	u8 *data, *pos;
+@@ -1872,3 +1875,32 @@ int radius_gen_session_id(u8 *id, size_t len)
+ 	 */
+ 	return os_get_random(id, len);
+ }
++
++#ifdef CONFIG_RADIUS_GREYLIST
++int radius_msg_add_greylist(struct radius_msg *msg, u8 subtype, char *data,
++		    				size_t len)
++{
++	struct radius_attr_hdr *attr;
++	u8 *buf, *pos;
++	size_t alen;
++
++	alen = 4 + 2 + len;
++	buf = os_malloc(alen);
++	if (buf == NULL)
++		return 0;
++	pos = buf;
++	WPA_PUT_BE32(pos, RADIUS_VENDOR_ID_COMCAST);
++	pos += 4;
++	*pos++ = subtype;
++	*pos++ = 2 + len;
++	memcpy_s(pos, len, data, len);
++	attr = radius_msg_add_attr(msg, RADIUS_ATTR_VENDOR_SPECIFIC,
++							   buf, alen);
++	os_free(buf);
++	if (attr == NULL)
++		return 0;
++
++	return 1;
++}
++#endif /* CONFIG_RADIUS_GREYLIST */
++
+diff --git a/src/radius/radius.h b/src/radius/radius.h
+index 571c15923..391612691 100644
+--- a/src/radius/radius.h
++++ b/src/radius/radius.h
+@@ -15,6 +15,18 @@
+ #pragma pack(push, 1)
+ #endif /* _MSC_VER */
+ 
++/* Greylist: Comcast Vendor-specific Attributes */
++#ifdef CONFIG_RADIUS_GREYLIST
++#define RADIUS_VENDOR_ID_COMCAST 17270
++enum {
++	RADIUS_VENDOR_ATTR_COMCAST_NETWORK_TYPE = 133,
++	RADIUS_VENDOR_ATTR_COMCAST_CM_MAC = 134,
++	RADIUS_VENDOR_ATTR_COMCAST_AP_VLAN = 135,
++	RADIUS_VENDOR_ATTR_COMCAST_AP_SNR = 136,
++	RADIUS_VENDOR_ATTR_COMCAST_REPLY_MESSAGE = 137,
++};
++#endif /* CONFIG_RADIUS_GREYLIST */
++
+ struct radius_hdr {
+ 	u8 code;
+ 	u8 identifier;
+@@ -370,5 +382,13 @@ int radius_copy_class(struct radius_class_data *dst,
+ u8 radius_msg_find_unlisted_attr(struct radius_msg *msg, u8 *attrs);
+ 
+ int radius_gen_session_id(u8 *id, size_t len);
++#ifdef CONFIG_RADIUS_GREYLIST
++u8 *radius_msg_get_vendor_attr(struct radius_msg *msg, u32 vendor,
++				u8 subtype, size_t *alen);
++
++int radius_msg_add_greylist(struct radius_msg *msg, u8 subtype, char *data,
++			   size_t len);
++
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ #endif /* RADIUS_H */
+diff --git a/src/radius/radius_das.c b/src/radius/radius_das.c
+index aaa3fc267..d212f7905 100644
+--- a/src/radius/radius_das.c
++++ b/src/radius/radius_das.c
+@@ -429,6 +429,9 @@ static void radius_das_receive(int sock, void *eloop_ctx, void *sock_ctx)
+ 	if (wpa_debug_level <= MSG_MSGDUMP)
+ 		radius_msg_dump(msg);
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (das->shared_secret) {
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	if (radius_msg_verify_das_req(msg, das->shared_secret,
+ 				       das->shared_secret_len,
+ 				       das->require_message_authenticator)) {
+@@ -437,6 +440,9 @@ static void radius_das_receive(int sock, void *eloop_ctx, void *sock_ctx)
+ 			   abuf, from_port);
+ 		goto fail;
+ 	}
++#ifdef CONFIG_RADIUS_GREYLIST
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 	os_get_time(&now);
+ 	res = radius_msg_get_attr(msg, RADIUS_ATTR_EVENT_TIMESTAMP,
+@@ -483,12 +489,18 @@ static void radius_das_receive(int sock, void *eloop_ctx, void *sock_ctx)
+ 				   "Event-Timestamp attribute");
+ 		}
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++		if (das->shared_secret) {
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 		if (radius_msg_finish_das_resp(reply, das->shared_secret,
+ 					       das->shared_secret_len, hdr) <
+ 		    0) {
+ 			wpa_printf(MSG_DEBUG, "DAS: Failed to add "
+ 				   "Message-Authenticator attribute");
+ 		}
++#ifdef CONFIG_RADIUS_GREYLIST
++		}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 		if (wpa_debug_level <= MSG_MSGDUMP)
+ 			radius_msg_dump(reply);
+@@ -513,6 +525,9 @@ static int radius_das_open_socket(int port)
+ {
+ 	int s;
+ 	struct sockaddr_in addr;
++#ifdef CONFIG_RADIUS_GREYLIST
++	int flag = 1;
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 
+ 	s = socket(PF_INET, SOCK_DGRAM, 0);
+ 	if (s < 0) {
+@@ -523,6 +538,11 @@ static int radius_das_open_socket(int port)
+ 	os_memset(&addr, 0, sizeof(addr));
+ 	addr.sin_family = AF_INET;
+ 	addr.sin_port = htons(port);
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (-1 == setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &flag, sizeof(flag))) {
++		wpa_printf(MSG_DEBUG, "RADIUS DAS: setsockopt fail");
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	if (bind(s, (struct sockaddr *) &addr, sizeof(addr)) < 0) {
+ 		wpa_printf(MSG_INFO, "RADIUS DAS: bind: %s", strerror(errno));
+ 		close(s);
+@@ -538,8 +558,13 @@ radius_das_init(struct radius_das_conf *conf)
+ {
+ 	struct radius_das_data *das;
+ 
++/* RADIUS greylist allows das secret to be null for open ssid */
++#ifdef CONFIG_RDKB_RADIUS_GREYLIST
++	if (conf->port == 0 || conf->client_addr == NULL)
++#else /* CONFIG_RADIUS_GREYLIST */
+ 	if (conf->port == 0 || conf->shared_secret == NULL ||
+ 	    conf->client_addr == NULL)
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 		return NULL;
+ 
+ 	das = os_zalloc(sizeof(*das));
+@@ -557,6 +582,9 @@ radius_das_init(struct radius_das_conf *conf)
+ 	os_memcpy(&das->client_addr, conf->client_addr,
+ 		  sizeof(das->client_addr));
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++	if (conf->shared_secret) {
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	das->shared_secret = os_memdup(conf->shared_secret,
+ 				       conf->shared_secret_len);
+ 	if (das->shared_secret == NULL) {
+@@ -565,6 +593,9 @@ radius_das_init(struct radius_das_conf *conf)
+ 	}
+ 	das->shared_secret_len = conf->shared_secret_len;
+ 
++#ifdef CONFIG_RADIUS_GREYLIST
++	}
++#endif /* CONFIG_RADIUS_GREYLIST */
+ 	das->sock = radius_das_open_socket(conf->port);
+ 	if (das->sock < 0) {
+ 		wpa_printf(MSG_ERROR, "Failed to open UDP socket for RADIUS "
+-- 
+2.43.0
+

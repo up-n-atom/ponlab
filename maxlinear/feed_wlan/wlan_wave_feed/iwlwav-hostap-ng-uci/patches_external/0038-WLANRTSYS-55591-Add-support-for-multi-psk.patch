@@ -1,0 +1,459 @@
+From df0708a10a9940c1adb1fcca5b2f492dcfae2808 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Fri, 26 May 2023 09:19:57 +0200
+Subject: [PATCH] WLANRTSYS-55591: Add support for multi-psk
+
+- Multi-PSK
+- WPS Multi-PSK
+---
+ hostapd/ctrl_iface.c  | 66 +++++++++++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c | 23 +++++++++++++++
+ src/ap/ap_config.c    | 11 +++++++-
+ src/ap/ap_config.h    |  5 ++--
+ src/ap/hostapd.h      |  1 +
+ src/ap/sta_info.c     | 24 ++++++++++++++++
+ src/ap/sta_info.h     |  2 ++
+ src/ap/wps_hostapd.c  | 55 ++++++++++++++++++++++++++++++++++++
+ src/ap/wps_hostapd.h  |  2 ++
+ src/wps/wps.h         |  4 +++
+ 10 files changed, 190 insertions(+), 3 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index f5b8c76e8..0de522b6c 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -549,12 +549,22 @@ static const char * pbc_status_str(enum pbc_status status)
+ 	}
+ }
+ 
++/* Get Key ID to be used for currently active PBC session
++ * If session not active or Key ID not set, return NULL */
++static const char * hostapd_wps_get_keyid (struct hostapd_data *hapd)
++{
++	if (WPS_PBC_STATUS_ACTIVE != hapd->wps_stats.pbc_status)
++		return NULL;
++
++	return hapd->wps_stats.key_id;
++}
+ 
+ static int hostapd_ctrl_iface_wps_get_status(struct hostapd_data *hapd,
+ 					     char *buf, size_t buflen)
+ {
+ 	int ret;
+ 	char *pos, *end;
++	const char *key_id;
+ 
+ 	pos = buf;
+ 	end = buf + buflen;
+@@ -566,6 +576,12 @@ static int hostapd_ctrl_iface_wps_get_status(struct hostapd_data *hapd,
+ 		return pos - buf;
+ 	pos += ret;
+ 
++	key_id = hostapd_wps_get_keyid(hapd);
++	ret = sprintf_s(pos, end - pos, "PBC KeyID: %s\n", key_id ? key_id : "");
++	if (ret <= 0)
++		return pos - buf;
++	pos += ret;
++
+ 	ret = os_snprintf(pos, end - pos, "Last WPS result: %s\n",
+ 			  (hapd->wps_stats.status == WPS_STATUS_SUCCESS ?
+ 			   "Success":
+@@ -5048,6 +5064,51 @@ static int hostapd_ctrl_iface_set_bss_load(struct hostapd_data *hapd, const char
+ 	return 0;
+ }
+ 
++static int hostapd_ctrl_iface_get_sta_wpa_psk(struct hostapd_data *hapd, char *cmd,
++					      char *buf, size_t buflen)
++{
++	u8 addr[ETH_ALEN];
++	struct sta_info *sta;
++	const char *key_id, *wpa_passphrase;
++
++	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	if (hapd == NULL) {
++		wpa_printf(MSG_ERROR, "Could not find the provided BSS name");
++		return -1;
++	}
++
++	cmd = os_strchr(cmd, ' ');
++	if (cmd) {
++		cmd++;
++	}
++	else {
++		wpa_printf(MSG_ERROR, "No STA MAC address provided");
++		return -1;
++	}
++
++	if (hwaddr_aton(cmd, addr)) {
++		wpa_printf(MSG_ERROR, "Invalid STA MAC address provided");
++		return -1;
++	}
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta) {
++		wpa_printf(MSG_WARNING, "STA" MACSTR "does not exist", MAC2STR(addr));
++		return -1;
++	}
++
++	key_id = ap_sta_wpa_get_keyid(hapd, sta);
++	wpa_passphrase = ap_sta_wpa_get_passphrase(hapd, sta);
++
++	if (!key_id || !wpa_passphrase) {
++		wpa_printf(MSG_INFO, "STA" MACSTR "does not use PSK from Multi PSK list", MAC2STR(addr));
++		return 0;
++	}
++
++	return sprintf_s(buf, buflen, "key_id=%s\nwpa_passphrase=%s\n",
++			 key_id, wpa_passphrase);
++}
++
+ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -5160,6 +5221,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "WPS_CHECK_PIN ", 14) == 0) {
+ 		reply_len = hostapd_ctrl_iface_wps_check_pin(
+ 			hapd, buf + 14, reply, reply_size);
++	} else if (os_strncmp(buf, "WPS_PBC_KEYID ", 14) == 0) {
++		if (hostapd_wps_button_pushed_keyid(hapd, buf + 14))
++			reply_len = -1;
+ 	} else if (os_strcmp(buf, "WPS_PBC") == 0) {
+ 		if (hostapd_wps_button_pushed(hapd, NULL))
+ 			reply_len = -1;
+@@ -5680,6 +5744,8 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		wpa_printf(MSG_EXCESSIVE, "%s; *** Received: 'SET_BSS_LOAD' (buf= '%s') ***\n", __FUNCTION__, buf);
+ 		reply_len = hostapd_ctrl_iface_set_bss_load(hapd, buf + 13, reply, reply_size);
+ #endif /* CONFIG_IEEE80211AX */
++	} else if (os_strncmp(buf, "GET_STA_WPA_PSK ", 16) == 0) {
++		reply_len = hostapd_ctrl_iface_get_sta_wpa_psk(hapd, buf + 16, reply, reply_size);
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index f5a27e888..1bf6b5056 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -2131,6 +2131,27 @@ static int hostapd_cli_cmd_reconf(struct wpa_ctrl *ctrl, int argc,
+ 	return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++static int hostapd_cli_cmd_get_sta_wpa_psk(struct wpa_ctrl *ctrl, int argc,
++					   char *argv[])
++{
++	int res;
++	char cmd[64];
++
++	if (argc != 2) {
++		printf("Invalid 'get_sta_wpa_psk' command: needs 2 arguments:\n"
++				"- BSS name and STA MAC address from which to get PSK\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "GET_STA_WPA_PSK %s %s", argv[0], argv[1]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2404,6 +2425,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  "are unaffected)\n"
+ 	  "  if BSS name is given, that BSS will be reloaded (main BSS isn't "
+ 	  "supported)" },
++	{ "get_sta_wpa_psk", hostapd_cli_cmd_get_sta_wpa_psk, NULL,
++	  "= get STAs key ID and passphrase if set in wpa_psk_file" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index fc141e103..3b5947358 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -491,8 +491,17 @@ static int hostapd_config_read_wpa_psk(const char *fname,
+ 			ok = 1;
+ 		else if (len >= 8 && len < 64 &&
+ 			 pbkdf2_sha1(pos, ssid->ssid, ssid->ssid_len,
+-				     4096, psk->psk, PMK_LEN) == 0)
++				     4096, psk->psk, PMK_LEN) == 0) {
++			len = os_strlcpy(psk->wpa_passphrase, pos, sizeof(psk->wpa_passphrase));
++			if ((size_t) len >= sizeof(psk->wpa_passphrase)) {
++				wpa_printf(MSG_ERROR, "%s: Passhphrase too long", __func__);
++				os_free(psk);
++				ret = -1;
++				break;
++			}
+ 			ok = 1;
++		}
++
+ 		if (!ok) {
+ 			wpa_printf(MSG_ERROR,
+ 				   "Invalid PSK '%s' on line %d in '%s'",
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 0f423905b..3e9aa110e 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -156,7 +156,6 @@ struct hostapd_vlan {
+ };
+ 
+ #define PMK_LEN 32
+-#define KEYID_LEN 32
+ #define MIN_PASSPHRASE_LEN 8
+ #define MAX_PASSPHRASE_LEN 63
+ struct hostapd_sta_wpa_psk_short {
+@@ -170,7 +169,8 @@ struct hostapd_sta_wpa_psk_short {
+ struct hostapd_wpa_psk {
+ 	struct hostapd_wpa_psk *next;
+ 	int group;
+-	char keyid[KEYID_LEN];
++	char keyid[KEYID_SIZE];
++	char wpa_passphrase[MAX_PASSPHRASE_LEN + 1];
+ 	int wps;
+ 	u8 psk[PMK_LEN];
+ 	u8 addr[ETH_ALEN];
+@@ -1396,6 +1396,7 @@ struct hostapd_config {
+ #define COEX_ACTIVE_TIME_MAX	0x1fffff
+ #define COEX_INACTIVE_TIME_MIN	2
+ #define COEX_INACTIVE_TIME_MAX	32
++#define AP_MAX_VALID_CHAR		255
+ 
+ static inline enum oper_chan_width
+ hostapd_get_oper_chwidth(struct hostapd_config *conf)
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 67dbcfe1a..1667855c4 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -158,6 +158,7 @@ struct wps_stat {
+ 	enum wps_error_indication failure_reason;
+ 	enum pbc_status pbc_status;
+ 	u8 peer_addr[ETH_ALEN];
++	char *key_id;
+ };
+ 
+ struct hostapd_neighbor_entry {
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 729cdf46c..9c795010e 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1323,6 +1323,30 @@ void ap_sta_stop_sa_query(struct hostapd_data *hapd, struct sta_info *sta)
+ 	sta->sa_query_count = 0;
+ }
+ 
++const char * ap_sta_wpa_get_passphrase(struct hostapd_data *hapd,
++				       struct sta_info *sta)
++{
++	struct hostapd_wpa_psk *psk;
++	struct hostapd_ssid *ssid;
++	const u8 *pmk;
++	int pmk_len;
++
++	ssid = &hapd->conf->ssid;
++
++	pmk = wpa_auth_get_pmk(sta->wpa_sm, &pmk_len);
++	if (!pmk || pmk_len != PMK_LEN)
++		return NULL;
++
++	for (psk = ssid->wpa_psk; psk; psk = psk->next)
++		if (os_memcmp(pmk, psk->psk, PMK_LEN) == 0)
++			break;
++	if (!psk)
++		return NULL;
++	if (!psk || !psk->wpa_passphrase[0])
++		return NULL;
++
++	return psk->wpa_passphrase;
++}
+ 
+ const char * ap_sta_wpa_get_keyid(struct hostapd_data *hapd,
+ 				  struct sta_info *sta)
+diff --git a/src/ap/sta_info.h b/src/ap/sta_info.h
+index f4073e843..0cbfb3790 100644
+--- a/src/ap/sta_info.h
++++ b/src/ap/sta_info.h
+@@ -399,6 +399,8 @@ const char * ap_sta_wpa_get_keyid(struct hostapd_data *hapd,
+ 				  struct sta_info *sta);
+ const u8 * ap_sta_wpa_get_dpp_pkhash(struct hostapd_data *hapd,
+ 				     struct sta_info *sta);
++const char * ap_sta_wpa_get_passphrase(struct hostapd_data *hapd,
++				  struct sta_info *sta);
+ void ap_sta_disconnect(struct hostapd_data *hapd, struct sta_info *sta,
+ 		       const u8 *addr, u16 reason);
+ 
+diff --git a/src/ap/wps_hostapd.c b/src/ap/wps_hostapd.c
+index aacfa3372..c4598f252 100644
+--- a/src/ap/wps_hostapd.c
++++ b/src/ap/wps_hostapd.c
+@@ -270,6 +270,25 @@ static void hostapd_wps_enrollee_seen_cb(void *ctx, const u8 *addr,
+ 		     config_methods, dev_password_id, request_type, dev_name);
+ }
+ 
++/* Returns true if key_id was set via CTRL iface and is present in WPA PSK file
++ * Fills PSK for the first entry with matching key_id */
++static bool hostapd_wps_lookup_key_id_psk (const struct hostapd_data *hapd, const u8 **psk)
++{
++	const struct hostapd_wpa_psk *wpa_psk;
++
++	if (NULL == hapd->wps_stats.key_id)
++		return false;
++
++	for (wpa_psk = hapd->conf->ssid.wpa_psk; wpa_psk; wpa_psk = wpa_psk->next) {
++		if (os_strcmp(hapd->wps_stats.key_id, wpa_psk->keyid))
++			continue;
++
++		*psk = wpa_psk->psk;
++		return true;
++	}
++
++	return false;
++}
+ 
+ static int hostapd_wps_lookup_pskfile_cb(void *ctx, const u8 *mac_addr,
+ 					 const u8 **psk)
+@@ -279,6 +298,9 @@ static int hostapd_wps_lookup_pskfile_cb(void *ctx, const u8 *mac_addr,
+ 	const u8 *any_psk = NULL;
+ 	const u8 *dev_psk = NULL;
+ 
++	if (hostapd_wps_lookup_key_id_psk(hapd, psk))
++		return 1;
++
+ 	for (wpa_psk = hapd->conf->ssid.wpa_psk; wpa_psk;
+ 	     wpa_psk = wpa_psk->next) {
+ 		if (!wpa_psk->wps)
+@@ -827,6 +849,7 @@ static void hostapd_wps_event_pbc_overlap(struct hostapd_data *hapd)
+ {
+ 	/* Update WPS Status - PBC Overlap */
+ 	hapd->wps_stats.pbc_status = WPS_PBC_STATUS_OVERLAP;
++	hapd->wps_stats.key_id = NULL;
+ }
+ 
+ 
+@@ -834,6 +857,7 @@ static void hostapd_wps_event_pbc_timeout(struct hostapd_data *hapd)
+ {
+ 	/* Update WPS PBC Status:PBC Timeout */
+ 	hapd->wps_stats.pbc_status = WPS_PBC_STATUS_TIMEOUT;
++	hapd->wps_stats.key_id = NULL;
+ }
+ 
+ 
+@@ -841,6 +865,8 @@ static void hostapd_wps_event_pbc_active(struct hostapd_data *hapd)
+ {
+ 	/* Update WPS PBC status - Active */
+ 	hapd->wps_stats.pbc_status = WPS_PBC_STATUS_ACTIVE;
++	if (hapd->wps && hapd->wps->key_id[0])
++		hapd->wps_stats.key_id = hapd->wps->key_id;
+ }
+ 
+ 
+@@ -848,6 +874,7 @@ static void hostapd_wps_event_pbc_disable(struct hostapd_data *hapd)
+ {
+ 	/* Update WPS PBC status - Active */
+ 	hapd->wps_stats.pbc_status = WPS_PBC_STATUS_DISABLE;
++	hapd->wps_stats.key_id = NULL;
+ }
+ 
+ 
+@@ -858,6 +885,7 @@ static void hostapd_wps_event_success(struct hostapd_data *hapd,
+ 	hapd->wps_stats.pbc_status = WPS_PBC_STATUS_DISABLE;
+ 	hapd->wps_stats.status = WPS_STATUS_SUCCESS;
+ 	os_memcpy(hapd->wps_stats.peer_addr, success->peer_macaddr, ETH_ALEN);
++	hapd->wps_stats.key_id = NULL;
+ }
+ 
+ 
+@@ -869,6 +897,7 @@ static void hostapd_wps_event_fail(struct hostapd_data *hapd,
+ 	os_memcpy(hapd->wps_stats.peer_addr, fail->peer_macaddr, ETH_ALEN);
+ 
+ 	hapd->wps_stats.failure_reason = fail->error_indication;
++	hapd->wps_stats.key_id = NULL;
+ 
+ 	if (fail->error_indication > 0 &&
+ 	    fail->error_indication < NUM_WPS_EI_VALUES) {
+@@ -1566,6 +1595,7 @@ int hostapd_wps_add_pin(struct hostapd_data *hapd, const u8 *addr,
+ 
+ struct wps_button_pushed_ctx {
+ 	const u8 *p2p_dev_addr;
++	const char *key_id;
+ 	unsigned int count;
+ };
+ 
+@@ -1575,6 +1605,12 @@ static int wps_button_pushed(struct hostapd_data *hapd, void *ctx)
+ 
+ 	if (hapd->wps) {
+ 		data->count++;
++		if (data->key_id)
++			strncpy_s(hapd->wps->key_id, sizeof(hapd->wps->key_id),
++				  data->key_id, MAX_KEYID_LEN);
++		else
++			os_memset(hapd->wps->key_id, 0, sizeof(hapd->wps->key_id));
++
+ 		return wps_registrar_button_pushed(hapd->wps->registrar,
+ 						   data->p2p_dev_addr);
+ 	}
+@@ -1597,6 +1633,25 @@ int hostapd_wps_button_pushed(struct hostapd_data *hapd,
+ 	return ret;
+ }
+ 
++int hostapd_wps_button_pushed_keyid(struct hostapd_data *hapd,
++				    const char *key_id)
++{
++	struct wps_button_pushed_ctx ctx;
++	int ret;
++	rsize_t key_id_len = strnlen_s(key_id, AP_MAX_VALID_CHAR);
++
++	if (!IS_VALID_RANGE(key_id_len, AP_MIN_VALID_CHAR, MAX_KEYID_LEN)) {
++		wpa_printf(MSG_ERROR, "CTRL: WPS PBC: wrong key ID length");
++		return -1;
++	}
++
++	os_memset(&ctx, 0, sizeof(ctx));
++	ctx.key_id = key_id;
++	ret = hostapd_wps_for_each(hapd, wps_button_pushed, &ctx);
++	if (ret == 0 && !ctx.count)
++		ret = -1;
++	return ret;
++}
+ 
+ struct wps_cancel_ctx {
+ 	unsigned int count;
+diff --git a/src/ap/wps_hostapd.h b/src/ap/wps_hostapd.h
+index 204bd820a..50ce86ad2 100644
+--- a/src/ap/wps_hostapd.h
++++ b/src/ap/wps_hostapd.h
+@@ -21,6 +21,8 @@ int hostapd_wps_add_pin(struct hostapd_data *hapd, const u8 *addr,
+ 			const char *uuid, const char *pin, int timeout);
+ int hostapd_wps_button_pushed(struct hostapd_data *hapd,
+ 			      const u8 *p2p_dev_addr);
++int hostapd_wps_button_pushed_keyid(struct hostapd_data *hapd,
++				  const char *key_id);
+ int hostapd_wps_cancel(struct hostapd_data *hapd);
+ int hostapd_wps_get_mib_sta(struct hostapd_data *hapd, const u8 *addr,
+ 			    char *buf, size_t buflen);
+diff --git a/src/wps/wps.h b/src/wps/wps.h
+index fed3e2848..b10eeec1f 100644
+--- a/src/wps/wps.h
++++ b/src/wps/wps.h
+@@ -67,6 +67,9 @@ struct wps_credential {
+ /* maximum number of parsed WPS vendor extension attributes */
+ #define MAX_WPS_PARSE_VENDOR_EXT 10
+ 
++#define KEYID_SIZE    64
++#define MAX_KEYID_LEN (KEYID_SIZE - 1)
++
+ /**
+  * struct wps_device_data - WPS Device Data
+  * @mac_addr: Device MAC address
+@@ -845,6 +848,7 @@ struct wps_context {
+ 	/* Whether to send WPA2-PSK passphrase as a passphrase instead of PSK
+ 	 * for WPA3-Personal transition mode needs. */
+ 	bool use_passphrase;
++	char key_id[KEYID_SIZE];
+ };
+ 
+ struct wps_registrar *
+-- 
+2.43.0
+

@@ -1,0 +1,154 @@
+From c5ef1127fba66179af02bfaf42b836fb8bc5f203 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Thu, 22 Jun 2023 14:43:10 +0200
+Subject: [PATCH] WLANRTSYS-56407: ifconfig support
+
+- ifconfig support per BSS
+---
+ src/drivers/driver_nl80211.c | 82 ++++++++++++++++++++++++++++++++++++
+ src/drivers/driver_nl80211.h |  1 +
+ 2 files changed, 83 insertions(+)
+
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index 00ff6e5e5..f59c14c49 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -1360,6 +1360,7 @@ static void nl80211_refresh_mac(struct wpa_driver_nl80211_data *drv,
+ 	}
+ }
+ 
++#define PROCESS_EVENTS_PER_BSS
+ 
+ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 						 struct ifinfomsg *ifi,
+@@ -1374,6 +1375,8 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 	char ifname[IFNAMSIZ + 1];
+ 	char extra[100], *pos, *end;
+ 	int init_failed;
++	struct i802_bss *cur_bss;
++	errno_t err;
+ 
+ 	extra[0] = '\0';
+ 	pos = extra;
+@@ -1424,6 +1427,81 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 	if (init_failed)
+ 		return; /* do not update interface state */
+ 
++#ifdef PROCESS_EVENTS_PER_BSS
++	cur_bss = get_bss_ifindex(drv, ifi->ifi_index);
++
++	if (cur_bss) {
++		if (cur_bss->if_enabled && !(ifi->ifi_flags & IFF_UP)) {
++			namebuf[0] = '\0';
++			if (if_indextoname(ifi->ifi_index, namebuf) &&
++			    linux_iface_up(drv->global->ioctl_sock, namebuf) > 0) {
++				/* Re-read MAC address as it may have changed */
++				nl80211_refresh_mac(drv, ifi->ifi_index,1);
++				wpa_printf(MSG_DEBUG, "nl80211: Ignore interface down "
++					   "event since interface %s is up", namebuf);
++				return;
++			}
++			wpa_printf(MSG_DEBUG, "nl80211: Interface down (%s/%s)",
++				   namebuf, ifname);
++
++			cur_bss->if_enabled = 0;
++			wpa_supplicant_event(cur_bss->ctx,
++					     EVENT_INTERFACE_DISABLED, NULL);
++
++			/*
++			 * Try to get drv again, since it may be removed as
++			 * part of the EVENT_INTERFACE_DISABLED handling for
++			 * dynamic interfaces
++			 */
++			drv = nl80211_find_drv(global, ifi->ifi_index,
++					       buf, len, NULL);
++			if (!drv)
++				return;
++		}
++
++		if (!cur_bss->if_enabled && (ifi->ifi_flags & IFF_UP)) {
++			u8 addr[ETH_ALEN];
++
++			if (if_indextoname(ifi->ifi_index, namebuf) &&
++			    linux_iface_up(drv->global->ioctl_sock, namebuf) == 0) {
++				wpa_printf(MSG_DEBUG, "nl80211: Ignore interface up "
++					   "event since interface %s is down",
++					   namebuf);
++				return;
++			}
++
++			if (cur_bss &&
++			    linux_get_ifhwaddr(drv->global->ioctl_sock,
++					       cur_bss->ifname, addr) < 0) {
++				wpa_printf(MSG_DEBUG,
++					   "nl80211: %s: failed to re-read MAC address",
++					   cur_bss->ifname);
++			} else if (cur_bss &&
++				   os_memcmp(addr, cur_bss->addr, ETH_ALEN) != 0) {
++				wpa_printf(MSG_DEBUG,
++					   "nl80211: Own MAC address on ifindex %d (%s) changed from "
++					   MACSTR " to " MACSTR,
++					   ifi->ifi_index, cur_bss->ifname,
++					   MAC2STR(cur_bss->addr),
++					   MAC2STR(addr));
++				err = memcpy_s(cur_bss->addr, sizeof(cur_bss->addr), addr, sizeof(addr));
++				if (EOK != err) {
++					wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++					return;
++				}
++			}
++
++			/* Re-read MAC address as it may have changed */
++			nl80211_refresh_mac(drv, ifi->ifi_index,1);
++			wpa_printf(MSG_DEBUG, "nl80211: Interface up (%s)", ifname);
++			cur_bss->if_enabled = 1;
++			wpa_supplicant_event(cur_bss->ctx, EVENT_INTERFACE_ENABLED,
++					     NULL);
++		}
++	}
++
++#else /* IF_EVENT_PER_BSS */
++
+ 	if (!drv->if_disabled && !(ifi->ifi_flags & IFF_UP)) {
+ 		namebuf[0] = '\0';
+ 		if (if_indextoname(ifi->ifi_index, namebuf) &&
+@@ -1494,6 +1572,7 @@ static void wpa_driver_nl80211_event_rtm_newlink(void *ctx,
+ 					     NULL);
+ 		}
+ 	}
++#endif /* IF_EVENT_PER_BSS */
+ 
+ 	/*
+ 	 * Some drivers send the association event before the operup event--in
+@@ -3065,6 +3144,8 @@ wpa_driver_nl80211_finish_drv_init(struct wpa_driver_nl80211_data *drv,
+ 			return ret;
+ 		}
+ 
++		bss->if_enabled = 1;
++
+ 		if (is_p2p_net_interface(nlmode))
+ 			nl80211_disable_11b_rates(bss->drv,
+ 						  bss->drv->ifindex, 1);
+@@ -7621,6 +7702,7 @@ static int wpa_driver_nl80211_set_operstate(void *priv, int state)
+ 	wpa_printf(MSG_DEBUG, "nl80211: Set %s operstate %d->%d (%s)",
+ 		   bss->ifname, drv->operstate, state,
+ 		   state ? "UP" : "DORMANT");
++	bss->if_enabled = state;
+ 	drv->operstate = state;
+ 	return netlink_send_oper_ifla(drv->global->netlink, drv->ifindex, -1,
+ 				      state ? IF_OPER_UP : IF_OPER_DORMANT);
+diff --git a/src/drivers/driver_nl80211.h b/src/drivers/driver_nl80211.h
+index f82f604e9..55e01b4b9 100644
+--- a/src/drivers/driver_nl80211.h
++++ b/src/drivers/driver_nl80211.h
+@@ -82,6 +82,7 @@ struct i802_bss {
+ 	unsigned int added_if:1;
+ 	unsigned int static_ap:1;
+ 	unsigned int use_nl_connect:1;
++	unsigned int if_enabled:1;
+ 
+ 	u8 addr[ETH_ALEN];
+ 	u8 prev_addr[ETH_ALEN];
+-- 
+2.43.0
+

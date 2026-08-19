@@ -1,0 +1,121 @@
+From 6bd42de2d9a2a502f19d094554c2118ea36fa34b Mon Sep 17 00:00:00 2001
+From: mshankar <mshankar@maxlinear.com>
+Date: Mon, 4 Nov 2024 18:33:31 +0800
+Subject: [PATCH] WLANRTSYS-85533 Max channel Switch time IE is missing in the
+ affiliated links after CSA count completion
+
+Issue: When a channel change is initiated on the affected link, the affiliated
+link includes the per sta profile of the affected link in its multilink IE
+along with its CSA IE as part of critical update procedure. After the CSA count
+in done on the affiliated link, MCST counting is supposed to happen which is
+missed to handle after hostap-ng migration
+
+RC: Hostap-ng has different ways to update the RNR in beacons in case of 6GHz
+colocation and MLO vaps' presence. Due to this, when we initiate channel
+change, apart from the templates that are expected to be sent to FW,
+multiple templates are sent to FW back to back for other radios as well the same
+radio which are replacing the template that was actually meant for MCST IE updation
+due to which MCST counting is skipped and we might face asserts during each
+critical update when there are multiple MLO vaps created. We have our own
+proprietary changes to handle the RNR beacon updates of other radios.
+
+Fix: Make changes so as to issue only relevant templates to FW during CSA.
+Related PR: https://mbitbucket.maxlinear.com/projects/SW_WAVE/repos/genrisc_tx_sender/pull-requests/547/overview
+
+FIXUP to WLANRTSYS-63318 ML CSA with puncturing and BSS critical update
+
+UT: Verified that MCST counting is done on all the links when initiating the channel change.
+Also, ran 24 hours of stability test with the channel change script. Faced two asserts
+which have already been taken care by other PRs in review state.
+---
+ src/ap/beacon.c            |  6 ++++++
+ src/ap/drv_callbacks.c     |  7 +++++++
+ src/ap/mxl_beacon.c        | 14 ++++++++++++++
+ src/ap/mxl_drv_callbacks.c |  3 ++-
+ 4 files changed, 29 insertions(+), 1 deletion(-)
+
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index c028a1d41..3756a3c30 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -3017,6 +3017,12 @@ int ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 	if (ret != 0)
+ 		return ret;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	/* We have proprietary implementation to update beacons in case
++	   of 6Ghz colocation */
++	return 0;
++#endif
++
+ 	if (!iface->interfaces || iface->interfaces->count <= 1)
+ 		return 0;
+ 
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 45d3d4150..2a2571add 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1311,7 +1311,14 @@ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 	/* set_beacon needs to be called when AP csa is in progress, and also when STA role
+ 	 * interface initiated the ch switch following Peer AP CSA (the AP the sta is
+ 	 * connected to is switching channel and AP beacons need to be changed */
++
++#ifndef CONFIG_VENDOR_MXL
+ 	ieee802_11_set_beacon(hapd);
++#else
++	/* No need to set other radio beacons after the CSA is done. We have proprietary
++	   changes to handle RNR updates both in case of 6GHz colocation and MLO */
++	ieee802_11_set_beacon_per_bss_only(hapd);
++#endif
+ 
+ #ifdef CONFIG_OCV
+ 	if (hapd->conf->ocv &&
+diff --git a/src/ap/mxl_beacon.c b/src/ap/mxl_beacon.c
+index aed2964c3..920c71e4b 100644
+--- a/src/ap/mxl_beacon.c
++++ b/src/ap/mxl_beacon.c
+@@ -849,6 +849,9 @@ int mxl_auto_update_rnr_db(struct hostapd_iface *iface)
+ void mxl_update_beacon_after_rnr (struct hapd_interfaces *interfaces)
+ {
+ 	int radio_idx, vap_idx;
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++	struct hostapd_data *sibling_hapd;
++#endif
+ 	if (interfaces == NULL)
+ 		return;
+ 
+@@ -858,6 +861,17 @@ void mxl_update_beacon_after_rnr (struct hapd_interfaces *interfaces)
+ 		    (SIX_GHZ_CAPABILITY_INVALID == interfaces->iface[radio_idx]->hw_features->he_capab[IEEE80211_MODE_AP].he_6ghz_capa)) {
+ 			for (vap_idx = 0; vap_idx < interfaces->iface[radio_idx]->num_bss; vap_idx++) {
+ 				if (interfaces->iface[radio_idx]->bss[vap_idx]->conf->mxl_bss_conf.rnr_auto_update) {
++#ifdef CONFIG_IEEE80211BE_MXL_MLO
++					sibling_hapd = interfaces->iface[radio_idx]->bss[vap_idx]->mxl_data.sibling_hapd;
++
++					/* Skip the beacon set for the affiliated vaps of 6G. The update for sibling is already taken care
++					 * as part of MXL specific ML vap's beacon updation process where we update the sibling beacon via
++					 * mxl_setup_link during the restart of 6G vap after configs are applied and via
++					 * mxl_hostapd_event_ml_csa_done_on_reporting_link during CSA */
++
++					if (sibling_hapd && is_6ghz_op_class(sibling_hapd->iface->conf->op_class))
++						continue;
++#endif
+ 					if (ieee802_11_update_beacon(interfaces->iface[radio_idx]->bss[vap_idx])) {
+ 						wpa_printf(MSG_ERROR, "Set Beacon failed");
+ 						return;
+diff --git a/src/ap/mxl_drv_callbacks.c b/src/ap/mxl_drv_callbacks.c
+index 593d3ef57..260362e56 100644
+--- a/src/ap/mxl_drv_callbacks.c
++++ b/src/ap/mxl_drv_callbacks.c
+@@ -117,7 +117,8 @@ static void mxl_hostapd_event_ml_csa_done_on_reporting_link(struct hostapd_data
+ 		hapd->mxl_data.ml_ie_max_chan_sw_time_ie_len_add = true;
+ 	}
+ 
+-	ieee802_11_update_beacon(hapd);
++	ieee802_11_set_beacon_per_bss_only(hapd);
++
+ 	hapd->mxl_data.ml_ie_max_chan_sw_time_ie_len_add = false;
+ }
+ 
+-- 
+2.43.0
+

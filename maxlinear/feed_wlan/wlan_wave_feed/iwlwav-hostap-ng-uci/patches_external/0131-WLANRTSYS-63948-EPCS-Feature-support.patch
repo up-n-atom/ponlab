@@ -1,0 +1,949 @@
+From ff24e89db04e2c1c72b8eda0916905ac34354761 Mon Sep 17 00:00:00 2001
+From: "Maneendra,Pokuri Naga" <pnmaneendra@maxlinear.com>
+Date: Sat, 9 Mar 2024 20:49:03 +0530
+Subject: [PATCH] WLANRTSYS-63948 EPCS Feature support
+
+---
+ hostapd/Makefile                   |   4 +
+ hostapd/mxl_config.c               |  27 +++++
+ hostapd/mxl_ctrl_iface.c           | 169 ++++++++++++++++++++++++++++
+ hostapd/mxl_hostapd_cli.c          |  13 +++
+ hostapd/mxl_hostapd_cli.h          |  16 +++
+ src/ap/ieee802_11.c                |  26 ++++-
+ src/ap/mxl_config.h                |   4 +
+ src/ap/mxl_hostapd.c               |   4 +
+ src/ap/mxl_mld.c                   |  48 +++++++-
+ src/ap/mxl_mld.h                   |  14 +++
+ src/ap/mxl_sta_info.h              |   5 +
+ src/ap/mxl_wmm.c                   | 173 +++++++++++++++++++++++++++++
+ src/ap/mxl_wmm.h                   |  26 +++++
+ src/ap/wmm.c                       |   8 +-
+ src/common/ieee802_11_common.c     |   6 +
+ src/common/ieee802_11_defs.h       |  13 +++
+ src/common/mxl_ieee802_11_common.h |  11 ++
+ src/common/mxl_ieee802_11_defs.h   |   5 +
+ src/drivers/driver_nl80211.c       |   5 +
+ 19 files changed, 571 insertions(+), 6 deletions(-)
+ create mode 100644 src/ap/mxl_wmm.c
+ create mode 100644 src/ap/mxl_wmm.h
+
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index b4327c719..742df6f4f 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -399,8 +399,12 @@ OBJS += ../src/ap/mxl_ieee802_11_shared.o
+ OBJS += ../src/ap/mxl_drv_callbacks.o
+ OBJS += ../src/ap/mxl_sta_info.o
+ OBJS += ../src/ap/mxl_utils.o
++OBJS += ../src/ap/mxl_wmm.o
+ ifdef CONFIG_IEEE80211BE_MXL_MLO
+ OBJS += ../src/ap/mxl_mld.o
++ifdef CONFIG_EPCS_MXL
++CFLAGS += -DCONFIG_EPCS_MXL
++endif
+ endif
+ endif
+ 
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 0a53092e8..226b7ddf7 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -1612,6 +1612,14 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->ignore_40_mhz_intolerant = val;
++#ifdef CONFIG_EPCS_MXL
++	} else if (os_strncmp(buf, "epcs_wmm_ac_", 12) == 0) {
++		if (hostapd_config_wmm_ac(mxl_conf->epcs_wmm_ac_params, buf, pos)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid EPCS WMM ac item",
++				line);
++			return 0;
++		}
++#endif /* CONFIG_EPCS_MXL */
+ 	} else if (os_strcmp(buf, "sBridgeMode") == 0) {
+ 		mxl_bss_conf->sBridgeMode = atoi(pos);
+ 	} else if (os_strcmp(buf, "colocated_6g_radio_info") == 0) {
+@@ -1912,6 +1920,19 @@ void mxl_hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ 
+ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+ {
++
++#ifdef CONFIG_EPCS_MXL
++	/* EPCS EDCA params referred from Wi-Fi 7 Testplan v0.0.22 */
++	const struct hostapd_wmm_ac_params epcs_ac_bk =
++	{ 4, 9, 7, 0, 0 }; /* background traffic */
++	const struct hostapd_wmm_ac_params epcs_ac_be =
++	{ 4, 9, 3, 0, 0 }; /* best effort traffic */
++	const struct hostapd_wmm_ac_params epcs_ac_vi =
++	{ 3, 4, 2, 188, 0 }; /* video traffic */
++	const struct hostapd_wmm_ac_params epcs_ac_vo =
++	{ 2, 3, 2, 102, 0 }; /* voice traffic */
++#endif /* CONFIG_EPCS_MXL */
++
+ 	/* no need to initlize with 0 or NULL - this is done by hostapd with memset */
+ 	struct mxl_hostapd_config *mxl_conf = &conf->mxl_conf;
+ 
+@@ -1931,6 +1952,12 @@ void mxl_hostapd_config_defaults(struct hostapd_config *conf)
+ 	mxl_conf->sCcaTh[2] = -72;
+ 	mxl_conf->sCcaTh[3] = -72;
+ 	mxl_conf->sCcaTh[4] = -69;
++#ifdef CONFIG_EPCS_MXL
++	mxl_conf->epcs_wmm_ac_params[0] = epcs_ac_be;
++	mxl_conf->epcs_wmm_ac_params[1] = epcs_ac_bk;
++	mxl_conf->epcs_wmm_ac_params[2] = epcs_ac_vi;
++	mxl_conf->epcs_wmm_ac_params[3] = epcs_ac_vo;
++#endif /* CONFIG_EPCS_MXL */
+ 
+ 	/* Advertisement protocol IE */
+ 	conf->adv_proto_query_resp_len = ADV_PROTO_QUERY_RESP_LEN_DEFAULT;
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index ce5998950..cd68c338d 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -75,6 +75,167 @@ struct hostapd_data *mxl_get_bss_index(const char **cmd, struct hostapd_data *ha
+ 	return NULL;
+ }
+ 
++#ifdef CONFIG_EPCS_MXL
++static int mxl_hostapd_ctrl_iface_send_epcs_req_frame(struct hostapd_data *hapd,
++				const char *cmd)
++{
++	u8 mac[ETH_ALEN];
++	u8 *pos, buf[61];
++	char *tmp;
++	int ret, dialog_token;
++	size_t len = 0;
++	struct sta_info *sta;
++
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
++	if (!hapd) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - there is no iface with the given name");
++		return -1;
++	}
++
++	if ((hapd->iconf->mxl_conf.mlo_supported == MULTILINK_DISABLED) && !mxl_is_mlo_enabled(hapd->conf)) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - MLO is not supported/enabled in AP");
++		return -1;
++	}
++
++	if (!hapd->iconf->mxl_conf.epcs_enabled) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - EPCS feature not supported in AP");
++		return -1;
++	}
++
++	if (!cmd) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - mac address is missing");
++		return -1;
++	}
++
++	if (hwaddr_aton(cmd, mac)) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - invalid peer mac address");
++		return -1;
++	}
++
++	tmp = os_strstr(cmd, " dialog_token=");
++	if (tmp) {
++		tmp += (sizeof(" dialog_token=") - 1);
++		dialog_token = atoi(tmp);
++		if (!IS_VALID_RANGE(dialog_token, 0, 255)) {
++			wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - Invalid dialog_token, must be in range 0 to 255");
++			return -1;
++		}
++	} else {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - dialog token missing");
++		return -1;
++	}
++
++	sta = ap_get_sta(hapd, mac);
++	if (sta == NULL)
++		sta = mxl_ap_get_sta_by_non_ap_mld_mac(hapd, mac);
++
++	if (sta == NULL) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - station not connected");
++		return -1;
++	}
++	if (!mxl_mlo_is_ml_sta(sta) && !(sta->mxl_sta_info.ext_flags & WLAN_STA_MLD_STA)) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - MLO not enabled/supported in station");
++		return -1;
++	}
++
++	if (!sta->mxl_sta_info.epcs_supported) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - EPCS feature not supported in station");
++		return -1;
++	}
++
++	pos = buf;
++	*pos++ = WLAN_ACTION_PROTECTED_EHT;
++	*pos++ = WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_ENABLE_REQ;
++	*pos++ = dialog_token;
++	pos = mxl_hostapd_eid_multilink(hapd, NULL, pos, ML_EPCS, 0, false, false);
++
++	len = pos - buf;
++
++	if (len != EPCS_REQUEST_FRAME_LENGTH) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_REQ_FRAME - Frame length is wrong Len=%ld", len);
++		return -1;
++	}
++
++	wpa_printf(MSG_INFO, "Send EPCS request frame to " MACSTR, MAC2STR(mac));
++
++	ret = hostapd_drv_send_action(hapd, (unsigned int)hapd->iface->freq, 0, mac,
++								  buf, len);
++
++	return ret;
++}
++
++static int mxl_hostapd_ctrl_iface_send_epcs_teardown_frame(struct hostapd_data *hapd,
++				const char *cmd)
++{
++	u8 mac[ETH_ALEN], buf[2], *pos;
++	int ret;
++	size_t len = 0;
++	struct sta_info *sta;
++
++	hapd = mxl_get_bss_index(&cmd, hapd, true, true);
++	if (!hapd) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - there is no iface with the given name");
++		return -1;
++	}
++
++	if ((hapd->iconf->mxl_conf.mlo_supported == MULTILINK_DISABLED) && !mxl_is_mlo_enabled(hapd->conf)) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - MLO is not supported/enabled in AP");
++		return -1;
++	}
++
++	if (!hapd->iconf->mxl_conf.epcs_enabled) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - EPCS feature not supported in AP");
++		return -1;
++	}
++
++	if (!cmd) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - mac address is missing");
++		return -1;
++	}
++
++	if (hwaddr_aton(cmd, mac)) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - invalid peer mac address");
++		return -1;
++	}
++
++	sta = ap_get_sta(hapd, mac);
++	if (sta == NULL)
++		sta = mxl_ap_get_sta_by_non_ap_mld_mac(hapd, mac);
++
++	if (sta == NULL) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - station not connected");
++		return -1;
++	}
++
++	if (!mxl_mlo_is_ml_sta(sta) && !(sta->mxl_sta_info.ext_flags & WLAN_STA_MLD_STA)) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - MLO not enabled/supported in station");
++		return -1;
++	}
++
++	if (!sta->mxl_sta_info.epcs_supported) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - EPCS feature not supported in station");
++		return -1;
++	}
++
++	pos = buf;
++	*pos++ = WLAN_ACTION_PROTECTED_EHT;
++	*pos++ = WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_TEARDOWN;
++	len = pos - buf;
++
++	if (len != EPCS_TEARDOWN_FRAME_LENGTH) {
++		wpa_printf(MSG_ERROR, "CTRL: SEND_EPCS_TEARDOWN_FRAME - Frame length is wrong Len=%ld", len);
++		return -1;
++	}
++
++	wpa_printf(MSG_INFO, "Send EPCS teardown frame to " MACSTR, MAC2STR(mac));
++
++	ret = hostapd_drv_send_action(hapd, (unsigned int)hapd->iface->freq, 0, mac,
++								  buf, len);
++
++	return ret;
++}
++#endif /* CONFIG_EPCS_MXL */
++
+ static int mxl_hostapd_ctrl_iface_get_hw_features(struct hostapd_iface *iface, const char *cmd, char *buf, size_t buflen)
+ {
+ 	int ret = 0, len = 0;
+@@ -2916,6 +3077,14 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "DISASSOCIATE ", 13) == 0) {
+ 		mxl_mlo_hostapd_ctrl_disassociate(hapd, buf + 13, reply_len);
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
++#ifdef CONFIG_EPCS_MXL
++	} else if (os_strncmp(buf, "SEND_EPCS_TEARDOWN_FRAME ", sizeof("SEND_EPCS_TEARDOWN_FRAME ") - 1) == 0) {
++		if (mxl_hostapd_ctrl_iface_send_epcs_teardown_frame(hapd, buf + sizeof("SEND_EPCS_TEARDOWN_FRAME ") - 1))
++			*reply_len = -1;
++	} else if (os_strncmp(buf, "SEND_EPCS_REQ_FRAME ", sizeof("SEND_EPCS_REQ_FRAME ") - 1) == 0) {
++		if (mxl_hostapd_ctrl_iface_send_epcs_req_frame(hapd, buf + sizeof("SEND_EPCS_REQ_FRAME ") - 1))
++			*reply_len = -1;
++#endif /* CONFIG_EPCS_MXL */
+ 	} else {
+ 		return 0;
+ 	}
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index 09efdc964..21adccb69 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -403,3 +403,16 @@ int mxl_hostapd_cli_cmd_set_power_mode(struct wpa_ctrl *ctrl, int argc,
+ 	}
+ 	return mxl_wpa_ctrl_command(ctrl, cmd);
+ }
++#ifdef CONFIG_EPCS_MXL
++int mxl_hostapd_cli_cmd_send_epcs_teardown_frame(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	return mxl_hostapd_cli_cmd(ctrl, "SEND_EPCS_TEARDOWN_FRAME", 2, argc, argv);
++}
++
++int mxl_hostapd_cli_cmd_send_epcs_req_frame(struct wpa_ctrl *ctrl, int argc,
++				char *argv[])
++{
++	return mxl_hostapd_cli_cmd(ctrl, "SEND_EPCS_REQ_FRAME", 3, argc, argv);
++}
++#endif /* CONFIG_EPCS_MXL */
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index 7c63859e6..903a52e54 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -28,6 +28,8 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ #endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+ #define MXL_HOSTAPD_ADD_VENDOR_CLI \
++	MXL_CLI_COMMANDS_ACS	   \
++	MXL_CLI_COMMANDS_EPCS	\
+ 	{ "get_hw_features", mxl_hostapd_cli_cmd_get_hw_features, NULL,			\
+ 	  " = get hardware features" },							\
+ 	{ "set_failsafe_chan", mxl_hostapd_cli_cmd_set_failsafe_chan, NULL,		\
+@@ -88,6 +90,20 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ #define MXL_CLI_COMMANDS_ACS
+ #endif /* CONFIG_ACS */
+ 
++#ifdef CONFIG_EPCS_MXL
++int mxl_hostapd_cli_cmd_send_epcs_teardown_frame(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_send_epcs_req_frame(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++
++#define MXL_CLI_COMMANDS_EPCS	\
++	{ "send_epcs_teardown_frame", mxl_hostapd_cli_cmd_send_epcs_teardown_frame, NULL, \
++		"<bss> <mac_addr>" },	\
++	{ "send_epcs_req_frame", mxl_hostapd_cli_cmd_send_epcs_req_frame, NULL, \
++		"<bss> <mac_addr> dialog_token=<dialogtoken>" }, \
++
++#else
++#define MXL_CLI_COMMANDS_EPCS
++#endif /* CONFIG_EPCS_MXL */
++
+ int mxl_hostapd_cli_cmd_get_hw_features(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_set_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_get_failsafe_chan(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index a5ff8e47b..e32665e6f 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -65,6 +65,8 @@
+ #include "mxl_beacon.h"
+ #include "mxl_sta_info.h"
+ #include "mxl_ieee802_11.h"
++#include "mxl_wmm.h"
++#include "common/mxl_ieee802_11_common.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #ifdef CONFIG_WDS_WPA
+ #include "wds_wpa.h"
+@@ -337,6 +339,10 @@ u16 hostapd_own_capab_info(struct hostapd_data *hapd)
+ 	    hapd->iface->current_mode->mode == HOSTAPD_MODE_IEEE80211A &&
+ 	    (hapd->iconf->spectrum_mgmt_required || dfs))
+ 		capab |= WLAN_CAPABILITY_SPECTRUM_MGMT;
++#ifdef CONFIG_EPCS_MXL
++	if (hapd->iconf->mxl_conf.epcs_enabled)
++		capab |= WLAN_CAPABILITY_QOS;
++#endif /* CONFIG_EPCS_MXL */
+ 
+ 	for (i = 0; i < RRM_CAPABILITIES_IE_LEN; i++) {
+ 		if (hapd->conf->radio_measurements[i]) {
+@@ -4217,7 +4223,13 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ 					  elems->eht_capabilities_len);
+ 		if (resp != WLAN_STATUS_SUCCESS)
+ 			return resp;
+-
++#ifdef CONFIG_EPCS_MXL
++		else {
++			if (elems->eht_capabilities && (sta->eht_capab &&
++				(sta->eht_capab->mac_cap & EHT_MAC_CAP0_EPCS_PRIO_ACCESS)))
++				sta->mxl_sta_info.epcs_supported = 1;
++		}
++#endif /* CONFIG_EPCS_MXL */
+ #ifndef CONFIG_IEEE80211BE_MXL_MLO
+ 		if (!link) {
+ 			resp = hostapd_process_ml_assoc_req(hapd, elems, sta);
+@@ -6444,7 +6456,6 @@ void notify_action_frame(struct hostapd_data *hapd, const u8 *action_frame,
+ 	os_free(buf);
+ }
+ 
+-
+ static int handle_action(struct hostapd_data *hapd,
+ 			 const struct ieee80211_mgmt *mgmt, size_t len,
+ 			 unsigned int freq)
+@@ -6452,7 +6463,13 @@ static int handle_action(struct hostapd_data *hapd,
+ 	struct sta_info *sta;
+ 	u8 *action __maybe_unused;
+ 
++#ifdef CONFIG_EPCS_MXL
++	u8 *mxl_action;
++	mxl_action = (u8 *) &mgmt->u.action.u;
++	if (len < action_payload_min_len_expected(mxl_action)) {
++#else
+ 	if (len < IEEE80211_HDRLEN + 2 + 1) {
++#endif /* CONFIG_EPCS_MXL */
+ 		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
+ 			       HOSTAPD_LEVEL_DEBUG,
+ 			       "handle_action - too short payload (len=%lu)",
+@@ -6521,6 +6538,11 @@ static int handle_action(struct hostapd_data *hapd,
+ 	case WLAN_ACTION_WMM:
+ 		hostapd_wmm_action(hapd, mgmt, len);
+ 		return 1;
++#ifdef CONFIG_EPCS_MXL
++	case WLAN_ACTION_PROTECTED_EHT:
++		mxl_hostapd_eht_protected(hapd, mgmt, len);
++		return 1;
++#endif /* CONFIG_EPCS_MXL */
+ 	case WLAN_ACTION_SA_QUERY:
+ 		ieee802_11_sa_query_action(hapd, mgmt, len);
+ 		return 1;
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index cad01a48f..cad799f38 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -340,6 +340,10 @@ struct mxl_hostapd_config {
+ 	bool rnr_6g_op_class_137_allowed;
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* CONFIG_IEEE80211BE */
++#ifdef CONFIG_EPCS_MXL
++	u8 epcs_enabled;
++	struct hostapd_wmm_ac_params epcs_wmm_ac_params[WMM_AC_NUM];
++#endif /* CONFIG_EPCS_MXL */
+ 	int sProbeReqCltMode;
+ 	int ProbeReqListTimer;
+ 	size_t nlmsg_default_size;
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 1c59826f1..fa1d0f907 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -1483,6 +1483,10 @@ mxl_hostapd_set_debug_mode_eht_cap(struct hostapd_data *hapd)
+ 		mxl_hostapd_set_debug_eht_txrx_mcs_support(hw->mcs, conf->optional, override_cap_idx);
+ 		mxl_hostapd_set_debug_eht_ppe_thresholds(hw->ppet, conf->optional + EHT_MCS_NSS_CAPAB_LEN, override_cap_idx);
+ 	}
++#ifdef CONFIG_EPCS_MXL
++	if ((conf->mac_cap & EHT_MAC_CAP0_EPCS_PRIO_ACCESS))
++		hapd->iconf->mxl_conf.epcs_enabled = 1;
++#endif /* CONFIG_EPCS_MXL */
+ }
+ 
+ static void mxl_hostapd_send_debug_mode_eht_cap (struct hostapd_data *hapd)
+diff --git a/src/ap/mxl_mld.c b/src/ap/mxl_mld.c
+index 4096fa118..cad8879f4 100644
+--- a/src/ap/mxl_mld.c
++++ b/src/ap/mxl_mld.c
+@@ -31,6 +31,7 @@
+ #include "mxl_wpa_auth_glue.h"
+ #include "mxl_wds.h"
+ #include "mxl_beacon.h"
++#include "mxl_wmm.h"
+ 
+ static void mxl_set_link_id(struct hostapd_data *hapd)
+ {
+@@ -42,6 +43,16 @@ static void mxl_set_link_id(struct hostapd_data *hapd)
+ 		hapd->conf->mxl_bss_conf.link_id = LINK_ID_2G;
+ }
+ 
++#ifdef CONFIG_EPCS_MXL
++static u8 * mxl_hostapd_eid_mld_staprof_epcs(struct hostapd_data *hapd, u8 *eid)
++{
++	eid = mxl_hostapd_eid_wmm_epcs(hapd, eid);
++	eid = hostapd_eid_he_mu_edca_parameter_set(hapd, eid);
++
++	return eid;
++}
++#endif /* CONFIG_EPCS_MXL */
++
+ static void mxl_update_mld_info(struct hostapd_data *hapd, int mld_id, bool set_ap_mld_mac)
+ {
+ 	struct p_ap_mld *p_ap_mld = NULL;
+@@ -828,10 +839,18 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	/* Multi-Link control element */
+ 	/* B0..B2 */
+-	multilink_ctrl |= MULTI_LINK_CONTROL_TYPE_BASIC;
+-
++#ifdef CONFIG_EPCS_MXL
++	if (ml_type == ML_EPCS)
++		multilink_ctrl |= MULTI_LINK_CONTROL_TYPE_PRIOR_ACCESS;
++	else
++#endif /* CONFIG_EPCS_MXL */
++		multilink_ctrl |= MULTI_LINK_CONTROL_TYPE_BASIC;
+ 	/* B4, B5, B7, B8 */
++#ifdef CONFIG_EPCS_MXL
++	if ((!is_auth) && (ml_type != ML_EPCS)) {
++#else
+ 	if (!is_auth) {
++#endif /* CONFIG_EPCS_MXL */
+ 		multilink_ctrl |= (MLO_LINK_ID_INFO_PRESENT | MLO_BSS_PARAM_CHANGE_COUNT_PRESENT |
+ 				MLO_MLD_CAPAB_PRESENT);
+ 		if (mld_num_simul_links) {
+@@ -848,7 +867,11 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 	eid += sizeof(multilink_ctrl);
+ 
+ 	/* Multi-Link Common info */
++#ifdef CONFIG_EPCS_MXL
++	if ((is_auth) || (ml_type == ML_EPCS))
++#else
+ 	if (is_auth)
++#endif /* CONFIG_EPCS_MXL */
+ 		common_info_len = COMMON_INFO_LEN_AUTH;
+ 	else {
+ 		if (mld_num_simul_links) {
+@@ -865,7 +888,11 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ 	memcpy_s(eid, ETH_ALEN, hapd->conf->mxl_bss_conf.ap_mld_mac, ETH_ALEN);
+ 	eid += ETH_ALEN;
++#ifdef CONFIG_EPCS_MXL
++	if ((!is_auth) && (ml_type != ML_EPCS)) {
++#else
+ 	if (!is_auth) {
++#endif /* CONFIG_EPCS_MXL */
+ 		*eid++ =  hapd->conf->mxl_bss_conf.link_id;
+ 		/* BSS Parameters Change Count */
+ 		*eid++ = 0;
+@@ -909,6 +936,14 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 		/* size not known yet */
+ 		*eid++ = 0;
+ 		link_info_data_pos = eid;
++#ifdef CONFIG_EPCS_MXL
++		if (ml_type == ML_EPCS) {
++			sta_ctrl = hapd->conf->mxl_bss_conf.link_id;
++			sta_ctrl = host_to_le16(sta_ctrl);
++			memcpy_s(eid, sizeof(sta_ctrl), &sta_ctrl, sizeof(sta_ctrl));
++			eid += sizeof(sta_ctrl);
++		} else {
++#endif /* CONFIG_EPCS_MXL */
+ 		sta_ctrl |= (sibling_hapd->conf->mxl_bss_conf.link_id | MLO_LINK_INFO_COMPLETE_PROFILE | MLO_LINK_INFO_MACADDR_PRESENT |
+ 				MLO_LINK_INFO_BI_PRESENT | MLO_LINK_INFO_TSF_OFFSET_PRESENT | MLO_LINK_INFO_DTIM_INFO_PRESENT);
+ 		if (ml_type == ML_ASSOC)
+@@ -945,6 +980,9 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 		}
+ 
+ 		*sta_info_size_pos = eid - sta_info_size_pos;
++#ifdef CONFIG_EPCS_MXL
++		}
++#endif /* CONFIG_EPCS_MXL */
+ 		/* Per-STA profile */
+ 		switch (ml_type) {
+ 			case ML_BASIC:
+@@ -966,7 +1004,11 @@ u8 * mxl_hostapd_eid_multilink(struct hostapd_data *hapd, struct sta_info *sta,
+ 							sta->mxl_sta_info.linked_sta, eid, link_sta_status);
+ 				}
+ 				break;
+-
++#ifdef CONFIG_EPCS_MXL
++			case ML_EPCS:
++				eid = mxl_hostapd_eid_mld_staprof_epcs(hapd, eid);
++				break;
++#endif /* CONFIG_EPCS_MXL */
+ 			default:
+ 				wpa_printf(MSG_ERROR,"MLD: NO valid ML type!!!");
+ 				return eid;
+diff --git a/src/ap/mxl_mld.h b/src/ap/mxl_mld.h
+index 86b0f51b9..4f5eb4087 100644
+--- a/src/ap/mxl_mld.h
++++ b/src/ap/mxl_mld.h
+@@ -61,6 +61,17 @@
+ /* To-do: this is place holder */
+ #define PER_STA_PROFILE_LENGTH 500
+ 
++#ifdef CONFIG_EPCS_MXL
++/* EPCS_FRAME_BODY(3) + MULTILINK_IE_HDR_LEN(3) + MULTILINK_CTRL_LEN(2) + COMMON_INFO_LEN(7) +
++ * PER_STA_PROFILE_LENGTH(46) */
++#define EPCS_REQUEST_FRAME_LENGTH 61
++/* 80211_HDR_LEN(24) + EPCS_FRAME_BODY(5) + MULTILINK_IE_HDR_LEN(3) + MULTILINK_CTRL_LEN(2) +
++ * COMMON_INFO_LEN(7) + PER_STA_PROFILE_LENGTH(46) */
++#define EPCS_RESPONSE_FRAME_LENGTH 87
++/* EPCS_FRAME_BODY */
++#define EPCS_TEARDOWN_FRAME_LENGTH 2
++#endif /* CONFIG_EPCS_MXL */
++
+ /* To-do: For EMLSR,Max numer of simultaneous links is 1
+  * this may chnage for EMLMR */
+ #define MAX_NUM_MLD_SIMUL_LINKS                 1
+@@ -113,6 +124,9 @@ enum multilink_type {
+ 	ML_BASIC,
+ 	ML_PROBE,
+ 	ML_ASSOC,
++#ifdef CONFIG_EPCS_MXL
++	ML_EPCS,
++#endif /* CONFIG_EPCS_MXL */
+ };
+ 
+ static inline bool mxl_is_mlo_enabled(struct hostapd_bss_config *conf)
+diff --git a/src/ap/mxl_sta_info.h b/src/ap/mxl_sta_info.h
+index 485547a8a..e2dceedf3 100644
+--- a/src/ap/mxl_sta_info.h
++++ b/src/ap/mxl_sta_info.h
+@@ -15,6 +15,7 @@
+ #define MXL_STA_INFO_H
+ #include "utils/common.h"
+ 
++struct hostapd_data;
+ struct mxl_sta_info {
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+ 	u8 non_ap_mld_mac[ETH_ALEN];
+@@ -26,6 +27,9 @@ struct mxl_sta_info {
+ 	struct ieee80211_ml_capab sta_ml_capab;
+ 	u16 sta_profile_status;
+ 	struct ieee80211_ml_sta_info ml_sta_info;
++#ifdef CONFIG_EPCS_MXL
++	unsigned int epcs_supported:1;
++#endif /* CONFIG_EPCS_MXL */
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ };
+ 
+@@ -37,6 +41,7 @@ struct mxl_sta_info {
+ #define WLAN_STA_MLD_WDS_STR_STA BIT(4)
+ 
+ void mxl_ml_ap_handle_timer(void *eloop_ctx, void *timeout_ctx);
++struct sta_info * mxl_ap_get_sta_by_non_ap_mld_mac(struct hostapd_data *hapd, const u8 *mac);
+ 
+ #endif /* CONFIG_IEEE80211BE_MXL_MLO */
+ #endif /* MXL_STA_INFO_H */
+diff --git a/src/ap/mxl_wmm.c b/src/ap/mxl_wmm.c
+new file mode 100644
+index 000000000..9f44a6ca4
+--- /dev/null
++++ b/src/ap/mxl_wmm.c
+@@ -0,0 +1,173 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "common/ieee802_11_defs.h"
++#include "common/ieee802_11_common.h"
++#include "hostapd.h"
++#include "ieee802_11.h"
++#include "sta_info.h"
++#include "ap_config.h"
++#include "ap_drv_ops.h"
++#include "wmm.h"
++#include "mxl_wmm.h"
++#include "beacon.h"
++
++
++#ifdef CONFIG_EPCS_MXL
++/*
++  * Add EPCS WMM Parameter Element to Beacon, Probe Response, and (Re)Association
++  * Response frames.
++  */
++u8 * mxl_hostapd_eid_wmm_epcs(struct hostapd_data *hapd, u8 *eid)
++{
++	u8 *pos = eid;
++	struct wmm_parameter_element *wmm =
++		(struct wmm_parameter_element *) (pos + 2);
++	int e;
++	struct hostapd_wmm_ac_params ac_params[WMM_AC_NUM];
++
++	if (!hapd->conf->wmm_enabled)
++		return eid;
++	eid[0] = WLAN_EID_VENDOR_SPECIFIC;
++	wmm->oui[0] = 0x00;
++	wmm->oui[1] = 0x50;
++	wmm->oui[2] = 0xf2;
++	wmm->oui_type = WMM_OUI_TYPE;
++	wmm->oui_subtype = WMM_OUI_SUBTYPE_PARAMETER_ELEMENT;
++	wmm->version = WMM_VERSION;
++	wmm->qos_info = hapd->parameter_set_count & 0xf;
++
++	if (hapd->conf->wmm_uapsd &&
++		(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_AP_UAPSD))
++	wmm->qos_info |= 0x80;
++
++	wmm->reserved = 0;
++
++	memcpy_s(ac_params, sizeof(ac_params), hapd->iconf->wmm_ac_params, sizeof(hapd->iconf->wmm_ac_params));
++	for (e = 0; e < WMM_AC_NUM; e++) {
++		ac_params[e].aifs = hapd->iconf->mxl_conf.epcs_wmm_ac_params[e].aifs;
++		ac_params[e].cwmin = hapd->iconf->mxl_conf.epcs_wmm_ac_params[e].cwmin;
++		ac_params[e].cwmax = hapd->iconf->mxl_conf.epcs_wmm_ac_params[e].cwmax;
++		ac_params[e].txop_limit = hapd->iconf->mxl_conf.epcs_wmm_ac_params[e].txop_limit;
++	}
++	/* fill in a parameter set record for each AC */
++	for (e = 0; e < WMM_AC_NUM; e++) {
++		struct wmm_ac_parameter *ac = &wmm->ac[e];
++		struct hostapd_wmm_ac_params *acp = &ac_params[e];
++		ac->aci_aifsn = mxl_wmm_aci_aifsn(acp->aifs,
++			acp->admission_control_mandatory,
++				e);
++		ac->cw = mxl_wmm_ecw(acp->cwmin, acp->cwmax);
++		ac->txop_limit = host_to_le16(acp->txop_limit);
++	}
++
++	pos = (u8 *) (wmm + 1);
++	eid[1] = pos - eid - 2; /* element length */
++	return pos;
++}
++
++static void mxl_handle_epcs_req(struct hostapd_data *hapd,
++			const struct ieee80211_mgmt *mgmt)
++{
++	u8 buf[256], *pos;
++	int len;
++	struct ieee80211_mgmt *mgmt_resp = (struct ieee80211_mgmt *) buf;
++	struct sta_info *sta;
++
++	if ((hapd->iconf->mxl_conf.mlo_supported == MULTILINK_DISABLED) && !mxl_is_mlo_enabled(hapd->conf)) {
++		wpa_printf(MSG_ERROR, "EPCS: mxl_handle_epcs_req - MLO is not supported/enabled in AP");
++		return;
++	}
++
++	sta = ap_get_sta(hapd, mgmt->sa);
++	if (sta == NULL) {
++		wpa_printf(MSG_ERROR, "EPCS: mxl_handle_epcs_req - station not connected");
++		return;
++	}
++
++	if (!mxl_mlo_is_ml_sta(sta) && !(sta->mxl_sta_info.ext_flags & WLAN_STA_MLD_STA)) {
++		wpa_printf(MSG_ERROR, "EPCS: mxl_handle_epcs_req - MLO not enabled/supported in station");
++		return;
++	}
++
++	if (!sta->mxl_sta_info.epcs_supported) {
++		wpa_printf(MSG_ERROR, "EPCS: mxl_handle_epcs_req - feature not supported in station");
++		return;
++	}
++
++	if (!hapd->iconf->mxl_conf.epcs_enabled) {
++		wpa_printf(MSG_ERROR, "EPCS: mxl_handle_epcs_req - feature not supported in AP");
++		return;
++	}
++
++	os_memset(buf, 0, sizeof(buf));
++	mgmt_resp->frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT, WLAN_FC_STYPE_ACTION);
++	os_memcpy(mgmt_resp->da, mgmt->sa, ETH_ALEN);
++	os_memcpy(mgmt_resp->sa, hapd->own_addr, ETH_ALEN);
++	os_memcpy(mgmt_resp->bssid, hapd->own_addr, ETH_ALEN);
++
++	mgmt_resp->u.action.category = WLAN_ACTION_PROTECTED_EHT;
++	mgmt_resp->u.action.u.eht_epcs_resp.action = WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_ENABLE_RESP;
++	mgmt_resp->u.action.u.eht_epcs_resp.dialog_token = mgmt->u.action.u.eht_epcs_req.dialog_token;
++	mgmt_resp->u.action.u.eht_epcs_resp.status = WLAN_STATUS_SUCCESS;
++
++	pos = mxl_hostapd_eid_multilink(hapd, NULL, mgmt_resp->u.action.u.eht_epcs_resp.variable,
++		ML_EPCS, 0, false, false);
++	len = pos - buf;
++
++	if (len != EPCS_RESPONSE_FRAME_LENGTH) {
++		wpa_printf(MSG_ERROR, "EPCS: mxl_handle_epcs_req - frame length is wrong Len:%d", len);
++		return;
++	}
++
++	if (hostapd_drv_send_mlme(hapd, mgmt_resp, len, 0, NULL, 0, 0) < 0)
++		wpa_printf(MSG_DEBUG, "EPCS epcs_send_resp: send failed");
++}
++
++void mxl_hostapd_eht_protected(struct hostapd_data *hapd,
++			const struct ieee80211_mgmt *mgmt, size_t len)
++{
++	u8 *action = (u8 *) &mgmt->u.action.u;
++
++	switch (*action) {
++	case WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_ENABLE_REQ:
++		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
++					HOSTAPD_LEVEL_DEBUG,
++					"hostapd_eht_epcs_action - EPCS Request frame received action code %d",
++					*action);
++		mxl_handle_epcs_req(hapd, mgmt);
++		return;
++	case WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_ENABLE_RESP:
++		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
++					HOSTAPD_LEVEL_DEBUG,
++					"hostapd_eht_epcs_action - EPCS Response frame received action code %d",
++					*action);
++		return;
++	case WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_TEARDOWN:
++		hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
++					HOSTAPD_LEVEL_DEBUG,
++					"hostapd_eht_epcs_action - EPCS teardown frame received action code %d",
++					*action);
++		return;
++	default:
++		break;
++	}
++
++	hostapd_logger(hapd, mgmt->sa, HOSTAPD_MODULE_IEEE80211,
++			HOSTAPD_LEVEL_DEBUG,
++			"hostapd_eht_epcs_action - unknown action code %d",
++			*action);
++}
++#endif /* CONFIG_EPCS_MXL */
+diff --git a/src/ap/mxl_wmm.h b/src/ap/mxl_wmm.h
+new file mode 100644
+index 000000000..f0c32ae21
+--- /dev/null
++++ b/src/ap/mxl_wmm.h
+@@ -0,0 +1,26 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_WME_H
++#define MXL_WME_H
++
++#ifdef CONFIG_EPCS_MXL
++struct ieee80211_mgmt;
++u8 mxl_wmm_aci_aifsn(int aifsn, int acm, int aci);
++u8 mxl_wmm_ecw(int ecwmin, int ecwmax);
++u8 * mxl_hostapd_eid_wmm_epcs(struct hostapd_data *hapd, u8 *eid);
++void mxl_hostapd_eht_protected(struct hostapd_data *hapd,
++			const struct ieee80211_mgmt *mgmt, size_t len);
++
++#endif /* CONFIG_EPCS_MXL */
++#endif /* MXL_WME_H */
+diff --git a/src/ap/wmm.c b/src/ap/wmm.c
+index 9ebb01e3d..d9fd7502f 100644
+--- a/src/ap/wmm.c
++++ b/src/ap/wmm.c
+@@ -19,7 +19,9 @@
+ #include "ap_config.h"
+ #include "ap_drv_ops.h"
+ #include "wmm.h"
+-
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_wmm.h"
++#endif /* CONFIG_VENDOR_MXL */
+ #ifndef MIN
+ #define MIN(a, b) (((a) < (b)) ? (a) : (b))
+ #endif
+@@ -45,6 +47,10 @@ static inline u8 wmm_ecw(int ecwmin, int ecwmax)
+ 		((ecwmax << WMM_AC_ECWMAX_SHIFT) & WMM_AC_ECWMAX_MASK);
+ }
+ 
++#ifdef CONFIG_EPCS_MXL
++u8 mxl_wmm_aci_aifsn(int aifsn, int acm, int aci) { return wmm_aci_aifsn(aifsn, acm, aci);}
++u8 mxl_wmm_ecw(int ecwmin, int ecwmax) { return wmm_ecw(ecwmin, ecwmax);}
++#endif /* CONFIG_EPCS_MXL */
+ 
+ static void
+ wmm_set_regulatory_limit(const struct hostapd_wmm_ac_params *wmm_conf,
+diff --git a/src/common/ieee802_11_common.c b/src/common/ieee802_11_common.c
+index c9b9f500b..39cb219e4 100644
+--- a/src/common/ieee802_11_common.c
++++ b/src/common/ieee802_11_common.c
+@@ -1314,6 +1314,12 @@ int hostapd_config_wmm_ac(struct hostapd_wmm_ac_params wmm_ac_params[],
+ 	const char *pos;
+ 	struct hostapd_wmm_ac_params *ac;
+ 
++#ifdef CONFIG_EPCS_MXL
++	if (!os_strncmp(name, "epcs_", 5)) {
++		 /* skip epcs_wmm_ac_ prefix */
++		pos = name + (sizeof("epcs_wmm_ac_") - 1);
++	} else
++#endif /* CONFIG_EPCS_MXL */
+ 	/* skip 'wme_ac_' or 'wmm_ac_' prefix */
+ 	pos = name + 7;
+ 	if (os_strncmp(pos, "be_", 3) == 0) {
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 4dd686e06..625263b98 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1154,6 +1154,19 @@ struct ieee80211_mgmt {
+ 					u8 dialog_token;
+ 					u8 variable[];
+ 				} STRUCT_PACKED rrm;
++#ifdef CONFIG_EPCS_MXL
++				struct {
++					u8 action;
++					u8 dialog_token;
++					le16 status;
++					u8 variable[];
++				} STRUCT_PACKED eht_epcs_resp;
++				struct {
++					u8 action;
++					u8 dialog_token;
++					u8 variable[];
++				} STRUCT_PACKED eht_epcs_req;
++#endif /* CONFIG_EPCS_MXL */
+ 			} u;
+ 		} STRUCT_PACKED action;
+ 	} u;
+diff --git a/src/common/mxl_ieee802_11_common.h b/src/common/mxl_ieee802_11_common.h
+index bba312a5a..44ee4077d 100644
+--- a/src/common/mxl_ieee802_11_common.h
++++ b/src/common/mxl_ieee802_11_common.h
+@@ -20,4 +20,15 @@ void mxl_scan_res_set_rssi_threshold(struct wpa_scan_results *scan_res, int rssi
+ bool mxl_scan_res_bss_below_threshold(struct wpa_scan_results *scan_res, int bss_rssi);
+ int mxl_parse_optional_neighbor_fields(char **tmp_o, const char **end_o, u8 **nei_pos_o, const char **pos_o, u8 **nei_rep_o, size_t nei_rep_len);
+ 
++inline int action_payload_min_len_expected(u8 *action)
++{
++#ifdef CONFIG_EPCS_MXL
++	/* This is added for the EPCS teardown frame which does not have a dialog token */
++	if (*action == WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_TEARDOWN)
++		return IEEE80211_HDRLEN + 2;
++	else
++#endif /* CONFIG_EPCS_MXL */
++	return IEEE80211_HDRLEN + 2 + 1;
++}
++
+ #endif /* MXL_IEEE802_11_COMMON_H */
+diff --git a/src/common/mxl_ieee802_11_defs.h b/src/common/mxl_ieee802_11_defs.h
+index 89874160a..8d393454e 100644
+--- a/src/common/mxl_ieee802_11_defs.h
++++ b/src/common/mxl_ieee802_11_defs.h
+@@ -561,5 +561,10 @@ enum multi_link_support_e {
+ #define MLO_LINK_INFO_BSS_PARAM_CHANGE_CNT_PRESENT      BIT(11)
+ /* reserved B12...B15 */
+ 
++/* EHT protected EPCS action frames*/
++#define WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_ENABLE_REQ 0x03
++#define WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_ENABLE_RESP 0x04
++#define WLAN_EHT_PROTECTED_EPCS_PRIORITY_ACCESS_TEARDOWN 0x05
++
+ #endif /* MXL_IEEE802_11_DEFS_H */
+ 
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index ef61c201c..96404492d 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -2887,6 +2887,11 @@ static int nl80211_action_subscribe_ap(struct i802_bss *bss)
+ 	/* WMM */
+ 	if (nl80211_register_action_frame(bss, (u8 *) "\x11", 1) < 0)
+ 		ret = -1;
++#ifdef CONFIG_EPCS_MXL
++	/* EHT Protected Action frames */
++	if (nl80211_register_action_frame(bss, (u8 *) "\x25", 1) < 0)
++		ret = -1;
++#endif /* CONFIG_EPCS_MXL */
+ #ifdef CONFIG_FST
+ 	/* FST Action frames */
+ 	if (nl80211_register_action_frame(bss, (u8 *) "\x12", 1) < 0)
+-- 
+2.43.0
+

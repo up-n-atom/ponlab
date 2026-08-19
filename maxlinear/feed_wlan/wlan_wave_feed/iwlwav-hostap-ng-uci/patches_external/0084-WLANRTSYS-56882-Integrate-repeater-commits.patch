@@ -1,0 +1,637 @@
+From 0c7488822b272ec19490e21a27acf8428e77a5b3 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Thu, 13 Jul 2023 13:19:44 +0200
+Subject: [PATCH] WLANRTSYS-56882: Integrate repeater commits
+
+ openWRT patch - CSA to hostapd part
+  openWRT open source added two patches to handle Repeater Mode :
+  360-ctrl_iface_reload.patch & 370-ap_sta_support.patch.
+  from those 2 patches, we are talking (and slightly modifying)
+  the code that is related to handling CSA from Far AP.
+
+  this commit allows running wpa_supplicant with -H<hostapd_ctrlif> flag
+  and thus making the supplicant the channel master.
+  upon start, the supplicant will send a "DISABLE" cmd to the give hostapd.
+  and upon NL80211_CMD_CH_SWITCH_STARTED_NOTIFY (CSA from Far AP), will
+  send the hostapd "CHAN_SWITCH TBTT-1 ..." cmd so that the multiroll will
+  succed.
+
+ openWRT channel master patch - init/reconnect
+  add new hostapd_iface cmd : UPDATE_RELOAD
+  this cmd will update the channel related conf params, disable
+  start_disabled from all sub interfaces && perform a complete reload
+  of hostapd.
+
+  allow wpa_supplicant (when given a hostapd ctrl_iface &&
+  '-F' parameter) to perform DISABLE cmds on hostapd in it's init
+  stage, and upon disconnet from the far-AP. And in addition to perform
+  UPDATE_RELOAD cmds on hostapd so that it will come up on the same channel
+  as the far AP.
+
+ Picked missed parts from following:
+  WLANRTSYS-23380: add small delay to hostapd reload in repeater mode
+  WLANRTSYS-23274: [AXP Repeater][CSA][WLAN6.1.1]CSA sequence is not completed successfully
+  WLANRTSYS-28443: [AxP3000][06.01.00.807][Repeater]: After defining the AxP3000 as repeater, it's impossible to add a VAP
+  WLANRTSYS-23406: [AXP][WLAN_6.1.1][Repeater]: TP issue Repeater with Client AX200 - low MCS 15(11n-20Mhz) and TP is ~120Mbps.
+  WLANRTSYS-27059: Repeater: Add support for UL-CSA
+  WLANRTSYS-27153: Repeater: Station interface can't connect in security mode following kernel/hostap upgrade
+  WLANRTSYS-28443: [AxP3000][06.01.00.807][Repeater]: After defining the AxP3000 as repeater, it's impossible to add a VAP
+  WLANRTSYS-38361: [AVM] [REPEATER] AVM Repeater 3/4 address mode driver API
+  WLANRTSYS-38467: Repeater radar detection - implementation
+  WLANRTSYS-40173: BSS Color: GW and Repeater enhancements
+  WLANRTSYS-41438: BSS Color: GW and repeater enhancements - driver Contd.
+  WLANRTSYS-47449: [Repeater][CGRv1][6.1.0] wlan0 VAPs are not up due to channel 165 in the GW
+---
+ hostapd/ctrl_iface.c               |  91 +++++++++++++++++++++
+ hostapd/hostapd_cli.c              |   7 ++
+ src/drivers/driver.h               |   2 +
+ src/drivers/driver_nl80211_event.c |   7 +-
+ wpa_supplicant/Makefile            |   1 +
+ wpa_supplicant/bss.c               |  10 +++
+ wpa_supplicant/bss.h               |   2 +
+ wpa_supplicant/events.c            |  53 +++++++++++++
+ wpa_supplicant/main.c              |  11 ++-
+ wpa_supplicant/wpa_supplicant.c    | 122 +++++++++++++++++++++++++++++
+ wpa_supplicant/wpa_supplicant_i.h  |  17 ++++
+ 11 files changed, 320 insertions(+), 3 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 4c305cbe8..84cce43d2 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1495,6 +1495,78 @@ static int hostapd_ctrl_iface_reload(struct hostapd_iface *iface)
+ 	return 0;
+ }
+ 
++static void hostapd_ctrl_iface_config_update(struct hostapd_config *conf, char* reload_opts)
++{
++	char *str;
++	int val;
++
++	str = os_strstr(reload_opts, "channel=");
++	if (str) {
++		str += sizeof("channel=") - 1;
++		conf->channel = strtol(str, NULL, 10);
++	}
++
++	str = os_strstr(reload_opts, "sec_chan=");
++	if (str) {
++		str += sizeof("sec_chan=") - 1;
++		conf->secondary_channel = strtol(str, NULL, 10);
++		if (conf->secondary_channel)
++			conf->ht_capab |= HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET;
++		else
++			conf->ht_capab &= ~HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET;
++	} else {
++		conf->ht_capab &= ~HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET;
++	}
++
++	str = os_strstr(reload_opts, "center_freq1=");
++	if (str) {
++		u8 cf1 = 0;
++		str += sizeof("center_freq1=") - 1;
++		val = strtol(str, NULL, 10);
++
++		/* In case invalid or 0 freq given, cf1 will stay at 0 */
++		ieee80211_freq_to_chan(val, &cf1);
++		hostapd_set_oper_centr_freq_seg0_idx(conf, cf1);
++	}
++
++	str = os_strstr(reload_opts, "center_freq2=");
++	if (str) {
++		u8 cf2 = 0;
++		str += sizeof("center_freq2=") - 1;
++		val = strtol(str, NULL, 10);
++
++		/* In case invalid or 0 freq given, cf2 will stay at 0 */
++		ieee80211_freq_to_chan(val, &cf2);
++		hostapd_set_oper_centr_freq_seg1_idx(conf, cf2);
++	}
++
++	str = os_strstr(reload_opts, "bandwidth=");
++	if (str) {
++		str += sizeof("bandwidth=") - 1;
++		val = strtol(str, NULL, 10);
++
++		switch (val) {
++		case CHAN_WIDTH_20_NOHT:
++		case CHAN_WIDTH_20:
++		case CHAN_WIDTH_40:
++			hostapd_set_oper_chwidth(conf, CONF_OPER_CHWIDTH_USE_HT);
++			break;
++		case CHAN_WIDTH_80P80:
++			wpa_printf(MSG_WARNING, "80P80 not supported");
++			break;
++		case CHAN_WIDTH_80:
++			hostapd_set_oper_chwidth(conf, CONF_OPER_CHWIDTH_80MHZ);
++			break;
++		case CHAN_WIDTH_160:
++			hostapd_set_oper_chwidth(conf, CONF_OPER_CHWIDTH_160MHZ);
++			break;
++		default:
++			wpa_printf(MSG_WARNING, "Unknown bandwidth: %d", val);
++			break;
++		}
++	}
++}
++
+ static int hostapd_ctrl_iface_reconf(struct hostapd_iface *iface,
+ 		char *param)
+ {
+@@ -1558,6 +1630,22 @@ static int hostapd_ctrl_iface_disable(struct hostapd_iface *iface)
+ 	return 0;
+ }
+ 
++static int hostapd_ctrl_iface_update_reload(struct hostapd_data *hapd, char *cmd)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct hostapd_config *conf = hapd->iconf;
++	int j;
++
++	hostapd_ctrl_iface_disable(iface);
++
++	hostapd_ctrl_iface_config_update(conf, cmd);
++
++	for (j = 0; j < iface->num_bss; j++) {
++		iface->bss[j]->conf->start_disabled = 0;
++	}
++
++	return hostapd_ctrl_iface_enable(iface);
++}
+ 
+ static int
+ hostapd_ctrl_iface_kick_mismatch_psk_sta_iter(struct hostapd_data *hapd,
+@@ -6460,6 +6548,9 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "GET_HE_PHY_CHANNEL_WIDTH_SET ", sizeof("GET_HE_PHY_CHANNEL_WIDTH_SET ") - 1) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_he_phy_channel_width_set(hapd,
+ 				buf + sizeof("GET_HE_PHY_CHANNEL_WIDTH_SET ") - 1, reply, reply_size);
++	} else if (os_strncmp(buf, "UPDATE_RELOAD ", 14) == 0) {
++		if (hostapd_ctrl_iface_update_reload(hapd, buf + 14))
++			reply_len = -1;
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index e49876ba3..19b7c3150 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -1281,6 +1281,11 @@ static int hostapd_cli_cmd_disable(struct wpa_ctrl *ctrl, int argc,
+ 	return wpa_ctrl_command(ctrl, "DISABLE");
+ }
+ 
++static int hostapd_cli_cmd_stop_ap(struct wpa_ctrl *ctrl, int argc,
++				      char *argv[])
++{
++	return wpa_ctrl_command(ctrl, "STOP_AP");
++}
+ 
+ static int hostapd_cli_cmd_update_beacon(struct wpa_ctrl *ctrl, int argc,
+ 				      char *argv[])
+@@ -2554,6 +2559,8 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ #endif /* CONFIG_MBO */
+ 	{ "get_he_phy_channel_width_set", hostapd_cli_cmd_get_he_phy_channel_width_set, NULL,
+ 	  "<MAC addr> = get HE PHY Channel Width Set field for specified STA" },
++	{ "stop_ap", hostapd_cli_cmd_stop_ap, NULL,
++	  "= stop hostapd AP on current interface" },
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 2c402b36b..61293f211 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -6685,6 +6685,7 @@ union wpa_event_data {
+ 
+ 	/**
+ 	 * struct ch_switch
++	 * @count: countdown until channel switch
+ 	 * @freq: Frequency of new channel in MHz
+ 	 * @ht_enabled: Whether this is an HT channel
+ 	 * @ch_offset: Secondary channel offset
+@@ -6695,6 +6696,7 @@ union wpa_event_data {
+ 	 * @punct_bitmap: Puncturing bitmap
+ 	 */
+ 	struct ch_switch {
++		int count;
+ 		int freq;
+ 		int ht_enabled;
+ 		int ch_offset;
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index ea60f4b86..a30fe8ea5 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -1230,7 +1230,7 @@ static void mlme_event_ch_switch(struct wpa_driver_nl80211_data *drv,
+ 				 struct nlattr *ifindex, struct nlattr *link,
+ 				 struct nlattr *freq, struct nlattr *type,
+ 				 struct nlattr *bw, struct nlattr *cf1,
+-				 struct nlattr *cf2,
++				 struct nlattr *cf2, struct nlattr *count,
+ 				 struct nlattr *punct_bitmap,
+ 				 int finished)
+ {
+@@ -1296,6 +1296,9 @@ static void mlme_event_ch_switch(struct wpa_driver_nl80211_data *drv,
+ 	if (cf2)
+ 		data.ch_switch.cf2 = nla_get_u32(cf2);
+ 
++	if (!finished && count)
++		data.ch_switch.count = nla_get_u32(count);
++
+ 	if (finished)
+ 		bss->flink->freq = data.ch_switch.freq;
+ 
+@@ -4145,6 +4148,7 @@ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 				     tb[NL80211_ATTR_CHANNEL_WIDTH],
+ 				     tb[NL80211_ATTR_CENTER_FREQ1],
+ 				     tb[NL80211_ATTR_CENTER_FREQ2],
++				     tb[NL80211_ATTR_CH_SWITCH_COUNT],
+ 				     tb[NL80211_ATTR_PUNCT_BITMAP],
+ 				     0);
+ 		break;
+@@ -4157,6 +4161,7 @@ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 				     tb[NL80211_ATTR_CHANNEL_WIDTH],
+ 				     tb[NL80211_ATTR_CENTER_FREQ1],
+ 				     tb[NL80211_ATTR_CENTER_FREQ2],
++				     NULL,
+ 				     tb[NL80211_ATTR_PUNCT_BITMAP],
+ 				     1);
+ 		break;
+diff --git a/wpa_supplicant/Makefile b/wpa_supplicant/Makefile
+index 0cc61c639..b4a3f38eb 100644
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -124,6 +124,7 @@ OBJS_c += ../src/utils/wpa_debug.o
+ OBJS_c += ../src/utils/common.o
+ OBJS_c += ../src/common/cli.o
+ OBJS += wmm_ac.o
++OBJS += ../src/common/wpa_ctrl.o
+ 
+ ifndef CONFIG_OS
+ ifdef CONFIG_NATIVE_WINDOWS
+diff --git a/wpa_supplicant/bss.c b/wpa_supplicant/bss.c
+index e07061abb..022ea8556 100644
+--- a/wpa_supplicant/bss.c
++++ b/wpa_supplicant/bss.c
+@@ -295,6 +295,9 @@ void calculate_update_time(const struct os_reltime *fetch_time,
+ static void wpa_bss_copy_res(struct wpa_bss *dst, struct wpa_scan_res *src,
+ 			     struct os_reltime *fetch_time)
+ {
++	struct ieee80211_ht_operation *oper;
++	struct ieee802_11_elems elems;
++
+ 	dst->flags = src->flags;
+ 	os_memcpy(dst->bssid, src->bssid, ETH_ALEN);
+ 	dst->freq = src->freq;
+@@ -309,6 +312,13 @@ static void wpa_bss_copy_res(struct wpa_bss *dst, struct wpa_scan_res *src,
+ 	dst->est_throughput = src->est_throughput;
+ 	dst->snr = src->snr;
+ 
++	memset(&elems, 0, sizeof(elems));
++	ieee802_11_parse_elems((u8 *) (src + 1), src->ie_len, &elems, 0);
++
++	oper = (struct ieee80211_ht_operation *) elems.ht_operation;
++	if (oper)
++		dst->ht_param = oper->ht_param;
++
+ 	calculate_update_time(fetch_time, src->age, &dst->last_update);
+ }
+ 
+diff --git a/wpa_supplicant/bss.h b/wpa_supplicant/bss.h
+index 7b13ef96b..a73c8e788 100644
+--- a/wpa_supplicant/bss.h
++++ b/wpa_supplicant/bss.h
+@@ -94,6 +94,8 @@ struct wpa_bss {
+ 	u8 ssid[SSID_MAX_LEN];
+ 	/** Length of SSID */
+ 	size_t ssid_len;
++	/* Five octets of HT Operation Information */
++	u8 ht_param;
+ 	/** Frequency of the channel in MHz (e.g., 2412 = channel 1) */
+ 	int freq;
+ 	/** The max channel width supported by both the AP and the STA */
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index 90a2f9c27..bc4d8ba96 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -5876,6 +5876,57 @@ static void wpa_supplicant_event_csa_received(struct wpa_supplicant *wpa_s,
+ 		csa->count);
+ }
+ 
++static void supplicant_ch_switch_started(struct wpa_supplicant *wpa_s,
++			union wpa_event_data *data)
++{
++	char cmd[128];
++	char buf[128];
++	size_t len = sizeof(buf);
++	int width = 0;
++	int ret;
++	rsize_t cmdlen;
++
++	if (!wpa_s->hostapd ||
++	    !(wpa_s->hostapd_allowed_control & CH_MASTER_HOSTAPD_CSA_CONTROL))
++		return;
++
++	wpa_msg(wpa_s, MSG_INFO, WPA_EVENT_CHANNEL_SWITCH
++		"count=%d freq=%d ht_enabled=%d ch_offset=%d ch_width=%s cf1=%d cf2=%d",
++		data->ch_switch.count,
++		data->ch_switch.freq,
++		data->ch_switch.ht_enabled,
++		data->ch_switch.ch_offset,
++		channel_width_to_string(data->ch_switch.ch_width),
++		data->ch_switch.cf1,
++		data->ch_switch.cf2);
++
++	width = channel_width_to_int(data->ch_switch.ch_width);
++	if (!width)
++		return;
++
++	ret = sprintf_s(cmd, sizeof(cmd), "CHAN_SWITCH %d %d sec_channel_offset=%d center_freq1=%d center_freq2=%d bandwidth=%d auto-ht",
++		  data->ch_switch.count,
++		  data->ch_switch.freq,
++		  data->ch_switch.ch_offset,
++		  data->ch_switch.cf1,
++		  data->ch_switch.cf2,
++		  width);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return;
++	}
++
++	cmdlen = strnlen_s(cmd, sizeof(cmd));
++	if (!IS_VALID_RANGE(cmdlen, AP_MIN_VALID_CHAR, sizeof(cmd) - 1)) {
++		wpa_printf(MSG_ERROR, "supplicant_ch_switch_started - wrong cmd len\n");
++		return;
++	}
++	ret = wpa_ctrl_request(wpa_s->hostapd, cmd, len, buf, &len, NULL);
++
++	if (ret < 0)
++		wpa_printf(MSG_ERROR, "\nFailed to reload hostapd AP interfaces\n");
++}
++
+ 
+ static const char * bitmap_to_str(u8 value, char *buf)
+ {
+@@ -6308,6 +6359,8 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 		}
+ 		break;
+ 	case EVENT_CH_SWITCH_STARTED:
++		supplicant_ch_switch_started(wpa_s, data);
++		break;
+ 	case EVENT_CH_SWITCH:
+ 		if (!data || !wpa_s->current_ssid)
+ 			break;
+diff --git a/wpa_supplicant/main.c b/wpa_supplicant/main.c
+index 9229eb51f..16915b936 100644
+--- a/wpa_supplicant/main.c
++++ b/wpa_supplicant/main.c
+@@ -35,7 +35,7 @@ static void usage(void)
+ 	       "vW] [-P<pid file>] "
+ 	       "[-g<global ctrl>] \\\n"
+ 	       "        [-G<group>] \\\n"
+-	       "        -i<ifname> -c<config file> [-C<ctrl>] [-D<driver>] "
++	       "        -i<ifname> -c<config file> [-C<ctrl>] [-D<driver>] [-H<hostapd path>] "
+ 	       "[-p<driver_param>] \\\n"
+ 	       "        [-b<br_ifname>] [-e<entropy file>]"
+ #ifdef CONFIG_DEBUG_FILE
+@@ -75,6 +75,7 @@ static void usage(void)
+ 	       "  -g = global ctrl_interface\n"
+ 	       "  -G = global ctrl_interface group\n"
+ 	       "  -h = show this help text\n"
++	       "  -H = connect to a hostapd instance to manage state changes\n"
+ 	       "  -i = interface name\n"
+ 	       "  -I = additional configuration file\n"
+ 	       "  -K = include keys (passwords, etc.) in debug output\n"
+@@ -202,7 +203,7 @@ int main(int argc, char *argv[])
+ 
+ 	for (;;) {
+ 		c = getopt(argc, argv,
+-			   "b:Bc:C:D:de:f:g:G:hi:I:KLMm:No:O:p:P:qsTtuvW");
++			   "b:Bc:C:D:de:f:Fg:G:hH:i:I:KLMm:No:O:p:P:qsTtuvW");
+ 		if (c < 0)
+ 			break;
+ 		switch (c) {
+@@ -249,6 +250,12 @@ int main(int argc, char *argv[])
+ 			usage();
+ 			exitcode = 0;
+ 			goto out;
++		case 'H':
++			iface->hostapd_ctrl = optarg;
++			break;
++		case 'F':
++			iface->hostapd_ctrl_init_reconn = 1;
++			break;
+ 		case 'i':
+ 			iface->ifname = optarg;
+ 			break;
+diff --git a/wpa_supplicant/wpa_supplicant.c b/wpa_supplicant/wpa_supplicant.c
+index f033f24ff..cb60c99a5 100644
+--- a/wpa_supplicant/wpa_supplicant.c
++++ b/wpa_supplicant/wpa_supplicant.c
+@@ -134,6 +134,75 @@ static void wpas_update_fils_connect_params(struct wpa_supplicant *wpa_s);
+ static void wpas_update_owe_connect_params(struct wpa_supplicant *wpa_s);
+ #endif /* CONFIG_OWE */
+ 
++static int hostapd_stop(struct wpa_supplicant *wpa_s)
++{
++	const char *cmd = "DISABLE";
++	char buf[128];
++	size_t len = sizeof(buf);
++
++	if (wpa_ctrl_request(wpa_s->hostapd, cmd, strnlen_s(cmd, sizeof("DISABLE")), buf, &len, NULL) < 0) {
++		wpa_printf(MSG_ERROR, "\nFailed to stop hostapd AP interfaces\n");
++		return -1;
++	}
++
++	return 0;
++}
++
++
++static int hostapd_reload(struct wpa_supplicant *wpa_s, struct wpa_bss *bss)
++{
++	char cmd[256];
++	char buf[128];
++	size_t len = sizeof(buf);
++	struct wpa_signal_info si;
++	u8 channel;
++	int sec_chan = 0;
++	int ret;
++	rsize_t cmdlen;
++
++	if (!bss)
++		return -1;
++
++	ieee80211_freq_to_chan(bss->freq, &channel);
++
++	ret = wpa_drv_signal_poll(wpa_s, &si);
++	if (ret)
++		return -1;
++
++	if (bss->ht_param & HT_INFO_HT_PARAM_STA_CHNL_WIDTH) {
++		int sec = bss->ht_param & HT_INFO_HT_PARAM_SECONDARY_CHNL_OFF_MASK;
++		if (sec == HT_INFO_HT_PARAM_SECONDARY_CHNL_ABOVE)
++			sec_chan = 1;
++		else if (sec ==  HT_INFO_HT_PARAM_SECONDARY_CHNL_BELOW)
++			sec_chan = -1;
++	}
++
++	ret = sprintf_s(cmd, sizeof(cmd), "UPDATE_RELOAD channel=%d sec_chan=%d "
++		  "center_freq1=%d center_freq2=%d bandwidth=%d",
++		  channel, sec_chan,
++		  si.center_frq1 > 0 ? si.center_frq1 : 0,
++		  si.center_frq2 > 0 ? si.center_frq2 : 0,
++		  si.chanwidth);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		return -1;
++	}
++
++	cmdlen = strnlen_s(cmd, sizeof(cmd));
++	if (!IS_VALID_RANGE(cmdlen, AP_MIN_VALID_CHAR, sizeof(cmd) - 1)) {
++		wpa_printf(MSG_ERROR, "hostapd_reload - wrong len\n");
++		return -1;
++	}
++
++	ret = wpa_ctrl_request(wpa_s->hostapd, cmd, len, buf, &len, NULL);
++
++	if (ret < 0) {
++		wpa_printf(MSG_ERROR, "\nFailed to reload hostapd AP interfaces\n");
++		return -1;
++	}
++
++	return 0;
++}
+ 
+ #ifdef CONFIG_WEP
+ /* Configure default/group WEP keys for static WEP */
+@@ -919,6 +988,29 @@ void wpa_supplicant_reinit_autoscan(struct wpa_supplicant *wpa_s)
+ 	}
+ }
+ 
++static void hostapd_delayed_reload_work(void *eloop_ctx, void *timeout_ctx)
++{
++	/* this delay between wpa_supplicant connection & hostapd reload is needed to:
++	 * 1) give a chance for dhcp client to get an IP address before starting AP vaps.
++	 * 2) on DFS channel, to avoid a race condition around changing the channel states
++	 *    to DFS_AVAILABLE & hostapd start, in order to prevent CAC.
++	 */
++	struct wpa_supplicant *wpa_s = eloop_ctx;
++	(void)timeout_ctx;
++
++	if (!wpa_s->hostapd ||
++	    !(wpa_s->hostapd_allowed_control & CH_MASTER_HOSTAPD_INIT_RECONNECT)) {
++		wpa_dbg(wpa_s, MSG_ERROR, "invalid operation mode");
++		return;
++	}
++
++	if (wpa_s->wpa_state != WPA_COMPLETED || !wpa_s->current_bss) {
++		wpa_dbg(wpa_s, MSG_ERROR, "incorrect wps state");
++		return;
++	}
++
++	hostapd_reload(wpa_s, wpa_s->current_bss);
++}
+ 
+ /**
+  * wpa_supplicant_set_state - Set current connection state
+@@ -1036,6 +1128,11 @@ void wpa_supplicant_set_state(struct wpa_supplicant *wpa_s,
+ 
+ 		sme_sched_obss_scan(wpa_s, 1);
+ 
++		if (wpa_s->hostapd &&
++		    wpa_s->hostapd_allowed_control & CH_MASTER_HOSTAPD_INIT_RECONNECT)
++			eloop_register_timeout(1, 0, hostapd_delayed_reload_work,
++					       wpa_s, NULL);
++
+ #if defined(CONFIG_FILS) && defined(IEEE8021X_EAPOL)
+ 		if (!fils_hlp_sent && ssid && ssid->eap.erp)
+ 			update_fils_connect_params = true;
+@@ -1046,6 +1143,12 @@ void wpa_supplicant_set_state(struct wpa_supplicant *wpa_s,
+ #endif /* CONFIG_OWE */
+ 	} else if (state == WPA_DISCONNECTED || state == WPA_ASSOCIATING ||
+ 		   state == WPA_ASSOCIATED) {
++		if (wpa_s->hostapd &&
++			wpa_s->hostapd_allowed_control & CH_MASTER_HOSTAPD_INIT_RECONNECT) {
++			eloop_cancel_timeout(hostapd_delayed_reload_work,
++					     wpa_s, NULL);
++			hostapd_stop(wpa_s);
++		}
+ 		wpa_s->new_connection = 1;
+ 		wpa_drv_set_operstate(wpa_s, 0);
+ #ifndef IEEE8021X_EAPOL
+@@ -2570,6 +2673,10 @@ void wpa_supplicant_associate(struct wpa_supplicant *wpa_s,
+ 			return;
+ 		}
+ 		wpa_s->current_bss = bss;
++		if (wpa_s->hostapd &&
++			wpa_s->hostapd_allowed_control & CH_MASTER_HOSTAPD_INIT_RECONNECT)
++			eloop_register_timeout(1, 0, hostapd_delayed_reload_work,
++					wpa_s, NULL);
+ #else /* CONFIG_MESH */
+ 		wpa_msg(wpa_s, MSG_ERROR,
+ 			"mesh mode support not included in the build");
+@@ -7131,6 +7238,21 @@ static int wpa_supplicant_init_iface(struct wpa_supplicant *wpa_s,
+ 			   sizeof(wpa_s->bridge_ifname));
+ 	}
+ 
++	if (iface->hostapd_ctrl) {
++		wpa_s->hostapd = wpa_ctrl_open(iface->hostapd_ctrl);
++		if (!wpa_s->hostapd) {
++			wpa_printf(MSG_ERROR, "\nFailed to connect to hostapd\n");
++			return -1;
++		}
++
++		wpa_s->hostapd_allowed_control |= CH_MASTER_HOSTAPD_CSA_CONTROL;
++		if (iface->hostapd_ctrl_init_reconn) {
++			wpa_s->hostapd_allowed_control |= CH_MASTER_HOSTAPD_INIT_RECONNECT;
++			if (hostapd_stop(wpa_s) < 0)
++				return -1;
++		}
++	}
++
+ 	/* RSNA Supplicant Key Management - INITIALIZE */
+ 	eapol_sm_notify_portEnabled(wpa_s->eapol, false);
+ 	eapol_sm_notify_portValid(wpa_s->eapol, false);
+diff --git a/wpa_supplicant/wpa_supplicant_i.h b/wpa_supplicant/wpa_supplicant_i.h
+index c626781d6..917cd7045 100644
+--- a/wpa_supplicant/wpa_supplicant_i.h
++++ b/wpa_supplicant/wpa_supplicant_i.h
+@@ -115,6 +115,17 @@ struct wpa_interface {
+ 	 */
+ 	const char *bridge_ifname;
+ 
++	/**
++	 * hostapd_ctrl - path to hostapd control socket for notification
++	 */
++	const char *hostapd_ctrl;
++
++	/**
++	 * hostapd_ctrl_init_reconn - if hostapd_ctrl is given, should wpa_supplicant
++	 * be allowed to reconfigure hostapd on connection and disconnection.
++	 */
++	int hostapd_ctrl_init_reconn;
++
+ 	/**
+ 	 * p2p_mgmt - Interface used for P2P management (P2P Device operations)
+ 	 *
+@@ -516,6 +527,9 @@ struct driver_signal_override {
+ 	int scan_level;
+ };
+ 
++#define CH_MASTER_HOSTAPD_CSA_CONTROL		BIT(0)
++#define CH_MASTER_HOSTAPD_INIT_RECONNECT	BIT(1)
++
+ struct robust_av_data {
+ 	u8 dialog_token;
+ 	enum scs_request_type request_type;
+@@ -707,6 +721,9 @@ struct wpa_supplicant {
+ #endif /* CONFIG_CTRL_IFACE_BINDER */
+ 	char bridge_ifname[16];
+ 
++	struct wpa_ctrl *hostapd;
++	u8 hostapd_allowed_control;
++
+ 	char *confname;
+ 	char *confanother;
+ 
+-- 
+2.43.0
+

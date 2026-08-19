@@ -1,0 +1,432 @@
+From 0de66b3a710528efa86fcd128e2ae18356aa5b35 Mon Sep 17 00:00:00 2001
+From: mvuls <mvuls@maxlinear.com>
+Date: Thu, 9 Nov 2023 21:35:19 +0200
+Subject: [PATCH] WLANRTSYS-50839: MXL Repeater DFS
+
+---
+ hostapd/mxl_config.c                   |  7 +++++
+ src/ap/dfs.c                           |  4 +++
+ src/ap/mxl_config.h                    |  1 +
+ src/ap/mxl_dfs_common.c                | 37 +++++++++++++++++++++++
+ src/ap/mxl_dfs_common.h                |  3 ++
+ src/ap/mxl_events.c                    | 32 ++++++++++++++++++++
+ src/common/mxl_vendor.h                | 18 +++++++----
+ src/common/mxl_wpa_ctrl.h              |  2 ++
+ src/common/vendor_cmds_copy.h          |  9 ++++++
+ src/drivers/driver_nl80211_event.c     |  9 ++++++
+ wpa_supplicant/Makefile                |  1 +
+ wpa_supplicant/config.c                |  7 ++++-
+ wpa_supplicant/config.h                |  4 +++
+ wpa_supplicant/mxl_events.c            | 41 ++++++++++++++++++++++++++
+ wpa_supplicant/mxl_supplicant_config.h | 21 +++++++++++++
+ 15 files changed, 190 insertions(+), 6 deletions(-)
+ create mode 100644 wpa_supplicant/mxl_events.c
+ create mode 100644 wpa_supplicant/mxl_supplicant_config.h
+
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index 3804360fa..a300a4b27 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -105,6 +105,13 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 		mxl_conf->sub_band_dfs = val;
+ 	} else if (os_strcmp(buf, "dfs_channels_state_file_location") == 0) {
+ 		mxl_conf->dfs_channels_state_file = os_strdup(pos);
++	} else if (os_strcmp(buf, "process_radar_slave_events") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "line %d: invalid process radar slave events value %d, valid is 0 or 1", line, val);
++			return 0;
++		}
++		mxl_conf->process_radar_slave_events = val;
+ 	} else
+ 		return 0;
+ 	return 1;
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 0bd050ab3..7e4bd5310 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -1471,6 +1471,10 @@ int mxl_set_dfs_state_freq(struct hostapd_iface *iface, int freq, u32 state) { r
+ void mxl_dfs_adjust_center_freq(struct hostapd_iface *iface, struct hostapd_channel_data *chan, int secondary_channel,
+ 				int sec_chan_idx_80p80, u8 *oper_centr_freq_seg0_idx, u8 *oper_centr_freq_seg1_idx)
+ 	{ return dfs_adjust_center_freq(iface, chan, secondary_channel, sec_chan_idx_80p80, oper_centr_freq_seg0_idx, oper_centr_freq_seg1_idx); }
++int mxl_set_dfs_state(struct hostapd_iface *iface, int freq, int ht_enabled, int chan_offset, int chan_width, int cf1, int cf2, u32 state)
++	{ return set_dfs_state(iface, freq, ht_enabled, chan_offset, chan_width, cf1, cf2, state); }
++int mxl_dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq, int chan_width, int cf1, int cf2)
++	{ return dfs_are_channels_overlapped(iface, freq, chan_width, cf1, cf2); }
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+ int hostapd_dfs_radar_detected(struct hostapd_iface *iface, int freq,
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 9b4cfde49..2d31b10c3 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -30,6 +30,7 @@ struct mxl_hostapd_config {
+ 	int allow_scan_during_cac;
+ 	int sub_band_dfs;
+ 	char *dfs_channels_state_file;
++	int process_radar_slave_events;
+ };
+ 
+ /**
+diff --git a/src/ap/mxl_dfs_common.c b/src/ap/mxl_dfs_common.c
+index 2dac86b1c..31ee80bec 100644
+--- a/src/ap/mxl_dfs_common.c
++++ b/src/ap/mxl_dfs_common.c
+@@ -22,6 +22,8 @@
+ #include "common/wpa_ctrl.h"
+ #include "common/hw_features_common.h"
+ #include "mxl_sub_band_dfs.h"
++#include "common/vendor_cmds_copy.h"
++#include "common/mxl_wpa_ctrl.h"
+ 
+ /* CAC finished reason code */
+ enum mxl_hostapd_cac_finished_stat {
+@@ -301,3 +303,38 @@ bool mxl_hostapd_handle_first_non_dfs(struct hostapd_iface *iface)
+ 
+ 	return false;
+ }
++
++static void mxl_hostapd_process_slave_event(struct hostapd_iface *iface, struct intel_vendor_radar *radar)
++{
++	mxl_set_dfs_state(iface, radar->center_freq,
++			  0, 0, /* unused */
++			  radar->width, radar->center_freq1, radar->center_freq2,
++			  HOSTAPD_CHAN_DFS_UNAVAILABLE);
++
++	if (!mxl_dfs_are_channels_overlapped(iface, radar->center_freq, radar->width, radar->center_freq1, radar->center_freq2))
++		return;
++
++	if (hostapd_csa_in_progress(iface))
++		return;
++
++	wpa_printf(MSG_INFO, "Vendor radar event, disable iface %s", iface->phy);
++	hostapd_disable_iface(iface);
++}
++
++void mxl_hostapd_vendor_radar_detected(struct hostapd_data *hapd, const u8 *data, size_t data_len)
++{
++	struct intel_vendor_radar *radar = (struct intel_vendor_radar *)data;
++
++	if (sizeof(*radar) != data_len) {
++		wpa_printf(MSG_ERROR, "Vendor radar event incorrect size %zu, expected %zu", data_len, sizeof(*radar));
++		return;
++	}
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, LTQ_RADAR
++		"freq=%d chan_width=%d cf1=%d cf2=%d radar_bit_map=0x%02X",
++		radar->center_freq, radar->width, radar->center_freq1, radar->center_freq2,
++		radar->radar_bit_map);
++
++	if (hapd->iconf->mxl_conf.process_radar_slave_events)
++		mxl_hostapd_process_slave_event(hapd->iface, radar);
++}
+diff --git a/src/ap/mxl_dfs_common.h b/src/ap/mxl_dfs_common.h
+index 86a361f71..af590f311 100644
+--- a/src/ap/mxl_dfs_common.h
++++ b/src/ap/mxl_dfs_common.h
+@@ -46,5 +46,8 @@ void mxl_hostapd_clear_rbm(void *ctx);
+ void mxl_dfs_adjust_center_freq(struct hostapd_iface *iface, struct hostapd_channel_data *chan, int secondary_channel,
+ 				int sec_chan_idx_80p80, u8 *oper_centr_freq_seg0_idx, u8 *oper_centr_freq_seg1_idx);
+ bool mxl_hostapd_handle_first_non_dfs(struct hostapd_iface *iface);
++int mxl_set_dfs_state(struct hostapd_iface *iface, int freq, int ht_enabled, int chan_offset, int chan_width, int cf1, int cf2, u32 state);
++int mxl_dfs_are_channels_overlapped(struct hostapd_iface *iface, int freq, int chan_width, int cf1, int cf2);
++void mxl_hostapd_vendor_radar_detected(struct hostapd_data *hapd, const u8 *data, size_t data_len);
+ 
+ #endif /* MXL_DFS_COMMON_H */
+diff --git a/src/ap/mxl_events.c b/src/ap/mxl_events.c
+index 39adff638..96c70e9bf 100644
+--- a/src/ap/mxl_events.c
++++ b/src/ap/mxl_events.c
+@@ -15,9 +15,11 @@
+ #include "utils/common.h"
+ #include "hostapd.h"
+ #include "mxl_hostapd.h"
++#include "mxl_dfs_common.h"
+ 
+ enum mxl_event_type {
+ 	EVENT_MXL_FLUSH_STATIONS_RX,
++	EVENT_MXL_RADAR,
+ };
+ 
+ union mxl_event_data {
+@@ -28,6 +30,10 @@ union mxl_event_data {
+ 		size_t data_len;
+ 	} flush_stations;
+ 
++	struct radar {
++		const u8 *data;
++		size_t data_len;
++	} radar;
+ };
+ 
+ static const char * mxl_event_to_string(enum mxl_event_type event)
+@@ -35,6 +41,7 @@ static const char * mxl_event_to_string(enum mxl_event_type event)
+ #define E2S(n) case EVENT_ ## n: return #n
+ 	switch (event) {
+ 	E2S(MXL_FLUSH_STATIONS_RX);
++	E2S(MXL_RADAR);
+ 	}
+ 
+ 	return "UNKNOWN";
+@@ -62,6 +69,19 @@ static void mxl_event_flush_stations_rx(struct hostapd_data *hapd,
+ 	mxl_hostapd_clear_old(iface, flush);
+ }
+ 
++static void mxl_event_radar_detected(struct hostapd_data *hapd, const u8 *data, size_t data_len)
++{
++	/* Discard event if interface didn't finished initialization.
++	 * This may happen when driver sends irrelevant events due to station mode actions
++	 */
++	if (hapd->iface->state != HAPD_IFACE_ENABLED) {
++		wpa_printf(MSG_DEBUG, "discard driver event (%s) - interface not initialized yet", __FUNCTION__);
++		return;
++	}
++
++	mxl_hostapd_vendor_radar_detected(hapd, data, data_len);
++}
++
+ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 			  union mxl_event_data *data)
+ {
+@@ -76,6 +96,9 @@ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 					data->flush_stations.data,
+ 					data->flush_stations.data_len);
+ 		break;
++	case EVENT_MXL_RADAR:
++		mxl_event_radar_detected(hapd, data->radar.data, data->radar.data_len);
++		break;
+ 	default:
+ 		wpa_printf(MSG_ERROR, "Unknown MXL event %d", event);
+ 		break;
+@@ -91,3 +114,12 @@ void mxl_drv_event_flush_stations(void *ctx, const u8 *data, size_t data_len)
+ 	event.flush_stations.data_len = data_len;
+ 	mxl_process_event(ctx, EVENT_MXL_FLUSH_STATIONS_RX, &event);
+ }
++
++void mxl_drv_event_radar(void *ctx, const u8 *data, size_t data_len)
++{
++	union mxl_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	event.radar.data = data;
++	event.radar.data_len = data_len;
++	mxl_process_event(ctx, EVENT_MXL_RADAR, &event);
++}
+diff --git a/src/common/mxl_vendor.h b/src/common/mxl_vendor.h
+index 529d89c8e..c6959b9d9 100644
+--- a/src/common/mxl_vendor.h
++++ b/src/common/mxl_vendor.h
+@@ -23,16 +23,24 @@
+ 	}
+ 
+ #ifdef CONFIG_VENDOR_MXL
++
+ #define MXL_EXPORT_EVENT_API MXL_EXPORT_EVENT_API_PROTOTYPE
++
++#ifdef CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT
++#define MXL_EXPORT_HOSTAPD_EVENT_API	MXL_EXPORT_EVENT_API_NOT_SUPPORTED
++#define MXL_EXPORT_SUPPLICANT_EVENT_API	MXL_EXPORT_EVENT_API_PROTOTYPE
++#else
++#define MXL_EXPORT_HOSTAPD_EVENT_API	MXL_EXPORT_EVENT_API_PROTOTYPE
++#define MXL_EXPORT_SUPPLICANT_EVENT_API	MXL_EXPORT_EVENT_API_NOT_SUPPORTED
++#endif /* CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT */
++
+ #else
+ #define MXL_EXPORT_EVENT_API MXL_EXPORT_EVENT_API_NOT_SUPPORTED
+ #endif /* CONFIG_VENDOR_MXL */
+ 
+-#ifdef CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT
+-#undef MXL_EXPORT_EVENT_API
+-#define MXL_EXPORT_EVENT_API MXL_EXPORT_EVENT_API_NOT_SUPPORTED
+-#endif /* CONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT */
+ 
+-MXL_EXPORT_EVENT_API(mxl_drv_event_flush_stations)
++MXL_EXPORT_EVENT_API(mxl_drv_event_radar)
++
++MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_flush_stations)
+ 
+ #endif /* MXL_VENDOR_H */
+diff --git a/src/common/mxl_wpa_ctrl.h b/src/common/mxl_wpa_ctrl.h
+index 351d83519..0484a7db4 100644
+--- a/src/common/mxl_wpa_ctrl.h
++++ b/src/common/mxl_wpa_ctrl.h
+@@ -17,4 +17,6 @@
+ /* Indication for the bandwidth change due to 20/40 coexistence */
+ #define AP_BW_CHANGED "AP-BW-CHANGED "
+ 
++#define LTQ_RADAR "LTQ-DFS-RADAR-DETECTED "
++
+ #endif /* MXL_WPA_CTRL_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 5e860bcbe..1da76dfcf 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -434,4 +434,13 @@ struct mxl_ml_sta_info {
+   u16 aid;
+ } __attribute__ ((packed));
+ 
++/* Data for EVENT_LTQ_RADAR events */
++struct intel_vendor_radar {
++  s32 width; /* enum nl80211_chan_width (drv) -> enum chan_width (hostap) */
++  u32 center_freq;
++  u32 center_freq1;
++  u32 center_freq2;
++  u8 radar_bit_map;
++} __attribute__ ((packed));
++
+ #endif /* _VENDOR_CMDS_H_ */
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index 8418127ae..a1736995d 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3237,6 +3237,12 @@ static void mxl_nl80211_handle_flush_stations(struct wpa_driver_nl80211_data *dr
+ 	mxl_drv_event_flush_stations(drv->ctx, data, len);
+ }
+ 
++static void mxl_nl80211_handle_radar(struct wpa_driver_nl80211_data *drv, const u8 *data, size_t len)
++{
++	wpa_printf(MSG_DEBUG, "nl80211: Receive MXL vendor event: radar detected, ctx=%p", drv->ctx);
++	mxl_drv_event_radar(drv->ctx, data, len);
++}
++
+ #endif /* CONFIG_DRIVER_NL80211_MXL */
+ 
+ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+@@ -3246,6 +3252,9 @@ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 		case LTQ_NL80211_VENDOR_EVENT_FLUSH_STATIONS:
+ 			mxl_nl80211_handle_flush_stations(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_RADAR_DETECTED:
++			mxl_nl80211_handle_radar(drv, data, len);
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported MXL vendor event %u", subcmd);
+ 			break;
+diff --git a/wpa_supplicant/Makefile b/wpa_supplicant/Makefile
+index dab270b5b..f5dd3b3ae 100644
+--- a/wpa_supplicant/Makefile
++++ b/wpa_supplicant/Makefile
+@@ -1955,6 +1955,7 @@ ifdef CONFIG_VENDOR_MXL
+ CFLAGS += -DCONFIG_VENDOR_MXL
+ CFLAGS += -DCONFIG_VENDOR_MXL_BUILD_FOR_SUPPLICANT
+ OBJS += ../src/common/mxl_ieee802_11_common.o
++OBJS += mxl_events.o
+ endif
+ 
+ dynamic_eap_methods: $(EAPDYN)
+diff --git a/wpa_supplicant/config.c b/wpa_supplicant/config.c
+index 1aff67be2..39d195fa7 100644
+--- a/wpa_supplicant/config.c
++++ b/wpa_supplicant/config.c
+@@ -19,7 +19,9 @@
+ #include "p2p/p2p.h"
+ #include "fst/fst.h"
+ #include "config.h"
+-
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_supplicant_config.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #if !defined(CONFIG_CTRL_IFACE) && defined(CONFIG_NO_CONFIG_WRITE)
+ #define NO_CONFIG_WRITE
+@@ -5496,6 +5498,9 @@ static const struct global_parse_data global_fields[] = {
+ 	{ INT_RANGE(mac_addr, 0, 2), 0 },
+ 	{ INT(rand_addr_lifetime), 0 },
+ 	{ INT_RANGE(preassoc_mac_addr, 0, 2), 0 },
++#ifdef CONFIG_VENDOR_MXL
++	MXL_GLOBAL_FIELDS
++#endif /* CONFIG_VENDOR_MXL */
+ 	{ INT(key_mgmt_offload), 0},
+ 	{ INT(passive_scan), 0 },
+ 	{ INT(reassoc_same_bss_optim), 0 },
+diff --git a/wpa_supplicant/config.h b/wpa_supplicant/config.h
+index 02139e6b2..14055bb79 100644
+--- a/wpa_supplicant/config.h
++++ b/wpa_supplicant/config.h
+@@ -1430,6 +1430,10 @@ struct wpa_config {
+ 	 */
+ 	enum wpas_mac_addr_style preassoc_mac_addr;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	int process_radar_slave_events;
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	/**
+ 	 * key_mgmt_offload - Use key management offload
+ 	 *
+diff --git a/wpa_supplicant/mxl_events.c b/wpa_supplicant/mxl_events.c
+new file mode 100644
+index 000000000..db815d05f
+--- /dev/null
++++ b/wpa_supplicant/mxl_events.c
+@@ -0,0 +1,41 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include "utils/includes.h"
++#include "utils/common.h"
++#include "config.h"
++#include "wpa_supplicant_i.h"
++#include "common/vendor_cmds_copy.h"
++
++void mxl_drv_event_radar(void *ctx, const u8 *data, size_t data_len)
++{
++	struct wpa_supplicant *wpa_s = ctx;
++	struct intel_vendor_radar *radar = (struct intel_vendor_radar *)data;
++
++
++	if (sizeof(*radar) != data_len) {
++		wpa_printf(MSG_ERROR, "Vendor radar event incorrect size %zu, expected %zu", data_len, sizeof(*radar));
++		return;
++	}
++
++	if (!wpa_s || wpa_s->current_ssid == NULL)
++		return;
++
++	if (radar->center_freq != wpa_s->assoc_freq)
++		return;
++
++	if (wpa_s->conf->process_radar_slave_events) {
++		wpa_printf(MSG_INFO, "Vendor Radar event on %s, disconnecting from AP", wpa_s->ifname);
++		wpas_request_disconnection(wpa_s);
++	}
++}
+diff --git a/wpa_supplicant/mxl_supplicant_config.h b/wpa_supplicant/mxl_supplicant_config.h
+new file mode 100644
+index 000000000..65c92e531
+--- /dev/null
++++ b/wpa_supplicant/mxl_supplicant_config.h
+@@ -0,0 +1,21 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_SUPPLICANT_CONFIG_H
++#define MXL_SUPPLICANT_CONFIG_H
++
++
++#define MXL_GLOBAL_FIELDS \
++	{ INT_RANGE(process_radar_slave_events, 0, 1), 0},	\
++
++#endif /* MXL_SUPPLICANT_CONFIG_H */
+-- 
+2.43.0
+

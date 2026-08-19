@@ -1,0 +1,1553 @@
+From a9a2f57958166bcf151fc69ff44ad75d3eec75f1 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Tue, 16 May 2023 17:30:58 +0200
+Subject: [PATCH] WLANRTSYS-55139: HE BSS color
+
+    Summary:
+    BSS color init flow:
+    To use opensource NL attributes to update
+    color parameters for BSS.
+
+    BSS color collision:
+    Recieve internal(OBSS Beacon based) collision event.
+    Parse WNM Action IEs to parse External collision event.
+
+    BSS color change Announcement (CCA): BSS color
+    should be dynamically changed when OBSS
+    uses same color (i.e. collision).
+
+    Trigger color switch when receiving collision.
+    BSS color change decision to flow to switch
+    out of current color and decide new color based
+    on used color table based on some thresholds/configs.
+    Prepare CCA NL command per BSS and call Driver
+    for CCA.
+
+    Adding CCA IE in probe/Assoc/Beacon and Changing
+    HE oper Element for color parameters.
+    Receive color change abort/notify to stop/complete
+    color change.
+
+    Configuration and hostapd cli changes.
+---
+ hostapd/config_file.c              |  74 ++++++++-
+ hostapd/ctrl_iface.c               | 111 ++++++++++++++
+ hostapd/hostapd.conf               |  24 +++
+ hostapd/hostapd_cli.c              |  24 +++
+ src/ap/ap_config.c                 |   9 +-
+ src/ap/ap_config.h                 |  26 ++++
+ src/ap/beacon.c                    |  31 +++-
+ src/ap/ctrl_iface_ap.c             |   8 +-
+ src/ap/drv_callbacks.c             |  71 ++++++++-
+ src/ap/hostapd.c                   | 238 +++++++++++++++++++++++------
+ src/ap/hostapd.h                   |  23 +++
+ src/ap/ieee802_11.c                |  10 ++
+ src/ap/ieee802_11.h                |   1 +
+ src/ap/ieee802_11_he.c             |   2 +
+ src/ap/wnm_ap.c                    | 163 +++++++-------------
+ src/common/ieee802_11_defs.h       |  28 ++--
+ src/common/wpa_ctrl.h              |   5 +
+ src/drivers/driver.h               |  15 ++
+ src/drivers/driver_nl80211.c       |  13 +-
+ src/drivers/driver_nl80211_event.c |  61 +++++++-
+ wpa_supplicant/events.c            |   7 +
+ 21 files changed, 751 insertions(+), 193 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index d27fec218..70b5d62b3 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -3509,8 +3509,80 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 	} else if (os_strcmp(buf, "he_mu_beamformer") == 0) {
+ 		conf->he_phy_capab.he_mu_beamformer = atoi(pos);
+ 	} else if (os_strcmp(buf, "he_bss_color") == 0) {
+-		conf->he_op.he_bss_color = atoi(pos) & 0x3f;
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, 1, HE_OPERATION_BSS_COLOR)) {
++			val = (os_random() % HE_OPERATION_BSS_COLOR) + 1;
++			wpa_printf(MSG_WARNING, "Line %u: Invalid BSS color value. "
++				   "Choose random color %u", line, val);
++		}
++		conf->he_op.he_bss_color = val;
+ 		conf->he_op.he_bss_color_disabled = 0;
++	} else if (os_strcmp(buf, "he_operation_bss_color_disabled") == 0) {
++		/* TODO-COLOR: To check if this config option can be removed.
++		 * Opensource uses "he_bss_color" config itself for enable/disable.
++		 */
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid he_operation_bss_color_disabled = %d",
++				   line, val);
++			return 1;
++		}
++		conf->he_op.he_bss_color_disabled = 1;
++	} else if (os_strcmp(buf, "he_bss_color_partial") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid he_bss_color_partial = %d",
++				   line, val);
++			return 1;
++		}
++		conf->he_op.he_bss_color_partial = val;
++	} else if (os_strcmp(buf, "bss_color_change_timeout") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, BSS_COLOR_CHANGE_TIMEOUT_MIN, BSS_COLOR_CHANGE_TIMEOUT_MAX) &&
++		   (val != BSS_COLOR_CHANGE_TIMEOUT_RANDOM)) {
++			wpa_printf(MSG_ERROR, "Invalid bss color change timeout, must be in range %u..%u",
++				   BSS_COLOR_CHANGE_TIMEOUT_MIN, BSS_COLOR_CHANGE_TIMEOUT_MAX);
++			return 1;
++		}
++		conf->bss_color_change_timeout = val;
++	} else if (os_strcmp(buf, "num_bss_color_coll_thresh") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, NUM_BSS_COLOR_COLL_THRESH_MIN, NUM_BSS_COLOR_COLL_THRESH_MAX)) {
++			wpa_printf(MSG_ERROR, "Invalid BSS color collision threshold count, "
++				   "must be in range %u..%u", NUM_BSS_COLOR_COLL_THRESH_MIN, NUM_BSS_COLOR_COLL_THRESH_MAX);
++			return 1;
++		}
++		conf->num_bss_color_coll_thresh = val;
++	} else if (os_strcmp(buf, "bss_color_coll_age_thresh") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, BSS_COLOR_COLL_AGE_THRESH_MIN, BSS_COLOR_COLL_AGE_THRESH_MAX)) {
++			wpa_printf(MSG_ERROR, "Invalid color collision age threshold, "
++				   "must be in range %u..%u", BSS_COLOR_COLL_AGE_THRESH_MIN, BSS_COLOR_COLL_AGE_THRESH_MAX);
++			return 1;
++		}
++		conf->bss_color_coll_age_thresh = val;
++	} else if (os_strcmp(buf, "used_color_table_ageing") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, USED_COLOR_TABLE_AGEING_MIN, USED_COLOR_TABLE_AGEING_MAX)) {
++			wpa_printf(MSG_ERROR, "Invalid used color table ageing value, "
++				   "must be in range %u..%u", USED_COLOR_TABLE_AGEING_MIN, USED_COLOR_TABLE_AGEING_MAX);
++			return 1;
++		}
++		conf->used_color_table_ageing = val;
++	} else if (os_strcmp(buf, "autonomous_color_change") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Invalid autonomous color change value, must be 0 or 1");
++			return 1;
++		}
++		conf->autonomous_color_change = val;
++	} else if (os_strcmp(buf, "color_coll_notify_interval") == 0) {
++		int val = atoi(pos);
++		if(!IS_VALID_RANGE(val, COLOR_COLL_NOTIFY_INTERVAL_MIN, COLOR_COLL_NOTIFY_INTERVAL_MAX)) {
++			wpa_printf(MSG_ERROR, "Invalid color collision notify interval value, must be 0 to 60");
++			return 1;
++		}
++		conf->color_coll_notify_interval = val;
+ 	} else if (os_strcmp(buf, "he_bss_color_partial") == 0) {
+ 		conf->he_op.he_bss_color_partial = atoi(pos);
+ 	} else if (os_strcmp(buf, "he_default_pe_duration") == 0) {
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index b7eabb5a3..906bdeb99 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2578,6 +2578,12 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ 	char *str, *pos2;
+ 	bool switch_type_scan = false;
+ 
++	if (iface->bss[0] && iface->bss[0]->cca_in_progress) {
++		wpa_printf(MSG_ERROR, "Channel switch isn't allowed "
++			"when color switch is in progress");
++		return -1;
++	}
++
+ 	ret = hostapd_parse_csa_settings(pos, &settings);
+ 	if (ret)
+ 		return ret;
+@@ -2729,6 +2735,94 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ #endif /* NEED_AP_MLME */
+ }
+ 
++#ifdef CONFIG_IEEE80211AX
++
++static int hostapd_ctrl_iface_color_switch(struct hostapd_iface *iface,
++						char *pos)
++{
++	struct hostapd_data *hapd = iface->bss[0];
++	int color = atoi(pos);
++	int switch_time = 0, cca_count = 0;
++
++	if (!IS_VALID_RANGE(color, 1, HE_OPERATION_BSS_COLOR)) {
++		color = (os_random() % HE_OPERATION_BSS_COLOR) + 1;
++		wpa_printf(MSG_WARNING, "CTRL: COLOR_SWITCH Invalid color. Choose random color %d", color);
++	}
++
++	pos = os_strchr(pos, ' ');
++	if (pos) {
++		pos++;
++		switch_time = atoi(pos);
++
++		cca_count = switch_time / hostapd_get_beacon_int(hapd);
++		if ((switch_time < hostapd_cca_calc_switch_time(iface)) || (cca_count > UINT8_MAX)) {
++			wpa_printf(MSG_ERROR, "CTRL: COLOR_SWITCH Invalid switch_time");
++			return -1;
++		}
++	}
++
++	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax) {
++		hapd->switch_time = switch_time;
++		hostapd_color_switch_trigger(hapd, color);
++		hapd->switch_time = 0;
++	} else {
++		wpa_printf(MSG_ERROR, "CTRL: COLOR_SWITCH not supported as 11ax disabled");
++		return -1;
++	}
++
++	return 0;
++}
++
++static int hostapd_ctrl_iface_get_color_table(struct hostapd_iface *iface,
++					char *buf, size_t buflen)
++{
++	char *pos, *end;
++	struct os_reltime now, age;
++	int ret;
++
++	pos = buf;
++	end = buf + buflen;
++
++	ret = os_snprintf(pos, end - pos, "cur color:%u color_collision_count: %u cca_in_progress: %u ",
++			  iface->conf->he_op.he_bss_color,
++			  iface->color_collision_count, iface->bss[0]->cca_in_progress);
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++
++	os_get_reltime(&now);
++	if (iface->last_color_collision.sec > 0) {
++		os_reltime_sub(&now, &iface->last_color_collision, &age);
++		ret = os_snprintf(pos, end - pos, "last_color_collision: %u(sec ago)\n\n", (unsigned int) age.sec);
++	} else {
++		ret = os_snprintf(pos, end - pos, "last_color_collision: NA\n\n");
++	}
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++
++	ret = os_snprintf(pos, end - pos, "color use_time(sec ago)\n"
++			  "-----------------------\n");
++	if (os_snprintf_error(end - pos, ret))
++		return pos - buf;
++	pos += ret;
++
++	for (int i = 0 ; i < HE_OPERATION_BSS_COLOR_MAX; i++) {
++		if (iface->used_color_table[i].use_time.sec == 0)
++			continue;
++
++		os_reltime_sub(&now, &iface->used_color_table[i].use_time, &age);
++		ret = os_snprintf(pos, end - pos, "%-5u %-17u\n", i, (unsigned int) age.sec);
++		if (os_snprintf_error(end - pos, ret))
++			break;
++		pos += ret;
++
++	}
++
++	return pos - buf;
++}
++
++#endif /* CONFIG_IEEE80211AX */
+ 
+ static u8 hostapd_maxnss(struct hostapd_data *hapd, struct sta_info *sta)
+ {
+@@ -4474,6 +4568,16 @@ static int hostapd_ctrl_iface_unconnected_sta(struct hostapd_data *hapd, const c
+ 
+ 	os_memset(&req, 0, sizeof(req));
+ 
++	/* While fw is working on color change unconnected sta scan shouldn't be triggered.
++	 * When an unconnected sta scan occurs fw would ideally disable BSS color filter
++	 * for unconnected_sta_scan_time duration and then would re-enable the filter.
++	 * Block scheduling an unconnected sta scan at such scenarios.
++	 */
++	if (hapd->cca_in_progress) {
++		wpa_printf(MSG_ERROR, "unconnected_sta: BSS Color change in progress, can't schedule scan");
++		return -1;
++	}
++
+ 	if (hwaddr_aton(cmd, req.addr))
+ 		return -1;
+ 
+@@ -5475,6 +5579,13 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "GET_CSA_DEAUTH ", sizeof("GET_CSA_DEAUTH ") - 1) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_csa_deauth(hapd, buf + sizeof("GET_CSA_DEAUTH ") - 1,
+ 			reply, reply_size);
++#ifdef CONFIG_IEEE80211AX
++	} else if (os_strncmp(buf, "COLOR_SWITCH ", 13) == 0) {
++		if (hostapd_ctrl_iface_color_switch(hapd->iface, buf + 13))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "GET_COLOR_TABLE", 15) == 0) {
++		reply_len = hostapd_ctrl_iface_get_color_table(hapd->iface, reply, reply_size);
++#endif /* CONFIG_IEEE80211AX */
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index be1ea038d..969d0f81f 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -842,6 +842,30 @@ wmm_ac_vo_acm=0
+ # he_bss_color_partial: BSS color AID equation
+ #he_bss_color_partial=0
+ 
++### HE bss color change task configs ###
++#Timeout to trigger bss color change after color collision
++# in seconds. Range 1..120. Special value 255 to allow
++# have random timeout between 40 to 80.
++#bss_color_change_timeout=50
++
++#Number of bss color collisions threshold for color switch
++# count value. Range 1..500
++#num_bss_color_coll_thresh=100
++
++#Last bss color collision detection time ago threshold
++# in seconds. Range 10..60
++#bss_color_coll_age_thresh=10
++
++#Used bss color ageing time
++# in Minutes. Range 1..1440
++#used_color_table_ageing=90
++
++#Color change decision
++# autonomous by hostapd or Externally managed
++# Boolean. 0 or 1.
++#autonomous_color_change=1
++### End HE bss color change task configs ###
++
+ #he_default_pe_duration: The duration of PE field in an HE PPDU in us
+ # Possible values are 0 us (default), 4 us, 8 us, 12 us, and 16 us
+ #he_default_pe_duration=0
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index 7318ccbef..84c672f39 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -2045,6 +2045,24 @@ static int hostapd_cli_cmd_get_hidden_mode(struct wpa_ctrl *ctrl, int argc, char
+ 	return wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++#ifdef CONFIG_IEEE80211AX
++static int hostapd_cli_cmd_color_switch(struct wpa_ctrl *ctrl, int argc,
++					char *argv[])
++{
++	if (argc < 1) {
++		printf("Invalid color_switch command - requires <bss-color>\n");
++		return -1;
++	}
++	return hostapd_cli_cmd(ctrl, "COLOR_SWITCH", 1, argc, argv);
++}
++
++static int hostapd_cli_cmd_get_color_table(struct wpa_ctrl *ctrl, int argc,
++					   char *argv[])
++{
++	return wpa_ctrl_command(ctrl, "GET_COLOR_TABLE");
++}
++#endif /* CONFIG_IEEE80211AX */
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2305,6 +2323,12 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  " = check interface is transmitted bssid"},
+ 	{ "get_hidden_mode", hostapd_cli_cmd_get_hidden_mode, NULL,
+ 	  " = get hidden_mode  value"},
++#ifdef CONFIG_IEEE80211AX
++	{ "color_switch", hostapd_cli_cmd_color_switch, NULL,
++	  " <bss_color> [switch_time] = initate color switch" },
++	{ "get_color_table", hostapd_cli_cmd_get_color_table, NULL,
++	  " Get bss used color table and collision history" },
++#endif /* CONFIG_IEEE80211AX */
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 725fcdbaf..4ed508aee 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -287,7 +287,7 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 		HE_OPERATION_RTS_THRESHOLD_OFFSET;
+ 	/* Set default basic MCS/NSS set to single stream MCS 0-7 */
+ 	conf->he_op.he_basic_mcs_nss_set = 0xfffc;
+-	conf->he_op.he_bss_color_disabled = 1;
++	conf->he_op.he_bss_color_disabled = 0;
+ 	conf->he_op.he_bss_color_partial = 0;
+ 	conf->he_op.he_bss_color = os_random() % 63 + 1;
+ 	conf->he_op.he_twt_responder = 1;
+@@ -296,6 +296,13 @@ struct hostapd_config * hostapd_config_defaults(void)
+ 	conf->he_6ghz_rx_ant_pat = 1;
+ 	conf->he_6ghz_tx_ant_pat = 1;
+ 	conf->he_oper_max_co_hosted_bssid_ind = 5;
++	conf->bss_color_change_timeout  = BSS_COLOR_CHANGE_TIMEOUT_DEFAULT;
++	conf->num_bss_color_coll_thresh = NUM_BSS_COLOR_COLL_THRESH_DEFAULT;
++	conf->bss_color_coll_age_thresh = BSS_COLOR_COLL_AGE_THRESH_DEFAULT;
++	conf->used_color_table_ageing   = USED_COLOR_TABLE_AGEING_DEFAULT;
++	/* TODO-COLOR: To make default value as true after FW CCA changes integrated */
++	conf->autonomous_color_change = true;
++	conf->color_coll_notify_interval = COLOR_COLL_NOTIFY_INTERVAL_DEFAULT;
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	/* The third octet of the country string uses an ASCII space character
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index 501ac046a..1b4929234 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -1039,6 +1039,25 @@ struct spatial_reuse {
+ 	u8 srg_partial_bssid_bitmap[8];
+ };
+ 
++#define BSS_COLOR_CHANGE_TIMEOUT_DEFAULT		DOT11BSS_COLOR_COLLISION_AP_PERIOD
++#define BSS_COLOR_CHANGE_TIMEOUT_RANDOM			(UINT8_MAX)
++#define BSS_COLOR_CHANGE_TIMEOUT_RANDOM_MIN		40
++#define BSS_COLOR_CHANGE_TIMEOUT_RANDOM_SPAN	40
++#define BSS_COLOR_CHANGE_TIMEOUT_MIN			1
++#define BSS_COLOR_CHANGE_TIMEOUT_MAX			120
++#define NUM_BSS_COLOR_COLL_THRESH_DEFAULT		100
++#define NUM_BSS_COLOR_COLL_THRESH_MIN			1
++#define NUM_BSS_COLOR_COLL_THRESH_MAX			500
++#define BSS_COLOR_COLL_AGE_THRESH_DEFAULT		10
++#define BSS_COLOR_COLL_AGE_THRESH_MIN			1
++#define BSS_COLOR_COLL_AGE_THRESH_MAX			60
++#define USED_COLOR_TABLE_AGEING_DEFAULT			90
++#define USED_COLOR_TABLE_AGEING_MIN				1
++#define USED_COLOR_TABLE_AGEING_MAX				1440
++#define COLOR_COLL_NOTIFY_INTERVAL_DEFAULT		1
++#define COLOR_COLL_NOTIFY_INTERVAL_MIN			0
++#define COLOR_COLL_NOTIFY_INTERVAL_MAX			60
++
+ enum multibss_aid_offset {
+ 	NON_MULTIBSS_AID_OFFSET = 0,
+ 	MULTIBSS_AID_OFFSET = 64
+@@ -1206,6 +1225,13 @@ struct hostapd_config {
+ 	u8 he_6ghz_tx_ant_pat;
+ 	u8 he_6ghz_reg_pwr_type;
+ 	bool require_he;
++
++	u32 bss_color_change_timeout; /* in seconds */
++	u32 num_bss_color_coll_thresh;
++	u32 bss_color_coll_age_thresh; /* in seconds */
++	u32 used_color_table_ageing; /* in mins */
++	bool autonomous_color_change;
++	u32 color_coll_notify_interval;
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ 	/* VHT enable/disable config from CHAN_SWITCH */
+diff --git a/src/ap/beacon.c b/src/ap/beacon.c
+index 1b15b289a..9897fe3af 100644
+--- a/src/ap/beacon.c
++++ b/src/ap/beacon.c
+@@ -872,6 +872,11 @@ static u8 * hostapd_probe_resp_fill_elems(struct hostapd_data *hapd,
+ 
+ 		pos = hostapd_eid_spatial_reuse(hapd, pos);
+ 		pos = hostapd_eid_he_mu_edca_parameter_set(hapd, pos);
++		/* CCA IE */
++		cca_pos = hostapd_eid_cca(hapd, pos);
++		if (cca_pos != pos)
++			hapd->cca_c_off_proberesp = cca_pos - (u8 *) params->resp - 2;
++		pos = cca_pos;
+ 		pos = hostapd_eid_he_6ghz_band_cap(hapd, pos);
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+@@ -1739,6 +1744,13 @@ void handle_probe_req(struct hostapd_data *hapd,
+ 				params.ecsa_pos - (u8 *) params.resp;
+ 	}
+ 
++	if (hapd->cca_in_progress) {
++		/* Keep the count as zero, as hostapd won't have
++		 * updated cca count during CCA */
++		if (hapd->cca_c_off_proberesp)
++			((u8 *)params.resp)[hapd->cca_c_off_proberesp] = 0;
++	}
++
+ 	ret = hostapd_drv_send_mlme(hapd->iconf->multibss_enable ? hapd->iface->bss[MULTIBSS_REFERENCE_BSS_IDX] : hapd,
+ 				    params.resp, params.resp_len, noack,
+ 				    csa_offs_len ? csa_offs : NULL,
+@@ -2458,10 +2470,15 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ #ifdef CONFIG_IEEE80211AX
+ 	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax) {
+ 		u8 *cca_pos;
++		u8 *he_oper_pos;
+ 
+ 		tailpos = hostapd_eid_he_capab(hapd, tailpos,
+ 					       IEEE80211_MODE_AP);
+-		tailpos = hostapd_eid_he_operation(hapd, tailpos);
++		he_oper_pos = hostapd_eid_he_operation(hapd, tailpos);
++		if (he_oper_pos != tailpos) {
++			hapd->he_oper_color_off_beacon = tailpos - tail + head_len + 3;
++		}
++		tailpos = he_oper_pos;
+ 
+ 		/* BSS Color Change Announcement element */
+ 		cca_pos = hostapd_eid_cca(hapd, tailpos);
+@@ -2471,6 +2488,11 @@ int ieee802_11_build_ap_params(struct hostapd_data *hapd,
+ 
+ 		tailpos = hostapd_eid_spatial_reuse(hapd, tailpos);
+ 		tailpos = hostapd_eid_he_mu_edca_parameter_set(hapd, tailpos);
++		/* CCA IE */
++		cca_pos = hostapd_eid_cca(hapd, tailpos);
++		if (cca_pos != tailpos)
++			hapd->cca_c_off_beacon = cca_pos - tail - 2;
++		tailpos = cca_pos;
+ 		tailpos = hostapd_eid_he_6ghz_band_cap(hapd, tailpos);
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+@@ -2736,8 +2758,11 @@ static int __ieee802_11_set_beacon(struct hostapd_data *hapd)
+ 		return -1;
+ 	}
+ 
+-	if (hapd->csa_in_progress) {
+-		wpa_printf(MSG_ERROR, "Cannot set beacons during CSA period");
++	/* TODO COLOR: During Reconfig, the BSS removed and hence these states cleaned up.
++	 * Need to see if bss[0] states can be used */
++	if (hapd->csa_in_progress || hapd->cca_in_progress) {
++		wpa_printf(MSG_ERROR, "Cannot set beacons during %s period",
++			   hapd->csa_in_progress ? "CSA" : "CCA");
+ 		return -1;
+ 	}
+ 
+diff --git a/src/ap/ctrl_iface_ap.c b/src/ap/ctrl_iface_ap.c
+index 5da8c4906..19592e4d2 100644
+--- a/src/ap/ctrl_iface_ap.c
++++ b/src/ap/ctrl_iface_ap.c
+@@ -910,10 +910,14 @@ int hostapd_ctrl_iface_status(struct hostapd_data *hapd, char *buf,
+ 		ret = os_snprintf(buf + len, buflen - len,
+ 				  "he_oper_chwidth=%d\n"
+ 				  "he_oper_centr_freq_seg0_idx=%d\n"
+-				  "he_oper_centr_freq_seg1_idx=%d\n",
++				  "he_oper_centr_freq_seg1_idx=%d\n"
++				  "he_bss_color=%u\n"
++				  "he_bss_color_disabled=%u\n",
+ 				  iface->conf->he_oper_chwidth,
+ 				  iface->conf->he_oper_centr_freq_seg0_idx,
+-				  iface->conf->he_oper_centr_freq_seg1_idx);
++				  iface->conf->he_oper_centr_freq_seg1_idx,
++				  iface->conf->he_op.he_bss_color,
++				  iface->conf->he_op.he_bss_color_disabled);
+ 		if (os_snprintf_error(buflen - len, ret))
+ 			return len;
+ 		len += ret;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 768c375ab..578d17ba1 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -2237,6 +2237,55 @@ static void hostapd_event_ltq_unconnected_sta_rx(struct hostapd_data *hapd,
+ 		unc_sta->rate);
+ }
+ 
++#ifdef CONFIG_IEEE80211AX
++static void hostapd_event_bss_color_collision(struct hostapd_data *hapd,
++					      u64 bitmap, u8 *bssid)
++{
++	hostapd_handle_bss_color_collision(hapd, bitmap, bssid);
++}
++
++static void hostapd_event_cca(struct hostapd_data *hapd, enum wpa_event_type event)
++{
++	switch (event) {
++	case EVENT_CCA_STARTED_NOTIFY:
++		if (! hapd->iface->conf->autonomous_color_change)
++			wpa_msg(hapd->msg_ctx, MSG_INFO, WPA_EVENT_CCA_STARTED_NOTIFY
++				"bss_color=%u BSS %s BSSID=" MACSTR, hapd->cca_color,
++				hapd->conf->ssid.ssid, MAC2STR(hapd->own_addr));
++		wpa_printf(MSG_DEBUG, "CCA started on %s", hapd->conf->iface);
++		break;
++	case EVENT_CCA_NOTIFY:
++		hapd->iface->conf->he_op.he_bss_color = hapd->cca_color;
++		if (!hapd->iface->conf->autonomous_color_change) {
++			wpa_msg(hapd->msg_ctx, MSG_INFO, WPA_EVENT_CCA_NOTIFY
++				"bss_color=%u BSS %s BSSID=" MACSTR, hapd->cca_color,
++				hapd->conf->ssid.ssid, MAC2STR(hapd->own_addr));
++		} else {
++			hapd->iface->color_collision_count = 0;
++			memset(&hapd->iface->last_color_collision, 0, sizeof(hapd->iface->last_color_collision));
++			os_get_reltime(&hapd->iface->used_color_table[hapd->cca_color].use_time);
++		}
++		hostapd_cleanup_cca_params(hapd);
++		wpa_printf(MSG_DEBUG, "CCA finished on %s color %d", hapd->conf->iface, hapd->cca_color);
++		break;
++	case EVENT_CCA_ABORTED_NOTIFY:
++		if (! hapd->iface->conf->autonomous_color_change) {
++			wpa_msg(hapd->msg_ctx, MSG_INFO, WPA_EVENT_CCA_ABORTED_NOTIFY
++				"bss_color=%u BSS %s BSSID=" MACSTR,
++				hapd->cca_color, hapd->conf->ssid.ssid, MAC2STR(hapd->own_addr));
++		} else {
++			hapd->iface->color_collision_count = 0;
++			memset(&hapd->iface->last_color_collision, 0, sizeof(hapd->iface->last_color_collision));
++		}
++		hostapd_cleanup_cca_params(hapd);
++		wpa_printf(MSG_DEBUG, "CCA aborted on %s", hapd->conf->iface);
++		break;
++	default:
++		break;
++	}
++}
++#endif /* CONFIG_IEEE80211AX */
++
+ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 			  union wpa_event_data *data)
+ {
+@@ -2554,24 +2603,25 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 		 * BSS. */
+ 		wpa_printf(MSG_DEBUG, "BSS color collision on %s",
+ 			   hapd->conf->iface);
+-		hostapd_switch_color(hapd->iface->bss[0],
+-				     data->bss_color_collision.bitmap);
++		hostapd_event_bss_color_collision(hapd,
++						  data->bss_color_collision.bitmap,
++						  data->bss_color_collision.bssid);
+ 		break;
+ 	case EVENT_CCA_STARTED_NOTIFY:
+ 		wpa_printf(MSG_DEBUG, "CCA started on on %s",
+ 			   hapd->conf->iface);
++		hostapd_event_cca(hapd, event);
+ 		break;
+ 	case EVENT_CCA_ABORTED_NOTIFY:
+ 		wpa_printf(MSG_DEBUG, "CCA aborted on on %s",
+ 			   hapd->conf->iface);
+ 		hostapd_cleanup_cca_params(hapd);
++		hostapd_event_cca(hapd, event);
+ 		break;
+ 	case EVENT_CCA_NOTIFY:
+ 		wpa_printf(MSG_DEBUG, "CCA finished on on %s",
+ 			   hapd->conf->iface);
+-		if (hapd->cca_color)
+-			hapd->iface->conf->he_op.he_bss_color = hapd->cca_color;
+-		hostapd_cleanup_cca_params(hapd);
++		hostapd_event_cca(hapd, event);
+ 		break;
+ #endif /* CONFIG_IEEE80211AX */
+ 	case EVENT_LTQ_UNCONNECTED_STA_RX:
+@@ -2618,4 +2668,15 @@ struct hostapd_data * mxl_get_hapd_bssid(struct hostapd_iface *iface, const u8 *
+ _Static_assert(HAPD_BROADCAST == MXL_HAPD_BROADCAST, "open source and MXL macros not aligned!");
+ #endif /* CONFIG_VENDOR_MXL */
+ 
++u16 hostapd_get_beacon_int(const struct hostapd_data *hapd)
++{
++#if 0
++	// ToDo: beacon_int per BSS
++	return hapd->conf->beacon_int ? hapd->conf->beacon_int :
++					hapd->iconf->beacon_int;
++#else
++	return hapd->iconf->beacon_int;
++#endif
++}
++
+ #endif /* HOSTAPD */
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index c3776de12..127ebf783 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -58,8 +58,11 @@
+ #include "hw_features.h"
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_hostapd.h"
++#include "mxl_dfs_common.h"
+ #endif /* CONFIG_VENDOR_MXL */
+ #include "drivers/driver_nl80211.h"
++#include "drivers/mxl_driver_nl80211.h"
++#include "limits.h"
+ 
+ 
+ static int hostapd_flush_old_stations(struct hostapd_data *hapd, u16 reason);
+@@ -1767,6 +1770,17 @@ static int hostapd_setup_bss(struct hostapd_data *hapd, int first,
+ 	if (hapd->wpa_auth && wpa_init_keys(hapd->wpa_auth) < 0)
+ 		return -1;
+ 
++	if (hapd->iface->conf->autonomous_color_change) {
++		u8 current_color, color_disabled;
++		current_color = hapd->iface->conf->he_op.he_bss_color;
++		color_disabled = hapd->iface->conf->he_op.he_bss_color_disabled;
++		if (current_color != hapd->iface->old_color && !color_disabled) {
++			if (!hapd->iface->old_color)
++				 hapd->iface->old_color = current_color;
++			 os_get_reltime(&hapd->iface->used_color_table[current_color].use_time);
++		}
++	}
++
+ 	hostapd_post_up_vendor_vap_cmd(hapd, conf);
+ 
+ #ifdef CONFIG_VENDOR_MXL
+@@ -3582,8 +3596,12 @@ int hostapd_disable_iface(struct hostapd_iface *hapd_iface)
+ 		   WPA_DRIVER_FLAGS_AP_TEARDOWN_SUPPORT);
+ 
+ #ifdef NEED_AP_MLME
+-	for (j = 0; j < hapd_iface->num_bss; j++)
++	for (j = 0; j < hapd_iface->num_bss; j++) {
+ 		hostapd_cleanup_cs_params(hapd_iface->bss[j]);
++#ifdef CONFIG_IEEE80211AX
++		hostapd_cleanup_cca_params(hapd_iface->bss[j]);
++#endif /* CONFIG_IEEE80211AX */
++	}
+ #endif /* NEED_AP_MLME */
+ 
+ 	/* same as hostapd_interface_deinit without deinitializing ctrl-iface */
+@@ -4558,6 +4576,9 @@ hostapd_switch_channel_fallback(struct hostapd_iface *iface,
+ 
+ void hostapd_cleanup_cca_params(struct hostapd_data *hapd)
+ {
++	hapd->switch_time = 0;
++	hapd->he_oper_color_off_beacon = 0;
++
+ 	hapd->cca_count = 0;
+ 	hapd->cca_color = 0;
+ 	hapd->cca_c_off_beacon = 0;
+@@ -4586,6 +4607,7 @@ static int hostapd_fill_cca_settings(struct hostapd_data *hapd,
+ 
+ 	settings->cca_count = hapd->cca_count;
+ 	settings->cca_color = hapd->cca_color,
++	settings->switch_time = hapd->switch_time;
+ 	hapd->cca_in_progress = true;
+ 
+ 	ret = hostapd_build_beacon_data(hapd, &settings->beacon_cca);
+@@ -4594,6 +4616,7 @@ static int hostapd_fill_cca_settings(struct hostapd_data *hapd,
+ 		return ret;
+ 	}
+ 
++	settings->he_oper_color_offset_beacon = hapd->he_oper_color_off_beacon;
+ 	settings->counter_offset_beacon = hapd->cca_c_off_beacon;
+ 	settings->counter_offset_presp = hapd->cca_c_off_proberesp;
+ 
+@@ -4601,89 +4624,208 @@ static int hostapd_fill_cca_settings(struct hostapd_data *hapd,
+ }
+ 
+ 
+-static void hostapd_switch_color_timeout_handler(void *eloop_data,
+-						 void *user_ctx)
++/* Select a new color to switch to. A new color is either
++ * unused color (use time 0) or color with oldest use timestamp
++ * yet older than used color ageing time. If none meets the
++ * criteria, return -1.
++ */
++static
++int select_bss_color(struct hostapd_data *hapd)
+ {
+-	struct hostapd_data *hapd = (struct hostapd_data *) eloop_data;
+-	os_time_t delta_t;
+-	unsigned int b;
+-	int i, r;
+-
+-	 /* CCA can be triggered once the handler constantly receives
+-	  * color collision events to for at least
+-	  * DOT11BSS_COLOR_COLLISION_AP_PERIOD (50 s by default). */
+-	delta_t = hapd->last_color_collision.sec -
+-		hapd->first_color_collision.sec;
+-	if (delta_t < DOT11BSS_COLOR_COLLISION_AP_PERIOD)
+-		return;
++	long oldest_use_time = LONG_MAX;
++	int oldest_used_color = -1;
++	int i = 0;
++	struct os_reltime now, age;
+ 
+-	r = os_random() % HE_OPERATION_BSS_COLOR_MAX;
++	if (os_get_reltime(&now))
++		return -1;
++
++	u8 bss_color_index = os_random() % HE_OPERATION_BSS_COLOR_MAX;
+ 	for (i = 0; i < HE_OPERATION_BSS_COLOR_MAX; i++) {
+-		if (r && !(hapd->color_collision_bitmap & (1ULL << r)))
+-			break;
++		if (bss_color_index != 0) {
++			os_reltime_sub(&now, &hapd->iface->used_color_table[bss_color_index].use_time, &age);
++			if (hapd->iface->used_color_table[bss_color_index].use_time.sec == 0) {
++				return bss_color_index;
++			} else if ((age.sec > hapd->iface->conf->used_color_table_ageing * 60) &&
++				   ((hapd->iface->used_color_table[bss_color_index].use_time.sec) <
++				   oldest_use_time)) {
++				oldest_use_time = hapd->iface->used_color_table[bss_color_index].use_time.sec;
++				oldest_used_color = bss_color_index;
++			}
++		}
++		bss_color_index = (bss_color_index + 1) % HE_OPERATION_BSS_COLOR;
++	}
++
++	return oldest_used_color;
++}
+ 
+-		r = (r + 1) % HE_OPERATION_BSS_COLOR_MAX;
++/* Calculate color switch time.
++ * switch time = greater than Max of DTIM period among all VAPs
++ */
++int hostapd_cca_calc_switch_time(struct hostapd_iface *iface)
++{
++	int j, switch_time = 0;
++	for (j = 0; j < iface->num_bss; j++) {
++		struct hostapd_data *hapd = iface->bss[j];
++		switch_time = MAX(switch_time, (hapd->conf->dtim_period * hostapd_get_beacon_int(hapd)));
+ 	}
++	/* +50ms to keep the switchtime > Max of DTIM period among all VAPs */
++#define COLOR_SWITCH_TIME_ADD_VAL 50
++	switch_time += COLOR_SWITCH_TIME_ADD_VAL;
++	return switch_time;
++}
+ 
+-	if (i == HE_OPERATION_BSS_COLOR_MAX) {
+-		/* There are no free colors so turn BSS coloring off */
+-		wpa_printf(MSG_INFO,
+-			   "No free colors left, turning off BSS coloring");
+-		hapd->iface->conf->he_op.he_bss_color_disabled = 1;
+-		hapd->iface->conf->he_op.he_bss_color = os_random() % 63 + 1;
+-		for (b = 0; b < hapd->iface->num_bss; b++)
+-			ieee802_11_set_beacon(hapd->iface->bss[b]);
++/* build CCA params and call driver color switch */
++void
++hostapd_color_switch_trigger(struct hostapd_data *hapd, u8 new_color)
++{
++	int ret, switch_time, b;
++	struct cca_settings settings;
++
++	if (hapd->cca_in_progress || hapd->csa_in_progress)
++		return;
++
++	if (hapd->iface->cac_started) {
++		wpa_printf(MSG_ERROR, "CAC is running, can't switch color");
+ 		return;
+ 	}
+ 
++	switch_time = hapd->switch_time ? hapd->switch_time :
++				hostapd_cca_calc_switch_time(hapd->iface);
++
+ 	for (b = 0; b < hapd->iface->num_bss; b++) {
+ 		struct hostapd_data *bss = hapd->iface->bss[b];
+-		struct cca_settings settings;
+-		int ret;
+ 
+ 		hostapd_cleanup_cca_params(bss);
+-		bss->cca_color = r;
+-		bss->cca_count = 10;
++		bss->cca_color = new_color;
++		bss->switch_time = switch_time;
++		bss->cca_count = switch_time / hostapd_get_beacon_int(hapd);
+ 
+ 		if (hostapd_fill_cca_settings(bss, &settings)) {
+ 			hostapd_cleanup_cca_params(bss);
+ 			continue;
+ 		}
+ 
++		wpa_printf(MSG_DEBUG, "%s: Trigger drv color switch color %u count %u "
++			   "switch_time %u", bss->conf->iface, bss->cca_color, bss->cca_count, bss->switch_time);
+ 		ret = hostapd_drv_switch_color(bss, &settings);
+-		if (ret)
+-			hostapd_cleanup_cca_params(bss);
+-
+ 		free_beacon_data(&settings.beacon_cca);
+ 		free_beacon_data(&settings.beacon_after);
++
++		if (ret) {
++			hostapd_cleanup_cca_params(bss);
++		}
+ 	}
+ }
+ 
+-
+-void hostapd_switch_color(struct hostapd_data *hapd, u64 bitmap)
++/* Timeout handler for color switch task scheduled post collision detection.
++ * Switch to new color if current color collision crossed threshold configs.
++ *	1) number of collisions > collision count threshold and
++ *	2) last collision age < age thresh
++ * Select a new color and Trigger CCA
++ */
++static void
++hostapd_switch_color_timeout_handler(void *eloop_data, void *user_ctx)
+ {
+-	struct os_reltime now;
++	struct hostapd_data *hapd = (struct hostapd_data *) eloop_data;
++	struct os_reltime now, age;
++	int new_color = -1;
+ 
+-	if (hapd->cca_in_progress)
++	if (os_get_reltime(&now))
+ 		return;
+ 
+-	if (os_get_reltime(&now))
++	/* 10s (default) window is the approximate margin of collision persistent
++	 * as an initial implementation. CCA can only be triggered once
++	 * handler constantly receives collision events to update the
++	 * last_color_collision.sec. How does it work -
++	 *
++	 * 1. BSS color collision persistent for at least "bss_color_change_timeout" seconds.
++	 * 2. The BSS Color Disabled subfield is set to 1.
++	 * 3. CCA.
++	 *
++	 * TODO: implement other 'persistent' computation methods.
++	 */
++	os_reltime_sub(&now, &hapd->iface->last_color_collision, &age);
++	if (!((hapd->iface->color_collision_count >=
++	    hapd->iface->conf->num_bss_color_coll_thresh) &&
++	    (age.sec < hapd->iface->conf->bss_color_coll_age_thresh))) {
++		//Reset the collision counter
++		hapd->iface->color_collision_count = 0;
+ 		return;
++	}
+ 
+-	hapd->color_collision_bitmap = bitmap;
+-	hapd->last_color_collision = now;
++	hapd->iface->color_collision_count = 0;
++	memset(&hapd->iface->last_color_collision, 0, sizeof(hapd->iface->last_color_collision));
+ 
+-	if (eloop_is_timeout_registered(hostapd_switch_color_timeout_handler,
+-					hapd, NULL))
++	new_color = select_bss_color(hapd);
++	if (new_color == -1) {
++		wpa_printf(MSG_ERROR, "%s: Failed to select new color for CCA", hapd->conf->iface);
+ 		return;
++	}
+ 
+-	hapd->first_color_collision = now;
+-	/* 10 s window as margin for persistent color collision reporting */
+-	eloop_register_timeout(DOT11BSS_COLOR_COLLISION_AP_PERIOD + 10, 0,
+-			       hostapd_switch_color_timeout_handler,
+-			       hapd, NULL);
++	hostapd_color_switch_trigger(hapd, new_color);
++}
++
++/* Handles BSS color collision events from both Internal and External */
++void hostapd_handle_bss_color_collision(struct hostapd_data *hapd,
++					u64 bitmap, u8 *bssid)
++{
++	bool autonomous_color_change = hapd->iface->conf->autonomous_color_change;
++	u8 current_color;
++	struct os_reltime now, age;
++
++	os_get_reltime(&now);
++
++	current_color = hapd->iface->conf->he_op.he_bss_color;
++	wpa_printf(MSG_EXCESSIVE, "BSS color collision on %s current color %d bitmap %llx",
++		   hapd->conf->iface, current_color, bitmap);
++	if (autonomous_color_change != true) {
++		/* TODO COLOR: Not flood control interface with collision msgs */
++		os_reltime_sub(&now, &hapd->iface->last_color_collision, &age);
++		if (!hapd->iface->conf->color_coll_notify_interval ||
++		    age.sec >= hapd->iface->conf->color_coll_notify_interval) {
++			wpa_msg(hapd->msg_ctx, MSG_INFO, WPA_EVENT_BSS_COLOR_COLLISION
++				"bss_color_bitmap=%llx BSSID=" MACSTR, bitmap, MAC2STR(bssid));
++			/* Use last_color_collision time as last reported time in non-autonomous mode */
++			hapd->iface->last_color_collision = now;
++		}
++	} else {
++		if (bitmap & (1ULL << current_color)) {
++			hapd->iface->last_color_collision = now;
++			hapd->iface->color_collision_count++;
++			/* the bss color is shared amongst all BBSs on a specific phy.
++			 * therefore we always start the color change on the primary BSS
++			 */
++			hostapd_switch_color(hapd->iface->bss[0], bitmap);
++		}
++	}
+ }
+ 
++/* Schedule color switch task after configured timeout */
++void hostapd_switch_color(struct hostapd_data *hapd, u64 bitmap)
++{
++	int timeout;
++	(void)bitmap; /* TODO */
++
++	if (hapd->cca_in_progress || hapd->csa_in_progress)
++		return;
++
++	timeout = hapd->iface->conf->bss_color_change_timeout;
++	if (timeout == BSS_COLOR_CHANGE_TIMEOUT_RANDOM) {
++		/* Choose random color change timeout value. But keep with 40 to 80.
++		 * Standard allows values from 1 to 120. Having random timeout
++		 * may reduce the occurance of both APs involved in collision
++		 * to change the color.
++		 */
++		timeout = BSS_COLOR_CHANGE_TIMEOUT_RANDOM_MIN +
++			 (os_random() % BSS_COLOR_CHANGE_TIMEOUT_RANDOM_SPAN);
++	}
++
++	if (!eloop_is_timeout_registered(hostapd_switch_color_timeout_handler, hapd, NULL)) {
++		eloop_register_timeout(timeout, 0, hostapd_switch_color_timeout_handler,
++				       hapd, NULL);
++	}
++}
+ #endif /* CONFIG_IEEE80211AX */
+ 
+ #endif /* NEED_AP_MLME */
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 62f48972b..781d9b307 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -335,6 +335,11 @@ struct hostapd_data {
+ 	u64 color_collision_bitmap;
+ #endif /* CONFIG_IEEE80211AX */
+ 
++#ifdef CONFIG_IEEE80211AX
++	u32 switch_time;
++	unsigned int he_oper_color_off_beacon;
++#endif /* CONFIG_IEEE80211AX */
++
+ #ifdef CONFIG_P2P
+ 	struct p2p_data *p2p;
+ 	struct p2p_group *p2p_group;
+@@ -504,6 +509,11 @@ struct hostapd_sta_info {
+ #endif /* CONFIG_TAXONOMY */
+ };
+ 
++typedef struct bss_color_use_history {
++	struct os_reltime use_time; /* 0 - value stands for color unused */
++} bss_color_use_history;
++
++
+ /**
+  * struct hostapd_iface - hostapd per-interface data structure
+  */
+@@ -690,6 +700,13 @@ struct hostapd_iface {
+ #ifdef CONFIG_VENDOR_MXL
+ 	struct mxl_hostapd_iface mxl_iface;
+ #endif /* CONFIG_VENDOR_MXL */
++#ifdef CONFIG_IEEE80211AX
++	bss_color_use_history used_color_table[HE_OPERATION_BSS_COLOR_MAX];
++	struct os_reltime last_color_collision;
++	int color_collision_count;
++	u8 old_color;
++#endif /* CONFIG_IEEE80211AX */
++
+ 	int set_freq_done;
+ 	int block_tx; /* Is TX block on or off */
+ };
+@@ -744,6 +761,11 @@ int hostapd_owe_trans_get_info(struct hostapd_data *hapd);
+ void hostapd_ocv_check_csa_sa_query(void *eloop_ctx, void *timeout_ctx);
+ bool hostapd_can_send_btwt_config(struct hostapd_data *hapd);
+ int hostapd_get_psd_val(struct hostapd_iface *iface, u8 *val);
++#ifdef CONFIG_IEEE80211AX
++void hostapd_color_switch_trigger(struct hostapd_data *hapd, u8 new_color);
++void hostapd_handle_bss_color_collision(struct hostapd_data *hapd, u64 bitmap, u8 *bssid);
++int hostapd_cca_calc_switch_time(struct hostapd_iface *iface);
++#endif /* CONFIG_IEEE80211AX*/
+ 
+ void hostapd_switch_color(struct hostapd_data *hapd, u64 bitmap);
+ void hostapd_cleanup_cca_params(struct hostapd_data *hapd);
+@@ -777,6 +799,7 @@ int hostapd_probe_req_rx(struct hostapd_data *hapd, const u8 *sa, const u8 *da,
+ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 			     int offset, int width, int cf1, int cf2,
+ 			     u16 punct_bitmap, int finished);
++u16 hostapd_get_beacon_int(const struct hostapd_data *hapd);
+ struct survey_results;
+ void hostapd_event_get_survey(struct hostapd_iface *iface,
+ 			      struct survey_results *survey_results);
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 4470477e8..ca7b9f4b9 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4927,11 +4927,21 @@ static u16 send_assoc_resp(struct hostapd_data *hapd, struct sta_info *sta,
+ 
+ #ifdef CONFIG_IEEE80211AX
+ 	if (hapd->iconf->ieee80211ax && !hapd->conf->disable_11ax) {
++		u8 *cca_pos;
+ 		p = hostapd_eid_he_capab(hapd, p, IEEE80211_MODE_AP);
+ 		p = hostapd_eid_he_operation(hapd, p);
+ 		p = hostapd_eid_cca(hapd, p);
+ 		p = hostapd_eid_spatial_reuse(hapd, p);
+ 		p = hostapd_eid_he_mu_edca_parameter_set(hapd, p);
++		/* CCA IE */
++		cca_pos = hostapd_eid_cca(hapd, p);
++		if (cca_pos != p) {
++			/* Keep the count as zero, as hostapd won't have
++			 * updated cca count during CCA */
++#define WLAN_CNT_OFF_IN_CCA_IE 3 /* eid(1) + len(1) + ext (1) */
++			cca_pos[WLAN_CNT_OFF_IN_CCA_IE] = 0;
++		}
++		p = cca_pos;
+ 		p = hostapd_eid_he_6ghz_band_cap(hapd, p);
+ 	}
+ #endif /* CONFIG_IEEE80211AX */
+diff --git a/src/ap/ieee802_11.h b/src/ap/ieee802_11.h
+index 05bc6152c..c361f31de 100644
+--- a/src/ap/ieee802_11.h
++++ b/src/ap/ieee802_11.h
+@@ -127,6 +127,7 @@ u16 copy_sta_he_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 		      size_t he_capab_len);
+ u16 copy_sta_he_6ghz_capab(struct hostapd_data *hapd, struct sta_info *sta,
+ 			   const u8 *he_6ghz_capab);
++u8 * hostapd_eid_cca(struct hostapd_data *hapd, u8 *eid);
+ int hostapd_get_he_twt_responder(struct hostapd_data *hapd,
+ 				 enum ieee80211_op_mode mode);
+ u8 * hostapd_eid_cca(struct hostapd_data *hapd, u8 *eid);
+diff --git a/src/ap/ieee802_11_he.c b/src/ap/ieee802_11_he.c
+index cadf5b41e..c84e81af0 100644
+--- a/src/ap/ieee802_11_he.c
++++ b/src/ap/ieee802_11_he.c
+@@ -214,6 +214,8 @@ u8 * hostapd_eid_he_operation(struct hostapd_data *hapd, u8 *eid)
+ 	if (hapd->iface->conf->he_op.he_bss_color_disabled ||
+ 	    hapd->cca_in_progress)
+ 		params |= HE_OPERATION_BSS_COLOR_DISABLED;
++	if (hapd->cca_in_progress)
++		params |= HE_OPERATION_BSS_COLOR_DISABLED;
+ 	if (hapd->iface->conf->he_op.he_bss_color_partial)
+ 		params |= HE_OPERATION_BSS_COLOR_PARTIAL;
+ 	params |= hapd->iface->conf->he_op.he_bss_color <<
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index 27377b0d5..68c2391a9 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -816,134 +816,81 @@ static void ieee802_11_rx_wnm_coloc_intf_report(struct hostapd_data *hapd,
+ 	os_free(hex);
+ }
+ 
+-
+-
+-static const char * wnm_event_type2str(enum wnm_event_report_type wtype)
++static void ieee802_11_rx_wnm_event_report_bss_collision(struct hostapd_data *hapd,
++							 u8 *evt_report,
++							 const u8 *addr)
+ {
+-#define W2S(wtype) case WNM_EVENT_TYPE_ ## wtype: return #wtype;
+-	switch (wtype) {
+-	W2S(TRANSITION)
+-	W2S(RSNA)
+-	W2S(P2P_LINK)
+-	W2S(WNM_LOG)
+-	W2S(BSS_COLOR_COLLISION)
+-	W2S(BSS_COLOR_IN_USE)
+-	}
+-	return "UNKNOWN";
+-#undef W2S
++	struct wnm_event_report_bss_collision_report *bss_coll_rep =
++			(struct wnm_event_report_bss_collision_report*) evt_report;
++#ifdef CONFIG_IEEE80211AX
++	hostapd_handle_bss_color_collision(hapd, bss_coll_rep->collision_bitmap, (u8*) addr);
++#endif
++	return;
+ }
+ 
+-
+ static void ieee802_11_rx_wnm_event_report(struct hostapd_data *hapd,
+ 					   const u8 *addr, const u8 *buf,
+ 					   size_t len)
+ {
+-	struct sta_info *sta;
+ 	u8 dialog_token;
+-	struct wnm_event_report_element *report_ie;
+-	const u8 *pos = buf, *end = buf + len;
+-	const size_t fixed_field_len = 3; /* Event Token/Type/Report Status */
+-#ifdef CONFIG_IEEE80211AX
+-	const size_t tsf_len = 8;
+-	u8 color;
+-	u64 bitmap;
+-#endif /* CONFIG_IEEE80211AX */
+-
+-	if (end - pos < 1 + 2) {
+-		wpa_printf(MSG_DEBUG,
+-			   "WNM: Ignore too short WNM Event Report frame from "
+-			   MACSTR, MAC2STR(addr));
++	if (len < 5)
+ 		return;
+-	}
+ 
+-	dialog_token = *pos++;
+-	report_ie = (struct wnm_event_report_element *) pos;
+-
+-	if (end - pos < 2 + report_ie->len ||
+-	    report_ie->len < fixed_field_len) {
+-		wpa_printf(MSG_DEBUG,
+-			   "WNM: Ignore truncated WNM Event Report frame from "
+-			   MACSTR, MAC2STR(addr));
+-		return;
+-	}
+-
+-	if (report_ie->eid != WLAN_EID_EVENT_REPORT ||
+-	    report_ie->status != WNM_STATUS_SUCCESSFUL)
+-		return;
++	wpa_printf(MSG_DEBUG, "WNM: Received Event report frame from "
++		   MACSTR, MAC2STR(addr));
++	wpa_hexdump(MSG_MSGDUMP, "WNM: Event report subelements",
++		    buf, len);
+ 
+-	wpa_printf(MSG_DEBUG, "WNM: Received WNM Event Report frame from "
+-		   MACSTR " dialog_token=%u event_token=%u type=%d (%s)",
+-		   MAC2STR(addr), dialog_token, report_ie->token,
+-		   report_ie->type, wnm_event_type2str(report_ie->type));
+ 
+-	pos += 2 + fixed_field_len;
+-	wpa_hexdump(MSG_MSGDUMP, "WNM: Event Report", pos, end - pos);
++	dialog_token = *buf++;
++	len -= 1;
+ 
+-	sta = ap_get_sta(hapd, addr);
+-	if (!sta || !(sta->flags & WLAN_STA_ASSOC)) {
+-		wpa_printf(MSG_DEBUG, "Station " MACSTR
+-			   " not found for received WNM Event Report",
+-			   MAC2STR(addr));
++	if (dialog_token != 0)
+ 		return;
+-	}
+ 
+-	switch (report_ie->type) {
+-#ifdef CONFIG_IEEE80211AX
+-	case WNM_EVENT_TYPE_BSS_COLOR_COLLISION:
+-		if (!hapd->iconf->ieee80211ax || hapd->conf->disable_11ax)
+-			return;
+-		if (report_ie->len <
+-		    fixed_field_len + tsf_len + 8) {
+-			wpa_printf(MSG_DEBUG,
+-				   "WNM: Too short BSS color collision event report from "
+-				   MACSTR, MAC2STR(addr));
+-			return;
+-		}
+-		bitmap = WPA_GET_LE64(report_ie->u.bss_color_collision.color_bitmap);
+-		wpa_printf(MSG_DEBUG,
+-			   "WNM: BSS color collision bitmap 0x%llx reported by "
+-			   MACSTR, (unsigned long long) bitmap, MAC2STR(addr));
+-		hostapd_switch_color(hapd->iface->bss[0], bitmap);
+-		break;
+-	case WNM_EVENT_TYPE_BSS_COLOR_IN_USE:
+-		if (!hapd->iconf->ieee80211ax || hapd->conf->disable_11ax)
+-			return;
+-		if (report_ie->len < fixed_field_len + tsf_len + 1) {
+-			wpa_printf(MSG_DEBUG,
+-				   "WNM: Too short BSS color in use event report from "
+-				   MACSTR, MAC2STR(addr));
+-			return;
+-		}
+-		color = report_ie->u.bss_color_in_use.color;
+-		if (color > 63) {
+-			wpa_printf(MSG_DEBUG,
+-				   "WNM: Invalid BSS color %u report from "
+-				   MACSTR, color, MAC2STR(addr));
+-			return;
+-		}
+-		if (color == 0) {
+-			wpa_printf(MSG_DEBUG,
+-				   "WNM: BSS color use report canceled by "
+-				   MACSTR, MAC2STR(addr));
+-			/* TODO: Clear stored color from the collision bitmap
+-			 * if there are no other users for it. */
+-			return;
++	while (len >= sizeof(struct wnm_event_report_element)) {
++		struct wnm_event_report_element *rep =
++			(struct wnm_event_report_element*) buf;
++		switch (rep->eid) {
++			case WLAN_EID_EVENT_REPORT:
++				/* WNM Event report - BSS color collision */
++				if ((rep->len == (sizeof(struct wnm_event_report_bss_collision_report)  +
++					sizeof(struct wnm_event_report_element) - 2)) && /* color collision evt report len */
++					(rep->event_token == 0) && /* autonomous */
++					(rep->event_report == WNM_EVENT_TYPE_BSS_COLOR_COLLISION) && /* evt type - color collision */
++					(rep->status == 0)) { /* status */
++					ieee802_11_rx_wnm_event_report_bss_collision(hapd,
++						rep->variable, addr);
++					return;
++				}
++				break;
++			default:
++				return;
+ 		}
+-		wpa_printf(MSG_DEBUG, "WNM: BSS color %u use report by "
+-			   MACSTR, color, MAC2STR(addr));
+-		hapd->color_collision_bitmap |= 1ULL << color;
+-		break;
+-#endif /* CONFIG_IEEE80211AX */
+-	default:
+-		wpa_printf(MSG_DEBUG,
+-			   "WNM Event Report type=%d (%s) not supported",
+-			   report_ie->type,
+-			   wnm_event_type2str(report_ie->type));
+-		break;
++		len -= 2 + rep->len;
++		buf += 2 + rep->len;
+ 	}
+ }
+ 
+ 
++#ifndef CONFIG_VENDOR_MXL
++static const char * wnm_event_type2str(enum wnm_event_report_type wtype)
++{
++#define W2S(wtype) case WNM_EVENT_TYPE_ ## wtype: return #wtype;
++	switch (wtype) {
++	W2S(TRANSITION)
++	W2S(RSNA)
++	W2S(P2P_LINK)
++	W2S(WNM_LOG)
++	W2S(BSS_COLOR_COLLISION)
++	W2S(BSS_COLOR_IN_USE)
++	}
++	return "UNKNOWN";
++#undef W2S
++}
++#endif /* CONFIG_VENDOR_MXL */
++
++
+ int ieee802_11_rx_wnm_action_ap(struct hostapd_data *hapd,
+ 				const struct ieee80211_mgmt *mgmt, size_t len)
+ {
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 9c55e2ab1..79a83d88b 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -2017,23 +2017,20 @@ enum wnm_notification_Type {
+ 	WNM_NOTIF_TYPE_VENDOR_SPECIFIC = 221,
+ };
+ 
++/* IEEE 802.11- WNM-Event Request element */
+ struct wnm_event_report_element {
+-	u8 eid; /* WLAN_EID_EVENT_REPORT */
++	u8 eid;		 /* WLAN_EID_EVENT_REPORT */
+ 	u8 len;
+-	u8 token;
+-	u8 type;
+-	u8 status;
+-	/* Followed by conditional fields */
+-	union {
+-		struct {
+-			u8 tsf[8]; /* Event TSF */
+-			u8 color_bitmap[8]; /* Event Report field */
+-		} STRUCT_PACKED bss_color_collision;
+-		struct {
+-			u8 tsf[8]; /* Event TSF */
+-			u8 color; /* Event Report field */
+-		} STRUCT_PACKED bss_color_in_use;
+-	} u;
++	u8 event_token;  /* 0 - autonomous */
++	u8 event_report; /* 4 - BSS color collision */
++	u8 status;       /* 0 - success. if not success, no variable. */
++	u8 variable[0];
++} STRUCT_PACKED;
++
++/* IEEE 802.11- WNM-Event report BSS collision */
++struct wnm_event_report_bss_collision_report {
++	u64 tsf;
++	u64 collision_bitmap; /* A set bit in a position denotes bss color (=position number) collision */
+ } STRUCT_PACKED;
+ 
+ enum wnm_event_report_status {
+@@ -2464,6 +2461,7 @@ enum he_6ghz_ap_type {
+ 	HE_6GHZ_INDOOR_AP		= 0,
+ 	HE_6GHZ_STANDARD_POWER_AP	= 1,
+ };
++#define HE_OPERATION_BSS_COLOR				0x3f
+ 
+ /* Spatial Reuse defines */
+ #define SPATIAL_REUSE_SRP_DISALLOWED		BIT(0)
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index ed4190aa3..922d49c9e 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -440,6 +440,11 @@ extern "C" {
+ #define UNCONNECTED_STA_RSSI "UNCONNECTED-STA-RSSI "
+ #define AP_PROBE_REQ_RECEIVED "AP-PROBE-REQ-RECEIVED "
+ 
++#define WPA_EVENT_BSS_COLOR_COLLISION "CTRL-EVENT-BSS-COLOR-COLLISION "
++#define WPA_EVENT_CCA_STARTED_NOTIFY "CTRL-EVENT-CCA-STARTED-NOTIFY "
++#define WPA_EVENT_CCA_ABORTED_NOTIFY "CTRL-EVENT-CCA-ABORTED-NOTIFY "
++#define WPA_EVENT_CCA_NOTIFY "CTRL-EVENT-CCA-NOTIFY "
++
+ #ifndef BIT
+ #define BIT(x) (1U << (x))
+ #endif
+diff --git a/src/drivers/driver.h b/src/drivers/driver.h
+index 870a20a62..910bd1054 100644
+--- a/src/drivers/driver.h
++++ b/src/drivers/driver.h
+@@ -2754,6 +2754,8 @@ struct csa_settings {
+  * struct cca_settings - Settings for color switch command
+  * @cca_count: Count in Beacon frames (TBTT) to perform the switch
+  * @cca_color: The new color that we are switching to
++ * @switch_time: The time in ms after which new is switched to
++ * @he_oper_color_offset_beacon: Offset to the he oper bss color field in beacon tmpl.
+  * @beacon_cca: Beacon/Probe Response/(Re)Association Response frame info for
+  * color switch period
+  * @beacon_after: Next Beacon/Probe Response/(Re)Association Response frame info
+@@ -2764,6 +2766,9 @@ struct cca_settings {
+ 	u8 cca_count;
+ 	u8 cca_color;
+ 
++	u32 switch_time;
++	u16 he_oper_color_offset_beacon;
++
+ 	struct beacon_data beacon_cca;
+ 	struct beacon_data beacon_after;
+ 
+@@ -6800,6 +6805,7 @@ union wpa_event_data {
+ 	 */
+ 	struct bss_color_collision {
+ 		u64 bitmap;
++		u8 *bssid;
+ 	} bss_color_collision;
+ 
+ 	/**
+@@ -6834,6 +6840,15 @@ union wpa_event_data {
+ 	} t2l_map_info;
+ 
+ 	struct intel_vendor_unconnected_sta unconnected_sta;
++
++	/**
++	 * struct bss_cca - Data for EVENT_CCA_STARTED
++	 */
++	struct bss_cca {
++		u8 cca_color;
++		u8 cca_count;
++	} bss_cca;
++
+ };
+ 
+ /**
+diff --git a/src/drivers/driver_nl80211.c b/src/drivers/driver_nl80211.c
+index b91f66fb0..43bd676c6 100644
+--- a/src/drivers/driver_nl80211.c
++++ b/src/drivers/driver_nl80211.c
+@@ -11254,7 +11254,6 @@ error:
+ 	return ret;
+ }
+ 
+-
+ #ifdef CONFIG_IEEE80211AX
+ static int nl80211_switch_color(void *priv, struct cca_settings *settings)
+ {
+@@ -11264,9 +11263,9 @@ static int nl80211_switch_color(void *priv, struct cca_settings *settings)
+ 	struct nl_msg *msg;
+ 	int ret = -ENOBUFS;
+ 
+-	wpa_printf(MSG_DEBUG,
+-		   "nl80211: Color change request (cca_count=%u color=%d)",
+-		   settings->cca_count, settings->cca_color);
++	wpa_printf(MSG_DEBUG, "nl80211: Color change request (cca_count=%u color=%d c_off_bcon=%u c_off_presp=%u col_off_he=%u)",
++		   settings->cca_count, settings->cca_color, settings->counter_offset_beacon,
++		   settings->counter_offset_presp, settings->he_oper_color_offset_beacon);
+ 
+ 	if (drv->nlmode != NL80211_IFTYPE_AP)
+ 		return -EOPNOTSUPP;
+@@ -11291,7 +11290,9 @@ static int nl80211_switch_color(void *priv, struct cca_settings *settings)
+ 	    nla_put_u8(msg, NL80211_ATTR_COLOR_CHANGE_COUNT,
+ 		       settings->cca_count) ||
+ 	    nla_put_u8(msg, NL80211_ATTR_COLOR_CHANGE_COLOR,
+-		       settings->cca_color))
++		       settings->cca_color) ||
++	    nla_put_u32(msg, NL80211_ATTR_COLOR_CHANGE_SWITCH_TIME,
++		       settings->switch_time))
+ 		goto error;
+ 
+ 	/* beacon_after params */
+@@ -11312,6 +11313,8 @@ static int nl80211_switch_color(void *priv, struct cca_settings *settings)
+ 
+ 	if (nla_put_u16(msg, NL80211_ATTR_CNTDWN_OFFS_BEACON,
+ 			settings->counter_offset_beacon) ||
++	     nla_put_u16(msg, NL80211_ATTR_HEOPER_COLOR_OFFS_BEACON,
++			settings->he_oper_color_offset_beacon) ||
+ 	    (settings->beacon_cca.probe_resp &&
+ 	     nla_put_u16(msg, NL80211_ATTR_CNTDWN_OFFS_PRESP,
+ 			 settings->counter_offset_presp))) {
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index e33a3c464..72399dd8f 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3786,7 +3786,6 @@ static void nl80211_control_port_frame(struct wpa_driver_nl80211_data *drv,
+ 	}
+ }
+ 
+-
+ static void
+ nl80211_control_port_frame_tx_status(struct wpa_driver_nl80211_data *drv,
+ 				     const u8 *frame, size_t len,
+@@ -3813,6 +3812,56 @@ nl80211_control_port_frame_tx_status(struct wpa_driver_nl80211_data *drv,
+ 	wpa_supplicant_event(drv->ctx, EVENT_EAPOL_TX_STATUS, &event);
+ }
+ 
++#ifdef CONFIG_IEEE80211AX
++static void mlme_event_obss_color_collision(struct i802_bss *bss,
++					    struct nlattr *tb[])
++{
++	union wpa_event_data data;
++
++	if (!tb[NL80211_ATTR_OBSS_COLOR_BITMAP] || !tb[NL80211_ATTR_BSSID])
++		return;
++
++	os_memset(&data, 0, sizeof(data));
++	data.bss_color_collision.bitmap = nla_get_u64(tb[NL80211_ATTR_OBSS_COLOR_BITMAP]);
++	data.bss_color_collision.bssid = nla_data(tb[NL80211_ATTR_BSSID]);
++
++	wpa_supplicant_event(bss->ctx, EVENT_BSS_COLOR_COLLISION, &data);
++}
++
++static void mlme_event_color_change_announcement_started(struct i802_bss *bss, struct nlattr *tb[])
++{
++	union wpa_event_data data;
++
++	if (!tb[NL80211_ATTR_COLOR_CHANGE_COLOR] || !tb[NL80211_ATTR_COLOR_CHANGE_COUNT])
++		return;
++
++	os_memset(&data, 0, sizeof(data));
++	data.bss_cca.cca_color = nla_get_u8(tb[NL80211_ATTR_COLOR_CHANGE_COLOR]);
++	data.bss_cca.cca_count = nla_get_u8(tb[NL80211_ATTR_COLOR_CHANGE_COUNT]);
++
++	wpa_printf(MSG_DEBUG, "nl80211: CCA started");
++
++	wpa_supplicant_event(bss->ctx, EVENT_CCA_STARTED_NOTIFY, &data);
++}
++
++static void mlme_event_color_change_announcement_aborted(struct i802_bss *bss)
++{
++	union wpa_event_data data = {};
++
++	wpa_printf(MSG_DEBUG, "nl80211: CCA aborted");
++
++	wpa_supplicant_event(bss->ctx, EVENT_CCA_ABORTED_NOTIFY, &data);
++}
++
++static void mlme_event_color_change_announcement_completed(struct i802_bss *bss)
++{
++	union wpa_event_data data = {};
++
++	wpa_printf(MSG_ERROR, "nl80211: CCA completed");
++
++	wpa_supplicant_event(bss->ctx, EVENT_CCA_NOTIFY, &data);
++}
++#endif /* CONFIG_IEEE80211AX */
+ 
+ static void nl80211_frame_wait_cancel(struct wpa_driver_nl80211_data *drv,
+ 				      struct nlattr *cookie_attr)
+@@ -3862,6 +3911,7 @@ static void nl80211_assoc_comeback(struct wpa_driver_nl80211_data *drv,
+ }
+ 
+ 
++#ifndef CONFIG_VENDOR_MXL
+ #ifdef CONFIG_IEEE80211AX
+ 
+ static void nl80211_obss_color_collision(struct i802_bss *bss,
+@@ -3909,6 +3959,7 @@ static void nl80211_color_change_announcement_completed(struct i802_bss *bss)
+ }
+ 
+ #endif /* CONFIG_IEEE80211AX */
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 
+ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+@@ -4165,16 +4216,16 @@ static void do_process_drv_event(struct i802_bss *bss, int cmd,
+ 		break;
+ #ifdef CONFIG_IEEE80211AX
+ 	case NL80211_CMD_OBSS_COLOR_COLLISION:
+-		nl80211_obss_color_collision(bss, tb);
++		mlme_event_obss_color_collision(bss, tb);
+ 		break;
+ 	case NL80211_CMD_COLOR_CHANGE_STARTED:
+-		nl80211_color_change_announcement_started(bss);
++		mlme_event_color_change_announcement_started(bss, tb);
+ 		break;
+ 	case NL80211_CMD_COLOR_CHANGE_ABORTED:
+-		nl80211_color_change_announcement_aborted(bss);
++		mlme_event_color_change_announcement_aborted(bss);
+ 		break;
+ 	case NL80211_CMD_COLOR_CHANGE_COMPLETED:
+-		nl80211_color_change_announcement_completed(bss);
++		mlme_event_color_change_announcement_completed(bss);
+ 		break;
+ #endif /* CONFIG_IEEE80211AX */
+ 	case NL80211_CMD_LINKS_REMOVED:
+diff --git a/wpa_supplicant/events.c b/wpa_supplicant/events.c
+index da73faaaf..aeeba5b98 100644
+--- a/wpa_supplicant/events.c
++++ b/wpa_supplicant/events.c
+@@ -6785,6 +6785,13 @@ void wpa_supplicant_event(void *ctx, enum wpa_event_type event,
+ 		if (data)
+ 			wpas_tid_link_map(wpa_s, &data->t2l_map_info);
+ 		break;
++	case EVENT_CCA_STARTED_NOTIFY:
++		wpa_msg(wpa_s, MSG_INFO, WPA_EVENT_CCA_STARTED_NOTIFY
++				"cca_color:%u cca_count:%u ifname:%s BSSID=" MACSTR,
++				data->bss_cca.cca_color, data->bss_cca.cca_count, wpa_s->ifname, MAC2STR(wpa_s->own_addr));
++		wpa_printf(MSG_ERROR, "CCA started on %s (cca_color:%u cca_count:%u)",
++				wpa_s->ifname, data->bss_cca.cca_color, data->bss_cca.cca_count);
++		break;
+ 	default:
+ 		wpa_msg(wpa_s, MSG_INFO, "Unknown event %d", event);
+ 		break;
+-- 
+2.43.0
+

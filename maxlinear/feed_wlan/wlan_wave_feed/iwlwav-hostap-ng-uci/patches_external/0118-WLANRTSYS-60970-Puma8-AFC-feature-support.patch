@@ -1,0 +1,638 @@
+From ef74c657444d80eee3c1a2689524ef2009c02ae5 Mon Sep 17 00:00:00 2001
+From: fromans <fromans@maxlinear.com>
+Date: Mon, 11 Dec 2023 14:54:40 +0200
+Subject: [PATCH] WLANRTSYS-60970: Puma8: AFC feature support
+
+---
+ hostapd/hostapd.conf               |   5 +
+ hostapd/mxl_config.c               |  17 ++++
+ hostapd/mxl_ctrl_iface.c           |  37 +++++++
+ hostapd/mxl_ctrl_iface.h           |   4 +
+ hostapd/mxl_hostapd_cli.c          |  26 +++++
+ hostapd/mxl_hostapd_cli.h          |   6 ++
+ src/ap/hostapd.c                   |  35 ++++++-
+ src/ap/mxl_config.h                |   3 +
+ src/ap/mxl_events.c                |  38 ++++++++
+ src/ap/mxl_hostapd.c               | 149 +++++++++++++++++++++++++++++
+ src/ap/mxl_hostapd.h               |   5 +
+ src/common/mxl_vendor.h            |   1 +
+ src/common/vendor_cmds_copy.h      |  21 ++++
+ src/drivers/driver_nl80211_event.c |   9 ++
+ 14 files changed, 355 insertions(+), 1 deletion(-)
+
+diff --git a/hostapd/hostapd.conf b/hostapd/hostapd.conf
+index 66017d1f8..72dca5b99 100644
+--- a/hostapd/hostapd.conf
++++ b/hostapd/hostapd.conf
+@@ -507,6 +507,11 @@ wmm_ac_vo_acm=0
+ # 3 = AP supports both backhaul BSS and fronthaul BSS
+ #multi_ap=0
+ 
++#AFC - Automated Frequency coordination
++#This parameter can be used to configure the power modes of the 6GHz radio.
++#power_mode=0 (Low Power Indoor)
++#power_mode=1 (Standard Power)
++
+ # Static WEP key configuration
+ #
+ # The key number to use when transmitting.
+diff --git a/hostapd/mxl_config.c b/hostapd/mxl_config.c
+index cbd2413ee..af5654da4 100644
+--- a/hostapd/mxl_config.c
++++ b/hostapd/mxl_config.c
+@@ -1429,6 +1429,23 @@ int mxl_hostapd_config_fill (struct hostapd_config *conf,
+ 			return 0;
+ 		}
+ 		mxl_conf->dynamic_edca = val;
++	} else if (os_strcmp(buf, "he_6ghz_pwr_mode") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: he_6ghz_pwr_mode %d",
++				   line, val);
++			return 0;
++		}
++		conf->he_6ghz_reg_pwr_type = val;
++	} else if (os_strcmp(buf, "power_mode") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_RANGE(val, POWER_MODE_MIN, POWER_MODE_MAX)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid power mode %d, must be between %d..%d",
++				   line, val, POWER_MODE_MIN, POWER_MODE_MAX);
++			return 0;
++		}
++		conf->he_6ghz_reg_pwr_type = val;
++		wpa_printf(MSG_INFO, "Line %d: power_mode '%d'", line, conf->he_6ghz_reg_pwr_type);
+ 	} else
+ 		return 0;
+ 
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 4e5705692..a24312ae2 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -2862,6 +2862,10 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 			*reply_len = -1;
+ 	} else if (os_strncmp(buf, "GET_STA_SOFTBLOCK ", 18) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_sta_softblock(hapd, buf + 18, reply, reply_size);
++	} else if (os_strncmp(buf, "GET_POWER_MODE", 14) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_get_power_mode(hapd->iface, reply, reply_size);
++	} else if (os_strncmp(buf, "SET_POWER_MODE", 14) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_set_power_mode(hapd->iface, buf + 14, reply, reply_size);
+ 	} else {
+ 		return 0;
+ 	}
+@@ -3264,6 +3268,39 @@ exit:
+ 
+ 	return sprintf_s(reply, reply_size, "dialog_token=%d\n", ret_dialog_token);
+ }
++
++int mxl_hostapd_ctrl_iface_get_power_mode(struct hostapd_iface *iface,
++					     char *buf, size_t buflen)
++{
++	return os_snprintf(buf, buflen, " Current mode = %s, Configured Mode = %s\n",
++			   mxl_he_6ghz_pwr_mode_text(iface->mxl_iface.he_6ghz_reg_pwr_mode),
++			   mxl_he_6ghz_pwr_mode_text(iface->conf->he_6ghz_reg_pwr_type));
++}
++
++int mxl_hostapd_ctrl_iface_set_power_mode(struct hostapd_iface *iface, const char *cmd,
++					     char *buf, size_t buflen)
++{
++	const char *pos = cmd;
++	int val;
++	struct hostapd_data *hapd = iface->bss[0];
++
++	pos = os_strchr(pos, ' ');
++	if (NULL == pos)
++		return -1;
++
++	pos++;
++	val = atoi(pos);
++	if (val < 0 || val > 1) {
++		wpa_printf(MSG_INFO, "Invalid Power mode - LPI-POWER-MODE (0) / STANDARD-POWER (1) value");
++		return -1;
++	}
++
++	iface->conf->he_6ghz_reg_pwr_type = val;
++	mxl_hostapd_interface_update_power_regd(hapd, val);
++
++	return os_snprintf(buf, buflen, "Power Mode=%s\n", iface->conf->he_6ghz_reg_pwr_type ? "STANDARD-POWER" : "LOW-POWER-INDOOR");
++}
++
+ int mxl_hostapd_ctrl_iface_acl_add_mac(struct mac_acl_entry **acl, int *num, const char *cmd)
+ { return hostapd_ctrl_iface_acl_add_mac (acl, num, cmd); }
+ int mxl_hostapd_ctrl_iface_acl_del_mac(struct mac_acl_entry **acl, int *num, const char *txtaddr)
+diff --git a/hostapd/mxl_ctrl_iface.h b/hostapd/mxl_ctrl_iface.h
+index 02db0438e..acd42d76b 100644
+--- a/hostapd/mxl_ctrl_iface.h
++++ b/hostapd/mxl_ctrl_iface.h
+@@ -27,5 +27,9 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ char * mxl_dfs_info(struct hostapd_channel_data *chan);
+ int mxl_hostapd_ctrl_iface_req_beacon(struct hostapd_data *hapd, char *cmd, char *reply, size_t reply_size);
+ int mxl_hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd, int *ret);
++int mxl_hostapd_ctrl_iface_get_power_mode(struct hostapd_iface *iface,
++					  char *buf, size_t buflen);
++int mxl_hostapd_ctrl_iface_set_power_mode(struct hostapd_iface *iface, const char *cmd,
++					  char *buf, size_t buflen);
+ 
+ #endif /* MXL_CTRL_IFACE_H */
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index 526835ddd..09efdc964 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -280,6 +280,7 @@ int mxl_hostapd_cli_cmd_report_beacon(struct wpa_ctrl *ctrl, int argc, char *arg
+ 	return mxl_hostapd_cli_cmd(ctrl, "REPORT_BEACON", 14, argc, argv);
+ }
+ 
++
+ int mxl_hostapd_cli_cmd_req_self_beacon(struct wpa_ctrl *ctrl, int argc, char *argv[])
+ {
+ 	if (argc < 3) {
+@@ -377,3 +378,28 @@ int mxl_hostapd_cli_cmd_report_sta_statistics(struct wpa_ctrl *ctrl, int argc, c
+ 
+ 	return mxl_hostapd_cli_cmd(ctrl, "REPORT_STA_STATISTICS", 7, argc, argv);
+ }
++
++int mxl_hostapd_cli_cmd_get_power_mode(struct wpa_ctrl *ctrl, int argc,
++					   char *argv[])
++{
++	return mxl_wpa_ctrl_command(ctrl, "GET_POWER_MODE");
++}
++
++int mxl_hostapd_cli_cmd_set_power_mode(struct wpa_ctrl *ctrl, int argc,
++					  char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 1) {
++		printf("Invalid power mode set command - LPI-POWER-MODE (0) / STANDARD-POWER (1) value\n");
++		return -1;
++	}
++	res = sprintf_s(cmd, sizeof(cmd), "SET_POWER_MODE %s", argv[0]);
++
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return mxl_wpa_ctrl_command(ctrl, cmd);
++}
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index 712ca81d5..7c63859e6 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -52,6 +52,10 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ 	  "<snrAuthHWM=x> <snrAuthLWM=x>]" },						\
+ 	{ "get_sta_softblock", mxl_hostapd_cli_cmd_get_sta_softblock, NULL,		\
+ 	  "<bss> <addr>" },								\
++	{ "get_power_mode", mxl_hostapd_cli_cmd_get_power_mode, NULL, \
++	  " get power_mode" }, \
++	{ "set_power_mode", mxl_hostapd_cli_cmd_set_power_mode, NULL, \
++	  " set power_mode value" }, \
+ 	{ "req_beacon", mxl_hostapd_cli_cmd_req_beacon, NULL, \
+ 	  "= send beacon request" }, \
+ 	{ "report_beacon", mxl_hostapd_cli_cmd_report_beacon, NULL, \
+@@ -93,6 +97,8 @@ int mxl_hostapd_cli_cmd_get_zwdfs_antenna(struct wpa_ctrl *ctrl, int argc, char
+ int mxl_hostapd_cli_cmd_sta_softblock(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_get_sta_softblock(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_reset_acs_state(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_get_power_mode(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++int mxl_hostapd_cli_cmd_set_power_mode(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_req_beacon(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_report_beacon(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_req_self_beacon(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index faed9c5fe..ebfe71ef9 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -2192,6 +2192,10 @@ static int hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface,
+ 		return 0;
+ 	iface->current_mode = mode;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	return mxl_hostapd_no_ir_channel_list_updated(iface);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	if (iface->state == HAPD_IFACE_ENABLED) {
+ 		if (!all_no_ir) {
+ 			struct hostapd_channel_data *chan;
+@@ -2298,6 +2302,14 @@ static int send_initial_params_to_driver (struct hostapd_data *hapd, const char
+ 		return -1;
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	if (is_6ghz_op_class(hapd->iconf->op_class)) {
++		if (mxl_hostapd_interface_update_power_regd(hapd, hapd->iface->conf->he_6ghz_reg_pwr_type) < 0) {
++			wpa_printf(MSG_WARNING, "Set 6GHz power mode failed");
++			return -1;
++		}
++	}
++#endif
+ 	return 0;
+ }
+ 
+@@ -2397,9 +2409,17 @@ void hostapd_channel_list_updated(struct hostapd_iface *iface, struct channel_li
+ 	if (!iface->wait_channel_update || info->initiator != REGDOM_SET_BY_USER)
+ 		return;
+ 
++#ifdef CONFIG_VENDOR_MXL
++	eloop_cancel_timeout(channel_list_update_timeout, iface, NULL);
++	if (!is_6ghz_op_class(iface->conf->op_class)) {
++		wpa_printf(MSG_ERROR, "Channel list updated - continue setup");
++		setup_interface2(iface);
++	}
++#else /* CONFIG_VENDOR_MXL */
+ 	wpa_printf(MSG_DEBUG, "Channel list updated - continue setup");
+ 	eloop_cancel_timeout(channel_list_update_timeout, iface, NULL);
+ 	setup_interface2(iface);
++#endif /* CONFIG_VENDOR_MXL */
+ }
+ 
+ 
+@@ -2488,7 +2508,16 @@ static int setup_interface(struct hostapd_iface *iface)
+ 		}
+ 
+ 		if (send_initial_params_to_driver(hapd, country))
+-			return -1;
++			return 0;
++
++#ifdef CONFIG_VENDOR_MXL
++		/*
++		 * Driver updates channel list for 6GHz interface.
++		 * Interface setup will resume after the list updation
++		 */
++		if (is_6ghz_op_class(hapd->iconf->op_class))
++			return 0;
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 		if (os_strncmp(previous_country, country, 2) != 0) {
+ 			wpa_printf(MSG_DEBUG, "Continue interface setup after channel list update");
+@@ -5958,3 +5987,7 @@ void hostapd_unconnected_sta_scan_fail_handle_cb (void *eloop_ctx, void *timeout
+ 	wpa_printf(MSG_ERROR,"Unconnected sta: Failed to get response, reverting scan state");
+ 	hapd->iface->in_unconnected_sta_scan = 0;
+ }
++
++#ifdef CONFIG_VENDOR_MXL
++int mxl_setup_interface2(struct hostapd_iface *iface) { return setup_interface2(iface); }
++#endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/mxl_config.h b/src/ap/mxl_config.h
+index 0725a4f0f..a6bfb5abe 100644
+--- a/src/ap/mxl_config.h
++++ b/src/ap/mxl_config.h
+@@ -346,4 +346,7 @@ void mxl_hostapd_config_free_bss(struct hostapd_bss_config *bss);
+ 
+ #define MAX_EVENT_CACHE_INTERVAL 3600
+ 
++#define POWER_MODE_MIN 0
++#define POWER_MODE_MAX 1
++
+ #endif /* MXL_CONFIG_H */
+diff --git a/src/ap/mxl_events.c b/src/ap/mxl_events.c
+index 184940b1f..2486a8bef 100644
+--- a/src/ap/mxl_events.c
++++ b/src/ap/mxl_events.c
+@@ -25,6 +25,7 @@ enum mxl_event_type {
+ 	EVENT_MXL_SOFTBLOCK_DROP,
+ 	EVENT_MXL_WDS_CONNECT,
+ 	EVENT_MXL_WDS_DISCONNECT,
++	EVENT_MXL_REGDB_UPDATE,
+ };
+ 
+ union mxl_event_data {
+@@ -55,6 +56,7 @@ union mxl_event_data {
+ 		size_t data_len;
+ 	} wds_sta_info_data;
+ 
++	struct mxl_update_power_reg_info regdb_status;
+ };
+ 
+ static const char * mxl_event_to_string(enum mxl_event_type event)
+@@ -67,6 +69,7 @@ static const char * mxl_event_to_string(enum mxl_event_type event)
+ 	E2S(MXL_SOFTBLOCK_DROP);
+ 	E2S(MXL_WDS_CONNECT);
+ 	E2S(MXL_WDS_DISCONNECT);
++	E2S(MXL_REGDB_UPDATE);
+ 	}
+ 
+ 	return "UNKNOWN";
+@@ -147,6 +150,27 @@ static void mxl_event_ltq_softblock_drop(struct hostapd_data *hapd, const u8 *da
+ 	mxl_hostapd_event_softblock_drop(hapd, msg_dropped);
+ }
+ 
++static int mxl_hostapd_event_6ghz_regdb_update_info(struct hostapd_data *hapd, u8 flags, u8 cur_pwr_mode)
++{
++        /*
++         * The AFC Update information indicates the current power mode and server query status of the driver.
++         * Successful queries result in AFC_UPDATE_STATUS_SERVER, while unsuccessful one lead to
++         * AFC_UPDATE_STATUS_DEFAULT. The default status involves marking all 6GHz channels as NO-IR, thereby
++         * stopping transmission. Hostap utilizes this information for future decision-making
++         * For example, if the AP is in LPI due to fallback, AFC_UPDATE_STATUS_SERVER can trigger a switch to
++         * SP mode; otherwise, it remains in LPI mode.
++         */
++	wpa_printf(MSG_INFO,"%s: Reg Update event received, Configured_mode: %s, Current op_power_mode: %s",
++		   hapd->iface->conf ? hapd->iface->conf->bss[0]->iface : "N/A",
++		   mxl_he_6ghz_pwr_mode_text(hapd->iface->conf->he_6ghz_reg_pwr_type),
++		   mxl_he_6ghz_pwr_mode_text(hapd->iface->mxl_iface.he_6ghz_reg_pwr_mode));
++
++	if (hapd->iface->conf->he_6ghz_reg_pwr_type == HE_6GHZ_STANDARD_POWER_AP)
++		mxl_hostapd_interface_update_power_regd(hapd, HE_6GHZ_STANDARD_POWER_AP);
++
++	return 0;
++}
++
+ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 			  union mxl_event_data *data)
+ {
+@@ -177,6 +201,11 @@ static void mxl_process_event(void *ctx, enum mxl_event_type event,
+ 	case EVENT_MXL_WDS_DISCONNECT:
+ 		mxl_wds_event_disconnect(hapd, data->wds_sta_info_data.data, data->wds_sta_info_data.data_len);
+ 		break;
++	case EVENT_MXL_REGDB_UPDATE:
++		mxl_hostapd_event_6ghz_regdb_update_info(hapd,
++						     data->regdb_status.flags,
++						     data->regdb_status.curr_power_mode);
++		break;
+ 	default:
+ 		wpa_printf(MSG_ERROR, "Unknown MXL event %d", event);
+ 		break;
+@@ -237,3 +266,12 @@ void mxl_drv_event_wds_disconnect(void *ctx, const u8 *data, size_t data_len)
+ 	event.wds_sta_info_data.data_len = data_len;
+ 	mxl_process_event(ctx, EVENT_MXL_WDS_DISCONNECT, &event);
+ }
++
++void mxl_drv_event_regdb_update(void *ctx, const u8 *data, size_t data_len)
++{
++	union mxl_event_data event;
++	os_memset(&event, 0, sizeof(event));
++	memcpy_s(&event.regdb_status, sizeof(event.regdb_status), data, data_len);
++	mxl_process_event(ctx, EVENT_MXL_REGDB_UPDATE, &event);
++}
++
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 21a4fa7a6..c25964d32 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -24,6 +24,9 @@
+ #include "ieee802_11.h"
+ #include "mxl_config.h"
+ #include "common/mxl_ieee802_11_defs.h"
++#include "hw_features.h"
++#include "common/hw_features_common.h"
++#include "common/wpa_ctrl.h"
+ 
+ 
+ #define COC_POWER_1x1_STATE 1
+@@ -1996,3 +1999,149 @@ int mxl_hostapd_action_ssi_get(struct hostapd_data *hapd)
+ {
+ 	return hapd->mxl_data.action_ssi_signal;
+ }
++
++const char * mxl_he_6ghz_pwr_mode_text(enum he_6ghz_ap_type pwr_mode)
++{
++	switch (pwr_mode) {
++	case HE_6GHZ_INDOOR_AP:
++		return "LOW-POWER-INDOOR";
++	case HE_6GHZ_STANDARD_POWER_AP:
++		return "STANDARD-POWER";
++	}
++
++	return "UNKNOWN";
++}
++
++void mxl_check_6ghz_power_mode_fallback(void *eloop_data, void *user_ctx)
++{
++	struct hostapd_iface *iface = (struct hostapd_iface *)eloop_data;
++	struct hostapd_data *hapd = iface->bss[0];
++
++	if (iface->state == HAPD_IFACE_NO_IR)
++		mxl_hostapd_interface_update_power_regd(hapd, HE_6GHZ_INDOOR_AP);
++}
++
++int mxl_hostapd_interface_update_power_regd(struct hostapd_data *hapd, int he_6ghz_pwr_mode)
++{
++#define AFC_FALLBACK_TIMER_IN_SEC 60
++	struct mxl_update_power_reg_info mxl_pwr_param;
++        int fallback_timer = AFC_FALLBACK_TIMER_IN_SEC;
++
++	mxl_pwr_param.oper_power_mode = he_6ghz_pwr_mode;
++	hapd->iface->mxl_iface.he_6ghz_reg_pwr_mode = he_6ghz_pwr_mode;
++	wpa_printf(MSG_INFO, "%s: set operating power mode %s",
++		   hapd->iface->conf ? hapd->iface->conf->bss[0]->iface : "N/A",
++		   mxl_he_6ghz_pwr_mode_text(he_6ghz_pwr_mode));
++
++	if (eloop_is_timeout_registered(mxl_check_6ghz_power_mode_fallback, hapd->iface, NULL))
++		eloop_cancel_timeout(mxl_check_6ghz_power_mode_fallback, hapd->iface, NULL);
++
++	if(MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_REG_UPDATE_6GHZ_OPER_POWER_MODE,
++				  (u8*)&mxl_pwr_param, sizeof(mxl_pwr_param))) {
++		fallback_timer = 0;
++		wpa_printf(MSG_ERROR, "Send LTQ_NL80211_VENDOR_SUBCMD_REG_UPDATE_6GHZ_OPER_POWER_MODE failed!!!");
++	}
++
++	if(he_6ghz_pwr_mode == HE_6GHZ_STANDARD_POWER_AP)
++		eloop_register_timeout(fallback_timer, 0, mxl_check_6ghz_power_mode_fallback,
++				       hapd->iface, NULL);
++
++	return 0;
++}
++
++enum hostapd_chan_status acs_init(struct hostapd_iface *iface);
++
++int mxl_hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface)
++{
++	int i, j;
++	/*
++	 *   When a reg change is received, try to activate the ACS by setting conf->channel to zero.
++	 *   Otherwise, before invoking acs_init, conf->channel will be applied as a current operating
++	 *   system if it is allowed in the AFC reg rule. In case of such occurrences, the candidate table
++	 *   will not be updated.
++	 */
++	if (iface->conf->acs) {
++		iface->conf->channel = 0;
++	}
++
++	wpa_printf(MSG_INFO, "hostapd_no_ir_channel_list_updated %d", iface->state);
++	if (iface->state == HAPD_IFACE_ENABLED) {
++		hostapd_set_state(iface, HAPD_IFACE_NO_IR);
++		wpa_msg(iface->bss[0]->msg_ctx, MSG_INFO, AP_EVENT_NO_IR);
++		iface->is_no_ir = true;
++		/* same as hostapd_interface_deinit without deinitializing ctrl-iface */
++		for (j = 0; j < iface->num_bss; j++) {
++			struct hostapd_data *hapd = iface->bss[j];
++			hostapd_drv_stop_ap(hapd);
++			hostapd_bss_deinit_no_free(hapd);
++			hostapd_free_hapd_data(hapd);
++		}
++
++		hostapd_cleanup_iface_partial(iface);
++	}
++
++	if (iface->state == HAPD_IFACE_NO_IR) {
++		bool all_no_ir = true;
++		struct hostapd_hw_modes *mode = NULL;
++		if (hostapd_get_hw_features(iface))
++			return 0;
++
++		for (i = 0; i < iface->num_hw_features; i++) {
++			mode = &iface->hw_features[i];
++			if (mode && (mode->mode == iface->conf->hw_mode)) {
++				if (iface->freq > 0 &&
++				    !hw_mode_get_channel(mode, iface->freq, NULL)) {
++					mode = NULL;
++					continue;
++				}
++
++				for (j = 0; j < mode->num_channels; j++) {
++					if (!(mode->channels[j].flag &
++					    HOSTAPD_CHAN_NO_IR))
++						all_no_ir = false;
++				}
++			}
++		}
++
++		if (!mode)
++			return 0;
++
++		iface->current_mode = mode;
++
++		if (all_no_ir) {
++			wpa_printf(MSG_DEBUG,
++				   "NO_IR: AP in NO_IR and all chan in the new chanlist are NO_IR. Ignore");
++			return 0;
++		}
++
++		if (!iface->conf->acs) {
++			struct hostapd_channel_data *chan;
++
++			chan = hw_get_channel_freq(iface->current_mode->mode,
++						   iface->freq, NULL,
++						   iface->hw_features,
++						   iface->num_hw_features);
++			if (!chan) {
++				wpa_printf(MSG_ERROR,
++					   "NO_IR: Could not derive chan from freq");
++				return 0;
++			}
++
++			/* If the last operating channel is NO_IR, trigger ACS.
++			 */
++			if (chan->flag & HOSTAPD_CHAN_NO_IR) {
++				iface->freq = 0;
++				iface->conf->channel = 0;
++				if (acs_init(iface) != HOSTAPD_CHAN_ACS)
++					wpa_printf(MSG_ERROR,
++						   "NO_IR: Could not start ACS");
++				return 0;
++			}
++		} else {
++			iface->freq = 0;
++			iface->conf->channel = 0;
++		}
++	}
++	mxl_setup_interface2(iface);
++	return 0;
++}
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 2f94329cd..bfd8ea279 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -76,6 +76,7 @@ struct mxl_hostapd_iface {
+ 	int snr_db_current_frame; /* SNR value for the currently processed frame */
+ 	unsigned int self_beacon_req:1;
+ 	struct beacon_request last_beacon_req;
++	int he_6ghz_reg_pwr_mode;
+ };
+ 
+ #define MAX_EVENT_MSG_LEN			512
+@@ -161,5 +162,9 @@ void mxl_hostapd_interface_deinit(struct hostapd_iface *iface);
+ void mxl_hostapd_alloc_bss_data(struct hostapd_data *hapd);
+ void mxl_hostapd_action_ssi_set(struct hostapd_data *hapd, int action_ssi);
+ int mxl_hostapd_action_ssi_get(struct hostapd_data *hapd);
++int mxl_hostapd_interface_update_power_regd(struct hostapd_data *hapd, int he_6ghz_pwr_mode);
++const char * mxl_he_6ghz_pwr_mode_text(enum he_6ghz_ap_type pwr_mode);
++int mxl_hostapd_no_ir_channel_list_updated(struct hostapd_iface *iface);
++int mxl_setup_interface2(struct hostapd_iface *iface);
+ 
+ #endif /* MXL_HOSTAPD_H */
+diff --git a/src/common/mxl_vendor.h b/src/common/mxl_vendor.h
+index 921676509..670acca98 100644
+--- a/src/common/mxl_vendor.h
++++ b/src/common/mxl_vendor.h
+@@ -46,5 +46,6 @@ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_coc)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_softblock_drop)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_wds_connect)
+ MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_wds_disconnect)
++MXL_EXPORT_HOSTAPD_EVENT_API(mxl_drv_event_regdb_update)
+ 
+ #endif /* MXL_VENDOR_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index 8679c5edb..4b34123f8 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -408,6 +408,9 @@ enum ltq_nl80211_vendor_subcmds {
+   LTQ_NL80211_VENDOR_SUBCMD_GET_ML_LINKSWITCH_STATS,
+   LTQ_NL80211_VENDOR_SUBCMD_SET_ML_LINKSWITCH_STATS,
+   LTQ_NL80211_VENDOR_SUBCMD_SET_DYNAMIC_EDCA,
++  LTQ_NL80211_VENDOR_SUBCMD_SET_STR_TID_LINK_SPREADING,
++  LTQ_NL80211_VENDOR_SUBCMD_REG_UPDATE_6GHZ_OPER_POWER_MODE,
++  LTQ_NL80211_VENDOR_SUBCMD_UPDATE_AFC_INFO,
+   /* add new iw sub commands here */
+ 
+   /* used to define LTQ_NL80211_VENDOR_SUBCMD_MAX below */
+@@ -433,6 +436,7 @@ enum ltq_nl80211_vendor_events {
+   LTQ_NL80211_VENDOR_EVENT_COC_BEACON_UPDATE   = 14,
+   LTQ_NL80211_VENDOR_EVENT_WHM                 = 15,
+   LTQ_NL80211_VENDOR_EVENT_CSI_STATS           = 16,
++  LTQ_NL80211_VENDOR_EVENT_REGDB_INFO_UPDATE   = 18,
+ };
+ 
+ 
+@@ -759,4 +763,21 @@ struct intel_vendor_whm_event_cfg {
+   u32               num_cards;
+ } __attribute__ ((packed));
+ 
++enum {
++  AFC_UPDATE_STATUS_DEFAULT = 0,
++  AFC_UPDATE_STATUS_SERVER,
++};
++
++/* Data for CMD_REG_UPDATE_6GHZ_OPER_POWER_MODE and EVENT_MXL_REGDB_UPDATE */
++struct mxl_update_power_reg_info {
++  u8 flags;
++  u8 oper_power_mode;
++  u8 curr_power_mode;
++} __attribute__ ((packed));
++
++typedef struct wave_radio_reg_data {
++  const struct ieee80211_regdomain *regd;
++  u8 flags;
++} wave_radio_reg_data_t;
++
+ #endif /* _VENDOR_CMDS_H_ */
+diff --git a/src/drivers/driver_nl80211_event.c b/src/drivers/driver_nl80211_event.c
+index b9cc900ea..d43c4442d 100644
+--- a/src/drivers/driver_nl80211_event.c
++++ b/src/drivers/driver_nl80211_event.c
+@@ -3284,6 +3284,12 @@ static void mxl_nl80211_handle_wds_disconnect (struct wpa_driver_nl80211_data *d
+ 	mxl_drv_event_wds_disconnect(drv->ctx, data, len);
+ }
+ 
++static void mxl_nl80211_handle_regdb_update(struct wpa_driver_nl80211_data *drv, const u8 *data, size_t len)
++{
++	wpa_printf(MSG_INFO, "nl80211: Receive MXL vendor event: regdb update, ctx=%p", drv->ctx);
++	mxl_drv_event_regdb_update(drv->ctx, data, len);
++}
++
+ static void mxl_nl80211_handle_softblock_drop(struct wpa_driver_nl80211_data *drv,
+ 				const u8 *data, size_t len)
+ {
+@@ -3362,6 +3368,9 @@ static void nl80211_vendor_event_mxl(struct wpa_driver_nl80211_data *drv,
+ 		case LTQ_NL80211_VENDOR_EVENT_WDS_DISCONNECT:
+ 			mxl_nl80211_handle_wds_disconnect(drv, data, len);
+ 			break;
++		case LTQ_NL80211_VENDOR_EVENT_REGDB_INFO_UPDATE:
++			mxl_nl80211_handle_regdb_update(drv, data, len);
++			break;
+ 		default:
+ 			wpa_printf(MSG_DEBUG, "nl80211: Ignore unsupported MXL vendor event %u", subcmd);
+ 			break;
+-- 
+2.43.0
+

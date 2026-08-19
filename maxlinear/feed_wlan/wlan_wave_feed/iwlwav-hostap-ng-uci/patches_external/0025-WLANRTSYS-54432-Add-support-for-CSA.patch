@@ -1,0 +1,829 @@
+From 049faf02ecd93458a0bb9d8b0343c5311390f912 Mon Sep 17 00:00:00 2001
+From: mvuls <mvuls@maxlinear.com>
+Date: Wed, 1 Nov 2023 14:39:32 +0200
+Subject: [PATCH] WLANRTSYS-54432: Add support for CSA
+
+---
+ hostapd/ctrl_iface.c              |  81 +++++++++++
+ src/ap/dfs.c                      |   5 +
+ src/ap/drv_callbacks.c            |  55 ++++----
+ src/ap/hostapd.c                  | 124 +++++++++++++++++
+ src/ap/hostapd.h                  |   3 +
+ src/ap/mxl_hostapd.c              |  32 ++++-
+ src/ap/mxl_hostapd.h              |   1 +
+ src/ap/mxl_sub_band_dfs.c         |   3 +
+ src/ap/mxl_zwdfs.c                |   2 +
+ src/ap/wpa_auth.c                 | 223 ++++++++++++++++++++++++++++++
+ src/ap/wpa_auth.h                 |  11 ++
+ src/ap/wpa_auth_i.h               |   5 +
+ src/common/vendor_cmds_copy.h     |  19 +++
+ src/drivers/driver_nl80211_capa.c |   1 -
+ 14 files changed, 539 insertions(+), 26 deletions(-)
+
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 84650be23..b7eabb5a3 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -2409,6 +2409,10 @@ static int hostapd_ctrl_check_freq_params(struct hostapd_freq_params *params,
+ 		}
+ 	}
+ 
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_update_freq_params_sec_offs(params);
++#endif /* CONFIG_VENDOR_MXL */
++
+ 	switch (params->bandwidth) {
+ 	case 0:
+ 		/* bandwidth not specified: use 20 MHz by default */
+@@ -2703,6 +2707,8 @@ static int hostapd_ctrl_iface_chan_switch(struct hostapd_iface *iface,
+ 		return 0;
+ 	}
+ 
++	hostapd_prepare_and_send_csa_deauth_cfg_to_driver(iface->bss[0]);
++
+ 	for (i = 0; i < iface->num_bss; i++) {
+ 
+ 		/* Save CHAN_SWITCH VHT, HE, and EHT config */
+@@ -4769,6 +4775,75 @@ static int hostapd_ctrl_iface_is_transmitted_bssid(struct hostapd_data *hapd, ch
+ 	return ret;
+ }
+ 
++static int hostapd_ctrl_iface_set_csa_deauth(struct hostapd_data *hapd,
++					  char *pos)
++{
++	int ret;
++	char *str, *pos2;
++
++	hapd = mxl_get_bss_index(pos, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++				"CTRL: SET_CSA_DEAUTH - there is no iface with the given name");
++		return -1;
++	}
++
++	str = os_strstr(pos, "mode=");
++	if (str) {
++		str += sizeof("mode=") - 1;
++
++		hapd->csa_deauth_mode = strtol(str, &pos2, 10);
++		if (str == pos2 || hapd->csa_deauth_mode > CSA_DEAUTH_MODE_BROADCAST) {
++			wpa_printf(MSG_ERROR, "csa deauth: invalid mode value provided");
++			return -1;
++		}
++	}
++	str = os_strstr(pos, "tx_time=");
++	if (str) {
++		ret = sscanf(str, "tx_time=%hu,%hu", &hapd->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_UC_IDX],
++				&hapd->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_MC_IDX]);
++		if (ret == 1) {
++			wpa_printf(MSG_INFO, "csa deauth: tx_time input format is not correct");
++			return 0;
++		}
++		if (ret == 0) {
++			wpa_printf(MSG_INFO, "csa deauth: tx_time not configured, will be using defaults");
++			return 0;
++		}
++		if (hapd->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_UC_IDX] < hapd->iconf->beacon_int ||
++			hapd->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_MC_IDX] < hapd->iconf->beacon_int) {
++			/* TODO how to identify max value */
++			wpa_printf(MSG_ERROR, "csa deauth: tx time value can't be less than beacon interval");
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static int hostapd_ctrl_iface_get_csa_deauth (struct hostapd_data *hapd, const char *cmd,
++	char *buf, size_t buflen)
++{
++	int ret, len = 0;
++
++	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	if (hapd == NULL) {
++		ret = sprintf_s(buf, buflen, "CTRL: GET_CSA_DEAUTH - there is no iface with the given name\n");
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			return 0;
++		}
++		return ret;
++	}
++
++	ret = sprintf_s(buf + len, buflen - len, "mode=%d unicast_tx_time=%d multicast_tx_time=%d\n",
++		hapd->csa_deauth_mode, hapd->csa_deauth_tx_time[0], hapd->csa_deauth_tx_time[1]);
++	if (ret <= 0)
++		return len;
++	len += ret;
++
++	return len;
++}
++
+ static int hostapd_ctrl_iface_get_hidden_mode(struct hostapd_data *hapd, char *reply, size_t reply_size)
+ {
+ 	int ret = 0;
+@@ -5394,6 +5469,12 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		reply_len = hostapd_ctrl_iface_is_transmitted_bssid(hapd,reply,reply_size);
+ 	} else if (os_strncmp(buf, "GET_HIDDEN_MODE", 15) == 0) {
+ 		reply_len = hostapd_ctrl_iface_get_hidden_mode(hapd,reply,reply_size);
++	} else if (os_strncmp(buf, "SET_CSA_DEAUTH ", sizeof("SET_CSA_DEAUTH ") - 1) == 0) {
++		if (hostapd_ctrl_iface_set_csa_deauth(hapd, buf + sizeof("SET_CSA_DEAUTH ") - 1))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "GET_CSA_DEAUTH ", sizeof("GET_CSA_DEAUTH ") - 1) == 0) {
++		reply_len = hostapd_ctrl_iface_get_csa_deauth(hapd, buf + sizeof("GET_CSA_DEAUTH ") - 1,
++			reply, reply_size);
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/src/ap/dfs.c b/src/ap/dfs.c
+index 716b4c3e4..25982214d 100644
+--- a/src/ap/dfs.c
++++ b/src/ap/dfs.c
+@@ -1031,6 +1031,10 @@ static int hostapd_dfs_request_channel_switch(struct hostapd_iface *iface,
+ #ifdef CONFIG_VENDOR_MXL
+ 	(void)mxl_hostapd_drv_set_antenna(iface, 0, 0);
+ #endif /* CONFIG_VENDOR_MXL */
++	hostapd_prepare_and_send_csa_deauth_cfg_to_driver(iface->bss[0]);
++
++	mxl_hostapd_channel_switch_reason_set(iface, HAPD_CHAN_SWITCH_RADAR_DETECTED);
++
+ 	for (i = 0; i < iface->num_bss; i++) {
+ 		err = hostapd_switch_channel(iface->bss[i], &csa_settings);
+ 		if (err)
+@@ -1330,6 +1334,7 @@ static int hostapd_dfs_start_channel_switch_cac(struct hostapd_iface *iface)
+ 					     oper_centr_freq_seg1_idx);
+ 	err = 0;
+ 
++	mxl_hostapd_channel_switch_reason_set(iface, HAPD_CHAN_SWITCH_RADAR_DETECTED);
+ 	hostapd_setup_interface_complete(iface, err);
+ 	return err;
+ }
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index 497bcb501..768c375ab 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -1020,6 +1020,23 @@ void hostapd_event_sta_opmode_changed(struct hostapd_data *hapd, const u8 *addr,
+ 	}
+ }
+ 
++static char *width2str(int width)
++{
++	switch(width) {
++	case CHAN_WIDTH_80:
++		return "80";
++	case CHAN_WIDTH_80P80:
++		return "80+80";
++	case CHAN_WIDTH_160:
++		return "160";
++	case CHAN_WIDTH_20_NOHT:
++	case CHAN_WIDTH_20:
++		return "20";
++	case CHAN_WIDTH_40:
++	default:
++		return "40";
++	}
++}
+ 
+ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 			     int offset, int width, int cf1, int cf2,
+@@ -1194,30 +1211,20 @@ void hostapd_event_ch_switch(struct hostapd_data *hapd, int freq, int ht,
+ 	if (!finished)
+ 		return;
+ 
+-	if (hapd->csa_in_progress &&
+-	    freq == hapd->cs_freq_params.freq) {
+-		hostapd_cleanup_cs_params(hapd);
+-		ieee802_11_set_beacon(hapd);
+-
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_CSA_FINISHED
+-			"freq=%d dfs=%d", freq, is_dfs);
+-	} else if (hapd->iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD) {
+-		/* Complete AP configuration for the first bring up. */
+-		if (is_dfs0 > 0 &&
+-		    hostapd_is_dfs_required(hapd->iface) <= 0 &&
+-		    hapd->iface->state != HAPD_IFACE_ENABLED) {
+-			/* Fake a CAC start bit to skip setting channel */
+-			hapd->iface->cac_started = 1;
+-			hostapd_setup_interface_complete(hapd->iface, 0);
+-		}
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_CSA_FINISHED
+-			"freq=%d dfs=%d", freq, is_dfs);
+-	} else if (is_dfs &&
+-		   hostapd_is_dfs_required(hapd->iface) &&
+-		   !hostapd_is_dfs_chan_available(hapd->iface) &&
+-		   !hapd->iface->cac_started) {
+-		hostapd_disable_iface(hapd->iface);
+-		hostapd_enable_iface(hapd->iface);
++	if ((hapd->csa_in_progress && freq == hapd->cs_freq_params.freq) ||
++		(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_DFS_OFFLOAD)) {
++
++		if (hapd->csa_in_progress && freq == hapd->cs_freq_params.freq)
++			hostapd_cleanup_cs_params(hapd);
++
++		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_CSA_FINISHED "freq=%d Channel=%d "
++				"OperatingChannelBandwidt=%s ExtensionChannel=%d cf1=%d "
++				"cf2=%d reason=%s dfs_chan=%d",
++				freq, channel, width2str(width), offset, cf1, cf2,
++				mxl_hostapd_channel_switch_text(hapd->mxl_data.chan_switch_reason),
++				is_dfs);
++
++		hapd->mxl_data.chan_switch_reason = HAPD_CHAN_SWITCH_OTHER;
+ 	}
+ 
+ 	for (i = 0; i < hapd->iface->num_bss; i++)
+diff --git a/src/ap/hostapd.c b/src/ap/hostapd.c
+index 30bc7302d..c3776de12 100644
+--- a/src/ap/hostapd.c
++++ b/src/ap/hostapd.c
+@@ -59,6 +59,7 @@
+ #ifdef CONFIG_VENDOR_MXL
+ #include "mxl_hostapd.h"
+ #endif /* CONFIG_VENDOR_MXL */
++#include "drivers/driver_nl80211.h"
+ 
+ 
+ static int hostapd_flush_old_stations(struct hostapd_data *hapd, u16 reason);
+@@ -2140,6 +2141,9 @@ static int configured_fixed_chan_to_freq(struct hostapd_iface *iface)
+ 
+ 	if (!iface->conf->channel)
+ 		return 0;
++	if (iface->conf->channel == FIRST_NON_DFS_CHAN)
++		return 0;
++
+ 	if (iface->conf->op_class) {
+ 		freq = ieee80211_chan_to_freq(NULL, iface->conf->op_class,
+ 					      iface->conf->channel);
+@@ -2527,6 +2531,109 @@ static void hostapd_interface_setup_failure_handler(void *eloop_ctx,
+ }
+ 
+ 
++static void hostapd_prepare_csa_deauth_frame(struct hostapd_data *hapd, u8 *mgmt_frame_buf, u8 *mgmt_frame_buf_len)
++{
++	errno_t err;
++	size_t len = INTEL_NON_PROTECTED_DEAUTH_FRAME_LEN, plen = len;
++	struct ieee80211_mgmt mgmt;
++#ifdef BIP_PROTECTION_WORKING
++	u8 *mgmt_frame_buf_t = NULL;
++#endif
++
++	memset(&mgmt, 0, sizeof(struct ieee80211_mgmt));
++	mgmt.frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT, WLAN_FC_STYPE_DEAUTH);
++	os_memset(mgmt.da, 0xff, ETH_ALEN);
++	err = memcpy_s(mgmt.sa, sizeof(mgmt.sa), hapd->own_addr, sizeof(hapd->own_addr));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return;
++	}
++	err = memcpy_s(mgmt.bssid, sizeof(mgmt.bssid), hapd->own_addr, sizeof(hapd->own_addr));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		return;
++	}
++	mgmt.u.deauth.reason_code = host_to_le16(WLAN_REASON_UNSPECIFIED);
++
++	if (hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
++#ifdef BIP_PROTECTION_WORKING
++		/* TODO invoke bip_protect or bip_protect_* on mgmt frame based on group_mgmt_cipher */
++		mgmt_frame_buf_t = bip_protect(hapd->wpa_auth, (u8 *)&mgmt, len, &plen);
++		err = memcpy_s(mgmt_frame_buf, INTEL_MAX_PROTECTED_DEAUTH_FRAME_LEN, mgmt_frame_buf_t, plen);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return;
++		}
++#else
++		err = memcpy_s(mgmt_frame_buf, INTEL_MAX_PROTECTED_DEAUTH_FRAME_LEN, &mgmt, plen);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return;
++		}
++#endif
++	}
++	else
++	{
++		err = memcpy_s(mgmt_frame_buf, INTEL_MAX_PROTECTED_DEAUTH_FRAME_LEN, &mgmt, plen);
++		if (EOK != err) {
++			wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++			return;
++		}
++	}
++	*mgmt_frame_buf_len = (u8)plen;
++}
++
++void hostapd_prepare_and_send_csa_deauth_cfg_to_driver(struct hostapd_data *hapd)
++{
++	struct hostapd_iface *iface = hapd->iface;
++	struct intel_vendor_channel_switch_cfg cs_vendor_cfg;
++	int i;
++
++	for (i = 1; i < iface->num_bss; i++) { /* skip master dummy vap (index 0) */
++		if (iface->bss[i]->conf->start_disabled) {
++			wpa_printf(MSG_DEBUG, "Skip csa deauth cfg to driver due to inteface disabled for %s",
++						iface->bss[i]->conf->iface);
++			continue;
++		}
++		os_memset(&cs_vendor_cfg, 0, sizeof(cs_vendor_cfg));
++		switch (iface->bss[i]->csa_deauth_mode) {
++			case CSA_DEAUTH_MODE_DISABLED:
++				cs_vendor_cfg.csaDeauthMode = iface->bss[i]->csa_deauth_mode;
++				break;
++			case CSA_DEAUTH_MODE_BROADCAST:
++				hostapd_prepare_csa_deauth_frame(iface->bss[i], cs_vendor_cfg.csaDeauthFrames,
++					&cs_vendor_cfg.csaMcDeauthFrameLength); /* TODO replace i in second param with VAP idx equivalent */
++				/* fall thru */
++			case CSA_DEAUTH_MODE_UNICAST:
++				cs_vendor_cfg.csaDeauthMode = iface->bss[i]->csa_deauth_mode;
++				if (cs_vendor_cfg.csaDeauthTxTime[INTEL_CSA_DEAUTH_TX_TIME_UC_IDX] == 0 &&
++					iface->bss[i]->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_UC_IDX] != 0) {
++					cs_vendor_cfg.csaDeauthTxTime[INTEL_CSA_DEAUTH_TX_TIME_UC_IDX] =
++						iface->bss[i]->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_UC_IDX];
++				}
++				if (cs_vendor_cfg.csaDeauthTxTime[INTEL_CSA_DEAUTH_TX_TIME_MC_IDX] == 0 &&
++					iface->bss[i]->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_MC_IDX] != 0) {
++					cs_vendor_cfg.csaDeauthTxTime[INTEL_CSA_DEAUTH_TX_TIME_MC_IDX] =
++						iface->bss[i]->csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_MC_IDX];
++				}
++				break;
++			default: /* unreachable code */
++				hostapd_logger(iface->bss[i], NULL, HOSTAPD_MODULE_IEEE80211,
++							HOSTAPD_LEVEL_INFO, "invalid csa deauth mode [%d]",
++							iface->bss[i]->csa_deauth_mode);
++				break;
++		}
++		if (hostapd_drv_vendor_cmd(iface->bss[i], OUI_LTQ, LTQ_NL80211_VENDOR_SUBCMD_CHANNEL_SWITCH_DEAUTH_CFG,
++							(const u8*)&cs_vendor_cfg, sizeof(cs_vendor_cfg),
++							NESTED_ATTR_NOT_USED, NULL)) {
++			wpa_printf(MSG_ERROR, "Failed to send driver vendor command LTQ_NL80211_VENDOR_SUBCMD_CHANNEL_SWITCH_DEAUTH_CFG for %s",
++						iface->bss[i]->conf->iface);
++		}
++	}
++
++	return;
++}
++
+ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 						 int err)
+ {
+@@ -2649,6 +2756,7 @@ static int hostapd_setup_interface_complete_sync(struct hostapd_iface *iface,
+ 			}
+ 
+ 			settings.cs_count = mxl_hostapd_get_cs_count(iface);
++			hostapd_prepare_and_send_csa_deauth_cfg_to_driver(iface->bss[0]);
+ 
+ 			for (j = 0; j < iface->num_bss; j++) {
+ 				hapd = iface->bss[j];
+@@ -4342,12 +4450,28 @@ int hostapd_switch_channel(struct hostapd_data *hapd,
+ 			   struct csa_settings *settings)
+ {
+ 	int ret;
++	struct i802_bss *bss;
+ 
+ 	if (!(hapd->iface->drv_flags & WPA_DRIVER_FLAGS_AP_CSA)) {
+ 		wpa_printf(MSG_INFO, "CSA is not supported");
+ 		return -1;
+ 	}
+ 
++	if (!hapd->drv_priv) {
++		wpa_printf(MSG_ERROR, "Interface is disabled");
++		return -1;
++	}
++	/* We should just update the bss freq and return
++	* for the disbaled interface here later once
++	* we enable the interface we pick the frequency
++	* to send a management frames
++	* */
++	if (hapd->conf->start_disabled) {
++		bss = hapd->drv_priv;
++		bss->flink->freq = settings->freq_params.freq;
++		return 0;
++	}
++
+ 	ret = hostapd_fill_csa_settings(hapd, settings);
+ 	if (ret)
+ 		return ret;
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 02a79f7af..62f48972b 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -489,6 +489,8 @@ struct hostapd_data {
+ #ifdef CONFIG_VENDOR_MXL
+ 	struct mxl_hostapd_data mxl_data;
+ #endif /* CONFIG_VENDOR_MXL */
++	u8 csa_deauth_mode;
++	u16 csa_deauth_tx_time[INTEL_CSA_DEAUTH_TX_TIME_ARR_SIZE];
+ };
+ 
+ 
+@@ -728,6 +730,7 @@ void hostapd_channel_list_updated(struct hostapd_iface *iface, int initiator);
+ void hostapd_set_state(struct hostapd_iface *iface, enum hostapd_iface_state s);
+ const char * hostapd_state_text(enum hostapd_iface_state s);
+ int hostapd_csa_in_progress(struct hostapd_iface *iface);
++void hostapd_prepare_and_send_csa_deauth_cfg_to_driver(struct hostapd_data *hapd);
+ void hostapd_chan_switch_config(struct hostapd_data *hapd,
+ 				struct hostapd_freq_params *freq_params);
+ int hostapd_switch_channel(struct hostapd_data *hapd,
+diff --git a/src/ap/mxl_hostapd.c b/src/ap/mxl_hostapd.c
+index 651face30..7388adae1 100644
+--- a/src/ap/mxl_hostapd.c
++++ b/src/ap/mxl_hostapd.c
+@@ -391,7 +391,7 @@ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface)
+ 
+ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx)
+ {
+-	if (bandwidth == 20)
++	if (bandwidth <= 20)
+ 		return 0;
+ 
+ 	while (bandwidth > 40)
+@@ -410,6 +410,36 @@ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx)
+ 		return -1;
+ }
+ 
++static int mxl_hostapd_get_sec_offs_by_freq(int primary_freq, int bandwidth, int center_freq)
++{
++	if (bandwidth <= 20)
++		return 0;
++
++	while (bandwidth > 40)
++	{
++		if (center_freq > primary_freq)
++			center_freq -= bandwidth / 4;
++		else
++			center_freq += bandwidth / 4;
++
++		bandwidth /= 2;
++	}
++
++	if (center_freq > primary_freq)
++		return 1;
++	else
++		return -1;
++}
++
++void mxl_hostapd_update_freq_params_sec_offs(struct hostapd_freq_params *params)
++{
++	/* Try to calculate sec_channel_offset if necessary */
++	if (params->center_freq1 && !params->sec_channel_offset) {
++		params->sec_channel_offset = mxl_hostapd_get_sec_offs_by_freq(params->freq, params->bandwidth, params->center_freq1);
++		wpa_printf(MSG_DEBUG, "freq_params: updated sec_channel_offset = %d", params->sec_channel_offset);
++	}
++}
++
+ enum oper_chan_width mxl_get_oper_width(int width)
+ {
+ 	switch (width) {
+diff --git a/src/ap/mxl_hostapd.h b/src/ap/mxl_hostapd.h
+index 8570b4232..92e7088a9 100644
+--- a/src/ap/mxl_hostapd.h
++++ b/src/ap/mxl_hostapd.h
+@@ -146,6 +146,7 @@ int mxl_hostapd_setup_bss_post(struct hostapd_data *hapd);
+ void mxl_hostapd_driver_init(struct hostapd_iface *iface, struct wpa_init_params *params);
+ void mxl_hostapd_setup_interface_pre(struct hostapd_iface *iface);
+ int mxl_hostapd_get_secondary_offset(int primary, int bandwidth, int center_idx);
++void mxl_hostapd_update_freq_params_sec_offs(struct hostapd_freq_params *params);
+ struct hostapd_channel_data * mxl_hostapd_get_mode_channel(struct hostapd_iface *iface, unsigned int freq);
+ enum oper_chan_width mxl_get_oper_width(int width);
+ struct hostapd_data * mxl_get_hapd_bssid(struct hostapd_iface *iface, const u8 *bssid);
+diff --git a/src/ap/mxl_sub_band_dfs.c b/src/ap/mxl_sub_band_dfs.c
+index 60d15dea5..63d19b6d9 100644
+--- a/src/ap/mxl_sub_band_dfs.c
++++ b/src/ap/mxl_sub_band_dfs.c
+@@ -533,6 +533,9 @@ mxl_hostapd_sub_dfs_switch_chan(struct hostapd_iface *iface, u8 rbm, int chan, i
+ 				      cmode ? &cmode->he_capab[IEEE80211_MODE_AP] : NULL,
+ 				      cmode ? &cmode->eht_capab[IEEE80211_MODE_AP] : NULL);
+ 
++	hostapd_prepare_and_send_csa_deauth_cfg_to_driver(iface->bss[0]);
++
++	mxl_hostapd_channel_switch_reason_set(iface, HAPD_CHAN_SWITCH_RADAR_DETECTED);
+ 	for (i = 0; i < iface->num_bss; i++) {
+ 		err = hostapd_switch_channel(iface->bss[i], &csa_settings);
+ 		if (err)
+diff --git a/src/ap/mxl_zwdfs.c b/src/ap/mxl_zwdfs.c
+index 074feff9f..97d3d46c9 100644
+--- a/src/ap/mxl_zwdfs.c
++++ b/src/ap/mxl_zwdfs.c
+@@ -187,6 +187,8 @@ int mxl_hostapd_zwdfs_switch(struct hostapd_iface *iface, int cac_status,
+ 	if (HOSTAPD_CAC_STAT_SUCCESS != cac_status)
+ 		goto cleanup;
+ 
++	hostapd_prepare_and_send_csa_deauth_cfg_to_driver(csa_iface->bss[0]);
++
+ 	for (i = 0; i < csa_iface->num_bss; i++) {
+ 		hostapd_chan_switch_config(csa_iface->bss[i], &csa_settings->freq_params);
+ 		ret = hostapd_switch_channel(csa_iface->bss[i], csa_settings);
+diff --git a/src/ap/wpa_auth.c b/src/ap/wpa_auth.c
+index bffbc64d9..5ee89c61c 100644
+--- a/src/ap/wpa_auth.c
++++ b/src/ap/wpa_auth.c
+@@ -6703,3 +6703,226 @@ void wpa_auth_set_ml_info(struct wpa_state_machine *sm, const u8 *mld_addr,
+ 	}
+ #endif /* CONFIG_IEEE80211BE */
+ }
++
++/* Group keys set to GTK by default and used as per generic 11W feature design.
++ * So the same is being used to generate MMIE IE here.
++ */
++u8 * bip_protect(struct wpa_authenticator *wpa_auth,
++		u8 *frame, size_t len, size_t *prot_len)
++{
++	errno_t err;
++	const u8 *igtk = wpa_auth->group->IGTK[wpa_auth->group->GN_igtk - 4];
++	size_t igtk_len = wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
++	size_t copied_bytes = 0, copied_prot = 0;
++	size_t buf_size;
++	u8 ipn[WPA_KEY_RSC_LEN] = {0};
++	int keyid = wpa_auth->group->GN;
++	u8 *prot, *pos, *buf;
++	u8 mic[WLAN_MMIE_SUBELEM_MIC2_SIZE];
++	u16 fc;
++	struct ieee80211_hdr *hdr;
++	size_t plen;
++
++	hdr = (struct ieee80211_hdr *) frame;
++	plen = len + (igtk_len == WPA_IGTK_MAX_LEN ? WLAN_MMIE_LENGTH2 : WLAN_MMIE_LENGTH1);
++	prot = os_malloc(plen);
++	if (prot == NULL)
++		return NULL;
++
++	buf_size = plen - (sizeof(hdr->duration_id) + sizeof(hdr->seq_ctrl)); /* skip duration_id and seq_ctrl from frame header */
++	buf = os_malloc(buf_size);
++	if (buf == NULL) {
++		os_free(prot);
++		return NULL;
++	}
++
++	err = memcpy_s(prot, plen, frame, len);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto fail;
++	}
++	pos = prot + len;
++	copied_prot += len;
++	*pos++ = WLAN_EID_MMIE;
++	copied_prot++;
++	*pos++ = (igtk_len == WPA_IGTK_MAX_LEN ? WLAN_MMIE_SUBELEM_LENGTH2_VALUE : WLAN_MMIE_SUBELEM_LENGTH1_VALUE);
++	copied_prot++;
++	WPA_PUT_LE16(pos, keyid);
++	pos += WLAN_MMIE_SUBELEM_KEYID_SIZE;
++	copied_prot += WLAN_MMIE_SUBELEM_KEYID_SIZE;
++	if (wpa_auth_get_seqnum(wpa_auth, NULL, wpa_auth->group->GN_igtk, ipn) < 0) {
++		wpa_printf(MSG_ERROR, "Failed to get seqnum for ipn, using '0's");
++		wpa_auth_logger(wpa_auth, NULL, LOGGER_INFO, "get seqnum for ipn failed, using '0's");
++	}
++	err = memcpy_s(pos, plen - copied_prot, ipn, WLAN_MMIE_SUBELEM_IPN_SIZE);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto fail;
++	}
++	pos += WLAN_MMIE_SUBELEM_IPN_SIZE;
++	copied_prot += WLAN_MMIE_SUBELEM_IPN_SIZE;
++	os_memset(pos, 0, igtk_len == WPA_IGTK_MAX_LEN ? WLAN_MMIE_SUBELEM_MIC2_SIZE : WLAN_MMIE_SUBELEM_MIC1_SIZE); /* MIC */
++
++	/* BIP AAD: FC(masked) A1 A2 A3 */
++	fc = le_to_host16(hdr->frame_control);
++	fc &= ~(WLAN_FC_RETRY | WLAN_FC_PWRMGT | WLAN_FC_MOREDATA);
++	WPA_PUT_LE16(buf, fc);
++	copied_bytes = sizeof(hdr->frame_control);
++	err = memcpy_s(buf + copied_bytes, buf_size - copied_bytes, hdr->addr1, sizeof(hdr->addr1));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto fail;
++	}
++	copied_bytes += sizeof(hdr->addr1);
++	err = memcpy_s(buf + copied_bytes, buf_size - copied_bytes, hdr->addr2, sizeof(hdr->addr2));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto fail;
++	}
++	copied_bytes += sizeof(hdr->addr2);
++	err = memcpy_s(buf + copied_bytes, buf_size - copied_bytes, hdr->addr3, sizeof(hdr->addr3));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto fail;
++	}
++	copied_bytes += sizeof(hdr->addr3);
++	err = memcpy_s(buf + copied_bytes, buf_size - copied_bytes, prot + IEEE80211_HDRLEN, plen - IEEE80211_HDRLEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		goto fail;
++	}
++	wpa_hexdump(MSG_MSGDUMP, "BIP: AAD|Body(masked)", buf, plen + copied_bytes - IEEE80211_HDRLEN);
++	/* MIC = L(AES-128-CMAC(AAD || Frame Body(masked)), 0, 64) */
++	if (omac1_aes_128(igtk, buf, plen + copied_bytes - IEEE80211_HDRLEN, mic) < 0) {
++		goto fail;
++	}
++	os_free(buf);
++
++	err = memcpy_s(pos, plen - copied_prot, mic, igtk_len == WPA_IGTK_MAX_LEN ? WLAN_MMIE_SUBELEM_MIC2_SIZE : WLAN_MMIE_SUBELEM_MIC1_SIZE);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(prot);
++		return NULL;
++	}
++	wpa_hexdump(MSG_DEBUG, "BIP MMIE MIC", pos, igtk_len == WPA_IGTK_MAX_LEN ? WLAN_MMIE_SUBELEM_MIC2_SIZE : WLAN_MMIE_SUBELEM_MIC1_SIZE);
++
++	*prot_len = plen;
++
++	return prot;
++fail:
++	os_free(prot);
++	os_free(buf);
++	return NULL;
++}
++
++#ifdef AES_GMAC_AVAILABLE
++u8 * bip_gmac_protect(struct wpa_authenticator *wpa_auth,
++		u8 *frame, size_t len, size_t *prot_len)
++{
++	errno_t err;
++	const u8 *igtk = wpa_auth->group->IGTK[wpa_auth->group->GN_igtk - 4];
++	size_t igtk_len = wpa_cipher_key_len(wpa_auth->conf.group_mgmt_cipher);
++	size_t copied_bytes = 0, copied_prot = 0;
++	size_t buf_size;
++	u8 *ipn = wpa_auth->group->ipn;
++	int keyid = wpa_auth->group->GN;
++	u8 *prot, *pos, *buf;
++	u16 fc;
++	struct ieee80211_hdr *hdr;
++	size_t plen;
++	u8 nonce[12], *npos;
++
++	hdr = (struct ieee80211_hdr *) frame;
++	plen = len + WLAN_MMIE_LENGTH2;
++	prot = os_malloc(plen);
++	if (prot == NULL)
++		return NULL;
++	buf_size = plen - (sizeof(hdr->duration_id) + sizeof(hdr->seq_ctrl)); /* skip duration_id and seq_ctrl from frame header */
++	buf = os_malloc(buf_size);
++	if (buf == NULL) {
++		os_free(prot);
++		return NULL;
++	}
++
++	err = memcpy_s(prot, plen, frame, len);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(prot);
++		os_free(buf);
++		return NULL;
++	}
++	pos = prot + len;
++	copied_prot += len;
++	*pos++ = WLAN_EID_MMIE;
++	copied_prot++;
++	*pos++ = WLAN_MMIE_SUBELEM_LENGTH2_VALUE;
++	copied_prot++;
++	WPA_PUT_LE16(pos, keyid);
++	pos += WLAN_MMIE_SUBELEM_KEYID_SIZE;
++	copied_prot += WLAN_MMIE_SUBELEM_KEYID_SIZE;
++	err = memcpy_s(pos, plen - copied_prot, ipn, WLAN_MMIE_SUBELEM_IPN_SIZE);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(prot);
++		os_free(buf);
++		return NULL;
++	}
++	pos += WLAN_MMIE_SUBELEM_IPN_SIZE;
++	copied_prot += WLAN_MMIE_SUBELEM_IPN_SIZE;
++	os_memset(pos, 0, WLAN_MMIE_SUBELEM_MIC2_SIZE); /* MIC */
++
++	/* BIP AAD: FC(masked) A1 A2 A3 */
++	fc = le_to_host16(hdr->frame_control);
++	fc &= ~(WLAN_FC_RETRY | WLAN_FC_PWRMGT | WLAN_FC_MOREDATA);
++	WPA_PUT_LE16(buf, fc);
++	copied_bytes = sizeof(hdr->frame_control);
++	err = memcpy_s(buf + copied_bytes, buf_size - copied_bytes, hdr->addr1, 3 * sizeof(hdr->addr1));
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(prot);
++		os_free(buf);
++		return NULL;
++	}
++	copied_bytes += (3 * sizeof(hdr->addr1));
++	err = memcpy_s(buf + copied_bytes, buf_size - copied_bytes, prot + IEEE80211_HDRLEN, plen - IEEE80211_HDRLEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(prot);
++		os_free(buf);
++		return NULL;
++	}
++	wpa_hexdump(MSG_MSGDUMP, "BIP-GMAC: AAD|Body(masked)",
++		    buf, plen + copied_bytes - IEEE80211_HDRLEN);
++
++	/* Nonce: A2 | IPN */
++	err = memcpy_s(nonce, sizeof(nonce), hdr->addr2, ETH_ALEN);
++	if (EOK != err) {
++		wpa_printf(MSG_ERROR, "%s: memcpy_s error %d", __func__, err);
++		os_free(prot);
++		os_free(buf);
++		return NULL;
++	}
++	npos = nonce + ETH_ALEN;
++	*npos++ = ipn[5];
++	*npos++ = ipn[4];
++	*npos++ = ipn[3];
++	*npos++ = ipn[2];
++	*npos++ = ipn[1];
++	*npos++ = ipn[0];
++	wpa_hexdump(MSG_EXCESSIVE, "BIP-GMAC: Nonce", nonce, sizeof(nonce));
++
++	/* MIC = AES-GMAC(AAD || Frame Body(masked)) */
++	if (aes_gmac(igtk, igtk_len, nonce, sizeof(nonce),
++		     buf, plen + copied_bytes - IEEE80211_HDRLEN, pos) < 0) {
++		os_free(prot);
++		os_free(buf);
++		return NULL;
++	}
++	os_free(buf);
++
++	wpa_hexdump(MSG_DEBUG, "BIP-GMAC MMIE MIC", pos, WLAN_MMIE_SUBELEM_MIC2_SIZE);
++
++	*prot_len = plen;
++	return prot;
++}
++#endif /* AES_GMAC_AVAILABLE */
+diff --git a/src/ap/wpa_auth.h b/src/ap/wpa_auth.h
+index 7e3dcbf39..46fd315c7 100644
+--- a/src/ap/wpa_auth.h
++++ b/src/ap/wpa_auth.h
+@@ -138,6 +138,17 @@ struct ft_rrb_seq {
+ #pragma pack(pop)
+ #endif /* _MSC_VER */
+ 
++/* Management MIC IE and it's sub-elements' sizes (IEEE Std 802.11w-2009, 7.3.2.55) */
++#define WLAN_MMIE_LENGTH1                18
++#define WLAN_MMIE_LENGTH2                26
++#define WLAN_MMIE_SUBELEM_ID_SIZE        1
++#define WLAN_MMIE_SUBELEM_LENGTH_SIZE    1
++#define WLAN_MMIE_SUBELEM_KEYID_SIZE     2
++#define WLAN_MMIE_SUBELEM_IPN_SIZE       6
++#define WLAN_MMIE_SUBELEM_MIC1_SIZE      8
++#define WLAN_MMIE_SUBELEM_MIC2_SIZE      16
++#define WLAN_MMIE_SUBELEM_LENGTH1_VALUE  16
++#define WLAN_MMIE_SUBELEM_LENGTH2_VALUE  24
+ 
+ /* per STA state machine data */
+ 
+diff --git a/src/ap/wpa_auth_i.h b/src/ap/wpa_auth_i.h
+index b2fa78912..8c9cb71c6 100644
+--- a/src/ap/wpa_auth_i.h
++++ b/src/ap/wpa_auth_i.h
+@@ -342,4 +342,9 @@ int wpa_ft_store_pmk_fils(struct wpa_state_machine *sm, const u8 *pmk_r0,
+ 			  const u8 *pmk_r0_name);
+ #endif /* CONFIG_IEEE80211R_AP */
+ 
++u8 * bip_protect(struct wpa_authenticator *wpa_auth,
++		u8 *frame, size_t len, size_t *prot_len);
++u8 * bip_gmac_protect(struct wpa_authenticator *wpa_auth,
++		u8 *frame, size_t len, size_t *prot_len);
++
+ #endif /* WPA_AUTH_I_H */
+diff --git a/src/common/vendor_cmds_copy.h b/src/common/vendor_cmds_copy.h
+index bd12b595c..55bc416f4 100644
+--- a/src/common/vendor_cmds_copy.h
++++ b/src/common/vendor_cmds_copy.h
+@@ -448,6 +448,17 @@ struct mxl_ml_sta_info {
+ 
+ /* Maximum possible number of antennas for statistics in driver */
+ #define WAVE_STAT_MAX_ANTENNAS                5
++#define INTEL_CSA_DEAUTH_TX_TIME_ARR_SIZE     2
++#define INTEL_CSA_DEAUTH_TX_TIME_UC_IDX       0
++#define INTEL_CSA_DEAUTH_TX_TIME_MC_IDX       1
++#define INTEL_MAX_PROTECTED_DEAUTH_FRAME_LEN  44
++#define INTEL_NON_PROTECTED_DEAUTH_FRAME_LEN  26
++
++enum {
++  CSA_DEAUTH_MODE_DISABLED = 0,
++  CSA_DEAUTH_MODE_UNICAST,
++  CSA_DEAUTH_MODE_BROADCAST
++};
+ 
+ /* SoftBlock Timer ACL configuration */
+ struct intel_vendor_sb_timer_acl_cfg {
+@@ -591,6 +602,14 @@ struct _mxl_vendor_bcast_twt_config_t {
+   struct _mxl_vendor_btwt_params_t btwt_params[MAX_NUM_BCAST_TWT_SP_TO_ADD];
+ } __attribute__ ((packed));
+ 
++/* Data for channel switch vendor implementation */
++struct intel_vendor_channel_switch_cfg {
++  u8 csaDeauthMode; /* 0-disabled, 1-unicast, 2-multicast */
++  u8 csaMcDeauthFrameLength; /* Length of deauth frame per VAP */
++  u16 csaDeauthTxTime[INTEL_CSA_DEAUTH_TX_TIME_ARR_SIZE]; /* Unicast and multicast deauth frame transmit time */
++  u8 csaDeauthFrames[INTEL_MAX_PROTECTED_DEAUTH_FRAME_LEN]; /* Deauth frames (optionally encrypted) per VAP */
++} __attribute__ ((packed));
++
+ /*******************************************************************************
+ *                           Event structures                                   *
+ *******************************************************************************/
+diff --git a/src/drivers/driver_nl80211_capa.c b/src/drivers/driver_nl80211_capa.c
+index 102d3064a..55985aded 100644
+--- a/src/drivers/driver_nl80211_capa.c
++++ b/src/drivers/driver_nl80211_capa.c
+@@ -936,7 +936,6 @@ static void wiphy_info_mbssid(struct wpa_driver_capa *cap, struct nlattr *attr)
+ 		   cap->mbssid_max_interfaces, cap->ema_max_periodicity);
+ }
+ 
+-
+ static int wiphy_info_handler(struct nl_msg *msg, void *arg)
+ {
+ 	struct nlattr *tb[NL80211_ATTR_MAX + 1];
+-- 
+2.43.0
+

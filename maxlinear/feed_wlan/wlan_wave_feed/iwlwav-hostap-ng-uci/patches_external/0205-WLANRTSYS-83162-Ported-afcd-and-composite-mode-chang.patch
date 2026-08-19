@@ -1,0 +1,675 @@
+From 9f22bbd67801babaa3498b8fe051cc1766a5b264 Mon Sep 17 00:00:00 2001
+From: "Ross-Ashikyan, William" <washikyan@maxlinear.com>
+Date: Tue, 27 Aug 2024 14:19:07 -0700
+Subject: [PATCH] WLANRTSYS-83162 Ported afcd and composite mode changes from
+ legacy hostapd
+
+---
+ afc/afcd.c                   |  24 +++-
+ hostapd/Makefile             |   3 +
+ hostapd/defconfig            |   2 +-
+ hostapd/mxl_ctrl_iface.c     |  31 ++++-
+ hostapd/mxl_hostapd_cli.c    |   6 +
+ hostapd/mxl_hostapd_cli.h    |  19 ++-
+ src/ap/afc.c                 |  37 +++++-
+ src/ap/mxl_afc.c             | 227 +++++++++++++++++++++++++++++++++++
+ src/ap/mxl_afc.h             |  78 ++++++++++++
+ src/common/ieee802_11_defs.h |   4 +
+ 10 files changed, 417 insertions(+), 14 deletions(-)
+ create mode 100644 src/ap/mxl_afc.c
+ create mode 100644 src/ap/mxl_afc.h
+
+diff --git a/afc/afcd.c b/afc/afcd.c
+index 2b99940ae..66bd64f49 100644
+--- a/afc/afcd.c
++++ b/afc/afcd.c
+@@ -27,7 +27,9 @@ static char *path = "/var/run";
+ static char *bearer_token;
+ static char *url;
+ static int port = 443;
+-
++#ifdef CONFIG_VENDOR_MXL
++static char cacert_path[256] = "/etc/certs/afc_ca.pem";
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ static size_t afcd_curl_cb_write(void *ptr, size_t size, size_t nmemb,
+ 				 void *userdata)
+@@ -60,11 +62,11 @@ static int afcd_send_request(struct curl_ctx *ctx, unsigned char *request)
+ 	curl = curl_easy_init();
+ 	if (!curl)
+ 		goto out_global_cleanup;
+-
++#ifndef CONFIG_VENDOR_MXL
+ 	headers  = curl_slist_append(headers, "Accept: application/json");
+ 	if (!headers)
+ 		goto out_easy_cleanup;
+-
++#endif /* CONFIG_VENDOR_MXL */
+ 	tmp = curl_slist_append(headers, "Content-Type: application/json");
+ 	if (!tmp)
+ 		goto out_slist_free_all;
+@@ -78,16 +80,26 @@ static int afcd_send_request(struct curl_ctx *ctx, unsigned char *request)
+ 	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+ 	curl_easy_setopt(curl, CURLOPT_URL, url);
+ 	curl_easy_setopt(curl, CURLOPT_PORT, port);
++#ifdef CONFIG_VENDOR_MXL
++	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
++#else
+ 	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_1);
++#endif /* CONFIG_VENDOR_MXL */
+ 	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+ 			 afcd_curl_cb_write);
+ 	curl_easy_setopt(curl, CURLOPT_WRITEDATA, ctx);
+ 	curl_easy_setopt(curl, CURLOPT_USERAGENT, "libcrp/0.1");
+ 	curl_easy_setopt(curl, CURLOPT_TIMEOUT, CURL_TIMEOUT);
+ 	curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
++#ifdef CONFIG_VENDOR_MXL
++	curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);
++	curl_easy_setopt(curl, CURLOPT_CAINFO, cacert_path);
++#endif /* CONFIG_VENDOR_MXL */
+ 	if (bearer_token)
+ 		curl_easy_setopt(curl, CURLOPT_XOAUTH2_BEARER, bearer_token);
++#ifndef CONFIG_VENDOR_MXL
+ 	curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BEARER);
++#endif /* CONFIG_VENDOR_MXL */
+ 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+ 	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 1L);
+ 	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, request);
+@@ -289,11 +301,17 @@ int main(int argc, char **argv)
+ 	}
+ 
+ 	if (!url) {
++#ifdef CONFIG_VENDOR_MXL
++		os_free(pid_file);
++#endif /* CONFIG_VENDOR_MXL */
+ 		usage();
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (daemonize && os_daemonize(pid_file)) {
++#ifdef CONFIG_VENDOR_MXL
++		os_free(pid_file);
++#endif /* CONFIG_VENDOR_MXL */
+ 		wpa_printf(MSG_ERROR, "daemon: %s", strerror(errno));
+ 		return -EINVAL;
+ 	}
+diff --git a/hostapd/Makefile b/hostapd/Makefile
+index f9bf9d03c..b2c8780fd 100644
+--- a/hostapd/Makefile
++++ b/hostapd/Makefile
+@@ -408,6 +408,9 @@ OBJS += ../src/ap/mxl_drv_callbacks.o
+ OBJS += ../src/ap/mxl_sta_info.o
+ OBJS += ../src/ap/mxl_utils.o
+ OBJS += ../src/ap/mxl_wmm.o
++ifdef CONFIG_AFC
++OBJS += ../src/ap/mxl_afc.o
++endif
+ ifdef CONFIG_IEEE80211BE_MXL_MLO
+ OBJS += ../src/ap/mxl_mld.o
+ ifdef CONFIG_EPCS_MXL
+diff --git a/hostapd/defconfig b/hostapd/defconfig
+index b96518044..829f4abb0 100644
+--- a/hostapd/defconfig
++++ b/hostapd/defconfig
+@@ -424,4 +424,4 @@ CONFIG_DPP2=y
+ CONFIG_RADIUS_GREYLIST=y
+ 
+ # Enable Automated Frequency Coordination for 6GHz outdoor
+-#CONFIG_AFC=y
++CONFIG_AFC=y
+diff --git a/hostapd/mxl_ctrl_iface.c b/hostapd/mxl_ctrl_iface.c
+index 4d2050fac..66bc578ec 100644
+--- a/hostapd/mxl_ctrl_iface.c
++++ b/hostapd/mxl_ctrl_iface.c
+@@ -32,6 +32,9 @@
+ #include "ap/ctrl_iface_ap.h"
+ #include "ap/neighbor_db.h"
+ #include "ap/mxl_mld.h"
++#ifdef CONFIG_AFC
++#include "ap/mxl_afc.h"
++#endif /* CONFIG_AFC */
+ 
+ struct hostapd_data *mxl_get_bss_index(const char **cmd, struct hostapd_data *hapd, bool ctrl_iface, bool delim)
+ {
+@@ -77,6 +80,14 @@ struct hostapd_data *mxl_get_bss_index(const char **cmd, struct hostapd_data *ha
+ 	return NULL;
+ }
+ 
++#ifdef CONFIG_AFC
++static int mxl_hostapd_ctrl_iface_send_afcd_request(struct hostapd_iface *iface,
++					     char *buf, size_t buflen)
++{
++	return mxl_hostapd_afc_send_receive(iface);
++}
++#endif /* CONFIG_AFC */
++
+ #ifdef CONFIG_EPCS_MXL
+ static int mxl_hostapd_ctrl_iface_send_epcs_req_frame(struct hostapd_data *hapd,
+ 				const char *cmd)
+@@ -3109,6 +3120,10 @@ int mxl_hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 		*reply_len = mxl_hostapd_ctrl_iface_get_power_mode(hapd->iface, reply, reply_size);
+ 	} else if (os_strncmp(buf, "SET_POWER_MODE", 14) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_set_power_mode(hapd->iface, buf + 14, reply, reply_size);
++#ifdef CONFIG_AFC
++	} else if (os_strncmp(buf, "SEND_AFC_REQUEST", 16) == 0) {
++		*reply_len = mxl_hostapd_ctrl_iface_send_afcd_request(hapd->iface, reply, reply_size);
++#endif /* CONFIG_AFC */
+ #ifdef CONFIG_IEEE80211BE_MXL_MLO
+ 	} else if (os_strncmp(buf, "SEND_T2LM_TEARDOWN_FRAME ", sizeof("SEND_T2LM_TEARDOWN_FRAME ") - 1) == 0) {
+ 		*reply_len = mxl_hostapd_ctrl_iface_send_t2lm_teardown_frame(hapd, buf + sizeof("SEND_T2LM_TEARDOWN_FRAME ") - 1);
+@@ -3558,15 +3573,21 @@ int mxl_hostapd_ctrl_iface_set_power_mode(struct hostapd_iface *iface, const cha
+ 
+ 	pos++;
+ 	val = atoi(pos);
+-	if (val < 0 || val > 1) {
+-		wpa_printf(MSG_INFO, "Invalid Power mode - LPI-POWER-MODE (0) / STANDARD-POWER (1) value");
++	switch (val) {
++	case HE_REG_INFO_6GHZ_AP_TYPE_INDOOR:
++	case HE_REG_INFO_6GHZ_AP_TYPE_SP:
++	case HE_REG_INFO_6GHZ_AP_TYPE_INDOOR_SP:
++		iface->conf->he_6ghz_reg_pwr_type = val;
++		break;
++	case HE_REG_INFO_6GHZ_AP_TYPE_VLP:
++		wpa_printf(MSG_INFO, "VERY-LOW-POWER is not supported"); /* Fall Through */
++	default:
++		wpa_printf(MSG_INFO, "Invalid power mode");
+ 		return -1;
+ 	}
+-
+-	iface->conf->he_6ghz_reg_pwr_type = val;
+ 	mxl_hostapd_interface_update_power_regd(hapd, val);
+ 
+-	return os_snprintf(buf, buflen, "Power Mode=%s\n", iface->conf->he_6ghz_reg_pwr_type ? "STANDARD-POWER" : "LOW-POWER-INDOOR");
++	return os_snprintf(buf, buflen, "Power Mode=%s\n", mxl_he_6ghz_pwr_mode_text(val));
+ }
+ 
+ int mxl_hostapd_handle_wmm_ac_params(struct hostapd_data *hapd, char *cmd, char *value)
+diff --git a/hostapd/mxl_hostapd_cli.c b/hostapd/mxl_hostapd_cli.c
+index f4b2a996c..fa249a2c9 100644
+--- a/hostapd/mxl_hostapd_cli.c
++++ b/hostapd/mxl_hostapd_cli.c
+@@ -404,6 +404,12 @@ int mxl_hostapd_cli_cmd_set_power_mode(struct wpa_ctrl *ctrl, int argc,
+ 	return mxl_wpa_ctrl_command(ctrl, cmd);
+ }
+ 
++int mxl_hostapd_cli_cmd_send_afc_request(struct wpa_ctrl *ctrl, int argc,
++					  char *argv[])
++{
++	return mxl_wpa_ctrl_command(ctrl, "SEND_AFC_REQUEST");
++}
++
+ int mxl_hostapd_cli_cmd_set_neighbor_psd(struct wpa_ctrl *ctrl, int argc,
+ 					char *argv[])
+ {
+diff --git a/hostapd/mxl_hostapd_cli.h b/hostapd/mxl_hostapd_cli.h
+index 6fed47846..229861060 100644
+--- a/hostapd/mxl_hostapd_cli.h
++++ b/hostapd/mxl_hostapd_cli.h
+@@ -28,9 +28,10 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ #endif /* CONFIG_CTRL_IFACE_PER_RADIO */
+ 
+ #define MXL_HOSTAPD_ADD_VENDOR_CLI \
+-	MXL_CLI_COMMANDS_ACS	   \
+-	MXL_CLI_COMMANDS_EPCS	\
+-	MXL_CLI_COMMANDS_MLO	   \
++	MXL_CLI_COMMANDS_ACS		\
++	MXL_CLI_COMMANDS_AFC		\
++	MXL_CLI_COMMANDS_EPCS		\
++	MXL_CLI_COMMANDS_MLO		\
+ 	{ "get_hw_features", mxl_hostapd_cli_cmd_get_hw_features, NULL,			\
+ 	  " = get hardware features" },							\
+ 	{ "set_failsafe_chan", mxl_hostapd_cli_cmd_set_failsafe_chan, NULL,		\
+@@ -93,6 +94,18 @@ int mxl_wpa_ctrl_command(struct wpa_ctrl *ctrl, const char *cmd);
+ #define MXL_CLI_COMMANDS_ACS
+ #endif /* CONFIG_ACS */
+ 
++#ifdef CONFIG_AFC
++
++int mxl_hostapd_cli_cmd_send_afc_request(struct wpa_ctrl *ctrl, int argc, char *argv[]);
++
++#define MXL_CLI_COMMANDS_AFC \
++	{ "send_afc_request", mxl_hostapd_cli_cmd_send_afc_request, NULL, \
++	  "  send request to configured AFC server" }, \
++
++#else /* CONFIG_AFC */
++#define MXL_CLI_COMMANDS_AFC
++#endif /* CONFIG_AFC */
++
+ #ifdef CONFIG_EPCS_MXL
+ int mxl_hostapd_cli_cmd_send_epcs_teardown_frame(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+ int mxl_hostapd_cli_cmd_send_epcs_req_frame(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+diff --git a/src/ap/afc.c b/src/ap/afc.c
+index cfee83fe7..95798b9eb 100644
+--- a/src/ap/afc.c
++++ b/src/ap/afc.c
+@@ -16,6 +16,9 @@
+ #include "hostapd.h"
+ #include "acs.h"
+ #include "hw_features.h"
++#ifdef CONFIG_VENDOR_MXL
++#include "mxl_afc.h"
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ #define HOSTAPD_AFC_RETRY_TIMEOUT	180
+ #define HOSTAPD_AFC_TIMEOUT		86400 /* 24h */
+@@ -441,7 +444,9 @@ hostad_afc_parse_available_freq_info(struct hostapd_iface *iface,
+ 	struct afc_freq_range_elem *f = NULL;
+ 	struct json_object *obj;
+ 	int i, count = 0;
+-
++#ifdef CONFIG_VENDOR_MXL
++	mxl_afc_load_composite_freq_list(iface, &f, &count);
++#endif /* CONFIG_VENDOR_MXL */
+ 	if (!json_object_object_get_ex(reply_elem_obj,
+ 				       "availableFrequencyInfo", &obj))
+ 		return 0;
+@@ -475,7 +480,11 @@ hostad_afc_parse_available_freq_info(struct hostapd_iface *iface,
+ 		    !json_object_object_get_ex(range_elem_obj, "maxPSD",
+ 					       &max_psd_obj))
+ 			continue;
+-
++#ifdef CONFIG_VENDOR_MXL
++		if (mxl_afc_check_duplicate_freq_rule(iface, low_freq_obj,
++						   high_freq_obj, max_psd_obj, f, count))
++			continue;
++#endif /* CONFIG_VENDOR_MXL */
+ 		f = os_realloc_array(f, count + 1, sizeof(*f));
+ 		if (!f)
+ 			return -ENOMEM;
+@@ -530,6 +539,10 @@ static int hostad_afc_update_chan_info(struct afc_chan_info_elem **chan_list,
+ 			c[count].chan = ch;
+ 			c[count++].power = power;
+ 		}
++#ifdef CONFIG_VENDOR_MXL
++		else
++			c[i].power = MAX(c[i].power, power);
++#endif /* CONFIG_VENDOR_MXL */
+ 	}
+ 
+ 	*chan_list_size = count;
+@@ -546,6 +559,9 @@ hostad_afc_parse_available_chan_info(struct hostapd_iface *iface,
+ 	struct afc_chan_info_elem *c = NULL;
+ 	struct json_object *obj;
+ 	int i, count = 0;
++#ifdef CONFIG_VENDOR_MXL
++	mxl_afc_load_composite_chan_list(iface, &c, &count);
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	if (!json_object_object_get_ex(reply_elem_obj,
+ 				       "availableChannelInfo", &obj))
+@@ -837,10 +853,17 @@ static int hostapd_afc_send_receive(struct hostapd_iface *iface)
+ 	ret = recv(sockfd, buf, HOSTAPD_AFC_BUFSIZE - 1, 0);
+ 	if (ret <= 0)
+ 		goto close_sock;
++#ifdef CONFIG_VENDOR_MXL
++	mxl_hostapd_afc_clear_and_load_lpi(iface);
++#endif /* CONFIG_VENDOR_MXL */
+ 
+ 	ret = hostapd_afc_parse_reply(iface, buf);
+ 	if (ret)
+ 		wpa_printf(MSG_ERROR, "Failed parsing AFC reply: %d", ret);
++#ifdef CONFIG_VENDOR_MXL
++	else
++		ret = mxl_hostap_afc_construct_regrule_from_afc_data(iface);
++#endif /* CONFIG_VENDOR_MXL */
+ close_sock:
+ 	os_free(buf);
+ 	json_object_put(request_obj);
+@@ -995,8 +1018,12 @@ void hostap_afc_disable_channels(struct hostapd_iface *iface)
+ 
+ 	for (i = 0; i < iface->num_hw_features; i++) {
+ 		mode = &iface->hw_features[i];
++#ifdef CONFIG_VENDOR_MXL
++		if (iface->num_hw_features < HOSTAPD_MODE_IEEE80211A)
++#else /* CONFIG_VENDOR_MXL */
+ 		if (mode->mode == HOSTAPD_MODE_IEEE80211A &&
+ 		    mode->is_6ghz)
++#endif /* CONFIG_VENDOR_MXL */
+ 			break;
+ 	}
+ 
+@@ -1039,3 +1066,9 @@ void hostap_afc_disable_channels(struct hostapd_iface *iface)
+ 			   chan->freq);
+ 	}
+ }
++
++#ifdef CONFIG_VENDOR_MXL
++int mxl_hostapd_afc_send_receive(struct hostapd_iface *iface) { return hostapd_afc_send_receive(iface); }
++void mxl_hostapd_afc_delete_data_from_server(struct hostapd_iface *iface) { hostapd_afc_delete_data_from_server(iface); }
++int mxl_hostapd_afc_parse_reply(struct hostapd_iface *iface, char *reply) { return hostapd_afc_parse_reply(iface, reply); }
++#endif /* CONFIG_VENDOR_MXL */
+diff --git a/src/ap/mxl_afc.c b/src/ap/mxl_afc.c
+new file mode 100644
+index 000000000..bc332da35
+--- /dev/null
++++ b/src/ap/mxl_afc.c
+@@ -0,0 +1,227 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#include <math.h>
++#include <json-c/json.h>
++
++#include "utils/includes.h"
++#include "common/ieee802_11_defs.h"
++#include "hostapd.h"
++#include "mxl_afc.h"
++#include "ap_drv_ops.h"
++
++#define EIRP_UNIT_CONVERSION	100
++#define FREQ_MHZ_TO_KHZ(freq)		((freq) * 1000)
++#define FREQ_KHZ_TO_MHZ(freq)		((freq) / 1000)
++
++static void mxl_hostap_afc_add_regulatory_rule(struct ieee80211_regdomain *regd, uint32_t idx, uint32_t start_freq_mhz,
++					   uint32_t end_freq_mhz, uint32_t bw_mhz, uint32_t eirp)
++{
++	if (start_freq_mhz && end_freq_mhz && bw_mhz && eirp) {
++		/* The driver accepts frequencies in KHz, so convert MHz to KHz here */
++		regd->reg_rules[idx].freq_range.start_freq_khz = FREQ_MHZ_TO_KHZ(start_freq_mhz);
++		regd->reg_rules[idx].freq_range.end_freq_khz = FREQ_MHZ_TO_KHZ(end_freq_mhz);
++		regd->reg_rules[idx].freq_range.max_bandwidth_khz = FREQ_MHZ_TO_KHZ(bw_mhz);
++		regd->reg_rules[idx].power_rule.max_eirp = (eirp * EIRP_UNIT_CONVERSION);
++	}
++}
++
++static uint32_t mxl_afc_calculate_psd_to_eirp(int psd, uint32_t bw_mhz)
++{
++	return (uint32_t)(psd + (10 * (log10(bw_mhz))));
++}
++
++static void mxl_hostap_afc_parse_chan_regrule(struct hostapd_iface *iface, struct ieee80211_regdomain *regd)
++{
++	uint32_t chan_idx;
++	uint32_t bw_mhz;
++	uint32_t start_freq_mhz, center_freq_mhz, end_freq_mhz;
++	uint32_t max_eirp;
++	u8 op_class;
++
++	for (chan_idx = 0; chan_idx < iface->afc.num_chan_info; chan_idx++) {
++		op_class = HOSTAP_6GHZ_20MHZ_OP_CLASS + center_idx_to_bw_6ghz(iface->afc.chan_info_list[chan_idx].chan);
++		bw_mhz = op_class_to_bandwidth(op_class);
++
++		center_freq_mhz = hostapd_chan_to_freq(iface->afc.chan_info_list[chan_idx].chan, true);
++		start_freq_mhz = center_freq_mhz - (bw_mhz / 2);
++		end_freq_mhz = center_freq_mhz + (bw_mhz / 2);
++		max_eirp = (uint32_t)iface->afc.chan_info_list[chan_idx].power;
++
++		mxl_hostap_afc_add_regulatory_rule(regd, chan_idx, start_freq_mhz,
++					       end_freq_mhz, bw_mhz, max_eirp);
++	}
++}
++
++static void mxl_hostap_afc_parse_freq_regrule(struct hostapd_iface *iface, struct ieee80211_regdomain *regd)
++{
++	int freq_idx;
++	uint32_t bw_mhz, eirp = 0;
++
++	for (freq_idx = 0; freq_idx < iface->afc.num_freq_range; freq_idx++) {
++		bw_mhz = iface->afc.freq_range[freq_idx].high_freq - iface->afc.freq_range[freq_idx].low_freq;
++		if (!bw_mhz)
++			continue;
++
++		eirp = mxl_afc_calculate_psd_to_eirp(iface->afc.freq_range[freq_idx].max_psd, bw_mhz);
++		mxl_hostap_afc_add_regulatory_rule(regd, freq_idx, iface->afc.freq_range[freq_idx].low_freq,
++					       iface->afc.freq_range[freq_idx].high_freq, bw_mhz, eirp);
++	}
++}
++
++static int mxl_hostap_afc_parse_chan_and_freq_regrule(struct hostapd_iface *iface, struct ieee80211_regdomain *regd)
++{
++	bool rule_exist;
++	uint32_t eirp;
++	int num_next_idx;
++	uint32_t last_chan_rule_idx, freq_idx, chan_idx;
++	uint32_t start_freq_mhz, end_freq_mhz, bw_mhz;
++
++	last_chan_rule_idx = iface->afc.num_chan_info; /*Actual index will be last_chan_rule_idx - 1 */
++
++	mxl_hostap_afc_parse_chan_regrule(iface, regd);
++	num_next_idx = last_chan_rule_idx;
++
++	for (freq_idx = 0; freq_idx < iface->afc.num_freq_range; freq_idx++) {
++		rule_exist = false;
++
++		bw_mhz = iface->afc.freq_range[freq_idx].high_freq - iface->afc.freq_range[freq_idx].low_freq;
++		if (!bw_mhz)
++			continue;
++
++		start_freq_mhz = iface->afc.freq_range[freq_idx].low_freq;
++		end_freq_mhz = iface->afc.freq_range[freq_idx].high_freq;
++		eirp = mxl_afc_calculate_psd_to_eirp(iface->afc.freq_range[freq_idx].max_psd, bw_mhz);
++
++		/* below check is to avoid the duplicate regulatory rule in the regd because
++		 * there is a possibility to receive same data in channel and freq response 
++		 */
++		for (chan_idx = 0; chan_idx < last_chan_rule_idx; chan_idx++) {
++			if (FREQ_MHZ_TO_KHZ(start_freq_mhz) == regd->reg_rules[chan_idx].freq_range.start_freq_khz &&
++			    FREQ_MHZ_TO_KHZ(end_freq_mhz) == regd->reg_rules[chan_idx].freq_range.end_freq_khz) {
++				if (eirp == (regd->reg_rules[chan_idx].power_rule.max_eirp/EIRP_UNIT_CONVERSION)) {
++					rule_exist = true;
++					break;
++				}
++			}
++		}
++		if (!rule_exist) {
++			mxl_hostap_afc_add_regulatory_rule(regd, num_next_idx, start_freq_mhz, end_freq_mhz, bw_mhz, eirp);
++			num_next_idx++;
++		}
++	}
++	return num_next_idx;
++}
++
++int mxl_hostap_afc_construct_regrule_from_afc_data(struct hostapd_iface *iface)
++{
++	int num_rules, new_num_rules;
++	size_t reg_size;
++	struct ieee80211_regdomain *regd;
++	struct hostapd_data *hapd = iface->bss[0];
++
++	num_rules = iface->afc.num_freq_range + iface->afc.num_chan_info;
++	/* Assuming we are storing all the chan responses in single array and num_chan_info indicates no. of 
++	 * channel in a response irrespective of any op_class restrictions
++	 */
++	reg_size = sizeof(struct ieee80211_regdomain) + num_rules * sizeof(struct ieee80211_reg_rule);
++
++	regd = (struct ieee80211_regdomain *)os_zalloc(reg_size);
++	if (!regd)
++		return -ENOMEM;
++
++	regd->n_reg_rules = num_rules;
++	os_memcpy(regd->alpha2, iface->conf->country, 2);
++
++	if (iface->afc.num_freq_range && iface->afc.num_chan_info) {
++		new_num_rules = mxl_hostap_afc_parse_chan_and_freq_regrule(iface, regd);
++		regd->n_reg_rules = new_num_rules;
++		reg_size = sizeof(struct ieee80211_regdomain) + new_num_rules * sizeof(struct ieee80211_reg_rule);
++	} else if (iface->afc.num_freq_range) {
++		mxl_hostap_afc_parse_freq_regrule(iface, regd);
++	} else if (iface->afc.num_chan_info) {
++		mxl_hostap_afc_parse_chan_regrule(iface, regd);
++	} else {
++		wpa_printf(MSG_ERROR,
++			   "AFC : no valid data from AFC server so sending number of regulatory rules as zero");
++		regd->n_reg_rules = 0;
++	}
++
++	if(MXL_DRV_VENDOR_SET(LTQ_NL80211_VENDOR_SUBCMD_UPDATE_AFC_INFO,
++			      (u8*)regd,
++			      reg_size)){
++		wpa_printf(MSG_ERROR, "AFC : failed to send NL msg to driver");
++		goto fail;
++	}
++	os_free(regd);
++	return 0;
++fail:
++	os_free(regd);
++	return -1;
++}
++
++void mxl_hostapd_afc_clear_and_load_lpi(struct hostapd_iface *iface)
++{
++/* Composite Mode: Clear prior AFC data, load LPI data into afc, then append new AFC values */
++	if (iface->conf->he_6ghz_reg_pwr_type == HE_REG_INFO_6GHZ_AP_TYPE_INDOOR_SP)
++	{
++		int ret;
++/* Hardcoded JSON for LPI frequencies and channels in AFC reponse format for US devices operating in composite power mode */
++/* DO NOT breakout and expose to end user, compile into binary, this should NEVER be user-editable */
++		char *composite_lpi_usa_json = "{\"availableSpectrumInquiryResponses\": [{\"response\": {\"responseCode\": 0, \"shortDescription\": \"SUCCESS\"}, \"availableFrequencyInfo\": [{\"frequencyRange\": {\"highFrequency\": 5945, \"lowFrequency\": 5925}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 5965, \"lowFrequency\": 5945}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 5985, \"lowFrequency\": 5965}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6005, \"lowFrequency\": 5985}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6025, \"lowFrequency\": 6005}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6045, \"lowFrequency\": 6025}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6065, \"lowFrequency\": 6045}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6085, \"lowFrequency\": 6065}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6105, \"lowFrequency\": 6085}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6125, \"lowFrequency\": 6105}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6145, \"lowFrequency\": 6125}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6165, \"lowFrequency\": 6145}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6185, \"lowFrequency\": 6165}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6205, \"lowFrequency\": 6185}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6245, \"lowFrequency\": 6225}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6265, \"lowFrequency\": 6245}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6285, \"lowFrequency\": 6265}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6305, \"lowFrequency\": 6285}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6325, \"lowFrequency\": 6305}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6345, \"lowFrequency\": 6325}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6365, \"lowFrequency\": 6345}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6385, \"lowFrequency\": 6365}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6405, \"lowFrequency\": 6385}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6425, \"lowFrequency\": 6405}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6545, \"lowFrequency\": 6525}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6565, \"lowFrequency\": 6545}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6585, \"lowFrequency\": 6565}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6605, \"lowFrequency\": 6585}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6625, \"lowFrequency\": 6605}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6645, \"lowFrequency\": 6625}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6665, \"lowFrequency\": 6645}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6685, \"lowFrequency\": 6665}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6705, \"lowFrequency\": 6685}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6725, \"lowFrequency\": 6705}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6745, \"lowFrequency\": 6725}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6765, \"lowFrequency\": 6745}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6785, \"lowFrequency\": 6765}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6805, \"lowFrequency\": 6785}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6825, \"lowFrequency\": 6805}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6845, \"lowFrequency\": 6825}, \"maxPsd\": 5}, {\"frequencyRange\": {\"highFrequency\": 6865, \"lowFrequency\": 6845}, \"maxPsd\": 5}], \"availableChannelInfo\": [{\"channelCfi\": [1, 5, 9, 13, 17, 21, 25, 29, 33, 37, 41, 45, 49, 53, 57, 61, 65, 69, 73, 77, 81, 85, 89, 93, 117, 121, 125, 129, 133, 137, 141, 145, 149, 153, 157, 161, 165, 169, 173, 177, 181], \"globalOperatingClass\": 131, \"maxEirp\": [18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0, 18.0]}, {\"channelCfi\": [3, 11, 19, 27, 35, 43, 51, 59, 67, 75, 83, 91, 123, 131, 139, 147, 155, 163, 171, 179], \"globalOperatingClass\": 132, \"maxEirp\": [21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0, 21.0]}, {\"channelCfi\": [7, 23, 39, 55, 71, 87, 135, 151, 167], \"globalOperatingClass\": 133, \"maxEirp\": [24.0, 24.0, 24.0, 24.0, 24.0, 24.0, 24.0, 24.0, 24.0]}, {\"channelCfi\": [15, 47, 79, 143], \"globalOperatingClass\": 134, \"maxEirp\": [27.0, 27.0, 27.0, 27.0]}, {\"channelCfi\": [2], \"globalOperatingClass\": 136, \"maxEirp\": [30.0]}], \"requestId\": \"11235813\", \"availabilityExpireTime\": \"2024-07-18T10:26:54Z\", \"rulesetId\": \"US_47_CFR_PART_15_SUBPART_E\"}], \"version\": \"1.4\"}";
++		mxl_hostapd_afc_delete_data_from_server(iface);
++		ret = mxl_hostapd_afc_parse_reply(iface, composite_lpi_usa_json);
++		if (ret)
++			wpa_printf(MSG_ERROR, "Failed parsing LPI json for composite mode: %d", ret);
++	}
++}
++
++int mxl_afc_check_duplicate_freq_rule(struct hostapd_iface *iface, 
++				struct json_object *low_freq_obj,
++				struct json_object *high_freq_obj,
++				struct json_object *max_psd_obj,
++				struct afc_freq_range_elem *f, int count)
++{
++	/* Check for duplicates, used only in Composite mode*/
++	if (iface->conf->he_6ghz_reg_pwr_type == HE_REG_INFO_6GHZ_AP_TYPE_INDOOR_SP) {
++		for (int j = 0; j < count; j++) {
++			if (f[j].low_freq == json_object_get_int(low_freq_obj) &&
++		 	    f[j].high_freq == json_object_get_int(high_freq_obj)) {
++					f[j].max_psd = MAX(f[j].max_psd, json_object_get_int(max_psd_obj));
++					wpa_printf(MSG_INFO, "Composite power mode found an AFC rule duplicate.");
++					return 1; /* Duplicate rule exists, do not append */
++			}
++		}
++	}
++	return 0; /* No duplicate rule exists, append new rule */
++}
++
++void mxl_afc_load_composite_freq_list(struct hostapd_iface *iface, struct afc_freq_range_elem ** f,
++										int * count)
++{
++	if (iface->conf->he_6ghz_reg_pwr_type == HE_REG_INFO_6GHZ_AP_TYPE_INDOOR_SP &&
++		iface->afc.data_valid == true) {
++		*f = iface->afc.freq_range;
++		*count = iface->afc.num_freq_range;
++	}
++}
++
++void mxl_afc_load_composite_chan_list(struct hostapd_iface *iface, struct afc_chan_info_elem ** c, 
++										int * count)
++{
++	if (iface->conf->he_6ghz_reg_pwr_type == HE_REG_INFO_6GHZ_AP_TYPE_INDOOR_SP &&
++		iface->afc.data_valid == true) {
++		*c = iface->afc.chan_info_list;
++		*count = iface->afc.num_chan_info;
++	}
++}
+diff --git a/src/ap/mxl_afc.h b/src/ap/mxl_afc.h
+new file mode 100644
+index 000000000..5659814c5
+--- /dev/null
++++ b/src/ap/mxl_afc.h
+@@ -0,0 +1,78 @@
++/******************************************************************************
++
++         Copyright (c) 2020 - 2025, MaxLinear, Inc.
++         Copyright 2016 - 2020 Intel Corporation
++         Copyright 2015 - 2016 Lantiq Beteiligungs-GmbH & Co. KG
++         Copyright 2009 - 2014 Lantiq Deutschland GmbH
++         Copyright 2007 - 2008 Infineon Technologies AG
++
++  This software may be distributed under the terms of the BSD license.
++  See README for more details.
++
++*******************************************************************************/
++
++#ifndef MXL_AFC_H
++#define MXL_AFC_H
++
++#include <json-c/json.h>
++#include "drivers/nl80211_copy.h"
++
++/* TODO: Move into vendor_cmds_copy.h after driver fix */
++struct ieee80211_freq_range {
++	uint32_t  start_freq_khz;
++	uint32_t  end_freq_khz;
++	uint32_t  max_bandwidth_khz;
++};
++
++struct ieee80211_power_rule {
++	uint32_t  max_antenna_gain;
++	uint32_t  max_eirp;
++};
++
++struct ieee80211_wmm_ac {
++	uint16_t  cw_min;
++	uint16_t cw_max;
++	uint16_t cot;
++	uint8_t aifsn;
++};
++
++struct ieee80211_wmm_rule {
++	struct ieee80211_wmm_ac client[4];
++	struct ieee80211_wmm_ac ap[4];
++};
++
++struct ieee80211_reg_rule {
++	struct ieee80211_freq_range freq_range;
++	struct ieee80211_power_rule power_rule;
++	struct ieee80211_wmm_rule wmm_rule;
++	uint32_t  flags;
++	uint32_t  dfs_cac_ms;
++	bool has_wmm;
++};
++
++struct callback_head {
++	struct callback_head *next;
++	void (*func)(struct callback_head *head);
++} __attribute__((aligned(sizeof(void *))));
++#define rcu_head callback_head
++
++struct ieee80211_regdomain {
++	struct rcu_head rcu_head;
++	uint32_t n_reg_rules;
++	char alpha2[3];
++	enum nl80211_dfs_regions dfs_region;
++	struct ieee80211_reg_rule reg_rules[];
++};
++
++int mxl_hostap_afc_construct_regrule_from_afc_data(struct hostapd_iface *iface);
++void mxl_hostapd_afc_clear_and_load_lpi(struct hostapd_iface *iface);
++int mxl_afc_check_duplicate_freq_rule(struct hostapd_iface *iface, 
++				struct json_object *low_freq_obj, struct json_object *high_freq_obj,
++				struct json_object *max_psd_obj, struct afc_freq_range_elem *f, int count);
++void mxl_afc_load_composite_freq_list(struct hostapd_iface *iface, struct afc_freq_range_elem ** f, int * count);
++void mxl_afc_load_composite_chan_list(struct hostapd_iface *iface, struct afc_chan_info_elem ** c, int * count);
++int mxl_hostapd_afc_parse_reply(struct hostapd_iface *iface, char *reply);
++void mxl_hostapd_afc_delete_data_from_server(struct hostapd_iface *iface);
++int mxl_hostapd_afc_send_receive(struct hostapd_iface *iface);
++
++#endif /* MXL_AFC_H */
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 719bd679c..743f1f91a 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -2150,6 +2150,10 @@ enum max_tx_pwr_interpretation {
+ 	LOCAL_EIRP_PSD = 1,
+ 	REGULATORY_CLIENT_EIRP = 2,
+ 	REGULATORY_CLIENT_EIRP_PSD = 3,
++#ifdef CONFIG_VENDOR_MXL
++	ADDITIONAL_REGULATORY_CLIENT_EIRP = 4,
++	ADDITIONAL_REGULATORY_CLIENT_EIRP_PSD = 5,
++#endif /* CONFIG_VENDOR_MXL */
+ };
+ 
+ /*
+-- 
+2.43.0
+

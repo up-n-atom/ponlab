@@ -1,0 +1,839 @@
+From d7ffac7c9ac331c267fe079855592db1f4e4c437 Mon Sep 17 00:00:00 2001
+From: Jurijs Soloveckis <jsoloveckis@maxlinear.com>
+Date: Tue, 6 Jun 2023 14:14:25 +0200
+Subject: [PATCH] WLANRTSYS-55850: Integrate MBO commits
+
+1)  mbo: add support of AP mbo_cell_aware
+
+    add option to configure the AP mbo_cell_aware in the .conf file:
+    mbo_cell_aware=1
+    add option to configure the AP mbo_cell_aware from the cli via the existing 'SET' command.
+    usage: "set mbo_cell_aware <0/1>".
+
+2)  mbo: add support to configure mbo_bss_assoc_disallow
+
+    this option allows to configure a single VAP to disallow associations.
+    to make it per VAP, we need to pass the VAP bssid.
+    new assoc_disallow MBO IE will be sent in beacon/probe response/assoc response
+    instead of the current cell_aware MBO IE.
+    it will affect only MBO stations.
+    non-MBO stations will not be affected by this command.
+    the value to pass to this command can be 0 to 5.
+    0: disable the disallow (allow association).
+    1-5: enable the disallow, and the value is the disallow reason code.
+
+    usage: "mbo_bss_assoc_disallow <bssid> <0-5>".
+
+3)  mbo: Cellular Preference in BTM Request in response to BTM Query
+
+    Added cellular preference to BSS Transition Management Request sent in response to BTM Query.
+    Added cellular preference set control interface command.
+
+    usage: cellular_pref_set <BSS_name> <cellular preference value - 0 or 1 or 255>
+    0 - The MBO AP does not want the MBO STA to use the cellular data connection.
+    1 - The MBO AP prefers the MBO STA should not use cellular.
+    255 - The MBO AP prefers the MBO STA should use cellular.
+
+4)  mbo: pmf bypass
+
+    enable hostapd to work with mbo and without pmf.
+    to enable the bypass, add the following to the conf file:
+    mbo_pmf_bypass=1
+---
+ hostapd/config_file.c        |  16 +++++
+ hostapd/ctrl_iface.c         | 134 +++++++++++++++++++++++++++++++++++
+ hostapd/hostapd_cli.c        |  44 ++++++++++++
+ src/ap/ap_config.c           |  14 ++--
+ src/ap/ap_config.h           |   1 +
+ src/ap/drv_callbacks.c       |  20 ++++--
+ src/ap/gas_serv.c            |  50 ++++++++-----
+ src/ap/hostapd.h             |   2 +
+ src/ap/ieee802_11.c          |  18 +++--
+ src/ap/ieee802_11_shared.c   |  23 +++---
+ src/ap/sta_info.c            |  50 +++++++++++--
+ src/ap/wnm_ap.c              | 110 ++++++++++++++++++++++++++--
+ src/common/ieee802_11_defs.h |  12 ++++
+ src/common/wpa_ctrl.h        |   2 +
+ 14 files changed, 445 insertions(+), 51 deletions(-)
+
+diff --git a/hostapd/config_file.c b/hostapd/config_file.c
+index f1a20e5a1..f0df44170 100644
+--- a/hostapd/config_file.c
++++ b/hostapd/config_file.c
+@@ -4628,6 +4628,22 @@ static int hostapd_config_fill(struct hostapd_config *conf,
+ 		bss->mbo_cell_data_conn_pref = atoi(pos);
+ 	} else if (os_strcmp(buf, "oce") == 0) {
+ 		bss->oce = atoi(pos);
++	} else if (os_strcmp(buf, "mbo_cell_aware") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid mbo_cell_aware %d",
++				line, val);
++			return 1;
++		}
++		bss->mbo_cell_aware = val;
++	} else if (os_strcmp(buf, "mbo_pmf_bypass") == 0) {
++		int val = atoi(pos);
++		if (!IS_VALID_BOOL_RANGE(val)) {
++			wpa_printf(MSG_ERROR, "Line %d: invalid mbo_pmf_bypass %d",
++				line, val);
++			return 1;
++		}
++		bss->mbo_pmf_bypass = val;
+ #endif /* CONFIG_MBO */
+ #ifdef CONFIG_TESTING_OPTIONS
+ #define PARSE_TEST_PROBABILITY(_val)				\
+diff --git a/hostapd/ctrl_iface.c b/hostapd/ctrl_iface.c
+index 25d24a755..8f1a071ff 100644
+--- a/hostapd/ctrl_iface.c
++++ b/hostapd/ctrl_iface.c
+@@ -1301,6 +1301,23 @@ static int hostapd_ctrl_iface_set(struct hostapd_data *hapd, char *cmd)
+ 		 * TODO: Need to configure drivers that do AP MLME offload with
+ 		 * disallowing station logic.
+ 		 */
++	} else if (os_strcasecmp(cmd, "mbo_cell_aware") == 0) {
++		int val;
++
++		if (!hapd->conf->mbo_enabled) {
++			wpa_printf(MSG_DEBUG, "MBO: mbo is not enabled");
++			return -1;
++		}
++
++		val = atoi(value);
++		if (val < 0 || val > 1) {
++			wpa_printf(MSG_DEBUG,
++				"MBO: mbo_cell_aware value is out of range (can be 0 or 1)");
++			return -1;
++		}
++
++		hapd->conf->mbo_cell_aware = val;
++		ieee802_11_update_beacons(hapd->iface);
+ #endif /* CONFIG_MBO */
+ #ifdef CONFIG_DPP
+ 	} else if (os_strcasecmp(cmd, "dpp_configurator_params") == 0) {
+@@ -5201,6 +5218,115 @@ static int hostapd_ctrl_iface_update_wan_metrics(struct hostapd_data *hapd,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_MBO
++
++static int hostapd_ctrl_iface_mbo_bss_assoc_disallow(struct hostapd_data *hapd, char *cmd)
++{
++	char *token, *context = NULL;
++	int val, i;
++	u8 bssid[ETH_ALEN];
++	struct hostapd_data *target_bss = NULL;
++
++	token = str_token(cmd, " ", &context);
++	if (!token || hwaddr_aton(token, bssid)) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - Bad bssid address");
++		return -1;
++	}
++
++	for (i = 0; i < hapd->iface->num_bss; i++) {
++		if (os_memcmp(bssid, hapd->iface->bss[i]->own_addr, ETH_ALEN) == 0) {
++			target_bss = hapd->iface->bss[i];
++			break;
++		}
++	}
++
++	if (!target_bss) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - there is no iface with the given bssid");
++		return -1;
++	}
++
++	if (!target_bss->conf->mbo_enabled) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - mbo is not enabled");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - enable/disable is missing");
++		return -1;
++	}
++
++	val = atoi(token);
++	if (val < 0 || val > 5) {
++		wpa_printf(MSG_INFO,
++				"CTRL: MBO_BSS_ASSOC_DISALLOW - enable/disable value is out of range");
++		return -1;
++	}
++
++	target_bss->mbo_bss_assoc_disallow = val;
++	ieee802_11_update_beacons(target_bss->iface);
++
++	return 0;
++}
++
++static int hostapd_ctrl_iface_cellular_pref_set(struct hostapd_data *hapd, char *cmd)
++{
++	char *token, *context = NULL;
++	int val;
++
++	hapd = mxl_get_bss_index(cmd, hapd->iface);
++	if (!hapd) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - there is no iface with the given name");
++		return -1;
++	}
++
++	if (!hapd->conf->mbo_enabled) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - mbo is not enabled");
++		return -1;
++	}
++
++	if (!hapd->conf->mbo_cell_aware) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - AP is not cellular aware");
++		return -1;
++	}
++
++	cmd = os_strchr(cmd, ' ');
++	if (cmd)
++		cmd++;
++	else {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - Cellular Preference is missing");
++		return -1;
++	}
++
++	token = str_token(cmd, " ", &context);
++	if (!token) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - Cellular Preference is missing");
++		return -1;
++	}
++
++	val = atoi(token);
++	if (val != MBO_CELL_PREF_EXCLUDED && val != MBO_CELL_PREF_NO_USE && val != MBO_CELL_PREF_USE) {
++		wpa_printf(MSG_INFO,
++				"CTRL: CELLULAR_PREF_SET - Cellular Preference value is out of range (can be 0, 1 or 255)");
++		return -1;
++	}
++
++	hapd->mbo_cell_pref = val;
++
++	return 0;
++}
++
++#endif /* CONFIG_MBO */
++
+ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 					      char *buf, char *reply,
+ 					      int reply_size,
+@@ -5844,6 +5970,14 @@ static int hostapd_ctrl_iface_receive_process(struct hostapd_data *hapd,
+ 	} else if (os_strncmp(buf, "UPDATE_WAN_METRICS ", 19) == 0) {
+ 		if (hostapd_ctrl_iface_update_wan_metrics(hapd, buf + 19))
+ 			reply_len = -1;
++#ifdef CONFIG_MBO
++	} else if (os_strncmp(buf, "MBO_BSS_ASSOC_DISALLOW ", 23) == 0) {
++		if (hostapd_ctrl_iface_mbo_bss_assoc_disallow(hapd, buf + 23))
++			reply_len = -1;
++	} else if (os_strncmp(buf, "CELLULAR_PREF_SET ", 18) == 0) {
++		if (hostapd_ctrl_iface_cellular_pref_set(hapd, buf + 18))
++			reply_len = -1;
++#endif /* CONFIG_MBO */
+ 	} else {
+ 		os_memcpy(reply, "UNKNOWN COMMAND\n", 16);
+ 		reply_len = 16;
+diff --git a/hostapd/hostapd_cli.c b/hostapd/hostapd_cli.c
+index c097fac95..e08187d26 100644
+--- a/hostapd/hostapd_cli.c
++++ b/hostapd/hostapd_cli.c
+@@ -2177,6 +2177,44 @@ static int hostapd_cli_cmd_update_wan_metrics(struct wpa_ctrl *ctrl,
+ 	return wpa_ctrl_command(ctrl, buf);
+ }
+ 
++#ifdef CONFIG_MBO
++static int hostapd_cli_cmd_mbo_bss_assoc_disallow(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 2) {
++		printf("Invalid mbo_bss_assoc_disallow command - requires <BSSID> and <0> to disable or <1-5> to enable(the specified number is the disallow reason code)\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "MBO_BSS_ASSOC_DISALLOW %s %s", argv[0], argv[1]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
++
++static int hostapd_cli_cmd_cellular_pref_set(struct wpa_ctrl *ctrl, int argc, char *argv[])
++{
++	char cmd[256];
++	int res;
++
++	if (argc != 2) {
++		printf("Invalid cellular_pref_set command - requires <BSS_name> and pref <0 or 1 or 255>\n");
++		return -1;
++	}
++
++	res = sprintf_s(cmd, sizeof(cmd), "CELLULAR_PREF_SET %s %s", argv[0], argv[1]);
++	if (res <= 0) {
++		printf("%s: sprintf_s error %d", __func__, res);
++		return -1;
++	}
++	return wpa_ctrl_command(ctrl, cmd);
++}
++#endif /* CONFIG_MBO */
++
+ struct hostapd_cli_cmd {
+ 	const char *cmd;
+ 	int (*handler)(struct wpa_ctrl *ctrl, int argc, char *argv[]);
+@@ -2456,6 +2494,12 @@ static const struct hostapd_cli_cmd hostapd_cli_commands[] = {
+ 	  "<bss> <mac_addr> <freq> frame=<frame_buf>" },
+ 	{ "update_wan_metrics", hostapd_cli_cmd_update_wan_metrics, NULL,
+ 	  "<WAN Info>:<DL Speed>:<UL Speed>:<DL Load>:<UL Load>:<LMD> = update_wan_metrics" },
++#ifdef CONFIG_MBO
++	{ "mbo_bss_assoc_disallow", hostapd_cli_cmd_mbo_bss_assoc_disallow, NULL,
++	  " = set mbo bss assoc disallow"},
++	{ "cellular_pref_set", hostapd_cli_cmd_cellular_pref_set, NULL,
++	  " = set cellular preference"},
++#endif /* CONFIG_MBO */
+ 	{ NULL, NULL, NULL, NULL }
+ };
+ 
+diff --git a/src/ap/ap_config.c b/src/ap/ap_config.c
+index 974957627..96b544f70 100644
+--- a/src/ap/ap_config.c
++++ b/src/ap/ap_config.c
+@@ -150,6 +150,7 @@ void hostapd_config_defaults_bss(struct hostapd_bss_config *bss)
+ #ifdef CONFIG_MBO
+ 	bss->mbo_cell_data_conn_pref = -1;
+ 	bss->mbo_cell_aware = 1;
++	bss->mbo_pmf_bypass = 1;
+ #endif /* CONFIG_MBO */
+ 
+ 	/* Disable TLS v1.3 by default for now to avoid interoperability issue.
+@@ -1521,12 +1522,13 @@ static int hostapd_config_check_bss(struct hostapd_bss_config *bss,
+ #endif /* CONFIG_HS20 */
+ 
+ #ifdef CONFIG_MBO
+-	if (full_config && bss->mbo_enabled && (bss->wpa & 2) &&
+-	    bss->ieee80211w == NO_MGMT_FRAME_PROTECTION) {
+-		wpa_printf(MSG_ERROR,
+-			   "MBO: PMF needs to be enabled whenever using WPA2 with MBO");
+-		return -1;
+-	}
++	if (!bss->mbo_pmf_bypass)
++		if (full_config && bss->mbo_enabled && (bss->wpa & 2) &&
++			bss->ieee80211w == NO_MGMT_FRAME_PROTECTION) {
++			wpa_printf(MSG_ERROR,
++				"MBO: PMF needs to be enabled whenever using WPA2 with MBO");
++			return -1;
++		}
+ #endif /* CONFIG_MBO */
+ 
+ #ifdef CONFIG_OCV
+diff --git a/src/ap/ap_config.h b/src/ap/ap_config.h
+index efd0d984c..29efea15a 100644
+--- a/src/ap/ap_config.h
++++ b/src/ap/ap_config.h
+@@ -801,6 +801,7 @@ struct hostapd_bss_config {
+ 	unsigned int oce;
+ 	int mbo_cell_data_conn_pref;
+ 	int mbo_cell_aware;
++	int mbo_pmf_bypass;
+ #endif /* CONFIG_MBO */
+ 
+ 	int ftm_responder;
+diff --git a/src/ap/drv_callbacks.c b/src/ap/drv_callbacks.c
+index e74021fa8..614c3647b 100644
+--- a/src/ap/drv_callbacks.c
++++ b/src/ap/drv_callbacks.c
+@@ -684,13 +684,21 @@ skip_wpa_check:
+ #endif /* CONFIG_WPS */
+ 
+ #ifdef CONFIG_MBO
+-	if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
+-	    elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
+-	    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+-		wpa_printf(MSG_INFO,
+-			   "MBO: Reject WPA2 association without PMF");
+-		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	mbo_ap_check_sta_assoc(hapd, sta, &elems);
++
++	if (hapd->conf->mbo_enabled && hapd->mbo_bss_assoc_disallow) {
++		wpa_printf(MSG_INFO, "MBO: AP configure to reject associations");
++		return WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 	}
++
++	if (!hapd->conf->mbo_pmf_bypass)
++		if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
++			elems.mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
++			hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
++			wpa_printf(MSG_INFO,
++				   "MBO: Reject WPA2 association without PMF");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
+ #endif /* CONFIG_MBO */
+ 
+ #ifdef CONFIG_IEEE80211R_AP
+diff --git a/src/ap/gas_serv.c b/src/ap/gas_serv.c
+index 9bf2473ea..b3b92ba81 100644
+--- a/src/ap/gas_serv.c
++++ b/src/ap/gas_serv.c
+@@ -191,6 +191,36 @@ static void anqp_add_hs_capab_list(struct hostapd_data *hapd,
+ }
+ #endif /* CONFIG_HS20 */
+ 
++#ifdef CONFIG_MBO
++static void anqp_add_mbo_capab_list(struct hostapd_data *hapd,
++		struct wpabuf *buf)
++{
++	if (hapd->conf->mbo_enabled) {
++		u8 *len = gas_anqp_add_element(buf, ANQP_VENDOR_SPECIFIC);
++		wpabuf_put_be24(buf, OUI_WFA);
++		wpabuf_put_u8(buf, MBO_ANQP_OUI_TYPE);
++		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_QUERY_LIST);
++		wpabuf_put_u8(buf, 0); /* Reserved */
++		gas_anqp_set_element_len(buf, len);
++	}
++}
++
++static void anqp_add_mbo_cell_data_conn_pref(struct hostapd_data *hapd,
++		struct wpabuf *buf)
++{
++	if (hapd->conf->mbo_cell_data_conn_pref >= 0 || hapd->conf->mbo_cell_aware) {
++		u8 *len = gas_anqp_add_element(buf, ANQP_VENDOR_SPECIFIC);
++		wpabuf_put_be24(buf, OUI_WFA);
++		wpabuf_put_u8(buf, MBO_ANQP_OUI_TYPE);
++		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_CELL_CONN_PREF);
++		if (hapd->conf->mbo_cell_data_conn_pref >= 0)
++			wpabuf_put_u8(buf, hapd->conf->mbo_cell_data_conn_pref);
++		else
++			wpabuf_put_u8(buf, hapd->mbo_cell_pref);
++		gas_anqp_set_element_len(buf, len);
++	}
++}
++#endif /* CONFIG_MBO */
+ 
+ static struct anqp_element * get_anqp_elem(struct hostapd_data *hapd,
+ 					   u16 infoid)
+@@ -310,6 +340,9 @@ static void anqp_add_capab_list(struct hostapd_data *hapd,
+ #ifdef CONFIG_HS20
+ 	anqp_add_hs_capab_list(hapd, buf);
+ #endif /* CONFIG_HS20 */
++#ifdef CONFIG_MBO
++	anqp_add_mbo_capab_list(hapd, buf);
++#endif /* CONFIG_MBO */
+ 	gas_anqp_set_element_len(buf, len);
+ }
+ 
+@@ -939,23 +972,6 @@ static void anqp_add_operator_icon_metadata(struct hostapd_data *hapd,
+ 
+ #endif /* CONFIG_HS20 */
+ 
+-
+-#ifdef CONFIG_MBO
+-static void anqp_add_mbo_cell_data_conn_pref(struct hostapd_data *hapd,
+-					     struct wpabuf *buf)
+-{
+-	if (hapd->conf->mbo_cell_data_conn_pref >= 0) {
+-		u8 *len = gas_anqp_add_element(buf, ANQP_VENDOR_SPECIFIC);
+-		wpabuf_put_be24(buf, OUI_WFA);
+-		wpabuf_put_u8(buf, MBO_ANQP_OUI_TYPE);
+-		wpabuf_put_u8(buf, MBO_ANQP_SUBTYPE_CELL_CONN_PREF);
+-		wpabuf_put_u8(buf, hapd->conf->mbo_cell_data_conn_pref);
+-		gas_anqp_set_element_len(buf, len);
+-	}
+-}
+-#endif /* CONFIG_MBO */
+-
+-
+ static size_t anqp_get_required_len(struct hostapd_data *hapd,
+ 				    const u16 *infoid,
+ 				    unsigned int num_infoid)
+diff --git a/src/ap/hostapd.h b/src/ap/hostapd.h
+index 1667855c4..aaf458616 100644
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -426,6 +426,8 @@ struct hostapd_data {
+ 
+ #ifdef CONFIG_MBO
+ 	unsigned int mbo_assoc_disallow;
++	unsigned int mbo_bss_assoc_disallow;
++	unsigned int mbo_cell_pref;
+ #endif /* CONFIG_MBO */
+ 
+ 	struct dl_list nr_db;
+diff --git a/src/ap/ieee802_11.c b/src/ap/ieee802_11.c
+index 91e15bdc9..618b10e11 100644
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4293,13 +4293,19 @@ static int __check_assoc_ies(struct hostapd_data *hapd, struct sta_info *sta,
+ #ifdef CONFIG_MBO
+ 	mbo_ap_check_sta_assoc(hapd, sta, elems);
+ 
+-	if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
+-	    elems->mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
+-	    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
+-		wpa_printf(MSG_INFO,
+-			   "MBO: Reject WPA2 association without PMF");
+-		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++	if (hapd->conf->mbo_enabled && hapd->mbo_bss_assoc_disallow) {
++		wpa_printf(MSG_INFO, "MBO: AP configure to reject associations");
++		return WLAN_STATUS_AP_UNABLE_TO_HANDLE_NEW_STA;
+ 	}
++
++	if (!hapd->conf->mbo_pmf_bypass)
++		if (hapd->conf->mbo_enabled && (hapd->conf->wpa & 2) &&
++		    elems->mbo && sta->cell_capa && !(sta->flags & WLAN_STA_MFP) &&
++		    hapd->conf->ieee80211w != NO_MGMT_FRAME_PROTECTION) {
++			wpa_printf(MSG_INFO,
++				   "MBO: Reject WPA2 association without PMF");
++			return WLAN_STATUS_UNSPECIFIED_FAILURE;
++		}
+ #endif /* CONFIG_MBO */
+ 
+ #if defined(CONFIG_FILS) && defined(CONFIG_OCV)
+diff --git a/src/ap/ieee802_11_shared.c b/src/ap/ieee802_11_shared.c
+index e4a1ade75..a2295c389 100644
+--- a/src/ap/ieee802_11_shared.c
++++ b/src/ap/ieee802_11_shared.c
+@@ -798,14 +798,21 @@ u8 * hostapd_eid_mbo(struct hostapd_data *hapd, u8 *eid, size_t len)
+ 	if (hapd->conf->mbo_enabled) {
+ 		*mbo_pos++ = MBO_ATTR_ID_AP_CAPA_IND;
+ 		*mbo_pos++ = 1;
+-		/* Not Cellular aware */
+-		*mbo_pos++ = 0;
+-	}
+-
+-	if (hapd->conf->mbo_enabled && hapd->mbo_assoc_disallow) {
+-		*mbo_pos++ = MBO_ATTR_ID_ASSOC_DISALLOW;
+-		*mbo_pos++ = 1;
+-		*mbo_pos++ = hapd->mbo_assoc_disallow;
++		if (hapd->conf->mbo_cell_aware)
++			*mbo_pos++ = MBO_AP_CAPA_CELL_AWARE;
++		else
++			/* Not Cellular aware */
++			*mbo_pos++ = 0;
++
++		if (hapd->mbo_assoc_disallow) {
++			*mbo_pos++ = MBO_ATTR_ID_ASSOC_DISALLOW;
++			*mbo_pos++ = 1;
++			*mbo_pos++ = hapd->mbo_assoc_disallow;
++		} else if (hapd->mbo_bss_assoc_disallow) {
++			*mbo_pos++ = MBO_ATTR_ID_ASSOC_DISALLOW;
++			*mbo_pos++ = 1;
++			*mbo_pos++ = hapd->mbo_bss_assoc_disallow;
++		}
+ 	}
+ 
+ 	if (OCE_STA_CFON_ENABLED(hapd) || OCE_AP_ENABLED(hapd)) {
+diff --git a/src/ap/sta_info.c b/src/ap/sta_info.c
+index 9c795010e..bdb526bad 100644
+--- a/src/ap/sta_info.c
++++ b/src/ap/sta_info.c
+@@ -1429,8 +1429,8 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		dev_addr = p2p_group_get_dev_addr(hapd->p2p_group, sta->addr);
+ 
+ 	if (dev_addr)
+-		ret = os_snprintf(buf, sizeof(buf), MACSTR " p2p_dev_addr=" MACSTR,
+-			    MAC2STR(sta->addr), MAC2STR(dev_addr));
++		ret = os_snprintf(pos, end - pos, MACSTR " p2p_dev_addr=" MACSTR,
++				MAC2STR(sta->addr), MAC2STR(dev_addr));
+ 		if (os_snprintf_error(end - pos, ret))
+ 			goto free_alloc;
+ 		pos += ret;
+@@ -1459,6 +1459,9 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		char *rates, *capabilities, *assoc_req;
+ 		int assoc_req_len;
+ 		int ret;
++#ifdef CONFIG_MBO
++		struct mbo_non_pref_chan_info *info;
++#endif /* CONFIG_MBO */
+ 
+ 		dpp_pkhash_buf[0] = '\0';
+ 		keyid_buf[0] = '\0';
+@@ -1523,6 +1526,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 			os_free(rates);
+ 			os_free(capabilities);
++			os_free(assoc_req);
+ 			goto free_alloc;
+ 		}
+ 
+@@ -1538,6 +1542,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 				wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 				os_free(rates);
+ 				os_free(capabilities);
++				os_free(assoc_req);
+ 				goto free_alloc;
+ 			}
+ 			len += ret;
+@@ -1551,6 +1556,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 				wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 				os_free(rates);
+ 				os_free(capabilities);
++				os_free(assoc_req);
+ 				goto free_alloc;
+ 			}
+ 		len += ret;
+@@ -1567,6 +1573,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 					wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 					os_free(rates);
+ 					os_free(capabilities);
++					os_free(assoc_req);
+ 					goto free_alloc;
+ 				}
+ 				len += ret;
+@@ -1579,6 +1586,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 				wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 				os_free(rates);
+ 				os_free(capabilities);
++				os_free(assoc_req);
+ 				goto free_alloc;
+ 			}
+ 			len += ret;
+@@ -1591,6 +1599,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 				wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
+ 				os_free(rates);
+ 				os_free(capabilities);
++				os_free(assoc_req);
+ 				goto free_alloc;
+ 			}
+ 			len += ret;
+@@ -1633,8 +1642,40 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 		}
+ 		pos += ret;
+ 
+-		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s%s%s",
+-			buf, ip_addr, signal_strength, rates, capabilities, keyid_buf, dpp_pkhash_buf);
++#ifdef CONFIG_MBO
++		ret = sprintf_s(pos, end - pos, "cell_capa=%d", sta->cell_capa);
++		if (ret <= 0) {
++			wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++			os_free(rates);
++			os_free(capabilities);
++			os_free(assoc_req);
++			goto free_alloc;
++		}
++		pos += ret;
++
++		for (info = sta->non_pref_chan; info; info = info->next) {
++			ret = sprintf_s(pos, end - pos, " non_pref_chan=%u:",
++					info->op_class);
++			if (ret <= 0)
++				break;
++			pos += ret;
++			for (i = 0; i < info->num_channels; i++) {
++				ret = sprintf_s(pos, end - pos, "%u%s", info->channels[i],
++						i + 1 < info->num_channels ? "," : ":");
++				if (ret <= 0)
++					break;
++				pos += ret;
++			}
++		  ret = sprintf_s(pos, end - pos, "%u:%u ",
++				  info->pref, info->reason_code);
++		  if (ret <= 0)
++			  break;
++		  pos += ret;
++		}
++#endif
++
++		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_CONNECTED "%s%s%s%s%s%s%s%s",
++			buf, ip_addr, signal_strength, rates, capabilities, assoc_req, keyid_buf, dpp_pkhash_buf);
+ 
+ 		if (hapd->msg_ctx_parent &&
+ 		    hapd->msg_ctx_parent != hapd->msg_ctx)
+@@ -1644,6 +1685,7 @@ void ap_sta_set_authorized(struct hostapd_data *hapd, struct sta_info *sta,
+ 					  dpp_pkhash_buf);
+ 		os_free(rates);
+ 		os_free(capabilities);
++		os_free(assoc_req);
+ 	} else {
+ 		wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_DISCONNECTED "%s", buf);
+ 
+diff --git a/src/ap/wnm_ap.c b/src/ap/wnm_ap.c
+index b0e6e104a..ecb1b73d7 100644
+--- a/src/ap/wnm_ap.c
++++ b/src/ap/wnm_ap.c
+@@ -588,9 +588,6 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 	btm_req_nr_list_len = nei_rep_tmp - nei_rep;
+ 
+ #ifdef CONFIG_MBO
+-#if 0
+-	/* ToDo: MBO */
+-
+ 	/* MBO: Add Cellular Preference value for Multimode stations */
+ 	if (hapd->conf->mbo_enabled && hapd->conf->mbo_cell_aware) {
+ 		struct sta_info *sta = ap_get_sta(hapd, addr);
+@@ -602,7 +599,6 @@ static void ieee802_11_rx_bss_trans_mgmt_query(struct hostapd_data *hapd,
+ 			mbo_len = 3;
+ 		}
+ 	}
+-#endif
+ #endif /* CONFIG_MBO */
+ 
+ 	ieee802_11_send_bss_trans_mgmt_request(hapd, addr, dialog_token,
+@@ -720,6 +716,109 @@ static void ieee802_11_rx_bss_trans_mgmt_resp(struct hostapd_data *hapd,
+ 		    pos, end - pos);
+ }
+ 
++static int ieee802_11_send_wnm_notification_resp(struct hostapd_data *hapd,
++					 const u8 *addr, u8 dialog_token)
++{
++	struct ieee80211_mgmt *mgmt;
++	int res;
++	size_t len;
++
++	mgmt = os_zalloc(sizeof(*mgmt));
++	if (mgmt == NULL) {
++		wpa_printf(MSG_DEBUG, "MLME: Failed to allocate buffer for "
++			   "WNM-notification Response action frame");
++		return -1;
++	}
++	os_memcpy(mgmt->da, addr, ETH_ALEN);
++	os_memcpy(mgmt->sa, hapd->own_addr, ETH_ALEN);
++	os_memcpy(mgmt->bssid, hapd->own_addr, ETH_ALEN);
++	mgmt->frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT, WLAN_FC_STYPE_ACTION);
++	mgmt->u.action.category = WLAN_ACTION_WNM;
++	mgmt->u.action.u.wnm_notification_resp.action = WNM_NOTIFICATION_RESP;
++	mgmt->u.action.u.wnm_notification_resp.dialogtoken = dialog_token;
++	mgmt->u.action.u.wnm_notification_resp.status_code = 0; /* Notification Acknowledged */
++	len = 1 + sizeof(mgmt->u.action.u.wnm_notification_resp);
++
++	res = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
++				      mgmt->da, &mgmt->u.action.category, len);
++
++	if (!res)
++		wpa_printf(MSG_DEBUG, "Successfully sent WNM-Notification Response frame");
++	else
++		wpa_printf(MSG_DEBUG, "Failed to send WNM-Notification Response frame");
++
++	os_free(mgmt);
++
++	return res;
++}
++
++static void report_notification_req(struct hostapd_data *hapd, const u8 *addr)
++{
++	char *buf, *pos, *end;
++	int buflen = 512;
++	int ret;
++	struct sta_info *sta;
++#ifdef CONFIG_MBO
++	struct mbo_non_pref_chan_info *info;
++	u8 i;
++#endif /* CONFIG_MBO */
++
++	sta = ap_get_sta(hapd, addr);
++	if (!sta)
++		return;
++
++	buf = os_malloc(buflen);
++	if (!buf)
++		return;
++	pos = buf;
++	end = buf + buflen;
++
++	ret = sprintf_s(pos, end - pos, MACSTR, MAC2STR(sta->addr));
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		goto free_alloc;
++	}
++	pos += ret;
++
++#ifdef CONFIG_MBO
++	ret = sprintf_s(pos, end - pos, " cell_capa=%d ", sta->cell_capa);
++	if (ret <= 0) {
++		wpa_printf(MSG_ERROR, "%s: sprintf_s error %d", __func__, ret);
++		goto free_alloc;
++	}
++	pos += ret;
++
++	for (info = sta->non_pref_chan; info; info = info->next) {
++		ret = sprintf_s(pos, end - pos, "non_pref_chan=%u:",
++				info->op_class);
++		if (ret <= 0)
++			break;
++		pos += ret;
++		for (i = 0; i < info->num_channels; i++) {
++			ret = sprintf_s(pos, end - pos, "%u%s", info->channels[i],
++					i + 1 < info->num_channels ? "," : ":");
++			if (ret <= 0)
++				break;
++			pos += ret;
++		}
++		ret = sprintf_s(pos, end - pos, "%u:%u ",
++				info->pref, info->reason_code);
++		if (ret <= 0)
++			break;
++		pos += ret;
++	}
++#endif
++
++	wpa_msg(hapd->msg_ctx, MSG_INFO, AP_STA_WNM_NOTIF "%s", buf);
++
++	if (hapd->msg_ctx_parent &&
++	    hapd->msg_ctx_parent != hapd->msg_ctx)
++		wpa_msg_no_global(hapd->msg_ctx_parent, MSG_INFO,
++				AP_STA_WNM_NOTIF "%s", buf);
++
++free_alloc:
++	os_free(buf);
++}
+ 
+ static void wnm_beacon_protection_failure(struct hostapd_data *hapd,
+ 					  const u8 *addr)
+@@ -772,6 +871,9 @@ static void ieee802_11_rx_wnm_notification_req(struct hostapd_data *hapd,
+ 		mbo_ap_wnm_notification_req(hapd, addr, buf, len);
+ 		break;
+ 	}
++
++	report_notification_req(hapd, addr);
++	ieee802_11_send_wnm_notification_resp(hapd, addr, dialog_token);
+ }
+ 
+ 
+diff --git a/src/common/ieee802_11_defs.h b/src/common/ieee802_11_defs.h
+index 8ba020ca7..52a79adc7 100644
+--- a/src/common/ieee802_11_defs.h
++++ b/src/common/ieee802_11_defs.h
+@@ -1076,6 +1076,18 @@ struct ieee80211_mgmt {
+ 					le16 keydata_len;
+ 					u8 variable[];
+ 				} STRUCT_PACKED wnm_sleep_resp;
++				struct {
++					u8 action;
++					u8 dialogtoken;
++					u8 type;
++					u8 variable[];
++				} STRUCT_PACKED wnm_notification_req;
++				struct {
++					u8 action;
++					u8 dialogtoken;
++					u8 status_code;
++					u8 variable[];
++				} STRUCT_PACKED wnm_notification_resp;
+ 				struct {
+ 					u8 action;
+ 					u8 variable[];
+diff --git a/src/common/wpa_ctrl.h b/src/common/wpa_ctrl.h
+index 922d49c9e..11c21c066 100644
+--- a/src/common/wpa_ctrl.h
++++ b/src/common/wpa_ctrl.h
+@@ -440,6 +440,8 @@ extern "C" {
+ #define UNCONNECTED_STA_RSSI "UNCONNECTED-STA-RSSI "
+ #define AP_PROBE_REQ_RECEIVED "AP-PROBE-REQ-RECEIVED "
+ 
++#define AP_STA_WNM_NOTIF "AP-STA-WNM-NOTIF "
++
+ #define WPA_EVENT_BSS_COLOR_COLLISION "CTRL-EVENT-BSS-COLOR-COLLISION "
+ #define WPA_EVENT_CCA_STARTED_NOTIFY "CTRL-EVENT-CCA-STARTED-NOTIFY "
+ #define WPA_EVENT_CCA_ABORTED_NOTIFY "CTRL-EVENT-CCA-ABORTED-NOTIFY "
+-- 
+2.43.0
+
