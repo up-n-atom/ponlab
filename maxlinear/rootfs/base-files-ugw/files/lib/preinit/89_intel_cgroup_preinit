@@ -1,0 +1,132 @@
+#!/bin/sh
+#
+# Cgroupv2 mount and pre-slicing based on input config file with
+# low, default and high configuration.
+#
+#
+
+# Add cgroups release agent script
+add_release_agent()
+{
+	local scpath="$1"
+	local group="$2"
+	echo -en "#!/bin/sh\nrmdir /sys/fs/cgroup/${group}/\$1\n" > ${scpath}/${group}_rel.sh
+	echo "${scpath}/${group}_rel.sh" > /sys/fs/cgroup/${group}/release_agent
+	chmod 500 ${scpath}/${group}_rel.sh
+}
+
+#
+# Un-mount any CGroup v1 and remount as CGroup v2. Auto finds supported v2 Groups from
+# proc entry '/proc/cgroups'. Combined few groups by using single mount path for
+# cpu & cpuacct as well as net_cls & net_prio. This is configurable under v2_unify macro.
+#
+cgroup_v2_mount() {
+	local ival jval kval val;
+	local mnt_opts="rw,nosuid,nodev,noexec,relatime"
+	local v2_unify="cpu,cpuacct net_cls,net_prio"
+	local v2_supported="$(sed -ne 's/[[:space:]].*//g' -e '/#/!p' /proc/cgroups)"
+	local found;
+
+	umount /sys/fs/cgroup/
+
+	mount -t tmpfs tmpfs /sys/fs/cgroup -orw,nosuid,nodev,noexec,mode=755
+	mkdir -m 0500 -p /tmp/cg_scripts
+
+	cd /sys/fs/cgroup/ && {
+		for ival in $v2_supported; do
+			found="";
+			for jval in ${v2_unify//,/ }; do
+				if [ "$ival" = "$jval" ]; then
+					found=1;
+					break;
+				fi
+			done
+			if [ -z "$found" ]; then
+				[ "$ival" = "cpuset" ] && val="$ival,clone_children" || val=$ival;
+				mkdir -p $ival;
+				mount -t cgroup cgroup /sys/fs/cgroup/$ival/ -o$mnt_opts,$val;
+				add_release_agent "/tmp/cg_scripts" "$ival"
+			fi
+		done
+		for ival in $v2_unify; do
+			lngroup=""
+			for jval in ${ival//,/ }; do
+				for kval in $v2_supported; do
+					if [ "$jval" = "$kval" ]; then
+						lngroup="$lngroup,$jval"
+						break;
+					fi
+				done
+			done
+			lngroup="${lngroup/,}"
+			if [ -n "$lngroup" ]; then
+				mkdir -p $lngroup;
+				for jval in ${lngroup//,/ }; do
+					ln -sf $lngroup $jval;
+				done
+				mount -t cgroup cgroup /sys/fs/cgroup/$lngroup/ -o$mnt_opts,$lngroup;
+				add_release_agent "/tmp/cg_scripts" "$lngroup"
+			fi
+		done
+	}
+}
+
+#
+# Creates pre-defined slices with separate prameters under CGroups v2 mount points.
+# Can be customized via mandatory input config file '/etc/cgroups.conf.default'
+# For example, create cpu/high/ with high cpu share values, memory/low with low memory
+# to use values, etc. Sample config file syntax provided below.
+#
+#   resources="cpu memory" # Specify CGroup v2 directory names here which needs slicing.
+#   resource_slices="low default high" # Specify slices. Any name can be used.
+#
+#   default_slice="default" # Only one default value here. Pid 1 will be added in this slice.
+#
+# Below are parameters to tune under each group. Specify as <groupname>_attributes="<parameters>"
+#   cpu_attributes="shares"             #You can specify more number of parameters to tune.
+#   memory_attributes="limit_in_bytes"
+#
+# Below are the parameter values to be used. Specify as <slicename>_<groupname>_<parameter>=<value>
+#   low_cpu_shares=2
+#   default_cpu_shares=80
+#   high_cpu_shares=160
+#
+#   low_memory_limit_in_bytes=31457280
+#   default_memory_limit_in_bytes=200000000
+#   high_memory_limit_in_bytes=400000000
+#
+cgroup_v2_configure() {
+	local ival jval kval _val _tmp;
+
+	cgroup_v2_mount;
+
+	if [ -f /etc/cgroups.conf.default ]; then
+		. /etc/cgroups.conf.default
+	else
+		return;
+	fi
+
+	cd /sys/fs/cgroup/ && {
+		for ival in $resources; do
+			if [ "$ival" = "memory" ]; then
+				echo 1 > $ival/memory.use_hierarchy
+			fi
+			for jval in $resource_slices; do
+				mkdir -p $ival/$jval;
+				eval _tmp='$'${ival}_attributes;
+				for kval in $_tmp; do
+					eval _val='$'${jval}_${ival}_${kval}
+					if [ -n "$_val" ]; then
+						echo $_val > ${ival}/${jval}/${ival}.${kval}
+					fi
+				done;
+				if [ -n "$default_slice" -a "$default_slice" = "$jval" ]; then
+					echo $$ >> $ival/$default_slice/tasks
+					echo 1 >> $ival/$default_slice/tasks
+				fi
+			done;
+		done;
+	}
+}
+
+boot_hook_add preinit_main cgroup_v2_configure

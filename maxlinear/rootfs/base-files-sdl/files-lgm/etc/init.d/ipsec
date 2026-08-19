@@ -1,0 +1,550 @@
+#!/bin/sh /etc/rc.common
+
+START=90
+STOP=10
+
+USE_PROCD=1
+PROG=/usr/lib/ipsec/starter
+
+. $IPKG_INSTROOT/lib/functions.sh
+. $IPKG_INSTROOT/lib/functions/network.sh
+
+IPSEC_SECRETS_FILE=/var/ipsec/ipsec.secrets
+IPSEC_CONN_FILE=/var/ipsec/ipsec.conf
+STRONGSWAN_CONF_FILE=/var/ipsec/strongswan.conf
+
+WAIT_FOR_INTF=0
+
+tunel_no=1
+g_all_my_ip=""
+g_my_ip=""
+
+prepare_env() {
+    mkdir -p /var/ipsec
+    #TODO:clean /var/ipsec/config files
+    file_reset $IPSEC_SECRETS_FILE
+    file_reset $IPSEC_CONN_FILE
+    file_reset $STRONGSWAN_CONF_FILE
+    WanUpFlag=0 
+    
+    config_load ipsec
+    config_foreach getAllMyIp remote
+
+    if [ $WanUpFlag -ne 1 ];then
+        echo "Wan down no configuration required."
+        return 0;
+    fi
+    config_foreach config_ipsec ipsec
+    config_foreach config_remote remote
+
+    #additional params
+    keylife="20"
+    rekeymargin="3"
+    echo "config setup" >> $IPSEC_CONN_FILE
+    echo "conn %default" >> $IPSEC_CONN_FILE
+    echo -n "	keylife=$keylife" >> $IPSEC_CONN_FILE
+    echo "m" >> $IPSEC_CONN_FILE
+    echo -n "	rekeymargin=$rekeymargin" >> $IPSEC_CONN_FILE
+    echo "m" >> $IPSEC_CONN_FILE
+    echo "	keyingtries=1" >> $IPSEC_CONN_FILE
+    echo "	authby=secret" >> $IPSEC_CONN_FILE #check hardcode
+    echo "	replay_window=1024" >> $IPSEC_CONN_FILE
+    echo "	mobike=no" >> $IPSEC_CONN_FILE
+    echo "	auto=start" >> $IPSEC_CONN_FILE
+    echo "	hw_offload=yes" >> $IPSEC_CONN_FILE
+    config_foreach TunnelConfig remote
+    procd_open_data
+    json_add_array firewall
+    config_foreach SetIptableRules remote
+    json_close_array
+    procd_close_data
+}
+
+getAllMyIp() {
+    local enabled
+    local conn_ifname
+    local uci_name
+    local remote_ip
+    local ip_version=4
+
+    config_get_bool enabled "$1" enabled  
+    if [ $enabled -ne 1 ]; then
+        return 0;
+    fi
+
+    config_get remote_ip "$1" remote_ip
+    echo $remote_ip | grep -q ':'
+    if [ $? -eq 0 ]; then
+        ip_version=6
+    fi
+
+    config_get conn_ifname "$1" conn_ifname
+
+    if [[ ${conn_ifname::6} == "pppoe-" || ${conn_ifname::6} == "pppoa-" ]];
+    then
+        uci_name=${conn_ifname#*-}
+    else
+        uci_name=`echo $(uci -P/var/state show | grep "\.ifname='$conn_ifname'" | awk -F '.' '{print $2}')`
+    fi
+
+    if [ -z "$uci_name" ]
+        then
+        return 0;
+    fi
+
+    json_init
+    if [ $ip_version -eq 6 ]; then
+        json_load "$(ifstatus ${uci_name}v6)"
+    else
+        json_load "$(ifstatus $uci_name)"
+    fi
+  
+    json_get_var up "up"
+    if [ $up -eq 1 ]; then
+        json_get_var conn_ifname "l3_device"
+        if [ $ip_version -eq 6 ]; then
+            json_get_keys _ipv6_address_entries "ipv6-address"
+            if [ -n "$_ipv6_address_entries" ]; then
+                json_select "ipv6-address"
+                json_select 1
+                json_get_var ipaddr "address"
+                g_my_ip=$ipaddr;
+                eval g_all_my_ip="'$g_all_my_ip'$ipaddr\;"
+                WanUpFlag=1;
+            fi
+        else
+            json_get_keys _ipv4_address_entries "ipv4-address"
+            if [ -n "$_ipv4_address_entries" ]; then
+                json_select "ipv4-address"
+                json_select 1
+                json_get_var ipaddr "address"
+                g_my_ip=$ipaddr;
+                eval g_all_my_ip="'$g_all_my_ip'$ipaddr\;"
+                WanUpFlag=1;
+            fi
+         fi
+    else
+        return 0;
+    fi
+}
+
+
+TunnelConfig() {
+  
+    config_get_bool enabled 		"$1" enabled 0
+    if [ $enabled -eq 0 ]; then
+        return 0;
+    fi
+  
+    config_get acceptable_kmp     	"$1" acceptable_kmp
+    config_get tunnel_name     		"$1" tunnel_name
+    config_get remote_ip			"$1" remote_ip
+    config_get kmp_enc_alg		"$1" kmp_enc_alg
+    config_get kmp_prf_alg		"$1" kmp_prf_alg
+    config_get kmp_hash_alg		"$1" kmp_hash_alg
+    config_get exchange_mode      	"$1" exchange_mode
+    config_get kmp_dh_group      		"$1" kmp_dh_group
+    config_get enc_dh_group      		"$1" enc_dh_group
+    config_get enc_esn           		"$1" enc_esn
+    config_get kmp_auth_method		"$1" kmp_auth_method
+    config_get pre_shared_key     	"$1" pre_shared_key "abcde"
+    config_get src			"$1" src
+    config_get dst 			"$1" dst
+    config_get encryption_algorithm 	"$1" encryption_algorithm
+    config_get hash_algorithm 		"$1" hash_algorithm
+    config_get ipsec_sa_lifetime_time	"$1" ipsec_sa_lifetime_time "60"
+    config_get tunnel_type	"$1" tunnel_type "tunnel"
+
+    kmp_auth_method="psk";  
+    esn=""
+    enc_dh="-$enc_dh_group"
+
+    if [ $enc_esn -eq 1  -a $acceptable_kmp = ikev2 ]; then
+    esn="-esn"
+    fi
+
+    if [ $enc_dh_group = "none" ]; then
+    enc_dh=""
+    fi
+
+
+    echo -n "$g_my_ip $remote_ip : PSK $pre_shared_key" > $IPSEC_SECRETS_FILE;
+
+    echo "" >> $IPSEC_CONN_FILE
+    echo "conn tunnel${tunel_no}" >> $IPSEC_CONN_FILE
+    echo -n "	ikelifetime=$ipsec_sa_lifetime_time" >> $IPSEC_CONN_FILE
+    echo "m" >> $IPSEC_CONN_FILE
+    if [ $acceptable_kmp = ikev2 ]; then
+        echo "	ike=$kmp_enc_alg-$kmp_hash_alg-$kmp_prf_alg-$kmp_dh_group!" >> $IPSEC_CONN_FILE
+    else
+        echo "	ike=$kmp_enc_alg-$kmp_hash_alg-$kmp_dh_group!" >> $IPSEC_CONN_FILE
+    fi
+    echo "	esp=$encryption_algorithm-$hash_algorithm$enc_dh$esn!" >> $IPSEC_CONN_FILE
+    echo "	keyexchange=$acceptable_kmp" >> $IPSEC_CONN_FILE
+    echo "	left=$g_my_ip" >> $IPSEC_CONN_FILE
+    if [ $tunnel_type != "transport" ]; then
+       echo "	leftsubnet=$src" >> $IPSEC_CONN_FILE
+    fi
+    echo "	leftid=$g_my_ip" >> $IPSEC_CONN_FILE
+    echo "	leftfirewall=yes" >> $IPSEC_CONN_FILE
+    echo "	right=$remote_ip" >> $IPSEC_CONN_FILE
+    if [ $tunnel_type != "transport" ]; then
+       echo "	rightsubnet=$dst" >> $IPSEC_CONN_FILE
+    fi
+    echo "	rightid=$remote_ip" >> $IPSEC_CONN_FILE
+    echo "	type=$tunnel_type" >> $IPSEC_CONN_FILE
+    tunel_no=`expr ${tunel_no} + 1`
+}
+
+
+
+SetIptableRules ()
+{
+    local ip_version=4
+
+    config_get_bool enabled               "$1" enabled 0
+    if [ $enabled -eq 0 ]; then
+        return 0;
+    fi
+
+    config_get remote_ip                  "$1" remote_ip
+    config_get src			"$1" src
+    config_get dst			"$1" dst
+
+    echo $remote_ip | grep -q ':'
+    if [ $? -eq 0 ]; then
+        ip_version=6
+    fi
+
+    if [ $ip_version -eq 6 ]; then
+        json_add_object ""
+        json_add_string type rule
+        json_add_string src "*"
+        json_add_string family ipv6
+        json_add_string src_ip $remote_ip
+        json_add_string dest_ip $g_my_ip
+        json_add_string target ACCEPT
+        json_close_object
+    else    
+        json_add_object ""
+        json_add_string type rule
+        json_add_string src "*"
+        json_add_string family ipv4
+        json_add_string src_ip $remote_ip
+        json_add_string dest_ip $g_my_ip
+        json_add_string target ACCEPT
+        json_close_object
+        json_add_object ""
+        json_add_string command "iptables -t nat -D POSTROUTING -s $src -d $dst -m policy --dir out --pol  ipsec --proto esp --mode tunnel -j ACCEPT" 
+        json_close_object
+        
+        json_add_object ""
+        json_add_string command "iptables -t nat -I POSTROUTING -s $src -d $dst -m policy --dir out --pol  ipsec --proto esp --mode tunnel -j ACCEPT" 
+        json_close_object
+    fi
+
+}
+
+file_reset() {
+    > "$1"
+}
+
+xappend() {
+    local file="$1"
+    shift
+
+    echo "${@}" >> "${file}"
+}
+
+ipsec_xappend() {
+    xappend "${IPSEC_CONN_FILE}" "$@"
+}
+
+swan_xappend() {
+    xappend "${STRONGSWAN_CONF_FILE}" "$@"
+}
+
+secret_xappend() {
+    xappend "${IPSEC_SECRETS_FILE}" "$@"
+}
+
+warning() {
+    echo "WARNING: $@" >&2
+}
+
+add_crypto_proposal() {
+    local encryption_algorithm
+    local hash_algorithm
+    local dh_group
+
+    config_get encryption_algorithm  "$1" encryption_algorithm
+    config_get hash_algorithm        "$1" hash_algorithm
+    config_get dh_group              "$1" dh_group
+
+    [ -n "${encryption_algorithm}" ] && \
+        crypto="${crypto:+${crypto},}${encryption_algorithm}${hash_algorithm:+-${hash_algorithm}}${dh_group:+-${dh_group}}"
+}
+
+set_crypto_proposal() {
+    local conf="$1"
+    local proposal
+
+    crypto=""
+
+    config_get crypto_proposal "$conf" crypto_proposal ""
+    for proposal in $crypto_proposal; do
+        add_crypto_proposal "$proposal"
+    done
+
+    [ -n "${crypto}" ] && {
+        local force_crypto_proposal
+
+        config_get_bool force_crypto_proposal "$conf" force_crypto_proposal
+    
+        [ "${force_crypto_proposal}" = "1" ] && crypto="${crypto}!"
+    }
+
+    crypto_proposal="${crypto}"
+}
+
+config_conn() {
+    # Generic ipsec conn section shared by tunnel and transport
+    local mode
+    local local_subnet
+    local local_nat
+    local local_sourceip
+    local local_updown
+    local local_firewall
+    local remote_subnet
+    local remote_sourceip
+    local remote_updown
+    local remote_firewall
+    local ikelifetime
+    local lifetime
+    local margintime
+    local keyingtries
+    local dpdaction
+    local dpddelay
+    local inactivity
+    local keyexchange
+
+    config_get mode                     "$1"           mode "route"
+    config_get local_subnet             "$1"           local_subnet ""
+    config_get local_nat                "$1"           local_nat ""
+    config_get local_sourceip           "$1"           local_sourceip ""
+    config_get local_updown             "$1"           local_updown ""
+    config_get local_firewall           "$1"           local_firewall ""
+    config_get remote_subnet            "$1"           remote_subnet ""
+    config_get remote_sourceip          "$1"           remote_sourceip ""
+    config_get remote_updown            "$1"           remote_updown ""
+    config_get remote_firewall          "$1"           remote_firewall ""
+    config_get ikelifetime              "$1"           ikelifetime "3h"
+    config_get lifetime                 "$1"           lifetime "1h"
+    config_get margintime               "$1"           margintime "9m"
+    config_get keyingtries              "$1"           keyingtries "3"
+    config_get dpdaction                "$1"           dpdaction "none"
+    config_get dpddelay                 "$1"           dpddelay "30s"
+    config_get inactivity               "$1"           inactivity
+    config_get keyexchange              "$1"           keyexchange "ikev2"
+
+    [ -n "$local_nat" ] && local_subnet=$local_nat
+
+    ipsec_xappend "conn $config_name-$1"
+    ipsec_xappend "  left=%any"
+    ipsec_xappend "  right=$remote_gateway"
+
+    [ -n "$local_sourceip" ] && ipsec_xappend "  leftsourceip=$local_sourceip"
+    [ -n "$local_subnet" ] && ipsec_xappend "  leftsubnet=$local_subnet"
+
+    [ -n "$local_firewall" ] && ipsec_xappend "  leftfirewall=$local_firewall"
+    [ -n "$remote_firewall" ] && ipsec_xappend "  rightfirewall=$remote_firewall"
+
+    ipsec_xappend "  ikelifetime=$ikelifetime"
+    ipsec_xappend "  lifetime=$lifetime"
+    ipsec_xappend "  margintime=$margintime"
+    ipsec_xappend "  keyingtries=$keyingtries"
+    ipsec_xappend "  dpdaction=$dpdaction"
+    ipsec_xappend "  dpddelay=$dpddelay"
+
+    [ -n "$inactivity" ] && ipsec_xappend "  inactivity=$inactivity"
+
+    if [ "$auth_method" = "psk" ]; then
+        ipsec_xappend "  leftauth=psk"
+        ipsec_xappend "  rightauth=psk"
+
+        [ "$remote_sourceip" != "" ] && ipsec_xappend "  rightsourceip=$remote_sourceip"
+        [ "$remote_subnet" != "" ] && ipsec_xappend "  rightsubnet=$remote_subnet"
+
+        ipsec_xappend "  auto=$mode"
+    else
+        warning "AuthenticationMethod $auth_method not supported"
+    fi
+
+    [ -n "$local_identifier" ] && ipsec_xappend "  leftid=$local_identifier"
+    [ -n "$remote_identifier" ] && ipsec_xappend "  rightid=$remote_identifier"
+    [ -n "$local_updown" ] && ipsec_xappend "  leftupdown=$local_updown"
+    [ -n "$remote_updown" ] && ipsec_xappend "  rightupdown=$remote_updown"
+    ipsec_xappend "  keyexchange=$keyexchange"
+
+    set_crypto_proposal "$1"
+    [ -n "${crypto_proposal}" ] && ipsec_xappend "  esp=$crypto_proposal"
+    [ -n "${ike_proposal}" ] && ipsec_xappend "  ike=$ike_proposal"
+}
+
+config_tunnel() {
+    config_conn "$1"
+
+    # Specific for the tunnel part
+    ipsec_xappend "  type=tunnel"
+}
+
+config_transport() {
+    config_conn "$1"
+
+    # Specific for the transport part
+    ipsec_xappend "  type=transport"
+}
+
+config_remote() {
+    local enabled
+    local gateway
+    local pre_shared_key
+    local auth_method
+
+    config_name=$1
+
+    config_get_bool enabled "$1" enabled 0
+    [ $enabled -eq 0 ] && return
+
+    config_get gateway           "$1" gateway
+    config_get pre_shared_key    "$1" pre_shared_key
+    config_get auth_method       "$1" authentication_method
+    config_get local_identifier  "$1" local_identifier ""
+    config_get remote_identifier "$1" remote_identifier ""
+
+    [ "$gateway" = "any" ] && remote_gateway="%any" || remote_gateway="$gateway"
+
+    [ -z "$local_identifier" ] && {
+        local ipdest
+
+        [ "$remote_gateway" = "%any" ] && ipdest="1.1.1.1" || ipdest="$remote_gateway"
+        local_gateway=`ip route get $ipdest | awk -F"src" '/src/{gsub(/ /,"");print $2}'`
+    }
+
+    [ -n "$local_identifier" ] && secret_xappend -n "$local_identifier " || secret_xappend -n "$local_gateway "
+    [ -n "$remote_identifier" ] && secret_xappend -n "$remote_identifier " || secret_xappend -n "$remote_gateway "
+
+    secret_xappend ": PSK \"$pre_shared_key\""
+
+    set_crypto_proposal "$1"
+    ike_proposal="$crypto_proposal"
+
+    config_list_foreach "$1" tunnel config_tunnel
+
+    config_list_foreach "$1" transport config_transport
+
+    ipsec_xappend ""
+}
+
+config_ipsec() {
+    local debug
+    local rtinstall_enabled
+    local routing_tables_ignored
+    local routing_table
+    local routing_table_id
+    local interface
+    local device_list
+
+    ipsec_xappend "# generated by /etc/init.d/ipsec"
+    ipsec_xappend "version 2"
+    ipsec_xappend ""
+
+    secret_xappend "# generated by /etc/init.d/ipsec"
+
+    config_get debug "$1" debug 0
+    config_get_bool rtinstall_enabled "$1" rtinstall_enabled 1
+    [ $rtinstall_enabled -eq 1 ] && install_routes=yes || install_routes=no
+
+    # prepare extra charon config option ignore_routing_tables
+    for routing_table in $(config_get "$1" "ignore_routing_tables"); do
+        if [ "$routing_table" -ge 0 ] 2>/dev/null; then
+            routing_table_id=$routing_table
+        else
+            routing_table_id=$(sed -n '/[ \t]*[0-9]\+[ \t]\+'$routing_table'[ \t]*$/s/[ \t]*\([0-9]\+\).*/\1/p' /etc/iproute2/rt_tables)
+        fi
+
+        [ -n "$routing_table_id" ] && append routing_tables_ignored "$routing_table_id"
+    done
+
+    local interface_list=$(config_get "$1" "interface")
+    if [ -z "$interface_list" ]; then
+        WAIT_FOR_INTF=0
+    else
+        for interface in $interface_list; do
+            network_get_device device $interface
+            [ -n "$device" ] && append device_list "$device" ","
+        done
+        [ -n "$device_list" ] && WAIT_FOR_INTF=0 || WAIT_FOR_INTF=1
+    fi
+
+    swan_xappend "# generated by /etc/init.d/ipsec"
+    swan_xappend "charon {"
+    swan_xappend "  load_modular = yes"
+    swan_xappend "  install_routes = $install_routes"
+    [ -n "$routing_tables_ignored" ] && swan_xappend "  ignore_routing_tables = $routing_tables_ignored"
+    [ -n "$device_list" ] && swan_xappend "  interfaces_use = $device_list"
+    swan_xappend "    plugins {"
+    swan_xappend "      include /etc/strongswan.d/charon/*.conf"
+    swan_xappend "    }"
+    swan_xappend "  syslog {"
+    swan_xappend "    identifier = ipsec"
+    swan_xappend "    daemon {"
+    swan_xappend "      default = $debug"
+    swan_xappend "    }"
+    swan_xappend "    auth {"
+    swan_xappend "      default = $debug"
+    swan_xappend "    }"
+    swan_xappend "  }"
+	swan_xappend " make_before_break = yes"
+    swan_xappend "}"
+}
+
+
+
+service_running() {
+    ipsec status > /dev/null 2>&1
+}
+
+reload_service() {
+    stop
+    start
+}
+
+service_triggers() {
+    procd_add_reload_trigger "ipsec"
+    config load "ipsec"
+    procd_add_raw_trigger "interface.*" 2000 /etc/init.d/ipsec reload
+}
+
+start_service() {
+
+    procd_open_instance
+
+    prepare_env
+    procd_set_param command $PROG --daemon charon --nofork
+    procd_set_param user ipsec
+    procd_set_param capabilities /usr/share/capabilities/ipsec_cap.json
+
+    procd_set_param file $IPSEC_CONN_FILE
+    procd_append_param file $IPSEC_SECRETS_FILE
+    procd_append_param file $STRONGSWAN_CONF_FILE
+    procd_append_param file /etc/strongswan.d/*.conf
+    procd_append_param file /etc/strongswan.d/charon/*.conf
+
+    procd_set_param respawn
+
+    procd_close_instance
+}
+service_started() {
+    procd_send_signal firewall '*' SIGUSR1
+}

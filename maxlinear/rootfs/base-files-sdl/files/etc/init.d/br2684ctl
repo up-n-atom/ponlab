@@ -1,0 +1,160 @@
+#!/bin/sh /etc/rc.common
+
+START=30
+USE_PROCD=1
+
+start_daemon() {
+	local cfg="$1"
+	local flag=0
+
+	local atmdev disabled
+
+	config_get_bool disabled "$cfg" disabled 0
+	[ "$disabled" -eq 1 ] && return
+
+	config_get atmdev "$cfg" atmdev 0
+
+	local nameprefix
+	config_get nameprefix "$cfg" nameprefix "nas"
+
+	local unit
+	config_get unit "$cfg" unit 0
+
+	local vpi
+	config_get vpi "$cfg" vpi 8
+
+	local vci
+	config_get vci "$cfg" vci 35
+
+	local encaps
+	config_get encaps "$cfg" encaps
+
+	case "$encaps" in
+		1|vc) encaps=1;;
+		*) encaps=0;;
+	esac
+
+	local payload
+	config_get payload "$cfg" payload
+
+	case "$payload" in
+		0|routed) payload=0;;
+		*) payload=1;;
+	esac
+
+	local qos
+	config_get qos "$cfg" qos
+
+	local sendsize
+	config_get sendsize "$cfg" sendsize
+
+	check_pvc="$(echo "$pvc_list"|sed -n '/nas'$unit':/{s/.*vcc \(.*\):.*/\1/;p}')";
+	if [ -n "$check_pvc" ]; then
+		tmp_pvc="$(echo "$pvc_list"|sed '/nas'$unit':/d')";
+		pvc_list="$tmp_pvc";
+
+		check_pvc="${check_pvc#*.}"
+		old_vpi="${check_pvc%.*}"
+		old_vci="${check_pvc#*.}"
+		if [ "$old_vpi" = "$vpi" -a "$old_vci" = "$vci" ]; then
+			flag=1
+		else
+			ubus call service delete '{"name": "br2684ctl", "instance": "'$cfg'" }'
+		fi
+	else
+		flag=1
+	fi
+	if [ "$flag" = "1" ]; then 
+		found=
+		for device in /sys/class/atm/atm-device-*; do
+			[ -d "$device" ] || break
+			[ "$(cat $device/atmindex)" = "$atmdev" ] || continue
+			found=1
+			break
+		done
+
+		[ -n "$found" ] || return
+		found=
+		for line in $(cat /tmp/status/dsl | grep link_encapsulation_used); do
+			[ -z $(echo "$line" | grep ATM) ] && continue
+			found=1
+			break
+		done
+		dsl_line_stat=$(cat /tmp/dsl_status 2>/dev/null);
+		[ -n $found  -a "$dsl_line_stat" = "1" ] || return
+
+		local circuit="$atmdev.$vpi.$vci"
+
+		procd_open_instance $cfg
+		procd_set_param command \
+			/usr/sbin/br2684ctl_wrap "${nameprefix}${unit}" \
+			-n "$nameprefix" -c "$unit" -e "$encaps" -p "$payload" \
+			-a "$circuit" ${qos:+-q "$qos"} ${sendsize:+-s "$sendsize"} \
+			-S /lib/netifd/br2684-up
+		procd_set_param user nwk
+		procd_set_param capabilities /usr/share/capabilities/br2684_cap.json
+		procd_close_instance
+	fi
+}
+
+service_triggers() {
+	local script=$(readlink "$initscript")
+	local name=$(basename ${script:-$initscript})
+
+	sleep 1
+	procd_add_reload_trigger network
+	procd_add_config_trigger "config.change" "atm_up" /etc/init.d/$name reload
+	sleep 1
+	procd_add_config_trigger "config.change" "atm_down" /etc/init.d/$name reload off
+}
+
+atm_off() {
+	local cfg="$1"
+	local nameprefix
+	config_get nameprefix "$cfg" nameprefix "nas"
+	local unit
+	config_get unit "$cfg" unit 0
+
+	local pid_path="/var/run/br2684ctl-$nameprefix$unit.pid"
+
+	local pid_id=$(cat $pid_path 2>/dev/null);
+
+	if [ -z "$pid_id" ]; then
+		# If atm_off kill process is triggered before complete the start_daemon process,
+		# this 1 second delay will help to complete the start-daemon process.
+		sleep 1
+		pid_id=$(cat $pid_path 2>/dev/null);
+		logger -t br2684ctl "cfg:$1, path:$pid_path, id:$pid_id"
+	fi
+
+	procd_kill br2684ctl $cfg
+}
+
+br2684ctl_off()
+{
+	config_load network
+	config_foreach atm_off atm-bridge
+}
+
+start_service() {
+	pvc_list="$(sed 'N;s/\n/ /' /proc/net/atm/br2684)"
+	config_load network
+	config_foreach start_daemon atm-bridge
+	
+	echo $pvc_list | while read line;do
+		if [ ! -z "$line" ]; then	
+			nas_instance=$(echo $line | awk '{print $2}')
+			nas_instance=${nas_instance//nas/atm} 
+			atm_instance=${nas_instance::-1} 
+			ubus call service delete '{"name": "br2684ctl", "instance": "'$atm_instance'" }'
+		fi
+	done  
+}
+
+reload_service() {
+	if [ -n "$1" -a "$1" = "off" ]; then
+		br2684ctl_off;
+	else
+		start
+	fi
+}

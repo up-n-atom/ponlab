@@ -1,0 +1,213 @@
+#!/bin/sh
+
+lxc_group_name="lxcgrp"
+
+log_err()
+{
+	logger -t "lxc-prepare" -p daemon.err "$1"
+}
+
+# LxC Needs CGroup mounts separately and set below:-
+# echo 1 > /sys/fs/cgroup/memory/memory.use_hierarchy
+# echo 1 > /sys/fs/cgroup/cpuacct/cgroup.clone_children (optional)
+# We set above from: /lib/preinit/89_intel_cgroup_preinit
+#
+# Optional fuse (we're not doing this here):-
+# grep -q "fusectl.*/sys/fs/fuse/connections" /proc/mounts || {
+#	grep -q fusectl /proc/filesystems && mount -t fusectl fusectl /sys/fs/fuse/connections/
+# }
+#
+
+add_cgroup_entry()
+{
+	local container_user="$1"
+	local d f;
+	for d in /sys/fs/cgroup/*; do
+		f="$(basename $d)"
+		mkdir -p "$d/$container_user"
+		chown -R "$container_user" "$d/$container_user"
+	done
+}
+
+download_rootfs()
+{
+	local rootfs_targz_url="$1"
+	local container_name="$2"
+	local url_proto url_host tarpath tarname
+
+	[ -n "$rootfs_targz_url" -a -n "$container_name" ] || {
+		log_err "download_rootfs Error: Wrong arguments. Use:- download_rootfs <url> <container name>"
+		return 1;
+	}
+
+	extract_tar()
+	{
+		echo "Extracting rootfs '$1' for '${container_name}' .."
+		tar -xzf "$1" || {
+			log_err "download_rootfs Error: Failed to extract tarball '$1' for '$container_name'"
+			return 1
+		}
+		rm -f "$1"
+	}
+
+	[ -n "$rootfs_targz_url" ] || return 1
+
+	if [ -f "$rootfs_targz_url" ]; then
+		extract_tar "$rootfs_targz_url" || return 1
+	else
+		url_proto="${rootfs_targz_url/:*}"
+		url_host="${rootfs_targz_url/*\/\/}"
+		url_host="${url_host/\/*}"
+		if [ "$url_proto" = "file" ]; then
+			tarpath="${rootfs_targz_url/*:\/\/}"
+			if [ -f "$tarpath" ]; then
+				extract_tar "$tarpath" || return 1
+			else
+				log_err "Tarball file '$tarpath' not found!"
+				return 1
+			fi
+		elif [ "$url_proto" = "tftp" ]; then
+			tarpath="$(echo $rootfs_targz_url|cut -d'/' -f4-)"
+			tarname="${rootfs_targz_url/*\/}"
+			echo "Downloading rootfs tarball for '$container_name' from '${rootfs_targz_url}' .."
+			tftp -g -r "$tarpath" "$url_host" || {
+				log_err "Unable to download from $rootfs_targz_url"
+				return 1
+			}
+			extract_tar "$tarname" || return 1
+		else
+			tarname="${rootfs_targz_url/*\/}"
+			echo "Downloading rootfs tarball for '$container_name' from '${rootfs_targz_url}' .."
+			wget "$rootfs_targz_url" || {
+				log_err "Unable to download from $rootfs_targz_url"
+				return 1
+			}
+			extract_tar "$tarname" || return 1
+		fi
+	fi
+
+}
+
+prepare_container_env()
+{
+	local container_rootfs="$1"
+	local container_name="$2"
+	local rootfs_targz_url="$3"
+	local container_privilege="$4"
+	local container_user="$5"
+	local force="$6"
+
+	# Get from env uid_rootmap, gid_rootmap, uid_range and gid_range
+
+	local container_home="/tmp/lxc_homes/$container_name"
+
+	local ival dwn_status rootfs_uid rootfs_gid subuid_range subgid_range
+
+	[ -n "$container_rootfs" -a -n "$container_name" ] || {
+		log_err "Error: Invalid arguments. Use:- prepare_container_env <container rootfs path> <container name> [container tarball URL]"
+		return 1
+	}
+
+	if [ -n "$force" -a "$force" = "1" ]; then
+		rm -rf "$container_rootfs"
+	fi
+
+	rm -f "/tmp/lxc-${container_name}.log"
+
+	[ -f /opt/intel/usr/sbin/servd ] && ubus -t 30 wait_for servd
+	ubus -t 30 wait_for network.interface
+
+	if ! [ -d "$container_rootfs" ]; then
+		[ -z "$rootfs_targz_url" ] && {
+			log_err "rootfs not found for $container_name. Provide URL to download."
+			return 1
+		}
+		mkdir -p "$container_rootfs" || {
+			log_err "Unable to create '$container_rootfs'. Container base path not writable!"
+			return 1
+		}
+		cd "$container_rootfs" && {
+			download_rootfs "$rootfs_targz_url" "$container_name" || {
+				log_err "Unable to download or extract tarball for $container_name"
+				return 1
+			}
+			cd - >/dev/null
+		}
+
+		dwn_status="1";
+	fi
+
+	# We acquire a lock here as we may add user, group, subuid, subgid, lxc-usernet info etc.
+	exec 200>/tmp/lxc.lock
+	flock -x 200
+
+	if [ "$container_privilege" = "unprivileged" ]; then
+		grep -wq "$lxc_group_name" /etc/group || {
+			groupadd "$lxc_group_name"
+		}
+
+		subuid_range="${uid_rootmap}-$(($uid_rootmap + $uid_range - 1))"
+		subgid_range="${gid_rootmap}-$(($gid_rootmap + $gid_range - 1))"
+
+		[ -f /etc/subuid ] || touch /etc/subuid
+		[ -f /etc/subgid ] || touch /etc/subgid
+
+		if ! grep -wq "$container_user" /etc/passwd; then
+			# Add user.
+			useradd -M "$container_user" -G "$lxc_group_name"
+
+			# Modify subuid and subgid based on lxc config.
+			sed -i '/'"$container_user"'/d' /etc/subuid
+			sed -i '/'"$container_user"'/d' /etc/subgid
+			usermod --add-subuids $subuid_range "$container_user"
+			usermod --add-subgids $subgid_range "$container_user"
+		else
+			# Some users already exists without subuid or subgid.
+			grep -wq "${container_user}:${uid_rootmap}:${uid_range}" /etc/subuid || {
+				sed -i '/'"$container_user"'/d' /etc/subuid
+				usermod --add-subuids $subuid_range "$container_user"
+			}
+
+			grep -wq "${container_user}:${gid_rootmap}:${gid_range}" /etc/subgid || {
+				sed -i '/'"$container_user"'/d' /etc/subgid
+				usermod --add-subgids $subgid_range "$container_user"
+			}
+		fi
+
+		for ival in /usr/bin/newgidmap /usr/bin/newuidmap /usr/lib/lxc/lxc-user-nic; do
+			if ! [ -u "$ival" ]; then
+				chown :$lxc_group_name $ival;
+				chmod 4750 $ival;
+			fi;
+		done
+
+		# If downloaded now, change the rootfs owner to unprivilege container subuid and subgid"
+		rootfs_uid="$(ls -nd "$container_rootfs"|awk '{ print $3 }')"
+		rootfs_gid="$(ls -nd "$container_rootfs"|awk '{ print $4 }')"
+		if ! ([ "$rootfs_uid" = "$uid_rootmap" -a "$rootfs_gid" = "$gid_rootmap" ] && [ -z "$dwn_status" ]); then
+			chown -R $uid_rootmap:$gid_rootmap "$container_rootfs" 2>/dev/null
+		fi
+
+		add_cgroup_entry "$container_user"
+	fi
+
+	mkdir -p "$container_home"
+	chown -R "$container_user:$container_user" "$container_home"
+	chmod 750 "$container_home"
+
+	if ! [ -h "/run" ]; then
+		mkdir -p /tmp/run;
+		ln -s /tmp/run /run;
+	fi
+
+	if ! ([ -f /etc/lxc/lxc-usernet ] && grep -qw "$container_user" /etc/lxc/lxc-usernet); then
+		touch /etc/lxc/lxc-usernet
+		echo "$container_user veth br-lan 10" >> /etc/lxc/lxc-usernet
+	fi
+
+	exec 200>&-
+
+	ubus call service event '{ "type": "config.change", "data": { "package": "lxcrun_'$container_name'" }}'
+}
+
+prepare_container_env $@
