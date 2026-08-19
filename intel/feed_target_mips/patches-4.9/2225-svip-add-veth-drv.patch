@@ -1,0 +1,350 @@
+Lantiq SVIP SoC virtual ethernet driver
+
+--- a/drivers/net/ethernet/Kconfig
++++ b/drivers/net/ethernet/Kconfig
+@@ -118,6 +118,11 @@ config LANTIQ_SVIP_ETH_DRV
+ 	---help---
+ 	  Support for the ethernet switch inside the Lantiq SoC SVIP
+ 
++config LANTIQ_SVIP_VIRTUAL_ETH
++	default y
++	tristate "Lantiq SoC SVIP Virtual Ethernet driver"
++	depends on SOC_SVIP
++
+ source "drivers/net/ethernet/marvell/Kconfig"
+ source "drivers/net/ethernet/mediatek/Kconfig"
+ source "drivers/net/ethernet/mellanox/Kconfig"
+--- a/drivers/net/ethernet/Makefile
++++ b/drivers/net/ethernet/Makefile
+@@ -48,6 +48,7 @@ obj-$(CONFIG_KORINA) += korina.o
+ obj-$(CONFIG_LANTIQ_ETOP) += lantiq_etop.o
+ obj-$(CONFIG_LANTIQ_XRX200) += lantiq_xrx200.o
+ obj-$(CONFIG_LANTIQ_SVIP_ETH_DRV) += lantiq_svip.o
++obj-$(CONFIG_LANTIQ_SVIP_VIRTUAL_ETH) += lantiq_svip_virtual_eth.o
+ obj-$(CONFIG_NET_VENDOR_MARVELL) += marvell/
+ obj-$(CONFIG_NET_VENDOR_MEDIATEK) += mediatek/
+ obj-$(CONFIG_NET_VENDOR_MELLANOX) += mellanox/
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq_svip_virtual_eth.c
+@@ -0,0 +1,321 @@
++/******************************************************************************
++**
++** FILE NAME    : lantiq_svip_virtual_eth.c
++** PROJECT      : Lantiq voice co
++** MODULES      : Lantiq VINETIC-SVIP virtual ethernet driver
++** DATE         : 12 August 2014
++** AUTHOR       : Martins Pukitis
++** DESCRIPTION  : Lantiq SVIP virtual ethernet device driver
++** COPYRIGHT    : Copyright (c) 2014
++**                Lantiq Deutschland
++**
++**    This program is free software; you can redistribute it and/or modify
++**    it under the terms of the GNU General Public License as published by
++**    the Free Software Foundation; either version 2 of the License, or
++**    (at your option) any later version.
++**
++**    Adapted from Lantiq VINETIC-SVIP virtual ethernet driver written by
++**    Risto Minev.
++**
++** HISTORY
++** $Date             $Author              $Comment
++** 12 Aug 2014       Martins Pukitis	  Initial version (no ethtool support)
++*******************************************************************************/
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/netdevice.h>
++#include <linux/platform_device.h>
++#include <linux/etherdevice.h>
++#include <linux/init.h>
++
++#define DRV_MODULE_NAME             "lantiq_svip_virtual_eth"
++#define DRV_MODULE_VERSION          "3.0"
++static char version[] =
++	DRV_MODULE_NAME ".c:v" DRV_MODULE_VERSION;
++
++/******************************************************************************
++ * Local define/macro definitions
++ ******************************************************************************/
++struct svip_ve_priv {
++	struct net_device_stats stats;
++};
++
++/******************************************************************************
++ * Global function declarations
++ ******************************************************************************/
++
++/******************************************************************************
++ * Local variable declarations
++ ******************************************************************************/
++static struct net_device *svip_ve_dev;
++static int watchdog_timeout = 10*HZ;
++static int (*svip_ve_mps_xmit)(struct sk_buff *skb);
++
++
++/******************************************************************************
++ * Global function declarations
++ ******************************************************************************/
++
++/**
++ * Called by MPS driver to register a transmit routine called for each outgoing
++ * VoFW0 message.
++ *
++ * \param   mps_xmit    pointer to transmit routine
++ *
++ * \return  none
++ *
++ * \ingroup Internal
++ */
++void register_mps_xmit_routine(int (*mps_xmit)(struct sk_buff *skb))
++{
++	svip_ve_mps_xmit = mps_xmit;
++}
++EXPORT_SYMBOL(register_mps_xmit_routine);
++
++/**
++ * Called by MPS driver upon receipt of a new message from VoFW0 module in
++ * the data inbox. The packet is pushed up the IP module for further processing.
++ *
++ * \param   skb            pointer to skb containing the incoming message
++ *
++ * \return  0 on success
++ * \return  non-zero on error
++ *
++ * \ingroup Internal
++ */
++int svip_ve_rx(struct sk_buff *skb)
++{
++	int err;
++	struct svip_ve_priv *priv = netdev_priv(svip_ve_dev);
++	struct net_device_stats *stats = &priv->stats;
++
++	skb->dev = svip_ve_dev;
++	skb->protocol = eth_type_trans(skb, svip_ve_dev);
++
++	stats->rx_packets++;
++	stats->rx_bytes += skb->len;
++
++	err = netif_rx(skb);
++	switch (err) {
++	case NET_RX_SUCCESS:
++		return 0;
++		break;
++	case NET_RX_DROP:
++	default:
++		stats->rx_dropped++;
++		break;
++	}
++
++	return 1;
++}
++EXPORT_SYMBOL(svip_ve_rx);
++
++/**
++ * Returns a pointer to the routine used to deliver an incoming packet/message
++ * from the MPS mailbox to the networking layer. This routine is called by MPS
++ * driver during initialisation time.
++ *
++ * \param   skb         pointer to incoming socket buffer
++ *
++ * \return  svip_ve_rx  pointer to incoming messages delivering routine
++ *
++ * \ingroup Internal
++ */
++int (*register_mps_recv_routine(void)) (struct sk_buff *skb)
++{
++	return svip_ve_rx;
++}
++EXPORT_SYMBOL(register_mps_recv_routine);
++
++/**
++ * Used to deliver outgoing packets to VoFW0 module through the MPS driver.
++ * Upon loading/initialisation the MPS driver is registering a transmitting
++ * routine, which is called here to deliver the packet to the VoFW0 module.
++ *
++ * \param   skb            pointer to skb containing outgoing data
++ * \param   dev            pointer to this networking device's data
++ *
++ * \return  0 on success
++ * \return  non-zero on error
++ *
++ * \ingroup Internal
++ */
++static int svip_ve_xmit(struct sk_buff *skb, struct net_device *dev)
++{
++	int err;
++	struct svip_ve_priv *priv = netdev_priv(dev);
++	struct net_device_stats *stats = &priv->stats;
++
++	stats->tx_packets++;
++	stats->tx_bytes += skb->len;
++
++	if (svip_ve_mps_xmit) {
++		err = svip_ve_mps_xmit(skb);
++		if (err)
++			stats->tx_errors++;
++		netif_trans_update(dev);
++		return err;
++	} else
++		netdev_err(dev, "MPS driver not registered, outgoing packet not delivered\n");
++
++	dev_kfree_skb(skb);
++
++	return -1;
++}
++
++
++/**
++ * Returns a pointer to the device's networking statistics data
++ *
++ * \param   dev            pointer to this networking device's data
++ *
++ * \return  stats          pointer to this network device's statistics data
++ *
++ * \ingroup Internal
++ */
++static struct net_device_stats *svip_ve_get_stats(struct net_device *dev)
++{
++	struct svip_ve_priv *priv = netdev_priv(dev);
++
++	return &priv->stats;
++}
++
++static void svip_ve_tx_timeout(struct net_device *dev)
++{
++	struct svip_ve_priv *priv = netdev_priv(dev);
++
++	priv->stats.tx_errors++;
++	netif_wake_queue(dev);
++}
++
++/**
++ * Device open routine. Called e.g. upon setting of an IP address using,
++ * 'ifconfig veth0 YYY.YYY.YYY.YYY netmask ZZZ.ZZZ.ZZZ.ZZZ' or
++ * 'ifconfig veth0 up'
++ *
++ * \param   dev            pointer to this network device's data
++ *
++ * \return  0 on success
++ * \return  non-zero on error
++ *
++ * \ingroup Internal
++ */
++int svip_ve_open(struct net_device *dev)
++{
++	netif_start_queue(dev);
++	return 0;
++}
++
++/**
++ * Device close routine. Called e.g. upon calling
++ * 'ifconfig veth0 down'
++ *
++ * \param   dev            pointer to this network device's data
++ *
++ * \return  0 on success
++ * \return  non-zero on error
++ *
++ * \ingroup Internal
++ */
++
++int svip_ve_release(struct net_device *dev)
++{
++	netif_stop_queue(dev);
++	return 0;
++}
++
++static int svip_ve_dev_init(struct net_device *dev);
++
++static const struct net_device_ops svip_virtual_eth_netdev_ops = {
++	.ndo_init = svip_ve_dev_init,
++	.ndo_open = svip_ve_open,
++	.ndo_stop = svip_ve_release,
++	.ndo_start_xmit = svip_ve_xmit,
++	.ndo_get_stats = svip_ve_get_stats,
++	.ndo_tx_timeout = svip_ve_tx_timeout,
++};
++
++
++/**
++ * Device initialisation routine which registers device interface routines.
++ * It is called upon execution of 'register_netdev' routine.
++ *
++ * \param   dev            pointer to this network device's data
++ *
++ * \return  0 on success
++ * \return  non-zero on error
++ *
++ * \ingroup Internal
++ */
++static int svip_ve_dev_init(struct net_device *dev)
++{
++	ether_setup(dev); /* assign some of the fields */
++
++	dev->watchdog_timeo  = watchdog_timeout;
++	memset(netdev_priv(dev), 0, sizeof(struct svip_ve_priv));
++	dev->flags |= IFF_NOARP|IFF_PROMISC;
++	dev->flags &= ~IFF_MULTICAST;
++
++	/* dedicated MAC address to veth0, 00:03:19:00:15:80 */
++	dev->dev_addr[0] = 0x00;
++	dev->dev_addr[1] = 0x03;
++	dev->dev_addr[2] = 0x19;
++	dev->dev_addr[3] = 0x00;
++	dev->dev_addr[4] = 0x15;
++	dev->dev_addr[5] = 0x80;
++
++	return 0;
++}
++
++static int svip_ve_probe(struct platform_device *dev)
++{
++	int result = 0;
++
++	svip_ve_dev = alloc_etherdev(sizeof(struct svip_ve_priv));
++	svip_ve_dev->netdev_ops = &svip_virtual_eth_netdev_ops;
++
++	strcpy(svip_ve_dev->name, "veth%d");
++
++	result = register_netdev(svip_ve_dev);
++	if (result) {
++		netdev_info(svip_ve_dev, "error %i registering device\n",
++			result);
++		goto out;
++	}
++
++	netdev_info(svip_ve_dev, "Lantiq virtual ethernet driver for SVIP, version %s,(c) 2014 Lantiq Deutschland GmbH\n",
++		version);
++
++out:
++	return result;
++}
++
++static int svip_ve_remove(struct platform_device *dev)
++{
++	unregister_netdev(svip_ve_dev);
++	free_netdev(svip_ve_dev);
++
++	return 0;
++}
++
++static const struct of_device_id svip_ve_drv_match[] = {
++	{.compatible = "lantiq,svip-ve-net"},
++	{},
++};
++MODULE_DEVICE_TABLE(of, svip_ve_drv_match);
++
++static struct platform_driver svip_ve_driver = {
++	.probe = svip_ve_probe,
++	.remove = svip_ve_remove,
++	.driver = {
++		.name = "svip-ve-net",
++		.of_match_table = svip_ve_drv_match,
++		.owner = THIS_MODULE,
++	},
++};
++module_platform_driver(svip_ve_driver);
++
++MODULE_AUTHOR("Martins Pukitis");
++MODULE_DESCRIPTION("SVIP virtual ethernet driver");
++MODULE_LICENSE("GPL");
++MODULE_VERSION(DRV_MODULE_VERSION);

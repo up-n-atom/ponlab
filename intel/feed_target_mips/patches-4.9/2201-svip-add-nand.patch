@@ -1,0 +1,230 @@
+Support for NAND on Lantiq SVIP SoC
+
+--- a/drivers/mtd/nand/Kconfig
++++ b/drivers/mtd/nand/Kconfig
+@@ -543,6 +543,14 @@ config MTD_NAND_XWAY
+ 	  Enables support for NAND Flash chips on Lantiq XWAY SoCs. NAND is attached
+ 	  to the External Bus Unit (EBU).
+ 
++config MTD_NAND_SVIP
++	tristate "Support for NAND on Lantiq SVIP SoC"
++	depends on LANTIQ && SOC_SVIP
++	select MTD_NAND_PLATFORM
++	help
++	  Enables support for NAND Flash chips on Lantiq SVIP SoCs. NAND is
++	  attached to the External Bus Unit (EBU).
++
+ config MTD_NAND_SUNXI
+ 	tristate "Support for NAND on Allwinner SoCs"
+ 	depends on ARCH_SUNXI
+--- a/drivers/mtd/nand/Makefile
++++ b/drivers/mtd/nand/Makefile
+@@ -53,6 +53,7 @@ obj-$(CONFIG_MTD_NAND_JZ4780)		+= jz4780
+ obj-$(CONFIG_MTD_NAND_GPMI_NAND)	+= gpmi-nand/
+ obj-$(CONFIG_MTD_NAND_XWAY)		+= xway_nand.o
+ obj-$(CONFIG_MTD_NAND_BCM47XXNFLASH)	+= bcm47xxnflash/
++obj-$(CONFIG_MTD_NAND_SVIP)		+= svip_nand.o
+ obj-$(CONFIG_MTD_NAND_SUNXI)		+= sunxi_nand.o
+ obj-$(CONFIG_MTD_NAND_HISI504)	        += hisi504_nand.o
+ obj-$(CONFIG_MTD_NAND_BRCMNAND)		+= brcmnand/
+--- /dev/null
++++ b/drivers/mtd/nand/svip_nand.c
+@@ -0,0 +1,198 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2012 Lantiq Deutschland GmbH */
++/* Copyright (C) 2018 Intel Corporation */
++
++#include <linux/mtd/nand.h>
++#include <linux/mtd/nand_ecc.h>
++#include <linux/of_gpio.h>
++#include <linux/of_platform.h>
++
++#include <lantiq_soc.h>
++
++#define EBU_ADDR_SEL_0		0x0020
++#define EBU_CON_0		0x0060
++#define EBU_NAND_CON		0x00B0
++#define EBU_NAND_WAIT		0x00B4
++#define EBU_NAND_ECC0		0x00B8
++
++#define NAND_WAIT_RD		0x1
++#define NAND_NOPS		150
++#define NAND_CLE_BIT		(1 << 3)
++#define NAND_ALE_BIT		(1 << 2)
++
++#define EBU_ADDR_SEL_0_MASK_VAL(val)   (((val) & 0xf) << 4)
++#define EBU_ADDR_SEL_0_REGEN_VAL(val)   (((val) & 0x1) << 0)
++#define EBU_CON_0_ADSWP_VAL(val)   (((val) & 0x1) << 30)
++#define EBU_CON_0_SETUP_VAL(val)   (((val) & 0x1) << 22)
++#define EBU_CON_0_BCGEN_VAL(val)   (((val) & 0x3) << 12)
++#define EBU_CON_0_WAITWRC_VAL(val)   (((val) & 0x7) << 8)
++#define EBU_CON_0_WAITRDC_VAL(val)   (((val) & 0x3) << 6)
++#define EBU_CON_0_HOLDC_VAL(val)   (((val) & 0x3) << 4)
++#define EBU_CON_0_CMULT_VAL(val)   (((val) & 0x3) << 0)
++#define EBU_NAND_CON_LAT_EN_VAL(val)   (((val) & 0x3f) << 18)
++#define EBU_NAND_CON_PRE_P_VAL(val)   (((val) & 0x1) << 7)
++#define EBU_NAND_CON_WP_P_VAL(val)   (((val) & 0x1) << 6)
++#define EBU_NAND_CON_SE_P_VAL(val)   (((val) & 0x1) << 5)
++#define EBU_NAND_CON_CS_P_VAL(val)   (((val) & 0x1) << 4)
++#define EBU_NAND_CON_NANDMODE_VAL(val)   (((val) & 0x1) << 0)
++#define EBU_NAND_CON_ECC_ON_VAL(val)   (((val) & 0x1) << 31)
++
++#define GET_BITS(x, msb, lsb)           (((x) & ((1 << ((msb) + 1)) - 1)) >> (lsb))
++
++static int f_ecc_write = 0;
++
++static void svip_cmd_ctrl(struct mtd_info *mtd, int cmd, unsigned int ctrl)
++{
++	struct nand_chip *this = mtd_to_nand(mtd);
++
++	if (ctrl & NAND_CTRL_CHANGE) {
++		unsigned long nandaddr = (unsigned long)this->IO_ADDR_W;
++		/* coming here means to change either the enable state or the address for
++		controlling ALE or CLE */
++		/* NAND_NCE: Select the chip by setting nCE to low. This is done in CON register */
++		if (ctrl & NAND_NCE)
++      {
++			ltq_ebu_w32_mask(0, EBU_NAND_CON_NANDMODE_VAL(1), EBU_NAND_CON);
++      }
++		else
++      {
++			ltq_ebu_w32_mask(EBU_NAND_CON_NANDMODE_VAL(1), 0, EBU_NAND_CON);
++      }
++		nandaddr &= ~(NAND_CLE_BIT | NAND_ALE_BIT);
++		nandaddr |= (ctrl & NAND_CLE) << 2 | (ctrl & NAND_ALE);
++		this->IO_ADDR_W = (void __iomem *)nandaddr;
++	}
++
++	if (cmd != NAND_CMD_NONE)
++   {
++		writeb(cmd, this->IO_ADDR_W);
++   }
++}
++
++static int svip_dev_ready(struct mtd_info *mtd)
++{
++	return ltq_ebu_r32(EBU_NAND_WAIT) & NAND_WAIT_RD;
++}
++
++static void svip_read_buf(struct mtd_info *mtd, u_char *buf, int len)
++{
++	int i, j;
++	struct nand_chip *this = mtd_to_nand(mtd);
++
++	for (i=0; i<len; i++){
++		buf[i] = readb(this->IO_ADDR_R);
++		for (j=0; j<NAND_NOPS; j++) {
++		/*insert some NOPs to let the FW still handle interrupts, 
++		otherwise the NAND access to the EBU would block 
++		the other cores too long when they also access the EBU */
++			asm("nop");
++		}
++	}
++}
++
++static void svip_write_buf(struct mtd_info *mtd, const u_char *buf, int len)
++{
++	int i, j;
++	struct nand_chip *this = mtd_to_nand(mtd);
++
++	for (i=0; i<len; i++){
++		writeb(buf[i], this->IO_ADDR_W);
++		for (j=0; j<NAND_NOPS; j++) {
++		/*insert some NOPs to let the FW still handle interrupts, 
++		otherwise the NAND access to the EBU would block 
++		the other cores too long when they also access the EBU */
++			asm("nop"); 
++		}
++	}
++}
++
++static int svip_calculate_ecc(struct mtd_info *mtd, const u_char *dat, u_char *ecc_code)
++{
++	if ( f_ecc_write ) {
++		nand_calculate_ecc(mtd, dat, ecc_code);
++	}
++	else {
++		unsigned int hwecc_result_val = ltq_ebu_r32(EBU_NAND_ECC0);
++		ecc_code[0] = GET_BITS(hwecc_result_val, 7, 0);
++		ecc_code[1] = GET_BITS(hwecc_result_val, 15, 8);
++		ecc_code[2] = GET_BITS(hwecc_result_val, 23, 16);
++		ltq_ebu_w32_mask(EBU_NAND_CON_ECC_ON_VAL(1), 0, EBU_NAND_CON);
++	}
++	return 0;
++}
++
++static void svip_enable_hwecc(struct mtd_info *mtd, int mode)
++{
++	switch ( mode ) {
++	case NAND_ECC_READ:
++		f_ecc_write = 0;
++		ltq_ebu_w32(0, EBU_NAND_ECC0);
++		ltq_ebu_w32_mask(0, EBU_NAND_CON_ECC_ON_VAL(1), EBU_NAND_CON);
++		break;
++	case NAND_ECC_WRITE:
++		f_ecc_write = 1;
++		break;
++	}
++}
++
++static int svip_nand_probe(struct platform_device *pdev)
++{
++	struct nand_chip *this = platform_get_drvdata(pdev);
++	unsigned long nandaddr = (unsigned long) this->IO_ADDR_W;
++
++	/* setup the EBU to run in NAND mode on our base addr */
++	ltq_ebu_w32(CPHYSADDR(nandaddr)
++		| EBU_ADDR_SEL_0_MASK_VAL(0xF) | EBU_ADDR_SEL_0_REGEN_VAL(1), EBU_ADDR_SEL_0);
++	ltq_ebu_w32(EBU_CON_0_ADSWP_VAL(1) | EBU_CON_0_SETUP_VAL(1) | EBU_CON_0_BCGEN_VAL(0x01)
++			| EBU_CON_0_WAITWRC_VAL(1) | EBU_CON_0_WAITRDC_VAL(1) | EBU_CON_0_HOLDC_VAL(1)
++			| EBU_CON_0_CMULT_VAL(0x01), EBU_CON_0);
++	ltq_ebu_w32(EBU_NAND_CON_LAT_EN_VAL(0x38)
++			| EBU_NAND_CON_PRE_P_VAL(1) | EBU_NAND_CON_WP_P_VAL(1)
++			| EBU_NAND_CON_SE_P_VAL(1) | EBU_NAND_CON_CS_P_VAL(1), EBU_NAND_CON);
++	this->ecc.calculate = svip_calculate_ecc;
++	this->ecc.mode = NAND_ECC_SOFT;
++	this->ecc.hwctl = svip_enable_hwecc;
++	return 0;
++}
++
++/* allow users to override the partition in DT using the cmdline */
++static const char *part_probes[] = { "cmdlinepart", "ofpart", NULL };
++
++static struct platform_nand_data svip_nand_data = {
++	.chip = {
++		.nr_chips		= 1,
++		.chip_delay		= 30,
++		.part_probe_types	= part_probes,
++	},
++	.ctrl = {
++		.probe		= svip_nand_probe,
++		.cmd_ctrl	= svip_cmd_ctrl,
++		.dev_ready	= svip_dev_ready,
++		.read_buf	= svip_read_buf,
++		.write_buf	= svip_write_buf,
++	}
++};
++
++/*
++ * Try to find the node inside the DT. If it is available attach out
++ * platform_nand_data
++ */
++static int __init svip_register_nand(void)
++{
++	struct device_node *node;
++	struct platform_device *pdev;
++
++	node = of_find_compatible_node(NULL, NULL, "lantiq,nand-svip");
++	if (!node) {
++		return -ENOENT;
++	}
++	pdev = of_find_device_by_node(node);
++	if (!pdev) {
++		return -EINVAL;
++	}
++	pdev->dev.platform_data = &svip_nand_data;
++	of_node_put(node);
++	return 0;
++}
++
++subsys_initcall(svip_register_nand);
