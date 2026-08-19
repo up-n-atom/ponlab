@@ -1,0 +1,196 @@
+diff --git a/udpst_data.c b/udpst_data.c
+index b73281b..ea2cd85 100644
+--- a/udpst_data.c
++++ b/udpst_data.c
+@@ -257,6 +257,38 @@ static CMSG_CTL initializeGSO() {
+         return cctl;
+ 
+ }
++//
++// Prepare lHdr for each gso sized UDP segment from
++// the large payload per burst
++//
++static void prepareSegmentlHdrs (int connindex, int lPayloadLen, char *lPayload, unsigned int rttrd)
++{
++
++        struct loadHdr *lHdr;
++        int udpPayloadRem = lPayloadLen;
++        char *nextSeg = lPayload;
++        struct connection *c = &conn[connindex];
++
++        while (udpPayloadRem > 0) {
++
++                // Prepare lHdr for UDP segment at correct offset
++                lHdr = (struct loadHdr *) nextSeg;
++                _populate_header(lHdr, c, rttrd);
++                lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
++
++                if (udpPayloadRem < conf.mtuSize) {
++                        // Last short segment
++                        lHdr->udpPayload = (uint16_t) udpPayloadRem;
++                }
++                else {
++                        lHdr->udpPayload = (uint16_t) conf.mtuSize;
++                }
++
++                nextSeg += lHdr->udpPayload;
++                udpPayloadRem -= lHdr->udpPayload;
++                lHdr->udpPayload = htons(lHdr->udpPayload);
++        }
++}
+ #endif
+ 
+ #if defined(HAVE_SENDMMSG)
+@@ -407,7 +439,9 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
+         //
+ #if defined(MXL_OPT)
+         CMSG_CTL cctl;
+-
++        //
++        // Setup cmsg structure if GSO is enabled
++        //
+         if (conf.gsoStatus) {
+             cctl = initializeGSO();
+         }
+@@ -421,16 +455,29 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
+         }
+         for (i = 0; i < totalburst; i++) {
+                 struct loadHdr *lHdr = (struct loadHdr *) nextsndbuf;
+-                _populate_header(lHdr, c, rttrd);
+-                lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
+                 if (i < burstsize)
+                         uvar = payload;
+                 else
+                         uvar = addon;
++#if defined(MXL_OPT)
++                if (conf.gsoStatus) {
++                        prepareSegmentlHdrs (connindex, uvar, nextsndbuf, rttrd);
++                } else {
++                        _populate_header(lHdr, c, rttrd);
++                        lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
++                        lHdr->udpPayload = htons((uint16_t) uvar);
++                        if (c->randPayload) {
++                                _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
++                        }
++                }
++#else
++                _populate_header(lHdr, c, rttrd);
++                lHdr->lpduSeqNo = htonl((uint32_t) ++c->lpduSeqNo);
+                 lHdr->udpPayload = htons((uint16_t) uvar);
+                 if (c->randPayload) {
+                         _randomize_payload((char *) lHdr + sizeof(struct loadHdr), uvar - sizeof(struct loadHdr));
+                 }
++#endif
+ 
+                 //
+                 // Setup corresponding message structure
+@@ -486,7 +533,7 @@ static void _sendmmsg_burst(int connindex, int totalburst, int burstsize, unsign
+ //
+ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigned int payload, unsigned int addon) {
+         register struct connection *c = &conn[connindex];
+-        struct msghdr msg;
++        struct msghdr msg = {0};
+         struct iovec iov;
+         unsigned int uvar, rttrd = 0;
+         int i;
+@@ -506,6 +553,9 @@ static void _sendmsg_burst(int connindex, int totalburst, int burstsize, unsigne
+         //
+ #if defined(MXL_OPT)
+         CMSG_CTL cctl;
++        //
++        // Setup cmsg structure if GSO is enabled
++        //
+         if (conf.gsoStatus) {
+             cctl = initializeGSO();
+         }
+@@ -748,11 +798,24 @@ int send_loadpdu(int connindex, int transmitter) {
+ int service_loadpdu(int connindex) {
+         register struct connection *c = &conn[connindex];
+         int i, delta, var;
++#if defined(MXL_OPT)
++        int ivar;
++#endif
+         BOOL bvar, firstpdu = FALSE;
+         unsigned int uvar, seqno, rttrd;
++#if defined(MXL_OPT)
++        struct loadHdr *lHdr = (struct loadHdr *) repo.defBuffer;
++        int udpPayloadRem = repo.rcvDataSize;
++        char *nextSeg = repo.defBuffer;
++        int udpSegLen;
++
++#else
+         struct loadHdr *lHdr = (struct loadHdr *) repo.rcvDataPtr;
++#endif
+         struct timespec tspecvar, tspecdelta;
+-
++#if defined(MXL_OPT)
++lbl_nextlhdr_gro:
++#endif
+         //
+         // Verify PDU
+         //
+@@ -888,7 +951,11 @@ int service_loadpdu(int connindex) {
+                 c->lpduHistIdx                 = ++c->lpduHistIdx & LPDU_HISTORY_MASK; // Update history buffer index
+         }
+         if (var > 0) {
++#if defined(MXL_OPT)
++                goto next_hdr_check;
++#else
+                 return 0; // No further processing for non-increasing sequence numbers
++#endif //MXL_OPT
+         }
+ 
+         //
+@@ -964,6 +1031,18 @@ int service_loadpdu(int connindex) {
+                 c->sisAct.delayVarSum += (uint32_t) uvar;
+                 c->sisAct.delayVarCnt++;
+         }
++#if defined(MXL_OPT)
++next_hdr_check:
++        udpSegLen = sizeof(struct loadHdr);
++        if (udpSegLen < udpPayloadRem) {
++                // We have received UDP_GRO segment with multiple lHdr,
++                // so iterate to next lHdr.
++                nextSeg += udpSegLen;
++                lHdr = (struct loadHdr *) nextSeg;
++                udpPayloadRem -= udpSegLen;
++                goto lbl_nextlhdr_gro;
++        }
++#endif
+         return 0;
+ }
+ //----------------------------------------------------------------------------
+@@ -2220,11 +2299,24 @@ int recv_proc(int connindex) {
+         //
+         // Specify receive buffer size (truncate load PDUs to reduce overhead of memory copy)
+         //
++#if defined(MXL_OPT)
++        if (c->secAction == &service_recvmmsg) {
++                recvsize = RCV_HEADER_SIZE;
++        } else if (c->secAction == &service_loadpdu) {
++                // Note: The server does not know if the client is a GSO
++                // payload with multiple load PDU headers. The whole payload needs
++                // to be received.
++                recvsize = DEF_BUFFER_SIZE;
++        } else {
++                recvsize = DEF_BUFFER_SIZE;
++        }
++#else
+         if (c->secAction == &service_recvmmsg || c->secAction == &service_loadpdu) {
+                 recvsize = RCV_HEADER_SIZE;
+         } else {
+                 recvsize = DEF_BUFFER_SIZE;
+         }
++#endif
+         repo.rcvDataPtr = repo.defBuffer; // Default to start of general I/O buffer
+ 
+         //
+@@ -2249,7 +2341,7 @@ int recv_proc(int connindex) {
+                                 rcvbuf += recvsize;  // Next buffer
+                                 mmsgDataSize[i] = 0; // Initialize as empty
+                         }
+-#ifdef HAVE_RECVMMSG
++#if defined(HAVE_RECVMMSG) && !defined(MXL_OPT)
+                         //
+                         // Perform read and process messages
+                         //
