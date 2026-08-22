@@ -1,0 +1,2330 @@
+From f437bfa5e1b9ce38eb951ef16b5ab6f7a566bc16 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Wed, 22 Jan 2020 19:27:09 +0100
+Subject: [PATCH] drivers: net: add basic tc qos offload driver
+
+The driver translates tc qdisc configuration to DP manager QoS APIs like
+scheduler and queue configuration providing support for qdisc offloads.
+Later translation for filters and actions will be added to enable offload
+of VLAN and traffic classification.
+
+The driver creates a port structure for each netdev and keeps internally
+information about the qdisc hierarchy by using its qdisc internal structure.
+The qdiscs are added to a radix tree using their handle as key to enable
+easier search in the QoS tree. An example of this representation is shown
+below. This data is needed to offload and un-offload the qdiscs to the
+hardware.
+
+                      +---------------------------------+
+                      |                                 |
+                      |    +-+-+-+-+-+-+-+-+-+-+-+-+    |
+                      |    | struct pon_qos_qdisc  |    |
+                      |    +-+-+-+-+-+-+-+-+-+-+-+-+    |
+                      |    |     queue array       |    |
+                      |    +-+-+-+-+-+-+-+-+-+-+-+-+    |
+                      |    |    parent/handle      |    |
+                      |    +-+-+-+-+-+-+-+-+-+-+-+-+    |
+                      |    | sched array(children) |    |
+                      |    +-|-+-+-+-+-+-+-+-+-+-+-+    |
+                      |      |                   |      |
+          +-----------+------+                   +------+----------+
+          |           |                                 |          |
+          |           |    +-+-+-+-+-+-+-+-+-+-+-+-+    |          |
+          |           |    |        ....           |    |          |
+          |           |    +-+-+-+-+-+-+-+-+-+-+-+-+    |          |
+          |           |                                 |          |
+          |           +---------------------------------+          |
+          |                                                        |
+          |                                                        |
+ +-+-+-+-+-+-+-+-+-+-+-+-+                           +-+-+-+-+-+-+-+-+-+-+-+-+
+ | struct pon_qos_qdisc  |                           | struct pon_qos_qdisc  |
+ +-+-+-+-+-+-+-+-+-+-+-+-+                           +-+-+-+-+-+-+-+-+-+-+-+-+
+ |      queue array      |                           |      queue array      |
+ +-+-+-+-+-+-+-+-+-+-+-+-+                           +-+-+-+-+-+-+-+-+-+-+-+-+
+ |     parent/handle     |                           |     parent/handle     |
+ +-+-+-+-+-+-+-+-+-+-+-+-+                           +-+-+-+-+-+-+-+-+-+-+-+-+
+ | sched array(children) |                           | sched array(children) |
+ +-+-+-+-+-+-+-+-+-+-+-+-+                           +-+-+-+-+-+-+-+-+-+-+-+-+
+ |        ....           |                           |        ....           |
+ +-+-+-+-+-+-+-+-+-+-+-+-+                           +-+-+-+-+-+-+-+-+-+-+-+-+
+
+Each qdisc structure can have up to 8 queues and up to 8 schedulers as
+children at the moment. The qdisc is identified by the parent and handle
+values passed by the TC-CA subsystem when calling the offload callback. The
+major part of the handle is used as insertion key in the radix tree of the
+port allocated for the netdev when the root qdisc is offloaded. The internal
+state is represented by the following structure references:
+
+	(struct net_device *)
+	        |
+                +---(struct pon_qos_port *)
+		            |
+			    +---(struct pon_qos_qdisc *)
+                            |
+			    +---(struct radix_tree_root)
+
+Example commands to configure mixed mode SP+WRR:
+
+/* Add SP with 8 queues */
+tc qdisc add dev eth0_1 root handle 5: prio bands 8 priomap 7 6 5 4 3 2 1 0
+/* Add WRR child with 4 queues */
+tc qdisc add dev eth0_1 parent 5:1 handle 7: drr
+tc class add dev eth0_1 parent 7: classid 7:1 drr quantum 160K
+tc class add dev eth0_1 parent 7: classid 7:2 drr quantum 80K
+tc class add dev eth0_1 parent 7: classid 7:3 drr quantum 160K
+tc class add dev eth0_1 parent 7: classid 7:4 drr quantum 80K
+/* Add SP child with 8 queues */
+tc qdisc add dev eth0_1 parent 5:2 handle 6: prio bands 8 priomap 7 6 5 4 3 2 1 0
+
+Hardware configuration:
+
+|-- Port-10(15)-WSP
+|       |-- Sched-60(168)-WSP
+|       |       |-- Queue-69(544)-rlm-43
+|       |       |-- Queue-68(545)-rlm-42
+|       |       |-- Queue-67(546)-rlm-41
+|       |       |-- Queue-66(547)-rlm-40
+|       |       |-- Queue-65(548)-rlm-39
+|       |       |-- Queue-64(549)-rlm-38
+|       |       |-- Sched-63(550)-WSP
+|       |       |       |-- Queue-83(568)-rlm-53
+|       |       |       |-- Queue-82(569)-rlm-52
+|       |       |       |-- Queue-81(570)-rlm-51
+|       |       |       |-- Queue-80(571)-rlm-50
+|       |       |       |-- Queue-79(572)-rlm-49
+|       |       |       |-- Queue-78(573)-rlm-48
+|       |       |       |-- Queue-77(574)-rlm-47
+|       |       |       '-- Queue-76(575)-rlm-37
+|       |       '-- Sched-62(551)-WRR
+|       |       |       |-- Queue-71(560)-rlm-36
+|       |       |       |-- Queue-72(561)-rlm-44
+|       |       |       |-- Queue-73(562)-rlm-45
+|       |       |       '-- Queue-74(563)-rlm-46
+|       |-- Queue-13(176)-rlm-3
+
+The driver currently *does not* support qdisc replace operations. They
+should be added later.
+---
+ drivers/net/datapath/Kconfig                     |   1 +
+ drivers/net/datapath/Makefile                    |   1 +
+ drivers/net/datapath/pon_qos/Kconfig             |  11 +
+ drivers/net/datapath/pon_qos/Makefile            |  10 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_drr.c    | 332 ++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.c |  61 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.c   |  76 +++
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.h   |  32 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_mqprio.c | 194 ++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_prio.c   | 222 +++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c   | 192 ++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h   |  16 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c    | 792 +++++++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h    | 138 ++++
+ drivers/net/ethernet/lantiq/Makefile             |   1 +
+ include/net/pon_qos_tc.h                         |  23 +
+ 16 files changed, 2102 insertions(+)
+
+diff --git a/drivers/net/datapath/Kconfig b/drivers/net/datapath/Kconfig
+index ab000bb8ce11..5425a5067489 100644
+--- a/drivers/net/datapath/Kconfig
++++ b/drivers/net/datapath/Kconfig
+@@ -12,4 +12,5 @@ if INTEL_NP_NET_CORE
+ source "drivers/net/datapath/dpm/Kconfig"
+ source "drivers/net/datapath/umt/Kconfig"
+ source "drivers/net/datapath/mib_counters/Kconfig"
++source "drivers/net/datapath/pon_qos/Kconfig"
+ endif # INTEL_NP_NET_CORE
+diff --git a/drivers/net/datapath/Makefile b/drivers/net/datapath/Makefile
+index f6d9e1751579..2a1d28016b72 100644
+--- a/drivers/net/datapath/Makefile
++++ b/drivers/net/datapath/Makefile
+@@ -5,3 +5,4 @@
+ obj-$(CONFIG_INTEL_NP_NET_CORE) += dpm/
+ obj-$(CONFIG_INTEL_NP_NET_CORE) += umt/
+ obj-$(CONFIG_INTEL_MIB_COUNTERS) += mib_counters/
++obj-$(CONFIG_PON_QOS) += pon_qos/
+diff --git a/drivers/net/datapath/pon_qos/Kconfig b/drivers/net/datapath/pon_qos/Kconfig
+new file mode 100644
+index 000000000000..61c30726ee76
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/Kconfig
+@@ -0,0 +1,11 @@
++# SPDX-License-Identifier: GPL-2.0
++
++config PON_QOS
++	tristate "PON QoS driver"
++	depends on INTEL_DATAPATH
++
++	help
++	  This driver provides user space API for configuring PON specific QoS
++	  resources as schedulers, queues etc. The interface is based on linux
++	  tc offload interface. The Intel datapath driver is used to do the
++	  actual hardware configuration.
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+new file mode 100644
+index 000000000000..e56349b75b67
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -0,0 +1,10 @@
++obj-$(CONFIG_PON_QOS) = pon_qos.o
++
++pon_qos-objs := \
++	pon_qos_tc_main.o \
++	pon_qos_tc_qos.o  \
++	pon_qos_tc_qmap.o \
++	pon_qos_tc_drr.o \
++	pon_qos_tc_prio.o \
++	pon_qos_tc_mqprio.o \
++	pon_qos_tc_flower.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_drr.c b/drivers/net/datapath/pon_qos/pon_qos_tc_drr.c
+new file mode 100644
+index 000000000000..ec3cab3cc6b9
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_drr.c
+@@ -0,0 +1,332 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_qos.h>
++#include "pon_qos_tc_qos.h"
++
++#define MAX_QUANTUM (255 * 4096)
++#define KB 1024
++#define MIN_WEIGHT 1
++#define MAX_WEIGHT 255
++
++static int pon_qos_scale_quantum(u32 q_quantum, u32 sch_quanta)
++{
++	u32 weight;
++
++	if (q_quantum < (KB * sch_quanta))
++		weight = MIN_WEIGHT;
++	else if (q_quantum > MAX_QUANTUM)
++		weight = MAX_WEIGHT;
++	else
++		weight = q_quantum / (KB * sch_quanta);
++
++	return weight;
++}
++
++/* Two cases of adding qdisc:
++ * 1. qdisc is root
++ * 2. qdisc is child
++ */
++static int pon_qos_drr_add_child_qdisc(struct net_device *dev,
++				       struct pon_qos_port *port,
++				       struct tc_drr_qopt_offload *p)
++{
++	enum pon_qos_qdisc_type type = PON_QOS_QDISC_DRR;
++
++	if (!dev || !port || !p)
++		return -1;
++
++	return pon_qos_add_child_qdisc(dev, port, type, p->parent, p->handle);
++}
++
++static int pon_qos_drr_sched_update(struct net_device *dev,
++				    struct pon_qos_port *port,
++				    struct tc_drr_qopt_offload *parms)
++{
++	int ret;
++
++	if (!dev || !port || !parms)
++		return -1;
++
++	if (port->root_qdisc.use_cnt && parms->parent == TC_H_ROOT)
++		return 0;
++
++	ret = pon_qos_drr_add_child_qdisc(dev, port, parms);
++	if (ret < 0) {
++		netdev_err(dev, "drr child qdisc create failed\n");
++		return -1;
++	}
++
++	port->sch_num++;
++
++	return 0;
++}
++
++static int pon_qos_drr_queue_update(struct net_device *dev,
++				    struct pon_qos_qdisc *sch,
++				    struct tc_drr_qopt_offload *parms)
++{
++	u32 handle = parms->handle;
++	int ret, idx = TC_H_MIN(handle) - 1;
++	int weight, quantum;
++
++	if (idx < 0 || idx > PON_QOS_TC_MAX_Q - 1) {
++		netdev_err(dev, "invalid child minor -> should be in [1-8]\n");
++		return -1;
++	}
++
++	if (!sch->use_cnt || TC_H_MAJ(handle) != sch->handle) {
++		netdev_err(dev, "invalid sched configuration\n");
++		return -1;
++	}
++
++	if (!parms->set_params.quantum) {
++		netdev_err(dev, "invalid quantum\n");
++		return -1;
++	}
++
++	quantum = parms->set_params.quantum;
++	weight = pon_qos_scale_quantum(quantum, 4);
++	/* Range provided from OMCI via quantum must be adapted to
++	 * hardware range.
++	 * PPv4 has range 1..126
++	 * OMCI has range 0..255
++	 * Calculation for the adaptation:
++	 * ppv4_w= round_up ((126-1)/(255-0)* omci_w + 1 )
++	 * Normally even values are used, then this will produce
++	 * better accuracy in lower range:
++	 * ppv4_w= round_up ((126-1)/(255-0)* omci_w + 0 )
++	 */
++	weight = (125 * weight + 254) / 255;
++
++	ret = pon_qos_queue_add(sch, PON_QOS_QDISC_DRR, weight, idx);
++
++	return ret;
++}
++
++static int pon_qos_tc_drr_replace(struct net_device *dev,
++				  u32 handle,
++				  struct tc_drr_qopt_offload *opt,
++				  int port_id,
++				  int deq_idx)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *qdisc = NULL;
++	int ret = 0;
++	bool newp = false;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		port = pon_qos_port_alloc(dev);
++		if (!port) {
++			netdev_err(dev, "tc-drr port alloc failed\n");
++			return -1;
++		}
++		newp = true;
++	}
++
++	if (!TC_H_MIN(handle)) {
++		netdev_dbg(dev, "%s: Config drr sched\n", __func__);
++		port->root_qdisc.port = port_id;
++		port->root_qdisc.deq_idx = deq_idx;
++		port->root_qdisc.dev = dev;
++		ret = pon_qos_get_port_info(&port->root_qdisc);
++		if (ret < 0) {
++			netdev_err(dev, "tc-drr port info get failed\n");
++			goto err_free_port;
++		}
++		ret = pon_qos_drr_sched_update(dev, port, opt);
++		if (ret < 0) {
++			netdev_err(dev, "tc-drr sched config failed\n");
++			goto err_free_port;
++		}
++	}
++
++	/* This is a drr class so queue has to be configured on
++	 * an existing port.
++	 */
++	if (TC_H_MIN(handle) && !newp) {
++		netdev_dbg(dev, "%s: Config queue\n", __func__);
++		qdisc = pon_qos_qdisc_find(port, handle);
++		if (!qdisc) {
++			netdev_err(dev, "%s: radix tree broken\n", __func__);
++			return -1;
++		}
++		ret = pon_qos_drr_queue_update(dev, qdisc, opt);
++		if (ret < 0) {
++			netdev_err(dev, "%s: drr queue config err\n", __func__);
++			return -1;
++		}
++	}
++
++	return 0;
++
++err_free_port:
++	if (newp)
++		pon_qos_port_delete(port);
++	return -1;
++}
++
++static int pon_qos_tc_drr_queue_del(struct pon_qos_qdisc *sch, u32 handle)
++{
++	int idx = TC_H_MIN(handle) - 1;
++	int ret;
++
++	/* not a queue */
++	if (!TC_H_MIN(handle))
++		return 0;
++
++	if (idx < 0 && idx >= PON_QOS_TC_MAX_Q)
++		return -1;
++
++	/* check if this is a queue */
++	if (sch->qids[idx].qid) {
++		netdev_dbg(sch->dev, "%s: qid:%d deleting\n",
++			   __func__, sch->qids[idx].qid);
++		ret = pon_qos_queue_del(sch, idx);
++		if (ret < 0) {
++			netdev_err(sch->dev, "%s: queue del err\n", __func__);
++			return -1;
++		}
++		return 1;
++	}
++
++	return 0;
++}
++
++static int pon_qos_tc_drr_qdisc_del(struct pon_qos_port *port,
++				    struct pon_qos_qdisc *sch)
++{
++	int ret;
++
++	if (!port || !sch)
++		return -1;
++
++	netdev_dbg(sch->dev, "%s:free sch:%d parent:%#x %#x children:%d/%d\n",
++		   __func__,
++		   sch->sch_id, sch->parent, sch->handle,
++		   sch->num_q, sch->num_children);
++
++	if (TC_H_MIN(sch->handle) || sch->num_q || sch->num_children) {
++		netdev_dbg(sch->dev, "%s: empty input or busy sched\n",
++			   __func__);
++		return 0;
++	}
++
++	if (sch->use_cnt) {
++		ret = pon_qos_sched_del(sch);
++		if (ret < 0) {
++			netdev_err(sch->dev, "%s: sch:%d del failed\n",
++				   __func__, sch->sch_id);
++			return -1;
++		}
++		port->sch_num--;
++		if (sch->parent != TC_H_ROOT && TC_H_MIN(sch->parent)) {
++			ret = pon_qos_tc_qdisc_unlink(port, sch);
++			if (ret < 0)
++				netdev_err(sch->dev, "%s:sch:%d unlink fail\n",
++					   __func__, sch->sch_id);
++		}
++	}
++
++	WARN_ON(radix_tree_delete(&port->qdiscs, TC_H_MAJ(sch->handle)) != sch);
++	if (sch->parent != TC_H_ROOT)
++		pon_qos_free_qdisc(sch);
++	else
++		pon_qos_port_delete(port);
++
++	return 0;
++}
++
++static int pon_qos_tc_drr_destroy(struct net_device *dev,
++				  u32 handle,
++				  struct tc_drr_qopt_offload *opt)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *sch = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_dbg(dev, "%s:port not found or deallocated\n", __func__);
++		return 0;
++	}
++
++	sch = pon_qos_qdisc_find(port, opt->handle);
++	if (!sch) {
++		netdev_dbg(dev, "%s:sch not found or deallocated\n", __func__);
++		return 0;
++	}
++
++	ret = pon_qos_tc_drr_queue_del(sch, handle);
++	if (ret < 0)
++		return -1;
++
++	/* this is a queue no need to do anything further */
++	if (ret == 1)
++		return 0;
++
++	/*pon_qos_tc_sched_status(port, &port->root_qdisc);*/
++
++	ret = pon_qos_tc_drr_qdisc_del(port, sch);
++	if (ret < 0) {
++		netdev_err(dev, "%s: %#x id: %d failed\n", __func__,
++			   sch->handle, sch->sch_id);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pon_qos_tc_drr_offload(struct net_device *dev,
++			   u32 handle,
++			   struct tc_to_netdev *tc,
++			   int port_id,
++			   int deq_idx)
++{
++	int err = 0;
++	struct tc_drr_qopt_offload *opt = tc->sch_drr;
++
++	ASSERT_RTNL();
++	netdev_dbg(dev, "DRR: offload starting\n");
++	switch (opt->command) {
++	case TC_DRR_REPLACE:
++		netdev_dbg(dev, "pid: %#x class/handle: %#x quantum: %#x\n",
++			   opt->parent, opt->handle, opt->set_params.quantum);
++		err = pon_qos_tc_drr_replace(dev, handle, opt,
++					     port_id, deq_idx);
++		if (err < 0) {
++			netdev_err(dev, "tc-drr replace failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_DRR_DESTROY:
++		netdev_dbg(dev,
++			   "destroy pid: %#x class/handle: %#x quantum: %#x\n",
++			   opt->parent, opt->handle, opt->set_params.quantum);
++		err = pon_qos_tc_drr_destroy(dev, handle, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-drr destroy failed\n");
++			return -EINVAL;
++		}
++
++		break;
++	case TC_DRR_STATS:
++		/* TODO */
++		return -EOPNOTSUPP;
++	case TC_DRR_GRAFT:
++		/* TODO */
++		return -EOPNOTSUPP;
++	default:
++		break;
++	}
++
++	netdev_dbg(dev, "DRR: offload end: %d\n", err);
++	return err;
++}
++EXPORT_SYMBOL(pon_qos_tc_drr_offload);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+new file mode 100644
+index 000000000000..5b02569c35bc
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+@@ -0,0 +1,61 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include "pon_qos_tc_qmap.h"
++
++static int pon_qos_tc_flower_replace(struct net_device *dev,
++				     struct tc_cls_flower_offload *f)
++{
++	if (f->classid)
++		return pon_qos_tc_flower_assign_tc(dev, f);
++
++	return -EOPNOTSUPP;
++}
++
++static int pon_qos_tc_flower_destroy(struct net_device *dev,
++				     struct tc_cls_flower_offload *f)
++{
++	return pon_qos_tc_flower_unassign_tc(dev, f);
++}
++
++int pon_qos_tc_flower_offload(struct net_device *dev,
++			      u32 handle,
++			      struct tc_cls_flower_offload *f)
++{
++	int ret = 0;
++
++	ASSERT_RTNL();
++	netdev_dbg(dev, "%s:start %d\n", __func__, ret);
++	if (TC_H_MAJ(f->common.classid) != TC_H_MAJ(TC_H_CLSACT))
++		return -EOPNOTSUPP;
++
++	switch (f->command) {
++	case TC_CLSFLOWER_REPLACE:
++	{
++		netdev_dbg(dev, "%s:replace:\n", __func__);
++		ret = pon_qos_tc_flower_replace(dev, f);
++		break;
++	}
++	case TC_CLSFLOWER_DESTROY:
++	{
++		netdev_dbg(dev, "%s:destroy:\n", __func__);
++		ret = pon_qos_tc_flower_destroy(dev, f);
++		break;
++	}
++	case TC_CLSFLOWER_STATS:
++	{
++		netdev_dbg(dev, "%s:stats:\n", __func__);
++		return -EOPNOTSUPP;
++	}
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	netdev_dbg(dev, "%s:exit %d\n", __func__, ret);
++	return ret;
++}
++EXPORT_SYMBOL(pon_qos_tc_flower_offload);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+new file mode 100644
+index 000000000000..ee723464162c
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+@@ -0,0 +1,76 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <net/pon_qos_tc.h>
++#include "pon_qos_tc_main.h"
++#include "pon_qos_tc_qos.h"
++
++#define DRV_NAME	"mod_pon_qos"
++
++int (*pon_qos_setup_tc_fn)(struct net_device *dev,
++			   u32 handle,
++			   __be16 protocol,
++			   struct tc_to_netdev *tc,
++			   int port_id,
++			   int deq_idx);
++EXPORT_SYMBOL(pon_qos_setup_tc_fn);
++
++int pon_qos_setup_tc(struct net_device *dev,
++		     u32 handle,
++		     __be16 protocol,
++		     struct tc_to_netdev *tc,
++		     int port_id,
++		     int deq_idx)
++{
++	int ret = 0;
++
++	ASSERT_RTNL();
++	switch (tc->type) {
++	case TC_SETUP_CLSFLOWER:
++		ret = pon_qos_tc_flower_offload(dev,
++						handle,
++						tc->cls_flower);
++		break;
++	case TC_SETUP_MQPRIO:
++		return pon_qos_tc_mqprio_offload(dev, handle, tc,
++						 port_id, deq_idx);
++		break;
++	case TC_SETUP_QDISC_PRIO:
++		return pon_qos_tc_prio_offload(dev, handle, tc,
++					       port_id, deq_idx);
++		break;
++	case TC_SETUP_DRR:
++		return pon_qos_tc_drr_offload(dev, handle, tc,
++					      port_id, deq_idx);
++		break;
++	default:
++		netdev_err(dev, "offload type:%d not supported\n", tc->type);
++		ret = -EOPNOTSUPP;
++		break;
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL(pon_qos_setup_tc);
++
++static int __init pon_qos_init(void)
++{
++	pon_qos_setup_tc_fn = pon_qos_setup_tc;
++	return 0;
++}
++
++static void __exit pon_qos_destroy(void)
++{
++	rtnl_lock();
++	pon_qos_ports_cleanup();
++	rtnl_unlock();
++}
++
++module_init(pon_qos_init);
++module_exit(pon_qos_destroy);
++MODULE_LICENSE("GPL");
++MODULE_ALIAS_RTNL_LINK(DRV_NAME);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.h b/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
+new file mode 100644
+index 000000000000..4cd4ca650029
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#ifndef _PON_QOS_TC_MAIN_
++#define _PON_QOS_TC_MAIN_
++
++int pon_qos_tc_drr_offload(struct net_device *dev,
++			   u32 handle,
++			   struct tc_to_netdev *tc,
++			   int port_id,
++			   int deq_idx);
++
++int pon_qos_tc_prio_offload(struct net_device *dev,
++			    u32 handle,
++			    struct tc_to_netdev *tc,
++			    int port_id,
++			    int deq_idx);
++
++int pon_qos_tc_mqprio_offload(struct net_device *dev,
++			      u32 handle,
++			      struct tc_to_netdev *tc,
++			      int port_id,
++			      int deq_idx);
++
++int pon_qos_tc_flower_offload(struct net_device *dev,
++			      u32 handle,
++			      struct tc_cls_flower_offload *f);
++
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_mqprio.c b/drivers/net/datapath/pon_qos/pon_qos_tc_mqprio.c
+new file mode 100644
+index 000000000000..b275e07219af
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_mqprio.c
+@@ -0,0 +1,194 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <linux/skbuff.h>
++#include <linux/module.h>
++#include <net/netlink.h>
++#include <net/pkt_sched.h>
++#include <net/sch_generic.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_qos.h>
++#include "pon_qos_tc_qos.h"
++
++/* create qdisc tree */
++
++static int pon_qos_sched_update(struct net_device *dev,
++				struct pon_qos_port *port,
++				u32 handle)
++{
++	int ret;
++	struct pon_qos_qdisc *sch = &port->root_qdisc;
++
++	if (sch->use_cnt)
++		return 0;
++
++	sch->type = PON_QOS_QDISC_PRIO;
++	sch->dev = dev;
++	sch->handle = handle;
++	/* mqprio can be only root */
++	sch->parent = TC_H_ROOT;
++	sch->use_cnt = 1;
++
++	ret = pon_qos_fill_port_data(sch);
++	if (ret < 0) {
++		netdev_err(dev, "failed getting port hw config %d\n", ret);
++		return -1;
++	}
++
++	/* add to radix tree here */
++	ret = radix_tree_insert(&port->qdiscs, TC_H_MAJ(handle), sch);
++	if (ret) {
++		netdev_err(dev, "qdisc insertion to radix tree failed: %d\n",
++			   ret);
++		return -1;
++	}
++
++	return pon_qos_add_sched(sch, 0);
++}
++
++static int pon_qos_queues_update(struct net_device *dev,
++				 struct pon_qos_qdisc *sch,
++				 u32 handle,
++				 struct tc_mqprio_qopt *parms)
++{
++	u8 *priomap = parms->prio_tc_map;
++	u8 bands = parms->num_tc;
++	int ret, i;
++
++	if (!sch->use_cnt || handle != sch->handle)
++		return -1;
++
++	if (bands == sch->prio.bands)
++		/* TODO: nothing to do? */
++		return 0;
++
++	if (bands < sch->prio.bands) {
++		/* TODO delete queue here */
++		return -1;
++	}
++
++	sch->prio.bands = bands;
++	memcpy(sch->prio.priomap, priomap,
++	       sizeof(sch->prio.priomap));
++
++	for (i = 0; i < bands; i++) {
++		ret = pon_qos_queue_add(sch, PON_QOS_QDISC_PRIO, priomap[i], i);
++		if (ret < 0)
++			netdev_err(dev, "queue add failed\n");
++	}
++
++	return 0;
++}
++
++static int pon_qos_tc_mqprio_replace(struct net_device *dev,
++				     u32 handle,
++				     struct tc_mqprio_qopt *opt,
++				     int port_id,
++				     int deq_idx)
++{
++	int ret = 0;
++	struct pon_qos_port *port;
++	bool newp = false;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		port = pon_qos_port_alloc(dev);
++		if (!port) {
++			netdev_err(dev, "tc-mqprio port alloc failed\n");
++			return -1;
++		}
++		newp = true;
++	}
++
++	port->root_qdisc.port = port_id;
++	port->root_qdisc.deq_idx = deq_idx;
++	port->root_qdisc.dev = dev;
++	ret = pon_qos_get_port_info(&port->root_qdisc);
++	if (ret < 0)
++		goto err_free_port;
++
++	netdev_dbg(dev, "Config sched\n");
++	ret = pon_qos_sched_update(dev, port, handle);
++	if (ret < 0) {
++		netdev_err(dev, "tc-mqpio sched config failed\n");
++		goto err_free_port;
++	}
++
++	netdev_dbg(dev, "Config queues\n");
++	ret = pon_qos_queues_update(dev, &port->root_qdisc, handle, opt);
++	if (ret < 0) {
++		netdev_err(dev, "tc-mqprio queues config failed\n");
++		goto err_free_qdisc;
++	}
++
++	return 0;
++
++err_free_qdisc:
++	ret = pon_qos_sched_del(&port->root_qdisc);
++	if (ret < 0)
++		netdev_err(dev, "%s: sched del failed\n", __func__);
++err_free_port:
++	if (newp)
++		pon_qos_port_delete(port);
++	return -1;
++}
++
++static int pon_qos_tc_mqprio_destroy(struct net_device *dev,
++				     u32 handle,
++				     struct tc_mqprio_qopt *opt)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *sch = NULL;
++
++	port = pon_qos_port_get(dev);
++	if (!port)
++		return -1;
++
++	sch = &port->root_qdisc;
++
++	if (handle != sch->handle)
++		return -1;
++
++	pon_qos_qdisc_tree_del(port, sch);
++
++	return 0;
++}
++
++int pon_qos_tc_mqprio_offload(struct net_device *dev,
++			      u32 handle,
++			      struct tc_to_netdev *tc,
++			      int port_id,
++			      int deq_idx)
++{
++	int err = 0;
++	struct tc_mqprio_qopt *opt = tc->mqprio;
++
++	ASSERT_RTNL();
++	netdev_dbg(dev, "MQPRIO: offload starting\n");
++	if (opt->num_tc > PON_QOS_TC_MAX_Q) {
++		netdev_err(dev, "tc mqprio offload - out of range bands\n");
++		return -EINVAL;
++	}
++
++	if (opt->num_tc) {
++		err = pon_qos_tc_mqprio_replace(dev, handle, opt,
++						port_id, deq_idx);
++		if (err < 0) {
++			netdev_err(dev, "tc-mqprio replace failed\n");
++			return -EINVAL;
++		}
++	} else {
++		err = pon_qos_tc_mqprio_destroy(dev, handle, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-mqprio destroy failed\n");
++			return -EINVAL;
++		}
++	}
++
++	return 0;
++}
++EXPORT_SYMBOL(pon_qos_tc_mqprio_offload);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_prio.c b/drivers/net/datapath/pon_qos/pon_qos_tc_prio.c
+new file mode 100644
+index 000000000000..497ad96d39a7
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_prio.c
+@@ -0,0 +1,222 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_qos.h>
++#include "pon_qos_tc_qos.h"
++
++/* create qdisc tree */
++
++static int pon_qos_sched_update(struct net_device *dev,
++				struct pon_qos_port *port,
++				struct tc_prio_qopt_offload *p)
++{
++	enum pon_qos_qdisc_type type = PON_QOS_QDISC_PRIO;
++
++	if (!dev || !port || !p)
++		return -1;
++
++	return pon_qos_add_child_qdisc(dev, port, type, p->parent, p->handle);
++}
++
++static int pon_qos_queues_update(struct net_device *dev,
++				 struct pon_qos_qdisc *sch,
++				 struct tc_prio_qopt_offload *parms)
++{
++	u8 *priomap = parms->replace_params.priomap;
++	u8 bands = parms->replace_params.bands;
++	int ret, i;
++
++	if (!sch->use_cnt)
++		return -1;
++
++	if (bands == sch->prio.bands)
++		/* TODO: nothing to do? */
++		return 0;
++
++	if (bands < sch->prio.bands) {
++		for (i = 0; i < sch->prio.bands; i++) {
++			ret = pon_qos_queue_del(sch, i);
++			if (ret < 0) {
++				netdev_err(dev, "queue del failed\n");
++				return -1;
++			}
++		}
++	}
++
++	sch->prio.bands = bands;
++	memcpy(sch->prio.priomap, priomap,
++	       sizeof(sch->prio.priomap));
++
++	for (i = 0; i < bands; i++) {
++		ret = pon_qos_queue_add(sch, PON_QOS_QDISC_PRIO, priomap[i], i);
++		if (ret < 0)
++			netdev_err(dev, "queue add failed\n");
++	}
++
++	return 0;
++}
++
++static int pon_qos_tc_prio_update_tree(struct pon_qos_qdisc *sch,
++				       struct tc_prio_qopt_offload *p)
++{
++	/* tree update requires grafting so skip it for now */
++
++	if (sch->num_children)
++		return -1;
++
++	return 0;
++}
++
++static int pon_qos_tc_prio_replace(struct net_device *dev,
++				   u32 handle,
++				   struct tc_prio_qopt_offload *opt,
++				   int port_id,
++				   int deq_idx)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *qdisc = NULL;
++	int ret = 0;
++	bool newp = false;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		port = pon_qos_port_alloc(dev);
++		if (!port) {
++			netdev_err(dev, "tc-drr port alloc failed\n");
++			return -1;
++		}
++		newp = true;
++	}
++
++	if (opt->parent == TC_H_ROOT) {
++		port->root_qdisc.port = port_id;
++		port->root_qdisc.deq_idx = deq_idx;
++		port->root_qdisc.dev = dev;
++		ret = pon_qos_get_port_info(&port->root_qdisc);
++		if (ret < 0)
++			goto err_free_port;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, opt->handle);
++	if (!qdisc) {
++		ret = pon_qos_sched_update(dev, port, opt);
++		if (ret < 0) {
++			netdev_err(dev, "tc-prio sched config failed\n");
++			goto err_free_port;
++		}
++	}
++
++	qdisc = pon_qos_qdisc_find(port, opt->handle);
++	if (!qdisc) {
++		netdev_err(dev, "%s: radix tree broken\n", __func__);
++		goto err_free_port;
++	}
++
++	ret = pon_qos_tc_prio_update_tree(qdisc, opt);
++	if (ret < 0)
++		return -EOPNOTSUPP;
++
++	ret = pon_qos_queues_update(dev, qdisc, opt);
++	if (ret < 0) {
++		netdev_err(dev, "tc-prio queues config failed\n");
++		goto err_free_qdisc;
++	}
++
++	return 0;
++
++err_free_qdisc:
++	ret = pon_qos_sched_del(qdisc);
++	if (ret < 0)
++		netdev_err(dev, "%s: sched del failed\n", __func__);
++	if (qdisc != &port->root_qdisc)
++		kfree(qdisc);
++err_free_port:
++	if (newp)
++		pon_qos_port_delete(port);
++	return -1;
++}
++
++static int pon_qos_tc_prio_destroy(struct net_device *dev,
++				   u32 handle,
++				   struct tc_prio_qopt_offload *opt)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *sch = NULL;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_dbg(dev, "%s:port not found or deallocated\n", __func__);
++		return 0;
++	}
++
++	sch = pon_qos_qdisc_find(port, opt->handle);
++	if (!sch) {
++		netdev_dbg(dev, "%s: sch not found or deallocated\n", __func__);
++		return 0;
++	}
++
++	/*pon_qos_tc_sched_status(port, &port->root_qdisc);*/
++	pon_qos_qdisc_tree_del(port, sch);
++
++	return 0;
++}
++
++int pon_qos_tc_prio_offload(struct net_device *dev,
++			    u32 handle,
++			    struct tc_to_netdev *tc,
++			    int port_id,
++			    int deq_idx)
++{
++	int err = 0;
++	struct tc_prio_qopt_offload *opt = tc->sch_prio;
++
++	ASSERT_RTNL();
++	netdev_dbg(dev, "PRIO: offload starting\n");
++	if (opt->replace_params.bands > PON_QOS_TC_MAX_Q) {
++		netdev_dbg(dev, "tc prio offload - out of range bands %d\n",
++			   opt->replace_params.bands);
++		return -EINVAL;
++	}
++	switch (opt->command) {
++	case TC_PRIO_REPLACE:
++		netdev_dbg(dev, "replace pid:%#x class/handle:%#x bands:%#x\n",
++			   opt->parent, opt->handle, opt->replace_params.bands);
++		err = pon_qos_tc_prio_replace(dev, handle, opt,
++					      port_id, deq_idx);
++		if (err < 0) {
++			netdev_err(dev, "tc-prio replace failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_PRIO_DESTROY:
++		netdev_dbg(dev, "destroy pid:%#x class/handle:%#x bands:%#x\n",
++			   opt->parent, opt->handle, opt->replace_params.bands);
++		err = pon_qos_tc_prio_destroy(dev, handle, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-prio destroy failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_PRIO_STATS:
++		/* TODO */
++		netdev_dbg(dev, "stats pid:%#x class/handle:%#x bands:%#x\n",
++			   opt->parent, opt->handle, opt->replace_params.bands);
++		return -EOPNOTSUPP;
++	case TC_PRIO_GRAFT:
++		/* TODO */
++		netdev_dbg(dev, "graft pid:%#x class/handle:%#x bands:%#x\n",
++			   opt->parent, opt->handle, opt->replace_params.bands);
++		return -EOPNOTSUPP;
++	default:
++		break;
++	}
++
++	netdev_dbg(dev, "PRIO: offload end: %d\n", err);
++	return 0;
++}
++EXPORT_SYMBOL(pon_qos_tc_prio_offload);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+new file mode 100644
+index 000000000000..9b6b53d720f3
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -0,0 +1,192 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <linux/list.h>
++#include <net/flow_dissector.h>
++#include <net/tc_act/tc_mirred.h>
++#include <net/tc_act/tc_gact.h>
++#include <net/pon_qos_tc.h>
++#include "pon_qos_tc_qos.h"
++
++struct flower_cls_map {
++	__be16 proto;
++	u32 pref;
++	u32 classid;
++	bool ingress;
++	struct flow_dissector_key_vlan key;
++	struct flow_dissector_key_vlan mask;
++	struct net_device *dev;
++	struct net_device *indev;
++	struct list_head list;
++};
++
++static LIST_HEAD(tc_class_list);
++
++static struct flower_cls_map *pon_qos_tc_flower_get_cls(struct net_device *dev,
++							u32 pref)
++{
++	struct flower_cls_map *p, *n;
++
++	list_for_each_entry_safe(p, n, &tc_class_list, list) {
++		if (p->dev == dev && p->pref == pref)
++			return p;
++	}
++
++	return NULL;
++}
++
++static int pon_qos_tc_flower_action_valid(struct tcf_exts *exts)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++	int act_nr = 0;
++	int act_ok_nr = 0;
++
++	if (tc_no_actions(exts))
++		return -EINVAL;
++
++	tcf_exts_to_list(exts, &actions);
++	list_for_each_entry(a, &actions, list) {
++		if (a->ops && a->ops->type == TCA_ACT_GACT &&
++		    to_gact(a)->tcf_action == TC_ACT_OK)
++			act_ok_nr++;
++		act_nr++;
++	}
++
++	if (act_nr != 1 && act_ok_nr != 1)
++		return -EINVAL;
++
++	return 0;
++}
++
++static int pon_qos_parse_tc_flower(struct tc_cls_flower_offload *f,
++				   struct flower_cls_map **flt)
++{
++	int ret = 0;
++
++	*flt = kzalloc(sizeof(**flt), GFP_KERNEL);
++	if (!*flt)
++		return -ENOMEM;
++
++	if (f->dissector->used_keys &
++			~(BIT(FLOW_DISSECTOR_KEY_CONTROL) |
++				BIT(FLOW_DISSECTOR_KEY_BASIC) |
++				BIT(FLOW_DISSECTOR_KEY_ETH_ADDRS) |
++				BIT(FLOW_DISSECTOR_KEY_VLAN) |
++				BIT(FLOW_DISSECTOR_KEY_IPV4_ADDRS) |
++				BIT(FLOW_DISSECTOR_KEY_IPV6_ADDRS) |
++				BIT(FLOW_DISSECTOR_KEY_IP) |
++				BIT(FLOW_DISSECTOR_KEY_PORTS))) {
++		pr_debug("%s: Unsupported key used: 0x%x\n", __func__,
++			 f->dissector->used_keys);
++		return -EINVAL;
++	}
++	pr_debug("%s: Supported key used: 0x%x\n", __func__,
++		 f->dissector->used_keys);
++
++	memset(*flt, 0, sizeof(**flt));
++
++	(*flt)->pref = f->common.prio >> 16;
++	(*flt)->proto = f->common.protocol;
++	(*flt)->classid = f->classid;
++	if (TC_H_MIN(f->common.classid) == TC_H_MIN(TC_H_MIN_EGRESS))
++		(*flt)->ingress = false;
++	else
++		(*flt)->ingress = true;
++
++	/* Classification/Matching arguments parsing */
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_dissector_key_vlan *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_VLAN,
++						  f->key);
++		struct flow_dissector_key_vlan *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_VLAN,
++						  f->mask);
++		pr_debug("%s: match vid: %#x/%#x pcp: %#x\n", __func__,
++			 key->vlan_id,
++			 key->vlan_priority,
++			 mask->vlan_id);
++		(*flt)->key = *key;
++		(*flt)->mask = *mask;
++	}
++
++	return ret;
++}
++
++int pon_qos_tc_flower_assign_tc(struct net_device *dev,
++				struct tc_cls_flower_offload *f)
++{
++	struct flower_cls_map *map = NULL;
++	struct net_device *indev = NULL;
++	struct pon_qos_qmap_tc qmap = { 0 };
++	int ifi = (int)*(int *)f->key;
++	int ret = 0;
++
++	if (ifi) {
++		indev = dev_get_by_index(dev_net(dev), ifi);
++		if (!indev)
++			return -1;
++	}
++
++	ret = pon_qos_tc_flower_action_valid(f->exts);
++	if (ret < 0)
++		return -EINVAL;
++
++	ret = pon_qos_parse_tc_flower(f, &map);
++	if (ret < 0)
++		return -EINVAL;
++
++	map->dev = dev;
++	map->indev = indev;
++	qmap.indev = map->indev;
++	qmap.tc = map->key.vlan_priority;
++	qmap.handle = map->classid;
++	ret = pon_qos_update_qmap(dev, &qmap, 1);
++	if (ret < 0) {
++		netdev_err(dev, "%s: queue map fail\n", __func__);
++		goto err;
++	}
++
++	list_add(&map->list, &tc_class_list);
++	return 0;
++err:
++	kfree(map);
++	return -EINVAL;
++}
++EXPORT_SYMBOL(pon_qos_tc_flower_assign_tc);
++
++int pon_qos_tc_flower_unassign_tc(struct net_device *dev,
++				  struct tc_cls_flower_offload *f)
++{
++	struct flower_cls_map *map = NULL;
++	struct pon_qos_qmap_tc qmap = { 0 };
++	int ret = 0;
++
++	map = pon_qos_tc_flower_get_cls(dev, f->common.prio >> 16);
++	if (!map)
++		return -EOPNOTSUPP;
++
++	qmap.indev = map->indev;
++	qmap.tc = map->key.vlan_priority;
++	qmap.handle = map->classid;
++	ret = pon_qos_update_qmap(dev, &qmap, 0);
++	if (ret < 0) {
++		netdev_err(dev, "%s: queue unmap fail\n", __func__);
++		ret = -EINVAL;
++	}
++
++	list_del(&map->list);
++	if (map->indev)
++		dev_put(map->indev);
++	kfree(map);
++
++	return 0;
++}
++EXPORT_SYMBOL(pon_qos_tc_flower_unassign_tc);
++
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
+new file mode 100644
+index 000000000000..741ab6ce643d
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
+@@ -0,0 +1,16 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#ifndef _PON_QOS_TC_QMAP_
++#define _PON_QOS_TC_QMAP_
++
++int pon_qos_tc_flower_assign_tc(struct net_device *dev,
++				struct tc_cls_flower_offload *f);
++
++int pon_qos_tc_flower_unassign_tc(struct net_device *dev,
++				  struct tc_cls_flower_offload *f);
++
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+new file mode 100644
+index 000000000000..5d4d59c7551e
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -0,0 +1,792 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <linux/netdevice.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_qos.h>
++#include <net/pon_qos_tc.h>
++#include "pon_qos_tc_qos.h"
++
++static LIST_HEAD(port_list);
++
++struct pon_qos_port *pon_qos_port_get(struct net_device *dev)
++{
++	struct pon_qos_port *p, *n;
++
++	list_for_each_entry_safe(p, n, &port_list, list) {
++		if (p->dev == dev)
++			return p;
++	}
++
++	return NULL;
++}
++
++struct pon_qos_port *pon_qos_port_alloc(struct net_device *dev)
++{
++	struct pon_qos_port *port = NULL;
++
++	port = kzalloc(sizeof(*port), GFP_KERNEL);
++	if (!port)
++		return NULL;
++
++	port->dev = dev;
++	INIT_RADIX_TREE(&port->qdiscs, GFP_KERNEL);
++
++	list_add(&port->list, &port_list);
++
++	return port;
++}
++
++int pon_qos_port_delete(struct pon_qos_port *port)
++{
++	list_del(&port->list);
++	kfree(port);
++
++	return 0;
++}
++
++int pon_qos_fill_port_data(struct pon_qos_qdisc *sch)
++{
++	dp_subif_t subif = {0};
++	struct dp_dequeue_res deq = {0};
++	static struct dp_queue_res q_res[PON_QOS_TC_MAX_Q];
++	int ret;
++
++	if (sch->deq_idx < 0) {
++		ret = dp_get_netif_subifid(sch->dev, NULL, NULL, 0, &subif, 0);
++		if (ret < 0)
++			return -1;
++		/* This is PON DS port so mark this */
++		sch->port = subif.port_id;
++		sch->deq_idx = 0;
++		sch->ds = true;
++	}
++
++	deq.dp_port = sch->port;
++	deq.cqm_deq_idx = sch->deq_idx;
++	deq.q_res = q_res;
++	deq.q_res_size = ARRAY_SIZE(q_res);
++	ret = dp_deq_port_res_get(&deq, 0);
++	if (ret < 0)
++		return -2;
++
++	/* save hw egress prot settings */
++	sch->inst = subif.inst;
++	sch->def_q = q_res[0].q_id;
++	sch->epn = deq.cqm_deq_port;
++
++	return 0;
++}
++
++int pon_qos_get_port_info(struct pon_qos_qdisc *sch)
++{
++	dp_subif_t subif = {0};
++	int ret = 0;
++
++	if (sch->deq_idx < 0 || sch->port < 0) {
++		ret = dp_get_netif_subifid(sch->dev, NULL, NULL, 0, &subif, 0);
++		if (ret < 0)
++			return -1;
++		/* This is PON DS port so mark this */
++		sch->port = subif.port_id;
++		sch->deq_idx = 0;
++		sch->ds = true;
++	}
++
++	return 0;
++}
++
++int pon_qos_alloc_qdisc(struct pon_qos_qdisc **qdisc)
++{
++	struct pon_qos_qdisc *qp;
++
++	qp = kzalloc(sizeof(**qdisc), GFP_KERNEL);
++	if (!qp)
++		return -1;
++
++	*qdisc = qp;
++
++	return 0;
++}
++
++void pon_qos_free_qdisc(struct pon_qos_qdisc *qdisc)
++{
++	kfree(qdisc);
++}
++
++struct pon_qos_qdisc *pon_qos_qdisc_find(struct pon_qos_port *port, u32 handle)
++{
++	return radix_tree_lookup(&port->qdiscs, TC_H_MAJ(handle));
++}
++
++int pon_qos_get_sch_by_handle(struct net_device *dev,
++			      u32 handle,
++			      struct pon_qos_qdisc **sch)
++{
++	struct pon_qos_port *port = NULL;
++
++	port = pon_qos_port_get(dev);
++	if (!port)
++		return -1;
++
++	*sch = pon_qos_qdisc_find(port, handle);
++	if (!*sch)
++		return -2;
++
++	return 0;
++}
++
++int pon_qos_get_queue_by_handle(struct net_device *dev,
++				u32 handle,
++				struct pon_qos_q_data **qid)
++{
++	struct pon_qos_qdisc *qdisc = NULL;
++	int idx = TC_H_MIN(handle) - 1;
++	int ret;
++
++	ret = pon_qos_get_sch_by_handle(dev, handle, &qdisc);
++	if (ret < 0)
++		return -1;
++
++	if (idx < 0 || idx >= PON_QOS_TC_MAX_Q)
++		return -2;
++
++	if (!qdisc->qids[idx].qid)
++		return -3;
++
++	*qid = &qdisc->qids[idx];
++
++	return 0;
++}
++EXPORT_SYMBOL(pon_qos_get_queue_by_handle);
++
++/* TODO: proper error handling */
++int pon_qos_add_sched(struct pon_qos_qdisc *sch, int prio)
++{
++	struct dp_node_link node = {0};
++	struct dp_node_alloc anode = {0};
++	struct dp_node_prio prio_info = {0};
++	int ret;
++
++	if (sch->parent != TC_H_ROOT)
++		return -1;
++
++	/* change def queue prio */
++	prio_info.inst = sch->inst;
++	prio_info.id.q_id = sch->def_q;
++	prio_info.type = DP_NODE_QUEUE;
++	ret = dp_qos_link_prio_get(&prio_info, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, " failed to get prio node\n");
++		return -1;
++	}
++
++	/* Re-set input and policy */
++	prio_info.arbi = ARBITRATION_WSP;
++	prio_info.prio_wfq = 7;
++	ret = dp_qos_link_prio_set(&prio_info, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "set input of link failed\n");
++		return -1;
++	}
++
++	/* Allocate sched */
++	anode.inst = sch->inst;
++	anode.dp_port = sch->port;
++	anode.type = DP_NODE_SCH;
++	anode.id.sch_id = DP_NODE_AUTO_ID;
++	ret = dp_node_alloc(&anode, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "sch_id alloc fialed\n");
++		return -1;
++	}
++	sch->sch_id = anode.id.sch_id;
++
++	/* Link SP/WRR sched to port/sched */
++	netdev_dbg(sch->dev, "adding sched id %u\n", node.node_id.sch_id);
++	node.inst = sch->inst;
++	node.dp_port = sch->port;
++	node.p_node_type = DP_NODE_PORT;
++	node.p_node_id.cqm_deq_port = sch->epn;
++	node.arbi = (sch->type == PON_QOS_QDISC_DRR) ?
++		    ARBITRATION_WRR : ARBITRATION_WSP;
++	node.prio_wfq = prio;
++	node.node_type = DP_NODE_SCH;
++	node.node_id.sch_id = sch->sch_id;
++	node.cqm_deq_port.cqm_deq_port = sch->epn;
++	if (dp_node_link_add(&node, 0) == DP_FAILURE) {
++		netdev_err(sch->dev, "failed to link WRR sched to port\n");
++		dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pon_qos_add_staged_sched(struct pon_qos_qdisc *psch,
++			     struct pon_qos_qdisc *csch,
++			     int prio)
++{
++	struct dp_node_link node = {0};
++	struct dp_node_alloc anode = {0};
++	int ret;
++
++	/* Allocate sched */
++	anode.inst = csch->inst;
++	anode.dp_port = csch->port;
++	anode.type = DP_NODE_SCH;
++	anode.id.sch_id = DP_NODE_AUTO_ID;
++	ret = dp_node_alloc(&anode, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(csch->dev, "sch_id alloc fialed\n");
++		return -1;
++	}
++	csch->sch_id = anode.id.sch_id;
++
++	/* Link SP/WRR sched to port/sched */
++	/*node.inst = csch->inst;*/
++	node.dp_port = csch->port;
++	node.p_node_type = DP_NODE_SCH;
++	node.p_node_id.sch_id = psch->sch_id;
++	node.arbi = (psch->type == PON_QOS_QDISC_DRR) ?
++		    ARBITRATION_WRR : ARBITRATION_WSP;
++	node.prio_wfq = prio;
++	node.node_type = DP_NODE_SCH;
++	node.node_id.sch_id = csch->sch_id;
++	node.cqm_deq_port.cqm_deq_port = csch->epn;
++	netdev_dbg(csch->dev, "%s: adding sched id %u\n",
++		   __func__, node.node_id.sch_id);
++	if (dp_node_link_add(&node, 0) == DP_FAILURE) {
++		netdev_err(csch->dev,
++			   "failed to link sched %d to sched %d in: %d\n",
++			   csch->sch_id, psch->sch_id, prio);
++		dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pon_qos_sched_del(struct pon_qos_qdisc *sch)
++{
++	struct dp_node_link node = {0};
++	struct dp_node_alloc anode = {0};
++	int ret;
++
++	node.node_type = DP_NODE_SCH;
++	node.node_id.sch_id = sch->sch_id;
++	ret = dp_node_unlink(&node, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "sched id %d unlink failed\n",
++			   node.node_id.sch_id);
++		return -1;
++	}
++
++	anode.type = DP_NODE_SCH;
++	anode.id.sch_id = sch->sch_id;
++	ret = dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "sched id %d free failed\n",
++			   node.node_id.sch_id);
++		return -1;
++	}
++
++	sch->use_cnt = 0;
++
++	return 0;
++}
++
++int pon_qos_add_child_qdisc(struct net_device *dev,
++			    struct pon_qos_port *port,
++			    enum pon_qos_qdisc_type type,
++			    u32 parent,
++			    u32 handle)
++{
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_qdisc *csch = NULL;
++	struct pon_qos_qdisc *psch = NULL;
++	int idx = TC_H_MIN(parent) - 1;
++	int prio_w = idx;
++	int ret;
++
++	if (!dev || !port)
++		return -1;
++
++	if (parent == TC_H_ROOT)
++		idx = 0;
++
++	if (idx < 0 || idx >= PON_QOS_TC_MAX_Q)
++		return -1;
++
++	netdev_dbg(dev, "searching qdisc %#x idx: %d\n", parent, idx);
++	if (parent != TC_H_ROOT) {
++		psch = pon_qos_qdisc_find(port, parent);
++		if (!psch) {
++			netdev_err(dev, "%s: parent not found\n", __func__);
++			return -1;
++		}
++	} else {
++		psch = &port->root_qdisc;
++	}
++
++	/* if there is a queue on this input then delete it */
++	if (psch->qids[idx].qid) {
++		netdev_dbg(dev, "parent: %#x handle: %#x prio: %d\n",
++			   psch->parent, psch->handle, psch->qids[idx].p_w);
++		prio_w = psch->qids[idx].p_w;
++		ret = pon_qos_queue_del(psch, idx);
++		if (ret < 0) {
++			netdev_err(dev,
++				   "%s: queue delete failed\n", __func__);
++			return -1;
++		}
++	}
++	/* if there is a sched on this input return with error for now */
++	csch = psch->children[idx];
++	if (csch && csch->sch_id) {
++		netdev_err(dev, "%s input allocated by sched\n", __func__);
++		return -1;
++	}
++
++	if (parent != TC_H_ROOT) {
++		/* ready to add the sched */
++		ret = pon_qos_alloc_qdisc(&qdisc);
++		if (ret < 0)
++			return -1;
++
++		psch->children[idx] = qdisc;
++		psch->num_children++;
++		/* get port data from parent qdisc */
++		qdisc->dev = dev;
++		qdisc->port = psch->port;
++		qdisc->deq_idx = psch->deq_idx;
++		qdisc->inst = psch->inst;
++		qdisc->def_q = psch->def_q;
++		qdisc->epn = psch->epn;
++	} else {
++		qdisc = psch;
++		qdisc->dev = dev;
++		ret = pon_qos_fill_port_data(qdisc);
++		if (ret < 0) {
++			netdev_err(dev,
++				   "%s: failed getting port hw config %d\n",
++				   __func__, ret);
++			goto err_free_qdisc;
++		}
++	}
++
++	qdisc->type = type;
++	qdisc->handle = handle;
++	qdisc->parent = parent;
++	qdisc->use_cnt = 1;
++
++	if (parent == TC_H_ROOT) {
++		ret = pon_qos_add_sched(psch, idx);
++		if (ret < 0) {
++			netdev_err(dev, "%s: add sched failed\n", __func__);
++			goto err_free_qdisc;
++		}
++		netdev_dbg(dev, "%s: add root sch id %d\n",
++			   __func__, psch->sch_id);
++	} else {
++		netdev_dbg(dev, "root id: %d parent id: %d idx: %d <=> %d\n",
++			   port->root_qdisc.sch_id, psch->sch_id, idx, prio_w);
++		ret = pon_qos_add_staged_sched(psch, qdisc, prio_w);
++		if (ret < 0) {
++			netdev_err(dev, "%s: add sched failed\n", __func__);
++			goto err_free_qdisc;
++		}
++	}
++
++	/* add to radix tree here */
++	ret = radix_tree_insert(&port->qdiscs, TC_H_MAJ(handle), qdisc);
++	if (ret) {
++		netdev_err(dev, "qdisc insertion to radix tree failed: %d\n",
++			   ret);
++		goto err_free_sched;
++	}
++
++	return 0;
++
++err_free_sched:
++	pon_qos_sched_del(qdisc);
++err_free_qdisc:
++	if (parent != TC_H_ROOT) {
++		netdev_err(dev, "%s: freeing child qdisc\n", __func__);
++		psch->children[idx] = NULL;
++		psch->num_children--;
++		pon_qos_free_qdisc(qdisc);
++	}
++	return -1;
++}
++
++static int pon_qos_get_subif_idx(struct net_device *dev, int *subif)
++{
++	dp_subif_t dp_subif = {0};
++	int ret;
++
++	if (!dev)
++		return -1;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, 0, &dp_subif, 0);
++	if (ret < 0) {
++		netdev_err(dev, "%s: subif idx get failed\n", __func__);
++		return -1;
++	}
++
++	*subif = dp_subif.subif;
++
++	return 0;
++}
++
++static int pon_qos_sched_policy_update(struct pon_qos_qdisc *sch,
++				       int arbi, int prio_w, int idx)
++{	struct dp_node_prio prio_info = {0};
++	int ret;
++
++	/* update parent sched policy and set prio_w correctly */
++	prio_info.id.sch_id = sch->qids[idx].qid;
++	prio_info.type = DP_NODE_QUEUE;
++	ret = dp_qos_link_prio_get(&prio_info, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "%s :get prio node failed\n", __func__);
++		return -1;
++	}
++
++	/* Re-set policy */
++	prio_info.arbi = (sch->type == PON_QOS_QDISC_DRR) ?
++		    ARBITRATION_WRR : ARBITRATION_WSP;
++	ret = dp_qos_link_prio_set(&prio_info, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: set sch arbi failed\n", __func__);
++		return -1;
++	}
++
++	prio_info.id.sch_id = sch->qids[idx].qid;
++	prio_info.type = DP_NODE_QUEUE;
++	ret = dp_qos_link_prio_get(&prio_info, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "%s :get prio node failed\n", __func__);
++		return -1;
++	}
++
++	prio_info.prio_wfq = prio_w;
++	ret = dp_qos_link_prio_set(&prio_info, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: set sch arbi failed\n", __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pon_qos_queue_add(struct pon_qos_qdisc *sch, int arbi, int prio_w, int idx)
++{
++	struct dp_node_link node = {0};
++	struct dp_node_alloc anode = {0};
++	int ret;
++
++	if (!sch)
++		return -1;
++
++	anode.inst = sch->inst;
++	anode.dp_port = sch->port;
++	anode.type = DP_NODE_QUEUE;
++	anode.id.q_id = DP_NODE_AUTO_ID;
++	ret = dp_node_alloc(&anode, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "failed to alloc queue\n");
++		return -1;
++	}
++
++	sch->qids[idx].qid = anode.id.q_id;
++	sch->qids[idx].arbi = arbi;
++	sch->qids[idx].p_w = prio_w;
++
++	node.arbi = (arbi == PON_QOS_QDISC_DRR) ?
++		    ARBITRATION_WRR : ARBITRATION_WSP;
++	node.prio_wfq = prio_w;
++	node.node_type = DP_NODE_QUEUE;
++	node.node_id.q_id = sch->qids[idx].qid;
++	node.p_node_type = DP_NODE_SCH;
++	node.p_node_id.sch_id = sch->sch_id;
++	if (dp_node_link_add(&node, 0) == DP_FAILURE) {
++		netdev_err(sch->dev, "failed to link queue\n");
++		anode.type = DP_NODE_QUEUE;
++		anode.id.q_id = sch->qids[idx].qid;
++		ret = dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
++		if (ret == DP_FAILURE)
++			netdev_err(sch->dev, "qid %d free failed\n",
++				   anode.id.q_id);
++		memset(&sch->qids[idx], 0, sizeof(struct pon_qos_q_data));
++		return -1;
++	}
++
++	sch->num_q++;
++	ret = pon_qos_sched_policy_update(sch, arbi, prio_w, idx);
++	if (ret < 0)
++		netdev_err(sch->dev, "%s:policy set fail\n", __func__);
++
++	return 0;
++}
++
++int pon_qos_queue_del(struct pon_qos_qdisc *sch, int idx)
++{
++	struct dp_node_alloc anode = {0};
++	int ret;
++
++	if (!sch)
++		return -1;
++
++	if (idx < 0 || idx > PON_QOS_TC_MAX_Q - 1)
++		return -1;
++
++	anode.type = DP_NODE_QUEUE;
++	anode.id.q_id = sch->qids[idx].qid;
++	if (!anode.id.q_id /*|| atomic_read(&sch->qids[idx].ref_cnt)*/)
++		return -1;
++
++	ret = dp_node_free(&anode, DP_NODE_AUTO_FREE_RES);
++	if (ret == DP_FAILURE)
++		netdev_err(sch->dev, "qid %d free failed\n",
++			   anode.id.q_id);
++
++	memset(&sch->qids[idx], 0, sizeof(struct pon_qos_q_data));
++	sch->num_q--;
++
++	netdev_dbg(sch->dev, "qid: %i deleted\n", anode.id.q_id);
++	return 0;
++}
++
++int pon_qos_tc_qdisc_unlink(struct pon_qos_port *p, struct pon_qos_qdisc *sch)
++{
++	int idx = TC_H_MIN(sch->parent) - 1;
++	struct pon_qos_qdisc *psch = NULL;
++
++	if (!p || !sch)
++		return -EINVAL;
++
++	if (idx < 0 || idx >= PON_QOS_TC_MAX_Q)
++		return -EINVAL;
++
++	psch = pon_qos_qdisc_find(p, sch->parent);
++	if (!psch)
++		return -EINVAL;
++
++	psch->children[idx] = NULL;
++	psch->num_children--;
++
++	return 0;
++}
++
++int pon_qos_qdisc_tree_del(struct pon_qos_port *p, struct pon_qos_qdisc *root)
++{
++	int i, ret;
++
++	/* try removing the queues */
++	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
++		if (root->qids[i].qid) {
++			netdev_dbg(root->dev, "%s: deleting qid: %d\n",
++				   __func__, root->qids[i].qid);
++			ret = pon_qos_queue_del(root, i);
++			if (ret < 0)
++				return -1;
++		}
++	}
++
++	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
++		struct pon_qos_qdisc *sch = root->children[i];
++
++		if (sch && sch->use_cnt) {
++			netdev_dbg(sch->dev, "%s: delete child %u of %u\n",
++				   __func__,
++				   root->children[i]->sch_id,
++				   root->sch_id);
++			ret = pon_qos_qdisc_tree_del(p, sch);
++			if (ret < 0)
++				return -1;
++		}
++	}
++
++	netdev_dbg(root->dev, "%s: del sched id: %d use: %d\n",
++		   __func__, root->sch_id, root->use_cnt);
++	if (!root->use_cnt)
++		return 0;
++
++	ret = pon_qos_sched_del(root);
++	if (ret < 0)
++		return -1;
++
++	p->sch_num--;
++	if (root->parent != TC_H_ROOT && TC_H_MIN(root->parent)) {
++		ret = pon_qos_tc_qdisc_unlink(p, root);
++		if (ret < 0)
++			netdev_err(root->dev, "%s: sch[%d] unlink failed\n",
++				   __func__, root->sch_id);
++	}
++
++	WARN_ON(radix_tree_delete(&p->qdiscs, TC_H_MAJ(root->handle)) != root);
++	if (root->parent != TC_H_ROOT)
++		pon_qos_free_qdisc(root);
++	else
++		pon_qos_port_delete(p);
++
++	return 0;
++}
++
++static void pon_qos_dump_qdisc(struct pon_qos_qdisc *sch)
++{
++	netdev_dbg(sch->dev, "hdl:%#x pid:%#x sta:%d numq:%d num sched:%d\n",
++		   sch->handle, sch->parent, sch->use_cnt,
++		   sch->num_q, sch->num_children);
++}
++
++int pon_qos_tc_sched_status(struct pon_qos_port *p, struct pon_qos_qdisc *root)
++{
++	int i;
++
++	pon_qos_dump_qdisc(root);
++
++	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
++		struct pon_qos_qdisc *sch = root->children[i];
++
++		if (!sch)
++			continue;
++
++		pon_qos_tc_sched_status(p, sch);
++	}
++
++	return 0;
++}
++
++static int pon_qos_set_qmap(struct pon_qos_q_data *qid,
++			    int port, int tc, bool en)
++{
++	struct dp_queue_map_set qmap_set = {0};
++	int ret;
++
++	qmap_set.inst = 0;
++	qmap_set.q_id = en ? qid->qid : 0;
++
++	qmap_set.map.dp_port = port;
++	qmap_set.map.subif = tc;
++	qmap_set.map.class = tc;
++	qmap_set.mask.flowid = 1;
++	qmap_set.mask.enc = 1;
++	qmap_set.mask.dec = 1;
++	qmap_set.mask.mpe1 = 1;
++	qmap_set.mask.mpe2 = 1;
++
++	ret = dp_queue_map_set(&qmap_set, 0);
++	if (ret == DP_FAILURE) {
++		pr_err("%s: queue map set failed\n", __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int pon_qos_config_cpu_port(struct pon_qos_q_data *qid,
++				   int port, int tc, bool en)
++{
++	int ret, i;
++
++	/* only 8 classes for CPU, starting from TC=8 */
++	tc += 8;
++
++	ret = pon_qos_set_qmap(qid, port, tc, en);
++	if (ret != 0)
++		return -1;
++
++	if (!en)
++		atomic_dec(&qid->ref_cnt);
++	else
++		atomic_inc(&qid->ref_cnt);
++
++	if (tc != 15)
++		return 0;
++
++	/* map class [0..7] and 15 to low prio queue */
++	for (i = 0; i < 7; i++) {
++		ret = pon_qos_set_qmap(qid, port, i, en);
++		if (ret != 0)
++			pr_err("%s: cpu port config failed\n", __func__);
++	}
++
++	return ret;
++}
++
++int pon_qos_update_qmap(struct net_device *dev,
++			struct pon_qos_qmap_tc *q_tc, bool en)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *sch = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	int ret, tc;
++
++	port = pon_qos_port_get(dev);
++	if (!port)
++		return -1;
++
++	sch = &port->root_qdisc;
++	if (!sch)
++		return -1;
++
++	ret = pon_qos_get_queue_by_handle(dev, q_tc->handle, &qid);
++	if (ret < 0 || !qid) {
++		netdev_err(dev, "%s: handle not found err %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	if (q_tc->indev) {
++		ret = pon_qos_get_subif_idx(q_tc->indev, &tc);
++		if (ret < 0)
++			return -1;
++		/* TODO: Force TC if PON DS */
++	} else {
++		tc = q_tc->tc;
++	}
++
++	netdev_dbg(dev, "port: %d deq_i: %d qid: %d handl: %#x tc: %d ds:%s\n",
++		   sch->port, sch->deq_idx, qid->qid, q_tc->handle, tc,
++		   sch->ds ? "true" : "false");
++
++	/* TODO: port zero is currently the CPU port */
++	if (!sch->port) {
++		ret = pon_qos_config_cpu_port(qid, sch->port, tc, en);
++	} else {
++		/* TODO: Queue sharing case */
++		ret = pon_qos_set_qmap(qid, sch->port, tc, en);
++		if (ret != 0)
++			netdev_err(dev, "%s: qmap set failed\n", __func__);
++
++		if (!en)
++			atomic_dec(&qid->ref_cnt);
++		else
++			atomic_inc(&qid->ref_cnt);
++	}
++
++	return ret;
++}
++EXPORT_SYMBOL(pon_qos_update_qmap);
++
++int pon_qos_ports_cleanup(void)
++{
++	struct pon_qos_port *p, *n;
++	int ret;
++
++	list_for_each_entry_safe(p, n, &port_list, list) {
++		ret = pon_qos_qdisc_tree_del(p, &p->root_qdisc);
++		if (ret < 0) {
++			pr_err("%s: error freeing port\n", __func__);
++			return -1;
++		}
++		pon_qos_port_delete(p);
++	}
++
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+new file mode 100644
+index 000000000000..7b7a722da0ba
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -0,0 +1,138 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#ifndef _PON_QOS_TC_QOS_
++#define _PON_QOS_TC_QOS_
++
++#include <net/pkt_cls.h>
++#include <linux/list.h>
++#include <linux/radix-tree.h>
++#include <linux/types.h>
++
++#define PON_QOS_TC_MAX_Q 8
++#define PON_QOS_SCH_MAX_LEVEL 3
++
++enum pon_qos_qdisc_type {
++	PON_QOS_QDISC_NONE,
++	PON_QOS_QDISC_PRIO,
++	PON_QOS_QDISC_DRR,
++	PON_QOS_QDISC_TBF,
++	PON_QOS_QDISC_RED,
++};
++
++struct pon_qos_qdisc_ops {
++	int (*offload)(struct net_device *dev, void *params);
++
++	int (*unoffload)(struct net_device *dev, void *params);
++};
++
++struct pon_qos_q_data {
++	u32 qid;
++	int tc;
++	atomic_t ref_cnt;
++	int arbi;
++	int p_w;
++};
++
++struct pon_qos_qdisc {
++	struct net_device *dev;
++	enum pon_qos_qdisc_type type;
++	u32 parent;
++	u32 handle;
++	int use_cnt;
++
++	/* HW specific settings */
++	u32 sch_id;
++	int inst;
++	s32 port;
++	s32 deq_idx;
++	int epn;
++	u16 def_q;
++	bool ds;
++
++	unsigned int num_q;
++	struct pon_qos_q_data qids[PON_QOS_TC_MAX_Q];
++
++	/* TODO: for multi-stage schedulers */
++	unsigned int num_children;
++	struct pon_qos_qdisc *children[PON_QOS_TC_MAX_Q];
++
++	union {
++		struct {
++			u8 bands;
++			u8 priomap[TC_PRIO_MAX + 1];
++		} prio;
++
++		struct {
++			u8 num_tc;
++			u8 priomap[TC_PRIO_MAX + 1];
++		} mqprio;
++
++		struct {
++			int classes;
++		} drr;
++	};
++
++	/* TODO: abstrac the hw specific part */
++	struct pon_qos_qdisc_ops *ops;
++};
++
++struct pon_qos_port {
++	struct net_device *dev;
++	struct pon_qos_qdisc root_qdisc;
++	unsigned int sch_num;
++	struct radix_tree_root qdiscs;
++	struct list_head list;
++};
++
++struct pon_qos_qmap_tc {
++	int flags;
++	u32 handle;
++	struct net_device *indev;
++	int tc;
++};
++
++int pon_qos_get_queue_by_handle(struct net_device *dev,
++				u32 handle,
++				struct pon_qos_q_data **qid);
++
++struct pon_qos_port *pon_qos_port_get(struct net_device *dev);
++struct pon_qos_port *pon_qos_port_alloc(struct net_device *dev);
++int pon_qos_port_delete(struct pon_qos_port *port);
++int pon_qos_alloc_qdisc(struct pon_qos_qdisc **qdisc);
++void pon_qos_free_qdisc(struct pon_qos_qdisc *qdisc);
++struct pon_qos_qdisc *pon_qos_qdisc_find(struct pon_qos_port *port, u32 handle);
++
++int pon_qos_queue_add(struct pon_qos_qdisc *sch, int arbi, int prio_w, int idx);
++int pon_qos_queue_del(struct pon_qos_qdisc *sch, int idx);
++
++int pon_qos_qos_init(void);
++int pon_qos_qos_destroy(void);
++
++int pon_qos_add_sched(struct pon_qos_qdisc *sch, int prio);
++int pon_qos_add_staged_sched(struct pon_qos_qdisc *psch,
++			     struct pon_qos_qdisc *csch,
++			     int prio);
++int pon_qos_sched_del(struct pon_qos_qdisc *sch);
++int pon_qos_add_child_qdisc(struct net_device *dev,
++			    struct pon_qos_port *port,
++			    enum pon_qos_qdisc_type type,
++			    u32 parent,
++			    u32 hanle);
++
++int pon_qos_fill_port_data(struct pon_qos_qdisc *sch);
++int pon_qos_get_port_info(struct pon_qos_qdisc *sch);
++
++int pon_qos_tc_qdisc_unlink(struct pon_qos_port *p, struct pon_qos_qdisc *sch);
++int pon_qos_qdisc_tree_del(struct pon_qos_port *p, struct pon_qos_qdisc *root);
++int pon_qos_tc_sched_status(struct pon_qos_port *p, struct pon_qos_qdisc *root);
++
++int pon_qos_update_qmap(struct net_device *dev,
++			struct pon_qos_qmap_tc *q_tc, bool en);
++
++int pon_qos_ports_cleanup(void);
++
++#endif
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index 1afa60c37b54..ca5b1f626b88 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -20,3 +20,4 @@ endif
+ #obj-$(CONFIG_INTEL_UMT_CQEM_MODE) += umt/umt.o
+ obj-$(CONFIG_LTQ_TOE_DRIVER) += ltq_toe_drv.o
+ obj-$(CONFIG_INTEL_MIB_COUNTERS) += ../../datapath/mib_counters/
++obj-$(CONFIG_PON_QOS) += ../../datapath/pon_qos/
+diff --git a/include/net/pon_qos_tc.h b/include/net/pon_qos_tc.h
+new file mode 100644
+index 000000000000..6a512843573c
+--- /dev/null
++++ b/include/net/pon_qos_tc.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#ifndef _PON_QOS_TC_
++#define _PON_QOS_TC_
++
++int pon_qos_setup_tc(struct net_device *dev,
++		      u32 handle,
++		      __be16 protocol,
++		      struct tc_to_netdev *tc,
++		      int port_id,
++		      int deq_idx);
++
++extern int (*pon_qos_setup_tc_fn)(struct net_device *dev,
++			  u32 handle,
++			  __be16 protocol,
++			  struct tc_to_netdev *tc,
++			  int port_id,
++			  int deq_idx);
++#endif

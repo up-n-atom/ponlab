@@ -1,0 +1,215 @@
+From 585aef9261b07d2d3f59fb38a5d76888f8337bc3 Mon Sep 17 00:00:00 2001
+From: Jack Ping CHNG <jack.ping.chng@linux.intel.com>
+Date: Wed, 3 Feb 2021 13:50:09 +0800
+Subject: [PATCH] DRV_DPM_SW-459 - DPM fixed arbitration handling
+
+- Introduce new arbitration enum: ARBITRATION_PARENT
+- Check arbitration mode of parent node for correct configuration
+- DP return FAILURE if user set wrong parent arbitration mode
+- Remove node correctly when encountering failure
+---
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   |  2 +-
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   | 79 ++++++++++++++++------
+ include/net/datapath_api_qos.h                     |  3 +
+ 3 files changed, 64 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 7af59eb34426..df0269696980 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -943,7 +943,7 @@ int alloc_q_to_port(struct ppv4_q_sch_port *info, u32 flag)
+ 	link.node_type = DP_NODE_QUEUE;
+ 	link.p_node_id.cqm_deq_port = info->cqe_deq;
+ 	link.p_node_type = DP_NODE_PORT;
+-	link.arbi = ARBITRATION_WRR;
++	link.arbi = ARBITRATION_PARENT;
+ 	link.prio_wfq = 0;
+ 
+ 	if (dp_node_link_add(&link, 0)) {
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index 9812ae17b7b4..d710061ee5fd 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -1066,7 +1066,7 @@ static int dp_node_alloc_global_pool(struct dp_node_alloc *node)
+  * Upon Success return QoS port logical id
+  * else return DP_FAILURE
+  */
+-static int dp_alloc_qos_port(struct dp_node_alloc *node, int flag)
++static int dp_alloc_qos_port(struct dp_node_alloc *node, int flag, bool *new)
+ {
+ 	struct pp_qos_port_conf port_cfg;
+ 	struct cqm_port_info *port_info;
+@@ -1114,6 +1114,7 @@ static int dp_alloc_qos_port(struct dp_node_alloc *node, int flag)
+ 		return DP_FAILURE;
+ 	}
+ 
++	*new = true;
+ 	sch_stat = &priv->qos_sch_stat[qos_port];
+ 	sch_stat->child_num = 0;
+ 	sch_stat->type = DP_NODE_PORT;
+@@ -1634,7 +1635,7 @@ int _dp_node_free(struct dp_node_alloc *node, int flag)
+  * upon Success return parent node id
+  * else return DP_FAILURE
+  */
+-static int dp_qos_parent_get(struct dp_node_link *info, int flag)
++static int dp_qos_parent_get(struct dp_node_link *info, int flag, bool *new_pid)
+ {
+ 	struct dp_node_alloc node;
+ 
+@@ -1648,6 +1649,7 @@ static int dp_qos_parent_get(struct dp_node_link *info, int flag)
+ 				       __func__);
+ 				return DP_FAILURE;
+ 			}
++			*new_pid = true;
+ 			info->p_node_id = node.id;
+ 		}
+ 
+@@ -1657,7 +1659,7 @@ static int dp_qos_parent_get(struct dp_node_link *info, int flag)
+ 		node.dp_port = info->dp_port;
+ 		node.id = info->cqm_deq_port;
+ 		node.type = info->p_node_type;
+-		return dp_alloc_qos_port(&node, flag);
++		return dp_alloc_qos_port(&node, flag, new_pid);
+ 	}
+ 
+ 	return DP_FAILURE;
+@@ -1949,8 +1951,12 @@ static int set_parent_arbi(int inst, int node_id, int arbi, int flag)
+ 		struct pp_qos_port_conf port_cfg = {0};
+ 
+ 		/* QoS port arbi is always WSP mode except for drop port */
+-		if (arbi == PP_QOS_ARBITRATION_WRR && pid != priv->ppv4_drop_p)
+-			return DP_SUCCESS;
++		if (arbi == PP_QOS_ARBITRATION_WRR &&
++		    pid != priv->ppv4_drop_p) {
++			pr_err("%s arbi WRR not supported for port %d\n",
++			       __func__, pid);
++			return DP_FAILURE;
++		}
+ 
+ 		if (dp_qos_port_conf_get(priv->qdev, pid, &port_cfg)) {
+ 			pr_err("%s dp_qos_port_conf_get fail\n", __func__);
+@@ -2028,8 +2034,6 @@ static int dp_link_set(struct dp_node_link *info, int pid, int flag)
+ 					 info->node_id.q_id, &q_cfg)) {
+ 			pr_err("%s dp_qos_queue_set_spl Q:%d parent:%d fail\n",
+ 			       __func__, node_id, pid);
+-			// FIXME: why remove Q?
+-			dp_qos_queue_remove(priv->qdev, node_id);
+ 			return DP_FAILURE;
+ 		}
+ 	} else if (S_NODE(info->node_type)) {
+@@ -2055,8 +2059,6 @@ static int dp_link_set(struct dp_node_link *info, int pid, int flag)
+ 		if (dp_qos_sched_set(priv->qdev, node_id, &sch_cfg)) {
+ 			pr_err("%s dp_qos_sched_set Sch:%d parent:%d fail\n",
+ 			       __func__, node_id, pid);
+-			// FIXME: why remove sch?
+-			dp_qos_sched_remove(priv->qdev, node_id);
+ 			return DP_FAILURE;
+ 		}
+ 
+@@ -2447,6 +2449,7 @@ int _dp_node_link_add(struct dp_node_link *info, int flag)
+ 	};
+ 	int free_child = 0, i, node_id = 0, pid, qid, q_num = 0;
+ 	int res = DP_FAILURE;
++	bool new_pid = false;
+ 	struct hal_priv *priv = HAL(info->inst);
+ 	struct local *l;
+ 
+@@ -2465,12 +2468,45 @@ int _dp_node_link_add(struct dp_node_link *info, int flag)
+ 	DP_DEBUG(DP_DBG_FLAG_QOS, "inst=%d dp_port:%d\n",
+ 		 info->inst, info->dp_port);
+ 
+-	pid = dp_qos_parent_get(info, flag);
++	pid = dp_qos_parent_get(info, flag, &new_pid);
+ 	if (pid == DP_FAILURE) {
+ 		pr_err("%s dp_qos_parent_get fail\n", __func__);
+ 		goto exit;
+ 	}
+ 
++	/* Used parent's arbi mode or force to use parent's arbi mode
++	 * if 1) parent is a port, 2)not newly allocated 3)arbi mode not WSP
++	 */
++	if (info->arbi == ARBITRATION_PARENT ||
++	    (P_NODE(info->p_node_type) &&
++	     !new_pid && info->arbi != ARBITRATION_WSP)) {
++		if (P_NODE(info->p_node_type)) {
++			struct pp_qos_port_conf cfg;
++
++			if (dp_qos_port_conf_get(priv->qdev, pid, &cfg)) {
++				pr_err("%s port:%d get parent arbi fail\n",
++				       __func__, pid);
++				goto exit;
++			}
++			info->arbi =
++				pp2dp_arbi(cfg.port_parent_prop.arbitration);
++			DP_DEBUG(DP_DBG_FLAG_QOS, "Parent: port:%d arbi:%d\n",
++				 pid, info->arbi);
++		} else if (S_NODE(info->p_node_type)) {
++			struct pp_qos_sched_conf cfg;
++
++			if (dp_qos_sched_conf_get(priv->qdev, pid, &cfg)) {
++				pr_err("%s Sch:%d get parent arbi fail\n",
++				       __func__, pid);
++				goto exit;
++			}
++			info->arbi =
++				pp2dp_arbi(cfg.sched_parent_prop.arbitration);
++			DP_DEBUG(DP_DBG_FLAG_QOS, "Parent: Sch:%d arbi:%d\n",
++				 pid, info->arbi);
++		}
++	}
++
+ 	if (priv->qos_sch_stat[pid].child_num >= DP_MAX_CHILD_PER_NODE) {
+ 		pr_err("%s node:%d child num:%d over limit\n", __func__,
+ 		       priv->qos_sch_stat[pid].child_num, pid);
+@@ -2658,23 +2694,28 @@ int _dp_node_link_add(struct dp_node_link *info, int flag)
+ 				 "%s remove Q:%d\n",
+ 				 __func__, node_id);
+ 			dp_qos_queue_remove(priv->qdev, node_id);
++			node_stat_update(info->inst, node_id, DP_NODE_RST);
+ 		} else if (S_NODE(l->node.type)) {
+ 			DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
+ 				 "%s remove Sch:%d\n",
+ 				 __func__, l->node.id.sch_id);
+ 			dp_qos_sched_remove(priv->qdev, l->node.id.sch_id);
++			node_stat_update(info->inst, node_id, DP_NODE_RST);
+ 		}
+ 	}
+ 
+-	if (P_NODE(info->p_node_type)) {
+-		DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL, "%s remove P:%d\n",
+-			 __func__, pid);
+-		dp_qos_port_remove(priv->qdev, pid);
+-	} else if (S_NODE(info->p_node_type) &&
+-		   info->p_node_id.sch_id == DP_NODE_AUTO_ID) {
+-		DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL, "%s remove Sch:%d\n",
+-			 __func__, pid);
+-		dp_qos_sched_remove(priv->qdev, pid);
++	if (new_pid) {
++		if (P_NODE(info->p_node_type)) {
++			DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL, "%s remove P:%d\n",
++				 __func__, pid);
++			dp_qos_port_remove(priv->qdev, pid);
++		} else if (S_NODE(info->p_node_type) &&
++			   info->p_node_id.sch_id == DP_NODE_AUTO_ID) {
++			DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL, "%s remove Sch:%d\n",
++				 __func__, pid);
++			dp_qos_sched_remove(priv->qdev, pid);
++		}
++		node_stat_update(info->inst, pid, DP_NODE_RST);
+ 	}
+ 
+ exit:
+diff --git a/include/net/datapath_api_qos.h b/include/net/datapath_api_qos.h
+index 40f7505a4a1c..a4fc375a9791 100644
+--- a/include/net/datapath_api_qos.h
++++ b/include/net/datapath_api_qos.h
+@@ -391,6 +391,9 @@ enum dp_arbitate {
+ 			      *   ppv4 also not support at present
+ 			      */
+ 	ARBITRATION_WFQ,     /*!< fwq: for TMU/ppv4*/
++	ARBITRATION_PARENT,  /*!< used parent's arbitration mode,
++			      *   parent's node ID must be valid
++			      */
+ };
+ 
+ /*! @brief dp_node_flag */

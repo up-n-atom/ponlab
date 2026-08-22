@@ -1,0 +1,454 @@
+From f05fb8413575cce66a8aeada942739cbac91b226 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Fri, 22 Jan 2021 15:16:57 +0800
+Subject: [PATCH] DRV_DPM_SW-392 - DPM enhance dp_get_netif_subifid_priv() with
+ dp_get_subifid_for_update
+
+---
+ drivers/net/datapath/dpm/datapath.h      |   4 +-
+ drivers/net/datapath/dpm/datapath_api.c  | 250 +++++++++++++------------------
+ drivers/net/datapath/dpm/datapath_misc.c |  41 ++---
+ 3 files changed, 122 insertions(+), 173 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 0ec8d75bc868..c7abbb627b91 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -1060,9 +1060,7 @@ u32 dp_subif_hash(struct net_device *dev);
+ int dp_cbm_deq_port_enable(struct module *owner, int inst, int port_id,
+ 			   int deq_port_idx, int num_deq_port, int flags,
+ 			   u32 dma_ch_off);
+-int32_t dp_get_netif_subifid_priv(int inst, struct net_device *netif,
+-				  struct sk_buff *skb, void *subif_data,
+-				  u8 dst_mac[DP_MAX_ETH_ALEN],
++int32_t dp_get_subifid_for_update(int inst, struct net_device *netif,
+ 				  dp_subif_t *subif, uint32_t flags);
+ struct hlist_head *get_dp_g_bridge_id_entry_hash_table_info(int index);
+ struct dp_evt_notif_info {
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index c5f0ae8eb3bc..2af6c57bb5a4 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -1411,18 +1411,18 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("dp_register_dev failed for datapath not init yet\n");
+-		return DP_FAILURE;
++		return res;
+ 	}
+ 
+ 	if (!data)
+ 		data = &tmp_data;
+ 
+ 	if (is_invalid_port(port_id) || is_invalid_inst(inst))
+-		return DP_FAILURE;
++		return res;
+ 
+ 	if (!owner) {
+ 		pr_err("owner NULL\n");
+-		return DP_FAILURE;
++		return res;
+ 	}
+ 
+ 	port_info = get_dp_port_info(inst, port_id);
+@@ -1467,7 +1467,6 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 	if (port_info->status != PORT_ALLOCATED) {
+ 		pr_err("register dev fail for %s for unknown status:%d\n",
+ 		       owner->name, port_info->status);
+-		res = DP_FAILURE;
+ 		goto exit;
+ 	}
+ 
+@@ -1675,7 +1674,8 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		 DP_DEBUG(DP_DBG_FLAG_DBG,
+-			    "%s failed: datapath not initialized yet\n", __func__);
++			  "%s failed: datapath not initialized yet\n",
++			  __func__);
+ 		return res;
+ 	}
+ 
+@@ -1685,7 +1685,7 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ 	dp_subif = dp_subif_lookup_safe(&dp_subif_list[idx], netif, subif_data);
+ 	if (!dp_subif) {
+ 		DP_DEBUG(DP_DBG_FLAG_DBG, "Failed dp_subif_lookup: %s\n",
+-		       netif ? netif->name : "NULL");
++			 netif ? netif->name : "NULL");
+ 		rcu_read_unlock_bh();
+ 		return res;
+ 	}
+@@ -1706,7 +1706,7 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ 				   flags);
+ 		if (res != 0)
+ 			DP_DEBUG(DP_DBG_FLAG_DBG,
+-				   "get_netif_subifid callback function failed\n");
++				 "get_netif_subifid callback function fail\n");
+ 	} else {
+ 		res = DP_SUCCESS;
+ 	}
+@@ -1733,171 +1733,135 @@ bool dp_is_pmapper_check(struct net_device *dev)
+ EXPORT_SYMBOL(dp_is_pmapper_check);
+ 
+ /*Note:
+- * try to get subif according to netif, skb,vcc,dst_mac.
+- * For DLS nas interface, must provide valid subif_data, otherwise set to NULL.
+- * Note: subif_data is mainly used for DSL WAN mode, esp ATM.
+- * If subif->port_id valid, take it, otherwise search all to get the port_id
++ * get subif according to netif.
++ * Use subif->port_id passed by caller to get port_info
+  */
+-int32_t dp_get_netif_subifid_priv(int inst, struct net_device *netif,
+-				  struct sk_buff *skb, void *subif_data,
+-				  u8 dst_mac[DP_MAX_ETH_ALEN],
++int32_t dp_get_subifid_for_update(int inst, struct net_device *netif,
+ 				  dp_subif_t *subif, u32 flags)
+ {
+-	int res = -1;
+-	int i, k;
+-	int port_id = -1;
+-	int start, end;
+-	u8 match = 0;
++	int res = DP_FAILURE;
++	int i;
++	int port_id;
+ 	u8 num = 0;
+ 	u16 *subifs = NULL;
+ 	u32 *subif_flag = NULL;
+ 	struct logic_dev *tmp = NULL;
+ 	struct pmac_port_info *p_info;
+ 
+-	subifs = devm_kzalloc(&g_dp_dev->dev,
+-			      sizeof(*subifs) * DP_MAX_CTP_PER_DEV,
+-			      GFP_ATOMIC);
+-	if (!subifs) {
+-		res = DP_ERR_MEM;
+-		return res;
+-	}
+-	subif_flag = devm_kzalloc(&g_dp_dev->dev,
+-				  sizeof(*subif_flag) * DP_MAX_CTP_PER_DEV,
+-				  GFP_ATOMIC);
+-	if (!subif_flag) {
+-		res = DP_ERR_MEM;
+-		devm_kfree(&g_dp_dev->dev, subifs);
+-		return res;
++	port_id = subif->port_id;
++	if (port_id < 0) {
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "%s failed: %s\n", __func__,
++			 netif ? netif->name : "NULL");
++		res = DP_ERR_SUBIF_NOT_FOUND;
++		goto EXIT;
+ 	}
+-	if (!netif && !subif_data) {
+-		DP_DEBUG(DP_DBG_FLAG_REG,
+-			 "%s failed: netif=%px subif_data=%px\n", __func__,
+-			 netif, subif_data);
+-		res = DP_ERR_NULL_DATA;
++
++	p_info = get_dp_port_info(inst, port_id);
++	if (p_info->status != PORT_SUBIF_REGISTERED)
+ 		goto EXIT;
++
++	/* For DSL ATM case netif will be NULL with valid port id */
++	if ((!netif) && (!is_dsl(p_info))) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "%s failed: netif null\n", __func__);
++		return DP_ERR_NULL_DATA;
+ 	}
+ 	if (!subif) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+-			 "%s failed:subif=%px\n", __func__, subif);
+-		res = DP_ERR_NULL_DATA;
+-		goto EXIT;
++			 "%s failed:subif is NULL\n", __func__);
++		return DP_ERR_NULL_DATA;
+ 	}
+-	start = 0;
+-	end = dp_port_prop[inst].info.cap.max_num_dp_ports;
+-#ifdef DP_FAST_SEARCH /* Don't enable since need to be back-compatible */
+-	if (subif->port_id < MAX_DP_PORTS && subif->port_id > 0) {
+-		start = subif->port_id;
+-		end = start + 1;
++
++	subifs = kzalloc(sizeof(*subifs) * DP_MAX_CTP_PER_DEV,
++			 GFP_ATOMIC);
++	if (!subifs)
++		return DP_ERR_MEM;
++
++	subif_flag = kzalloc(sizeof(*subif_flag) * DP_MAX_CTP_PER_DEV,
++			     GFP_ATOMIC);
++	if (!subif_flag) {
++		res = DP_ERR_MEM;
++		goto EXIT;
+ 	}
+-#endif
++
+ 	subif->flag_pmapper = 0;
+-	for (k = start; k < end; k++) {
+-		struct pmac_port_info *port = get_dp_port_info(inst, k);
+ 
+-		if (port->status != PORT_SUBIF_REGISTERED)
+-			continue;
++	/*search sub-interfaces/VAP */
++	for (i = 0; i < p_info->subif_max; i++) {
++		struct dp_subif_info *sif = get_dp_port_subif(p_info, i);
+ 
+-		/*Workaround for VRX318 */
+-		if (subif_data && is_dsl(port)) {
+-			/*VRX318 should overwritten them later if necessary */
+-			port_id = k;
++		/* FOR DSL ATM case when netif is NULL, no need subif info */
++		if (is_dsl(p_info))
+ 			break;
+-		}
+ 
+-		/*search sub-interfaces/VAP */
+-		for (i = 0; i < port->subif_max; i++) {
+-			struct dp_subif_info *sif = get_dp_port_subif(port, i);
++		if (!sif->flags)
++			continue;
+ 
+-			if (!sif->flags)
+-				continue;
+-			if (sif->ctp_dev == netif) { /*for PON pmapper case*/
+-				match = 1;
+-				port_id = k;
+-				if (num > 0) {
+-					pr_err("Multiple same ctp_dev exist\n");
+-					goto EXIT;
+-				}
+-				subifs[num] = sif->subif;
+-				subif_flag[num] = sif->subif_flag;
+-				subif->flag_bp = 0;
+-				memcpy(&subif->subif_common, &sif->subif_common,
+-				       sizeof(struct dp_subif_common));
+-				num++;
+-				break;
++		if (sif->ctp_dev == netif) { /*for PON pmapper case*/
++			if (num > 0) {
++				pr_err("Multiple same ctp_dev exist\n");
++				goto EXIT;
+ 			}
++			subifs[num] = sif->subif;
++			subif_flag[num] = sif->subif_flag;
++			subif->flag_bp = 0;
++			memcpy(&subif->subif_common, &sif->subif_common,
++			       sizeof(struct dp_subif_common));
++			res = DP_SUCCESS;
++			num++;
++			break;
++		}
+ 
+-			if (sif->netif == netif) {
+-				if (subif->port_id > 0 && subif->port_id != k) {
+-					DP_DEBUG(DP_DBG_FLAG_REG,
+-						 "%s %d not match expect %d\n",
+-						 __func__, subif->port_id, k);
+-				} else {
+-					match = 1;
+-					subif->flag_bp = 1;
+-					port_id = k;
+-					if (num >= DP_MAX_CTP_PER_DEV) {
+-						pr_err("%s: Why CTP over %d\n",
+-						       netif ? netif->name : "",
+-						       DP_MAX_CTP_PER_DEV);
+-						goto EXIT;
+-					}
+-					/* some dev may have multiple
+-					 * subif,like pon
+-					 */
+-					subifs[num] = sif->subif;
+-					memcpy(&subif->subif_common,
+-					       &sif->subif_common,
+-					       sizeof(struct dp_subif_common));
+-					subif_flag[num] = sif->subif_flag;
+-					if (sif->ctp_dev)
+-						subif->flag_pmapper = 1;
+-					if (num && subif->bport != sif->bp) {
+-						pr_err("%s:Why many bp:%d %d\n",
+-						       netif ? netif->name : "",
+-						       sif->bp, subif->bport);
+-						goto EXIT;
+-					}
+-					num++;
+-				}
++		if (sif->netif == netif) {
++			subif->flag_bp = 1;
++			if (num >= DP_MAX_CTP_PER_DEV) {
++				pr_err("%s: Why CTP over %d\n",
++				       netif->name,
++				       DP_MAX_CTP_PER_DEV);
++				goto EXIT;
+ 			}
+-			/*continue search non-explicate logical device */
+-			list_for_each_entry(tmp, &sif->logic_dev, list) {
+-				if (tmp->dev == netif) {
+-					subif->subif_num = 1;
+-					subif->subif_list[0] = tmp->ctp;
+-					subif->inst = inst;
+-					memcpy(&subif->subif_common,
+-					       &sif->subif_common,
+-					       sizeof(struct dp_subif_common));
+-					subif->bport = tmp->bp;
+-					subif->port_id = k;
+-					subif_flag[num] = sif->subif_flag;
+-					res = 0;
+-					/*note: logical device no callback */
+-					goto EXIT;
+-				}
++			/* some dev may have multiple
++			 * subif,like pon
++			 */
++			subifs[num] = sif->subif;
++			memcpy(&subif->subif_common, &sif->subif_common,
++			       sizeof(struct dp_subif_common));
++			subif_flag[num] = sif->subif_flag;
++			if (sif->ctp_dev)
++				subif->flag_pmapper = 1;
++			if (num && subif->bport != sif->bp) {
++				pr_err("%s:Why many bp:%d %d\n",
++				       netif->name, sif->bp,
++				       subif->bport);
++				goto EXIT;
+ 			}
++			res = DP_SUCCESS;
++			num++;
+ 		}
+-		if (match) {
+-			res = 0;
+-			break;
++		/*continue search non-explicate logical device */
++		list_for_each_entry(tmp, &sif->logic_dev, list) {
++			if (tmp->dev == netif) {
++				subif->subif_num = 1;
++				subif->inst = inst;
++				subif->bport = tmp->bp;
++				subif->port_id = port_id;
++				subif->subif_list[0] = tmp->ctp;
++				memcpy(&subif->subif_common,
++				       &sif->subif_common,
++				       sizeof(struct dp_subif_common));
++				subif_flag[num] = sif->subif_flag;
++				res = DP_SUCCESS;
++				/*note: logical device no callback */
++				goto EXIT;
++			}
+ 		}
+ 	}
++
+ 	if (flags & DP_F_DEREGISTER)
+ 		goto EXIT;
+-	if (port_id < 0) {
+-		if (subif_data)
+-			DP_DEBUG(DP_DBG_FLAG_DBG,
+-				 "%s failed with subif_data %px\n", __func__,
+-				 subif_data);
+-		else /*netif must should be valid */
+-			DP_DEBUG(DP_DBG_FLAG_DBG,
+-				 "%s failed: %s\n", __func__, netif->name);
+-		res = DP_ERR_SUBIF_NOT_FOUND;
+-		goto EXIT;
+-	}
++
+ 	subif->inst = inst;
+-	p_info = get_dp_port_info(inst, port_id);
+ 	memcpy(&subif->subif_port_cmn, &p_info->subif_port_cmn,
+ 	       sizeof(struct dp_subif_port_common));
+ 	subif->subif_num = num;
+@@ -1905,10 +1869,10 @@ int32_t dp_get_netif_subifid_priv(int inst, struct net_device *netif,
+ 		subif->subif_list[i] = subifs[i];
+ 		subif->subif_flag[i] = subif_flag[i];
+ 	}
+-	res = 0;
++	res = DP_SUCCESS;
+ EXIT:
+-	devm_kfree(&g_dp_dev->dev, subifs);
+-	devm_kfree(&g_dp_dev->dev, subif_flag);
++	kfree(subifs);
++	kfree(subif_flag);
+ 	return res;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_misc.c b/drivers/net/datapath/dpm/datapath_misc.c
+index 4ea87b178bfb..b5fac08334b0 100644
+--- a/drivers/net/datapath/dpm/datapath_misc.c
++++ b/drivers/net/datapath/dpm/datapath_misc.c
+@@ -994,48 +994,35 @@ int32_t dp_sync_subifid(struct net_device *dev, char *subif_name,
+ 			dp_subif_t *subif_id, struct dp_subif_data *data,
+ 			u32 flags, int *f_subif_up)
+ {
+-	void *subif_data = NULL;
+ 	struct pmac_port_info *port;
+ 	int res = DP_FAILURE;
+ 
+ 	port = get_dp_port_info(subif_id->inst, subif_id->port_id);
+ 
+-	/* Note: workaround to set dummy subif_data via subif_name for DSL case.
+-	 *       During dp_get_netif_subifID, subif_data is used to get its PVC
+-	 *       information.
+-	 * Later VRX518/618 need to provide valid subif_data in order to support
+-	 * multiple DSL instances during dp_register_subif_ext
+-	 */
+-	if (is_dsl(port) && !dev)
+-		subif_data = (void *)subif_name;
+ 	/*check flag for register / deregister to update/del */
+ 	if (flags & DP_F_DEREGISTER) {
+ 		/* subif info not required for data->ctp_dev */
+-		res = dp_get_netif_subifid_priv(subif_id->inst, dev, NULL,
+-						subif_data, NULL,
++		res = dp_get_subifid_for_update(subif_id->inst, dev,
+ 						&subif_id[0], flags);
+ 		if (res)
+ 			*f_subif_up = 0;
+ 		else
+ 			*f_subif_up = 1;
+ 	} else {
+-		res = dp_get_netif_subifid_priv(subif_id->inst, dev, NULL,
+-					      subif_data, NULL,
+-					      &subif_id[0], 0);
++		res = dp_get_subifid_for_update(subif_id->inst, dev,
++						&subif_id[0], 0);
+ 		if (res) {
+-			pr_err("%s:dp_get_netif_subif_priv fail (%s)(err:%d)\n",
++			pr_err("%s:dp_get_subifid fail (%s)(err:%d)\n",
+ 			       __func__, dev->name ? dev->name : "NULL", res);
+ 			return res;
+ 		}
+ 		if (data && data->ctp_dev) {
+-			res = dp_get_netif_subifid_priv(subif_id->inst,
+-						      data->ctp_dev, NULL,
+-						      subif_data, NULL,
+-						      &subif_id[1], 0);
++			res = dp_get_subifid_for_update(subif_id->inst,
++							data->ctp_dev,
++							&subif_id[1], 0);
+ 			if (res) {
+-				pr_err("get_netif_subif_priv fail(%s)err:%d\n",
+-				       data->ctp_dev->name ? data->ctp_dev->name : "NULL",
+-				       res);
++				pr_err("%s:get_subifid fail(%s)err:%d\n",
++				       __func__, data->ctp_dev->name, res);
+ 				return res;
+ 			}
+ 		}
+@@ -1053,14 +1040,14 @@ int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
+ 	void *subif_data = NULL;
+ 	struct pmac_port_info *port;
+ 
+-	/* Note: to set dummy subif_data via subif_name for
+-	 * DSL case when dev is NULL
++	port = get_dp_port_info(0, subif_id->port_id);
++
++	/* Note: workaround to set dummy subif_data via subif_name for DSL case.
+ 	 *       During dp_get_netif_subifID, subif_data is used to get its PVC
+ 	 *       information.
++	 * Later VRX518/618 need to provide valid subif_data in order to support
++	 * multiple DSL instances during dp_register_subif_ext
+ 	 */
+-	port = get_dp_port_info(0, subif_id->port_id);
+-	if (!port)
+-		return DP_FAILURE;
+ 	if (is_dsl(port) && !dev)
+ 		subif_data = (void *)subif_name;
+ 	/*check flag for register / deregister to update/del */

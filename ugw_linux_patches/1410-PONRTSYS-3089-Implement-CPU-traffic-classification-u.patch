@@ -1,0 +1,569 @@
+From edbe49e2b447620335aad26c66fbc816c8f8f8dc Mon Sep 17 00:00:00 2001
+From: Jan Dominiak <janx.dominiak@intel.com>
+Date: Thu, 27 Aug 2020 10:44:13 +0200
+Subject: [PATCH] PONRTSYS-3089: Implement CPU traffic classification using tc
+
+---
+ drivers/net/datapath/pon_qos/Makefile            |   3 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.c |  28 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.h |   1 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_trap.c   | 411 +++++++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_trap.h   |  29 ++
+ 5 files changed, 471 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index 3cea80046262..c13fed0b4c77 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -21,4 +21,5 @@ pon_qos-objs := \
+ 	pon_qos_tc_mirred.o \
+ 	pon_qos_tc_ds_tc_remap.o \
+ 	pon_qos_tc_colmark.o \
+-	pon_qos_tc_tbf.o
++	pon_qos_tc_tbf.o \
++	pon_qos_tc_trap.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+index efe368f28519..e34bc5bf7305 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+@@ -7,6 +7,7 @@
+ #include <net/pkt_cls.h>
+ #include <net/tc_act/tc_mirred.h>
+ #include <net/tc_act/tc_colmark.h>
++#include <net/tc_act/tc_gact.h>
+ #include <net/flow_dissector.h>
+ #include "pon_qos_tc_flower.h"
+ #include "pon_qos_tc_ext_vlan.h"
+@@ -14,6 +15,7 @@
+ #include "pon_qos_tc_qmap.h"
+ #include "pon_qos_tc_mirred.h"
+ #include "pon_qos_tc_colmark.h"
++#include "pon_qos_tc_trap.h"
+ 
+ struct pon_qos_storage_node {
+ 	/** Unique key for TC flower - flower cookie */
+@@ -43,6 +45,8 @@ static char *flower_type_str_get(enum pon_qos_tc_flower_type type)
+ 		return "TC_TYPE_MIRRED";
+ 	case TC_TYPE_COLMARK:
+ 		return "TC_TYPE_COLMARK";
++	case TC_TYPE_TRAP:
++		return "TC_TYPE_TRAP";
+ 	default:
+ 		return "TC_TYPE_UNKNOWN";
+ 	}
+@@ -89,6 +93,8 @@ static int flower_remove(struct net_device *dev,
+ 		return pon_qos_mirred_unoffload(dev, f, handle);
+ 	case TC_TYPE_COLMARK:
+ 		return pon_qos_colmark_unoffload(dev, arg1, arg2);
++	case TC_TYPE_TRAP:
++		return pon_qos_trap_unoffload(dev, f, handle);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -145,6 +151,23 @@ static bool is_type_colmark(struct net_device *dev,
+ 	return is_tcf_colmark(f->exts->actions[0]);
+ }
+ 
++static bool is_type_trap(struct net_device *dev,
++			 struct tc_cls_flower_offload *f)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++
++	if (tc_no_actions(f->exts))
++		return false;
++
++	tcf_exts_to_list(f->exts, &actions);
++	list_for_each_entry(a, &actions, list)
++		if (((struct tcf_gact *)a)->tcf_action == TC_ACT_TRAP)
++			return true;
++
++	return false;
++}
++
+ static bool is_type_queue(struct net_device *dev,
+ 			  struct tc_cls_flower_offload *f)
+ {
+@@ -186,6 +209,9 @@ static bool is_type_ext_vlan(struct net_device *dev,
+ static enum pon_qos_tc_flower_type
+ flower_type_get(struct net_device *dev, struct tc_cls_flower_offload *f)
+ {
++	if (is_type_trap(dev, f))
++		return TC_TYPE_TRAP;
++
+ 	if (is_type_mirred(dev, f))
+ 		return TC_TYPE_MIRRED;
+ 
+@@ -224,6 +250,8 @@ static int pon_qos_tc_flower_replace(struct net_device *dev,
+ 		return pon_qos_mirred_offload(dev, f, handle);
+ 	case TC_TYPE_COLMARK:
+ 		return pon_qos_colmark_offload(dev, f);
++	case TC_TYPE_TRAP:
++		return pon_qos_trap_offload(dev, f, handle);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+index f98429ea76e5..62e2c72e5073 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+@@ -15,6 +15,7 @@ enum pon_qos_tc_flower_type {
+ 	TC_TYPE_QUEUE = 3,
+ 	TC_TYPE_MIRRED = 4,
+ 	TC_TYPE_COLMARK = 5,
++	TC_TYPE_TRAP = 6,
+ };
+ 
+ int pon_qos_tc_flower_storage_add(struct net_device *dev,
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
+new file mode 100644
+index 000000000000..7ec9336ed1f6
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
+@@ -0,0 +1,411 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#include <linux/netdevice.h>
++#include <linux/types.h>
++#include <net/datapath_api.h>
++#include <net/pkt_cls.h>
++#include <net/datapath_api_qos.h>
++#include <net/switch_api/lantiq_gsw_flow.h>
++#include "pon_qos_tc_flower.h"
++#include "pon_qos_tc_vlan_prepare.h"
++#include "pon_qos_tc_pce.h"
++#include "pon_qos_tc_trap.h"
++
++LIST_HEAD(tc_trap_storage);
++
++struct pce_rule_storage {
++	/** TC command handle used as dual identificator */
++	s32 handle;
++	/** Logical Port Id. The valid range is hardware dependent */
++	u32 logicalportid;
++	/** Sub interface ID group,
++	 *  The valid range is hardware/protocol dependent
++	 */
++	u32 subifidgroup;
++	/** PCE TABLE Region */
++	GSW_PCE_RuleRegion_t	region;
++	/** Rule Index in the PCE Table */
++	u32	nIndex;
++	/** Sub-Block Type ID */
++	int	subblk_id;
++	struct list_head list;
++};
++
++static void pon_qos_trap_set_default(struct net_device *dev,
++				     GSW_PCE_rule_t *pce_rule,
++				     struct dp_pce_blk_info *pce_blk_info)
++{
++	/* Set default values for trap action */
++	pce_rule->action.ePortMapAction = GSW_PCE_ACTION_PORTMAP_CPU;
++	pce_rule->pattern.bEnable = 1;
++	pce_rule->pattern.bInsertionFlag_Enable = 1;
++	pce_rule->pattern.nInsertionFlag = 0;
++	pce_rule->region = GSW_PCE_RULE_COMMMON;
++
++	pce_blk_info->region = pce_rule->region;
++
++	return;
++}
++
++static int pon_qos_trap_set_sub_interface(struct net_device *dev,
++					  GSW_PCE_rule_t *pce_rule,
++					  struct dp_pce_blk_info *pce_blk_info,
++					  int ifindex)
++{
++	struct net_device *indev = NULL;
++	dp_subif_t *dp_subif;
++	int ret;
++
++	dp_subif = kzalloc(sizeof(*dp_subif), GFP_ATOMIC);
++	if (!dp_subif)
++		return -ENOMEM;
++
++	/* Use indev if available */
++	if (ifindex)
++		indev = dev_get_by_index(dev_net(dev), ifindex);
++
++	if (indev) {
++		ret = dp_get_netif_subifid(indev, NULL, NULL, NULL,
++					   dp_subif, 0);
++		dev_put(indev);
++	} else {
++		ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, dp_subif, 0);
++	}
++
++	/* If dp_get_netif_subifid() fails assume that this rule should be
++	 * configured for all sub interfaces. This is for example the case
++	 * for pon0.
++	 */
++	if (ret == DP_SUCCESS) {
++		if (dp_subif->port_id != 0) {
++			pce_rule->logicalportid = dp_subif->port_id;
++			pce_rule->pattern.bPortIdEnable = 1;
++			pce_rule->pattern.nPortId = dp_subif->port_id;
++
++			pce_blk_info->info.portid = dp_subif->port_id;
++		}
++
++		/* For pmapper set subifid based on bport */
++		if (dp_subif->flag_pmapper) {
++			pce_rule->pattern.eSubIfIdType =
++				GSW_PCE_SUBIFID_TYPE_BRIDGEPORT;
++
++			pce_rule->subifidgroup = dp_subif->bport;
++			pce_rule->pattern.bSubIfIdEnable = 1;
++			pce_rule->pattern.nSubIfId = dp_subif->bport;
++
++			pce_blk_info->info.subif = dp_subif->bport;
++		} else if (dp_subif->subif != 0) {
++			pce_rule->pattern.eSubIfIdType =
++				GSW_PCE_SUBIFID_TYPE_GROUP;
++			pce_rule->subifidgroup = dp_subif->subif_groupid;
++			pce_rule->pattern.bSubIfIdEnable = 1;
++			pce_rule->pattern.nSubIfId = dp_subif->subif;
++
++			pce_blk_info->info.subif = dp_subif->subif;
++		}
++
++		netdev_dbg(dev, "%s: nPortId = %d\n", __func__,
++			   pce_rule->pattern.nPortId);
++		netdev_dbg(dev, "%s: nSubIfId = %d\n", __func__,
++			   pce_rule->pattern.nSubIfId);
++	}
++
++	kfree(dp_subif);
++
++	return 0;
++}
++
++static void pon_qos_trap_parse_key_basic(struct net_device *dev,
++					 const struct tc_cls_flower_offload *f,
++					 GSW_PCE_rule_t *pce_rule)
++{
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
++		struct flow_dissector_key_basic *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_BASIC,
++						  f->key);
++		struct flow_dissector_key_basic *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_BASIC,
++						  f->mask);
++		if (mask->ip_proto) {
++			pce_rule->pattern.bProtocolEnable = 1;
++			pce_rule->pattern.nProtocol = key->ip_proto;
++			netdev_dbg(dev, "%s: bProtocolEnable = %d\n",
++				   __func__, pce_rule->pattern.bProtocolEnable);
++			netdev_dbg(dev, "%s: nProtocol = %#x\n",
++				   __func__, pce_rule->pattern.nProtocol);
++		}
++		if (mask->n_proto) {
++			pce_rule->pattern.bEtherTypeEnable = 1;
++			pce_rule->pattern.nEtherType = key->n_proto;
++			netdev_dbg(dev, "%s: bEtherTypeEnable = %d\n",
++				   __func__,
++				   pce_rule->pattern.bEtherTypeEnable);
++			netdev_dbg(dev, "%s: nEtherType = %#x\n",
++				   __func__, pce_rule->pattern.nEtherType);
++		}
++	}
++
++	return;
++}
++
++static void pon_qos_trap_parse_key_vlan(struct net_device *dev,
++					const struct tc_cls_flower_offload *f,
++					GSW_PCE_rule_t *pce_rule)
++{
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_dissector_key_vlan *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_VLAN,
++						  f->key);
++		struct flow_dissector_key_vlan *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_VLAN,
++						  f->mask);
++
++		if (mask->vlan_id == 0xfff) {
++			pce_rule->pattern.bSLAN_Vid = 1;
++			pce_rule->pattern.nSLAN_Vid = key->vlan_id;
++			netdev_dbg(dev, "%s: bSLAN_Vid = %d\n",
++				   __func__, pce_rule->pattern.bSLAN_Vid);
++			netdev_dbg(dev, "%s: nSLAN_Vid = %d\n",
++				   __func__, pce_rule->pattern.nSLAN_Vid);
++		}
++	}
++
++	if (pce_rule->pattern.nSLAN_Vid == 0 &&
++	    eth_type_vlan(f->common.protocol)) {
++		pce_rule->pattern.bSVidRange_Select = 1;
++		pce_rule->pattern.nOuterVidRange = 4095;
++		netdev_dbg(dev, "%s: nOuterVidRange = %d\n",
++			   __func__, pce_rule->pattern.nOuterVidRange);
++		netdev_dbg(dev, "%s: bSVidRange_Select = %d\n",
++			   __func__, pce_rule->pattern.bSVidRange_Select);
++	}
++
++	return;
++}
++
++static void pon_qos_trap_parse_key_eth(struct net_device *dev,
++				       const struct tc_cls_flower_offload *f,
++				       GSW_PCE_rule_t *pce_rule)
++{
++	int cnt_dst = 0;
++	int cnt_src = 0;
++	int i = 0;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
++		struct flow_dissector_key_eth_addrs *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_ETH_ADDRS,
++						  f->key);
++		struct flow_dissector_key_eth_addrs *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_ETH_ADDRS,
++						  f->mask);
++
++		for (i = 0; i < ARRAY_SIZE(mask->dst); i++) {
++			if (mask->dst[i] != 0)
++				cnt_dst++;
++			if (mask->src[i] != 0)
++				cnt_src++;
++		}
++
++		if (cnt_dst == ARRAY_SIZE(mask->dst)) {
++			pce_rule->pattern.bMAC_DstEnable = 1;
++
++			for (i = 0; i < ARRAY_SIZE(key->dst); i++)
++				pce_rule->pattern.nMAC_Dst[i] = key->dst[i];
++		}
++
++		if (cnt_src == ARRAY_SIZE(mask->src)) {
++			pce_rule->pattern.bMAC_SrcEnable = 1;
++
++			for (i = 0; i < ARRAY_SIZE(key->src); i++)
++				pce_rule->pattern.nMAC_Src[i] = key->src[i];
++		}
++	}
++
++	return;
++}
++
++static void pon_qos_trap_set_traffic_class(struct net_device *dev,
++					   GSW_PCE_rule_t *pce_rule,
++					   unsigned int classid)
++{
++	if (classid != 0) {
++		pce_rule->action.eTrafficClassAction =
++			GSW_PCE_ACTION_TRAFFIC_CLASS_ALTERNATIVE;
++		pce_rule->action.nTrafficClassAlternate = classid;
++
++		netdev_dbg(dev, "%s: eTrafficClassAction = %d\n",
++			   __func__, pce_rule->action.eTrafficClassAction);
++		netdev_dbg(dev, "%s: nTrafficClassAlternate = %d\n",
++			   __func__, pce_rule->action.nTrafficClassAlternate);
++	}
++}
++
++static int pon_qos_trap_storage_add(struct net_device *dev,
++				    GSW_PCE_rule_t *pce_rule,
++				    struct dp_pce_blk_info *pce_blk_info,
++				    uint32_t tc_handle)
++{
++	struct pce_rule_storage *pce_rule_storage;
++
++	pce_rule_storage = kzalloc(sizeof(*pce_rule_storage), GFP_KERNEL);
++	if (!pce_rule_storage)
++		return -ENOMEM;
++
++	pce_rule_storage->handle = tc_handle;
++	pce_rule_storage->nIndex = pce_rule->pattern.nIndex;
++	pce_rule_storage->logicalportid = pce_rule->logicalportid;
++	pce_rule_storage->subifidgroup = pce_rule->subifidgroup;
++	pce_rule_storage->region = pce_blk_info->region;
++	pce_rule_storage->subblk_id = pce_blk_info->info.subblk_id;
++
++	list_add(&pce_rule_storage->list, &tc_trap_storage);
++
++	return 0;
++}
++
++int pon_qos_trap_offload(struct net_device *dev,
++			 const struct tc_cls_flower_offload *f,
++			 uint32_t tc_handle)
++{
++	struct dp_pce_blk_info *pce_blk_info;
++	GSW_PCE_rule_t *pce_rule;
++	int ret, index;
++
++	pce_rule = kzalloc(sizeof(*pce_rule), GFP_ATOMIC);
++	if (!pce_rule)
++		return -ENOMEM;
++
++	pce_blk_info = kzalloc(sizeof(*pce_blk_info), GFP_ATOMIC);
++	if (!pce_blk_info) {
++		kfree(pce_rule);
++		return -ENOMEM;
++	}
++
++	pon_qos_trap_set_default(dev, pce_rule, pce_blk_info);
++
++	/* Set subif and portid */
++	ret = pon_qos_trap_set_sub_interface(dev, pce_rule, pce_blk_info,
++					     (int)*(int *)f->key);
++	if (ret != DP_SUCCESS) {
++		kfree(pce_rule);
++		kfree(pce_blk_info);
++		return ret;
++	}
++
++	/* Set protocol based on ip_proto and ethertype based on n_proto */
++	pon_qos_trap_parse_key_basic(dev, f, pce_rule);
++
++	/* Set SLAN_Vid */
++	pon_qos_trap_parse_key_vlan(dev, f, pce_rule);
++
++	/* Set MAC source and destination */
++	pon_qos_trap_parse_key_eth(dev, f, pce_rule);
++
++	/* Parse hw_tc */
++	pon_qos_trap_set_traffic_class(dev, pce_rule, f->classid);
++
++	index = dp_pce_rule_add(pce_blk_info, pce_rule);
++	if (index < 0) {
++		netdev_err(dev, "%s: dp_pce_rule_add failed err %d\n",
++			   __func__, index);
++		kfree(pce_rule);
++		kfree(pce_blk_info);
++		return -1;
++	}
++	netdev_info(dev, "%s: pce rule added with index %d\n", __func__, index);
++
++	/* Save data needed for rule deletion */
++	ret = pon_qos_trap_storage_add(dev, pce_rule, pce_blk_info, tc_handle);
++	if (ret != DP_SUCCESS) {
++		kfree(pce_rule);
++		kfree(pce_blk_info);
++		return ret;
++	}
++
++	kfree(pce_rule);
++	kfree(pce_blk_info);
++
++	ret = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_TRAP,
++					    NULL, NULL);
++	if (ret < 0)
++		(void)pon_qos_trap_unoffload(dev, NULL, tc_handle);
++
++	return 0;
++}
++
++int pon_qos_trap_unoffload(struct net_device *dev,
++			   const struct tc_cls_flower_offload *f,
++			   uint32_t tc_handle)
++{
++	struct dp_pce_blk_info pce_blk_info = {0};
++	struct pce_rule_storage *p;
++	GSW_PCE_ruleDelete_t *pce_rule;
++	bool deletion = false;
++	int ret;
++
++	list_for_each_entry(p, &tc_trap_storage, list) {
++		if (tc_handle == p->handle) {
++			deletion = true;
++			break;
++		}
++	}
++
++	if (!deletion) {
++		pr_debug("%s: nothing to delete\n", __func__);
++		return -EINVAL;
++	}
++
++	pce_rule = kzalloc(sizeof(*pce_rule), GFP_ATOMIC);
++	if (!pce_rule)
++		return -ENOMEM;
++
++	pce_rule->logicalportid = p->logicalportid;
++	pce_blk_info.info.portid = p->logicalportid;
++	netdev_dbg(dev, "%s: logicalportid  = %d\n", __func__,
++		   pce_rule->logicalportid);
++
++	pce_rule->subifidgroup = p->subifidgroup;
++	pce_blk_info.info.subif = p->subifidgroup;
++	netdev_dbg(dev, "%s: subifidgroup  = %d\n", __func__,
++		   pce_rule->subifidgroup);
++
++	pce_rule->region = p->region;
++	pce_blk_info.region = p->region;
++	netdev_dbg(dev, "%s: region  = %d\n", __func__,
++		   pce_rule->region);
++
++	pce_rule->nIndex = p->nIndex;
++	netdev_dbg(dev, "%s: nIndex  = %d\n", __func__,
++		   pce_rule->nIndex);
++
++	pce_blk_info.info.subblk_id = p->subblk_id;
++	netdev_dbg(dev, "%s: subblk_id  = %d\n", __func__,
++		   pce_blk_info.info.subblk_id);
++
++	ret = dp_pce_rule_del(&pce_blk_info, pce_rule);
++	if (ret < 0) {
++		netdev_info(dev, "%s: dp_pce_rule_del failed err %d\n",
++			    __func__, ret);
++		return -1;
++	}
++	netdev_info(dev, "%s: deleted pce rule with index %d\n", __func__,
++		    pce_rule->nIndex);
++
++	list_del(&p->list);
++	kfree(p);
++
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_trap.h b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.h
+new file mode 100644
+index 000000000000..1b6b3fb47ae6
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++/**
++ *  Offload trap actions to HW using PCE rules.
++ *
++ *  \param[in]	dev		Network device
++ *  \param[in]	f		Flower offload
++ *  \param[in]	tc_handle	TC command identifier
++ */
++int pon_qos_trap_offload(struct net_device *dev,
++			 const struct tc_cls_flower_offload *f,
++			 uint32_t tc_handle);
++
++/**
++ *  Remove trap actions from HW by removing PCE rule.
++ *
++ *  \param[in]	dev		Network device
++ *  \param[in]	f		Flower offload
++ *  \param[in]	tc_handle	TC command identifier
++ */
++int pon_qos_trap_unoffload(struct net_device *dev,
++			   const struct tc_cls_flower_offload *f,
++			   uint32_t tc_handle);
++

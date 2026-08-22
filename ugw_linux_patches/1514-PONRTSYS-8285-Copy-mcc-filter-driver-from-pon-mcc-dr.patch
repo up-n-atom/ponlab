@@ -1,0 +1,274 @@
+From 8aedb90aae2831c2b32acc1000b8587285616b89 Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke.mehrtens@intel.com>
+Date: Wed, 18 Nov 2020 15:08:06 +0100
+Subject: [PATCH] PONRTSYS-8285: Copy mcc filter driver from pon_mcc_drv
+ project
+
+This is more or less only coping the driver without many changes and add
+them to the make and KConfig system.
+---
+ drivers/net/datapath/Kconfig                       |   1 +
+ drivers/net/datapath/mcast_bridge_filter/Kconfig   |  11 ++
+ drivers/net/datapath/mcast_bridge_filter/Makefile  |   2 +
+ .../mcast_bridge_filter/mcast_bridge_filter.c      | 180 +++++++++++++++++++++
+ drivers/net/ethernet/lantiq/Makefile               |   1 +
+ include/net/mcast_bridge_filter.h                  |  21 +++
+ 6 files changed, 216 insertions(+)
+
+diff --git a/drivers/net/datapath/Kconfig b/drivers/net/datapath/Kconfig
+index 48e0dfeb3902..0bef26607a98 100644
+--- a/drivers/net/datapath/Kconfig
++++ b/drivers/net/datapath/Kconfig
+@@ -14,4 +14,5 @@ source "drivers/net/datapath/umt/Kconfig"
+ source "drivers/net/datapath/mib_counters/Kconfig"
+ source "drivers/net/datapath/pon_qos/Kconfig"
+ source "drivers/net/datapath/dp_eth_reinsert/Kconfig"
++source "drivers/net/datapath/mcast_bridge_filter/Kconfig"
+ endif # INTEL_NP_NET_CORE
+diff --git a/drivers/net/datapath/mcast_bridge_filter/Kconfig b/drivers/net/datapath/mcast_bridge_filter/Kconfig
+new file mode 100644
+index 000000000000..86617687c215
+--- /dev/null
++++ b/drivers/net/datapath/mcast_bridge_filter/Kconfig
+@@ -0,0 +1,11 @@
++if INTEL_DATAPATH
++
++config DP_MCAST_BRIDGE_FILTER
++	tristate "Datapath multicast packet bridge filter"
++
++	help
++	  This installs a netfilter hook which filters out all multicast
++	  packets on all bridges. These packages can then be handled in
++	  user space applications.
++
++endif
+diff --git a/drivers/net/datapath/mcast_bridge_filter/Makefile b/drivers/net/datapath/mcast_bridge_filter/Makefile
+new file mode 100644
+index 000000000000..9890e5bbd813
+--- /dev/null
++++ b/drivers/net/datapath/mcast_bridge_filter/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_DP_MCAST_BRIDGE_FILTER) += mcast_bridge_filter.o
++
+diff --git a/drivers/net/datapath/mcast_bridge_filter/mcast_bridge_filter.c b/drivers/net/datapath/mcast_bridge_filter/mcast_bridge_filter.c
+new file mode 100644
+index 000000000000..273852794ba3
+--- /dev/null
++++ b/drivers/net/datapath/mcast_bridge_filter/mcast_bridge_filter.c
+@@ -0,0 +1,180 @@
++/******************************************************************************
++ *
++ * Copyright (c) 2018 Intel Corporation
++ *
++ * For licensing information, see the file 'LICENSE' in the root folder of
++ * this software module.
++ *
++ ******************************************************************************/
++/*
++ * This intercepts all packets transferred on any bridge in the system and
++ * drops the IPv4 IGMP and the IPv6 MLD packets.
++ */
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/netfilter.h>
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter_bridge.h>
++#include <linux/if_vlan.h>
++#include <linux/in.h>
++#include <linux/version.h>
++#include <net/ip.h>
++#include <net/ipv6.h>
++#include <net/mcast_bridge_filter.h>
++
++/* max number of encapsulated vlan tags */
++#define MAX_VLAN_TAGS	3
++
++bool mc_nf_vlan_activate = false;
++
++/*
++ * Iterates over the VLAN tags and increases nhoff for each VLAN tag.
++ * returns 0 on success and -EINVAL in case of an parsing error.
++ */
++static int mc_nf_vlan_iter(struct sk_buff *skb, __be16 *proto, int *nhoff)
++{
++	const struct vlan_hdr *vlan = NULL;
++	struct vlan_hdr _vlan;
++	int i;
++
++	for (i = 0; i < MAX_VLAN_TAGS; i++) {
++		vlan = skb_header_pointer(skb, *nhoff, sizeof(_vlan), &_vlan);
++		if (!vlan)
++			return -EINVAL;
++
++		*proto = vlan->h_vlan_encapsulated_proto;
++		*nhoff += sizeof(*vlan);
++		if (!eth_type_vlan(*proto))
++			break;
++	}
++
++	return 0;
++}
++
++/*
++ * Returns 1 for an IPv6 MLD or MGM packet, 0, -EINVAL on an parsing error and
++ * 0 if it is not an IPv6 MLD or MGM packet.
++ */
++static int mc_nf_ipv6_is_mld_pkt(struct sk_buff *skb, int nhoff)
++{
++	const struct icmp6hdr *icmp6hdr;
++	struct icmp6hdr _icmp6hdr;
++
++	icmp6hdr = skb_header_pointer(skb, nhoff, sizeof(_icmp6hdr),
++				      &_icmp6hdr);
++	if (!icmp6hdr)
++		return -EINVAL;
++
++	switch (icmp6hdr->icmp6_type) {
++	case ICMPV6_MGM_QUERY:
++	case ICMPV6_MGM_REPORT:
++	case ICMPV6_MGM_REDUCTION:
++	case ICMPV6_MLD2_REPORT:
++		return 1;
++	default:
++		break;
++	}
++	return 0;
++}
++
++static unsigned int mc_nf_br_hook_ipv4(struct sk_buff *skb, int nhoff)
++{
++	const struct iphdr *iph;
++	struct iphdr _iph;
++
++	iph = skb_header_pointer(skb, nhoff, sizeof(_iph), &_iph);
++	if (!iph || iph->ihl < 5) {
++		pr_debug("IPv4 packet too short, accepted");
++		return NF_ACCEPT;
++	}
++
++	if (iph->protocol == IPPROTO_IGMP) {
++		pr_debug("IPv4 IGMP packet dropped");
++		return NF_DROP;
++	}
++	return NF_ACCEPT;
++}
++
++static unsigned int mc_nf_br_hook_ipv6(struct sk_buff *skb, int nhoff)
++{
++	const struct ipv6hdr *iph;
++	struct ipv6hdr _iph;
++	__u8 nexthdr;
++	__be16 frag_off;
++
++	iph = skb_header_pointer(skb, nhoff, sizeof(_iph), &_iph);
++	if (!iph) {
++		pr_debug("IPv6 packet too short");
++		return NF_ACCEPT;
++	}
++
++	nexthdr = iph->nexthdr;
++	nhoff = ipv6_skip_exthdr(skb, nhoff + sizeof(_iph), &nexthdr,
++				 &frag_off);
++	if (nhoff < 0) {
++		pr_debug("IPv6 packet too short, accepted");
++		return NF_ACCEPT;
++	}
++
++	if (nexthdr != NEXTHDR_ICMP)
++		return NF_ACCEPT;
++
++	if (mc_nf_ipv6_is_mld_pkt(skb, nhoff) == 1) {
++		pr_debug("IPv6 MLD packet dropped");
++		return NF_DROP;
++	}
++	return NF_ACCEPT;
++}
++
++static unsigned int mc_nf_br_hook(void *priv, struct sk_buff *skb,
++				  const struct nf_hook_state *state)
++{
++	__be16 proto = skb->protocol;
++	int nhoff = skb_network_offset(skb);
++	int err;
++
++	if (!mc_nf_vlan_activate)
++		return NF_ACCEPT;
++
++	if (eth_type_vlan(proto)) {
++		err = mc_nf_vlan_iter(skb, &proto, &nhoff);
++		if (err) {
++			pr_debug("VLAN header broken, accepted");
++			return NF_ACCEPT;
++		}
++	}
++
++	switch (proto) {
++	case htons(ETH_P_IP):
++		return mc_nf_br_hook_ipv4(skb, nhoff);
++	case htons(ETH_P_IPV6):
++		return mc_nf_br_hook_ipv6(skb, nhoff);
++	default:
++		return NF_ACCEPT;
++	}
++}
++
++static struct nf_hook_ops mc_nf_ops = {
++	.hook = mc_nf_br_hook,
++	.hooknum = NF_BR_PRE_ROUTING,
++	.pf = NFPROTO_BRIDGE,
++	.priority = NF_BR_PRI_BRNF,
++};
++
++int __init mc_nf_init(void)
++{
++#if (KERNEL_VERSION(4, 13, 0) > LINUX_VERSION_CODE)
++	return nf_register_hook(&mc_nf_ops);
++#else
++	return nf_register_net_hook(&init_net, &mc_nf_ops);
++#endif
++}
++
++void __exit mc_nf_fini(void)
++{
++#if (KERNEL_VERSION(4, 13, 0) > LINUX_VERSION_CODE)
++	nf_unregister_hook(&mc_nf_ops);
++#else
++	nf_unregister_net_hook(&init_net, &mc_nf_ops);
++#endif
++}
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index ad70e126fd1b..7a744884479d 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -21,3 +21,4 @@ obj-$(CONFIG_LTQ_TOE_DRIVER) += ltq_toe_drv.o
+ obj-$(CONFIG_INTEL_MIB_COUNTERS) += ../../datapath/mib_counters/
+ obj-$(CONFIG_PON_QOS) += ../../datapath/pon_qos/
+ obj-$(CONFIG_DP_ETH_REINSERT) += ../../datapath/dp_eth_reinsert/
++obj-$(CONFIG_DP_MCAST_BRIDGE_FILTER) += ../../datapath/mcast_bridge_filter/
+diff --git a/include/net/mcast_bridge_filter.h b/include/net/mcast_bridge_filter.h
+new file mode 100644
+index 000000000000..1b0dcfd0886e
+--- /dev/null
++++ b/include/net/mcast_bridge_filter.h
+@@ -0,0 +1,21 @@
++/******************************************************************************
++ *
++ * Copyright (c) 2018 Intel Corporation
++ *
++ * For licensing information, see the file 'LICENSE' in the root folder of
++ * this software module.
++ *
++ ******************************************************************************/
++
++#ifndef __PON_MCC_MCNF_H
++#define __PON_MCC_MCNF_H
++
++/* Init the IGMP / MLD bridge filter. */
++int __init mc_nf_init(void);
++/* Uninit the IGMP / MLD bridge filter. */
++void __exit mc_nf_fini(void);
++
++/* Activate the IGMP / MLD bridge filter. */
++extern bool mc_nf_vlan_activate;
++
++#endif /* __PON_MCC_MCNF_H */

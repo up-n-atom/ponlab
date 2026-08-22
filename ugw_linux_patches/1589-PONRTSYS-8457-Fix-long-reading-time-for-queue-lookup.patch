@@ -1,0 +1,494 @@
+From 9e6331e7a2a2011b18c4d88f66cbf0b837de4108 Mon Sep 17 00:00:00 2001
+From: Lishan Liu <lishan.liu@intel.com>
+Date: Sun, 24 Jan 2021 13:08:33 +0800
+Subject: [PATCH] PONRTSYS-8457 Fix long reading time for queue-lookup
+
+---
+ .../net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c   | 369 ++++++++++++++-------
+ 1 file changed, 258 insertions(+), 111 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c
+index 3469abc36be8..3299b1c4444e 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c
+@@ -6,7 +6,7 @@
+ #include "../cqm_common.h"
+ 
+ #define PRINTK  pr_err
+-#define cqm_proc_printf(s, fmt, arg...) \
++#define cqm_dbg_printf(s, fmt, arg...) \
+ 	do { \
+ 		if (!s) \
+ 			printk(fmt, ##arg); \
+@@ -82,6 +82,29 @@ static int lookup_mask_n;
+ #define ENTRY_FILLED 0
+ #define ENTRY_USED   1
+ 
++typedef void (*cqm_dbg_single_callback_t) (struct seq_file *);
++typedef int (*cqm_dbg_callback_t) (struct seq_file *, int);
++typedef int (*cqm_dbg_init_callback_t) (void);
++typedef ssize_t(*cqm_dbg_write_callback_t) (struct file *file,
++					     const char __user *input,
++					     size_t size, loff_t *loff);
++
++struct cqm_dbg_file_entry {
++	cqm_dbg_callback_t multi_callback;
++	cqm_dbg_single_callback_t single_callback;
++	int pos;
++	int single_call_only;
++};
++
++struct cqm_dbg_entry {
++	char *name;
++	cqm_dbg_single_callback_t single_callback;
++	cqm_dbg_callback_t multi_callback;
++	cqm_dbg_init_callback_t init_callback;
++	cqm_dbg_write_callback_t write_callback;
++	const struct file_operations ops;
++};
++
+ static int pattern_match_flag;	/*1--start matching  2--failed, 3---match 0k */
+ static unsigned char lookup_mask1[LOOKUP_FIELD_BITS];
+ 
+@@ -111,6 +134,12 @@ static void lookup_table_remap(int old_q, int new_q);
+ static int cqm_find_pattern(int port_id, struct seq_file *s, int qid);
+ static int get_dont_care_lookup(char *s);
+ static void lookup_table_recursive(int k, int tmp_index, int set_flag, int qid);
++static int lookup_start32(void);
++static ssize_t cqm_get_qid_queue_map_write(struct file *file,
++					   const char __user *buf,
++					   size_t count, loff_t *ppos);
++static int cqm_dbg_open(struct inode *inode, struct file *file);
++static int cqm_qid_queue_map_read(struct seq_file *s, int pos);
+ 
+ /* The main function that prints all combinations of size r*/
+ /* in arr[] of size n. This function mainly uses combine_util()*/
+@@ -298,36 +327,36 @@ int cqm_mode_mask3[] = {13, 12, 11, 10, 9, 8, /*7, 6, 5, 4, 3 , */2, 1, 0 };
+ static void cqm_print_title(struct seq_file *s, int ep, int mode, int qid)
+ {
+ 	if (mode == 0)
+-		cqm_proc_printf(s,
+-				"%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
+-				"F2", "F1",
+-				"DEC", "ENC", "MPE2", "MPE1", "EP3",
+-				"EP2", "EP1", "EP0", "CLS3", "CLS2", "CLS1",
+-				"CLS0", "qid", "id", "mode", "=", mode);
++		cqm_dbg_printf(s,
++			       "%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
++			       "F2", "F1",
++			       "DEC", "ENC", "MPE2", "MPE1", "EP3",
++			       "EP2", "EP1", "EP0", "CLS3", "CLS2", "CLS1",
++			       "CLS0", "qid", "id", "mode", "=", mode);
+ 
+ 	else if (mode == 1)
+-		cqm_proc_printf(s,
+-				"%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
+-				"S7", "S6",
+-				"S5", "S4", "MPE2", "MPE1", "EP3",
+-				"EP2", "EP1", "EP0", "S3", "S2", "S1",
+-				"S0", "qid", "id", "mode", "=", mode);
++		cqm_dbg_printf(s,
++			       "%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
++			       "S7", "S6",
++			       "S5", "S4", "MPE2", "MPE1", "EP3",
++			       "EP2", "EP1", "EP0", "S3", "S2", "S1",
++			       "S0", "qid", "id", "mode", "=", mode);
+ 
+ 	else if (mode == 2)
+-		cqm_proc_printf(s,
+-				"%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
+-				"S11", "S10",
+-				"S9", "S8", "MPE2", "MPE1", "EP3",
+-				"EP2", "EP1", "EP0", "CLS3", "CLS2", "CLS1",
+-				"CLS0", "qid", "id", "mode", "=", mode);
++		cqm_dbg_printf(s,
++			       "%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
++			       "S11", "S10",
++			       "S9", "S8", "MPE2", "MPE1", "EP3",
++			       "EP2", "EP1", "EP0", "CLS3", "CLS2", "CLS1",
++			       "CLS0", "qid", "id", "mode", "=", mode);
+ 
+ 	else if (mode == 3)
+-		cqm_proc_printf(s,
+-				"%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
+-				"S4", "S3",
+-				"S2", "S1", "MPE2", "MPE1", "EP3",
+-				"EP2", "EP1", "EP0", "S0", "CLS2", "CLS1",
+-				"CLS0", "qid", "id", "mode", "=", mode);
++		cqm_dbg_printf(s,
++			       "%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%5s%s%d\n",
++			       "S4", "S3",
++			       "S2", "S1", "MPE2", "MPE1", "EP3",
++			       "EP2", "EP1", "EP0", "S0", "CLS2", "CLS1",
++			       "CLS0", "qid", "id", "mode", "=", mode);
+ 	else
+ 		return;
+ }
+@@ -342,6 +371,7 @@ static int cqm_find_pattern(int port_id, struct seq_file *s, int qid)
+ 	char data_str[14];
+ 	u32 mode;
+ 	int match = 0;
++	int matching_qid_arr[MAX_QOS_QUEUES];
+ 
+ 	entry.ep = port_id;
+ 	ret = cqm_mode_table_get(0, &mode, &entry, 0);
+@@ -379,11 +409,13 @@ static int cqm_find_pattern(int port_id, struct seq_file *s, int qid)
+ 	}
+ 
+ 	for (i = 0; i < match; i++) {
+-		if ((qid >= 0) && (qid != lookup_match_qid[i]))
++		if (((qid >= 0) && (qid != lookup_match_qid[i])) ||
++		    (!lookup_match_qid[i]))
+ 			continue;
+ 		if (!f) {
+ 			f = 1;
+-			cqm_print_title(s, tmp_pattern_port_id, mode, qid);
++			cqm_print_title(s, tmp_pattern_port_id,
++					mode, qid);
+ 		}
+ 		data_index = 0;
+ 		for (j = LOOKUP_FIELD_BITS - 1; j >= 0; j--) {
+@@ -395,47 +427,23 @@ static int cqm_find_pattern(int port_id, struct seq_file *s, int qid)
+ 					+ '0';
+ 			data_index++;
+ 		}
+-		cqm_proc_printf(s,
+-				"%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c  %-3d(0x%04x)\n",
+-				data_str[0], data_str[1], data_str[2],
+-				data_str[3], data_str[4], data_str[5],
+-				data_str[6], data_str[7], data_str[8],
+-				data_str[9], data_str[10], data_str[11],
+-				data_str[12], data_str[13],
+-				lookup_match_qid[i], lookup_match_index[i]);
++		cqm_dbg_printf(s,
++			       "%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c%5c  %-3d(0x%04x)\n",
++			       data_str[0], data_str[1], data_str[2],
++			       data_str[3], data_str[4], data_str[5],
++			       data_str[6], data_str[7], data_str[8],
++			       data_str[9], data_str[10], data_str[11],
++			       data_str[12], data_str[13],
++			       lookup_match_qid[i],
++			       lookup_match_index[i]);
+ 	}
++
+ 	if (s && seq_has_overflowed(s))
+ 		return -1;
+ 
+ 	return 0;
+ }
+ 
+-static int cqm_qid_queue_map_read(struct seq_file *s, void *v)
+-{
+-	cbm_queue_map_entry_t *qmap_entry = NULL;
+-	u32 i, qid, num_entries0;
+-
+-	/*start from qid = 1, assuming 0 as drop queue*/
+-	for (qid = 1; qid < 256; qid++) {
+-		if (cbm_queue_map_get(0, (s32)qid, /*0,*/
+-				      &num_entries0, &qmap_entry, 0)) {
+-			seq_printf(s,
+-				   "Error detected when querying qid = %d\n",
+-				   qid);
+-			return 0;
+-		}
+-
+-		cbm_queue_map_buf_free(qmap_entry);
+-		if (!num_entries0) {
+-			continue;
+-		} else {
+-			for (i = 0; i < 15; i++)
+-				cqm_find_pattern(i, s, qid);
+-		}
+-	}
+-	return 0;
+-}
+-
+ ssize_t cqm_get_qid_queue_map_write(struct file *file, const char __user *buf,
+ 				    size_t count, loff_t *ppos)
+ {
+@@ -488,9 +496,9 @@ ssize_t cqm_get_qid_queue_map_write(struct file *file, const char __user *buf,
+ 			return count;
+ 		}
+ 		qid = get_lookup_qid_via_index(lookup_index);
+-		cqm_proc_printf(NULL,
+-				"Get lookup[%05u 0x%04x] ->     queue[%u]\n",
+-				lookup_index, lookup_index, qid);
++		cqm_dbg_printf(NULL,
++			       "Get lookup[%05u 0x%04x] ->     queue[%u]\n",
++			       lookup_index, lookup_index, qid);
+ 		return count;
+ 	} else if (dp_strncmpi(param_list[0], "find", strlen("find") + 1)
+ 			       == 0) {
+@@ -512,40 +520,40 @@ ssize_t cqm_get_qid_queue_map_write(struct file *file, const char __user *buf,
+ 		int new_q = dp_atoi(param_list[2]);
+ 
+ 		lookup_table_remap(old_q, new_q);
+-		cqm_proc_printf(NULL,
+-				"remap queue[%d] to queue[%d] done\n",
+-				old_q, new_q);
++		cqm_dbg_printf(NULL,
++			       "remap queue[%d] to queue[%d] done\n",
++			       old_q, new_q);
+ 		return count;
+ 	}
+ 
+ 	goto help;
+ help:
+-	cqm_proc_printf(NULL,
+-			"Usage: echo set lookup_flags queue_id > %s\n",
+-			DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL,
+-			"     : echo get lookup_flags > %s\n",
+-			DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL,
+-			"     : echo find  <x> > %s\n", DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL, "     : echo find2 <x> > %s\n", DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL, "     : echo remap <old_q> <new_q> > %s\n",
+-			DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL, "  Hex example: echo set 0x10 10 > %s\n",
+-			DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL, "  Dec:example: echo set 16 10 > %s\n",
+-			DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL, "  Bin:example: echo set b10000 10 > %s\n",
+-			DEBUGFS_LOOKUP);
+-
+-	cqm_proc_printf(NULL, "%s: echo set b1xxxx 10 > %s\n",
+-			"Special for BIN(Don't care bit)", DEBUGFS_LOOKUP);
+-	cqm_proc_printf(NULL, "Lookup format:\n");
+-	cqm_proc_printf(NULL, "  Bits Index: | %s\n",
+-			"13   12 |  11  |  10  |  9   |  8   |7   4 | 3   0 |");
+-	cqm_proc_printf(NULL,
+-			"  Fields:     | %s\n",
+-			"Flow ID | DEC  | ENC  | MPE2 | MPE1 |  EP  | CLASS |");
++	cqm_dbg_printf(NULL,
++		       "Usage: echo set lookup_flags queue_id > %s\n",
++		       DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL,
++		       "     : echo get lookup_flags > %s\n",
++		       DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL,
++		       "     : echo find  <x> > %s\n", DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL, "     : echo find2 <x> > %s\n", DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL, "     : echo remap <old_q> <new_q> > %s\n",
++		       DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL, "  Hex example: echo set 0x10 10 > %s\n",
++		       DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL, "  Dec:example: echo set 16 10 > %s\n",
++		       DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL, "  Bin:example: echo set b10000 10 > %s\n",
++		       DEBUGFS_LOOKUP);
++
++	cqm_dbg_printf(NULL, "%s: echo set b1xxxx 10 > %s\n",
++		       "Special for BIN(Don't care bit)", DEBUGFS_LOOKUP);
++	cqm_dbg_printf(NULL, "Lookup format:\n");
++	cqm_dbg_printf(NULL, "  Bits Index: | %s\n",
++		       "13   12 |  11  |  10  |  9   |  8   |7   4 | 3   0 |");
++	cqm_dbg_printf(NULL,
++		       "  Fields:     | %s\n",
++		       "Flow ID | DEC  | ENC  | MPE2 | MPE1 |  EP  | CLASS |");
+ 	return count;
+ }
+ 
+@@ -564,10 +572,10 @@ void lookup_table_via_qid(int qid)
+ 				if (tmp != qid)
+ 					continue;
+ 				f = 1;
+-				cqm_proc_printf(NULL,
+-						"Get lookup[%05u 0x%04x]%s[%d]\n",
+-						index, index,
+-						" ->     queue", qid);
++				cqm_dbg_printf(NULL,
++					       "Get lookup[%05u 0x%04x]%s[%d]\n",
++					       index, index,
++					       " ->     queue", qid);
+ 			}
+ 		}
+ 	}
+@@ -696,19 +704,6 @@ void lookup_table_recursive(int k, int tmp_index, int set_flag, int qid)
+ 			       set_flag, qid);
+ }
+ 
+-static int cqm_qid_queue_map_open(struct inode *inode, struct file *file)
+-{
+-	return single_open(file, cqm_qid_queue_map_read, inode->i_private);
+-}
+-
+-static const struct file_operations cqm_qid_queue_map_fops = {
+-	.open = cqm_qid_queue_map_open,
+-	.read = seq_read,
+-	.write = cqm_get_qid_queue_map_write,
+-	.llseek = seq_lseek,
+-	.release = single_release,
+-};
+-
+ static ssize_t print_cqm_dbg_cntrs_write(struct file *file,
+ 					 const char __user *buf,
+ 					 size_t count, loff_t *ppos)
+@@ -2524,6 +2519,157 @@ static const struct file_operations cqm_qid_to_ep_fops = {
+ 	.release = single_release,
+ };
+ 
++int lookup_start32(void)
++{
++	return 0;
++}
++
++static int cqm_qid_queue_map_read(struct seq_file *s, int pos)
++{
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++	if (cqm_find_pattern(pos, s, -1) < 0)
++		return pos;
++	pos++;
++	if (pos >= 16)
++		pos = -1;
++	return pos;
++}
++
++static void *cqm_seq_start(struct seq_file *s, loff_t *pos)
++{
++	struct cqm_dbg_file_entry *p = s->private;
++
++	if (p->pos < 0)
++		return NULL;
++
++	return p;
++}
++
++static void *cqm_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	struct cqm_dbg_file_entry *p = s->private;
++
++	*pos = p->pos;
++
++	if (p->pos >= 0)
++		return p;
++	else
++		return NULL;
++}
++
++static void cqm_seq_stop(struct seq_file *s, void *v)
++{
++}
++
++static int cqm_seq_show(struct seq_file *s, void *v)
++{
++	struct cqm_dbg_file_entry *p = s->private;
++
++	if (p->pos >= 0) {
++		if (p->multi_callback) {
++			//pr_info("multiple call");
++			p->pos = p->multi_callback(s, p->pos);
++		} else if (p->single_callback) {
++			//pr_info("single call: %px", p->single_callback);
++			p->single_callback(s);
++			p->pos = -1;
++		}
++	}
++	return 0;
++}
++
++static const struct seq_operations cqm_seq_ops = {
++	.start = cqm_seq_start,
++	.next = cqm_seq_next,
++	.stop = cqm_seq_stop,
++	.show = cqm_seq_show
++};
++
++void cqm_dummy_single_show(struct seq_file *s)
++{
++	seq_puts(s, "Cat Not implemented yet !\n");
++}
++
++static int cqm_dbg_open(struct inode *inode, struct file *file)
++{
++	struct seq_file *s;
++	struct cqm_dbg_file_entry *p;
++	struct cqm_dbg_entry *entry;
++	int ret;
++
++	ret = seq_open(file, &cqm_seq_ops);
++	if (ret)
++		return ret;
++
++	s = file->private_data;
++	p = kmalloc(sizeof(*p), GFP_KERNEL);
++
++	if (!p) {
++		(void)seq_release(inode, file);
++		return -ENOMEM;
++	}
++	memset(p, 0, sizeof(*p));
++
++	entry = inode->i_private;
++
++	if (entry->multi_callback)
++		p->multi_callback = entry->multi_callback;
++	if (entry->single_callback)
++		p->single_callback = entry->single_callback;
++	else
++		p->single_callback = cqm_dummy_single_show;
++
++	if (entry->init_callback)
++		p->pos = entry->init_callback();
++	else
++		p->pos = 0;
++
++	s->private = p;
++
++	return 0;
++}
++
++static int cqm_dbg_release(struct inode *inode, struct file *file)
++{
++	struct seq_file *s;
++
++	s = file->private_data;
++	kfree(s->private);
++
++	return seq_release(inode, file);
++}
++
++static int cqm_seq_single_show(struct seq_file *s, void *v)
++{
++	struct cqm_dbg_entry *p = s->private;
++
++	p->single_callback(s);
++	return 0;
++}
++
++static int cqm_dbg_single_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, cqm_seq_single_show, inode->i_private);
++}
++
++static const struct file_operations cqm_queue_map_lookup_fops = {
++	.owner = THIS_MODULE,
++	.open = cqm_dbg_open,
++	.read = seq_read,
++	.write = cqm_get_qid_queue_map_write,
++	.llseek = seq_lseek,
++	.release = cqm_dbg_release,
++};
++
++static struct cqm_dbg_entry cqm_dbg_entries[] = {
++	{"qid_queue_map", NULL, cqm_qid_queue_map_read,
++		lookup_start32, cqm_get_qid_queue_map_write,
++		cqm_queue_map_lookup_fops},
++	/*the last place holder */
++	{NULL, NULL, NULL, NULL, NULL}
++};
++
+ int cqm_debugfs_init(struct cqm_ctrl *pctrl)
+ {
+ 	char cqm_dir[64] = {0};
+@@ -2594,7 +2740,8 @@ int cqm_debugfs_init(struct cqm_ctrl *pctrl)
+ 		goto err;
+ 
+ 	file = debugfs_create_file("qid_queue_map", 0400, pctrl->debugfs,
+-				   pctrl, &cqm_qid_queue_map_fops);
++				   &cqm_dbg_entries[0],
++				   &cqm_queue_map_lookup_fops);
+ 	if (!file)
+ 		goto err;
+ 

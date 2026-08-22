@@ -1,0 +1,819 @@
+From 048bb0c2e4c67d2c6e62baf9278c6af80e8b979a Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <krywacki@maxlinear.com>
+Date: Fri, 11 Jun 2021 00:09:32 +0200
+Subject: [PATCH] dp: pon_qos: add mcc mirred support
+
+It is now possible to configure special multicast mirred rules in global
+hardware table. Current solution was made to still support special
+mirred offloading rules with their ordering. Parsing code was extracted
+to separate file to be used for all TC to PCE conversions in the future.
+---
+ drivers/net/datapath/pon_qos/Makefile              |   1 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c |  55 +----
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.h   |   6 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c   |  47 +++--
+ drivers/net/datapath/pon_qos/pon_qos_tc_parser.c   | 224 +++++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_parser.h   |  29 +++
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.c      |  13 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_police.c   |   2 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c     |   2 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_trap.c     | 195 +-----------------
+ 10 files changed, 305 insertions(+), 269 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index bedb88b533d8..01a6724f9e7f 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -18,6 +18,7 @@ pon_qos-objs := \
+ 	pon_qos_tc_vlan_filter.o \
+ 	pon_qos_tc_lct.o \
+ 	pon_qos_tc_pce.o \
++	pon_qos_tc_parser.o \
+ 	pon_qos_tc_mirred.o \
+ 	pon_qos_tc_ds_tc_remap.o \
+ 	pon_qos_tc_police.o \
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+index d74cad967100..ab052ef52e5e 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+@@ -17,13 +17,13 @@
+ #include <net/datapath_api.h>
+ #include <net/datapath_api_vlan.h>
+ #include <uapi/linux/tc_act/tc_vlan.h>
+-#include <uapi/linux/icmpv6.h>
+ #include "pon_qos_tc_flower.h"
+ #include "pon_qos_tc_vlan_prepare.h"
+ #include "pon_qos_tc_vlan_storage.h"
+ #include "pon_qos_tc_ext_vlan.h"
+ #include "pon_qos_tc_lct.h"
+ #include "pon_qos_trace.h"
++#include "pon_qos_tc_parser.h"
+ 
+ static LIST_HEAD(tc_ext_vlan_storage);
+ 
+@@ -359,57 +359,6 @@ static int dp_update(struct net_device *dev,
+ 	return 0;
+ }
+ 
+-static int check_mld_type(struct net_device *dev,
+-			  const struct tc_cls_flower_offload *f)
+-{
+-	struct flow_dissector_key_icmp *key = NULL;
+-
+-	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ICMP)) {
+-		key = skb_flow_dissector_target(f->dissector,
+-						FLOW_DISSECTOR_KEY_ICMP,
+-						f->key);
+-
+-		switch (key->type) {
+-		case ICMPV6_MGM_QUERY:
+-		case ICMPV6_MGM_REPORT:
+-		case ICMPV6_MGM_REDUCTION:
+-		case ICMPV6_NI_REPLY:
+-			netdev_dbg(dev, "MLD type: %u\n", key->type);
+-			return 0;
+-		default:
+-			netdev_dbg(dev, "Invalid MLD type\n");
+-			return -EIO;
+-		}
+-	}
+-
+-	netdev_dbg(dev, "Missing MLD type\n");
+-	return -EIO;
+-}
+-
+-static bool is_mcc(struct net_device *dev,
+-		   const struct tc_cls_flower_offload *f)
+-{
+-	struct flow_dissector_key_basic *key = NULL;
+-	struct flow_dissector *d = f->dissector;
+-	int ret;
+-
+-	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
+-		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
+-						f->key);
+-
+-		if (key->ip_proto == IPPROTO_IGMP)
+-			return true;
+-
+-		if (key->ip_proto == IPPROTO_ICMPV6) {
+-			ret = check_mld_type(dev, f);
+-			if (ret == 0)
+-				return true;
+-		}
+-	}
+-
+-	return false;
+-}
+-
+ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 			    struct tc_cls_flower_offload *f,
+ 			    bool ingress)
+@@ -417,7 +366,7 @@ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 	struct dp_tc_vlan dp_vlan = {0};
+ 	struct pon_qos_vlan_storage_node *node;
+ 	enum tc_flower_vlan_tag tag;
+-	bool mcc = is_mcc(dev, f);
++	bool mcc = pon_qos_tc_parse_is_mcc(dev, f);
+ 	int err;
+ 
+ 	netdev_dbg(dev, "Extended VLAN add start\n");
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+index 16568d25fd5e..70cadf8b510b 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+@@ -9,6 +9,12 @@
+ #ifndef _PON_QOS_TC_FLOWER_
+ #define _PON_QOS_TC_FLOWER_
+ 
++/*  Access the indev_ifindex member which is the first element in
++ *  struct fl_flow_key, but struct fl_flow_key is not defined in
++ *  a header file, but only in net/sched/cls_flower.c
++ */
++#define FL_FLOW_KEY_IFINDEX(f) ((int)*(int *)(f)->key)
++
+ enum pon_qos_tc_flower_type {
+ 	TC_TYPE_UNKNOWN = 0,
+ 	TC_TYPE_EXT_VLAN = 1,
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+index 86d0a94ea624..6df4fddcfc73 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+@@ -19,6 +19,7 @@
+ #include "pon_qos_tc_flower.h"
+ #include <net/tc_act/tc_gact.h>
+ #include "pon_qos_tc_pce.h"
++#include "pon_qos_tc_parser.h"
+ #include "pon_qos_tc_mirred.h"
+ 
+ struct pon_qos_mirr_filter {
+@@ -38,7 +39,8 @@ static int pon_qos_parse_flower(struct net_device *dev,
+ 	if (f->dissector->used_keys &
+ 			~(BIT(FLOW_DISSECTOR_KEY_CONTROL) |
+ 				BIT(FLOW_DISSECTOR_KEY_BASIC) |
+-				BIT(FLOW_DISSECTOR_KEY_VLAN))) {
++				BIT(FLOW_DISSECTOR_KEY_VLAN) |
++				BIT(FLOW_DISSECTOR_KEY_ICMP))) {
+ 		pr_debug("%s: Unsupported key used: 0x%x\n", __func__,
+ 			 f->dissector->used_keys);
+ 		return -EINVAL;
+@@ -136,7 +138,6 @@ static int pon_qos_vlan_to_pce_single(struct net_device *dev,
+ 	rule->pattern.nOuterVidRange = 0x0;
+ 	rule->pattern.bSVidRange_Select = 0;
+ 	rule->pattern.bOuterVid_Original = 0;
+-	rule->action.ePortFilterType_Action = 1;
+ 
+ 	if (flt->drop) {
+ 		pr_debug("%s: Mirring VLAN drop\n", __func__);
+@@ -158,7 +159,6 @@ static int pon_qos_vlan_to_pce_wildcard(struct net_device *dev,
+ 	rule->pattern.nOuterVidRange = 4095;
+ 	rule->pattern.bSVidRange_Select = 1;
+ 	rule->pattern.bOuterVid_Original = 0;
+-	rule->action.ePortFilterType_Action = 1;
+ 
+ 	netdev_dbg(dev, "%s: Mirring VLAN wildcard\n", __func__);
+ 	flt->pce_type = PCE_MIRR_VLAN_WILD;
+@@ -189,7 +189,6 @@ static int pon_qos_all_to_pce(struct net_device *dev,
+ 	rule->pattern.bSLANVid_Exclude = 1;
+ 	rule->pattern.bSVidRange_Select = 1;
+ 	rule->pattern.bOuterVid_Original = 0;
+-	rule->action.ePortFilterType_Action = 1;
+ 
+ 	if (flt->drop) {
+ 		netdev_dbg(dev, "%s: Mirring VLAN untag drop\n", __func__);
+@@ -203,31 +202,27 @@ static int pon_qos_all_to_pce(struct net_device *dev,
+ }
+ 
+ static int pon_qos_tc_to_pce(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
+ 			     struct net_device *mirr_dev,
+ 			     struct pon_qos_mirr_filter *flt,
+ 			     GSW_PCE_rule_t *pce_rule)
+ {
+-	dp_subif_t dp_subif;
+ 	int ret = 0;
+ 	int bp = 0, pidx;
+ 
+-	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
+-	if (ret != DP_SUCCESS) {
+-		netdev_err(dev, "%s: dp_get_netif_subifid failed\n",
+-			   __func__);
+-		return -ENODEV;
+-	}
+-
+-	netdev_dbg(dev, "%s: using port: %d subif_groupid: %d\n",
+-		   __func__, dp_subif.port_id, dp_subif.subif_groupid);
+-
+ 	pce_rule->pattern.bEnable = 1;
+-	pce_rule->pattern.bPortIdEnable = 1;
+-	pce_rule->pattern.nPortId = dp_subif.port_id;
+-	pce_rule->pattern.bSubIfIdEnable = 1;
+-	pce_rule->pattern.nSubIfId = dp_subif.subif_groupid;
+-
+-	if (ntohs(flt->proto) == ETH_P_ALL) {
++	flt->pce_type = PCE_COMMON;
++
++	pon_qos_tc2pce_subif_parse(dev, pce_rule, FL_FLOW_KEY_IFINDEX(f));
++	pon_qos_tc2pce_proto_parse(dev, f, pce_rule);
++
++	if (pon_qos_tc_parse_is_mcc(dev, f)) {
++		pon_qos_tc2pce_vlan_parse(dev, f, pce_rule);
++		pon_qos_tc2pce_icmp_parse(dev, f, pce_rule);
++		/* use only on reinserted packets */
++		pce_rule->pattern.bInsertionFlag_Enable = 1;
++		pce_rule->pattern.nInsertionFlag = 1;
++	} else if (ntohs(flt->proto) == ETH_P_ALL) {
+ 		ret = pon_qos_all_to_pce(dev, flt, pce_rule);
+ 	} else if (eth_type_vlan(flt->proto)) {
+ 		ret = pon_qos_vlan_to_pce(dev, flt, pce_rule);
+@@ -240,6 +235,14 @@ static int pon_qos_tc_to_pce(struct net_device *dev,
+ 	if (ret != 0)
+ 		return ret;
+ 
++	/* TODO: Use portmap instead of portfilter */
++	if (pon_qos_tc_parse_is_mcc(dev, f))
++		pce_rule->action.ePortFilterType_Action =
++			GSW_PCE_PORT_FILTER_ACTION_6;
++	else
++		pce_rule->action.ePortFilterType_Action =
++			GSW_PCE_PORT_FILTER_ACTION_1;
++
+ 	if (flt->drop) {
+ 		netdev_dbg(dev, "%s: PCE rule prepared\n", __func__);
+ 		return ret;
+@@ -286,7 +289,7 @@ int pon_qos_mirred_offload(struct net_device *dev,
+ 		goto err;
+ 	}
+ 
+-	ret = pon_qos_tc_to_pce(dev, mirr_dev, &flt, pce_rule);
++	ret = pon_qos_tc_to_pce(dev, f, mirr_dev, &flt, pce_rule);
+ 	if (ret != 0) {
+ 		kfree(pce_rule);
+ 		goto err;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c b/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c
+new file mode 100644
+index 000000000000..ddadaefc7bfa
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2021 MaxLinear, Inc.
++ *
++ *****************************************************************************/
++
++#include <linux/netdevice.h>
++#include <linux/types.h>
++#include <linux/version.h>
++#include <net/datapath_api.h>
++#include <net/pkt_cls.h>
++#include <net/datapath_api_qos.h>
++#include <net/switch_api/lantiq_gsw_flow.h>
++#include <uapi/linux/icmpv6.h>
++#include "pon_qos_tc_parser.h"
++
++void pon_qos_tc2pce_subif_parse(struct net_device *dev,
++				GSW_PCE_rule_t *pce_rule,
++				int ifindex)
++{
++	struct net_device *indev = NULL;
++	dp_subif_t dp_subif = {0};
++	int ret;
++
++	if (ifindex)
++		indev = dev_get_by_index(dev_net(dev), ifindex);
++
++	if (indev) {
++		ret = dp_get_netif_subifid(indev, NULL, NULL, NULL,
++					   &dp_subif, 0);
++		dev_put(indev);
++	} else {
++		ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++	}
++
++	/* If dp_get_netif_subifid() fails assume that this rule should be
++	 * configured for all sub interfaces. This is for example the case
++	 * for pon0.
++	 */
++	if (ret != DP_SUCCESS)
++		return;
++
++	pce_rule->logicalportid = dp_subif.port_id;
++	pce_rule->pattern.bPortIdEnable = 1;
++	pce_rule->pattern.nPortId = dp_subif.port_id;
++
++	if (dp_subif.flag_pmapper) {
++		pce_rule->pattern.eSubIfIdType =
++			GSW_PCE_SUBIFID_TYPE_BRIDGEPORT;
++
++		pce_rule->subifidgroup = dp_subif.bport;
++		pce_rule->pattern.bSubIfIdEnable = 1;
++		pce_rule->pattern.nSubIfId = dp_subif.bport;
++	} else {
++		pce_rule->pattern.eSubIfIdType =
++			GSW_PCE_SUBIFID_TYPE_GROUP;
++		pce_rule->subifidgroup = dp_subif.subif_groupid;
++		pce_rule->pattern.bSubIfIdEnable = 1;
++		pce_rule->pattern.nSubIfId = dp_subif.subif;
++	}
++
++	netdev_dbg(dev, "%s: nPortId = %d\n", __func__,
++		   pce_rule->pattern.nPortId);
++	netdev_dbg(dev, "%s: nSubIfId = %d\n", __func__,
++		   pce_rule->pattern.nSubIfId);
++}
++
++void pon_qos_tc2pce_proto_parse(struct net_device *dev,
++				const struct tc_cls_flower_offload *f,
++				GSW_PCE_rule_t *pce_rule)
++{
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
++		struct flow_dissector_key_basic *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_BASIC,
++						  f->key);
++		struct flow_dissector_key_basic *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_BASIC,
++						  f->mask);
++		if (mask->ip_proto) {
++			pce_rule->pattern.bProtocolEnable = 1;
++			pce_rule->pattern.nProtocol = key->ip_proto;
++			netdev_dbg(dev, "%s: bProtocolEnable = %d\n",
++				   __func__, pce_rule->pattern.bProtocolEnable);
++			netdev_dbg(dev, "%s: nProtocol = %#x\n",
++				   __func__, pce_rule->pattern.nProtocol);
++		}
++		if (mask->n_proto) {
++			pce_rule->pattern.bEtherTypeEnable = 1;
++			pce_rule->pattern.nEtherType = ntohs(key->n_proto);
++			netdev_dbg(dev, "%s: bEtherTypeEnable = %d\n",
++				   __func__,
++				   pce_rule->pattern.bEtherTypeEnable);
++			netdev_dbg(dev, "%s: nEtherType = %#x\n",
++				   __func__, pce_rule->pattern.nEtherType);
++		}
++	}
++}
++
++static bool is_mac_set(GSW_PCE_rule_t *pce_rule)
++{
++	return pce_rule->pattern.bMAC_SrcEnable ||
++	       pce_rule->pattern.bMAC_DstEnable;
++}
++
++void pon_qos_tc2pce_vlan_parse(struct net_device *dev,
++			       const struct tc_cls_flower_offload *f,
++			       GSW_PCE_rule_t *pce_rule)
++{
++	struct flow_dissector_key_vlan *key = NULL;
++	struct flow_dissector_key_vlan *mask = NULL;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN)) {
++		key = skb_flow_dissector_target(f->dissector,
++						FLOW_DISSECTOR_KEY_VLAN,
++						f->key);
++		mask = skb_flow_dissector_target(f->dissector,
++						 FLOW_DISSECTOR_KEY_VLAN,
++						 f->mask);
++
++		if (key && key->vlan_id && mask && mask->vlan_id == 0xfff) {
++			pce_rule->pattern.nSLAN_Vid = key->vlan_id;
++			pce_rule->pattern.bSLAN_Vid = 1;
++			return;
++		}
++	}
++
++	if (f->common.protocol == htons(ETH_P_ALL) &&
++	    (is_mac_set(pce_rule) || pce_rule->pattern.bSubIfIdEnable))
++		return;
++
++	pce_rule->pattern.nOuterVidRange = 4095;
++	pce_rule->pattern.bSVidRange_Select = 1;
++	pce_rule->pattern.bSLAN_Vid = 1;
++
++	if (eth_type_vlan(f->common.protocol))
++		pce_rule->pattern.bSLANVid_Exclude = 0;
++	else
++		pce_rule->pattern.bSLANVid_Exclude = 1;
++
++	netdev_dbg(dev, "%s: nOuterVidRange = %d\n",
++		   __func__, pce_rule->pattern.nOuterVidRange);
++	netdev_dbg(dev, "%s: bSVidRange_Select = %d\n",
++		   __func__, pce_rule->pattern.bSVidRange_Select);
++	netdev_dbg(dev, "%s: bSLANVid_Exclude = %d\n",
++		   __func__, pce_rule->pattern.bSLANVid_Exclude);
++}
++
++void pon_qos_tc2pce_icmp_parse(struct net_device *dev,
++			       const struct tc_cls_flower_offload *f,
++			       GSW_PCE_rule_t *pce_rule)
++{
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ICMP)) {
++		struct flow_dissector_key_icmp *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_ICMP,
++						  f->key);
++		struct flow_dissector_key_icmp *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_ICMP,
++						  f->mask);
++
++		if (mask->icmp) {
++			pce_rule->pattern.bAppDataMSB_Enable = 1;
++			pce_rule->pattern.nAppDataMSB = key->icmp;
++			pce_rule->pattern.nAppMaskRangeMSB = 0x3;
++			netdev_dbg(dev, "%s: nAppDataMSB = %#x\n",
++				   __func__, pce_rule->pattern.nAppDataMSB);
++		}
++	}
++}
++
++static int check_mld_type(struct net_device *dev,
++			  const struct tc_cls_flower_offload *f)
++{
++	struct flow_dissector_key_icmp *key = NULL;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ICMP)) {
++		key = skb_flow_dissector_target(f->dissector,
++						FLOW_DISSECTOR_KEY_ICMP,
++						f->key);
++
++		switch (key->type) {
++		case ICMPV6_MGM_QUERY:
++		case ICMPV6_MGM_REPORT:
++		case ICMPV6_MGM_REDUCTION:
++		case ICMPV6_NI_REPLY:
++			netdev_dbg(dev, "MLD type: %u\n", key->type);
++			return 0;
++		default:
++			netdev_dbg(dev, "Invalid MLD type\n");
++			return -EIO;
++		}
++	}
++
++	netdev_dbg(dev, "Missing MLD type\n");
++	return -EIO;
++}
++
++bool pon_qos_tc_parse_is_mcc(struct net_device *dev,
++			     const struct tc_cls_flower_offload *f)
++{
++	struct flow_dissector_key_basic *key = NULL;
++	struct flow_dissector *d = f->dissector;
++	int ret;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
++		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
++						f->key);
++
++		if (key->ip_proto == IPPROTO_IGMP)
++			return true;
++
++		if (key->ip_proto == IPPROTO_ICMPV6) {
++			ret = check_mld_type(dev, f);
++			if (ret == 0)
++				return true;
++		}
++	}
++
++	return false;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_parser.h b/drivers/net/datapath/pon_qos/pon_qos_tc_parser.h
+new file mode 100644
+index 000000000000..50ac9616cf0d
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_parser.h
+@@ -0,0 +1,29 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2021 MaxLinear, Inc.
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_PARSER_
++#define _PON_QOS_TC_PARSER_
++
++void pon_qos_tc2pce_subif_parse(struct net_device *dev,
++				GSW_PCE_rule_t *pce_rule,
++				int ifindex);
++
++void pon_qos_tc2pce_proto_parse(struct net_device *dev,
++				const struct tc_cls_flower_offload *f,
++				GSW_PCE_rule_t *pce_rule);
++
++void pon_qos_tc2pce_vlan_parse(struct net_device *dev,
++			       const struct tc_cls_flower_offload *f,
++			       GSW_PCE_rule_t *pce_rule);
++
++void pon_qos_tc2pce_icmp_parse(struct net_device *dev,
++			       const struct tc_cls_flower_offload *f,
++			       GSW_PCE_rule_t *pce_rule);
++
++bool pon_qos_tc_parse_is_mcc(struct net_device *dev,
++			     const struct tc_cls_flower_offload *f);
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+index ef2524610779..f16e115eeda6 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+@@ -63,7 +63,7 @@ static int get_subif_data(struct net_device *dev,
+ 	case PCE_COMMON:
+ 		*portid = PON_QOS_PCE_BLOCK_COMMON;
+ 		*subif = PON_QOS_PCE_BLOCK_COMMON;
+-		pr_debug("%s: portid: %u, subif: %u\n", __func__,
++		pr_debug("%s: portid: %d, subif: %d\n", __func__,
+ 			 PON_QOS_PCE_BLOCK_COMMON, PON_QOS_PCE_BLOCK_COMMON);
+ 		break;
+ 	case PCE_UNCOMMON:
+@@ -189,10 +189,10 @@ int pon_qos_pce_rule_create(struct net_device *dev,
+ 		pce_blk_info->info.portid = portid;
+ 		pce_blk_info->info.subif = subif;
+ 		pce_blk_info->region = GSW_PCE_RULE_CTP;
+-		strncpy(pce_blk_info->info.subblk_name, "MIRRED",
++		pce_blk_info->info.subblk_size = TC_PCE_SUBBLK_SIZE;
++		strlcpy(pce_blk_info->info.subblk_name, "MIRRED",
+ 			sizeof(pce_blk_info->info.subblk_name));
+ 	}
+-	pce_blk_info->info.subblk_size = TC_PCE_SUBBLK_SIZE;
+ 
+ 	/* All PCE rules for each region should be put in the same subblock,
+ 	 * take subblk_id from the first rule on the list. If there are no
+@@ -206,7 +206,12 @@ int pon_qos_pce_rule_create(struct net_device *dev,
+ 		kfree(pce_blk_info);
+ 		return ret;
+ 	}
+-	user_data.idx_en = true;
++
++	if (type == PCE_COMMON)
++		pce_blk_info->info.subblk_size = 8;
++	else
++		user_data.idx_en = true;
++
+ 	pce_blk_info->info.user_data = &user_data;
+ 
+ 	ret = dp_pce_rule_add(pce_blk_info, pce_rule);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_police.c b/drivers/net/datapath/pon_qos/pon_qos_tc_police.c
+index c498a79352a6..9d3fb1e7d9b9 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_police.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_police.c
+@@ -65,7 +65,7 @@ static bool pon_qos_police_match(struct policer_data *p1,
+ static struct net_device *pon_qos_get_indev(struct net_device *dev,
+ 					    struct tc_cls_flower_offload *f)
+ {
+-	int ifi = (int)*(int *)f->key;
++	int ifi = FL_FLOW_KEY_IFINDEX(f);
+ 
+ 	if (ifi)
+ 		return dev_get_by_index(dev_net(dev), ifi);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index 1a0c2c1a114e..edae2966ba01 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -200,7 +200,7 @@ int pon_qos_tc_map(struct net_device *dev, struct tc_cls_flower_offload *f,
+ 	struct flower_cls_map *map = NULL;
+ 	struct net_device *indev = NULL;
+ 	char tc_cookie = PON_QOS_TC_COOKIE_EMPTY;
+-	int ifi = (int)*(int *)f->key;
++	int ifi = FL_FLOW_KEY_IFINDEX(f);
+ 	int ret = 0;
+ 
+ 	if (ifi) {
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
+index 2120c2f34bca..25a68002f6d8 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
+@@ -17,6 +17,7 @@
+ #include "pon_qos_tc_vlan_prepare.h"
+ #include "pon_qos_tc_pce.h"
+ #include "pon_qos_tc_trap.h"
++#include "pon_qos_tc_parser.h"
+ 
+ LIST_HEAD(tc_trap_storage);
+ 
+@@ -72,158 +73,6 @@ static void pon_qos_trap_set_default(struct net_device *dev,
+ 	return;
+ }
+ 
+-static int pon_qos_trap_set_sub_interface(struct net_device *dev,
+-					  GSW_PCE_rule_t *pce_rule,
+-					  struct dp_pce_blk_info *pce_blk_info,
+-					  int ifindex)
+-{
+-	struct net_device *indev = NULL;
+-	dp_subif_t *dp_subif;
+-	int ret;
+-
+-	dp_subif = kzalloc(sizeof(*dp_subif), GFP_ATOMIC);
+-	if (!dp_subif)
+-		return -ENOMEM;
+-
+-	/* Use indev if available */
+-	if (ifindex)
+-		indev = dev_get_by_index(dev_net(dev), ifindex);
+-
+-	if (indev) {
+-		ret = dp_get_netif_subifid(indev, NULL, NULL, NULL,
+-					   dp_subif, 0);
+-		dev_put(indev);
+-	} else {
+-		ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, dp_subif, 0);
+-	}
+-
+-	/* If dp_get_netif_subifid() fails assume that this rule should be
+-	 * configured for all sub interfaces. This is for example the case
+-	 * for pon0.
+-	 */
+-	if (ret == DP_SUCCESS) {
+-		pce_rule->logicalportid = dp_subif->port_id;
+-		pce_rule->pattern.bPortIdEnable = 1;
+-		pce_rule->pattern.nPortId = dp_subif->port_id;
+-
+-		pce_blk_info->info.portid = dp_subif->port_id;
+-
+-		/* For pmapper set subifid based on bport */
+-		if (dp_subif->flag_pmapper) {
+-			pce_rule->pattern.eSubIfIdType =
+-				GSW_PCE_SUBIFID_TYPE_BRIDGEPORT;
+-
+-			pce_rule->subifidgroup = dp_subif->bport;
+-			pce_rule->pattern.bSubIfIdEnable = 1;
+-			pce_rule->pattern.nSubIfId = dp_subif->bport;
+-
+-			pce_blk_info->info.subif = dp_subif->bport;
+-		} else {
+-			pce_rule->pattern.eSubIfIdType =
+-				GSW_PCE_SUBIFID_TYPE_GROUP;
+-			pce_rule->subifidgroup = dp_subif->subif_groupid;
+-			pce_rule->pattern.bSubIfIdEnable = 1;
+-			pce_rule->pattern.nSubIfId = dp_subif->subif;
+-
+-			pce_blk_info->info.subif = dp_subif->subif;
+-		}
+-
+-		netdev_dbg(dev, "%s: nPortId = %d\n", __func__,
+-			   pce_rule->pattern.nPortId);
+-		netdev_dbg(dev, "%s: nSubIfId = %d\n", __func__,
+-			   pce_rule->pattern.nSubIfId);
+-	}
+-
+-	kfree(dp_subif);
+-
+-	return 0;
+-}
+-
+-static void pon_qos_trap_parse_key_basic(struct net_device *dev,
+-					 const struct tc_cls_flower_offload *f,
+-					 GSW_PCE_rule_t *pce_rule)
+-{
+-	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
+-		struct flow_dissector_key_basic *key =
+-			skb_flow_dissector_target(f->dissector,
+-						  FLOW_DISSECTOR_KEY_BASIC,
+-						  f->key);
+-		struct flow_dissector_key_basic *mask =
+-			skb_flow_dissector_target(f->dissector,
+-						  FLOW_DISSECTOR_KEY_BASIC,
+-						  f->mask);
+-		if (mask->ip_proto) {
+-			pce_rule->pattern.bProtocolEnable = 1;
+-			pce_rule->pattern.nProtocol = key->ip_proto;
+-			netdev_dbg(dev, "%s: bProtocolEnable = %d\n",
+-				   __func__, pce_rule->pattern.bProtocolEnable);
+-			netdev_dbg(dev, "%s: nProtocol = %#x\n",
+-				   __func__, pce_rule->pattern.nProtocol);
+-		}
+-		if (mask->n_proto) {
+-			pce_rule->pattern.bEtherTypeEnable = 1;
+-			pce_rule->pattern.nEtherType = ntohs(key->n_proto);
+-			netdev_dbg(dev, "%s: bEtherTypeEnable = %d\n",
+-				   __func__,
+-				   pce_rule->pattern.bEtherTypeEnable);
+-			netdev_dbg(dev, "%s: nEtherType = %#x\n",
+-				   __func__, pce_rule->pattern.nEtherType);
+-		}
+-	}
+-}
+-
+-static bool is_mac_set(GSW_PCE_rule_t *pce_rule)
+-{
+-	return pce_rule->pattern.bMAC_SrcEnable ||
+-	       pce_rule->pattern.bMAC_DstEnable;
+-}
+-
+-static void pon_qos_trap_parse_key_vlan(struct net_device *dev,
+-					const struct tc_cls_flower_offload *f,
+-					GSW_PCE_rule_t *pce_rule)
+-{
+-	struct flow_dissector_key_vlan *key = NULL;
+-	struct flow_dissector_key_vlan *mask = NULL;
+-
+-	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN)) {
+-		key = skb_flow_dissector_target(f->dissector,
+-						FLOW_DISSECTOR_KEY_VLAN,
+-						f->key);
+-		mask = skb_flow_dissector_target(f->dissector,
+-						 FLOW_DISSECTOR_KEY_VLAN,
+-						 f->mask);
+-
+-		if (key && key->vlan_id && mask && mask->vlan_id == 0xfff) {
+-			pce_rule->pattern.nSLAN_Vid = key->vlan_id;
+-			pce_rule->pattern.bSLAN_Vid = 1;
+-			return;
+-		}
+-	}
+-
+-	if (f->common.protocol == htons(ETH_P_ALL) &&
+-	    (is_mac_set(pce_rule) || pce_rule->pattern.bSubIfIdEnable))
+-		return;
+-
+-	pce_rule->pattern.nOuterVidRange = 4095;
+-	pce_rule->pattern.bSVidRange_Select = 1;
+-	pce_rule->pattern.bSLAN_Vid = 1;
+-
+-	if (eth_type_vlan(f->common.protocol)) {
+-		pce_rule->pattern.bSLANVid_Exclude = 0;
+-	} else {
+-		pce_rule->pattern.bSLANVid_Exclude = 1;
+-	}
+-
+-	netdev_dbg(dev, "%s: nOuterVidRange = %d\n",
+-			__func__, pce_rule->pattern.nOuterVidRange);
+-	netdev_dbg(dev, "%s: bSVidRange_Select = %d\n",
+-			__func__, pce_rule->pattern.bSVidRange_Select);
+-	netdev_dbg(dev, "%s: bSLANVid_Exclude = %d\n",
+-			__func__, pce_rule->pattern.bSLANVid_Exclude);
+-
+-	return;
+-}
+-
+ static void pon_qos_trap_parse_key_eth(struct net_device *dev,
+ 				       const struct tc_cls_flower_offload *f,
+ 				       GSW_PCE_rule_t *pce_rule)
+@@ -285,32 +134,6 @@ static void pon_qos_trap_parse_key_eth(struct net_device *dev,
+ 	}
+ }
+ 
+-static void pon_qos_trap_parse_key_icmp(struct net_device *dev,
+-					const struct tc_cls_flower_offload *f,
+-					GSW_PCE_rule_t *pce_rule)
+-{
+-	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ICMP)) {
+-		struct flow_dissector_key_icmp *key =
+-			skb_flow_dissector_target(f->dissector,
+-						  FLOW_DISSECTOR_KEY_ICMP,
+-						  f->key);
+-		struct flow_dissector_key_icmp *mask =
+-			skb_flow_dissector_target(f->dissector,
+-						  FLOW_DISSECTOR_KEY_ICMP,
+-						  f->mask);
+-
+-		if (mask->icmp) {
+-			pce_rule->pattern.bAppDataMSB_Enable = 1;
+-			pce_rule->pattern.nAppDataMSB = key->icmp;
+-			pce_rule->pattern.nAppMaskRangeMSB = 0x3;
+-			netdev_dbg(dev, "%s: nAppDataMSB = %#x\n",
+-				   __func__, pce_rule->pattern.nAppDataMSB);
+-		}
+-	}
+-
+-	return;
+-}
+-
+ static void pon_qos_trap_set_traffic_class(struct net_device *dev,
+ 					   GSW_PCE_rule_t *pce_rule,
+ 					   unsigned int classid)
+@@ -376,25 +199,21 @@ int pon_qos_trap_offload(struct net_device *dev,
+ 	pon_qos_trap_set_default(dev, pce_rule, pce_blk_info);
+ 
+ 	/* Set subif and portid */
+-	ret = pon_qos_trap_set_sub_interface(dev, pce_rule, pce_blk_info,
+-					     (int)*(int *)f->key);
+-	if (ret != DP_SUCCESS) {
+-		kfree(pce_rule);
+-		kfree(pce_blk_info);
+-		return ret;
+-	}
++	pon_qos_tc2pce_subif_parse(dev, pce_rule, FL_FLOW_KEY_IFINDEX(f));
++	pce_blk_info->info.portid = pce_rule->pattern.nPortId;
++	pce_blk_info->info.subif = pce_rule->pattern.nSubIfId;
+ 
+ 	/* Set protocol based on ip_proto and ethertype based on n_proto */
+-	pon_qos_trap_parse_key_basic(dev, f, pce_rule);
++	pon_qos_tc2pce_proto_parse(dev, f, pce_rule);
+ 
+ 	/* Set MAC source and destination */
+ 	pon_qos_trap_parse_key_eth(dev, f, pce_rule);
+ 
+ 	/* Set SLAN_Vid */
+-	pon_qos_trap_parse_key_vlan(dev, f, pce_rule);
++	pon_qos_tc2pce_vlan_parse(dev, f, pce_rule);
+ 
+ 	/* Set ICMP type */
+-	pon_qos_trap_parse_key_icmp(dev, f, pce_rule);
++	pon_qos_tc2pce_icmp_parse(dev, f, pce_rule);
+ 
+ 	/* Parse hw_tc */
+ 	pon_qos_trap_set_traffic_class(dev, pce_rule, f->classid);

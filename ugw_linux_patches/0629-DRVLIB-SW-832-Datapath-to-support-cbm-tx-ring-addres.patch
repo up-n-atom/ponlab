@@ -1,0 +1,404 @@
+From d843cf6ec20af332e634eb3761ff5aa36f6af4c5 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Tue, 21 May 2019 11:04:17 +0800
+Subject: [PATCH] DRVLIB_SW-832 Datapath to support cbm tx ring address
+ changes,also add some DP condition checks
+
+---
+ drivers/net/datapath/dpm/datapath.h                | 12 ++++---
+ drivers/net/datapath/dpm/datapath_api.c            | 16 +++++----
+ drivers/net/datapath/dpm/datapath_ioctl.c          |  2 +-
+ drivers/net/datapath/dpm/datapath_proc.c           | 18 +++++-----
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   | 38 ++++++++++++++--------
+ drivers/net/datapath/dpm/gswip31/datapath_ppv4.c   | 12 ++++---
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   |  2 +-
+ drivers/net/datapath/dpm/gswip31/datapath_rx.c     | 17 ++++------
+ 8 files changed, 66 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 1816c5e906a6..4317957d749b 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -499,8 +499,10 @@ struct pmac_port_info {
+ 	u32 dma_chan; /*associated dma tx CH,-1 means no DMA CH*/
+ 	u32 tx_pkt_credit;  /*PP port tx bytes credit */
+ 	u32 tx_b_credit;  /*PP port tx bytes credit */
+-	void *tx_ring_addr;  /*PP port ring address (physical address) */
+-	void *tx_ring_addr_push;  /*PP port ring address. should follow HW definition*/
++	void *txpush_addr_qos;  /*QoS push addr after shift or mask from
++				 * PP QOS point of view
++				 */
++	void *txpush_addr;  /* QOS push address without any shift/mask */
+ 	u32 tx_ring_size; /*PP ring size */
+ 	u32 tx_ring_offset;  /*PP: next tx_ring_addr=
+ 			      *   current tx_ring_addr + tx_ring_offset
+@@ -587,8 +589,10 @@ struct cqm_port_info {
+ 	int f_first_qid : 1; /*0 not valid */
+ 	u32 ref_cnt; /*reference counter: the number of CTP attached to it*/
+ 	u32 tx_pkt_credit;  /*PP port tx bytes credit */
+-	void *tx_ring_addr;  /*PP port ring address. should follow HW definition*/
+-	void *tx_ring_addr_push;  /*PP port ring address. should follow HW definition*/
++	void *txpush_addr; /* QOS push addr after shift or mask from
++			    * PP QOS point of view
++			    */
++	void *txpush_addr_qos; /* QOS push address without any shift/mask */
+ 	u32 tx_ring_size; /*PP port ring size */
+ 	int qos_port; /*qos port id*/
+ 	int first_qid; /*in order to auto sharing queue, 1st queue allocated by
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index d61c30746695..54246d3897a6 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -447,16 +447,16 @@ static int32_t dp_alloc_port_private(int inst,
+ 	if (cbm_data.flags & CBM_PORT_BYTE_CRDT_SET)
+ 		port->tx_b_credit = cbm_data.tx_b_credit;
+ 	if (cbm_data.flags & CBM_PORT_RING_ADDR_SET) {
+-		port->tx_ring_addr = cbm_data.tx_ring_addr;
+-		port->tx_ring_addr_push = cbm_data.tx_ring_addr_txpush;
++		port->txpush_addr = (void *)cbm_data.txpush_addr;
++		port->txpush_addr_qos =	(void *)cbm_data.txpush_addr_qos;
+ 	}
+ 	if (cbm_data.flags & CBM_PORT_RING_SIZE_SET)
+ 	port->tx_ring_size = cbm_data.tx_ring_size;
+ 	if (cbm_data.flags & CBM_PORT_RING_OFFSET_SET)
+ 		port->tx_ring_offset =
+ 				cbm_data.tx_ring_offset;
+-	if((cbm_data.num_dma_chan > 1) && (cbm_data.deq_port_num !=
+-	   cbm_data.num_dma_chan)) {
++	if ((cbm_data.num_dma_chan > 1) && (cbm_data.deq_port_num !=
++	    cbm_data.num_dma_chan)) {
+ 		PR_ERR("ERROR:deq_port_num=%d not equal to num_dma_chan=%d\n",
+ 		       cbm_data.deq_port_num, cbm_data.num_dma_chan);
+ 		return DP_FAILURE;
+@@ -604,6 +604,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 		if ((port_info->num_subif == 1) ||
+ 		    (platfrm_data.act & TRIGGER_CQE_DP_ENABLE)) {
+ 			u32 dma_ch_ref;
++
+ 			cbm_data.dp_inst = inst;
+ 			cbm_data.num_dma_chan = port_info->num_dma_chan;
+ 			cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+@@ -901,6 +902,7 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 	struct cbm_dp_alloc_complete_data cbm_data = {0};
+ #endif
+ 	struct dp_dev_data tmp_data = {0};
++
+ 	if (unlikely(!dp_init_ok)) {
+ 		PR_ERR("dp_register_dev failed for datapath not init yet\n");
+ 		return DP_FAILURE;
+@@ -1879,8 +1881,8 @@ int dp_lan_wan_bridging(int port_id, struct sk_buff *skb)
+ }
+ 
+ void set_chksum(struct pmac_tx_hdr *pmac, u32 tcp_type,
+-		       u32 ip_offset, int ip_off_hw_adjust,
+-		       u32 tcp_h_offset)
++		u32 ip_offset, int ip_off_hw_adjust,
++		u32 tcp_h_offset)
+ {
+ 	pmac->tcp_type = tcp_type;
+ 	pmac->ip_offset = ip_offset + ip_off_hw_adjust;
+@@ -1975,7 +1977,7 @@ int dp_vlan_set(struct dp_tc_vlan *vlan, int flags)
+ 	info.inst = subif.inst;
+ 
+ 	if ((vlan->def_apply == DP_VLAN_APPLY_CTP) &&
+-				(subif.flag_pmapper == 1)) {
++	    (subif.flag_pmapper == 1)) {
+ 		PR_ERR("cannot apply VLAN rule for pmapper device\n");
+ 		return DP_FAILURE;
+ 	} else if (vlan->def_apply == DP_VLAN_APPLY_CTP) {
+diff --git a/drivers/net/datapath/dpm/datapath_ioctl.c b/drivers/net/datapath/dpm/datapath_ioctl.c
+index 2e00682eda21..f88bf2d643a2 100644
+--- a/drivers/net/datapath/dpm/datapath_ioctl.c
++++ b/drivers/net/datapath/dpm/datapath_ioctl.c
+@@ -4,7 +4,6 @@
+ static int dp_ndo_ptp_ioctl(struct net_device *dev,
+ 			    struct ifreq *ifr,
+ 			    int cmd);
+-#endif
+ 
+ static int get_tsinfo(struct net_device *dev,
+ 		      struct ethtool_ts_info *ts_info)
+@@ -30,6 +29,7 @@ static int get_tsinfo(struct net_device *dev,
+ 		 dev->name);
+ 	return 0;
+ }
++#endif
+ 
+ int dp_ops_set(void **dev_ops, int ops_cb_offset,
+ 	       size_t ops_size, void **dp_orig_ops_cb,
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index e9d24c9ece1c..a269d0ad4c3e 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -96,8 +96,6 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 			seq_printf(s, "          : port/node:    %d/%d\n",
+ 				   sif->cqm_deq_port,
+ 				   sif->qos_deq_port);
+-
+-
+ 		} else
+ 			seq_printf(s,
+ 				   "%02d: rx_err_drop=0x%08x  tx_err_drop=0x%08x\n",
+@@ -156,14 +154,14 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	seq_printf(s, "    gpid_num:          %d\n", port->policy_num);
+ 	seq_printf(s, "    tx_pkt_credit:     %d\n", port->tx_pkt_credit);
+ 	seq_printf(s, "    tx_b_credit:       %02d\n", port->tx_b_credit);
+-	seq_printf(s, "    tx_ring_addr:      0x%px\n", port->tx_ring_addr);
+-	seq_printf(s, "    tx_ring_addr_push: 0x%px\n", port->tx_ring_addr_push);
++	seq_printf(s, "    txpush_addr:      0x%px\n", port->txpush_addr);
++	seq_printf(s, "    txpush_addr_qos: 0x%px\n", port->txpush_addr_qos);
+ 	seq_printf(s, "    tx_ring_size:      %d\n", port->tx_ring_size);
+ 	seq_printf(s, "    tx_ring_offset:    %d(to next dequeue port)\n",
+ 		   port->tx_ring_offset);
+ 	if (pos == 0)
+ 		loop = info->cap.max_num_subif_per_port;
+-	else 
++	else
+ 		loop = port->ctp_max;
+ 	for (i = 0; i < loop; i++) {
+ 		struct dp_subif_info *sif = get_dp_port_subif(port, i);
+@@ -227,11 +225,11 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 		dma_ch_offset = dp_deq_port_tbl[tmp_inst][cqm_p].dma_ch_offset;
+ 		if (port->num_dma_chan && dp_dma_chan_tbl[tmp_inst]) {
+ 			seq_printf(s, "          : tx_dma_ch:    0x%x(ref=%d)\n",
+-			   dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan,
++				   dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan,
+ 			   atomic_read(&(dp_dma_chan_tbl[tmp_inst] +
+ 				       dma_ch_offset)->ref_cnt));
+ 			seq_printf(s, "          : dma-ctrl/port/channel:%d/%d/%d\n",
+-				cid, pid, nid);
++				   cid, pid, nid);
+ 		}
+ 		seq_printf(s, "          : gpid:           %d\n",
+ 			   sif->gpid);
+@@ -494,10 +492,10 @@ ssize_t proc_dbg_write(struct file *file, const char *buf, size_t count,
+ 	}
+ 
+ 	for (i = 1; i < num; i++) {
+-		for (j = 0; j < get_dp_dbg_flag_str_size()-1; j++)
++		for (j = 0; j < get_dp_dbg_flag_str_size() - 1; j++)
+ 			if (dp_strncmpi(param_list[i],
+-				dp_dbg_flag_str[j],
+-				strlen(dp_dbg_flag_str[j]) + 1) == 0) {
++					dp_dbg_flag_str[j],
++					strlen(dp_dbg_flag_str[j]) + 1) == 0) {
+ 				set_ltq_dbg_flag(dp_dbg_flag, f_enable,
+ 						 dp_dbg_flag_list[j]);
+ 				break;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index f78f2144e0c0..a0e7f3e990ff 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -88,7 +88,7 @@ static void init_dma_pmac_template(int portid, u32 flags)
+ 		dp_info->dma1_mask_template[i].all = 0xFFFFFFFF;
+ 	}
+ 	if ((flags & DP_F_FAST_ETH_LAN) || (flags & DP_F_FAST_ETH_WAN) ||
+-	    (flags & DP_F_GPON) || (flags & DP_F_EPON)|| (flags & DP_F_GINT)) {
++	    (flags & DP_F_GPON) || (flags & DP_F_EPON) || (flags & DP_F_GINT)) {
+ 		/*always with pmac */
+ 		for (i = 0; i < MAX_TEMPLATE; i++) {
+ 			dp_info->pmac_template[i].class_en = 1;
+@@ -1142,21 +1142,28 @@ int dp_platform_queue_set(int inst, u32 flag)
+ 		q_port.cqe_deq = cpu_data.dq_tx_push_info[i].deq_port;
+ 		q_port.tx_pkt_credit = cpu_data.dq_tx_push_info[i].
+ 							tx_pkt_credit;
+-		q_port.tx_ring_addr = cpu_data.dq_tx_push_info[i].tx_ring_addr;
++		q_port.tx_ring_addr = cpu_data.dq_tx_push_info[i].
++								txpush_addr_qos;
+ 		q_port.tx_ring_size = cpu_data.dq_tx_push_info[i].tx_ring_size;
+ 
+ 		/*Sotre Ring Info */
+ 		dp_deq_port_tbl[inst][q_port.cqe_deq].tx_pkt_credit =
+ 			cpu_data.dq_tx_push_info[i].tx_pkt_credit;
+-		dp_deq_port_tbl[inst][q_port.cqe_deq].tx_ring_addr =
+-			cpu_data.dq_tx_push_info[i].tx_ring_addr;
++		dp_deq_port_tbl[inst][q_port.cqe_deq].txpush_addr =
++			(void *)cpu_data.dq_tx_push_info[i].txpush_addr;
++		dp_deq_port_tbl[inst][q_port.cqe_deq].txpush_addr_qos =
++			(void *)cpu_data.dq_tx_push_info[i].txpush_addr_qos;
+ 		dp_deq_port_tbl[inst][q_port.cqe_deq].tx_ring_size =
+ 			cpu_data.dq_tx_push_info[i].tx_ring_size;
+ 		dp_deq_port_tbl[inst][q_port.cqe_deq].dp_port = 0;/* CPU */
+ 		DP_DEBUG(DP_DBG_FLAG_QOS, "Store CPU ring info\n");
+ 		DP_DEBUG(DP_DBG_FLAG_QOS, "  ring_address[%d]=0x%p\n",
+ 			 q_port.cqe_deq,
+-			 dp_deq_port_tbl[inst][q_port.cqe_deq].tx_ring_addr);
++			 (void *)dp_deq_port_tbl[inst][q_port.cqe_deq].
++								txpush_addr);
++		DP_DEBUG(DP_DBG_FLAG_QOS, "  ring_address_push[%d]=0x%px\n",
++			 q_port.cqe_deq,
++			 dp_deq_port_tbl[inst][q_port.cqe_deq].txpush_addr_qos);
+ 		DP_DEBUG(DP_DBG_FLAG_QOS, "  ring_size[%d]=%d\n",
+ 			 q_port.cqe_deq,
+ 			 dp_deq_port_tbl[inst][q_port.cqe_deq].tx_ring_size);
+@@ -1166,7 +1173,7 @@ int dp_platform_queue_set(int inst, u32 flag)
+ 		q_port.inst = inst;
+ 		q_port.dp_port = PMAC_CPU_ID;
+ 		DP_DEBUG(DP_DBG_FLAG_QOS, "CPU[%d] ring addr=%x\n", i,
+-			 cpu_data.dq_tx_push_info[i].tx_ring_addr);
++			 cpu_data.dq_tx_push_info[i].txpush_addr);
+ 		q_port.ctp = i; /*fake CTP for CPU port to store its qid*/
+ 		DP_DEBUG(DP_DBG_FLAG_QOS, "alloc_q_to_port...\n");
+ 		if (alloc_q_to_port(&q_port, 0)) {
+@@ -1245,7 +1252,6 @@ static int dp_platform_set(int inst, u32 flag)
+ 		sif->bp = CPU_BP;
+ 		sif->mac_learn_dis = DP_MAC_LEARNING_DIS;
+ 		INIT_LIST_HEAD(&sif->logic_dev);
+-
+ 		priv->bp_def = alloc_bridge_port(inst, CPU_PORT, CPU_SUBIF,
+ 						 CPU_FID, CPU_BP);
+ 		DP_DEBUG(DP_DBG_FLAG_DBG, "bp_def[%d]=%d\n",
+@@ -1369,7 +1375,7 @@ static int dp_port_spl_cfg(int inst, int ep, struct dp_port_data *data,
+ }
+ 
+ static int dev_platform_set(int inst, u8 ep, struct dp_dev_data *data,
+-			     u32 flags)
++			    u32 flags)
+ {
+ 	struct gsw_itf *itf;
+ 	struct hal_priv *priv = (struct hal_priv *)dp_port_prop[inst].priv_hal;
+@@ -1413,8 +1419,11 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 	dma_chan =  port_info->dma_chan;
+ 	dma_ch_base = port_info->dma_ch_base;
+ 	for (i = 0; i < port_info->deq_port_num; i++) {
+-		dp_deq_port_tbl[inst][i + idx].tx_ring_addr =
+-			port_info->tx_ring_addr +
++		dp_deq_port_tbl[inst][i + idx].txpush_addr =
++			port_info->txpush_addr +
++			(port_info->tx_ring_offset * i);
++		dp_deq_port_tbl[inst][i + idx].txpush_addr_qos =
++			port_info->txpush_addr_qos +
+ 			(port_info->tx_ring_offset * i);
+ 		dp_deq_port_tbl[inst][i + idx].tx_ring_size =
+ 			port_info->tx_ring_size;
+@@ -1448,9 +1457,10 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+ 	if (DP_DBG_FLAG_QOS & dp_dbg_flag) {
+ 		for (i = 0; i < port_info->deq_port_num; i++) {
+-			PR_INFO("cqm[%d]: addr=%p credit=%d size==%d\n",
++			PR_INFO("cqm[%d]:addr/push=%px/%px credit=%dsize==%d\n",
+ 				i + idx,
+-				dp_deq_port_tbl[inst][i + idx].tx_ring_addr,
++				dp_deq_port_tbl[inst][i + idx].txpush_addr,
++				dp_deq_port_tbl[inst][i + idx].txpush_addr_qos,
+ 				dp_deq_port_tbl[inst][i + idx].tx_pkt_credit,
+ 				dp_deq_port_tbl[inst][i + idx].tx_ring_size);
+ 		}
+@@ -1609,8 +1619,8 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ #endif
+ 	q_port.tx_pkt_credit =
+ 		dp_deq_port_tbl[inst][q_port.cqe_deq].tx_pkt_credit;
+-	q_port.tx_ring_addr =
+-		dp_deq_port_tbl[inst][q_port.cqe_deq].tx_ring_addr;
++	q_port.tx_ring_addr = (u32)dp_deq_port_tbl[inst][q_port.cqe_deq].
++								txpush_addr_qos;
+ 	q_port.tx_ring_size =
+ 		dp_deq_port_tbl[inst][q_port.cqe_deq].tx_ring_size;
+ 	q_port.inst = inst;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c
+index 58e83c2217b8..5e1865862058 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c
+@@ -728,12 +728,16 @@ int init_ppv4_qos(int inst, int flag)
+ 	}
+ 	priv->cqm_drop_p = idx;
+ 	dp_deq_port_tbl[inst][idx].tx_pkt_credit = flush_port->tx_pkt_credit;
+-	dp_deq_port_tbl[inst][idx].tx_ring_addr = flush_port->tx_ring_addr;
++	dp_deq_port_tbl[inst][idx].txpush_addr =
++				(void *)flush_port->txpush_addr;
++	dp_deq_port_tbl[inst][idx].txpush_addr_qos =
++				(void *)flush_port->txpush_addr_qos;
+ 	dp_deq_port_tbl[inst][idx].tx_ring_size = flush_port->tx_ring_size;
+ 	dp_deq_port_tbl[inst][idx].dp_port = 0;/* dummy one */
+ 	DP_DEBUG(DP_DBG_FLAG_QOS,
+-		 "DP Flush port[%d]: ring addr=0x%x size=%d pkt_credit=%d\n",
+-		 priv->cqm_drop_p, dp_deq_port_tbl[inst][idx].tx_ring_addr,
++		 "DP Flush port[%d]: ring addr/push=0x%px/0x%px size=%d pkt_credit=%d\n",
++		 priv->cqm_drop_p, dp_deq_port_tbl[inst][idx].txpush_addr_qos,
++		 dp_deq_port_tbl[inst][idx].txpush_addr,
+ 		 dp_deq_port_tbl[inst][idx].tx_ring_size,
+ 		 dp_deq_port_tbl[inst][idx].tx_pkt_credit);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_QOS_HAL)
+@@ -750,7 +754,7 @@ int init_ppv4_qos(int inst, int flag)
+ 	qos_port_conf_set_default(&t->p_conf);
+ 	t->p_conf.port_parent_prop.arbitration = PP_QOS_ARBITRATION_WRR;
+ 	t->p_conf.ring_address =
+-	(void *)dp_deq_port_tbl[inst][idx].tx_ring_addr;
++	(void *)dp_deq_port_tbl[inst][idx].txpush_addr_qos;
+ 	t->p_conf.ring_size = dp_deq_port_tbl[inst][idx].tx_ring_size;
+ 	t->p_conf.packet_credit_enable = 1;
+ 	t->p_conf.credit = dp_deq_port_tbl[inst][idx].tx_pkt_credit;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index ae6bbc23db43..ca802a0d538e 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -1348,7 +1348,7 @@ static int dp_alloc_qos_port(struct dp_node_alloc *node, int flag)
+ 	/* Configure QOS dequeue port */
+ 	qos_port_conf_set_default(&port_cfg);
+ 	port_cfg.ring_address =
+-		(void *)dp_deq_port_tbl[inst][cqm_deq_port].tx_ring_addr;
++		(void *)dp_deq_port_tbl[inst][cqm_deq_port].txpush_addr_qos;
+ 	port_cfg.ring_size = dp_deq_port_tbl[inst][cqm_deq_port].tx_ring_size;
+ 	port_cfg.credit = dp_deq_port_tbl[inst][cqm_deq_port].tx_pkt_credit;
+ 	if (port_cfg.credit)
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_rx.c b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+index 5a6dc0b304e5..a46e0334001b 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_rx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+@@ -151,7 +151,9 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 	char decryp = 0;
+ 	u8 inst = 0;
+ 	struct pmac_port_info *dp_port;
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_PTP1588)
+ 	struct mac_ops *ops;
++#endif
+ 	int ret_lct = 1;
+ 	struct dp_subif_info *sif;
+ 	struct dev_mib *mib;
+@@ -238,7 +240,8 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 		//desc_1->all &= dma_rx_desc_mask1.all;
+ 		desc_3->all &= dma_rx_desc_mask3.all;
+ 		skb->priority = desc_1->field.classid;
+-		skb->dev = sif->netif;
++		skb->dev = sif->netif; /* note: for DSL ATM case, its driver
++					* will correct it in later stage */
+ 		if (((dp_port->alloc_flags & DP_F_FAST_DSL) == 0) && /*non-dsl*/
+ 			sif->flags) { /*not de-registered */
+ 			dev = sif->netif;
+@@ -248,7 +251,7 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 			desc_1->field.enc = 1;
+ 		}
+ 		if (!dev &&
+-		    ((dp_port->alloc_flags & DP_F_FAST_DSL) == 0)) {
++		    (!(dp_port->alloc_flags & DP_F_FAST_DSL))) {
+ 			UP_STATS(mib->rx_fn_dropped);
+ 			goto RX_DROP;
+ 		}
+@@ -293,9 +296,7 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 			if (dp_port->lct_idx > 0)
+ 				ret_lct = dp_handle_lct(dp_port, skb, rx_fn);
+ 			if (ret_lct) {
+-				if ((STATS_GET(sif->rx_flag) <= 0) &&
+-					((dp_port->alloc_flags & DP_F_FAST_DSL)
+-						== 0)) {
++				if (STATS_GET(sif->rx_flag) <= 0) {
+ 					UP_STATS(mib->rx_fn_dropped);
+ 					goto RX_DROP2;
+ 				}
+@@ -303,9 +304,7 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 				UP_STATS(mib->rx_fn_rxif_pkt);
+ 			}
+ 		} else {
+-			if ((STATS_GET(sif->rx_flag) <= 0) &&
+-					((dp_port->alloc_flags & DP_F_FAST_DSL)
+-						== 0)) {
++			if (STATS_GET(sif->rx_flag) <= 0) {
+ 				UP_STATS(mib->rx_fn_dropped);
+ 				goto RX_DROP2;
+ 			}
+@@ -341,5 +340,3 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 		dev_kfree_skb_any(skb);
+ 	return res;
+ }
+-
+-

@@ -1,0 +1,512 @@
+From 029a288be2c020d4945377a8be93201f357f5d4f Mon Sep 17 00:00:00 2001
+From: Jan Dominiak <janx.dominiak@intel.com>
+Date: Thu, 15 Oct 2020 08:09:02 +0200
+Subject: [PATCH] PONRTSYS-8006: Update PCE handling to use DP PCE API
+
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.c      | 391 ++++-----------------
+ drivers/net/datapath/pon_qos/pon_qos_tc_trap.c     |   1 +
+ .../net/ethernet/lantiq/switch-api/gsw_flow_core.c |   2 +-
+ 3 files changed, 63 insertions(+), 331 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+index 056dfcf9255c..e70e0bdc113a 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+@@ -39,150 +39,14 @@ struct pce_node {
+ 	s64 subif;
+ 	/** PCE rule index used in hardware */
+ 	u32 index;
+-	struct list_head list;
+-};
+-
+-/** This structure represent list element storing PCE rules reservation arrays
+- *  for common and ctp PCE rules blocks.
+- */
+-struct pce_block_node {
+-	/** Logical port id, Common block is using -1 id. */
+-	s64 portid;
+-	/** CTP id, used for PCE block management,
+-	 *  Common block is using -1 id.
+-	 */
+-	s64 subif;
+-	/** Reserved block id,
+-	 *  used for non-common block management
+-	 */
+-	s64 blockid;
+-	/** Reservation table per block */
+-	u8 reserved[PON_QOS_PCE_BLOCK_ENTRIES_MAX];
+-	/** Reservation counter,
+-	 *  used for non-common block management cleanup
+-	 */
+-	u8 reservation_cnt;
++	/** Sub-Block Type ID */
++	int subblk_id;
++	/** Sub-Block type */
++	GSW_PCE_RuleRegion_t region;
+ 	struct list_head list;
+ };
+ 
+ static LIST_HEAD(tc_pce_list);
+-static LIST_HEAD(tc_pce_block_list);
+-
+-static int pce_block_delete(int portid, int subif,
+-			    struct pce_block_node *block);
+-
+-static int pce_index_range_get(enum pce_type type,
+-			       u32 *start,
+-			       u32 *stop)
+-{
+-	switch (type) {
+-	case PCE_COMMON:
+-		*start = 0;
+-		*stop = PON_QOS_PCE_BLOCK_ENTRIES_MAX;
+-		break;
+-	case PCE_MIRR_VLAN_FWD:
+-		*start = 0;
+-		*stop = 16;
+-		break;
+-	case PCE_MIRR_VLAN_DROP:
+-		*start = 16;
+-		*stop = 26;
+-		break;
+-	case PCE_MIRR_VLAN_WILD:
+-		*start = 26;
+-		*stop = 27;
+-		break;
+-	case PCE_MIRR_UNTAG_FWD:
+-		*start = 27;
+-		*stop = 28;
+-		break;
+-	case PCE_MIRR_UNTAG_DROP:
+-		*start = 28;
+-		*stop = 29;
+-		break;
+-	default:
+-		pr_err("%s: Range not found!\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	pr_debug("%s: Range assigned, start: %u, stop: %u\n", __func__,
+-		 *start, *stop);
+-	return 0;
+-}
+-
+-static int pce_free_index_get(u32 *index,
+-			      enum pce_type type,
+-			      int portid, int subif,
+-			      struct pce_block_node *block)
+-{
+-	struct core_ops *gsw_handle;
+-	GSW_PCE_rule_t pce_rule;
+-	GSW_return_t ret;
+-	u32 i, j;
+-
+-	ret = pce_index_range_get(type, &i, &j);
+-	if (ret != 0)
+-		return ret;
+-
+-	gsw_handle = gsw_get_swcore_ops(0);
+-	if (!gsw_handle) {
+-		pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	for (; i < j; i++) {
+-		if (block->reserved[i] == PON_QOS_PCE_RESERVED)
+-			continue;
+-
+-		pce_rule.pattern.nIndex = i;
+-		if (type != PCE_COMMON) {
+-			pce_rule.logicalportid = portid;
+-			pce_rule.subifidgroup = subif;
+-			pce_rule.region = GSW_PCE_RULE_CTP;
+-		}
+-
+-		ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleRead(gsw_handle,
+-								  &pce_rule);
+-		if (ret != GSW_statusOk) {
+-			pr_err("%s: lpid/gpid: %u/%u failed, idx: %u, ret: %d\n",
+-			       __func__, portid, subif,
+-			       pce_rule.pattern.nIndex, ret);
+-			return ret;
+-		}
+-
+-		if (!pce_rule.pattern.bEnable) {
+-			*index = i;
+-			pr_debug("%s: Free index found, index: %u\n", __func__,
+-				 *index);
+-			return 0;
+-		}
+-	}
+-
+-	pr_err("%s: Free index not found\n", __func__);
+-	return -EINVAL;
+-}
+-
+-static int pce_rule_write(GSW_PCE_rule_t *pce_rule)
+-{
+-	struct core_ops *gsw_handle;
+-	GSW_return_t ret;
+-
+-	gsw_handle = gsw_get_swcore_ops(0);
+-	if (!gsw_handle)
+-		return -EINVAL;
+-
+-	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle,
+-							   pce_rule);
+-	if (ret != GSW_statusOk) {
+-		pr_err("%s: TFLOW_PceRuleWrite failed, nIndex: %u, ret: %d\n",
+-		       __func__, pce_rule->pattern.nIndex, ret);
+-		return ret;
+-	}
+-
+-	pr_debug("%s: TFLOW_PceRuleWrite success, nIndex: %u\n",
+-		 __func__, pce_rule->pattern.nIndex);
+-	return 0;
+-}
+ 
+ static int get_subif_data(struct net_device *dev,
+ 			  enum pce_type type,
+@@ -221,214 +85,88 @@ static int get_subif_data(struct net_device *dev,
+ 	return 0;
+ }
+ 
+-static int pce_block_create(int portid, int subif,
+-			    enum pce_type type,
+-			    struct pce_block_node **block)
+-{
+-	struct core_ops *gsw_handle;
+-	GSW_PCE_rule_alloc_t alloc = {0};
+-	GSW_CTP_portConfig_t ctp = {0};
+-	struct pce_block_node *pce_block;
+-	GSW_return_t ret;
+-
+-	if (type != PCE_COMMON) {
+-		gsw_handle = gsw_get_swcore_ops(0);
+-		if (!gsw_handle) {
+-			pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
+-			return -EINVAL;
+-		}
+-
+-		alloc.num_of_rules = PON_QOS_PCE_BLOCK_ENTRIES_MAX;
+-
+-		ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleAlloc(gsw_handle,
+-								   &alloc);
+-		if (ret != GSW_statusOk) {
+-			pr_err("%s: TFLOW_PceRuleAlloc failed, num_of_rules: %u, ret: %d\n",
+-			       __func__, alloc.num_of_rules, ret);
+-			return ret;
+-		}
+-
+-		pr_debug("%s: TFLOW_PceRuleAlloc success, num_of_rules: %u, block_id: %u\n",
+-			 __func__, alloc.num_of_rules, alloc.blockid);
+-
+-		ctp.nLogicalPortId = portid;
+-		ctp.nSubIfIdGroup = subif;
+-		ctp.nFirstFlowEntryIndex = alloc.blockid;
+-		ctp.eMask |= GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
+-
+-		ret = gsw_handle->gsw_ctp_ops.CTP_PortConfigSet(gsw_handle,
+-								&ctp);
+-		if (ret != GSW_statusOk) {
+-			pr_err("%s: CTP_PortConfigSet failed, nLogicalPortId: %u, nFirstFlowEntryIndex: %u, ret: %d\n",
+-			       __func__, ctp.nLogicalPortId,
+-			       ctp.nFirstFlowEntryIndex, ret);
+-			return ret;
+-		}
+-
+-		pr_debug("%s: CTP_PortConfigSet success, nLogicalPortId: %u, nFirstFlowEntryIndex: %u\n",
+-			 __func__, ctp.nLogicalPortId,
+-			 ctp.nFirstFlowEntryIndex);
+-	}
+-
+-	pce_block = kzalloc(sizeof(*pce_block), GFP_KERNEL);
+-	if (!pce_block)
+-		return -ENOMEM;
+-
+-	pce_block->subif = subif;
+-	pce_block->portid = portid;
+-	if (type != PCE_COMMON)
+-		pce_block->blockid = alloc.blockid;
+-	else
+-		pce_block->blockid = PON_QOS_PCE_BLOCK_COMMON;
+-	memset(pce_block->reserved, 0, sizeof(pce_block->reserved));
+-	pce_block->reservation_cnt = 0;
+-
+-	list_add(&pce_block->list, &tc_pce_block_list);
+-
+-	*block = pce_block;
+-
+-	pr_debug("%s: PCE block created for subif: %#x\n", __func__, subif);
+-	return 0;
+-}
+-
+-static int pce_block_get(int portid, int subif,
+-			 struct pce_block_node **block)
+-{
+-	struct pce_block_node *p, *n;
+-
+-	list_for_each_entry_safe(p, n, &tc_pce_block_list, list) {
+-		if (p->subif == subif && p->portid == portid) {
+-			*block = p;
+-			pr_debug("%s: PCE block found\n", __func__);
+-			return 0;
+-		}
+-	}
+-
+-	pr_debug("%s: PCE block not found\n", __func__);
+-	return -EINVAL;
+-}
++#define TC_PCE_SUBBLK_SIZE 32
+ 
+ int pon_qos_pce_rule_create(struct net_device *dev,
+ 			    u32 tc_handle, int pref,
+ 			    enum pce_type type,
+ 			    GSW_PCE_rule_t *pce_rule)
+ {
+-	u32 index;
+-	s32 ret;
++	struct dp_pce_blk_info *pce_blk_info;
+ 	struct pce_node *tc_pce = NULL;
+-	struct pce_block_node *block;
++	struct pce_node *p;
+ 	int portid, subif;
++	u32 index;
++	s32 ret;
+ 
+ 	ret = get_subif_data(dev, type, &portid, &subif);
+ 	if (ret != 0)
+ 		return -ENODEV;
+ 
+-	ret = pce_block_get(portid, subif, &block);
+-	if (ret != 0) {
+-		ret = pce_block_create(portid, subif, type, &block);
+-		if (ret != 0)
+-			return ret;
+-	}
+-
+-	ret = pce_free_index_get(&index, type, portid, subif, block);
+-	if (ret != 0)
+-		goto error_block;
+-
+-	pce_rule->pattern.nIndex = index;
++	pce_blk_info = kzalloc(sizeof(*pce_blk_info), GFP_ATOMIC);
++	if (!pce_blk_info)
++		return -ENOMEM;
+ 
+ 	if (type != PCE_COMMON) {
+ 		pce_rule->logicalportid = portid;
+ 		pce_rule->subifidgroup = subif;
+ 		pce_rule->region = GSW_PCE_RULE_CTP;
++
++		pce_blk_info->info.portid = portid;
++		pce_blk_info->info.subif = subif;
++		pce_blk_info->region = GSW_PCE_RULE_CTP;
++		strncpy(pce_blk_info->info.subblk_name, "MIRRED",
++			sizeof(pce_blk_info->info.subblk_name));
++	}
++	pce_blk_info->info.subblk_size = TC_PCE_SUBBLK_SIZE;
++
++	/* All PCE rules for each region should be put in the same subblock,
++	 * take subblk_id from the first rule on the list. If there are no
++	 * rules in storage, leave subblk_id equal to 0, to make DP create new
++	 * subblock. */
++	list_for_each_entry(p, &tc_pce_list, list) {
++		if (pce_rule->region == p->region) {
++			pce_blk_info->info.subblk_id = p->subblk_id;
++		}
+ 	}
+ 
+-	ret = pce_rule_write(pce_rule);
+-	if (ret != 0)
+-		goto error_block;
++	index = dp_pce_rule_add(pce_blk_info, pce_rule);
++	if (index < 0) {
++		netdev_err(dev, "%s: dp_pce_rule_add failed err %d\n",
++			   __func__, index);
++		kfree(pce_blk_info);
++		return -EINVAL;
++	}
++	netdev_dbg(dev, "%s: pce rule added with index %d\n", __func__, index);
+ 
+ 	tc_pce = kzalloc(sizeof(*tc_pce), GFP_KERNEL);
+-	if (!tc_pce)
+-		goto error_block;
++	if (!tc_pce) {
++		kfree(pce_blk_info);
++		return ret;
++	}
+ 
+ 	tc_pce->handle = tc_handle;
+ 	tc_pce->pref = pref;
+ 	tc_pce->index = index;
+ 	tc_pce->portid = portid;
+ 	tc_pce->subif = subif;
++	tc_pce->subblk_id = pce_blk_info->info.subblk_id;
++	tc_pce->region = pce_blk_info->region;
+ 
+ 	list_add(&tc_pce->list, &tc_pce_list);
++	kfree(pce_blk_info);
+ 
+-	block->reserved[index] = PON_QOS_PCE_RESERVED;
+-	block->reservation_cnt++;
+-
+-	pr_debug("%s: PCE rule created for lpid/gpid %u/%u\n", __func__, portid, subif);
+-	return 0;
+-
+-error_block:
+-	if (!block->reservation_cnt)
+-		(void)pce_block_delete(portid, subif, block);
+-
+-	return ret;
+-}
+-
+-static int pce_block_delete(int portid, int subif,
+-			    struct pce_block_node *block)
+-{
+-	struct core_ops *gsw_handle;
+-	GSW_PCE_rule_alloc_t alloc = {0};
+-	GSW_CTP_portConfig_t ctp = {0};
+-	GSW_return_t ret;
+-
+-	if (block->blockid == PON_QOS_PCE_BLOCK_COMMON) {
+-		pr_debug("%s: Common block\n", __func__);
+-		return 0;
+-	}
+-
+-	ctp.nLogicalPortId = portid;
+-	ctp.nSubIfIdGroup = subif;
+-	ctp.nFirstFlowEntryIndex = 0xFFFFFFFF;
+-	ctp.eMask |= GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
+-
+-	gsw_handle = gsw_get_swcore_ops(0);
+-	if (!gsw_handle) {
+-		pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
+-		return -EINVAL;
+-	}
+-
+-	ret = gsw_handle->gsw_ctp_ops.CTP_PortConfigSet(gsw_handle,
+-							&ctp);
+-	if (ret != GSW_statusOk) {
+-		pr_err("%s: CTP_PortConfigSet failed, nLogicalPortId: %u, nFirstFlowEntryIndex: %u, ret: %d\n",
+-		       __func__, ctp.nLogicalPortId, ctp.nFirstFlowEntryIndex,
+-		       ret);
+-		return ret;
+-	}
+-
+-	pr_debug("%s: CTP_PortConfigSet success, lpid/gpid: %u/%u, nFirstFlowEntryIndex: %u\n",
+-		 __func__, portid, subif, ctp.nFirstFlowEntryIndex);
+-	alloc.blockid = block->blockid;
+-
+-	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleFree(gsw_handle, &alloc);
+-	if (ret != GSW_statusOk) {
+-		pr_err("%s: TFLOW_PceRuleFree failed, block_id: %u, ret: %d\n",
+-		       __func__, alloc.blockid, ret);
+-		return ret;
+-	}
+-
+-	list_del(&block->list);
+-	kfree(block);
+-
+-	pr_debug("%s: PCE block deleted\n", __func__);
++	pr_debug("%s: PCE rule created for lpid/gpid %u/%u\n",
++		 __func__, portid, subif);
+ 	return 0;
+ }
+ 
+ int pon_qos_pce_rule_delete(u32 tc_handle, int pref)
+ {
+-	struct core_ops *gsw_handle;
++	struct dp_pce_blk_info *pce_blk_info;
+ 	struct pce_node *p, *n;
+ 	bool deletion = false;
+ 	GSW_PCE_ruleDelete_t pce_rule = {0};
+-	struct pce_block_node *block;
+ 	GSW_return_t ret;
+ 
+ 	list_for_each_entry_safe(p, n, &tc_pce_list, list) {
+@@ -443,44 +181,37 @@ int pon_qos_pce_rule_delete(u32 tc_handle, int pref)
+ 		return -ENOENT;
+ 	}
+ 
+-	ret = pce_block_get(p->portid, p->subif, &block);
+-	if (ret != 0)
+-		return ret;
++	pce_blk_info = kzalloc(sizeof(*pce_blk_info), GFP_ATOMIC);
++	if (!pce_blk_info) {
++		return -ENOMEM;
++	}
+ 
+ 	if (p->subif != PON_QOS_PCE_BLOCK_COMMON &&
+ 	    p->portid != PON_QOS_PCE_BLOCK_COMMON) {
+ 		pce_rule.logicalportid = p->portid;
++		pce_blk_info->info.portid = p->portid;
+ 		pce_rule.subifidgroup = p->subif;
++		pce_blk_info->info.subif = p->subif;
+ 		pce_rule.region = GSW_PCE_RULE_CTP;
++		pce_blk_info->region = GSW_PCE_RULE_CTP;
+ 	}
+ 
+-	gsw_handle = gsw_get_swcore_ops(0);
+-	if (!gsw_handle) {
+-		pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
+-		return -EINVAL;
+-	}
++	pce_blk_info->info.subblk_id = p->subblk_id;
+ 
+ 	pce_rule.nIndex = p->index;
+ 
+-	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleDelete(gsw_handle,
+-							    &pce_rule);
+-	if (ret != GSW_statusOk) {
+-		pr_err("%s: TFLOW_PceRuleDelete failed, nIndex: %u, ret: %d\n",
+-		       __func__, pce_rule.nIndex, ret);
++	ret = dp_pce_rule_del(pce_blk_info, &pce_rule);
++	if (ret < 0) {
++		pr_err("%s: dp_pce_rule_del failed err %d\n", __func__, ret);
+ 		return ret;
+ 	}
++	pr_debug("%s: deleted pce rule with index %d\n", __func__,
++		 pce_rule.nIndex);
+ 
+-	block->reserved[p->index] = PON_QOS_PCE_UNRESERVED;
+-	block->reservation_cnt--;
+-
+-	if (!block->reservation_cnt) {
+-		ret = pce_block_delete(p->portid, p->subif, block);
+-		if (ret != 0)
+-			return ret;
+-	}
+ 
+ 	list_del(&p->list);
+ 	kfree(p);
++	kfree(pce_blk_info);
+ 
+ 	pr_debug("%s: PCE rule deleted\n", __func__);
+ 	return 0;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
+index fdae7f570311..aafcee503e4d 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_trap.c
+@@ -456,6 +456,7 @@ int pon_qos_trap_unoffload(struct net_device *dev,
+ 
+ 	list_del(&p->list);
+ 	kfree(p);
++	kfree(pce_rule);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
+index ee67bd076f50..ad60bdc8afc6 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
+@@ -18512,7 +18512,7 @@ static int gsw_get_ctp_baseindex(void *cdev, GSW_PCE_RuleManage_t *parm)
+ 	base = gswdev->ctpportconfig_idx[ctp_port].IngressTflowFirstIdx;
+ 	num = gswdev->ctpportconfig_idx[ctp_port].IngressTflowNumberOfEntrys;
+ 
+-	if (parm->nIndex >= num) {
++	if (parm->nIndex >= base + num) {
+ 		pr_err("\n\tERROR: Index %u is not in CTP region (%u entries) start at %u\n",
+ 		       parm->nIndex, num, base);
+ 		return GSW_statusErr;

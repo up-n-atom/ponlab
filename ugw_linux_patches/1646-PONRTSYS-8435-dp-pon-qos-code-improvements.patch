@@ -1,0 +1,231 @@
+From 3c5243d7f7f717d57817d82d5d7d7b312b8dfa1e Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <kamil.rywacki@intel.com>
+Date: Thu, 8 Apr 2021 11:16:35 +0200
+Subject: [PATCH] PONRTSYS-8435: dp: pon_qos: code improvements
+
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c | 39 +++++++++--
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c  | 90 ++++++++++----------------
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h  |  2 +-
+ 3 files changed, 69 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index d2bf7dfacb78..6f737ef5fea0 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -7,6 +7,7 @@
+  *****************************************************************************/
+ #include <net/pkt_cls.h>
+ #include <linux/list.h>
++#include <net/datapath_api.h>
+ #include <net/flow_dissector.h>
+ #include <net/tc_act/tc_mirred.h>
+ #include <net/tc_act/tc_gact.h>
+@@ -125,6 +126,25 @@ static int pon_qos_parse_tc_flower(struct tc_cls_flower_offload *f,
+ 	return ret;
+ }
+ 
++static int pon_qos_get_subif_idx(struct net_device *dev, int *subif)
++{
++	dp_subif_t dp_subif = {0};
++	int ret;
++
++	if (!dev)
++		return -EINVAL;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, 0, &dp_subif, 0);
++	if (ret < 0) {
++		netdev_err(dev, "%s: subif idx get failed\n", __func__);
++		return -ENODEV;
++	}
++
++	*subif = dp_subif.subif_groupid;
++
++	return 0;
++}
++
+ static int __pon_qos_tc_map(struct net_device *dev,
+ 			    struct flower_cls_map *map,
+ 			    struct net_device *indev,
+@@ -134,10 +154,19 @@ static int __pon_qos_tc_map(struct net_device *dev,
+ 	int ret;
+ 
+ 	qmap.indev = indev;
+-	if (en)
+-		qmap.subif = map->key.vlan_priority;
+-	else
+-		qmap.subif = tc;
++
++	if (en) {
++		if (qmap.indev) {
++			ret = pon_qos_get_subif_idx(qmap.indev,
++						    &qmap.tc);
++			if (ret < 0)
++				return -ENODEV;
++		} else {
++			qmap.tc = map->key.vlan_priority;
++		}
++	} else {
++		qmap.tc = tc;
++	}
+ 
+ 	/* when Q is removed we should unmap the same classid */
+ 	qmap.handle = map->classid;
+@@ -148,7 +177,7 @@ static int __pon_qos_tc_map(struct net_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	map->tc = qmap.subif;
++	map->tc = qmap.tc;
+ 	map->mapped = en;
+ 
+ 	return 0;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 3edfa8ea6b5a..8d5b50860836 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -509,25 +509,6 @@ int pon_qos_add_child_qdisc(struct net_device *dev,
+ 	return ret;
+ }
+ 
+-static int pon_qos_get_subif_idx(struct net_device *dev, int *subif)
+-{
+-	dp_subif_t dp_subif = {0};
+-	int ret;
+-
+-	if (!dev)
+-		return -EINVAL;
+-
+-	ret = dp_get_netif_subifid(dev, NULL, NULL, 0, &dp_subif, 0);
+-	if (ret < 0) {
+-		netdev_err(dev, "%s: subif idx get failed\n", __func__);
+-		return -ENODEV;
+-	}
+-
+-	*subif = dp_subif.subif_groupid;
+-
+-	return 0;
+-}
+-
+ static int pon_qos_sched_policy_update(struct pon_qos_qdisc *sch,
+ 				       int arbi, int prio_w, int idx)
+ {	struct dp_node_prio prio_info = {0};
+@@ -936,8 +917,7 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 	return ret;
+ }
+ 
+-/*
+- * classid option identifies the queue id.
++/* classid option identifies the queue id.
+  *
+  * Queue mapping scenarios PON upstream:
+  *  - GEM port is mapped to specific queue: The GEM port netdev is passed using
+@@ -968,6 +948,25 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+  *  direction if required.
+  */
+ 
++int pon_qos_update_ds_qmap(struct net_device *dev,
++			   struct pon_qos_qdisc *sch,
++			   struct pon_qos_qmap_tc *q_tc,
++			   bool en)
++{
++	int pqn;
++
++	if (q_tc->indev) {
++		/* Get the queue id from the handle. In PON pq = 1 is
++		 * the one with the highest priority e.g.
++		 * handle 100:1 has higher prio than 100:7
++		 */
++		pqn = TC_H_MIN(q_tc->handle);
++		return pon_qos_force_tc(q_tc->indev, pqn, en);
++	}
++
++	return pon_qos_reassign_tc(sch, q_tc->tc, en);
++}
++
+ int pon_qos_update_qmap(struct net_device *dev,
+ 			struct pon_qos_qmap_tc *q_tc,
+ 			bool en)
+@@ -975,7 +974,7 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 	struct pon_qos_port *port = NULL;
+ 	struct pon_qos_qdisc *sch = NULL;
+ 	struct pon_qos_q_data *qid = NULL;
+-	int ret, tc;
++	int ret;
+ 
+ 	port = pon_qos_port_get(dev);
+ 	if (!port)
+@@ -995,47 +994,26 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 		}
+ 	}
+ 
+-	if (q_tc->indev && en) {
+-		ret = pon_qos_get_subif_idx(q_tc->indev,
+-					    &q_tc->subif);
+-		if (ret < 0)
+-			return -ENODEV;
+-	}
+-	tc = q_tc->subif;
+-
+ 	netdev_dbg(dev, "port:%d deq_i:%d q:%d cls:%#x tc:%d/%u ds:%s en:%d\n",
+ 		   sch->port, sch->deq_idx, qid->qid, q_tc->handle,
+-		   tc, q_tc->tc_cookie,
++		   q_tc->tc, q_tc->tc_cookie,
+ 		   sch->ds ? "true" : "false", en);
+ 
+ 	/* TODO: DPM uses port zero currently as the CPU port */
+-	if (pon_qos_is_cpu_port(sch->port)) {
+-		ret = pon_qos_config_cpu_port(qid, sch->port, 0,
+-					      q_tc->tc_cookie, en);
+-	} else {
+-		ret = pon_qos_map_qid(qid, sch, tc, q_tc->tc_cookie, en);
+-		if (ret != 0) {
+-			netdev_err(dev, "%s: qid map err\n", __func__);
+-			return -EFAULT;
+-		}
+-
+-		if (sch->ds && q_tc->indev) {
+-			/* Get the queue id from the handle. In PON pq = 1 is
+-			 * the one with the highest priority e.g.
+-			 * handle 100:1 has higher prio than 100:7
+-			 */
+-			int pqn = TC_H_MIN(q_tc->handle);
+-
+-			return pon_qos_force_tc(q_tc->indev, pqn, en);
+-		}
+-
+-		if (!q_tc->indev && sch->ds && sch->dev == dev) {
+-			ret = pon_qos_reassign_tc(sch, tc, en);
+-			if (ret != 0)
+-				netdev_err(dev, "%s: tc remap err\n", __func__);
+-		}
++	if (pon_qos_is_cpu_port(sch->port))
++		return pon_qos_config_cpu_port(qid, sch->port, 0,
++					       q_tc->tc_cookie, en);
++
++	ret = pon_qos_map_qid(qid, sch, q_tc->tc,
++			      q_tc->tc_cookie, en);
++	if (ret != 0) {
++		netdev_err(dev, "%s: qid map err\n", __func__);
++		return -EFAULT;
+ 	}
+ 
++	if (sch->ds)
++		return pon_qos_update_ds_qmap(dev, sch, q_tc, en);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(pon_qos_update_qmap);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index 743712fd9b37..c84d299bc14d 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -123,7 +123,7 @@ struct pon_qos_qmap_tc {
+ 	int flags;
+ 	u32 handle;
+ 	struct net_device *indev;
+-	int subif;
++	int tc;
+ 	char tc_cookie;
+ };
+ 

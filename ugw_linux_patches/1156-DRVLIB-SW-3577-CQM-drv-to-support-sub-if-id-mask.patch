@@ -1,0 +1,327 @@
+From c6ad4478019b03fa1f58f0a53ccf4057ad47b87a Mon Sep 17 00:00:00 2001
+From: Lishan Liu <lishan.liu@intel.com>
+Date: Thu, 30 Apr 2020 16:15:33 +0800
+Subject: [PATCH] DRVLIB_SW-3577: CQM drv to support sub_if_id mask
+
+---
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   |   2 +-
+ drivers/net/ethernet/lantiq/cqm/grx500/cbm.c       |   3 +-
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c       | 103 +++++++++++++++------
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.h       |  11 ++-
+ include/net/lantiq_cbm_api.h                       |  29 +++---
+ 5 files changed, 101 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index f7c905bb9dca..807f0f15ff9b 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -4004,7 +4004,7 @@ int dp_queue_map_set_31(struct dp_queue_map_set *cfg, int flag)
+ 		cqm_flags |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
+ 		if (get_dp_port_info(cfg->inst, cfg->map.dp_port)->gsw_mode ==
+ 		    GSW_LOGICAL_PORT_9BIT_WLAN)
+-			cqm_flags |= CBM_QUEUE_MAP_F_SUBIF_LSB_DONTCARE;
++			qmap_cfg.sub_if_id_mask_bits = 1;
+ 	}
+ 
+ 	if (cbm_queue_map_set(cfg->inst, cfg->q_id, &qmap_cfg, cqm_flags)) {
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index e23e260c4549..6c198e5792b4 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -1396,7 +1396,7 @@ queue_map_get(
+ 		spin_unlock_irqrestore(&cbm_qidt_lock, sys_flag);
+ 		return CBM_FAILURE;
+ 	}
+-	temp_entry = kmalloc(sizeof(cbm_queue_map_entry_t) * (j), GFP_ATOMIC);
++	temp_entry = kzalloc(sizeof(cbm_queue_map_entry_t) * (j), GFP_ATOMIC);
+ 	if (temp_entry) {
+ 		*entries = temp_entry;
+ 		*num_entries = j;
+@@ -1405,7 +1405,6 @@ queue_map_get(
+ 			offset = (g_qidt_help[i] % 4);
+ 			index = index + 3 - offset;
+ 
+-			temp_entry[i].regval = 0;
+ 			temp_entry[i].flowid = ((index & 0x2000) | (index & 0x1000)) >> 12;
+ 			temp_entry[i].dec = (index & 0x800) >> 11;
+ 			temp_entry[i].enc = (index & 0x400) >> 10;
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index a3d00f7eace1..f19dbf0cf0f1 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -764,6 +764,29 @@ static u8 get_lookup_qid_via_idx_prx300(u32 index)
+ 	return value;
+ }
+ 
++static inline void find_next_sub_if_id(u32 *idx_p, u32 mask, u32 mask_all,
++				       u32 limit_v, u32 start_v)
++{
++	if (mask && (*idx_p) && mask_all) {
++		while ((start_v != ((*idx_p) & (~mask))) &&
++		       ((*idx_p) < limit_v)) {
++			*idx_p =  *idx_p + 1;
++		}
++	}
++}
++
++static inline void sub_if_id_masking(u32 sub_if_id, u32 *st, u32 *lim,
++				     u32 in_mask, u32 *bit_mask)
++{
++	if (in_mask & 1) {
++		*bit_mask = in_mask >> SUB_IF_ID_MASK_SHF;
++		if (*bit_mask) {
++			*st = sub_if_id & (~(*bit_mask));
++			*lim = ((*st) | (*bit_mask)) + 1;
++		}
++	}
++}
++
+ static void cqm_qidt_set_mode0(const struct cqm_qidt_elm *qid_set,
+ 			       const struct cqm_qidt_mask *qid_mask,
+ 			       u8 qid_val)
+@@ -855,6 +878,11 @@ static void cqm_qidt_set_mode1(const struct cqm_qidt_elm *qid_set,
+ 	struct cqm_qidt_elm qidt_elm = {0};
+ 	int state;
+ 	struct qidt_flag_done flag_done = {0};
++	u32 limit = MODE1_SUB_IF_ID_LIMIT, masking_bits = 0, start = 0;
++	u32 sub_if_id_bit_mask =
++		((qid_mask->sub_if_id_mask >> SUB_IF_ID_MODE_1_POS) &
++		(SUB_IF_ID_MODE_1_MASK << SUB_IF_ID_MASK_SHF)) |
++		(qid_mask->sub_if_id_mask & 0x01);
+ 	u8 sel_field = 0;
+ 
+ 	dev_dbg(cqm_ctrl->dev, "%u\n", qid_val);
+@@ -868,15 +896,23 @@ static void cqm_qidt_set_mode1(const struct cqm_qidt_elm *qid_set,
+ 		qid_mask->dec_mask, qid_mask->flowid_hmask,
+ 		qid_mask->flowid_lmask);
+ 	state = STATE_SUBIF_ID;
++	sub_if_id_masking(((qid_set->sub_if_id >> SUB_IF_ID_MODE_1_POS) &
++			  SUB_IF_ID_MODE_1_MASK), &start, &limit,
++			  sub_if_id_bit_mask, &masking_bits);
++	qidt_elm.sub_if_id = start;
++	qidt_idx.sub_if_id = start;
+ 	while (state != STATE_NONE) {
+ 		switch (state) {
+ 		case STATE_SUBIF_ID:
+-			handle_state(&state, STATE_EP, STATE_NONE, 256,
++			handle_state(&state, STATE_EP, STATE_NONE, limit,
+ 				     &flag_done.sub_if_id_done,
+ 				     (qid_set->sub_if_id & 0xff),
+ 				     qid_mask->sub_if_id_mask,
+ 				     &qidt_elm.sub_if_id, &qidt_idx.sub_if_id);
+ 			sel_field = qidt_elm.sub_if_id;
++			find_next_sub_if_id(&qidt_idx.sub_if_id, masking_bits,
++					    (qid_mask->sub_if_id_mask & 1),
++					    limit, start);
+ 			break;
+ 		case STATE_EP:
+ 			handle_state(&state, STATE_MPE1, STATE_SUBIF_ID, 16,
+@@ -909,10 +945,14 @@ static void cqm_qidt_set_mode2(const struct cqm_qidt_elm *qid_set,
+ {
+ 	struct cqm_qidt_elm qidt_idx = {0};
+ 	struct cqm_qidt_elm qidt_elm = {0};
+-	int state, nxt_st_subif, pr_st_ep;
++	int state;
+ 	struct qidt_flag_done flag_done = {0};
++	u32 limit = MODE2_SUB_IF_ID_LIMIT, masking_bits = 0, start = 0;
++	u32 sub_if_id_bit_mask =
++		((qid_mask->sub_if_id_mask >> SUB_IF_ID_MODE_2_POS) &
++		(SUB_IF_ID_MODE_2_MASK << SUB_IF_ID_MASK_SHF)) |
++		(qid_mask->sub_if_id_mask & 0x01);
+ 	u8 sel_field = 0;
+-	u32 temp = 0, temp_idx = 0;
+ 
+ 	dev_dbg(cqm_ctrl->dev, "%u\n", qid_val);
+ 	dev_dbg(cqm_ctrl->dev, "%u %u %u %u\n", qid_set->clsid,
+@@ -926,11 +966,13 @@ static void cqm_qidt_set_mode2(const struct cqm_qidt_elm *qid_set,
+ 		qid_mask->flowid_lmask);
+ 	dev_dbg(cqm_ctrl->dev, "%u %u\n", qid_set->sub_if_id,
+ 		qid_mask->sub_if_id_mask);
+-	nxt_st_subif = (qid_mask->sub_if_id_mask & FLAG_LSB_DONT_CARE) ?
+-			STATE_SUBIF_LSB_DC : STATE_EP;
+-	pr_st_ep = (qid_mask->sub_if_id_mask & FLAG_LSB_DONT_CARE) ?
+-			STATE_SUBIF_LSB_DC : STATE_SUBIF_ID;
++
+ 	state = STATE_CLASS;
++	sub_if_id_masking(((qid_set->sub_if_id >> SUB_IF_ID_MODE_2_POS) &
++			  SUB_IF_ID_MODE_2_MASK), &start, &limit,
++			  sub_if_id_bit_mask, &masking_bits);
++	qidt_elm.sub_if_id = start;
++	qidt_idx.sub_if_id = start;
+ 	while (state != STATE_NONE) {
+ 		switch (state) {
+ 		case STATE_CLASS:
+@@ -940,30 +982,22 @@ static void cqm_qidt_set_mode2(const struct cqm_qidt_elm *qid_set,
+ 				     &qidt_idx.clsid);
+ 			break;
+ 		case STATE_SUBIF_ID:
+-			handle_state(&state, nxt_st_subif, STATE_CLASS,
+-				     16, &flag_done.sub_if_id_done,
++			handle_state(&state, STATE_EP, STATE_CLASS,
++				     limit, &flag_done.sub_if_id_done,
+ 				     ((qid_set->sub_if_id >> 8) & 0xf),
+ 				     qid_mask->sub_if_id_mask & 1,
+ 				     &qidt_elm.sub_if_id,
+ 				     &qidt_idx.sub_if_id);
+ 			sel_field = (qidt_elm.sub_if_id << 4) |
+ 				(qidt_elm.clsid & 0xf);
+-			temp = (qidt_elm.sub_if_id & 0xf);
+-			temp |= 1UL;
+-			temp_idx = temp & (~1UL);
+-			break;
+-		case STATE_SUBIF_LSB_DC:
+-			handle_state(&state, STATE_EP, STATE_SUBIF_ID,
+-				     temp + 1, &flag_done.sub_if_dc_done,
+-				     ((qid_set->sub_if_id >> 8) & 0xf),
+-				     qid_mask->sub_if_id_mask,
+-				     &qidt_elm.sub_if_id,
+-				     &temp_idx);
+-			sel_field = (qidt_elm.sub_if_id << 4) |
+-					     (qidt_elm.clsid & 0xf);
++
++			find_next_sub_if_id(&qidt_idx.sub_if_id, masking_bits,
++					    (qid_mask->sub_if_id_mask & 1),
++					    limit, start);
++
+ 			break;
+ 		case STATE_EP:
+-			handle_state(&state, STATE_MPE1, pr_st_ep, 16,
++			handle_state(&state, STATE_MPE1, STATE_SUBIF_ID, 16,
+ 				     &flag_done.ep_done, qid_set->ep,
+ 				     qid_mask->ep_mask, &qidt_elm.ep,
+ 				     &qidt_idx.ep);
+@@ -996,6 +1030,11 @@ static void cqm_qidt_set_mode3(const struct cqm_qidt_elm *qid_set,
+ 	int state;
+ 	struct qidt_flag_done flag_done = {0};
+ 	u8 sel_field = 0;
++	u32 limit = MODE3_SUB_IF_ID_LIMIT, masking_bits = 0, start = 0;
++	u32 sub_if_id_bit_mask =
++		((qid_mask->sub_if_id_mask >> SUB_IF_ID_MODE_3_POS) &
++		(SUB_IF_ID_MODE_3_MASK << SUB_IF_ID_MASK_SHF)) |
++		(qid_mask->sub_if_id_mask & 0x01);
+ 
+ 	dev_dbg(cqm_ctrl->dev, "%u\n", qid_val);
+ 	dev_dbg(cqm_ctrl->dev, "%u %u %u %u\n", qid_set->clsid,
+@@ -1008,6 +1047,11 @@ static void cqm_qidt_set_mode3(const struct cqm_qidt_elm *qid_set,
+ 		qid_mask->dec_mask, qid_mask->flowid_hmask,
+ 		qid_mask->flowid_lmask);
+ 	state = STATE_CLASS;
++	sub_if_id_masking(((qid_set->sub_if_id >> SUB_IF_ID_MODE_3_POS) &
++			  SUB_IF_ID_MODE_3_MASK), &start, &limit,
++			  sub_if_id_bit_mask, &masking_bits);
++	qidt_elm.sub_if_id = start;
++	qidt_idx.sub_if_id = start;
+ 	while (state != STATE_NONE) {
+ 		switch (state) {
+ 		case STATE_CLASS:
+@@ -1017,7 +1061,7 @@ static void cqm_qidt_set_mode3(const struct cqm_qidt_elm *qid_set,
+ 				     &qidt_idx.clsid);
+ 			break;
+ 		case STATE_SUBIF_ID:
+-			handle_state(&state, STATE_EP, STATE_CLASS, 32,
++			handle_state(&state, STATE_EP, STATE_CLASS, limit,
+ 				     &flag_done.sub_if_id_done,
+ 				     (qid_set->sub_if_id & 0x1f),
+ 				      qid_mask->sub_if_id_mask,
+@@ -1025,6 +1069,9 @@ static void cqm_qidt_set_mode3(const struct cqm_qidt_elm *qid_set,
+ 				      &qidt_idx.sub_if_id);
+ 			sel_field = (qidt_elm.sub_if_id << 3) |
+ 				     (qidt_elm.clsid & 0x7);
++			find_next_sub_if_id(&qidt_idx.sub_if_id, masking_bits,
++					    (qid_mask->sub_if_id_mask & 1),
++					    limit, start);
+ 			break;
+ 		case STATE_EP:
+ 			handle_state(&state, STATE_MPE1, STATE_SUBIF_ID, 16,
+@@ -1134,7 +1181,6 @@ static s32 queue_map_get(int cbm_inst, s32 queue_id, s32 *num_entries,
+ 		index = (g_qidt_help[i] / 4) << 2;
+ 		offset = (g_qidt_help[i] % 4);
+ 		index = index + 3 - offset;
+-		temp_entry[i].regval = 0;
+ 		temp_entry[i].mpe1 = (index & 0x100) >> PRX300_MPE1_POS;
+ 		temp_entry[i].mpe2 = (index & 0x200) >> PRX300_MPE2_POS;
+ 		temp_entry[i].ep = (index & 0xF0) >> PRX300_EP_POS;
+@@ -1213,10 +1259,11 @@ static s32 queue_map_set(int cbm_inst, s32 queue_id,
+ 		qidt_mask.ep_mask = 1;
+ 	if (flags & CBM_QUEUE_MAP_F_TC_DONTCARE)
+ 		qidt_mask.classid_mask = 1;
+-	if (flags & CBM_QUEUE_MAP_F_SUBIF_DONTCARE)
++	if (flags & CBM_QUEUE_MAP_F_SUBIF_DONTCARE) {
+ 		qidt_mask.sub_if_id_mask = 1;
+-	if (flags & CBM_QUEUE_MAP_F_SUBIF_LSB_DONTCARE)
+-		qidt_mask.sub_if_id_mask |= FLAG_LSB_DONT_CARE;
++		qidt_mask.sub_if_id_mask |= (entry->sub_if_id_mask_bits
++			<< SUB_IF_ID_MASK_SHF);
++	}
+ 
+ 	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
+ 	cqm_qidt_set(&qidt_elm, &qidt_mask, queue_id);
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+index cd69303c5aab..d4b204231c7a 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+@@ -43,7 +43,16 @@
+ #define DMA_PORT_FOR_FLUSH 25
+ #define PRX300_CQM_DROP_Q	0x0
+ #define PRX300_CQM_Q_MASK	0xff
+-
++#define SUB_IF_ID_MASK_SHF	16
++#define SUB_IF_ID_MODE_1_MASK	0xFF
++#define SUB_IF_ID_MODE_2_MASK	0x0F
++#define SUB_IF_ID_MODE_3_MASK	0x1F
++#define SUB_IF_ID_MODE_1_POS	0
++#define SUB_IF_ID_MODE_2_POS	8
++#define SUB_IF_ID_MODE_3_POS	0
++#define MODE1_SUB_IF_ID_LIMIT	BIT(8)
++#define MODE2_SUB_IF_ID_LIMIT	BIT(4)
++#define MODE3_SUB_IF_ID_LIMIT	BIT(5)
+ /***********************
+  * ENUM
+  ***********************/
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index 06f8f863af49..0d22f74dee60 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -156,7 +156,6 @@
+ #define CBM_QUEUE_MAP_F_FLOWID_L_DONTCARE		0x1
+ #define CBM_QUEUE_MAP_F_FLOWID_H_DONTCARE		0x80
+ #define CBM_QUEUE_MAP_F_SUBIF_DONTCARE		0x100
+-#define CBM_QUEUE_MAP_F_SUBIF_LSB_DONTCARE		0x200
+ 
+ /*!
+ 	\brief VPN Encrypt bit is don't care for map to QueueId */
+@@ -427,20 +426,20 @@ typedef union {
+ /*!
+ 	\brief CBM Queue Map table Entry
+ */
+-typedef union {
+-	uint32_t	regval;	/*!< 32-bit register value */
+-	struct {
+-		uint32_t	flowid:2; /*!< FlowId (Bits 7:6) */
+-		uint32_t	dec:1; /*!< VPN Decrypt flag */
+-		uint32_t	enc:1; /*!< VPN Encrypt flag */
+-		uint32_t	mpe1:1; /*!< MPE1 Flag */
+-		uint32_t	mpe2:1; /*!< MPE2 Flag */
+-		uint32_t	ep:4; /*!< PMAC Egress Port number */
+-		uint32_t	tc:4; /*!< Traffic Class */
+-		uint32_t	sub_if_id:12;/*sub if id*/
+-		uint32_t	resv:6;/*resv*/
+-	};
+-	uint32_t	flags; /*!< Flags stored in DDR CBM Queue map table. Currently, only flag defined is CBM_F_QUEUE_DROP */
++typedef struct {
++	uint32_t	flowid:2; /*!< FlowId (Bits 7:6) */
++	uint32_t	dec:1; /*!< VPN Decrypt flag */
++	uint32_t	enc:1; /*!< VPN Encrypt flag */
++	uint32_t	mpe1:1; /*!< MPE1 Flag */
++	uint32_t	mpe2:1; /*!< MPE2 Flag */
++	uint32_t	ep:4; /*!< PMAC Egress Port number */
++	uint32_t	tc:4; /*!< Traffic Class */
++	uint32_t	sub_if_id:12;/*sub if id*/
++	uint32_t	sub_if_id_mask_bits:12; /*sub_if_id bit mask
++							 *set to 1 means
++							 *don't care
++							 */
++	uint32_t	resv:26;/*resv*/
+ } cbm_queue_map_entry_t;
+ 
+ /*!

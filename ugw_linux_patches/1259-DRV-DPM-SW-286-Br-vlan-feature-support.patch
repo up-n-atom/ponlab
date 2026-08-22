@@ -1,0 +1,1214 @@
+From 846f3e449cab68dd627b57eb27c0fe4ce3296c8d Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Thu, 18 Jun 2020 19:17:25 +0800
+Subject: [PATCH] DRV_DPM_SW-286: Br vlan feature support
+
+---
+ drivers/net/datapath/dpm/datapath.h                |   4 +
+ drivers/net/datapath/dpm/datapath_proc.c           | 105 ++-
+ drivers/net/datapath/dpm/datapath_swdev.c          |  62 +-
+ drivers/net/datapath/dpm/datapath_swdev.h          |  25 +-
+ drivers/net/datapath/dpm/gswip31/Makefile          |   1 +
+ .../net/datapath/dpm/gswip31/datapath_br_vlan.c    | 789 +++++++++++++++++++++
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   |   4 +
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h   |   7 +
+ include/net/datapath_inst.h                        |   7 +
+ 9 files changed, 999 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 54bc0bff74a4..fa8a5e7e3785 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -285,6 +285,7 @@ enum DP_DBG_FLAG {
+ 	DP_DBG_FLAG_LOOKUP = BIT(21),
+ 	DP_DBG_FLAG_REG = BIT(22),
+ 
++	DP_DBG_FLAG_BR_VLAN = BIT(23),
+ 	/*Note, once add a new entry here int the enum,
+ 	 *need to add new item in below macro DP_F_FLAG_LIST
+ 	 */
+@@ -318,6 +319,7 @@ enum DP_DBG_FLAG {
+ 	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_QOS_DETAIL, "qos2"), \
+ 	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_LOOKUP, "lookup"), \
+ 	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_REG, "register"), \
++	DP_DBG_ENUM_OR_STRING(DP_DBG_FLAG_BR_VLAN, "br_vlan"), \
+ 	\
+ 	\
+ 	/*must be last one */\
+@@ -1089,5 +1091,7 @@ int dp_cqm_port_alloc_complete(struct module *owner,
+ int dp_cqm_deq_port_res_get(u32 dp_port, cbm_dq_port_res_t *res,
+ 			    u32 flags);
+ 
++int init_br_vlan(u32 maxvlanid);
++
+ #endif /*DATAPATH_H */
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index 4129138df3b3..d84e79e99bb5 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -34,6 +34,7 @@
+ #define DBGFS_QOS      "qos"
+ #define DBGFS_EVENT    "event"
+ #define DBGFS_MIB_GLOBAL    "mib_global_stats"
++#define DBGFS_BR_VLAN "vlan"
+ 
+ typedef int (*print_ctp_bp_t)(struct seq_file *s, int inst,
+ 			      struct pmac_port_info *port,
+@@ -50,6 +51,106 @@ static int proc_port_dump(struct seq_file *s, int pos);
+ static int proc_port_init(void);
+ int proc_dp_event_list_dump(struct seq_file *s, int pos);
+ 
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++static u32 br_hash_index;
++static struct br_info *brdev_info;
++static int proc_brvlan_start(void)
++{
++	br_hash_index = 0;
++
++	brdev_info = hlist_entry_safe
++		     ((get_dp_g_bridge_id_entry_hash_table_info(0,
++				     br_hash_index))->first,
++		      struct br_info, br_hlist);
++	return 0;
++}
++
++static int proc_brvlan_dump(struct seq_file *s, int pos)
++{
++	struct bridge_member_port *tmp = NULL;
++	struct vlist_entry *vlist_entry = NULL;
++	int bp_entry = 0, vlan_entry = 0, i = 0;
++
++	while (!brdev_info) {
++		br_hash_index++;
++		pos = 0;
++		if (br_hash_index == BR_ID_ENTRY_HASH_TABLE_SIZE) {
++			seq_puts(s, "end\n");
++			return -1;
++		}
++		brdev_info = hlist_entry_safe
++			     ((get_dp_g_bridge_id_entry_hash_table_info(0,
++					     br_hash_index))->first,
++			      struct br_info, br_hlist);
++	}
++
++	if (!brdev_info->br_vlan_en)
++		goto EXIT;
++
++	if (pos == 0) {
++		seq_printf(s, "%-10s%-10s%-30s%-10s%-30s\n",
++			   "Br", "BrFid", "BrVlanID (EntryPtr)",
++			   "Bp", "Bp (VlanID/FiD/RefCnt/ EntryPtr)");
++		for (i = 0; i < 90; i++)
++			seq_printf(s, "=");
++		seq_printf(s, "\n");
++	}
++	seq_printf(s, "%-10s", brdev_info->dev->name);
++	seq_printf(s, "%-10d", brdev_info->fid);
++	bp_entry = 0;
++	list_for_each_entry(vlist_entry, &brdev_info->br_vlan_list, list) {
++		if (!vlist_entry->vlan_entry)
++			continue;
++		if (bp_entry) {
++			seq_printf(s, "\n");
++			seq_printf(s, "%-10s%-10s", "", "");
++		}
++		seq_printf(s, "%-4d %-25x", vlist_entry->vlan_entry->vlan_id,
++			   (u32)vlist_entry->vlan_entry);
++		bp_entry = 1;
++	}
++
++	if (bp_entry == 0)
++		seq_printf(s, "%-30s", "");
++	bp_entry = 0;
++	list_for_each_entry(tmp, &brdev_info->bp_list, list) {
++		if (bp_entry) {
++			seq_printf(s, "\n\n");
++			seq_printf(s, "%-10s%-10s%-30s", "", "", "");
++		}
++		seq_printf(s, "%-10d", tmp->bportid);
++		bp_entry = 1;
++		vlan_entry = 0;
++		list_for_each_entry(vlist_entry, &tmp->bport_vlan_list,
++				    list) {
++			if (bp_entry == 0)
++				seq_printf(s, "%-10s", "");
++			if (!vlist_entry->vlan_entry)
++				continue;
++			if (vlan_entry) {
++				seq_printf(s, "\n");
++				seq_printf(s, "%-10s%-10s%-30s%-10s",
++					   "", "", "", "");
++			}
++			seq_printf(s, "%-d/%-d/%-d/ %-x",
++				   vlist_entry->vlan_entry->vlan_id,
++				   vlist_entry->vlan_entry->fid,
++				   vlist_entry->vlan_entry->ref_cnt,
++				   (u32)vlist_entry->vlan_entry);
++			vlan_entry = 1;
++		}
++	}
++
++	seq_puts(s, "\n");
++EXIT:
++	brdev_info = hlist_entry_safe((brdev_info)->br_hlist.next,
++				      struct br_info, br_hlist);
++	if (!seq_has_overflowed(s))
++		pos++;
++	return pos;
++}
++#endif
++
+ static int proc_dp_mib_global_stats(struct seq_file *s, int pos)
+ {
+ 	struct mib_global_stats stats = {0};
+@@ -834,7 +935,9 @@ static struct dp_proc_entry dp_proc_entries[] = {
+ 	{DBGFS_EVENT, NULL, proc_dp_event_list_dump, NULL, NULL},
+ 	{DBGFS_MIB_GLOBAL, NULL, proc_dp_mib_global_stats, NULL,
+ 		proc_dp_mib_g_stats_write},
+-
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	{DBGFS_BR_VLAN, NULL, proc_brvlan_dump, proc_brvlan_start, NULL},
++#endif
+ 	/*the last place holder */
+ 	{NULL, NULL, NULL, NULL, NULL}
+ };
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index 923ff35cfc82..1fdf6c8b6a9c 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -231,6 +231,8 @@ static int dp_swdev_add_bport_to_list(struct br_info *br_item,
+ 		if (!bmp)
+ 			return DP_FAILURE;
+ 
++		INIT_LIST_HEAD(&bmp->bport_vlan_list);
++
+ 		bmp->dev_priv_flag = brid_item->priv_flag;
+ 		bmp->dev_reg_flag = br_item->flag;
+ 		bmp->bportid = brid_item->bportid;
+@@ -246,7 +248,7 @@ static int dp_swdev_add_bport_to_list(struct br_info *br_item,
+ }
+ 
+ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+-				  u8 *addr)
++				  u8 *addr, struct net_device *dev)
+ {
+ 	struct pmac_port_info *p_info;
+ 	struct inst_info *i_info;
+@@ -271,12 +273,19 @@ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+ 
+ 	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
+ 	i_info = &dp_port_prop[br_item->inst].info;
++
++	/* dev is the bridge port member dev */
++	i_info->dp_reg_bport_vlan(br_info, dev, br_item->bportid,
++				  DP_OPS_RESET);
++
+ 	ret = i_info->swdev_bridge_port_cfg_reset(br_info, br_item->inst,
+ 						  br_item->bportid,
+ 						  p_info->bp_hairpin_cap);
+ 	if (ret == DEL_BRENTRY) {
+ 		i_info->swdev_free_brcfg(br_item->inst, br_item->fid);
+ 
++		i_info->dp_reg_br_vlan(br_info, DP_OPS_RESET);
++
+ 		dp_swdev_remove_bridge_id_entry(br_info);
+ 
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+@@ -434,8 +443,19 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 				br_info->flag = LOGIC_DEV_REGISTER;
+ 
+ 			br_info->dev = br_item->dev;
++
+ 			INIT_LIST_HEAD(&br_info->bp_list);
++			INIT_LIST_HEAD(&br_info->br_vlan_list);
++
+ 			dp_swdev_insert_bridge_id_entry(br_info);
++
++			/* br_info->dev is the bridge device */
++			i_info->dp_reg_br_vlan(br_info, 0);
++
++			/* dev is the bridge device */
++			i_info->dp_reg_bport_vlan(br_info, dev,
++						  br_item->bportid, 0);
++
+ 			dp_swdev_add_bport_to_list(br_info, br_item);
+ 
+ 			i_info->swdev_bridge_port_cfg_set(br_info,
+@@ -460,6 +480,10 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 
+ 		if (br_item->flags & LOGIC_DEV_REGISTER)
+ 			br_info->flag = LOGIC_DEV_REGISTER;
++
++		/* dev is the bridge port device */
++		i_info->dp_reg_bport_vlan(br_info, dev, br_item->bportid, 0);
++
+ 		dp_swdev_add_bport_to_list(br_info, br_item);
+ 		i_info->swdev_bridge_port_cfg_set(br_info, br_item->inst,
+ 						  br_item->bportid);
+@@ -484,7 +508,7 @@ static int dp_del_swdev_reg_vlan(struct bridge_id_entry_item *br_item,
+ 	dp_subif_t subif;
+ 
+ 	if (br_item) {
+-		dp_swdev_clr_gswip_cfg(br_item, addr);
++		dp_swdev_clr_gswip_cfg(br_item, addr, dev);
+ 
+ 		/* De-register logical dev i.e. VLAN DEV
+ 		 * if it is registered
+@@ -1031,9 +1055,11 @@ int dp_notif_br_alloc(struct net_device *br_dev)
+ 		}
+ 
+ 		INIT_LIST_HEAD(&br_info->bp_list);
++		INIT_LIST_HEAD(&br_info->br_vlan_list);
+ 		br_info->dev = br_dev;
+ 		br_info->fid = br_id;
+ 
++		dp_info->dp_reg_br_vlan(br_info, 0);
+ 		dp_swdev_insert_bridge_id_entry(br_info);
+ 	} else {
+ 		pr_err("Switch configuration failed\n");
+@@ -1080,6 +1106,38 @@ int dp_register_switchdev_ops(struct dp_dev *dp_dev, int reset)
+ 	return DP_SUCCESS;
+ }
+ 
++int dp_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
++			  u16 flags)
++{
++	struct inst_info *dp_info = get_dp_prop_info(0);
++	int ret = 0;
++
++	if (!dev || !nlh || !dp_info || dp_info->dp_ndo_br_setlink)
++		return -EINVAL;
++
++	DP_LIB_LOCK(&dp_lock);
++	ret = dp_info->dp_ndo_br_setlink(dev, nlh, flags);
++	DP_LIB_UNLOCK(&dp_lock);
++
++	return ret;
++}
++
++int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
++			  u16 flags)
++{
++	struct inst_info *dp_info = get_dp_prop_info(0);
++	int ret = 0;
++
++	if (!dev || !nlh || !dp_info || dp_info->dp_ndo_br_dellink)
++		return -EINVAL;
++
++	DP_LIB_LOCK(&dp_lock);
++	ret = dp_info->dp_ndo_br_dellink(dev, nlh, flags);
++	DP_LIB_UNLOCK(&dp_lock);
++
++	return ret;
++}
++
+ void dp_switchdev_exit(void)
+ {
+ 	int i;
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.h b/drivers/net/datapath/dpm/datapath_swdev.h
+index db9c912ca915..5ee40a3c4517 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.h
++++ b/drivers/net/datapath/dpm/datapath_swdev.h
+@@ -42,6 +42,10 @@ struct br_info {
+ 	u32 inst;
+ 	u32 dp_port;
+ 	struct list_head bp_list;
++	bool br_vlan_en; 		/* VLAN Enabled for this bridge */
++	u32 num_vlan;			/* Num of vlans supported in br */
++	u32 num_fid;			/* Num of vlan aware fid in br */
++	struct list_head br_vlan_list;  /* List pointing to the vlan entry */
+ };
+ 
+ struct bridge_member_port {
+@@ -51,6 +55,18 @@ struct bridge_member_port {
+ 	u16 bport[8];
+ 	u32 dev_priv_flag; /* to store bp dev priv flags (like IFF_NO_QUEUE) */
+ 	u32 dp_port;
++	struct list_head bport_vlan_list; /* List pointing to the vlan entry */
++};
++
++struct vlist_entry {
++	struct list_head list;
++	struct vlan_entry *vlan_entry;  /* Pointer to the VLAN Aware Entry */
++};
++
++struct vlan_entry {
++	u16 fid;	/* New FiD used for this bridge port */
++	u16 vlan_id;	/* Vlan ID supported in this bridge port */
++	u32 ref_cnt;	/* Reference count for this VLAN */
+ };
+ 
+ struct fdb_tbl {
+@@ -64,7 +80,12 @@ extern struct list_head fdb_tbl_list;
+ int dp_swdev_bridge_id_entry_free(int instance);
+ int dp_swdev_bridge_id_entry_init(void);
+ struct br_info *dp_swdev_bridge_entry_lookup_rcu(struct net_device *dev);
+-int dp_swdev_chk_bport_in_br(struct net_device *bp_dev, int bport, int inst);
+-void dp_switchdev_exit(void);
++int dp_swdev_chk_bport_in_br(struct net_device *bp_dev, int bport,
++			     int inst);
++int dp_ndo_bridge_setlink(struct net_device *dev,
++			  struct nlmsghdr *nlh, u16 flags);
+ 
++int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
++			  u16 flags);
++void dp_switchdev_exit(void);
+ #endif /*DATAPATH_SWDEV_H*/
+diff --git a/drivers/net/datapath/dpm/gswip31/Makefile b/drivers/net/datapath/dpm/gswip31/Makefile
+index 858a18b9a737..8249fd2e5e2c 100644
+--- a/drivers/net/datapath/dpm/gswip31/Makefile
++++ b/drivers/net/datapath/dpm/gswip31/Makefile
+@@ -2,6 +2,7 @@ obj-$(CONFIG_INTEL_DATAPATH) += datapath_misc.o datapath_gswip.o datapath_proc.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_ppv4.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_lookup_proc.o datapath_ppv4_api.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_rx.o datapath_tx.o
++obj-$(CONFIG_INTEL_DATAPATH) += datapath_br_vlan.o
+ 
+ ifneq ($(CONFIG_INTEL_DATAPATH_HAL_GSWIP31_MIB),)
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_mib.o
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_br_vlan.c b/drivers/net/datapath/dpm/gswip31/datapath_br_vlan.c
+new file mode 100644
+index 000000000000..6257e55a3002
+--- /dev/null
++++ b/drivers/net/datapath/dpm/gswip31/datapath_br_vlan.c
+@@ -0,0 +1,789 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) Intel Corporation
++ * Author: Joby Thampan
++ */
++
++#include <net/switch_api/gsw_flow_ops.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_vlan.h>
++#include "../datapath.h"
++#include "../datapath_instance.h"
++#include <linux/if_bridge.h>
++#include <../net/bridge/br_private.h>
++
++#define MAX_FID		64 /* Only 6 bits for FiD */
++
++struct br_vlan_cap {
++	u32 maxvlanid;
++	u32 maxbridgeid;
++};
++
++struct br_vlan_cap g_br_vlan_cap = {0};
++
++enum BR_VLAN_FLAG {
++	BR_VLAN_LIST_TOP_ENTRY = BIT(0),
++	BR_VLAN_DEREGISTER = BIT(1)
++};
++
++static int dp_del_vlan_entry(struct br_info *br_info,
++			     struct vlist_entry *vlist_entry, u16 bport,
++			     u16 vlanid, int flags);
++
++/* Check Bridge have the entry added through Self
++ * if vlanid=0, returns first entry
++ * if valid vlanid, returns entry pointed by VLAN ID
++ */
++struct vlist_entry *get_vlist_entry_in_br(struct br_info *br_info,
++		u16 vlanid, int flags)
++{
++	struct vlist_entry *list_entry = NULL;
++
++	/* Returning the top entry in list or Return the exact matching Entry */
++	if (flags & BR_VLAN_LIST_TOP_ENTRY) {
++		list_for_each_entry(list_entry, &br_info->br_vlan_list, list) {
++			if (!list_entry->vlan_entry)
++				continue;
++			return list_entry;
++		}
++	} else {
++		list_for_each_entry(list_entry, &br_info->br_vlan_list, list) {
++			if (!list_entry->vlan_entry ||
++			    (vlanid != list_entry->vlan_entry->vlan_id))
++				continue;
++			return list_entry;
++		}
++	}
++	return NULL;
++}
++
++/* Check through all Bridge Member port have the entry added through Master
++ * if have return the entry
++ */
++struct vlist_entry *get_vlist_entry_in_all_bp(struct br_info *br_info,
++		u16 vlanid)
++{
++	struct vlist_entry *list_entry = NULL;
++	struct bridge_member_port *bmp;
++
++	/* Check Bridge Member port have the entry added through Master */
++	list_for_each_entry(bmp, &br_info->bp_list, list) {
++		list_for_each_entry(list_entry, &bmp->bport_vlan_list, list) {
++			if (!list_entry->vlan_entry ||
++			    (vlanid != list_entry->vlan_entry->vlan_id))
++				continue;
++			return list_entry;
++		}
++	}
++	return NULL;
++}
++
++/* Get the List Head for the BP Vlan List */
++struct list_head *get_vlan_entry_head_in_bp(struct br_info *br_info,
++		int bport)
++{
++	struct bridge_member_port *bmp;
++
++	list_for_each_entry(bmp, &br_info->bp_list, list) {
++		if (bmp->bportid != bport)
++			continue;
++		return &bmp->bport_vlan_list;
++	}
++	return NULL;
++}
++
++/* Check through Bridge Member port specified have the entry added
++ * through Master if have return the entry
++ */
++struct vlist_entry *get_vlist_entry_in_bp(struct br_info *br_info,
++		int bport, u16 vlanid, int flags)
++{
++	struct vlist_entry *list_entry = NULL;
++	struct bridge_member_port *bmp;
++
++	/* Returning the top entry in list or Return the exact matching Entry */
++	if (flags & BR_VLAN_LIST_TOP_ENTRY) {
++		list_for_each_entry(bmp, &br_info->bp_list, list) {
++			if (bmp->bportid != bport)
++				continue;
++			list_for_each_entry(list_entry, &bmp->bport_vlan_list,
++					    list) {
++				if (!list_entry->vlan_entry)
++					continue;
++				return list_entry;
++			}
++		}
++	} else {
++		list_for_each_entry(bmp, &br_info->bp_list, list) {
++			if (bmp->bportid != bport)
++				continue;
++			list_for_each_entry(list_entry, &bmp->bport_vlan_list,
++					    list) {
++				if (!list_entry->vlan_entry ||
++				    (vlanid != list_entry->vlan_entry->vlan_id))
++					continue;
++				return list_entry;
++			}
++		}
++	}
++	return NULL;
++}
++
++/* When Bridge Entry is created/deleted in DPM we check whether this bridge is
++ * VLAN Aware and change ndo_bridge ops
++ */
++int dp_register_br_vlan(struct br_info *br_info, int flags)
++{
++	struct net_bridge *br;
++	int offset;
++	int flag = DP_OPS_NETDEV | flags;
++	struct net_device *br_dev;
++	struct vlist_entry *list_entry = NULL;
++
++	if (!br_info)
++		return DP_FAILURE;
++
++	/* TODO: This cap should be per bridge in Br_Info */
++	if (!g_br_vlan_cap.maxbridgeid && !g_br_vlan_cap.maxvlanid)
++		return DP_FAILURE;
++
++	br_dev = br_info->dev;
++
++	if (!netif_is_bridge_master(br_dev)) {
++		pr_err("%s: dev %s is not bridge dev\n", __func__,
++		       br_dev->name);
++		return DP_FAILURE;
++	}
++
++	/* Netdev ops need to register only if VLAN Aware */
++	br = netdev_priv(br_dev);
++	if (!br_vlan_enabled(br)) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Bridge %s is not VLAN Aware\n", __func__,
++			 br_dev->name);
++		return DP_SUCCESS;
++	}
++
++	/* Using br_vlan_en flag to check bridge ops registered */
++	if (flags & DP_OPS_RESET) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Un-Register br %s netdev ops\n",
++			 __func__, br_dev->name);
++		br_info->br_vlan_en = false; /* Mark as ops unreg */
++
++		while ((list_entry = get_vlist_entry_in_br(br_info, 0,
++				     BR_VLAN_LIST_TOP_ENTRY))) {
++			dp_del_vlan_entry(br_info,
++					  list_entry, 0,
++					  list_entry->vlan_entry->vlan_id,
++					  BRIDGE_FLAGS_MASTER);
++		}
++	} else if (br_info->br_vlan_en) {
++		goto EXIT; 	/* Already ops registered for this bridge */
++	} else {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Register br %s netdev ops\n", __func__,
++			 br_dev->name);
++		br_info->br_vlan_en = true; /* mark as ops regd */
++	}
++
++	offset = offsetof(const struct net_device_ops, ndo_bridge_setlink);
++	dp_set_net_dev_ops_priv(br_dev, &dp_ndo_bridge_setlink, offset,
++				flag);
++
++	offset = offsetof(const struct net_device_ops, ndo_bridge_dellink);
++	dp_set_net_dev_ops_priv(br_dev, &dp_ndo_bridge_dellink, offset,
++				flag);
++EXIT:
++	return DP_SUCCESS;
++}
++
++/* When Bridge Port Entry is created/deleted in DPM
++ * we check whether this bridge is VLAN Aware and change ndo_bridge ops
++ */
++int dp_register_bport_vlan(struct br_info *br_info,
++			   struct net_device *dev, int bport, int flags)
++{
++	int offset;
++	int flag = DP_OPS_NETDEV | flags;
++	struct vlist_entry *list_entry = NULL;
++
++	if (!dev || !br_info)
++		return DP_FAILURE;
++
++	/* TODO: This cap should be per bridge in Br_Info */
++	if (!g_br_vlan_cap.maxbridgeid && !g_br_vlan_cap.maxvlanid)
++		return DP_FAILURE;
++
++	if (!netif_is_bridge_port(dev)) {
++		pr_err("%s: dev %s is not bridge port\n", __func__, dev->name);
++		return DP_FAILURE;
++	}
++
++	/* If not VLAN Aware we are not registering ops for this device */
++	if (!br_info->br_vlan_en) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Vlan Aware is not enabled for this Bridge %s\n",
++			 __func__, br_info->dev->name);
++		return DP_SUCCESS;
++	}
++
++	if (flags & DP_OPS_RESET) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Un-Register dev=%s in br=%s netdev ops\n",
++			 __func__, dev->name, br_info->dev->name);
++
++		while ((list_entry = get_vlist_entry_in_bp(br_info, bport, 0,
++				     BR_VLAN_LIST_TOP_ENTRY))) {
++			dp_del_vlan_entry(br_info,
++					  list_entry, bport,
++					  list_entry->vlan_entry->vlan_id,
++					  BRIDGE_FLAGS_MASTER);
++		}
++	} else {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Register dev=%s in br=%s netdev ops\n", __func__,
++			 dev->name, br_info->dev->name);
++	}
++
++	/* Register member port ndo_bridge ops callback */
++	offset = offsetof(const struct net_device_ops, ndo_bridge_setlink);
++	dp_set_net_dev_ops_priv(dev, &dp_ndo_bridge_setlink, offset,
++				flag);
++
++	offset = offsetof(const struct net_device_ops, ndo_bridge_dellink);
++	dp_set_net_dev_ops_priv(dev, &dp_ndo_bridge_dellink, offset,
++				flag);
++
++	return DP_SUCCESS;
++}
++
++/* Copy the Bridge Settings of bridge to the new Vlan Aware FiD's */
++static int dp_gsw_bridge_cfg_copy(int inst, u16 src_fid, u16 dst_fid)
++{
++	GSW_return_t ret = DP_SUCCESS;
++	GSW_BRIDGE_config_t brcfg;
++	struct core_ops *gsw_handle;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: src_fid=%d dst_fid=%d\n",
++		 __func__, src_fid, dst_fid);
++
++	gsw_handle = dp_port_prop[inst].ops[0];
++	memset(&brcfg, 0, sizeof(brcfg));
++
++	brcfg.nBridgeId = src_fid;
++	ret = gsw_handle->gsw_brdg_ops.Bridge_ConfigGet(gsw_handle, &brcfg);
++	if (ret)
++		return ret;
++
++	brcfg.nBridgeId = dst_fid;
++	ret = gsw_handle->gsw_brdg_ops.Bridge_ConfigSet(gsw_handle, &brcfg);
++	if (ret)
++		return ret;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "FID(%d to %d) copy success\n",
++		 src_fid, dst_fid);
++	return ret;
++}
++
++/* Free the Bridge FiD created in GSWIP */
++static int deallocate_br_vlan_fid(struct br_info *br_info,
++				  u16 vlanid, u16 fid)
++{
++	struct inst_info *dp_info = get_dp_prop_info(0);
++	int ret = 0;
++
++	ret = dp_info->swdev_free_brcfg(0, fid);
++	if (ret) {
++		pr_err("%s: swdev_free_brcfg Failed for FiD %d\n",
++		       __func__, fid);
++		return DP_FAILURE;
++	}
++
++	br_info->num_fid--;
++	return DP_SUCCESS;
++}
++
++/* Allocate new VLAN Aware Bridge FiD in GSWIP */
++static int allocate_br_vlan_fid(struct br_info *br_info,
++				u16 vlanid, int bport)
++{
++	u16 fid = 0;
++	struct inst_info *dp_info = get_dp_prop_info(0);
++	int new_brid;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: Br=%s Br_Fid=%d bport=%d vlanid=%d num_vlan=%d num_fid=%d\n",
++		 __func__, br_info->dev->name, br_info->fid, bport, vlanid,
++		 br_info->num_vlan, br_info->num_fid);
++
++	if (br_info->num_vlan > g_br_vlan_cap.maxvlanid) {
++		pr_err("%s: Cannot Support more than %d VLAN ID's \n",
++		       __func__, g_br_vlan_cap.maxvlanid);
++		return DP_FAILURE;
++	}
++
++	if (br_info->num_fid > g_br_vlan_cap.maxbridgeid) {
++		pr_err("%s: Cannot Support more than %d Bridge ID's \n",
++		       __func__, g_br_vlan_cap.maxbridgeid);
++		return DP_FAILURE;
++	}
++
++	new_brid = dp_info->swdev_alloc_bridge_id(br_info->inst);
++	if (new_brid <= 0) {
++		pr_err("%s: Switch bridge alloc failed\n", __func__);
++		return DP_FAILURE;
++	}
++
++	fid = new_brid;
++
++	if (new_brid > MAX_FID) {
++		dp_info->swdev_free_brcfg(br_info->inst, fid);
++		pr_err("%s: VLAN Aware support max 64 FiD (VlanID + BriID)\n",
++		       __func__);
++		return DP_FAILURE;
++	}
++
++	if (dp_gsw_bridge_cfg_copy(br_info->inst, br_info->fid, fid)) {
++		dp_info->swdev_free_brcfg(br_info->inst, fid);
++		pr_err("%s: Bridge Cfg Copy for Fid %d to Fid %d failed\n",
++		       __func__, br_info->fid, fid);
++		return DP_FAILURE;
++	}
++
++	br_info->num_fid++;
++	return fid;
++}
++
++/* Add a VLAN Entry, If already have in BP or Bridge, reuse the VLAN entry
++ * In 1 Bridge Each VLAN have only 1 uniqueue FiD
++ * NewFID = VlanID + BridgeID
++ */
++static struct vlan_entry *dp_add_vlan_entry(struct br_info *br_info,
++		struct vlist_entry *br_ventry,
++		struct vlist_entry *bp_ventry,
++		int bport, u16 vlanid, int flags)
++{
++	struct vlist_entry *vlist_entry;
++	struct vlan_entry *ventry;
++	struct list_head *vhead;
++	int fid = 0;
++	bool alloc_fid = false;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: dev=%s bport=%d vlanid=%d flags=%08x\n", __func__,
++		 br_info->dev->name, bport, vlanid, flags);
++
++	if (br_ventry && bp_ventry) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: No Need to add both br & bport have the entry\n",
++			 __func__);
++		return DP_SUCCESS;
++	}
++
++	vlist_entry = devm_kzalloc(&g_dp_dev->dev,
++				   sizeof(struct vlist_entry), GFP_ATOMIC);
++	if (!vlist_entry)
++		return NULL;
++
++	/* if bridge or bridge member port have the VLAN Entry
++	 * Add to the corresponding list increase ref_cnt and return Entry
++	 */
++	if (flags & BRIDGE_FLAGS_SELF)
++		vhead = &br_info->br_vlan_list;
++	else
++		vhead = get_vlan_entry_head_in_bp(br_info, bport);
++
++	if (!vhead) {
++		devm_kfree(&g_dp_dev->dev, vlist_entry);
++		return NULL;
++	}
++
++	/* Bridge Port or Bridge dont have the VLAN Entry allocate a new one */
++	if (!br_ventry && !bp_ventry) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: Allocating a new entry\n",
++			 __func__);
++
++		ventry = devm_kzalloc(&g_dp_dev->dev,
++				      sizeof(struct vlan_entry), GFP_ATOMIC);
++		if (!ventry) {
++			devm_kfree(&g_dp_dev->dev, vlist_entry);
++			return NULL;
++		}
++
++		vlist_entry->vlan_entry = ventry;
++		vlist_entry->vlan_entry->vlan_id = vlanid;
++		vlist_entry->vlan_entry->ref_cnt++;
++		list_add(&vlist_entry->list, vhead);
++		return vlist_entry->vlan_entry;
++	} else if (br_ventry && !bp_ventry) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: Allocating a br entry\n",
++			 __func__);
++		vlist_entry->vlan_entry = br_ventry->vlan_entry;
++		alloc_fid = true; /* BR already have, now going to create BP */
++	} else if (!br_ventry && bp_ventry) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: Allocating a bp entry\n",
++			 __func__);
++		vlist_entry->vlan_entry = bp_ventry->vlan_entry;
++
++		/* BP already have, now we are going to create BR */
++		if (flags & BRIDGE_FLAGS_SELF)
++			alloc_fid = true;
++	} else {
++		pr_err("%s: Impossible alloc both BP and BR have VLAN Entry\n",
++		       __func__);
++		devm_kfree(&g_dp_dev->dev, vlist_entry);
++		return NULL;
++	}
++
++	/* FiD is created only when 1 Self + 1 Master */
++	if (alloc_fid) {
++		/* Allocate a unique FID for this VLAN ID */
++		fid = allocate_br_vlan_fid(br_info, vlanid, bport);
++		if (fid < 0) {
++			devm_kfree(&g_dp_dev->dev, vlist_entry);
++			return NULL;
++		}
++		vlist_entry->vlan_entry->fid = fid;
++	}
++	vlist_entry->vlan_entry->ref_cnt++;
++
++	list_add(&vlist_entry->list, vhead);
++	return vlist_entry->vlan_entry;
++}
++
++/* Deleting a bridge member VLAN Entry and FID */
++static int dp_del_vlan_entry(struct br_info *br_info,
++			     struct vlist_entry *vlist_entry, u16 bport,
++			     u16 vlanid, int flags)
++{
++	struct vlan_entry *ventry;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: Br=%s bport=%d vlanid=%d flags=%08x\n", __func__,
++		 br_info->dev->name, bport, vlanid, flags);
++
++	/* if Entry or Ref Count is not present this VLAN ID doesn't exist */
++	if (!vlist_entry || !vlist_entry->vlan_entry ||
++	    !vlist_entry->vlan_entry->ref_cnt) {
++		pr_err("%s: VLAN ID %d is not present\n", __func__, vlanid);
++		return DP_SUCCESS;
++	}
++
++	ventry = vlist_entry->vlan_entry;
++
++	/* if usage > 1, Cannot delete now!! decrease ref count and delete the
++	 * entry from list of either br or bridge member
++	 */
++	if (ventry->ref_cnt > 1) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "Deleting entry in Br=%s Bp=%d vlanid=%d ref_cnt=%d\n",
++			 br_info->dev->name, bport, ventry->vlan_id,
++			 ventry->ref_cnt);
++		ventry->ref_cnt--;
++		list_del(&vlist_entry->list);
++		devm_kfree(&g_dp_dev->dev, vlist_entry);
++		return DP_SUCCESS;
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: Fid=%d Br=%s BrFid=%d vlanid=%d bport=%d ref_cnt=%d\n",
++		 __func__, ventry->fid, br_info->dev->name, br_info->fid,
++		 vlanid, bport, ventry->ref_cnt);
++
++	/* Deallocate VLAN aware FiD, if FiD is > 0 */
++	if (ventry->fid)
++		deallocate_br_vlan_fid(br_info, vlanid, ventry->fid);
++
++	/* Decrease ref count and delete the VLAN ID Entry */
++	ventry->ref_cnt--;
++	list_del(&vlist_entry->list);
++	devm_kfree(&g_dp_dev->dev, ventry);
++	devm_kfree(&g_dp_dev->dev, vlist_entry);
++
++	br_info->num_vlan--;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "Vlan ID %d removed on bridge %s\n", vlanid,
++		 br_info->dev->name);
++	return DP_SUCCESS;
++}
++
++/* Self is called for bridge interface to assign VLAN ID */
++static int dp_register_self(struct br_info *br_info, u16 vlanid,
++			    int flags)
++{
++	int ret = DP_FAILURE;
++	struct vlan_entry *ventry;
++	struct vlist_entry *vlist_entry, *br_ventry, *bp_ventry;
++
++	/* if not bridge return error */
++	if (!netif_is_bridge_master(br_info->dev))
++		return ret;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: dev=%s vlanid=%d flags=%08x\n", __func__,
++		 br_info->dev->name, vlanid, flags);
++
++	if (flags & BR_VLAN_DEREGISTER) {
++		vlist_entry = get_vlist_entry_in_br(br_info, vlanid, 0);
++		ret = dp_del_vlan_entry(br_info, vlist_entry, 0, vlanid,
++					BRIDGE_FLAGS_SELF);
++		goto EXIT;
++	}
++
++	/* Dont allow multiple commands to add multiple entries in list */
++	br_ventry = get_vlist_entry_in_br(br_info, vlanid, 0);
++	if (br_ventry) {
++		pr_info("%s: Vlan ID %d is already present in Br %s\n",
++			__func__, vlanid, br_info->dev->name);
++		goto EXIT;
++	}
++
++	bp_ventry = get_vlist_entry_in_all_bp(br_info, vlanid);
++
++	/* if not present will allocate a new one */
++	ventry = dp_add_vlan_entry(br_info, br_ventry, bp_ventry, 0, vlanid,
++				   BRIDGE_FLAGS_SELF);
++	if (!ventry) {
++		pr_err("%s: Failed to Add vland id %d to br %s\n",
++		       __func__, vlanid, br_info->dev->name);
++		goto EXIT;
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "VLAN Id %d added for bridge %s Fid %d ref_cnt %d\n",
++		 ventry->vlan_id, br_info->dev->name, ventry->fid,
++		 ventry->ref_cnt);
++
++	br_info->num_vlan++;
++	ret = DP_SUCCESS;
++EXIT:
++	return ret;
++}
++
++/* This API will be called for Bridge Member ports */
++static int dp_register_master(struct br_info *br_info,
++			      struct net_device *dev, u16 vlanid, int flags)
++{
++	dp_subif_t subif;
++	struct vlan_entry *ventry;
++	int ret = DP_FAILURE;
++	struct vlist_entry *vlist_entry, *br_ventry, *bp_ventry;
++
++	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
++		pr_err("%s: dp_get_netif_subifid failed\n", __func__);
++		return DP_FAILURE;
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: Br=%s bport=%d vlanid=%d flags=%08x\n", __func__,
++		 br_info->dev->name, subif.bport, vlanid, flags);
++
++	if (flags & BR_VLAN_DEREGISTER) {
++		vlist_entry = get_vlist_entry_in_bp(br_info, subif.bport,
++						    vlanid, 0);
++		ret = dp_del_vlan_entry(br_info, vlist_entry, subif.bport,
++					vlanid, BRIDGE_FLAGS_MASTER);
++		goto EXIT;
++	}
++
++	/* Dont allow multiple commands to add multiple entries in list */
++	bp_ventry = get_vlist_entry_in_bp(br_info, subif.bport, vlanid, 0);
++	if (bp_ventry) {
++		pr_info("%s: Vlan ID %d is already present in Bp %d of Br %s\n",
++			__func__, vlanid, subif.bport, br_info->dev->name);
++		goto EXIT;
++	}
++
++	bp_ventry = get_vlist_entry_in_all_bp(br_info, vlanid);
++	br_ventry = get_vlist_entry_in_br(br_info, vlanid, 0);
++
++	/* For every member port bport will be unique */
++	ventry = dp_add_vlan_entry(br_info, br_ventry, bp_ventry,
++				   subif.bport, vlanid, BRIDGE_FLAGS_MASTER);
++	if (!ventry) {
++		pr_err("%s: Failed to Add vland id %d to dev %s in br %s\n",
++		       __func__, vlanid, dev->name, br_info->dev->name);
++		goto EXIT;
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: Vlan ID %d Enabled Iface=%s br=%s NewFiD=%d RefCnt=%d\n",
++		 __func__, ventry->vlan_id, dev->name, br_info->dev->name,
++		 ventry->fid, ventry->ref_cnt);
++
++	ret = DP_SUCCESS;
++EXIT:
++	return ret;
++}
++
++/* Parse netlink message to get VLAN ID and Bridge Flags for Master and Self */
++static int parse_netlink_msg(struct nlmsghdr *nlh, u16 *vid,
++			     u16 *br_flags)
++{
++	struct nlattr *attr, *br_spec;
++	int rem;
++	struct bridge_vlan_info *vinfo = NULL;
++
++	br_spec = nlmsg_find_attr(nlh, sizeof(struct ifinfomsg), IFLA_AF_SPEC);
++	if (!br_spec)
++		return -EINVAL;
++
++	nla_for_each_nested(attr, br_spec, rem) {
++		if ((nla_type(attr) != IFLA_BRIDGE_FLAGS) &&
++		    (nla_type(attr) != IFLA_BRIDGE_VLAN_INFO))
++			continue;
++
++		if (nla_type(attr) == IFLA_BRIDGE_VLAN_INFO) {
++			if (nla_len(attr) != sizeof(struct bridge_vlan_info))
++				return -EINVAL;
++			vinfo = nla_data(attr);
++			if (vinfo)
++				*vid = vinfo->vid;
++		}
++
++		if (nla_type(attr) == IFLA_BRIDGE_FLAGS) {
++			if (nla_len(attr) < sizeof(u16))
++				return -EINVAL;
++			*br_flags = nla_get_u16(attr);
++		}
++	}
++
++	if (!vinfo) {
++		pr_err("Vlan ID is not passed for VLAN Aware bridge\n");
++		return -EINVAL;
++	}
++	return DP_SUCCESS;
++}
++
++/* This will be called for bridge add dev eth0 vid 100
++ * By this time bridge interface is added to bridge
++ */
++int dp_ndo_br_setlink(struct net_device *dev, struct nlmsghdr *nlh,
++		      u16 flags)
++{
++	u16 vid;
++	u16 br_flags = 0;
++	struct net_device *br_dev;
++	struct br_info *br_info;
++	int ret = 0;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s\n", __func__,
++		 dev ? dev->name : "NULL");
++
++	if (netif_is_bridge_master(dev))
++		br_dev = dev;
++	else if (netif_is_bridge_port(dev))
++		br_dev = netdev_master_upper_dev_get(dev);
++	else
++		return -EOPNOTSUPP;
++
++	if (parse_netlink_msg(nlh, &vid, &br_flags)) {
++		pr_err("%s: Error in parsing netlink message\n", __func__);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
++	if (!br_info) {
++		pr_err("%s: dev %s is not registered to DPM\n", __func__,
++		       br_dev->name);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	if (!br_info->br_vlan_en) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: br=%s is not VLAN Aware\n",
++			 __func__, br_dev->name);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s Flags=%s VlandID=%d\n",
++		 __func__, br_dev->name,
++		 (br_flags & BRIDGE_FLAGS_SELF) ? "Self" : "Master",
++		 vid);
++
++	/* if Br Flags is not passed considering it as Master */
++	if (br_flags & BRIDGE_FLAGS_SELF)
++		dp_register_self(br_info, vid, 0);
++	else
++		dp_register_master(br_info, dev, vid, 0);
++
++	ret = 0;
++EXIT:
++	return ret;
++}
++
++int dp_ndo_br_dellink(struct net_device *dev, struct nlmsghdr *nlh,
++		      u16 flags)
++{
++	int ret = DP_SUCCESS;
++	u16 vid;
++	u16 br_flags = 0;
++	struct net_device *br_dev;
++	struct br_info *br_info;
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s\n", __func__,
++		 dev ? dev->name : "NULL");
++
++	if (netif_is_bridge_master(dev))
++		br_dev = dev;
++	else if (netif_is_bridge_port(dev))
++		br_dev = netdev_master_upper_dev_get(dev);
++	else
++		return -EOPNOTSUPP;
++
++	if (parse_netlink_msg(nlh, &vid, &br_flags)) {
++		pr_err("%s: Error in parsing netlink message\n", __func__);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
++	if (!br_info) {
++		pr_err("%s: dev %s is not registered to DPM\n", __func__,
++		       br_dev->name);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	if (!br_info->br_vlan_en) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: br=%s is not VLAN Aware\n",
++			 __func__, br_dev->name);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s Flags=%s VlandID=%d\n",
++		 __func__, dev->name,
++		 br_flags & BRIDGE_FLAGS_SELF ? "Self" : "Master",
++		 vid);
++
++	if (br_flags & BRIDGE_FLAGS_SELF)
++		dp_register_self(br_info, vid, BR_VLAN_DEREGISTER);
++	else
++		dp_register_master(br_info, dev, vid, BR_VLAN_DEREGISTER);
++
++	ret = 0;
++EXIT:
++	return ret;
++}
++
++/* FiD for VLAN can be only 6 bits, Here we need to know
++ * maxvlanid - Max VLAN ID supported per Bridge
++ */
++int init_br_vlan(u32 maxvlanid)
++{
++	if (maxvlanid > MAX_FID || maxvlanid < 1) {
++		pr_err("VLAN Aware support max 64 FiD (VlanID + BriID)\n");
++		return DP_FAILURE;
++	}
++
++	g_br_vlan_cap.maxvlanid = maxvlanid;
++	g_br_vlan_cap.maxbridgeid = MAX_FID - maxvlanid;
++	return DP_SUCCESS;
++}
++EXPORT_SYMBOL(init_br_vlan);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index f31497f72cba..dc959952b572 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -2530,6 +2530,10 @@ int register_dp_cap_gswip31(int flag)
+ 	cap.info.dp_mac_reset = dp_gswip_mac_entry_del;
+ 	cap.info.dp_cfg_vlan = dp_gswip_ext_vlan; /*for symmetric VLAN */
+ 	cap.info.dp_tc_vlan_set = tc_vlan_set_31;
++	cap.info.dp_reg_bport_vlan = dp_register_bport_vlan;
++	cap.info.dp_reg_br_vlan = dp_register_br_vlan;
++	cap.info.dp_ndo_br_setlink = dp_ndo_br_setlink;
++	cap.info.dp_ndo_br_dellink = dp_ndo_br_dellink;
+ #endif
+ 	cap.info.cap.hw_tso = 0;
+ 	cap.info.cap.hw_gso = 0;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index bd4bdad4c9b4..b07e87e467c9 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -325,5 +325,12 @@ int dp_queue_block_flush_31(struct dp_qos_blk_flush_queue *cfg,
+ 			    int flag);
+ int dp_port_block_flush_31(struct dp_qos_blk_flush_port *cfg,
+ 			   int flag);
++int dp_register_br_vlan(struct br_info *br_info, int flags);
++int dp_register_bport_vlan(struct br_info *br_info,
++			   struct net_device *dev, int bport, int flags);
++int dp_ndo_br_setlink(struct net_device *dev, struct nlmsghdr *nlh,
++		      u16 flags);
++int dp_ndo_br_dellink(struct net_device *dev, struct nlmsghdr *nlh,
++		      u16 flags);
+ 
+ #endif /* DATAPATH_MISC31_H */
+diff --git a/include/net/datapath_inst.h b/include/net/datapath_inst.h
+index dbef6c88b83e..a5bcf4e997c6 100644
+--- a/include/net/datapath_inst.h
++++ b/include/net/datapath_inst.h
+@@ -159,6 +159,13 @@ struct inst_info {
+ 	int (*dp_mac_set)(int bport, int fid, int inst, u8 *addr);
+ 	int (*dp_mac_reset)(int bport, int fid, int inst, u8 *addr);
+ 	int (*dp_cfg_vlan)(int inst, int vap, int ep);
++	int (*dp_reg_br_vlan)(struct br_info *br_info, int flags);
++	int (*dp_reg_bport_vlan)(struct br_info *br_info,
++			   struct net_device *dev, int bport, int flags);
++	int (*dp_ndo_br_setlink)(struct net_device *dev,struct nlmsghdr *nlh, 
++			u16 flags);
++	int (*dp_ndo_br_dellink)(struct net_device *dev,struct nlmsghdr *nlh, 
++			u16 flags);	
+ #endif
+ 	int (*dp_tc_vlan_set)(struct core_ops *ops, struct dp_tc_vlan *vlan,
+ 			      struct dp_tc_vlan_info *info,

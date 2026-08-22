@@ -1,0 +1,99 @@
+From 26bb7a0e6abc68fe75bb8b480d172a0c449a1263 Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Fri, 22 May 2020 19:37:46 +0800
+Subject: [PATCH] PONRTSYS-7499: DP - add rate shaper to limit packet rate to
+ PON interface
+
+---
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 71 ++++++++++++++++++++++++
+ 1 file changed, 71 insertions(+)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 9ff45628e4ba..a9370e8fbb18 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1284,6 +1284,74 @@ static int dp_platform_set(int inst, u32 flag)
+ 	return 0;
+ }
+ 
++/* Configure Shaper 1 on PON Egress to mitigate
++ * high packet rate which PON IP can't handle.
++ * Change overhead to 128 bytes to achieve adaptive packet rate
++ * limit on different packet size.
++ * Caculation Example for DDR-1600:
++ *   64-byte packet:
++ *     normal rate:  10Gbps / ((64 + 20) * 8) = 14.88095Mpps
++ *     limited rate: 11Gbps / ((64 + 68) * 8) = 10.41667Mpps
++ *   1518-byte packet:
++ *     normal rate:  10Gbps / ((1518 + 20) * 8) = 812.743Kpps
++ *     limited rate: 11Gbps / ((1518 + 68) * 8) = 866.960Kpps
++ * So the packet rate limit is mainly applied to the small packet.
++ */
++static void adaptive_packet_rate_limit(int inst, int ep, u32 flags)
++{
++	struct core_ops *gsw_handle = dp_port_prop[inst].ops[GSWIP_L];
++	struct common_ops *gsw_com = &gsw_handle->gsw_common_ops;
++	u16 overhead[] = {
++		0xEC,	/* default value for rater shaping */
++		188,	/* DDR-1600 (400) */
++		208,	/* DDR-1866 (466), need extension to pass in as flag */
++		222,	/* DDR-2133 (533), need extension to pass in as flag */
++	};
++	u32 ovrhd_idx;
++	GSW_register_t gswreg = {0};
++	struct qos_ops *qos_ops = &gsw_handle->gsw_qos_ops;
++	GSW_QoS_ShaperCfg_t shaper_cfg = {0};
++	GSW_QoS_ShaperQueue_t shaper_q = {0};
++	GSW_QoS_queuePort_t qp_cfg = {0};
++	u32 i;
++
++	ovrhd_idx = (flags & DP_F_DEREGISTER) ? 0 : 1;
++
++	gswreg.nRegAddr = 0x61;
++	gswreg.nData = overhead[ovrhd_idx];
++	gsw_com->RegisterSet(gsw_handle, &gswreg);
++
++	shaper_cfg.nRateShaperId = 1;
++	if (!(flags & DP_F_DEREGISTER)) {
++		shaper_cfg.bEnable = 1;
++		shaper_cfg.nCbs = 1048576;
++		shaper_cfg.nRate = 11000000;
++		qos_ops->QoS_ShaperCfgSet(gsw_handle, &shaper_cfg);
++	}
++
++	shaper_q.nRateShaperId = shaper_cfg.nRateShaperId;
++	qp_cfg.nPortId = ep;
++	qp_cfg.bRedirectionBypass = 0;
++	for (i = 0; i < 16; i++) {
++		qp_cfg.nTrafficClassId = i;
++		if (qos_ops->QoS_QueuePortGet(gsw_handle, &qp_cfg)
++		    != GSW_statusOk)
++			continue;
++		if (qp_cfg.nRedirectPortId != 1)
++			continue;
++		shaper_q.nQueueId = qp_cfg.nQueueId;
++		if (flags & DP_F_DEREGISTER)
++			qos_ops->QoS_ShaperQueueDeassign(gsw_handle, &shaper_q);
++		else
++			qos_ops->QoS_ShaperQueueAssign(gsw_handle, &shaper_q);
++	}
++
++	if (flags & DP_F_DEREGISTER) {
++		shaper_cfg.bEnable = 0;
++		qos_ops->QoS_ShaperCfgSet(gsw_handle, &shaper_cfg);
++	}
++}
++
+ static int pon_config(int inst, int ep, struct dp_port_data *data, u32 flags)
+ {
+ 	struct core_ops *gsw_handle;
+@@ -1352,6 +1420,9 @@ static int pon_config(int inst, int ep, struct dp_port_data *data, u32 flags)
+ 	 */
+ 	mac_ops->soft_restart(mac_ops);
+ 
++	if (flags & DP_F_GPON)
++		adaptive_packet_rate_limit(inst, ep, flags);
++
+ 	return 0;
+ }
+ 

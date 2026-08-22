@@ -1,0 +1,204 @@
+From c7b189b9d0ba58bd6a29c706af71965c01f0a8e9 Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Thu, 15 Oct 2020 23:23:25 +0800
+Subject: [PATCH] DRVLIB_SW-3755: GSW API - disable PHC registration if
+ external reference clock is used, separate interrupt for PHC aux timestamp
+ and PTP Packet timestamp
+
+---
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.c   | 19 ++++++-------
+ .../net/ethernet/lantiq/switch-api/mac/mac_drv.c   |  2 ++
+ .../ethernet/lantiq/switch-api/mac/xgmac_mac_api.c | 30 +++++++++++++++++---
+ .../net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c | 33 ++++++++++++++--------
+ 4 files changed, 58 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+index 19a6489cbeb3..98b0b64d7ee3 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+@@ -935,10 +935,6 @@ int mac_enable_ts(void *pdev)
+ 	/* Tell adaption layer to attach Timestamp */
+ 	gswss_set_mac_rxtime_op(pdev, MODE1);
+ 
+-	mac_int_enable(pdev);
+-
+-	xgmac_set_mac_int(pdev, XGMAC_TSTAMP_EVNT, 1);
+-
+ #ifdef __KERNEL__
+ 	spin_unlock_bh(&pdata->mac_lock);
+ #endif
+@@ -961,12 +957,6 @@ int mac_disable_ts(void *pdev)
+ 
+ 	gswss_set_mac_rxtime_op(pdev, MODE0);
+ 
+-	xgmac_disable_tstamp(pdev);
+-
+-	xgmac_set_mac_int(pdev, XGMAC_TSTAMP_EVNT, 0);
+-
+-	pdata->systime_initialized = 0;
+-
+ #ifdef __KERNEL__
+ 	spin_unlock_bh(&pdata->mac_lock);
+ #endif
+@@ -1222,6 +1212,11 @@ int mac_exit(void *pdev)
+ 	u32 mtl_rx_debugq, prxq, rxqsts;
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 
++	/* disable interrupts */
++	mac_int_disable(pdev);
++	xgmac_set_mac_int(pdev, XGMAC_ALL_EVNT, 0);
++	lmac_set_event_int(pdev, LMAC_ALL_EVNT, 0);
++
+ 	mtl_tx_debugq = XGMAC_RGRD(pdata, MTL_Q_TQDG);
+ 	trcsts = MAC_GET_VAL(mtl_tx_debugq, MTL_Q_TQDG, TRCSTS);
+ 	txqsts = MAC_GET_VAL(mtl_tx_debugq, MTL_Q_TQDG, TXQSTS);
+@@ -1243,6 +1238,10 @@ int mac_exit(void *pdev)
+ 	else
+ 		mac_printf("ERROR: Data is still txing to system memory\n");
+ 
++#ifdef CONFIG_PTP_1588_CLOCK
++	xgmac_ptp_remove(pdev);
++#endif
++
+ #ifdef __KERNEL__
+ 	xgmac_mdio_unregister(pdev);
+ #endif
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
+index 5243a43e79de..5b60c02653d7 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
+@@ -286,6 +286,8 @@ static int mac_remove(struct platform_device *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(platform_get_drvdata(pdev));
+ 
++	pdata->ops.exit(&pdata->ops);
++
+ 	clk_disable_unprepare(pdata->ker_ptp_clk);
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+index e72531515c8b..e3174754ada8 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+@@ -275,10 +275,15 @@ int xgmac_set_mac_int(void *pdev, u32 event, u32 val)
+ 		MAC_SET_VAL(mtl_q_ier, MTL_Q_IER, RXOIE, val);
+ 		break;
+ 
+-	/* Interrupt Enable All */
++	/* Interrupt Enable or Disable All */
+ 	case XGMAC_ALL_EVNT:
+-		mac_ier = 0xFFFFFFFF;
+-		mtl_q_ier = 0xFFFFFFFF;
++		if (val) {
++			mac_ier = 0xFFFFFFFF;
++			mtl_q_ier = 0xFFFFFFFF;
++		} else {
++			mac_ier = 0;
++			mtl_q_ier = 0;
++		};
+ 		break;
+ 
+ 	default:
+@@ -1488,12 +1493,21 @@ int xgmac_set_hwtstamp_settings(void *pdev,
+ 				u32 rx_filter)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+-	u32 mac_tscr = 0;
++	u32 mac_tscr;
+ 	struct ptp_flags ptp_flgs = {0};
+ 
+ 	mac_dbg("Mac Idx %d\n", pdata->mac_idx);
+ 	mac_dbg("tx_type = %d, rx_filter = %d\n", tx_type, rx_filter);
+ 
++	if (pdata->systime_initialized) {
++		mac_tscr = XGMAC_RGRD(pdata, MAC_TSTAMP_CR)
++			   & (BIT(MAC_TSTAMP_CR_TSENA_POS)
++			      | BIT(MAC_TSTAMP_CR_TSCFUPDT_POS)
++			      | BIT(MAC_TSTAMP_CR_TSCTRLSSR_POS));
++	} else {
++		mac_tscr = 0;
++	}
++
+ 	switch (tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		break;
+@@ -1663,6 +1677,14 @@ int xgmac_set_hwtstamp_settings(void *pdev,
+ 		xgmac_config_timer_reg(pdev, mac_tscr);
+ #endif
+ 
++	if (mac_tscr & BIT(MAC_TSTAMP_CR_TSENA_POS)) {
++		/* Enable timestamp interrupt for ExtTS */
++		mac_int_enable(pdev);
++		xgmac_set_mac_int(pdev, XGMAC_TSTAMP_EVNT, 1);
++	} else {
++		xgmac_set_mac_int(pdev, XGMAC_TSTAMP_EVNT, 0);
++	}
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+index fe8fd5f7c6ce..5fdcbb20c388 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+@@ -699,14 +699,20 @@ int xgmac_ptp_init(void *pdev)
+ 	 */
+ 	INIT_WORK(&pdata->ptp_tx_work, (work_func_t)xgmac_ptp_tx_work);
+ 
+-	/* Start internal clock */
+-	xgmac_config_tstamp(&pdata->ops, BIT(MAC_TSTAMP_CR_TSENA_POS));
+-	xgmac_config_timer_reg(&pdata->ops, BIT(MAC_TSTAMP_CR_TSENA_POS));
+-
+ 	ret = xgmac_ptp_register(pdev);
+ 
+ 	if (ret == -1)
+ 		pr_info("Already have a PTP clock device\n");
++	
++	if (pdata->ptp_clock) {
++		/* Start internal clock */
++		xgmac_config_tstamp(&pdata->ops, BIT(MAC_TSTAMP_CR_TSENA_POS));
++		xgmac_config_timer_reg(&pdata->ops, BIT(MAC_TSTAMP_CR_TSENA_POS));
++
++		/* Enable timestamp interrupt for ExtTS */
++		mac_int_enable(pdev);
++		xgmac_set_mac_int(pdev, XGMAC_TSTAMP_EVNT, 1);
++	}
+ 
+ 	return ret;
+ }
+@@ -798,11 +804,13 @@ static int xgmac_ptp_register(void *pdev)
+ 	info->settime64 = xgmac_set_time;
+ 	info->enable	= xgmac_extts_enable;
+ #ifdef CONFIG_PTP_1588_CLOCK
+-	pdata->ptp_clock = ptp_clock_register(info, pdata->dev);
+-	if (IS_ERR(pdata->ptp_clock)) {
+-		pdata->ptp_clock = NULL;
+-		pr_err("ptp_clock_register() failed\n");
+-		return -1;
++	if (!pdata->ext_ref_time) {
++		pdata->ptp_clock = ptp_clock_register(info, pdata->dev);
++		if (IS_ERR(pdata->ptp_clock)) {
++			pdata->ptp_clock = NULL;
++			pr_err("ptp_clock_register() failed\n");
++			return -1;
++		}
+ 	}
+ #endif
+ 
+@@ -819,12 +827,13 @@ void xgmac_ptp_remove(void *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 
+-	if (pdata->ptp_clock) {
+-		cancel_work_sync(&pdata->ptp_tx_work);
++	cancel_work_sync(&pdata->ptp_tx_work);
++
+ #ifdef CONFIG_PTP_1588_CLOCK
++	if (pdata->ptp_clock) {
+ 		ptp_clock_unregister(pdata->ptp_clock);
+ 		pr_info("Removed PTP HW clock successfully\n");
+-#endif
+ 	}
++#endif
+ }
+ 

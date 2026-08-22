@@ -1,0 +1,685 @@
+From c457ac93701df8497803f9d60372c4512f6e37aa Mon Sep 17 00:00:00 2001
+From: Robert Dabrowski <robertx.dabrowski@intel.com>
+Date: Thu, 23 Jan 2020 15:49:35 +0100
+Subject: [PATCH] PONRTSYS-5867: HW counter overflow handling - sync SDK rc.17
+
+---
+ drivers/net/datapath/Kconfig                       |   1 +
+ drivers/net/datapath/Makefile                      |   3 +-
+ drivers/net/datapath/dpm/datapath_notifier.c       |   2 +-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   |  30 +-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h   |   7 +-
+ drivers/net/datapath/mib_counters/Kconfig          |  12 +
+ drivers/net/datapath/mib_counters/Makefile         |   7 +
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 453 +++++++++++++++++++++
+ .../net/datapath/mib_counters/dp_mib_counters.h    |  23 ++
+ drivers/net/ethernet/lantiq/Makefile               |   1 +
+ 10 files changed, 529 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/datapath/Kconfig b/drivers/net/datapath/Kconfig
+index bcca1406530b..ab000bb8ce11 100644
+--- a/drivers/net/datapath/Kconfig
++++ b/drivers/net/datapath/Kconfig
+@@ -11,4 +11,5 @@ menuconfig INTEL_NP_NET_CORE
+ if INTEL_NP_NET_CORE
+ source "drivers/net/datapath/dpm/Kconfig"
+ source "drivers/net/datapath/umt/Kconfig"
++source "drivers/net/datapath/mib_counters/Kconfig"
+ endif # INTEL_NP_NET_CORE
+diff --git a/drivers/net/datapath/Makefile b/drivers/net/datapath/Makefile
+index 78eb54e04a96..f6d9e1751579 100644
+--- a/drivers/net/datapath/Makefile
++++ b/drivers/net/datapath/Makefile
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: GPL-2.0
+ #
+-# Copyright (C) 2019 Intel Corporation.
++# Copyright (C) 2019 - 2020 Intel Corporation.
+ 
+ obj-$(CONFIG_INTEL_NP_NET_CORE) += dpm/
+ obj-$(CONFIG_INTEL_NP_NET_CORE) += umt/
++obj-$(CONFIG_INTEL_MIB_COUNTERS) += mib_counters/
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index fb658fd75407..ef9d97b9b510 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -353,7 +353,7 @@ int unregister_dp_event_notifier(struct dp_event *info)
+ 
+ 	atomic_notifier_chain_unregister(&dp_evt_notif_list, evt_notif->nb);
+ 	devm_kfree(&g_dp_dev->dev, evt_notif->nb);
+-	devm_kfree(&g_dp_dev->dev, evt_notif);
++	/* devm_kfree(&g_dp_dev->dev, evt_notif); */
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index f2a1eda08afd..4c085f66d3ac 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -26,6 +26,10 @@
+ #include "datapath_switchdev.h"
+ #endif
+ 
++#if IS_ENABLED(CONFIG_INTEL_MIB_COUNTERS)
++#include "../../mib_counters/dp_mib_counters.h"
++#endif
++
+ static void init_dma_desc_mask(void)
+ {
+ 	/*mask 0: to remove the bit, 1 -- keep the bit */
+@@ -2146,7 +2150,12 @@ int register_dp_cap_gswip31(int flag)
+ 	cap.info.dp_net_dev_get_ss_stat_strings_count =
+ 		dp_net_dev_get_ss_stat_strings_count_3X;
+ 	cap.info.dp_net_dev_get_ethtool_stats =
++#if IS_ENABLED(CONFIG_INTEL_MIB_COUNTERS)
++		mib_cnt_get_ethtool_stats_31;
++#else
+ 		dp_net_dev_get_ethtool_stats_31;
++#endif
++
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP31_MIB)
+ 	cap.info.dp_get_port_vap_mib = dp_get_port_vap_mib_31;
+ 	cap.info.dp_clear_netif_mib = dp_clear_netif_mib_31;
+@@ -2194,7 +2203,15 @@ int register_dp_cap_gswip31(int flag)
+ 	return 0;
+ }
+ 
+-/* ethtool statistics support */
++/********************* ETHTOOL STATISTIC SUPPORT ****************************/
++
++#if IS_ENABLED(CONFIG_INTEL_MIB_COUNTERS)
++/* ethtool statistics serviced in mib_counters module */
++#else
++/* This function is used for retrieving MIB counters statistics from
++ * HW registers when "mib_counters" kernel module isn't used for
++ * handling counters overflow
++ */
+ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 				     struct ethtool_stats *stats, u64 *data)
+ {
+@@ -2231,9 +2248,6 @@ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 		netdev_err(dev, "dp_get_netif_subifid returned %d\n", ret);
+ 		devm_kfree(&g_dp_dev->dev, ps_subif);
+ 		devm_kfree(&g_dp_dev->dev, g_counters);
+-		/* dev_put(dev); */
+-		kfree(g_counters);
+-		kfree(ps_subif);
+ 		return;
+ 	}
+ 
+@@ -2257,8 +2271,8 @@ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 		ret = ops->gsw_rmon_ops.RMON_Port_Get(ops, &g_counters[i]);
+ 		if (ret != DP_SUCCESS) {
+ 			netdev_err(dev, "RMON_Port_Get returned %d\n", ret);
+-			kfree(g_counters);
+-			kfree(ps_subif);
++			devm_kfree(&g_dp_dev->dev, g_counters);
++			devm_kfree(&g_dp_dev->dev, ps_subif);
+ 			return;
+ 		}
+ 	}
+@@ -2272,6 +2286,8 @@ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 	DP_ETHTOOL_STAT_REG_TX_DECLARE
+ #undef _DP_ETHTOOL_TX
+ 
++	/* here subtract counters by reinserted packets */
++
+ 	/* copy counters' values to ethtool buffer */
+ 	data_dst = data;
+ 
+@@ -2282,4 +2298,4 @@ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 	devm_kfree(&g_dp_dev->dev, g_counters);
+ 	devm_kfree(&g_dp_dev->dev, ps_subif);
+ }
+-
++#endif /* CONFIG_INTEL_MIB_COUNTERS */
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 7ddbd1412470..8e3e5bd5c91e 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -224,6 +224,9 @@ int tc_vlan_set_31(struct core_ops *ops, struct dp_tc_vlan *vlan,
+ int dp_get_reinsert_cnt_31(int inst, int dp_port, int vap, int flag,
+ 			   struct dp_reinsert_count *dp_reins_count);
+ 
++#if IS_ENABLED(CONFIG_INTEL_MIB_COUNTERS)
++/* ethtool statistics serviced in mib_counters module */
++#else
+ /*!
+  *@brief dp_net_dev_get_ethtool_stats_31 - function used by callback
+  * dp_net_dev_get_ethtool_stats to retrieve counters' values specyfic for
+@@ -234,4 +237,6 @@ int dp_get_reinsert_cnt_31(int inst, int dp_port, int vap, int flag,
+  */
+ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 				     struct ethtool_stats *stats, u64 *data);
+-#endif
++#endif /* CONFIG_INTEL_MIB_COUNTERS */
++
++#endif /* DATAPATH_MISC31_H */
+diff --git a/drivers/net/datapath/mib_counters/Kconfig b/drivers/net/datapath/mib_counters/Kconfig
+new file mode 100644
+index 000000000000..0b9476f633a5
+--- /dev/null
++++ b/drivers/net/datapath/mib_counters/Kconfig
+@@ -0,0 +1,12 @@
++# SPDX-License-Identifier: GPL-2.0
++
++config INTEL_MIB_COUNTERS
++    bool "MIB counters driver"
++    default y
++    depends on INTEL_DATAPATH
++
++    ---help---
++    This driver supports counters overflow handling.
++    It is designed to accumulate 32 bit wide counters
++    into 64 bit counters and overflow handling
++
+diff --git a/drivers/net/datapath/mib_counters/Makefile b/drivers/net/datapath/mib_counters/Makefile
+new file mode 100644
+index 000000000000..105bed7d8a47
+--- /dev/null
++++ b/drivers/net/datapath/mib_counters/Makefile
+@@ -0,0 +1,7 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++# Makefile for the Intel(R) MIB Counters driver
++#
++# Copyright (C) 2020 Intel Corporation.
++
++obj-$(CONFIG_INTEL_MIB_COUNTERS) += dp_mib_counters.o
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+new file mode 100644
+index 000000000000..28adb635f01f
+--- /dev/null
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -0,0 +1,453 @@
++// SPDX-License-Identifier: GPL-2.0
++/*  Copyright (C) 2020 Intel Corporation.
++ */
++
++#include <linux/module.h> /* Needed by all modules */
++#include <linux/kernel.h> /* Needed for KERN_INFO */
++#include <linux/init.h> /* Needed for the macros */
++#include <linux/timer.h>
++#include <linux/spinlock.h>
++#include <linux/list.h>
++
++#include <net/datapath_api.h>
++#include "../dpm/datapath.h"
++#include "dp_mib_counters.h"
++
++/* Counters update interval = 3[min] -> 180'000[ms] */
++#define CNT_UPDATE_TIME 180000
++
++struct mib_counters_u64 {
++#define _DP_ETHTOOL(x, y)	u64 y;
++DP_ETHTOOL_STAT_REG_DECLARE
++#undef _DP_ETHTOOL
++};
++
++/** Data set needed for maintain mib counters overflow for one net device */
++struct mib_counters {
++	/** devices list handle */
++	struct list_head dev_list;
++	/** lock for update the set */
++	rwlock_t cnt_lock;
++	/** net device handle */
++	struct net_device *dev;
++	/** inst */
++	s32 inst;
++	/** device id */
++	s32 port_id;
++	/** sub interface id group*/
++	s32 sub_if_id_grp;
++	/** last read counters */
++	GSW_RMON_Port_cnt_t last_read_rmon;
++	/** stored 64 bits wide counters */
++	struct mib_counters_u64 wide_cntrs;
++};
++
++/* Timer for update counters for all registered net devices */
++static struct timer_list cnt_upd_timer;
++
++/* List of registered net devices */
++static struct list_head registered_devices_list;
++
++/* Devices list lock */
++static rwlock_t dev_list_lock;
++
++/* Wraparound counter handle */
++static u64 wraparound(u64 curr, u64 last, u32 size)
++{
++	#define WRAPAROUND_MAX_32 0xFFFFFFFF
++	/* for 8 bytes(64bit mib),no need to do wraparound */
++	if ((size > 4) || (curr >= last))
++		return curr - last;
++	return ((u64)WRAPAROUND_MAX_32) + curr - last;
++}
++
++/* Update counters for one device */
++static void update_dev_counters(struct mib_counters *cnt)
++{
++	GSW_RMON_Port_cnt_t *tmp_counters;
++	struct core_ops *ops;
++	s32 ret = 0;
++	u8 i = 0;
++
++	tmp_counters = devm_kzalloc(&g_dp_dev->dev,
++				    (2 * sizeof(GSW_RMON_Port_cnt_t)),
++				    GFP_KERNEL);
++	if (!tmp_counters) {
++		netdev_err(cnt->dev, "failed to get memory for counters");
++		return;
++	}
++
++	/* TODO: check whether these zeros can be replaced by consts/variables
++	 * (e.g. "inst")
++	 */
++	ops = dp_port_prop[0].ops[0];
++
++	DP_DEBUG(DP_DBG_FLAG_DBG,
++		 "MIB CNT - update_dev_counters for dev: %s, port_id: %d, sub_if_id_grp: %d\n",
++		 cnt->dev->name, cnt->port_id, cnt->sub_if_id_grp);
++
++	/* read current counters' values */
++	for (i = 0; i < 2; i++) {
++		tmp_counters[i].ePortType = GSW_CTP_PORT;
++		tmp_counters[i].nPortId = cnt->port_id;
++		tmp_counters[i].nSubIfIdGroup = cnt->sub_if_id_grp;
++		tmp_counters[i].bPceBypass = i;
++
++		/* read CTP counters */
++		ret = ops->gsw_rmon_ops.RMON_Port_Get(ops, &tmp_counters[i]);
++		if (ret != DP_SUCCESS) {
++			netdev_err(cnt->dev,
++				   "RMON_Port_Get returned %d\n", ret);
++			devm_kfree(&g_dp_dev->dev, tmp_counters);
++			return;
++		}
++	}
++
++	/* Overwrite CTP Tx counters by CTP Tx Pce-Bypass counters.
++	 * CTP Tx counters are placed before QoS modules, and they
++	 * record packets dropped by QoS modules too.
++	 * CTP Tx PCE-Bypass counters are placed after QoS modules,
++	 * and they record the packets actually transmitted.
++	 */
++#define _DP_ETHTOOL_TX(r)	tmp_counters[0].r = tmp_counters[1].r;
++	DP_ETHTOOL_STAT_REG_TX_DECLARE
++#undef _DP_ETHTOOL_TX
++
++	/* update 64 bits wide counters based on last read values */
++	write_lock(&cnt->cnt_lock);
++#define _DP_ETHTOOL(x, y) cnt->wide_cntrs.y += wraparound(tmp_counters[0].y, cnt->last_read_rmon.y, sizeof(cnt->last_read_rmon.y));
++	DP_ETHTOOL_STAT_REG_DECLARE
++#undef _DP_ETHTOOL
++	write_unlock(&cnt->cnt_lock);
++
++	/* Update last read counters set */
++	cnt->last_read_rmon = tmp_counters[0];
++
++	devm_kfree(&g_dp_dev->dev, tmp_counters);
++}
++
++/* update counters for all registered devices */
++static void update_all_devs_counters(void)
++{
++	struct mib_counters *mib_cnt;
++	struct list_head *p;
++
++	DP_DEBUG(DP_DBG_FLAG_DBG, "MIB CNT - update all counters\n");
++
++	read_lock(&dev_list_lock);
++	list_for_each(p, &registered_devices_list)
++	{
++		mib_cnt = list_entry(p, struct mib_counters, dev_list);
++		update_dev_counters(mib_cnt);
++	}
++	read_unlock(&dev_list_lock);
++}
++
++/* Adds new net device to counter update list */
++s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
++{
++	struct mib_counters *dev_cnt;
++	struct pmac_port_info *port_info;
++
++	dev_cnt = devm_kzalloc(&g_dp_dev->dev,
++			       sizeof(struct mib_counters),
++			       GFP_KERNEL);
++	if (!dev_cnt) {
++		/* TODO: use appropriate errno */
++		return -1;
++	}
++
++	port_info = get_dp_port_info(inst, port_id);
++
++	/* TODO: check if there is a need to pass also sub_if to mib_counters
++	 *       structure to be able to match DE REGISTERED SUBIF
++	 */
++	dev_cnt->inst = inst;
++	dev_cnt->dev = dev;
++	dev_cnt->port_id = port_id;
++	dev_cnt->sub_if_id_grp = GET_VAP(sub_if, port_info->vap_offset,
++					 port_info->vap_mask);
++	rwlock_init(&dev_cnt->cnt_lock);
++
++	INIT_LIST_HEAD(&dev_cnt->dev_list);
++
++	write_lock(&dev_list_lock);
++	list_add_tail(&dev_cnt->dev_list, &registered_devices_list);
++	write_unlock(&dev_list_lock);
++
++	DP_DEBUG(DP_DBG_FLAG_DBG, "MIB CNT - added device: %s port_id = %d, sub_if_id_grp = %d <- from sub_if: %d\n",
++		 dev->name, port_id, dev_cnt->sub_if_id_grp, sub_if);
++
++	return 0;
++}
++
++/* Looks for matched list item and remove it */
++s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
++{
++	struct pmac_port_info *port_info;
++	struct mib_counters *mib_cnt;
++	struct list_head *p;
++	s32 sub_if_id_grp;
++
++	/* TODO: tune the range check */
++	if ((!dev) || (port_id < 0) || (port_id > 16) || (sub_if < 0) || (sub_if > 512)) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "MIB CNT -- item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d  - POSSIBLY WRONG DATA !\n",
++			 dev->name, port_id, sub_if, inst);
++		return -1;
++	}
++
++	port_info = get_dp_port_info(inst, port_id);
++
++	DP_DEBUG(DP_DBG_FLAG_DBG, "MIB CNT - inside rm_dev_from_list\n");
++	DP_DEBUG(DP_DBG_FLAG_DBG,
++		 "MIB CNT -- looking for item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d\n",
++		 dev->name, port_id, sub_if, inst);
++
++	sub_if_id_grp = GET_VAP(sub_if, port_info->vap_offset,
++				port_info->vap_mask);
++
++	DP_DEBUG(DP_DBG_FLAG_DBG,
++		 "MIB CNT --- sub_if_id_grp taken from VAP = %d\n",
++		 sub_if_id_grp);
++
++	write_lock(&dev_list_lock);
++	list_for_each(p, &registered_devices_list)
++	{
++		mib_cnt = list_entry(p, struct mib_counters, dev_list);
++
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - list item: name = %s, port_id = %d, sub_if_id_grp = %d, inst = %d\n",
++			 mib_cnt->dev->name, mib_cnt->port_id, mib_cnt->sub_if_id_grp, mib_cnt->inst);
++
++		if ((mib_cnt->port_id == port_id) &&
++		    (mib_cnt->sub_if_id_grp == sub_if_id_grp) &&
++		    (mib_cnt->inst == inst)) {
++			DP_DEBUG(DP_DBG_FLAG_DBG, "MIB CNT - removed device: %s port_id = %d, sub_if_id_grp = %d\n",
++				 dev->name, port_id, sub_if_id_grp);
++			list_del(p);
++			devm_kfree(&g_dp_dev->dev, mib_cnt);
++		} else {
++			DP_DEBUG(DP_DBG_FLAG_DBG, "MIB CNT  -  item DOES NOT MATCH\n");
++		}
++	}
++	write_unlock(&dev_list_lock);
++
++	return 0;
++}
++
++/* Function needed for ethtool to find on list appropriate wide counters set */
++/* TODO: check why sometimes gem(s) and pmapper(s) has the same port_id and
++ *       sub_if_id_grp
++ */
++struct mib_counters *find_registered_dev(s32 port_id, s32 sub_if_id_grp,
++					 s32 inst)
++{
++	struct mib_counters *mib_cnt;
++	struct list_head *p;
++
++	list_for_each(p, &registered_devices_list)
++	{
++		mib_cnt = list_entry(p, struct mib_counters, dev_list);
++		if ((mib_cnt->port_id == port_id) &&
++		    (mib_cnt->sub_if_id_grp == sub_if_id_grp) &&
++		    (mib_cnt->inst == inst)) {
++			return mib_cnt;
++		}
++	}
++
++	return NULL;
++}
++
++/* Callback function to register new net device (subif) reported by DP API */
++s32 subif_register_cb(struct dp_event_info *info)
++{
++	DP_DEBUG(DP_DBG_FLAG_DBG,
++		 "MIB CNT - EVENT - SUBIF REGISTER CB called\n - event info type = %d\n",
++		 info->type);
++
++	switch (info->type) {
++	case DP_EVENT_REGISTER_SUBIF:
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - event type: DP_EVENT_REGISTER_SUBIF\n");
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - info->reg_subif_info.dpid = %d\n",
++			 info->reg_subif_info.dpid);
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - info->reg_subif_info.subif = %d\n",
++			 info->reg_subif_info.subif);
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - info->reg_subif_info.dev->name = %s\n",
++			 info->reg_subif_info.dev->name);
++
++		/* add new net device to registered devices list */
++		add_dev_to_list(info->reg_subif_info.dev,
++				info->reg_subif_info.dpid,
++				info->reg_subif_info.subif,
++				info->inst);
++		break;
++	case DP_EVENT_DE_REGISTER_SUBIF:
++
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - event type: DP_EVENT_DE_REGISTER_SUBIF\n");
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - info->de_reg_subif_info.dpid = %d\n",
++			 info->de_reg_subif_info.dpid);
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - info->de_reg_subif_info.subif = %d\n",
++			 info->de_reg_subif_info.subif);
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "MIB CNT - info->de_reg_subif_info.dev->name = %s\n",
++			 info->de_reg_subif_info.dev->name);
++
++		/* remove net device from registered devices list */
++		rm_dev_from_list(info->de_reg_subif_info.dev,
++				 info->de_reg_subif_info.dpid,
++				 info->de_reg_subif_info.subif,
++				 info->inst);
++		break;
++	default:
++		return 0;
++	}
++
++	return 0;
++}
++
++/************************* ETHTOOL SUPPORT ************************/
++
++void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
++				  struct ethtool_stats *stats, u64 *data)
++{
++	struct pmac_port_info *port_info;
++	struct mib_counters *mib_cnt;
++	dp_subif_t *ps_subif;
++	u32 sub_if_id_grp;
++	u64 *data_dst;
++	u32 flags = 0;
++	int ret;
++
++	ps_subif = devm_kzalloc(&g_dp_dev->dev, (sizeof(dp_subif_t)),
++				GFP_KERNEL);
++	if (!ps_subif)
++		return;
++
++	/* Get port_id and sub_if information from net device */
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, ps_subif, flags);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "dp_get_netif_subifid returned %d\n", ret);
++		devm_kfree(&g_dp_dev->dev, ps_subif);
++		return;
++	}
++
++	port_info = get_dp_port_info(ps_subif->inst, ps_subif->port_id);
++
++	sub_if_id_grp = GET_VAP(ps_subif->subif,
++				port_info->vap_offset,
++				port_info->vap_mask);
++
++	/* Find required registered device on list */
++	read_lock(&dev_list_lock);
++	mib_cnt = find_registered_dev(ps_subif->port_id, sub_if_id_grp,
++				      ps_subif->inst);
++	if (!mib_cnt) {
++		devm_kfree(&g_dp_dev->dev, ps_subif);
++		read_unlock(&dev_list_lock);
++		return;
++	}
++
++	devm_kfree(&g_dp_dev->dev, ps_subif);
++
++	/* Update counters for the requested net device */
++	update_dev_counters(mib_cnt);
++
++	/* Copy counters values to ethtool buffer */
++	data_dst = data;
++
++#define _DP_ETHTOOL(x, y)	*data_dst++ = mib_cnt->wide_cntrs.y;
++	DP_ETHTOOL_STAT_REG_DECLARE
++#undef _DP_ETHTOOL
++
++	read_unlock(&dev_list_lock);
++}
++
++/********************* TIMER **************************************/
++
++void cnt_upd_timer_handler(unsigned long data)
++{
++	/* Restarting the timer...*/
++	mod_timer(&cnt_upd_timer, jiffies + msecs_to_jiffies(CNT_UPDATE_TIME));
++
++	update_all_devs_counters();
++}
++
++/*******************************************************************/
++
++static int __init mib_counters_mod_init(void)
++{
++	struct dp_event event_info = {0};
++	int ret;
++
++	/* Initialize empty list of registered net devices */
++	INIT_LIST_HEAD(&registered_devices_list);
++
++	rwlock_init(&dev_list_lock);
++
++	/* Starting the timer.*/
++	setup_timer(&cnt_upd_timer, cnt_upd_timer_handler, 0);
++	mod_timer(&cnt_upd_timer, jiffies + msecs_to_jiffies(CNT_UPDATE_TIME));
++
++	/* Registering of net dev register callback */
++	event_info.inst = 0;
++	event_info.owner = DP_EVENT_OWNER_MIB;
++	event_info.type = DP_EVENT_REGISTER_SUBIF;
++	event_info.id = 0;
++	event_info.dp_event_cb = subif_register_cb;
++
++	ret = dp_register_event_cb(&event_info, 0);
++	if (ret != DP_SUCCESS) {
++		pr_err("Can't register DP_EVENT_REGISTERT_SUBIF callback\n");
++		return ret;
++	}
++
++	return 0;
++}
++
++static void __exit mib_counters_mod_exit(void)
++{
++	struct dp_event event_info = {0};
++	int ret;
++	struct mib_counters *mib_cnt;
++	struct list_head *p;
++
++	/* Deregistering the callback function */
++	event_info.inst = 0;
++	event_info.owner = DP_EVENT_OWNER_MIB;
++	event_info.type = DP_EVENT_DE_REGISTER_SUBIF;
++	event_info.id = 0;
++	event_info.dp_event_cb = subif_register_cb;
++
++	ret = dp_register_event_cb(&event_info, DP_F_DEREGISTER);
++	if (ret != DP_SUCCESS) {
++		pr_err("Can't deregister DP_EVENT_REGISTER_SUBIF callback\n");
++		return;
++	}
++
++	/* STOP and remove timer */
++	del_timer(&cnt_upd_timer);
++
++	/* Free all list entries for registered net devices */
++	write_lock(&dev_list_lock);
++	list_for_each(p, &registered_devices_list)
++	{
++		mib_cnt = list_entry(p, struct mib_counters, dev_list);
++		list_del(p);
++		devm_kfree(&g_dp_dev->dev, mib_cnt);
++	}
++	write_unlock(&dev_list_lock);
++}
++
++module_init(mib_counters_mod_init);
++module_exit(mib_counters_mod_exit);
++
++MODULE_LICENSE("GPL v2");
++MODULE_DESCRIPTION("MIB counters driver for overflow handling");
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.h b/drivers/net/datapath/mib_counters/dp_mib_counters.h
+new file mode 100644
+index 000000000000..ccbb830f6d49
+--- /dev/null
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.h
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2020 Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ */
++
++#ifndef DP_MIB_COUNTERS
++#define DP_MIB_COUNTERS
++
++/*!
++ *@brief mib_cnt_get_ethtool_stats_31 - function used by callback
++ * dp_net_dev_get_ethtool_stats to retrieve counters' values specyfic for
++ * gswip31
++ *@param[in] dev: net device
++ *@param[out] stats: for dumping NIC-specific statistics
++ *@param[out] data: for dumping counters values sequence
++ */
++void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
++				  struct ethtool_stats *stats, u64 *data);
++
++#endif
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index ca54a9f59a70..bd4c82110647 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -16,3 +16,4 @@ obj-$(CONFIG_XRX500_PHY_FW) += xrx500_phy_fw.o
+ obj-$(CONFIG_PPA) += ppa/
+ #obj-$(CONFIG_INTEL_UMT_CQEM_MODE) += umt/umt.o
+ obj-$(CONFIG_LTQ_TOE_DRIVER) += ltq_toe_drv.o
++obj-$(CONFIG_INTEL_MIB_COUNTERS) += ../../datapath/mib_counters/

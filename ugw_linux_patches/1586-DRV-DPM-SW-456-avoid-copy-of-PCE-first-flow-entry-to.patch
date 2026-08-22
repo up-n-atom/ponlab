@@ -1,0 +1,174 @@
+From 9b4e58ee0fa47c25b6798b07a24e17b21ce41d71 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Mon, 25 Jan 2021 10:25:58 +0800
+Subject: [PATCH] DRV_DPM_SW-456 - avoid copy of PCE first flow entry to other
+ CTP's if pmapper is not vlan aware (PONRTSYS-8401)
+
+---
+ drivers/net/datapath/dpm/datapath_br_vlan.c      | 81 ++++++++++++++++++++----
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 13 ++--
+ 2 files changed, 76 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_br_vlan.c b/drivers/net/datapath/dpm/datapath_br_vlan.c
+index bbdc36776f22..e35e02a7a26c 100644
+--- a/drivers/net/datapath/dpm/datapath_br_vlan.c
++++ b/drivers/net/datapath/dpm/datapath_br_vlan.c
+@@ -437,23 +437,80 @@ static int allocate_br_vlan_fid(struct br_info *br_info, u16 vlanid)
+ 	return fid;
+ }
+ 
++static bool is_pmapper_vlan_aware(int inst, int bp)
++{
++	struct bp_pmapper *bp_info;
++	struct net_device *br_dev;
++	struct br_info *br_info;
++	struct vlist_entry *list_entry = NULL;
++	struct bridge_member_port *bmp;
++
++	bp_info = get_dp_bp_info(inst, bp);
++	rcu_read_lock();
++	br_dev = netdev_master_upper_dev_get_rcu(bp_info->dev);
++	if (!br_dev) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: pmapper dev(%s) not in bridge\n", __func__,
++			 bp_info->dev->name ? bp_info->dev->name : "NULL");
++		rcu_read_unlock();
++		return false;
++	}
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
++	if (!br_info) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: br_info not added to DPM\n", __func__);
++		rcu_read_unlock();
++		return false;
++	}
++	rcu_read_unlock();
++
++	if (!br_info->br_vlan_en) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: br=%s is not VLAN Aware\n",
++			 __func__, br_dev->name ? br_dev->name : "NULL");
++		return false;
++	}
++
++	/* Check if Bridge Member port have any VLAN entry added */
++	list_for_each_entry(bmp, &br_info->bp_list, list) {
++		if (bmp->bportid != bp)
++			continue;
++		list_for_each_entry(list_entry, &bmp->bport_vlan_list, list) {
++			if (!list_entry->vlan_entry)
++				continue;
++			if (list_entry->vlan_entry->vlan_id)
++				return true;
++		}
++	}
++	return false;
++}
++
+ /* In case of Pmapper, Copies FirstFlowEntryIndex to all its CTP ports in GSWIP */
+ int dp_gsw_copy_ctp_cfg(int inst, int bp, struct dp_subblk_info *subblk_info,
+ 			int portid)
+ {
+ 	struct ctp_dev *ctp_entry;
+ 	struct bp_pmapper *bp_info;
+-	GSW_CTP_portConfig_t ctpcfg;
+-	struct core_ops *gsw_handle;
++	GSW_CTP_portConfig_t ctpcfg = {0};
++	struct core_ops *gsw_ops;
+ 	int flow_index;
+ 
+-	gsw_handle = dp_port_prop[inst].ops[0];
+-	memset(&ctpcfg, 0, sizeof(ctpcfg));
++	gsw_ops = dp_port_prop[inst].ops[0];
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: bp=%d, is pmapper\n", __func__, bp);
+-	bp_info = get_dp_bp_info(0, bp);
++
++	/* check if pmapper is VLAN aware before PCE block copy to other CTP */
++	if (!is_pmapper_vlan_aware(inst, bp)) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: pmapper is not vlan aware\n",
++			 __func__);
++		return DP_SUCCESS;
++	}
++
++	bp_info = get_dp_bp_info(inst, bp);
+ 	if ((!bp_info) || (!bp_info->ref_cnt))
+-		return -1;
++		return DP_FAILURE;
++
+ 
+ 	/* Retrieve the CTP dev list for the pmapper bridge port */
+ 	list_for_each_entry(ctp_entry, &bp_info->ctp_dev, list) {
+@@ -461,11 +518,10 @@ int dp_gsw_copy_ctp_cfg(int inst, int bp, struct dp_subblk_info *subblk_info,
+ 			continue;
+ 		ctpcfg.nLogicalPortId = portid;
+ 		ctpcfg.nSubIfIdGroup = ctp_entry->ctp;
+-		if (gsw_handle->gsw_ctp_ops.CTP_PortConfigGet(gsw_handle,
+-							      &ctpcfg)) {
++		if (gsw_ops->gsw_ctp_ops.CTP_PortConfigGet(gsw_ops, &ctpcfg)) {
+ 			pr_err("CTP(%d) CfgGet fail for bp=%d for ep=%d\n",
+ 			       ctp_entry->ctp, bp, portid);
+-			return -1;
++			return DP_FAILURE;
+ 		}
+ 		/* if FlowEntryIndex exists, dont configure */
+ 		if (ctpcfg.nFirstFlowEntryIndex) {
+@@ -488,14 +544,13 @@ int dp_gsw_copy_ctp_cfg(int inst, int bp, struct dp_subblk_info *subblk_info,
+ 			 __func__, flow_index, ctp_entry->ctp);
+ 		ctpcfg.nFirstFlowEntryIndex = flow_index;
+ 		ctpcfg.eMask = GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
+-		if (gsw_handle->gsw_ctp_ops.CTP_PortConfigSet(gsw_handle,
+-							      &ctpcfg)) {
++		if (gsw_ops->gsw_ctp_ops.CTP_PortConfigSet(gsw_ops, &ctpcfg)) {
+ 			pr_err("CTP(%d) CfgSet fail for bp=%d for ep=%d\n",
+ 			       ctp_entry->ctp, bp, portid);
+-			return -1;
++			return DP_FAILURE;
+ 		}
+ 	}
+-	return 0;
++	return DP_SUCCESS;
+ }
+ 
+ /* Update current PCE rule index with enable/disable */
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index ca4c2fd41833..4700dc990bda 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1843,8 +1843,9 @@ static int set_ctp_bp(int inst, int ctp, int portid, int bp,
+ 
+ 	/* Copy first flow entry index incase of VLAN aware Pmapper dev */
+ 	if (dp_gsw_copy_ctp_cfg(inst, bp, NULL,	portid)) {
+-		pr_err("%s: gsw_ctp_cfg copy bp=%d failed\n",
+-		       __func__, bp);
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "%s: gsw_ctp_cfg copy bp=%d not required\n",
++			 __func__, bp);
+ 		return DP_SUCCESS;
+ 	}
+ 
+@@ -2277,10 +2278,8 @@ static int subif_bp_cfg(int inst, struct subif_platform_data *data,
+ 	}
+ 
+ 	/* Register */
+-	if (data->subif_data->ctp_dev) {
++	if (data->subif_data->ctp_dev)
+ 		bp = bp_pmapper_get(inst, data->dev);
+-		subif_pmapper_cfg(inst, data, bp, portid, subif_idx, flags);
+-	}
+ 
+ 	if (bp < 0) {
+ 		sif->mac_learn_dis = data->subif_data->mac_learn_disable;
+@@ -2295,7 +2294,11 @@ static int subif_bp_cfg(int inst, struct subif_platform_data *data,
+ 			return DP_FAILURE;
+ 		}
+ 	}
++
+ 	sif->bp = bp;
++	if (data->subif_data->ctp_dev)
++		subif_pmapper_cfg(inst, data, bp, portid, subif_idx, flags);
++
+ 	if (bp_cfg)
+ 		set_ctp_bp(inst, vap, portid, bp, data);
+ 

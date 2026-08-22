@@ -1,0 +1,556 @@
+From 2bca3e316f214f682d14819e18c003dfe021ff1b Mon Sep 17 00:00:00 2001
+From: Lishan Liu <lishan.liu@intel.com>
+Date: Thu, 25 Jun 2020 09:59:59 +0800
+Subject: [PATCH] DRVLIB_SW-3688: CQM drv support two radio dp port
+
+to enable please add below entry to DTS to indicate
+Number of radio dev: intel,radio-32-vap
+example: intel,radio-32-vap = <1>;
+---
+ drivers/net/ethernet/lantiq/cqm/cqm_dev.c    |   5 +
+ drivers/net/ethernet/lantiq/cqm/cqm_dev.h    |   1 +
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c | 316 +++++++++++++++++++--------
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.h |   2 +
+ include/net/lantiq_cbm_api.h                 |   2 +
+ 5 files changed, 236 insertions(+), 90 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_dev.c b/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
+index 0ae399f73083..83332d6cc0e1 100755
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
+@@ -86,6 +86,11 @@ struct device_node *parse_dts(int j, void **pdata, struct resource **res,
+ 		pr_err("No syscon phandle specified for wan mux\n");
+ 		cqm_pdata->syscfg = NULL;
+ 	}
++
++	of_property_read_u32(node, "intel,radio-32-vap",
++			     &cqm_pdata->radio_dev_num);
++	pr_debug("num of radio dev : %d\n", cqm_pdata->radio_dev_num);
++
+ 	cqm_pdata->force_xpcs = of_property_read_bool(node, "intel,force-xpcs");
+ 	of_property_for_each_u32(node, "intel,bm-buff-num", prop, p, buf_num) {
+ 		cqm_pdata->pool_ptrs[cqm_pdata->num_pools++] = buf_num;
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_dev.h b/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
+index 4ed8f34fcd1c..53934955d441 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
+@@ -51,6 +51,7 @@ struct cqm_data {
+ 	int gint_mode;
+ 	int highprio_lan;
+ 	int re_insertion;
++	int radio_dev_num;
+ };
+ 
+ void cqm_rst(struct cqm_data *lpp);
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index 5163ccfd43e9..1d2f73ba4bc6 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -258,9 +258,11 @@ static u32 get_matching_pmac(u32 *ep, u32 flags, u32 *cbm_port, int pmac,
+ 						cbm_port[j] =
+ 						epg_lookup_table[i].epg;
+ 						if (cbm_port[j] ==
+-							DMA_PORT_FOR_FLUSH) {
+-							dev_err(cqm_ctrl->dev, "DMA port %d in use pmac %d\n",
+-								cbm_port[j], pmac);
++						    DMA_PORT_FOR_FLUSH) {
++							dev_err(cqm_ctrl->dev,
++								"DMA port %d in use pmac %d\n",
++								cbm_port[j],
++								pmac);
+ 						}
+ 						j++;
+ 					}
+@@ -2126,7 +2128,7 @@ static s32 cqm_dp_port_dealloc(struct module *owner, u32 dev_port,
+ {
+ 	u32 num, cpu =  smp_processor_id();
+ 	struct cqm_res_t *res = NULL;
+-	int port, idx;
++	int port, idx, shared_p;
+ 	struct cqm_dqm_port_info *p_info;
+ 	void *buf;
+ 
+@@ -2136,9 +2138,31 @@ static s32 cqm_dp_port_dealloc(struct module *owner, u32 dev_port,
+ 			"Error getting resources for port_id %d\n", port_id);
+ 		return CBM_FAILURE;
+ 	}
++	if (port_id >= PMAC_MAX_NUM || port_id < 0)
++		return DP_FAILURE;
++
++	dev_dbg(cqm_ctrl->dev,
++		"cqm_delete_from_list port_id:%d, flags:0x%x\n",
++		port_id, flags);
++	cqm_delete_from_list(port_id, flags);
++
+ /*First Subif*/
+ 	port = res[0].cqm_deq_port;
+ 	p_info = &dqm_port_info[port];
++	if (p_info->ref_cnt != 0)
++		return DP_SUCCESS;
++
++	if (flags & DP_F_SHARE_RES) {
++		shared_p = port_id ^ 1;
++		if (is_dp_allocated(shared_p, flags)) {
++			dev_dbg(cqm_ctrl->dev,
++				"shared port_id %d exists\n",
++				shared_p);
++			return DP_SUCCESS;
++		}
++	}
++	dev_dbg(cqm_ctrl->dev, "%s free deq port = %d\n",
++		__func__, port);
+ 
+ 	/* Free ACA port */
+ 	if ((flags & FLAG_ACA) && (p_info->deq_info.pkt_base)) {
+@@ -2167,9 +2191,6 @@ static s32 cqm_dp_port_dealloc(struct module *owner, u32 dev_port,
+ 	}
+ 	devm_kfree(cqm_ctrl->dev, res);
+ 
+-	if (port_id >= PMAC_MAX_NUM || port_id < 0)
+-		return DP_FAILURE;
+-	cqm_delete_from_list(port_id, flags);
+ 	return DP_SUCCESS;
+ }
+ 
+@@ -2177,20 +2198,32 @@ static s32
+ dp_port_alloc(struct module *owner, struct net_device *dev, u32 dev_port,
+ 	      s32 port_id, struct cbm_dp_alloc_data *data, u32 flags)
+ {
+-	u32 port_start;
+-	u32 port_end;
++	u32 port_start, port_resv_st = 0;
++	u32 port_end, port_resv_end = 0;
+ 	int i, result, cnt;
+ 	int param_pmac = 0, pmac_present = 0, pmac_found = 0;
+ 	u32 cbm_port[PRX300_MAX_PORT_PER_EP],
+ 	pmac[PRX300_MAX_PORT_PER_EP];
+ 	struct cqm_pmac_port_map local_entry = {0};
+ 	struct cqm_pmac_port_map *dp_local_entry = NULL;
++	u32 ch_dp_port, ch_num;
++	struct cqm_res_t *res = NULL;
++	u32 shared_port = 0;
++	u32 shared_port_exist = 0;
+ 
+ 	data->flags = 0;
+ 	if (!owner)
+ 		return CBM_FAILURE;
+ 	dev_dbg(cqm_ctrl->dev, "flags 0x%x\n", flags);
+ 	/*to allocate port*/
++
++	if (cqm_ctrl->radio_num) {
++		port_resv_st = PMAC_ALLOC_START_ID % 2 + PMAC_ALLOC_START_ID;
++		port_resv_end = port_resv_st + 2 * cqm_ctrl->radio_num - 1;
++		if (port_resv_end > PMAC_ALLOC_END_ID)
++			return DP_FAILURE;
++	}
++
+ 	if (flags & FLAG_LAN) {
+ 		port_start = PMAC_ETH_LAN_START_ID;
+ 		port_end = PMAC_ETH_LAN_END_ID;
+@@ -2207,6 +2240,11 @@ dp_port_alloc(struct module *owner, struct net_device *dev, u32 dev_port,
+ 	} else {
+ 		port_start = PMAC_ALLOC_START_ID;
+ 		port_end = PMAC_ALLOC_END_ID;
++
++		if (flags & DP_F_SHARE_RES) {
++			port_start = port_resv_st;
++			port_end = port_resv_end;
++		}
+ 	}
+ 	/*alloc port */
+ 	if (port_id) {	/*allocate with specified port id */
+@@ -2217,30 +2255,74 @@ dp_port_alloc(struct module *owner, struct net_device *dev, u32 dev_port,
+ 			return DP_FAILURE;
+ 		}
+ 
++		if ((cqm_ctrl->radio_num) && !(flags & DP_F_SHARE_RES) &&
++		    (port_id > port_resv_st) &&
++		    (port_id < port_resv_end)) {
++			dev_err(cqm_ctrl->dev,
++				"pord_id %i is reserved [%i..%i]\n", port_id,
++				port_resv_st, port_resv_end);
++			return DP_FAILURE;
++		}
++
+ 		if (is_dp_allocated(port_id, flags)) {
+ 			dev_err(cqm_ctrl->dev,
+ 				"already llocated pmac port %d\n", port_id);
+ 			return DP_FAILURE; /*not free*/
+ 		}
++
++		if ((flags & DP_F_SHARE_RES) && (cqm_ctrl->radio_num)) {
++			shared_port = port_id ^ 1;
++			if (is_dp_allocated(shared_port, flags))
++				shared_port_exist = 1;
++			else
++				shared_port_exist = 0;
++		}
+ 		param_pmac = port_id;
+ 		pmac_present = 1;
+ 		goto ALLOC_OK;
+ 	} else { /* dynamic alloc a free port */
+ 		for (i = port_start; i <= port_end; i++) {
++			if ((cqm_ctrl->radio_num) &&
++			    !(flags & DP_F_SHARE_RES) &&
++			    (i >= port_resv_st) && (i <= port_resv_end)) {
++				i = port_resv_end;
++				continue;
++			}
+ 			dp_local_entry = is_dp_allocated(i, flags);
+ 			if (!dp_local_entry) {
+ 				port_id = i;
++				if (flags & DP_F_SHARE_RES) {
++					shared_port = port_id ^ 1;
++					dp_local_entry =
++						is_dp_allocated(shared_port,
++								flags);
++					if (dp_local_entry) {
++						i++;
++						continue;
++					}
++				}
+ 				goto ALLOC_OK;
+ 			}
++			/*to get next even port id for SHARE_RES*/
++			if (flags & DP_F_SHARE_RES)
++				i++;
+ 		}
+ 	}
+ 	dev_err(cqm_ctrl->dev,
+ 		"Failed to get a free port for module %p\n", owner);
+ 	return DP_FAILURE;
+ ALLOC_OK:
+-	result = get_matching_pmac(pmac, flags, cbm_port, param_pmac,
+-				   pmac_present);
+-	if (result == CBM_NOTFOUND) {
++	if (!shared_port_exist) {
++		result = get_matching_pmac(pmac, flags, cbm_port, param_pmac,
++					   pmac_present);
++	} else {
++		pmac[0] = CBM_PMAC_DYNAMIC;
++		result = CBM_SUCCESS;
++	}
++	if (result == CBM_FAILURE) {
++		dev_err(cqm_ctrl->dev, "get_matching pmac error\n");
++		return DP_FAILURE;
++	} else if (result == CBM_NOTFOUND) {
+ 		/*Physical port allocation failure,
+ 		 *means this is just virtual pmac required
+ 		 */
+@@ -2256,17 +2338,38 @@ dp_port_alloc(struct module *owner, struct net_device *dev, u32 dev_port,
+ 		local_entry.dev = dev;
+ 		local_entry.dev_port = dev_port;
+ 		local_entry.flags = P_ALLOCATED;
+-		for (i = 0; i < PRX300_MAX_PORT_PER_EP; i++) {
+-			if (pmac[i] == CBM_PORT_INVALID)
+-				continue;
+-			cnt = i;
+-			do_port_setting(pmac, flags, cbm_port, &local_entry,
+-					&pmac_found, &cnt);
+-			if (cnt == CBM_FAILURE)
+-				break;
++
++		if (!shared_port_exist) {
++			for (i = 0; i < PRX300_MAX_PORT_PER_EP; i++) {
++				if (pmac[i] == CBM_PORT_INVALID)
++					continue;
++				cnt = i;
++				do_port_setting(pmac, flags, cbm_port,
++						&local_entry,
++						&pmac_found, &cnt);
++				if (cnt == CBM_FAILURE)
++					break;
++			}
++			if (!pmac_found)
++				return DP_FAILURE;
+ 		}
+-		if (!pmac_found)
+-			return DP_FAILURE;
++	}
++
++	if (shared_port_exist) {
++			/*get cbm_port[0] accordingly*/
++		ch_dp_port = port_id ^ 1;
++		local_entry.egp_type = flags;
++		result = dp_port_resources_get(&ch_dp_port, &ch_num,
++					       &res, flags);
++
++		if (result == CBM_FAILURE)
++			return CBM_FAILURE;
++
++		cbm_port[0] = res[0].cqm_deq_port;
++		devm_kfree(cqm_ctrl->dev, res);
++		cqm_populate_entry(&local_entry,
++				   &ch_dp_port, cbm_port[0],
++				   flags, &pmac_found);
+ 	}
+ 	cqm_add_to_list(&local_entry);
+ 	fill_dp_alloc_data(data, port_id, cbm_port[0], flags);
+@@ -2294,7 +2397,6 @@ static void fill_tx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 		dp_data->tx_ring[ring_idx].in_deq_vaddr	=
+ 			(deq_v + (dp_data->deq_port * (DESC0_0_CPU_EGP_1 -
+ 			 DESC0_0_CPU_EGP_0)));
+-
+ 		dp_data->tx_ring[ring_idx].out_free_paddr =
+ 			(free + (dp_data->deq_port * (PTR_RTN_CPU_DW2_EGP_1 -
+ 			 PTR_RTN_CPU_DW2_EGP_0)));
+@@ -2335,6 +2437,9 @@ static int fill_rx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 	p_info = &dqm_port_info[dp_data->deq_port];
+ 
+ 	for (ring_idx = 0; ring_idx < dp_data->num_rx_ring; ring_idx++) {
++		tbl_size = dp_data->rx_ring[ring_idx].prefill_pkt_num
++			 * sizeof(u32);
++		dma_size = tbl_size * 2;
+ 		/* rx_pkt_size fixed to 2048 */
+ 		if (dp_data->rx_ring[ring_idx].rx_pkt_size != CQM_KB(2)) {
+ 			dev_err(cqm_ctrl->dev, "%s rx_pkt_size %u\n",
+@@ -2351,89 +2456,108 @@ static int fill_rx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 			break;
+ 		}
+ 
+-		if (p_info->dma_dt_init_type != DEQ_DMA_CHNL) {
+-			dev_err(cqm_ctrl->dev, "%s Inv DMA type %u dqport %u\n",
+-				__func__, p_info->dma_dt_init_type,
+-				dp_data->deq_port);
+-			break;
+-		}
+-
+-		if (ltq_request_dma(p_info->dma_ch, p_info->dma_chan_str)) {
+-			dev_err(cqm_ctrl->dev, "%s: dma open failed\r\n",
+-				__func__);
+-			break;
+-		}
+-
+-		if (ltq_dma_chan_desc_alloc(
+-			p_info->dma_ch,
+-			dp_data->rx_ring[ring_idx].out_enq_ring_size)) {
+-			ltq_free_dma(p_info->dma_ch);
+-			dev_err(cqm_ctrl->dev, "%s: dma alloc failed\r\n",
+-				__func__);
+-			break;
+-		}
+-		ltq_dma_chan_polling_cfg(p_info->dma_ch, 10, 10);
+-		p_info->dma_ch_in_use = true;
+-		dp_data->rx_ring[ring_idx].out_dma_ch_to_gswip = p_info->dma_ch;
+-		dp_data->rx_ring[ring_idx].num_out_tx_dma_ch =
+-							dp_data->num_rx_ring;
+-		dp_data->rx_ring[ring_idx].out_enq_paddr =
+-			(void *)ltq_dma_chan_get_desc_phys_base(p_info->dma_ch);
+-		dp_data->rx_ring[ring_idx].out_enq_vaddr =
+-			(void *)ltq_dma_chan_get_desc_vir_base(p_info->dma_ch);
++		if (!p_info->dma_ch_in_use) {
++			if (p_info->dma_dt_init_type != DEQ_DMA_CHNL) {
++				dev_err(cqm_ctrl->dev, "%s Inv DMA type %u dqport %u\n",
++					__func__, p_info->dma_dt_init_type,
++					dp_data->deq_port);
++				break;
++			}
+ 
+-		tbl_size = dp_data->rx_ring[ring_idx].prefill_pkt_num
+-				* sizeof(u32);
+-		dma_size = tbl_size * 2;
+-		dma_vaddr = dmam_alloc_coherent(cqm_ctrl->dev, dma_size,
+-						&dma_paddr, GFP_DMA);
+-		if (!dma_vaddr) {
+-			dev_err(cqm_ctrl->dev,
+-				"%s: dmam_alloc_coherent failed\n", __func__);
+-			ltq_free_dma(p_info->dma_ch);
+-			break;
+-		}
+-		p_info->deq_info.pkt_base_paddr = (void *)dma_paddr;
+-		p_info->deq_info.pkt_base = dma_vaddr;
+-		p_info->deq_info.dma_size = dma_size;
+-		dp_data->rx_ring[ring_idx].pkt_base_paddr = (void *)dma_paddr;
+-		dp_data->rx_ring[ring_idx].pkt_base_vaddr = dma_vaddr;
+-		vbase = dma_vaddr + tbl_size;
+-		dp_data->rx_ring[ring_idx].pkt_list_vaddr = vbase;
+-
+-		/* BM Buffer */
+-		for (idx = 0; idx < dp_data->rx_ring[ring_idx].prefill_pkt_num;
+-			idx++) {
+-			/* depends on the dc port policy right now
+-			 * its fixed to policy 0
+-			 */
+-			buf = (u32)cqm_buff_alloc_by_policy_prx300(cpu, 0, 0);
+-			if (!buf) {
+-				dev_err(cqm_ctrl->dev, "%s: BM alloc failed\n",
++			if (ltq_request_dma(p_info->dma_ch,
++					    p_info->dma_chan_str)) {
++				dev_err(cqm_ctrl->dev, "%s: dma open failed\r\n",
+ 					__func__);
++				break;
++			}
+ 
+-				while (--idx >= 0) {
+-					buf = p_info->deq_info.pkt_base[idx];
+-					cqm_buffer_free(cpu, (void *)buf, 1);
+-				}
+-				dmam_free_coherent(cqm_ctrl->dev, dma_size,
+-						   dma_vaddr, dma_paddr);
++			if (ltq_dma_chan_desc_alloc(
++				p_info->dma_ch,
++				dp_data->rx_ring[ring_idx].out_enq_ring_size)) {
+ 				ltq_free_dma(p_info->dma_ch);
+-				return CBM_FAILURE;
++				dev_err(cqm_ctrl->dev, "%s: dma alloc failed\r\n",
++					__func__);
++				break;
++			}
++			ltq_dma_chan_polling_cfg(p_info->dma_ch, 10, 10);
++
++			p_info->deq_info.desc_phy_base =
++				(void *)ltq_dma_chan_get_desc_phys_base(p_info->
++									dma_ch);
++			p_info->deq_info.desc_vir_base =
++				(void *)ltq_dma_chan_get_desc_vir_base(p_info->
++								       dma_ch);
++			dma_vaddr = dmam_alloc_coherent(cqm_ctrl->dev, dma_size,
++							&dma_paddr, GFP_DMA);
++			if (!dma_vaddr) {
++				dev_err(cqm_ctrl->dev,
++					"%s: dmam_alloc_coherent failed\n",
++					__func__);
++				ltq_free_dma(p_info->dma_ch);
++				break;
+ 			}
++			p_info->deq_info.pkt_base_paddr = (void *)dma_paddr;
++			p_info->deq_info.pkt_base = dma_vaddr;
++			p_info->deq_info.dma_size = dma_size;
++
++			for (idx = 0; idx <
++			     dp_data->rx_ring[ring_idx].prefill_pkt_num;
++			     idx++) {
++				/* depends on the dc port policy right now
++				 * its fixed to policy 0
++				 */
++				buf = (u32)cqm_buff_alloc_by_policy_prx300(cpu,
++									   0,
++									   0);
++				if (!buf) {
++					dev_err(cqm_ctrl->dev, "%s: BM alloc failed\n",
++						__func__);
++
++					while (--idx >= 0) {
++						buf = p_info->
++							deq_info.pkt_base[idx];
++						cqm_buffer_free(cpu,
++								(void *)buf,
++								1);
++					}
++					dmam_free_coherent(cqm_ctrl->dev,
++							   dma_size,
++							   dma_vaddr,
++							   dma_paddr);
++					ltq_free_dma(p_info->dma_ch);
++					return CBM_FAILURE;
++				}
+ 			p_info->deq_info.pkt_base[idx] =
+ 					__pa(buf - CQM_POOL_METADATA);
++			vbase = p_info->deq_info.pkt_base + tbl_size;
+ 			vbase[idx] = buf - CQM_POOL_METADATA;
++			dev_info(cqm_ctrl->dev, "%s: p_info->deq_info.pkt_base[%d] = %x\n",
++				 __func__, idx, p_info->deq_info.pkt_base[idx]);
++			}
+ 		}
+ 
++		dp_data->rx_ring[ring_idx].out_dma_ch_to_gswip =
++			p_info->dma_ch;
++		dp_data->rx_ring[ring_idx].num_out_tx_dma_ch =
++			dp_data->num_rx_ring;
++		dp_data->rx_ring[ring_idx].out_enq_paddr =
++			p_info->deq_info.desc_phy_base;
++		dp_data->rx_ring[ring_idx].out_enq_vaddr =
++			p_info->deq_info.desc_vir_base;
++		dp_data->rx_ring[ring_idx].pkt_base_paddr =
++			p_info->deq_info.pkt_base_paddr;
++		dp_data->rx_ring[ring_idx].pkt_base_vaddr =
++			p_info->deq_info.pkt_base;
++		dp_data->rx_ring[ring_idx].pkt_list_vaddr =
++			p_info->deq_info.pkt_base + tbl_size;
+ 		dp_data->rx_ring[ring_idx].num_pkt =
+ 				dp_data->rx_ring[ring_idx].prefill_pkt_num;
+ 		p_info->deq_info.prefill_pkt_num =
+ 				dp_data->rx_ring[ring_idx].prefill_pkt_num;
+-
+ 		/* Need to be disccused and modified later base on policy */
+ 		dp_data->rx_ring[ring_idx].rx_policy_base = 0;
+ 
++		p_info->dma_ch_in_use = true;
+ 		ret = CBM_SUCCESS;
+ 	}
+ 
+@@ -2455,7 +2579,6 @@ static s32 dp_port_alloc_complete(struct module *owner, struct net_device *dev,
+ 	if (flags & FLAG_ACA) {
+ 		if (fill_rx_ring_data(data) != CBM_SUCCESS)
+ 			return CBM_FAILURE;
+-
+ 		fill_tx_ring_data(data);
+ 	} else if (flags & DP_F_EPON) {
+ 		reg = (EPON_EPON_MODE_REG_EPONCHKEN_MASK |
+@@ -2535,6 +2658,7 @@ static s32 dp_enable(struct module *owner, u32 port_id,
+ 
+ 	static bool set_bsl;
+ 	void *deq = cqm_ctrl->deq;
++	struct cqm_dqm_port_info *dqp_info;
+ 
+ 	port = data->deq_port;
+ 	if (port == -1) {
+@@ -2542,6 +2666,16 @@ static s32 dp_enable(struct module *owner, u32 port_id,
+ 		return CBM_FAILURE;
+ 	}
+ 
++	dqp_info = &dqm_port_info[data->deq_port];
++	if (flags & CBM_PORT_F_DISABLE) {
++		dqp_info->ref_cnt--;
++		if (dqp_info->ref_cnt)
++			return CBM_SUCCESS;
++	} else {
++		dqp_info->ref_cnt++;
++		if (dqp_info->ref_cnt > 1)
++			return CBM_SUCCESS;
++	}
+ 	if (data->dma_chnl_init) {
+ 		for (i = 0; i < data->num_dma_chan; i++)
+ 			handle_dma_chnl_init((port + i), flags);
+@@ -4470,6 +4604,8 @@ static int cqm_prx300_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	cqm_ctrl->radio_num = pdata->radio_dev_num;
++
+ 	cqm_ctrl->re_insertion = pdata->re_insertion;
+ 	if (cqm_ctrl->re_insertion > 0)
+ 		cqm_enable_re_insertion_port(cqm_ctrl->re_insertion);
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+index d4b204231c7a..f827e6ff14fe 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+@@ -521,6 +521,7 @@ struct cqm_dqm_port_info {
+ 	char dma_chan_str[DMA_CH_STR_LEN];
+ 	u32 cpu_port_type;
+ 	u32 valid;
++	s32 ref_cnt;
+ };
+ 
+ struct cqm_eqm_port_info {
+@@ -627,6 +628,7 @@ struct cqm_ctrl {
+ 	u32 prx300_pool_size[CQM_PRX300_NUM_BM_POOLS];
+ 	int gint_mode;
+ 	int re_insertion;
++	u32 radio_num;
+ };
+ 
+ struct cqm_buf_dbg_cnt {
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index 50bdc546f14d..4b9fdacfd085 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -246,6 +246,8 @@ typedef struct cbm_dq_info {
+ 	void *pkt_base_paddr;	/* packet list base DMA physical address */
+ 	size_t dma_size;	/* size of allocated DMA memory */
+ 	int prefill_pkt_num; /* number of pre-fill packet buffer requested */
++	void *desc_phy_base;
++	void *desc_vir_base;
+ } cbm_dq_info_t;
+ 
+ /**

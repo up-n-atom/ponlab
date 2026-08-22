@@ -1,0 +1,241 @@
+From cb839aebd5aea5dc5b06ee63527ba6ab0c382940 Mon Sep 17 00:00:00 2001
+From: Elad Fernandes <elad.fernandes@intel.com>
+Date: Sun, 25 Oct 2020 12:58:19 +0200
+Subject: [PATCH] LMTSYS-4178: Adding Classifier WA for unblocking the session
+ command for LGM PPv4 B-step
+
+---
+ drivers/net/ppv4/pp-hal/classifier/classifier.c    | 49 +++++++++++++---------
+ .../ppv4/pp-hal/classifier/classifier_debugfs.c    | 35 +++++++++++++++-
+ .../ppv4/pp-hal/classifier/classifier_internal.h   | 13 ++++++
+ .../net/ppv4/pp-hal/receive-packet-buffer/rpb.c    | 11 +++++
+ .../net/ppv4/pp-hal/receive-packet-buffer/rpb.h    |  8 +++-
+ 5 files changed, 94 insertions(+), 22 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.c b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+index f5c0dd54d53b..fd1b3c9445e1 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+@@ -16,6 +16,7 @@
+ #include "classifier.h"
+ #include "classifier_internal.h"
+ #include "infra.h"
++#include "rpb.h"
+ /* For A-step only*/
+ #include "uc.h"
+ #include "uc_common.h"
+@@ -731,27 +732,39 @@ s32 cls_session_add(void *si, struct pp_hash *hash)
+ 	return db->cls_cmd_status;
+ }
+ 
+-static inline bool __cls_is_cmd_fifo_ready(void)
++void cls_n_retries_set(u32 n)
+ {
+-	/* Check num of free words on FIFO */
+-	if (pp_reg_poll(PP_CLS_CMD_STATUS_REG,
+-			PP_CLS_CMD_STATUS_FW_REMAIN_WORD_MSK,
+-			PP_CLS_CMD_STATUS_FW_REMAIN_WORD_RST)) {
+-		pr_err("Failed polling on classifier FIFO status\n");
+-		return false;
+-	}
++	db->num_retries = n;
++}
++
++void cls_n_retries_get(u32 *n)
++{
++	if (unlikely(ptr_is_null(n)))
++		return;
++
++	*n = db->num_retries;
++}
+ 
+-	return true;
++static inline s32 __cls_cmd_status_poll(void)
++{
++	return pp_reg_poll_x(PP_CLS_CMD_STATUS_REG, PP_CLS_CMD_STATUS_MSK, 0,
++			     db->num_retries);
+ }
+ 
+ static inline bool __cls_cmd_is_done(void)
+ {
+-	if (pp_reg_poll(PP_CLS_CMD_STATUS_REG, PP_CLS_CMD_STATUS_MSK, 0)) {
+-		pr_err("Failed polling on classifier command status\n");
+-		return false;
+-	}
++	if (!__cls_cmd_status_poll())
++		return true;
+ 
+-	return true;
++	/* polling failed, stop the RPB egress and try again */
++	rpb_rcu_egress_set(false);
++	if (!__cls_cmd_status_poll()) {
++		rpb_rcu_egress_set(true);
++		return true;
++	}
++	rpb_rcu_egress_set(true);
++	pr_err("Failed polling on classifier command status\n");
++	return false;
+ }
+ 
+ /**
+@@ -816,11 +829,6 @@ static inline s32 __cls_cmd_execute(struct uc_cls_cmd *cmd)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (unlikely(!__cls_is_cmd_fifo_ready())) {
+-		db->cls_cmd_status = -ENOMEM;
+-		return -EINVAL;
+-	}
+-
+ 	pr_debug("CLS CMD done successfully\n");
+ 
+ 	return 0;
+@@ -1333,6 +1341,9 @@ s32 cls_init(struct pp_cls_init_param *init_param)
+ 	db->num_sessions = init_param->num_sessions;
+ 	db->num_lu_threads = init_param->num_lu_threads;
+ 
++	/* set default polling retries */
++	db->num_retries = PP_REG_DFLT_RETRIES;
++
+ 	/* Allocate ddr */
+ 	ret = __cls_ddr_allocate();
+ 	if (unlikely(ret)) {
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c b/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c
+index 9bfc1775d99d..8c6e23e4622b 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c
+@@ -3,7 +3,7 @@
+  * Description: Packet Processor Classifier Debug FS Interface
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #include <linux/kernel.h>
+ #include <linux/init.h>
+@@ -771,6 +771,36 @@ static int cls_dbg_ver_get(void *data, u64 *val)
+ 
+ PP_DEFINE_DBGFS_ATT(cls_dbg_ver_show, cls_dbg_ver_get, NULL);
+ 
++/**
++ * @brief Set the classifier polling num retries
++ * @param data unused
++ * @param val value to set
++ * @return 0 on success
++ */
++static int cls_dbg_n_retries_set(void *data, u64 val)
++{
++	cls_n_retries_set(val);
++	return 0;
++}
++
++/**
++ * @brief Get the classifier polling num retries
++ * @param data unused
++ * @param val value to set
++ * @return 0 on success
++ */
++static int cls_dbg_n_retries_get(void *data, u64 *val)
++{
++	u32 n = 0;
++
++	cls_n_retries_get(&n);
++	*val = (u64)n;
++	return 0;
++}
++
++PP_DEFINE_DBGFS_ATT(cls_dbg_n_retries, cls_dbg_n_retries_get,
++		    cls_dbg_n_retries_set);
++
+ /**
+  * @brief Set the signature cache mode
+  * @param data pointer to the date to set
+@@ -1580,7 +1610,8 @@ PP_DEFINE_DEBUGFS(stw_show, __cls_stw_show, NULL);
+ 
+ static struct debugfs_file cls_root_files[] = {
+ 	{ "version", &PP_DEBUGFS_FOPS(cls_dbg_ver_show) },
+-	{ "stw_show", &PP_DEBUGFS_FOPS(stw_show) }
++	{ "stw_show", &PP_DEBUGFS_FOPS(stw_show) },
++	{ "poll_n_retries", &PP_DEBUGFS_FOPS(cls_dbg_n_retries) },
+ };
+ 
+ static struct debugfs_file session_dbg_files[] = {
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier_internal.h b/drivers/net/ppv4/pp-hal/classifier/classifier_internal.h
+index 4414c62170f6..535dd117465a 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier_internal.h
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier_internal.h
+@@ -344,6 +344,7 @@ struct cls_database {
+ 	void         *ht2_base_virt;
+ 	dma_addr_t   ht2_base_phys;
+ 	size_t       ht2_sz;
++	u32          num_retries;
+ };
+ 
+ enum cls_sig_cache {
+@@ -352,6 +353,18 @@ enum cls_sig_cache {
+ 	CLS_SIG_CACHE_CNT
+ };
+ 
++/**
++ * @brief Set the polling num retries
++ * @param n number of polling retries
++ */
++void cls_n_retries_set(u32 n);
++
++/**
++ * @brief Get the polling num retries
++ * @param n number of polling retries
++ */
++void cls_n_retries_get(u32 *n);
++
+ /**
+  * @brief Set the hash tables size
+  * @param size number of element in each hash table
+diff --git a/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.c b/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.c
+index 4e8ead63e4f9..335012d30f95 100644
+--- a/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.c
++++ b/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.c
+@@ -1094,6 +1094,17 @@ s32 rpb_pp_port_unmap(u16 rpb)
+ 	return -EINVAL;
+ }
+ 
++void rpb_rcu_egress_set(bool enable)
++{
++	u32 reg, val = enable ? 0 : 1;
++
++	__rpb_lock();
++	reg = PP_REG_RD32(PP_RPB_DBG_FEAT_REG);
++	reg = PP_FIELD_MOD(PP_RPB_DBG_FEAT_DIS_RCU_EGR_MSK, val, reg);
++	PP_REG_WR32(PP_RPB_DBG_FEAT_REG, reg);
++	__rpb_unlock();
++}
++
+ /**
+  * @brief Initial default RPB profile <br>
+  *        Port 0: for streaming ports with flow control enabled, get
+diff --git a/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.h b/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.h
+index 62ca52374a06..89b1c9787ad9 100644
+--- a/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.h
++++ b/drivers/net/ppv4/pp-hal/receive-packet-buffer/rpb.h
+@@ -3,7 +3,7 @@
+  * Description: PP receive packet buffer h file
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #ifndef __RPB_H__
+@@ -365,6 +365,12 @@ s32 rpb_pp_port_map(bool is_mem, bool flow_ctrl, u16 *rpb);
+  */
+ s32 rpb_pp_port_unmap(u16 rpb);
+ 
++/**
++ * @brief Set the RPB RCU egress
++ * @param enable true to enable, false to disable
++ */
++void rpb_rcu_egress_set(bool enable);
++
+ /**
+  * @brief RPB init function
+  * @param cfg rpb init parameters

@@ -1,0 +1,2080 @@
+From 60a25ad829defea31e7546c95f08f079623f9622 Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:00 +0800
+Subject: [PATCH] Add support for cadence qspi driver
+
+---
+ drivers/spi/spi-cadence-qspi-apb.c | 1163 ++++++++++++++++++++++++++++++++++++
+ drivers/spi/spi-cadence-qspi-apb.h |  203 +++++++
+ drivers/spi/spi-cadence-qspi.c     |  571 ++++++++++++++++++
+ drivers/spi/spi-cadence-qspi.h     |  107 ++++
+ 4 files changed, 2044 insertions(+)
+
+diff --git a/drivers/spi/spi-cadence-qspi-apb.c b/drivers/spi/spi-cadence-qspi-apb.c
+new file mode 100644
+index 000000000000..367dfbf3ec15
+--- /dev/null
++++ b/drivers/spi/spi-cadence-qspi-apb.c
+@@ -0,0 +1,1163 @@
++/*
++ * Driver for Cadence QSPI Controller
++ *
++ * Copyright (C) 2012 Altera Corporation
++ * Copyright (C) 2018 Intel Corporation
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ */
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/io.h>
++#include <linux/spi/spi.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include "spi-cadence-qspi.h"
++#include "spi-cadence-qspi-apb.h"
++
++/* 1-beat single, 4-byte width = 4-byte single = 2**2 */
++#define CQSPI_NUMSGLREQBYTES (2)
++/* 16-beat burst, 4-byte width = 64-byte bursts = 2**6 */
++#define CQSPI_NUMBURSTREQBYTES (6)
++
++unsigned int start_print = 0;
++
++#define debug_print(fmt, ...)	\
++do {	\
++	if (start_print)	\
++		printk(fmt, ##__VA_ARGS__);	\
++} while(0)
++
++void SwapBytes(void *pv, unsigned int n)
++{
++	unsigned char *p = pv;
++	unsigned int lo, hi;
++
++	for(lo=0, hi=n-1; hi>lo; lo++, hi--) {
++		unsigned char tmp = p[lo];
++		p[lo] = p[hi];
++		p[hi] = tmp;
++	}
++}
++static unsigned int cadence_qspi_apb_cmd2addr(const unsigned char *addr_buf,
++	unsigned int addr_width)
++{
++	unsigned int addr = 0;
++	int i;
++
++	debug_print("[%s] addr_buf[0]=0x%x addr_buf[1]=0x%x addr_buf[2]=0x%x "
++		"addr_buf[3]=0x%x addr_width %d\n", __func__,
++		addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3], addr_width);
++	for (i = 0; i < addr_width; i++) {
++		addr = addr << 8;
++		addr |= addr_buf[i];
++	}
++
++	return addr;
++}
++static uint32_t qspi_create_address(const u8 *address, unsigned int cmdlen)
++{
++	uint32_t addr_value = 0;
++
++	addr_value = address[2] << 16 | address[1] << 8 |
++						address[0];
++	if (cmdlen > 3)
++		addr_value |= (address[3] << 24);
++
++	return addr_value;
++}
++
++void disable_qspi_direct_access(void *reg_base)
++{
++	u32 reg;
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	reg &= ~(CQSPI_REG_CONFIG_DIRECT_MASK);
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++
++	return;
++}
++
++void enable_qspi_direct_access(void *reg_base)
++{
++	u32 reg;
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	reg |= CQSPI_REG_CONFIG_DIRECT_MASK;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++
++	return;
++}
++
++
++static void cadence_qspi_apb_read_fifo_data(void *dest,
++			const void *src_ahb_addr, unsigned int bytes,
++			unsigned int flash_type)
++{
++	unsigned int temp, count = 0;
++	int remaining = bytes;
++	unsigned int *dest_ptr = (unsigned int *)dest;
++	unsigned int *src_ptr = (unsigned int *)src_ahb_addr;
++
++	debug_print("[%s]dest=0x%x src_ahb_addr=0x%x bytes=0x%x\n",
++		__func__, dest, src_ahb_addr, bytes);
++	if (bytes == 0)
++		return;
++	while (remaining > 0) {
++		if (flash_type == QSPI_FLASH_TYPE_NOR) {
++			if (remaining >= CQSPI_FIFO_WIDTH) {
++				temp = CQSPI_READL(src_ptr);
++//				SwapBytes(&temp, CQSPI_FIFO_WIDTH);
++				(*(u32 *)(dest_ptr)) = temp;
++//				debug_print("[%s]dest_ptr=0x%x *src_ptr=0x%x\n",
++//					__func__, dest_ptr, temp);
++				remaining -= CQSPI_FIFO_WIDTH;
++			} else {
++				/* dangling bytes */
++				temp = CQSPI_READL(src_ptr);
++//				SwapBytes(&temp, remaining);
++				(*(u32 *)(dest_ptr)) = temp;
++				debug_print("[%s]dest_ptr=0x%x *src_ptr=0x%x\n",
++					__func__, dest_ptr, temp);
++				remaining = 0;
++				break;
++			}
++		} else {
++			if (remaining >= CQSPI_FIFO_WIDTH) {
++				(*(u32 *)(dest_ptr)) = CQSPI_READL(src_ptr);
++				remaining -= CQSPI_FIFO_WIDTH;
++			} else {
++				/* dangling bytes */
++				(*(u32 *)(dest_ptr)) = CQSPI_READL(src_ptr);
++				remaining = 0;
++				break;
++			}
++		}
++		src_ptr++;
++		dest_ptr++;
++	}
++	return;
++}
++static void cadence_qspi_apb_write_fifo_data(void *dest_ahb_addr,
++					const void *src, unsigned int bytes,
++					unsigned int flash_type)
++{
++	unsigned int temp;
++	int remaining = bytes;
++	unsigned int *dest_ptr = (unsigned int *)dest_ahb_addr;
++	unsigned int *src_ptr = (unsigned int *)src;
++
++	debug_print("[%s]dest_ahb_addr=0x%x src=0x%x bytes=0x%x\n",
++		__func__, dest_ahb_addr, src, bytes);
++	debug_print("[%s]*dest_ahb_addr=0x%x *src=0x%x\n",
++		__func__, *(unsigned int *)dest_ahb_addr,
++		*(unsigned int *)src);
++	while (remaining > 0) {
++		if (flash_type == QSPI_FLASH_TYPE_NOR) {
++			if (remaining >= CQSPI_FIFO_WIDTH) {
++				temp = *src_ptr;
++//				SwapBytes(&temp, CQSPI_FIFO_WIDTH);
++				CQSPI_WRITEL(temp, dest_ptr);
++				debug_print("[%s]dest_ptr=0x%x *src_ptr=0x%x\n",
++					__func__, dest_ptr, temp);
++				remaining -= CQSPI_FIFO_WIDTH;
++			} else {
++				/* dangling bytes */
++				memcpy(&temp, src_ptr, remaining);
++//				SwapBytes(&temp, remaining);
++				CQSPI_WRITEL(temp, dest_ptr);
++				debug_print("[%s]dest_ptr=0x%x *src_ptr=0x%x\n",
++					__func__, dest_ptr, temp);
++				break;
++			}
++		} else {
++			if (remaining >= CQSPI_FIFO_WIDTH) {
++				CQSPI_WRITEL(*src_ptr, dest_ptr);
++				remaining -= CQSPI_FIFO_WIDTH;
++			} else {
++				/* dangling bytes */
++				memcpy(&temp, src_ptr, remaining);
++				CQSPI_WRITEL(temp, dest_ptr);
++				break;
++			}
++		}
++		src_ptr++;
++		dest_ptr++;
++	}
++	return;
++}
++/* Return 1 if idle, otherwise return 0 (busy). */
++static unsigned int cadence_qspi_wait_idle(void *reg_base)
++{
++	unsigned int count = 0;
++	unsigned timeout;
++
++	timeout = cadence_qspi_init_timeout(CQSPI_TIMEOUT_MS);
++	while (cadence_qspi_check_timeout(timeout)) {
++		if (CQSPI_REG_IS_IDLE(reg_base)) {
++			/* Read few times in succession to ensure it does
++			not transition low again */
++			count++;
++			if (count >= CQSPI_POLL_IDLE_RETRY)
++				return 1;
++		} else {
++			count = 0;
++		}
++	}
++	/* Timeout, in busy mode. */
++	pr_err("QSPI: QSPI is still busy after %dms timeout.\n",
++		CQSPI_TIMEOUT_MS);
++	return 0;
++}
++static void cadence_qspi_apb_readdata_capture(void *reg_base,
++			unsigned int bypass, unsigned int delay)
++{
++	unsigned int reg;
++
++	debug_print("%s %d %d\n", __func__, bypass, delay);
++	cadence_qspi_apb_controller_disable(reg_base);
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_READCAPTURE);
++	if (bypass)
++		reg |= (1 << CQSPI_REG_READCAPTURE_BYPASS_LSB);
++	else
++		reg &= ~(1 << CQSPI_REG_READCAPTURE_BYPASS_LSB);
++
++	reg &= ~(CQSPI_REG_READCAPTURE_DELAY_MASK
++		<< CQSPI_REG_READCAPTURE_DELAY_LSB);
++
++	reg |= ((delay & CQSPI_REG_READCAPTURE_DELAY_MASK)
++		<< CQSPI_REG_READCAPTURE_DELAY_LSB);
++
++		CQSPI_WRITEL(reg, reg_base + CQSPI_REG_READCAPTURE);
++	cadence_qspi_apb_controller_enable(reg_base);
++	return;
++}
++static void cadence_qspi_apb_config_baudrate_div(void *reg_base,
++		unsigned int ref_clk_hz, unsigned int sclk_hz)
++{
++	unsigned int reg;
++	unsigned int div;
++
++	debug_print("%s %d %d\n", __func__, ref_clk_hz, sclk_hz);
++	cadence_qspi_apb_controller_disable(reg_base);
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	reg &= ~(CQSPI_REG_CONFIG_BAUD_MASK << CQSPI_REG_CONFIG_BAUD_LSB);
++	div = ref_clk_hz / sclk_hz;
++	/* Recalculate the baudrate divisor based on QSPI specification. */
++	if (div > 32)
++		div = 32;
++	/* Check if even number. */
++	if (div & 1)
++		div = (div / 2);
++	else
++		div = (div / 2) - 1;
++	debug_print("QSPI: ref_clk %dHz sclk %dHz div 0x%x\n", ref_clk_hz,
++		sclk_hz, div);
++	div = (div & CQSPI_REG_CONFIG_BAUD_MASK) << CQSPI_REG_CONFIG_BAUD_LSB;
++	reg |= div;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++	cadence_qspi_apb_controller_enable(reg_base);
++	return;
++}
++static void cadence_qspi_apb_chipselect(void *reg_base,
++	unsigned int chip_select, unsigned int decoder_enable)
++{
++	unsigned int reg;
++
++	debug_print("%s\n", __func__);
++	debug_print("QSPI: chipselect %d decode %d\n", chip_select,
++		decoder_enable);
++	cadence_qspi_apb_controller_disable(reg_base);
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	/* docoder */
++	if (decoder_enable)
++		reg |= CQSPI_REG_CONFIG_DECODE_MASK;
++	else {
++		reg &= ~CQSPI_REG_CONFIG_DECODE_MASK;
++		/* Convert CS if without decoder.
++		 * CS0 to 4b'1110
++		 * CS1 to 4b'1101
++		 * CS2 to 4b'1011
++		 * CS3 to 4b'0111
++		 */
++		chip_select = 0xF & ~(1 << chip_select);
++	}
++	reg &= ~(CQSPI_REG_CONFIG_CHIPSELECT_MASK
++			<< CQSPI_REG_CONFIG_CHIPSELECT_LSB);
++	reg |= (chip_select & CQSPI_REG_CONFIG_CHIPSELECT_MASK)
++			<< CQSPI_REG_CONFIG_CHIPSELECT_LSB;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++	cadence_qspi_apb_controller_enable(reg_base);
++	return;
++}
++static int cadence_qspi_apb_exec_flash_cmd(void *reg_base, unsigned int reg)
++{
++	unsigned int timeout;
++
++	debug_print("cadence_qspi_apb_exec_flash_cmd: reg_base 0x%x reg 0x%x\n",
++		reg_base, reg);
++	/* Write the CMDCTRL without start execution. */
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CMDCTRL);
++	/* Start execute */
++	reg |= CQSPI_REG_CMDCTRL_EXECUTE_MASK;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CMDCTRL);
++	debug_print("[%s] CQSPI_REG_CMDCTRL=0x%x\n", __func__, reg);
++	/* Polling for completion. */
++	timeout = cadence_qspi_init_timeout(CQSPI_TIMEOUT_MS);
++	while (cadence_qspi_check_timeout(timeout)) {
++		reg = CQSPI_READL(reg_base + CQSPI_REG_CMDCTRL) &
++			CQSPI_REG_CMDCTRL_INPROGRESS_MASK;
++		if (!reg)
++			break;
++	}
++	if (reg != 0) {
++		pr_err("QSPI: flash cmd execute time out\n");
++		return -EIO;
++	}
++	/* Polling QSPI idle status. */
++	if (!cadence_qspi_wait_idle(reg_base))
++		return -EIO;
++	return 0;
++}
++/* For command RDID, RDSR. */
++static int cadence_qspi_apb_command_read(void *reg_base,
++	unsigned int txlen, const unsigned char *txbuf,
++	unsigned addrlen, unsigned char *addrbuf,
++	unsigned rxlen, unsigned char *rxbuf, unsigned int flash_type)
++{
++	unsigned int reg, i;
++	unsigned int addr_value;
++	int status;
++	unsigned char *tmp;
++
++	debug_print("%s txlen %d txbuf %p rxlen %d rxbuf %p\n",
++		__func__, txlen, txbuf, rxlen, rxbuf);
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi tx: ", DUMP_PREFIX_NONE,
++		32, 1, txbuf, txlen, false);
++#endif
++	if (!rxlen || rxlen > CQSPI_STIG_DATA_LEN_MAX || rxbuf == NULL) {
++		pr_err("QSPI: Invalid input argument, len %d rxbuf 0x%08x\n",
++			rxlen, (unsigned int)rxbuf);
++		return -EINVAL;
++	}
++	reg = txbuf[0] << CQSPI_REG_CMDCTRL_OPCODE_LSB;
++	reg |= (0x1 << CQSPI_REG_CMDCTRL_RD_EN_LSB);
++	if (addrlen) {
++		/* Command with address */
++		reg |= (0x1 << CQSPI_REG_CMDCTRL_ADDR_EN_LSB);
++		/* Number of bytes to write. */
++		reg |= ((addrlen - 1) & CQSPI_REG_CMDCTRL_ADD_BYTES_MASK)
++			<< CQSPI_REG_CMDCTRL_ADD_BYTES_LSB;
++		/* Get address */
++		addr_value = qspi_create_address(&addrbuf[0],
++			addrlen >= 5 ? 4 : 3);
++		CQSPI_WRITEL(addr_value, reg_base + CQSPI_REG_CMDADDRESS);
++		debug_print("[%s] CQSPI_REG_CMDADDRESS=0x%x\n", __func__, addr_value);
++	}
++	/* 0 means 1 byte. */
++	reg |= (((rxlen - 1) & CQSPI_REG_CMDCTRL_RD_BYTES_MASK)
++		<< CQSPI_REG_CMDCTRL_RD_BYTES_LSB);
++	status = cadence_qspi_apb_exec_flash_cmd(reg_base, reg);
++	if (status != 0)
++		return status;
++
++	/* Put read value into rxbuf. STIG data is in LE format.
++	 * We should not use direct pointer cast to ensure it works
++	 * regardless of CPU endianness.
++	 */
++	for (i = 0; i < rxlen; i++) {
++		if (i == 0) {
++			reg = readl(reg_base + CQSPI_REG_CMDREADDATALOWER);
++			debug_print("[%s] CQSPI_REG_CMDREADDATALOWER=0x%x\n",
++				    __func__, reg);
++		} else if (i == 4) {
++			reg = readl(reg_base + CQSPI_REG_CMDREADDATAUPPER);
++			debug_print("[%s] CQSPI_REG_CMDREADDATAUPPER=0x%x\n",
++				    __func__, reg);
++		}
++		rxbuf[i] = reg & 0xFF;
++		reg = reg >> 8;
++	}
++
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi rx: ", DUMP_PREFIX_NONE,
++		       32, 1, rxbuf, rxlen, false);
++#endif
++	return 0;
++}
++
++/* For commands: WRSR, WREN, WRDI, CHIP_ERASE, BE, etc. */
++static int cadence_qspi_apb_command_write(void *reg_base,
++	unsigned txlen, const unsigned char *txbuf,
++	unsigned addrlen, const unsigned char *addrbuf,
++	unsigned datalen, const unsigned char *databuf, unsigned int flash_type)
++{
++	unsigned int reg;
++	unsigned int addr_value;
++	unsigned int data = 0;
++	int i;
++
++	debug_print("%s txlen %d txbuf[0]=0x%x\n", __func__, txlen, txbuf[0]);
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi tx: ", DUMP_PREFIX_NONE,
++		32, 1, txbuf, txlen, false);
++#endif
++	if (!txlen || txbuf == NULL) {
++		pr_err("QSPI: Invalid input argument, cmdlen %d txbuf 0x%08x\n",
++			txlen, (unsigned int)txbuf);
++		return -EINVAL;
++	}
++	reg = txbuf[0] << CQSPI_REG_CMDCTRL_OPCODE_LSB;
++	if (datalen != 0) {
++		if (datalen <= 4) {
++			/* Command with data only. */
++			reg |= (0x1 << CQSPI_REG_CMDCTRL_WR_EN_LSB);
++			reg |= ((datalen - 1) & CQSPI_REG_CMDCTRL_WR_BYTES_MASK)
++				<< CQSPI_REG_CMDCTRL_WR_BYTES_LSB;
++			for (i = 0; i < datalen; i++)
++				data |= databuf[i] << (8 * i);
++
++			/* Write the data */
++			CQSPI_WRITEL(data,
++				reg_base + CQSPI_REG_CMDWRITEDATALOWER);
++			debug_print("[%s] CQSPI_REG_CMDWRITEDATALOWER=0x%x\n", __func__, data);
++		} else {
++			/* Command with data only. */
++			reg |= (0x1 << CQSPI_REG_CMDCTRL_WR_EN_LSB);
++			reg |= ((datalen - 1) & CQSPI_REG_CMDCTRL_WR_BYTES_MASK)
++				<< CQSPI_REG_CMDCTRL_WR_BYTES_LSB;
++			for (i = 0; i < 4; i++)
++				data |= databuf[i] << (8 * i);
++
++			/* Write the data */
++			CQSPI_WRITEL(data,
++				reg_base + CQSPI_REG_CMDWRITEDATALOWER);
++			debug_print("[%s] CQSPI_REG_CMDWRITEDATALOWER=0x%x\n", __func__, data);
++
++			data = 0;
++			for (i = 0; i < datalen - 4; i++)
++				data |= databuf[i + 4] << (8 * i);
++
++			/* Write the data */
++			CQSPI_WRITEL(data,
++				reg_base + CQSPI_REG_CMDWRITEDATAUPPER);
++			debug_print("[%s] CQSPI_REG_CMDWRITEDATAUPPER=0x%x\n", __func__, data);
++		}
++	}
++	if (addrlen > 3)
++		addrlen = 3;
++	if (addrlen) {
++		/* Command with address */
++		reg |= (0x1 << CQSPI_REG_CMDCTRL_ADDR_EN_LSB);
++		/* Number of bytes to write. */
++		reg |= ((addrlen - 1) & CQSPI_REG_CMDCTRL_ADD_BYTES_MASK)
++			<< CQSPI_REG_CMDCTRL_ADD_BYTES_LSB;
++		/* Get address */
++		if ((flash_type == QSPI_FLASH_TYPE_NOR) && (txbuf[0] != MACRONIX_WRSR_CMD))
++			addr_value = cadence_qspi_apb_cmd2addr(&txbuf[1],
++				addrlen >= 5 ? 4 : 3);
++		else
++			addr_value = qspi_create_address(&addrbuf[0],
++				addrlen >= 5 ? 4 : 3);
++		CQSPI_WRITEL(addr_value, reg_base + CQSPI_REG_CMDADDRESS);
++		debug_print("[%s] CQSPI_REG_CMDADDRESS=0x%x\n", __func__, addr_value);
++	}
++#if 0
++	else if ((txlen > 1) && (flash_type == QSPI_FLASH_TYPE_NOR)) {
++		addrlen = txlen - 1;
++		/* Command with address */
++		reg |= (0x1 << CQSPI_REG_CMDCTRL_ADDR_EN_LSB);
++		/* Number of bytes to write. */
++		reg |= ((addrlen - 1) & CQSPI_REG_CMDCTRL_ADD_BYTES_MASK)
++			<< CQSPI_REG_CMDCTRL_ADD_BYTES_LSB;
++		/* Get address */
++		addr_value = cadence_qspi_apb_cmd2addr(&txbuf[1],
++			addrlen >= 5 ? 4 : 3);
++		CQSPI_WRITEL(addr_value, reg_base + CQSPI_REG_CMDADDRESS);
++		debug_print("[%s] CQSPI_REG_CMDADDRESS=0x%x\n", __func__, addr_value);
++	}
++#endif
++	return cadence_qspi_apb_exec_flash_cmd(reg_base, reg);
++}
++static int cadence_qspi_apb_indirect_read_setup(void *reg_base,
++	unsigned int ahb_phy_addr, unsigned txlen, const unsigned char *txbuf,
++	unsigned addrlen, const unsigned char *addrbuf,
++	unsigned int addr_bytes, unsigned int flash_type,
++	unsigned int quad_mode)
++{
++	unsigned int reg;
++	unsigned int addr_value;
++	unsigned int dummy_clk;
++	unsigned int dummy_bytes;
++
++	debug_print("[%s]ahb_phy_addr=0x%x txlen=%d txbuf=0x%x "
++		"addr_bytes=%d addrlen=%d\n",
++		__func__, ahb_phy_addr, txlen, txbuf, addr_bytes, addrlen);
++	if (txlen == 6)
++		debug_print("[%s][0]=0x%x [1]=0x%x [2]=0x%x [3]=0x%x [4]=0x%x [5]=0x%x\n",
++			__func__, *txbuf, *(txbuf + 1), *(txbuf + 2), *(txbuf + 3), *(txbuf + 4), *(txbuf + 5));
++
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi tx: ", DUMP_PREFIX_NONE,
++		32, 1, txbuf, txlen, false);
++#endif
++	CQSPI_WRITEL(ahb_phy_addr, reg_base + CQSPI_REG_INDIRECTTRIGGER);
++	if (addrlen) {
++		/* Get address */
++		if (flash_type == QSPI_FLASH_TYPE_NOR) {
++			addr_value = cadence_qspi_apb_cmd2addr(&addrbuf[0], addr_bytes);
++		} else {
++			addr_value = qspi_create_address(&addrbuf[0], addr_bytes);
++		}
++		CQSPI_WRITEL(addr_value,
++			reg_base + CQSPI_REG_INDIRECTRDSTARTADDR);
++		debug_print("[%s]CQSPI_REG_INDIRECTRDSTARTADDR=0x%x\n", __func__, addr_value);
++	}
++	/* The remaining lenght is dummy bytes. */
++	if (txlen > addr_bytes)
++		dummy_bytes = txlen - addr_bytes - 1;
++	else
++		dummy_bytes = 0;
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_RD_INSTR);
++	/* Configure the opcode */
++	reg |= txbuf[0] << CQSPI_REG_RD_INSTR_OPCODE_LSB;
++	/* Configure the quad */
++	reg |= (quad_mode & CQSPI_REG_RD_INSTR_TYPE_DATA_MASK) << CQSPI_REG_RD_INSTR_TYPE_DATA_LSB;
++	/* Setup dummy clock cycles */
++	if (dummy_bytes) {
++		if (dummy_bytes > CQSPI_DUMMY_BYTES_MAX)
++			dummy_bytes = CQSPI_DUMMY_BYTES_MAX;
++		reg |= (1 << CQSPI_REG_RD_INSTR_MODE_EN_LSB);
++		/* Set all high to ensure chip doesn't enter XIP */
++		CQSPI_WRITEL(0xFF, reg_base + CQSPI_REG_MODE_BIT);
++		/* Convert to clock cycles. */
++		dummy_clk = dummy_bytes * CQSPI_DUMMY_CLKS_PER_BYTE;
++		/* Need to minus the mode byte (8 clocks). */
++		dummy_clk -= CQSPI_DUMMY_CLKS_PER_BYTE;
++		if (dummy_clk)
++			reg |= (dummy_clk & CQSPI_REG_RD_INSTR_DUMMY_MASK)
++				<< CQSPI_REG_RD_INSTR_DUMMY_LSB;
++	} else if (flash_type == QSPI_FLASH_TYPE_NAND) {
++		/* for qspi nand, we need at least 8 dummy cycles for rd */
++		reg |= ((1 * CQSPI_DUMMY_CLKS_PER_BYTE)
++				<< CQSPI_REG_RD_INSTR_DUMMY_LSB);
++	}
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_RD_INSTR);
++	debug_print("[%s]quad_mode=%d CQSPI_REG_RD_INSTR=0x%x\n", __func__, quad_mode, reg);
++	/* Set device size */
++	reg = CQSPI_READL(reg_base + CQSPI_REG_SIZE);
++	reg &= ~CQSPI_REG_SIZE_ADDRESS_MASK;
++	reg |= (addr_bytes - 1);
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_SIZE);
++	debug_print("[%s]CQSPI_REG_SIZE=0x%x\n", __func__, reg);
++	/* disable auto-polling */
++	reg = CQSPI_READL(reg_base + CQSPI_REG_WRITE_COMPLETION_CTRL);
++	reg |= (1 << WRITE_COMPLETION_CTRL_REG_DISABLE_POLLING_FLD_POS);
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_WRITE_COMPLETION_CTRL);
++	debug_print("[%s]CQSPI_REG_WRITE_COMPLETION_CTRL=0x%x\n", __func__, reg);
++
++	return 0;
++}
++static int cadence_qspi_apb_indirect_read_execute(
++	struct struct_cqspi *cadence_qspi, unsigned rxlen,
++	unsigned char *rxbuf, unsigned int flash_type)
++{
++	unsigned int reg = 0;
++	unsigned int timeout;
++	unsigned int watermark = CQSPI_REG_SRAM_THRESHOLD_BYTES;
++	unsigned int *irq_status = &(cadence_qspi->irq_status);
++	struct platform_device *pdev = cadence_qspi->pdev;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	void *reg_base = cadence_qspi->iobase;
++	void *ahb_base = cadence_qspi->qspi_ahb_virt;
++	int remaining = (int)rxlen;
++	int ret = 0;
++	unsigned char *buf = rxbuf;
++
++	debug_print("%s rxlen %d rxbuf %p\n", __func__, rxlen, rxbuf);
++	CQSPI_WRITEL(0, reg_base + CQSPI_REG_INDIRECTRDWATERMARK);
++
++	CQSPI_WRITEL(0xa, reg_base + CQSPI_INDIRECT_TRIGGER_ADDR_RANGE_REG);
++
++	CQSPI_WRITEL(remaining, reg_base + CQSPI_REG_INDIRECTRDBYTES);
++	debug_print("[%s]CQSPI_REG_INDIRECTRDBYTES=0x%x\n", __func__, remaining);
++
++	mb();
++
++	CQSPI_WRITEL(pdata->fifo_depth - CQSPI_REG_SRAM_RESV_WORDS,
++		reg_base + CQSPI_REG_SRAMPARTITION);
++	/* Clear all interrupts. */
++	CQSPI_WRITEL(CQSPI_IRQ_STATUS_MASK, reg_base + CQSPI_REG_IRQSTATUS);
++	CQSPI_WRITEL(CQSPI_IRQ_MASK_RD, reg_base + CQSPI_REG_IRQMASK);
++
++	/* Start the indirect read transfer */
++//	reg = CQSPI_READL(reg_base + CQSPI_REG_INDIRECTRD);
++//	reg |= CQSPI_REG_INDIRECTRD_START_MASK;
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTRD_START_MASK, reg_base + CQSPI_REG_INDIRECTRD);
++	debug_print("[%s]CQSPI_REG_INDIRECTRD=0x%x\n", __func__, CQSPI_READL(reg_base + CQSPI_REG_INDIRECTRD));
++	while (remaining > 0) {
++//		if (flash_type == QSPI_FLASH_TYPE_NOR) {
++			reg = CQSPI_GET_RD_SRAM_LEVEL(reg_base);
++			/* convert to bytes */
++			reg *= CQSPI_FIFO_WIDTH;
++			reg = reg > remaining ? remaining : reg;
++			/* Read data from FIFO. */
++			cadence_qspi_apb_read_fifo_data(buf, ahb_base, reg,
++							flash_type);
++			buf += reg;
++			remaining -= reg;
++#if 0
++			} else {
++			ret = wait_event_interruptible_timeout(cadence_qspi->waitqueue,
++				*irq_status, CQSPI_TIMEOUT_MS);
++			if (!ret) {
++				pr_err("QSPI: Indirect read timeout\n");
++				ret = -ETIMEDOUT;
++				goto failrd;
++			}
++			if (*irq_status & CQSPI_IRQ_STATUS_ERR) {
++				/* Error occurred */
++				pr_err("QSPI: Indirect read error IRQ status 0x%08x\n",
++					*irq_status);
++				ret = -EPERM;
++				goto failrd;
++			}
++			if (*irq_status & (CQSPI_REG_IRQ_IND_RD_OVERFLOW |
++				CQSPI_REG_IRQ_IND_COMP | CQSPI_REG_IRQ_WATERMARK)) {
++				reg = CQSPI_GET_RD_SRAM_LEVEL(reg_base);
++				/* convert to bytes */
++				reg *= CQSPI_FIFO_WIDTH;
++				reg = reg > remaining ? remaining : reg;
++				/* Read data from FIFO. */
++				cadence_qspi_apb_read_fifo_data(buf, ahb_base,
++								reg,
++								flash_type);
++				buf += reg;
++				remaining -= reg;
++			}
++		}
++#endif
++	}
++	/* Check indirect done status */
++	timeout = cadence_qspi_init_timeout(CQSPI_TIMEOUT_MS);
++	while (cadence_qspi_check_timeout(timeout)) {
++		reg = CQSPI_READL(reg_base + CQSPI_REG_INDIRECTRD);
++		if (reg & CQSPI_REG_INDIRECTRD_DONE_MASK)
++			break;
++	}
++	if (!(reg & CQSPI_REG_INDIRECTRD_DONE_MASK)) {
++		pr_err("QSPI : Indirect read completion status error with "
++			"reg 0x%08x\n", reg);
++		ret = -ETIMEDOUT;
++		goto failrd;
++	}
++	/* Disable interrupt */
++	CQSPI_WRITEL(0, reg_base + CQSPI_REG_IRQMASK);
++	/* Clear indirect completion status */
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTRD_DONE_MASK,
++		reg_base + CQSPI_REG_INDIRECTRD);
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi rx: ", DUMP_PREFIX_NONE,
++		32, 1, rxbuf, rxlen, false);
++#endif
++	return 0;
++failrd:
++	/* Disable interrupt */
++	CQSPI_WRITEL(0, reg_base + CQSPI_REG_IRQMASK);
++	/* Cancel the indirect read */
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_CANCEL_MASK,
++			reg_base + CQSPI_REG_INDIRECTRD);
++	return ret;
++}
++static int cadence_qspi_apb_indirect_write_setup(void *reg_base,
++	unsigned int ahb_phy_addr, unsigned txlen, const unsigned char *txbuf,
++	unsigned addrlen, const unsigned char *addrbuf, unsigned int flash_type,
++	unsigned int quad_mode)
++{
++	unsigned int reg;
++	unsigned int addr_bytes = txlen;
++
++	debug_print("%s txlen %d txbuf %p addr_bytes %d\n",
++		__func__, txlen, txbuf, addr_bytes);
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi tx: ", DUMP_PREFIX_NONE,
++		32, 1, txbuf, txlen, false);
++#endif
++	if (txbuf == NULL) {
++		pr_err("QSPI: Invalid input argument, txlen %d txbuf 0x%08x\n",
++			txlen, (unsigned int)txbuf);
++		return -EINVAL;
++	}
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	reg &= ~(CQSPI_REG_CONFIG_DIRECT_MASK);
++	reg &= ~(CQSPI_REG_CONFIG_DMA_MASK);
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++
++	CQSPI_WRITEL(ahb_phy_addr, reg_base + CQSPI_REG_INDIRECTTRIGGER);
++	/* Set opcode. */
++	reg = txbuf[0] << CQSPI_REG_WR_INSTR_OPCODE_LSB;
++	reg |= (1 << DEV_INSTR_WR_CONFIG_REG_WEL_DIS_FLD_POS);
++	if ((txbuf[0] == MACRONIX_4PP_CMD) && (flash_type == QSPI_FLASH_TYPE_NOR) && (quad_mode == QUAD_QIO)) {
++		/* Configure the quad */
++		reg |= (quad_mode & CQSPI_REG_WR_INSTR_TYPE_ADDR_MASK) << CQSPI_REG_WR_INSTR_TYPE_ADDR_LSB;
++	}
++	/* Configure the quad */
++	reg |= (quad_mode & CQSPI_REG_WR_INSTR_TYPE_DATA_MASK) << CQSPI_REG_WR_INSTR_TYPE_DATA_LSB;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_WR_INSTR);
++	debug_print("[%s]quad_mode=%d CQSPI_REG_WR_INSTR=0x%x\n", __func__, quad_mode, reg);
++	/* Setup write address. */
++	reg = cadence_qspi_apb_cmd2addr(&addrbuf[0], addrlen);
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_INDIRECTWRSTARTADDR);
++	reg = CQSPI_READL(reg_base + CQSPI_REG_SIZE);
++	reg &= ~CQSPI_REG_SIZE_ADDRESS_MASK;
++	reg |= ((addrlen - 1) & CQSPI_REG_SIZE_ADDRESS_MASK);
++	CQSPI_WRITEL(reg, reg_base +  CQSPI_REG_SIZE);
++
++	/* disable auto-polling */
++	reg = CQSPI_READL(reg_base + CQSPI_REG_WRITE_COMPLETION_CTRL);
++	reg |= (1 << 14);
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_WRITE_COMPLETION_CTRL);
++	return 0;
++}
++static int cadence_qspi_apb_indirect_write_execute(
++	struct struct_cqspi *cadence_qspi, unsigned txlen,
++	const unsigned char *txbuf, unsigned int flash_type)
++{
++	int ret;
++	unsigned int timeout;
++	unsigned int reg = 0;
++	unsigned int *irq_status = &(cadence_qspi->irq_status);
++	void *reg_base = cadence_qspi->iobase;
++	void *ahb_base = cadence_qspi->qspi_ahb_virt;
++	struct platform_device *pdev = cadence_qspi->pdev;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	struct cqspi_flash_pdata *f_pdata =
++			&(pdata->f_pdata[cadence_qspi->current_cs]);
++	unsigned int page_size = f_pdata->page_size;
++	int remaining = (int)txlen;
++	unsigned int write_bytes;
++	uint16_t fill_level = 0;
++	uint32_t retry = 0xffff;
++
++	debug_print("%s txlen %d txbuf %p\n", __func__, txlen, txbuf);
++#ifdef DEBUG
++	/* Dump the QSPI command */
++	print_hex_dump(KERN_DEBUG, "qspi tx: ", DUMP_PREFIX_NONE,
++		32, 1, txbuf, txlen, false);
++#endif
++	CQSPI_WRITEL(0xa, reg_base + CQSPI_INDIRECT_TRIGGER_ADDR_RANGE_REG);
++	CQSPI_WRITEL(0x0, reg_base + CQSPI_REG_INDIRECTWRWATERMARK);
++	reg = CQSPI_READL(reg_base + CQSPI_REG_SIZE);
++	reg &= ~(CQSPI_REG_SIZE_PAGE_MASK << CQSPI_REG_SIZE_PAGE_LSB);
++	reg &= ~(CQSPI_REG_SIZE_BLOCK_MASK << CQSPI_REG_SIZE_BLOCK_LSB);
++	reg |= (f_pdata->page_size << CQSPI_REG_SIZE_PAGE_LSB);
++	reg |= (f_pdata->block_size << CQSPI_REG_SIZE_BLOCK_LSB);
++	CQSPI_WRITEL(reg, reg_base +  CQSPI_REG_SIZE);
++
++	CQSPI_WRITEL(remaining, reg_base + CQSPI_REG_INDIRECTWRBYTES);
++	CQSPI_WRITEL(CQSPI_REG_SRAM_PARTITION_WR,
++		     reg_base + CQSPI_REG_SRAMPARTITION);
++	/* Clear all interrupts. */
++	CQSPI_WRITEL(CQSPI_IRQ_STATUS_MASK, reg_base + CQSPI_REG_IRQSTATUS);
++	CQSPI_WRITEL(CQSPI_IRQ_MASK_WR, reg_base + CQSPI_REG_IRQMASK);
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_START_MASK,
++			reg_base + CQSPI_REG_INDIRECTWR);
++
++	/* Write a page or remaining bytes. */
++	write_bytes = remaining > page_size ? page_size : remaining;
++
++	/* Fill up the data at the beginning */
++	cadence_qspi_apb_write_fifo_data(ahb_base, txbuf, write_bytes,
++					 flash_type);
++	txbuf += write_bytes;
++	remaining -= write_bytes;
++
++	while (remaining > 0) {
++		ret = wait_event_interruptible_timeout(cadence_qspi->waitqueue,
++						       *irq_status,
++						       CQSPI_TIMEOUT_MS);
++		if (!ret) {
++			pr_err("QSPI: Indirect write timeout\n");
++			ret = -ETIMEDOUT;
++			goto failwr;
++		}
++		if (*irq_status & CQSPI_IRQ_STATUS_ERR) {
++			/* Error occurred */
++			pr_err("QSPI: Indirect write error IRQ status 0x%08x\n",
++			       *irq_status);
++			ret = -EPERM;
++			goto failwr;
++		}
++		if (*irq_status & (CQSPI_REG_IRQ_UNDERFLOW |
++			CQSPI_REG_IRQ_IND_COMP | CQSPI_REG_IRQ_WATERMARK)){
++			/* Calculate number of bytes to write. */
++			write_bytes = remaining > page_size ?
++				page_size : remaining;
++			cadence_qspi_apb_write_fifo_data(ahb_base, txbuf,
++				write_bytes, flash_type);
++			txbuf  += write_bytes;
++			remaining -= write_bytes;
++		}
++	}
++
++	/* Check indirect done status */
++	timeout = cadence_qspi_init_timeout(CQSPI_TIMEOUT_MS);
++	while (cadence_qspi_check_timeout(timeout)) {
++		reg = CQSPI_READL(reg_base + CQSPI_REG_INDIRECTWR);
++		if (reg & CQSPI_REG_INDIRECTWR_DONE_MASK)
++			break;
++	}
++	if (!(reg & CQSPI_REG_INDIRECTWR_DONE_MASK)) {
++		pr_err("QSPI: Indirect write completion status error with "
++			"reg 0x%08x\n", reg);
++		ret = -ETIMEDOUT;
++		goto failwr;
++	}
++	/* Disable interrupt. */
++	CQSPI_WRITEL(0, reg_base + CQSPI_REG_IRQMASK);
++	/* Clear indirect completion status */
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_DONE_MASK,
++		reg_base + CQSPI_REG_INDIRECTWR);
++	if (flash_type == QSPI_FLASH_TYPE_NOR)
++		return txlen;
++	else
++		return 0;
++failwr:
++	/* Disable interrupt. */
++	CQSPI_WRITEL(0, reg_base + CQSPI_REG_IRQMASK);
++	/* Cancel the indirect write */
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_CANCEL_MASK,
++		reg_base + CQSPI_REG_INDIRECTWR);
++	return ret;
++}
++void cadence_qspi_apb_controller_enable(void *reg_base)
++{
++	unsigned int reg;
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	reg |= CQSPI_REG_CONFIG_ENABLE_MASK;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++	return;
++}
++void cadence_qspi_apb_controller_disable(void *reg_base)
++{
++	unsigned int reg;
++
++	reg = CQSPI_READL(reg_base + CQSPI_REG_CONFIG);
++	reg &= ~CQSPI_REG_CONFIG_ENABLE_MASK;
++	CQSPI_WRITEL(reg, reg_base + CQSPI_REG_CONFIG);
++	return;
++}
++unsigned int cadence_qspi_apb_is_controller_ready(void *reg_base)
++{
++	return cadence_qspi_wait_idle(reg_base);
++}
++void cadence_qspi_apb_controller_init(struct struct_cqspi *cadence_qspi)
++{
++	cadence_qspi_apb_controller_disable(cadence_qspi->iobase);
++
++	/* Configure the remap address register, no remap */
++	CQSPI_WRITEL(0, cadence_qspi->iobase + CQSPI_REG_REMAP);
++	/* Disable all interrupts. */
++	CQSPI_WRITEL(0, cadence_qspi->iobase + CQSPI_REG_IRQMASK);
++
++	cadence_qspi_apb_controller_enable(cadence_qspi->iobase);
++	return;
++}
++unsigned int calculate_ticks_for_ns(unsigned int ref_clk_hz,
++	unsigned int ns_val)
++{
++	unsigned int ticks;
++
++	ticks = ref_clk_hz;
++	ticks /= 1000;
++	ticks *= ns_val;
++	ticks +=  999999;
++	ticks /= 1000000;
++	return ticks;
++}
++void cadence_qspi_apb_delay(struct struct_cqspi *cadence_qspi,
++	unsigned int ref_clk, unsigned int sclk_hz)
++{
++	void __iomem *iobase = cadence_qspi->iobase;
++	struct platform_device *pdev = cadence_qspi->pdev;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	struct cqspi_flash_pdata *f_pdata =
++			&(pdata->f_pdata[cadence_qspi->current_cs]);
++	unsigned int ref_clk_ns;
++	unsigned int sclk_ns;
++	unsigned int tshsl, tchsh, tslch, tsd2d;
++	unsigned int reg;
++	unsigned int tsclk;
++
++	debug_print("%s %d %d\n", __func__, ref_clk, sclk_hz);
++
++	cadence_qspi_apb_controller_disable(cadence_qspi->iobase);
++	/* Convert to ns. */
++	ref_clk_ns = (1000000000) / pdata->master_ref_clk_hz;
++	/* Convert to ns. */
++	sclk_ns = (1000000000) / sclk_hz;
++	/* calculate the number of ref ticks for one sclk tick */
++	tsclk = (pdata->master_ref_clk_hz + sclk_hz - 1) / sclk_hz;
++	tshsl = calculate_ticks_for_ns(pdata->master_ref_clk_hz,
++		f_pdata->tshsl_ns);
++	/* this particular value must be at least one sclk */
++	if (tshsl < tsclk)
++		tshsl = tsclk;
++	tchsh = calculate_ticks_for_ns(pdata->master_ref_clk_hz,
++		f_pdata->tchsh_ns);
++	tslch = calculate_ticks_for_ns(pdata->master_ref_clk_hz,
++		f_pdata->tslch_ns);
++	tsd2d = calculate_ticks_for_ns(pdata->master_ref_clk_hz,
++		f_pdata->tsd2d_ns);
++	debug_print("%s tshsl %d tsd2d %d tchsh %d tslch %d\n",
++		__func__, tshsl, tsd2d, tchsh, tslch);
++	reg = ((tshsl & CQSPI_REG_DELAY_TSHSL_MASK)
++			<< CQSPI_REG_DELAY_TSHSL_LSB);
++	reg |= ((tchsh & CQSPI_REG_DELAY_TCHSH_MASK)
++			<< CQSPI_REG_DELAY_TCHSH_LSB);
++	reg |= ((tslch & CQSPI_REG_DELAY_TSLCH_MASK)
++			<< CQSPI_REG_DELAY_TSLCH_LSB);
++	reg |= ((tsd2d & CQSPI_REG_DELAY_TSD2D_MASK)
++			<< CQSPI_REG_DELAY_TSD2D_LSB);
++	CQSPI_WRITEL(reg, iobase + CQSPI_REG_DELAY);
++	cadence_qspi_apb_controller_enable(cadence_qspi->iobase);
++	return;
++}
++void cadence_qspi_switch_cs(struct struct_cqspi *cadence_qspi,
++	unsigned int cs)
++{
++	unsigned int reg;
++	struct platform_device *pdev = cadence_qspi->pdev;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	struct cqspi_flash_pdata *f_pdata = &(pdata->f_pdata[cs]);
++	void __iomem *iobase = cadence_qspi->iobase;
++
++	debug_print("%s\n", __func__);
++	cadence_qspi_apb_controller_disable(iobase);
++	/* Configure page size and block size. */
++	reg = CQSPI_READL(iobase + CQSPI_REG_SIZE);
++	/* clear the previous value */
++	reg &= ~(CQSPI_REG_SIZE_PAGE_MASK << CQSPI_REG_SIZE_PAGE_LSB);
++	reg &= ~(CQSPI_REG_SIZE_BLOCK_MASK << CQSPI_REG_SIZE_BLOCK_LSB);
++	reg |= (f_pdata->page_size << CQSPI_REG_SIZE_PAGE_LSB);
++	reg |= (f_pdata->block_size << CQSPI_REG_SIZE_BLOCK_LSB);
++	CQSPI_WRITEL(reg, iobase + CQSPI_REG_SIZE);
++	debug_print("[%s]f_pdata->page_size=0x%x f_pdata->block_size=0x%x\n",
++		__func__, f_pdata->page_size, f_pdata->block_size);
++	debug_print("[%s]CQSPI_REG_SIZE=0x%x\n", __func__,
++		CQSPI_READL(iobase + CQSPI_REG_SIZE));
++	/* configure the chip select */
++	cadence_qspi_apb_chipselect(iobase, cs, pdata->ext_decoder);
++	cadence_qspi_apb_controller_enable(iobase);
++	return;
++}
++int cadence_qspi_apb_process_queue(struct struct_cqspi *cadence_qspi,
++				  struct spi_device *spi, unsigned int n_trans,
++				  struct spi_transfer **spi_xfer)
++{
++	struct platform_device *pdev = cadence_qspi->pdev;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	struct spi_transfer *cmd_xfer = spi_xfer[0];
++	struct spi_transfer *data_xfer = (n_trans >= 2) ? spi_xfer[1] : NULL;
++	void __iomem *iobase = cadence_qspi->iobase;
++	unsigned int sclk;
++	/* 1 byte coomand, 3 bytes address, 1 byte dummy */
++	unsigned char txbuffer[5];
++	unsigned int mode = DC_MODE;
++	int ret = 0;
++	struct cqspi_flash_pdata *f_pdata;
++
++	f_pdata = &(pdata->f_pdata[cadence_qspi->current_cs]);
++	debug_print("[%s] flash_type=%d cadence_qspi->current_cs=%d\n", __func__, f_pdata->flash_type, cadence_qspi->current_cs);
++	debug_print("[%s] page_size=%d block_size=%d quad=%d\n", __func__, f_pdata->page_size, f_pdata->block_size, f_pdata->quad);
++	debug_print("[%s] n_trans=%d\n", __func__, n_trans);
++	debug_print("[%s] cmd_xfer->len=%d\n", __func__, cmd_xfer->len);
++	debug_print("[%s] cmd_xfer->tx_buf=0x%x\n", __func__, cmd_xfer->tx_buf);
++	debug_print("[%s] cmd_xfer->rx_buf=0x%x\n", __func__, cmd_xfer->rx_buf);
++	debug_print("[%s] data_xfer=0x%x\n", __func__, data_xfer);
++
++	if (!cmd_xfer->len) {
++		pr_err("QSPI: SPI transfer length is 0.\n");
++		return -EINVAL;
++	}
++
++	/* Setup baudrate divisor and delays */
++	sclk = cmd_xfer->speed_hz ?
++		cmd_xfer->speed_hz : spi->max_speed_hz;
++	cadence_qspi_apb_controller_disable(iobase);
++	cadence_qspi_apb_config_baudrate_div(iobase,
++		pdata->master_ref_clk_hz, sclk);
++	/* this set delay function need work with device tree */
++	cadence_qspi_apb_delay(cadence_qspi,
++		pdata->master_ref_clk_hz, sclk);
++	cadence_qspi_apb_readdata_capture(iobase, 1,
++		f_pdata->read_delay);
++	cadence_qspi_apb_controller_enable(iobase);
++
++	/* Switch chip select. */
++	if (cadence_qspi->current_cs != spi->chip_select) {
++		cadence_qspi->current_cs = spi->chip_select;
++		cadence_qspi_switch_cs(cadence_qspi, spi->chip_select);
++	}
++	if (f_pdata->flash_type == QSPI_FLASH_TYPE_NOR) {
++		if (n_trans == 2) {
++			if ((data_xfer->len > 6) && (data_xfer->rx_buf)) {
++				mode = IDC_READ_MODE;
++			}
++			else if ((data_xfer->len > 6) && (data_xfer->tx_buf))
++				mode = IDC_WRITE_MODE;
++			else if (data_xfer->tx_buf)
++				mode = STIG_WRITE_MODE;
++			else if (data_xfer->rx_buf)
++				mode = STIG_READ_MODE;
++		} else if (n_trans == 1)
++			mode = STIG_WRITE_MODE;
++	} else if (f_pdata->flash_type == QSPI_FLASH_TYPE_NAND) {
++		/*
++		 * Use STIG command to send if the transfer length is less than
++		 * 4 or if only one transfer.
++		 */
++		if (n_trans >= 3) {
++			if ((spi_xfer[2]->len > 4) && (spi_xfer[2]->rx_buf))
++				mode = IDC_READ_MODE;
++			else if ((spi_xfer[2]->len > 4) && (spi_xfer[2]->tx_buf))
++				mode = IDC_WRITE_MODE;
++			else if ((spi_xfer[2]->len < 4) && (spi_xfer[2]->tx_buf))
++				mode = STIG_WRITE_MODE;
++			else if ((spi_xfer[2]->len < 4) && (spi_xfer[2]->rx_buf))
++				mode = STIG_READ_MODE;
++		} else if (n_trans == 2) {
++			if ((data_xfer->len > 4) && (data_xfer->rx_buf))
++				mode = IDC_READ_MODE;
++			else if ((data_xfer->len > 4) && (data_xfer->tx_buf))
++				mode = IDC_WRITE_MODE;
++			else if (data_xfer->tx_buf)
++				mode = STIG_WRITE_MODE;
++			else if (data_xfer->rx_buf)
++				mode = STIG_READ_MODE;
++		} else if (n_trans == 1)
++			mode = STIG_WRITE_MODE;
++	}
++
++	if (mode == STIG_WRITE_MODE) {
++		/* STIG write */
++		if ((n_trans == 3) && data_xfer && spi_xfer[2])
++			ret = cadence_qspi_apb_command_write(iobase,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				data_xfer->len, data_xfer->tx_buf,
++				spi_xfer[2]->len, spi_xfer[2]->tx_buf, f_pdata->flash_type);
++		else if ((n_trans == 2) && data_xfer)
++			ret = cadence_qspi_apb_command_write(iobase,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				data_xfer->len, data_xfer->tx_buf, 0, NULL, f_pdata->flash_type);
++		else
++			ret = cadence_qspi_apb_command_write(iobase,
++				cmd_xfer->len, cmd_xfer->tx_buf, cmd_xfer->len - 1,
++				cmd_xfer->tx_buf + 1, 0, NULL, f_pdata->flash_type);
++	} else if (mode == STIG_READ_MODE) {
++		/* STIG read */
++		if ((n_trans == 3) && data_xfer && spi_xfer[2])
++			ret = cadence_qspi_apb_command_read(iobase,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				data_xfer->len, data_xfer->tx_buf,
++				spi_xfer[2]->len, spi_xfer[2]->rx_buf, f_pdata->flash_type);
++		else if ((n_trans == 2) && data_xfer)
++			ret = cadence_qspi_apb_command_read(iobase,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				0, NULL, data_xfer->len, data_xfer->rx_buf, f_pdata->flash_type);
++	} else if (mode == IDC_READ_MODE) {
++		/* Indirect operation */
++		/* write command and address byte */
++		/* Indirect read */
++		if (f_pdata->flash_type == QSPI_FLASH_TYPE_NOR)
++			ret = cadence_qspi_apb_indirect_read_setup(iobase,
++				pdata->qspi_ahb_phy & pdata->qspi_ahb_mask,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				cmd_xfer->len - 1, cmd_xfer->tx_buf + 1, 3, f_pdata->flash_type,
++				f_pdata->quad);
++		else
++			/* read data from cache len should be 2 */
++			ret = cadence_qspi_apb_indirect_read_setup(iobase,
++				pdata->qspi_ahb_phy & pdata->qspi_ahb_mask,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				data_xfer->len, data_xfer->tx_buf, 2, f_pdata->flash_type,
++				f_pdata->quad);
++
++		if (n_trans == 3) {
++			ret = cadence_qspi_apb_indirect_read_execute(
++			cadence_qspi, spi_xfer[2]->len, spi_xfer[2]->rx_buf, f_pdata->flash_type);
++		} else {
++			ret = cadence_qspi_apb_indirect_read_execute(
++			cadence_qspi, data_xfer->len,
++			data_xfer->rx_buf, f_pdata->flash_type);
++		}
++	} else if (mode == IDC_WRITE_MODE) {
++		/* Indirect write */
++		if (f_pdata->flash_type == QSPI_FLASH_TYPE_NOR) {
++			ret = cadence_qspi_apb_indirect_write_setup(
++				iobase,
++				pdata->qspi_ahb_phy & pdata->qspi_ahb_mask,
++				data_xfer->len, cmd_xfer->tx_buf, 
++				cmd_xfer->len - 1, cmd_xfer->tx_buf + 1, f_pdata->flash_type,
++				f_pdata->quad);
++
++			ret = cadence_qspi_apb_indirect_write_execute(
++				cadence_qspi, spi_xfer[1]->len,
++				spi_xfer[1]->tx_buf, f_pdata->flash_type);
++		} else {
++			ret = cadence_qspi_apb_indirect_write_setup(
++				iobase,
++				pdata->qspi_ahb_phy & pdata->qspi_ahb_mask,
++				cmd_xfer->len, cmd_xfer->tx_buf,
++				data_xfer->len, data_xfer->tx_buf,
++				f_pdata->flash_type, f_pdata->quad);
++			ret = cadence_qspi_apb_indirect_write_execute(
++				cadence_qspi, spi_xfer[2]->len,
++				spi_xfer[2]->tx_buf, f_pdata->flash_type);
++		}
++	} else {
++		pr_err("QSPI : Unknown SPI transfer.\n");
++		return -EINVAL;
++	}
++	return ret;
++}
++MODULE_LICENSE("Dual BSD/GPL");
+diff --git a/drivers/spi/spi-cadence-qspi-apb.h b/drivers/spi/spi-cadence-qspi-apb.h
+new file mode 100644
+index 000000000000..d45aecd6de49
+--- /dev/null
++++ b/drivers/spi/spi-cadence-qspi-apb.h
+@@ -0,0 +1,203 @@
++/*
++ * Driver for Cadence QSPI Controller
++ *
++ * Copyright (C) 2012 Altera Corporation
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ *
++ */
++#ifndef __CADENCE_QSPI_APB_H__
++#define __CADENCE_QSPI_APB_H__
++#include "spi-cadence-qspi.h"
++/* Operation timeout value */
++#define CQSPI_TIMEOUT_MS			(5000)
++#define CQSPI_POLL_IDLE_RETRY			(3)
++#define CQSPI_FIFO_WIDTH			(4)
++/* Controller sram size in word */
++#define CQSPI_REG_SRAM_RESV_WORDS		(2)
++#define CQSPI_REG_SRAM_PARTITION_WR		(1)
++#define CQSPI_REG_SRAM_THRESHOLD_BYTES		(50)
++/* Instruction type */
++#define CQSPI_INST_TYPE_SINGLE			(0)
++#define CQSPI_INST_TYPE_DUAL			(1)
++#define CQSPI_INST_TYPE_QUAD			(2)
++#define CQSPI_DUMMY_CLKS_PER_BYTE		(8)
++#define CQSPI_DUMMY_BYTES_MAX			(4)
++#define CQSPI_STIG_DATA_LEN_MAX			(8)
++#define CQSPI_INDIRECTTRIGGER_ADDR_MASK		(0xFFFFF)
++/* Register map */
++#define	CQSPI_REG_CONFIG			0x00
++#define	CQSPI_REG_CONFIG_ENABLE_MASK		(1 << 0)
++#define	CQSPI_REG_CONFIG_DIRECT_MASK		(1 << 7)
++#define	CQSPI_REG_CONFIG_DECODE_MASK		(1 << 9)
++#define	CQSPI_REG_CONFIG_CHIPSELECT_LSB		10
++#define	CQSPI_REG_CONFIG_DMA_MASK		(1 << 15)
++#define	CQSPI_REG_CONFIG_BAUD_LSB		19
++#define	CQSPI_REG_CONFIG_IDLE_LSB		31
++#define	CQSPI_REG_CONFIG_CHIPSELECT_MASK	0xF
++#define	CQSPI_REG_CONFIG_BAUD_MASK		0xF
++#define	CQSPI_REG_RD_INSTR			0x04
++#define	CQSPI_REG_RD_INSTR_OPCODE_LSB		0
++#define	CQSPI_REG_RD_INSTR_TYPE_INSTR_LSB	8
++#define	CQSPI_REG_RD_INSTR_TYPE_ADDR_LSB	12
++#define	CQSPI_REG_RD_INSTR_TYPE_DATA_LSB	16
++#define	CQSPI_REG_RD_INSTR_MODE_EN_LSB		20
++#define	CQSPI_REG_RD_INSTR_DUMMY_LSB		24
++#define	CQSPI_REG_RD_INSTR_TYPE_INSTR_MASK	0x3
++#define	CQSPI_REG_RD_INSTR_TYPE_ADDR_MASK	0x3
++#define	CQSPI_REG_RD_INSTR_TYPE_DATA_MASK	0x3
++#define	CQSPI_REG_RD_INSTR_DUMMY_MASK		0x1F
++#define	CQSPI_REG_WR_INSTR			0x08
++#define	CQSPI_REG_WR_INSTR_OPCODE_LSB		0
++#define	CQSPI_REG_WR_INSTR_TYPE_DATA_MASK	0x3
++#define	CQSPI_REG_WR_INSTR_TYPE_DATA_LSB	16
++#define	CQSPI_REG_WR_INSTR_TYPE_ADDR_MASK	0x3
++#define	CQSPI_REG_WR_INSTR_TYPE_ADDR_LSB	12
++/*! Field WEL_DIS_FLD - wel_dis_fld */
++#define DEV_INSTR_WR_CONFIG_REG_WEL_DIS_FLD_POS 8
++#define	CQSPI_REG_DELAY				0x0C
++#define	CQSPI_REG_DELAY_TSLCH_LSB		0
++#define	CQSPI_REG_DELAY_TCHSH_LSB		8
++#define	CQSPI_REG_DELAY_TSD2D_LSB		16
++#define	CQSPI_REG_DELAY_TSHSL_LSB		24
++#define	CQSPI_REG_DELAY_TSLCH_MASK		0xFF
++#define	CQSPI_REG_DELAY_TCHSH_MASK		0xFF
++#define	CQSPI_REG_DELAY_TSD2D_MASK		0xFF
++#define	CQSPI_REG_DELAY_TSHSL_MASK		0xFF
++#define	CQSPI_REG_READCAPTURE			0x10
++#define	CQSPI_REG_READCAPTURE_BYPASS_LSB	0
++#define	CQSPI_REG_READCAPTURE_DELAY_LSB		1
++#define	CQSPI_REG_READCAPTURE_DELAY_MASK	0xF
++#define	CQSPI_REG_SIZE				0x14
++#define	CQSPI_REG_SIZE_ADDRESS_LSB		0
++#define	CQSPI_REG_SIZE_PAGE_LSB			4
++#define	CQSPI_REG_SIZE_BLOCK_LSB		16
++#define	CQSPI_REG_SIZE_ADDRESS_MASK		0xF
++#define	CQSPI_REG_SIZE_PAGE_MASK		0xFFF
++#define	CQSPI_REG_SIZE_BLOCK_MASK		0x3F
++#define	CQSPI_REG_SRAMPARTITION			0x18
++#define	CQSPI_REG_INDIRECTTRIGGER		0x1C
++#define	CQSPI_REG_DMA				0x20
++#define	CQSPI_REG_DMA_SINGLE_LSB		0
++#define	CQSPI_REG_DMA_BURST_LSB			8
++#define	CQSPI_REG_DMA_SINGLE_MASK		0xFF
++#define	CQSPI_REG_DMA_BURST_MASK		0xFF
++#define	CQSPI_REG_REMAP				0x24
++#define	CQSPI_REG_MODE_BIT			0x28
++#define	CQSPI_REG_SDRAMLEVEL			0x2C
++#define	CQSPI_REG_SDRAMLEVEL_RD_LSB		0
++#define	CQSPI_REG_SDRAMLEVEL_WR_LSB		16
++#define	CQSPI_REG_SDRAMLEVEL_RD_MASK		0xFFFF
++#define	CQSPI_REG_SDRAMLEVEL_WR_MASK		0xFFFF
++
++#define CQSPI_REG_WRITE_COMPLETION_CTRL	0x38
++/*! Field DISABLE_POLLING_FLD - disable_polling_fld */
++#define WRITE_COMPLETION_CTRL_REG_DISABLE_POLLING_FLD_POS 14
++
++
++#define	CQSPI_REG_IRQSTATUS			0x40
++#define	CQSPI_REG_IRQMASK			0x44
++#define	CQSPI_REG_INDIRECTRD			0x60
++#define	CQSPI_REG_INDIRECTRD_START_MASK		(1 << 0)
++#define	CQSPI_REG_INDIRECTRD_CANCEL_MASK	(1 << 1)
++#define	CQSPI_REG_INDIRECTRD_DONE_MASK		(1 << 5)
++#define	CQSPI_REG_INDIRECTRDWATERMARK		0x64
++#define	CQSPI_REG_INDIRECTRDSTARTADDR		0x68
++#define	CQSPI_REG_INDIRECTRDBYTES		0x6C
++#define CQSPI_INDIRECT_TRIGGER_ADDR_RANGE_REG 0x80
++#define	CQSPI_REG_CMDCTRL			0x90
++#define	CQSPI_REG_CMDCTRL_EXECUTE_MASK		(1 << 0)
++#define	CQSPI_REG_CMDCTRL_INPROGRESS_MASK	(1 << 1)
++#define	CQSPI_REG_CMDCTRL_WR_BYTES_LSB		12
++#define	CQSPI_REG_CMDCTRL_WR_EN_LSB		15
++#define	CQSPI_REG_CMDCTRL_ADD_BYTES_LSB		16
++#define	CQSPI_REG_CMDCTRL_ADDR_EN_LSB		19
++#define	CQSPI_REG_CMDCTRL_RD_BYTES_LSB		20
++#define	CQSPI_REG_CMDCTRL_RD_EN_LSB		23
++#define	CQSPI_REG_CMDCTRL_OPCODE_LSB		24
++#define	CQSPI_REG_CMDCTRL_WR_BYTES_MASK		0x7
++#define	CQSPI_REG_CMDCTRL_ADD_BYTES_MASK	0x3
++#define	CQSPI_REG_CMDCTRL_RD_BYTES_MASK		0x7
++#define	CQSPI_REG_INDIRECTWR			0x70
++#define	CQSPI_REG_INDIRECTWR_START_MASK		(1 << 0)
++#define	CQSPI_REG_INDIRECTWR_CANCEL_MASK	(1 << 1)
++#define	CQSPI_REG_INDIRECTWR_DONE_MASK		(1 << 5)
++#define	CQSPI_REG_INDIRECTWRWATERMARK		0x74
++#define	CQSPI_REG_INDIRECTWRSTARTADDR		0x78
++#define	CQSPI_REG_INDIRECTWRBYTES		0x7C
++#define	CQSPI_REG_CMDADDRESS			0x94
++#define	CQSPI_REG_CMDREADDATALOWER		0xA0
++#define	CQSPI_REG_CMDREADDATAUPPER		0xA4
++#define	CQSPI_REG_CMDWRITEDATALOWER		0xA8
++#define	CQSPI_REG_CMDWRITEDATAUPPER		0xAC
++/* Interrupt status bits */
++#define CQSPI_REG_IRQ_MODE_ERR			(1 << 0)
++#define CQSPI_REG_IRQ_UNDERFLOW			(1 << 1)
++#define CQSPI_REG_IRQ_IND_COMP			(1 << 2)
++#define CQSPI_REG_IRQ_IND_RD_REJECT		(1 << 3)
++#define CQSPI_REG_IRQ_WR_PROTECTED_ERR		(1 << 4)
++#define CQSPI_REG_IRQ_ILLEGAL_AHB_ERR		(1 << 5)
++#define CQSPI_REG_IRQ_WATERMARK			(1 << 6)
++#define CQSPI_REG_IRQ_IND_RD_OVERFLOW		(1 << 12)
++#define CQSPI_IRQ_STATUS_ERR		(CQSPI_REG_IRQ_MODE_ERR		| \
++					 CQSPI_REG_IRQ_IND_RD_REJECT	| \
++					 CQSPI_REG_IRQ_WR_PROTECTED_ERR	| \
++					 CQSPI_REG_IRQ_ILLEGAL_AHB_ERR)
++#define CQSPI_IRQ_MASK_RD		(CQSPI_REG_IRQ_MODE_ERR		| \
++					 CQSPI_REG_IRQ_IND_RD_REJECT	| \
++					 CQSPI_REG_IRQ_WATERMARK	| \
++					 CQSPI_REG_IRQ_IND_RD_OVERFLOW	| \
++					 CQSPI_REG_IRQ_IND_COMP)
++#define CQSPI_IRQ_MASK_WR		(CQSPI_REG_IRQ_MODE_ERR		| \
++					 CQSPI_REG_IRQ_WR_PROTECTED_ERR	| \
++					 CQSPI_REG_IRQ_IND_COMP		| \
++					 CQSPI_REG_IRQ_WATERMARK	| \
++					 CQSPI_REG_IRQ_UNDERFLOW)
++#define CQSPI_IRQ_STATUS_MASK		(0xFFFFFFFF)
++#define CQSPI_REG_IS_IDLE(base)						\
++		((CQSPI_READL(base + CQSPI_REG_CONFIG) >>		\
++			CQSPI_REG_CONFIG_IDLE_LSB) & 0x1)
++#define CQSPI_CAL_DELAY(tdelay_ns, tref_ns, tsclk_ns)			\
++		((((tdelay_ns) - (tsclk_ns)) / (tref_ns)))
++#define CQSPI_GET_RD_SRAM_LEVEL(reg_basse)				\
++		(((CQSPI_READL(reg_base + CQSPI_REG_SDRAMLEVEL)) >>	\
++		CQSPI_REG_SDRAMLEVEL_RD_LSB) & CQSPI_REG_SDRAMLEVEL_RD_MASK)
++#define CQSPI_READ_IRQ_STATUS(reg_base)					\
++		CQSPI_READL(reg_base + CQSPI_REG_IRQSTATUS)
++#define CQSPI_CLEAR_IRQ(reg_base, status)				\
++		CQSPI_WRITEL(status, reg_base + CQSPI_REG_IRQSTATUS)
++/* Functions call declaration */
++unsigned int cadence_qspi_apb_is_controller_ready(void *reg_base_addr);
++void cadence_qspi_apb_controller_init(struct struct_cqspi *cadence_qspi);
++int cadence_qspi_apb_process_queue(struct struct_cqspi *cadence_qspi,
++	struct spi_device *spi, unsigned int n_trans,
++	struct spi_transfer **spi_xfer);
++void cadence_qspi_apb_controller_enable(void *reg_base_addr);
++void cadence_qspi_apb_controller_disable(void *reg_base_addr);
++#endif /* __CADENCE_QSPI_APB_H__ */
+diff --git a/drivers/spi/spi-cadence-qspi.c b/drivers/spi/spi-cadence-qspi.c
+new file mode 100644
+index 000000000000..f5fe312595ea
+--- /dev/null
++++ b/drivers/spi/spi-cadence-qspi.c
+@@ -0,0 +1,571 @@
++/*
++ * Driver for Cadence QSPI Controller
++ *
++ * Copyright Altera Corporation (C) 2012-2014. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/clk.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/interrupt.h>
++#include <linux/errno.h>
++#include <linux/spi/spi.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/clk.h>
++#include "spi-cadence-qspi.h"
++#include "spi-cadence-qspi-apb.h"
++
++#define CADENCE_QSPI_NAME			"cadence-qspi"
++
++unsigned int cadence_qspi_init_timeout(const unsigned long timeout_in_ms)
++{
++	return jiffies + msecs_to_jiffies(timeout_in_ms);
++}
++unsigned int cadence_qspi_check_timeout(const unsigned long timeout)
++{
++	return time_before(jiffies, timeout);
++}
++static irqreturn_t cadence_qspi_irq_handler(int this_irq, void *dev)
++{
++	struct struct_cqspi *cadence_qspi = dev;
++	u32 irq_status;
++	unsigned long flags;
++
++	/* Read interrupt status
++	 * We need to ignore those that comes with irq_status 0.
++	 */
++	irq_status = CQSPI_READ_IRQ_STATUS(cadence_qspi->iobase);
++	if (!irq_status)
++		return IRQ_HANDLED;
++
++	cadence_qspi->irq_status = irq_status;
++
++	/* Clear interrupt */
++	CQSPI_CLEAR_IRQ(cadence_qspi->iobase, irq_status);
++	wake_up(&cadence_qspi->waitqueue);
++	return IRQ_HANDLED;
++}
++static void cadence_qspi_work(struct work_struct *work)
++{
++	struct struct_cqspi *cadence_qspi
++		= container_of(work, struct struct_cqspi, work);
++	unsigned long flags;
++
++	pr_debug("%s\n", __func__);
++	spin_lock_irqsave(&cadence_qspi->lock, flags);
++	while ((!list_empty(&cadence_qspi->msg_queue)) &&
++		cadence_qspi->running) {
++		struct spi_message *spi_msg;
++		struct spi_device *spi;
++		struct spi_transfer *spi_xfer;
++		struct spi_transfer *xfer[CQSPI_MAX_TRANS];
++		int status = 0;
++		int n_trans = 0;
++		int skip_xfer = 0;
++		spi_msg = container_of(cadence_qspi->msg_queue.next,
++			struct spi_message, queue);
++		list_del_init(&spi_msg->queue);
++		spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++		spi = spi_msg->spi;
++		list_for_each_entry(spi_xfer, &spi_msg->transfers,
++				transfer_list) {
++			if (n_trans >= CQSPI_MAX_TRANS) {
++				pr_debug("[%s]n_trans=%d CQSPI_MAX_TRANS=%d\n",
++					__func__, n_trans, CQSPI_MAX_TRANS);
++				dev_err(&spi->dev, "ERROR: Number of SPI "
++					"transfer is more than %d.\n",
++					CQSPI_MAX_TRANS);
++				/* Skip process the queue if number of
++				 * transaction is greater than max 2. */
++				skip_xfer = 1;
++				break;
++			}
++			xfer[n_trans++] = spi_xfer;
++		}
++		pr_debug("[%s]n_trans=%d CQSPI_MAX_TRANS=%d\n",
++			__func__, n_trans, CQSPI_MAX_TRANS);
++		if (!skip_xfer) {
++			status = cadence_qspi_apb_process_queue(cadence_qspi,
++						spi, n_trans, xfer);
++			if (!status) {
++				spi_msg->actual_length += xfer[0]->len;
++				if (n_trans > 1)
++					spi_msg->actual_length += xfer[1]->len;
++			}
++			spi_msg->status = status;
++			spi_msg->complete(spi_msg->context);
++		}
++		spin_lock_irqsave(&cadence_qspi->lock, flags);
++	}
++	spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++}
++static int cadence_qspi_transfer(struct spi_device *spi,
++	struct spi_message *msg)
++{
++	struct struct_cqspi *cadence_qspi =
++		spi_master_get_devdata(spi->master);
++	struct spi_transfer *spi_xfer;
++	struct platform_device *pdev = cadence_qspi->pdev;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	unsigned long flags;
++
++	pr_debug("%s\n", __func__);
++	list_for_each_entry(spi_xfer, &msg->transfers, transfer_list) {
++		if (spi_xfer->speed_hz > (pdata->master_ref_clk_hz / 2)) {
++			dev_err(&spi->dev, "speed_hz%d greater than "
++				"maximum %dHz\n",
++				spi_xfer->speed_hz,
++				(pdata->master_ref_clk_hz / 2));
++			msg->status = -EINVAL;
++			return -EINVAL;
++		}
++	}
++	spin_lock_irqsave(&cadence_qspi->lock, flags);
++	if (!cadence_qspi->running) {
++		spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++		return -ESHUTDOWN;
++	}
++	msg->status = -EINPROGRESS;
++	msg->actual_length = 0;
++	list_add_tail(&msg->queue, &cadence_qspi->msg_queue);
++	queue_work(cadence_qspi->workqueue, &cadence_qspi->work);
++	spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++	return 0;
++}
++static int cadence_qspi_setup(struct spi_device *spi)
++{
++	pr_debug("%s\n", __func__);
++	if (spi->chip_select > spi->master->num_chipselect) {
++		dev_err(&spi->dev, "%d chip select is out of range\n",
++			spi->chip_select);
++		return -EINVAL;
++	}
++	pr_debug("cadence_qspi : bits per word %d, chip select %d, "
++		"speed %d KHz\n", spi->bits_per_word, spi->chip_select,
++		spi->max_speed_hz);
++	return 0;
++}
++static int cadence_qspi_start_queue(struct struct_cqspi *cadence_qspi)
++{
++	unsigned long flags;
++
++	pr_debug("%s\n", __func__);
++	spin_lock_irqsave(&cadence_qspi->lock, flags);
++	if (cadence_qspi->running) {
++		spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++		return -EBUSY;
++	}
++	if (!cadence_qspi_apb_is_controller_ready(cadence_qspi->iobase)) {
++		spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++		return -EBUSY;
++	}
++	cadence_qspi->running = true;
++	spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++	queue_work(cadence_qspi->workqueue, &cadence_qspi->work);
++	return 0;
++}
++static int cadence_qspi_stop_queue(struct struct_cqspi *cadence_qspi)
++{
++	unsigned long flags;
++	unsigned limit = 500;
++	int status = 0;
++
++	spin_lock_irqsave(&cadence_qspi->lock, flags);
++	cadence_qspi->running = false;
++	/* We will wait until controller process all the queue and ensure the
++	 * controller is not busy. */
++	while ((!list_empty(&cadence_qspi->msg_queue) ||
++		!cadence_qspi_apb_is_controller_ready(cadence_qspi->iobase))
++		&& limit--) {
++		spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++		msleep(20);
++		spin_lock_irqsave(&cadence_qspi->lock, flags);
++	}
++	if (!list_empty(&cadence_qspi->msg_queue) ||
++		!cadence_qspi_apb_is_controller_ready(cadence_qspi->iobase))
++		status = -EBUSY;
++	spin_unlock_irqrestore(&cadence_qspi->lock, flags);
++	return status;
++}
++static int cadence_qspi_of_get_pdata(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++	struct device_node *nc;
++	struct cqspi_platform_data *pdata = pdev->dev.platform_data;
++	struct cqspi_flash_pdata *f_pdata;
++	unsigned int cs;
++	unsigned int prop;
++
++	/* this function works with device tree information */
++	if (of_property_read_u32(np, "lantiq,qspi-phyaddr", &prop)) {
++		dev_err(&pdev->dev,
++			"couldn't determine lantiq,qspi-phyaddr\n");
++		return -ENXIO;
++	}
++	pdata->qspi_ahb_phy = prop;
++
++	if (of_property_read_u32(np, "lantiq,qspi-physize", &prop)) {
++		dev_info(&pdev->dev,
++			 "missing lantiq,qspi-physize; default to 128 MB\n");
++		prop = 128;
++	}
++	pdata->qspi_ahb_size = prop * 1024 * 1024; /* translate to MBytes */
++
++	/* Some arch (e.g. twinhill) do not work with default mask 0xFFFFF */
++	if (of_property_read_u32(np, "lantiq,qspi-phymask", &prop))
++		prop = CQSPI_INDIRECTTRIGGER_ADDR_MASK;
++
++	pdata->qspi_ahb_mask = prop;
++
++	if (of_property_read_u32(np, "bus-num", &prop)) {
++		dev_err(&pdev->dev, "couldn't determine bus-num\n");
++		return -ENXIO;
++	}
++	pdata->bus_num = prop;
++	if (of_property_read_u32(np, "num-chipselect", &prop)) {
++		dev_err(&pdev->dev, "couldn't determine num-chipselect\n");
++		return -ENXIO;
++	}
++	pdata->num_chipselect = prop;
++	if (of_property_read_u32(np, "fifo-depth", &prop)) {
++		dev_err(&pdev->dev, "couldn't determine fifo-depth\n");
++		return -ENXIO;
++	}
++	pdata->fifo_depth = prop;
++
++	if (of_property_read_u32(np, "ext-decoder", &prop)) {
++		dev_err(&pdev->dev, "couldn't determine ext-decoder\n");
++		return -ENXIO;
++	}
++	pdata->ext_decoder = prop;
++	pdata->enable_dma = of_property_read_bool(np, "dmas");
++	dev_info(&pdev->dev, "DMA %senabled\n",
++		pdata->enable_dma ? "" : "NOT ");
++
++	/* Get flash devices platform data */
++	for_each_child_of_node(np, nc) {
++		if (!of_device_is_available(nc))
++			continue;
++
++		if (of_property_read_u32(nc, "reg", &cs)) {
++			dev_err(&pdev->dev, "couldn't determine reg\n");
++			return -ENXIO;
++		}
++		f_pdata = &(pdata->f_pdata[cs]);
++
++		/* use compatible string to determine flash type */
++		if (of_device_is_compatible(nc, "lantiq,spinand"))
++			f_pdata->flash_type = QSPI_FLASH_TYPE_NAND;
++		else
++			f_pdata->flash_type = QSPI_FLASH_TYPE_NOR;
++
++		pr_debug("[%s]cs=%d flash-type=%d\n", __func__, cs,
++			 f_pdata->flash_type);
++
++		if (of_property_read_u32(nc, "spi-rx-bus-width", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine quad\n");
++			return -ENXIO;
++		}
++		pr_debug("[%s]cs=%d quad=%d\n", __func__, cs, prop);
++		if (prop == 4)
++			f_pdata->quad = QUAD_QIO;
++		else
++			f_pdata->quad = QUAD_SIO;
++		if (of_property_read_u32(nc, "page-size", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine page-size\n");
++			return -ENXIO;
++		}
++		f_pdata->page_size = prop;
++		if (of_property_read_u32(nc, "block-size", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine block-size\n");
++			return -ENXIO;
++		}
++		f_pdata->block_size = prop;
++
++		if (of_property_read_u32(nc, "read-delay", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine read-delay\n");
++			return -ENXIO;
++		}
++		f_pdata->read_delay = prop;
++		if (of_property_read_u32(nc, "tshsl-ns", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine tshsl-ns\n");
++			return -ENXIO;
++		}
++		f_pdata->tshsl_ns = prop;
++		if (of_property_read_u32(nc, "tsd2d-ns", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine tsd2d-ns\n");
++			return -ENXIO;
++		}
++		f_pdata->tsd2d_ns = prop;
++		if (of_property_read_u32(nc, "tchsh-ns", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine tchsh-ns\n");
++			return -ENXIO;
++		}
++		f_pdata->tchsh_ns = prop;
++		if (of_property_read_u32(nc, "tslch-ns", &prop)) {
++			dev_err(&pdev->dev, "couldn't determine tslch-ns\n");
++			return -ENXIO;
++		}
++		f_pdata->tslch_ns = prop;
++	}
++	return 0;
++}
++
++static void cadence_qspi_rst(struct struct_cqspi *cadence_qspi,
++	struct platform_device *pdev)
++{
++	cadence_qspi->reset = devm_reset_control_get(&pdev->dev, "qspi");
++	if (IS_ERR(cadence_qspi->reset))
++		dev_err(&pdev->dev, "qspi get reset fail.\n");
++
++	reset_control_assert(cadence_qspi->reset);
++	reset_control_deassert(cadence_qspi->reset);
++}
++
++static int cadence_qspi_probe(struct platform_device *pdev)
++{
++	struct spi_master *master;
++	struct struct_cqspi *cadence_qspi;
++	struct resource *res;
++	struct resource *res_ahb;
++	struct cqspi_platform_data *pdata;
++	int status;
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++	struct cqspi_flash_pdata *f_pdata;
++
++	pr_debug("%s %s %s\n", __func__,
++		pdev->name, pdev->id_entry->name);
++	master = spi_alloc_master(&pdev->dev, sizeof(*cadence_qspi));
++	if (master == NULL) {
++		dev_err(&pdev->dev, "spi_alloc_master failed\n");
++		return -ENOMEM;
++	}
++	master->mode_bits = SPI_CS_HIGH | SPI_CPOL | SPI_CPHA | SPI_TX_QUAD |
++			    SPI_RX_QUAD | SPI_TX_DUAL | SPI_RX_DUAL;
++	master->setup = cadence_qspi_setup;
++	master->transfer = cadence_qspi_transfer;
++	master->dev.of_node = pdev->dev.of_node;
++	cadence_qspi = spi_master_get_devdata(master);
++	cadence_qspi->pdev = pdev;
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	cadence_qspi->iobase = devm_ioremap_resource(&pdev->dev, res);
++	if (!cadence_qspi->iobase) {
++		dev_err(&pdev->dev, "devm_ioremap_resource res 0 failed\n");
++		status = -EADDRNOTAVAIL;
++		goto err_ioremap;
++	}
++
++	pdata = kmalloc(sizeof(struct cqspi_platform_data), GFP_KERNEL);
++	if (!pdata) {
++		status = -ENOMEM;
++		goto err_pdata;
++	}
++	pdev->dev.platform_data = pdata;
++	cadence_qspi->clk = devm_clk_get(&pdev->dev, "qspi");
++	if (IS_ERR(cadence_qspi->clk)) {
++		dev_err(&pdev->dev, "cannot get qspi clk\n");
++		return PTR_ERR(cadence_qspi->clk);
++	}
++	cadence_qspi->fpi_clk = devm_clk_get(&pdev->dev, "freq");
++	if (IS_ERR(cadence_qspi->fpi_clk)) {
++		dev_err(&pdev->dev, "cannot get qspi fpi_clk\n");
++		return PTR_ERR(cadence_qspi->fpi_clk);
++	}
++	pdata->master_ref_clk_hz = clk_get_rate(cadence_qspi->fpi_clk);
++	status = clk_prepare_enable(cadence_qspi->clk);
++	if (status < 0) {
++		dev_err(&pdev->dev,
++			"failed to enable qspi clock: %d\n", status);
++		return status;
++	}
++
++	status = cadence_qspi_of_get_pdata(pdev);
++	if (status) {
++		dev_err(&pdev->dev, "Get platform data failed.\n");
++		goto err_of;
++	}
++
++	cadence_qspi->res = res;
++
++	/* request and remap ahb */
++	status = devm_request_mem_region(&pdev->dev, pdata->qspi_ahb_phy,
++					 pdata->qspi_ahb_size, "ahb");
++	if (!status) {
++		dev_err(&pdev->dev, "failed to request memory region\n");
++		status = -EADDRNOTAVAIL;
++		goto err_ahbremap;
++	}
++
++	cadence_qspi->qspi_ahb_virt = devm_ioremap(&pdev->dev,
++						   pdata->qspi_ahb_phy,
++						   pdata->qspi_ahb_size);
++	if (!cadence_qspi->qspi_ahb_virt) {
++		dev_err(&pdev->dev, "failed to remap memory region\n");
++		status = -EADDRNOTAVAIL;
++		goto err_ahbremap;
++	}
++
++	cadence_qspi_rst(cadence_qspi, pdev);
++	cadence_qspi->workqueue =
++		create_singlethread_workqueue(dev_name(master->dev.parent));
++	if (!cadence_qspi->workqueue) {
++		dev_err(&pdev->dev, "create_workqueue failed\n");
++		status = -ENOMEM;
++		goto err_wq;
++	}
++	cadence_qspi->running = false;
++	INIT_WORK(&cadence_qspi->work, cadence_qspi_work);
++	spin_lock_init(&cadence_qspi->lock);
++	INIT_LIST_HEAD(&cadence_qspi->msg_queue);
++	init_waitqueue_head(&cadence_qspi->waitqueue);
++	status = cadence_qspi_start_queue(cadence_qspi);
++	if (status) {
++		dev_err(&pdev->dev, "problem starting queue.\n");
++		goto err_start_q;
++	}
++	cadence_qspi->irq = platform_get_irq(pdev, 0);
++	if (cadence_qspi->irq < 0) {
++		dev_err(&pdev->dev, "platform_get_irq failed\n");
++		status = -ENXIO;
++		goto err_irq;
++	}
++	status = request_irq(cadence_qspi->irq, cadence_qspi_irq_handler,
++		0, pdev->name, cadence_qspi);
++	if (status) {
++		dev_err(&pdev->dev, "request_irq failed\n");
++		goto err_irq;
++	}
++	master->bus_num = pdata->bus_num;
++	master->num_chipselect = pdata->num_chipselect;
++	platform_set_drvdata(pdev, master);
++	cadence_qspi_apb_controller_init(cadence_qspi);
++	cadence_qspi->current_cs = 0;
++	status = spi_register_master(master);
++	if (status) {
++		dev_err(&pdev->dev, "spi_register_master=%d failed\n", status);
++		goto err_of;
++	}
++	dev_info(&pdev->dev, "Cadence QSPI controller driver\n");
++	return 0;
++err_of:
++	kfree(pdata);
++err_pdata:
++	free_irq(cadence_qspi->irq, cadence_qspi);
++err_start_q:
++err_irq:
++	destroy_workqueue(cadence_qspi->workqueue);
++err_wq:
++err_ahbremap:
++err_ioremap:
++	spi_master_put(master);
++	dev_err(&pdev->dev, "Cadence QSPI controller probe failed\n");
++	return status;
++}
++static int cadence_qspi_remove(struct platform_device *pdev)
++{
++	struct spi_master *master = platform_get_drvdata(pdev);
++	struct struct_cqspi *cadence_qspi = spi_master_get_devdata(master);
++
++	cadence_qspi_apb_controller_disable(cadence_qspi->iobase);
++	platform_set_drvdata(pdev, NULL);
++	destroy_workqueue(cadence_qspi->workqueue);
++	free_irq(cadence_qspi->irq, cadence_qspi);
++	iounmap(cadence_qspi->iobase);
++	iounmap(cadence_qspi->qspi_ahb_virt);
++	release_mem_region(cadence_qspi->res->start,
++		resource_size(cadence_qspi->res));
++	kfree(pdev->dev.platform_data);
++	spi_unregister_master(master);
++	spi_master_put(master);
++	return 0;
++}
++#ifdef CONFIG_PM
++static int cadence_qspi_suspend(struct device *dev)
++{
++	struct spi_master	*master = dev_get_drvdata(dev);
++	struct struct_cqspi *cadence_qspi = spi_master_get_devdata(master);
++	int status = 0;
++
++	/* Stop the queue */
++	status = cadence_qspi_stop_queue(cadence_qspi);
++	if (status != 0)
++		return status;
++	/* Disable the controller to conserve the power */
++	cadence_qspi_apb_controller_disable(cadence_qspi->iobase);
++	return 0;
++}
++static int cadence_qspi_resume(struct device *dev)
++{
++	struct spi_master	*master = dev_get_drvdata(dev);
++	struct struct_cqspi *cadence_qspi = spi_master_get_devdata(master);
++	int status = 0;
++	cadence_qspi_apb_controller_enable(cadence_qspi->iobase);
++	/* Start the queue running */
++	status = cadence_qspi_start_queue(cadence_qspi);
++	if (status != 0) {
++		cadence_qspi_apb_controller_disable(cadence_qspi->iobase);
++		dev_err(dev, "problem starting queue (%d)\n", status);
++		return status;
++	}
++	return 0;
++}
++static const struct dev_pm_ops cadence_qspi__dev_pm_ops = {
++	.suspend	= cadence_qspi_suspend,
++	.resume		= cadence_qspi_resume,
++};
++#define	CADENCE_QSPI_DEV_PM_OPS	(&cadence_qspi__dev_pm_ops)
++#else
++#define	CADENCE_QSPI_DEV_PM_OPS	NULL
++#endif
++#ifdef CONFIG_OF
++static struct of_device_id cadence_qspi_of_match[] = {
++	{ .compatible = "cadence,qspi",},
++	{ /* end of table */}
++};
++MODULE_DEVICE_TABLE(of, cadence_qspi_of_match);
++#else
++#define cadence_qspi_of_match NULL
++#endif /* CONFIG_OF */
++static struct platform_driver cadence_qspi_platform_driver = {
++	.probe		= cadence_qspi_probe,
++	.remove		= cadence_qspi_remove,
++	.driver = {
++		.name	= CADENCE_QSPI_NAME,
++		.owner	= THIS_MODULE,
++		.pm	= CADENCE_QSPI_DEV_PM_OPS,
++		.of_match_table = cadence_qspi_of_match,
++	},
++};
++static int __init cadence_qspi_init(void)
++{
++	return platform_driver_register(&cadence_qspi_platform_driver);
++}
++static void __exit cadence_qspi_exit(void)
++{
++	platform_driver_unregister(&cadence_qspi_platform_driver);
++}
++module_init(cadence_qspi_init);
++module_exit(cadence_qspi_exit);
++MODULE_AUTHOR("Ley Foon Tan <lftan@altera.com>");
++MODULE_DESCRIPTION("Cadence QSPI Controller Driver");
++MODULE_LICENSE("GPL");
++MODULE_ALIAS("platform:" CADENCE_QSPI_NAME);
+diff --git a/drivers/spi/spi-cadence-qspi.h b/drivers/spi/spi-cadence-qspi.h
+new file mode 100644
+index 000000000000..d52cb4426c0a
+--- /dev/null
++++ b/drivers/spi/spi-cadence-qspi.h
+@@ -0,0 +1,107 @@
++/*
++ * Driver for Cadence QSPI Controller
++ *
++ * Copyright Altera Corporation (C) 2012-2014. All rights reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU General Public License along with
++ * this program.  If not, see <http://www.gnu.org/licenses/>.
++ */
++#include <linux/reset.h>
++#ifndef __CADENCE_QSPI_H__
++#define __CADENCE_QSPI_H__
++#define CQSPI_MAX_TRANS				(10)
++#define CQSPI_MAX_CHIP_SELECT			(16)
++#define DC_MODE						0
++#define STIG_READ_MODE				1
++#define STIG_WRITE_MODE				2
++#define STIG_WRITE_READ_MODE		3
++#define IDC_READ_MODE				4
++#define IDC_WRITE_MODE				5
++
++#define QSPI_FLASH_TYPE_NOR		0
++#define QSPI_FLASH_TYPE_NAND	1
++
++#define QUAD_SIO			0
++#define QUAD_DIO			1
++#define QUAD_QIO			2
++
++#define QUAD_LSB			4
++
++#define MACRONIX_4PP_CMD		0x38
++#define MACRONIX_WRSR_CMD		0x01
++
++struct cqspi_flash_pdata {
++	unsigned int page_size;
++	unsigned int block_size;
++	unsigned int flash_type;
++	unsigned int quad;
++	unsigned int read_delay;
++	unsigned int tshsl_ns;
++	unsigned int tsd2d_ns;
++	unsigned int tchsh_ns;
++	unsigned int tslch_ns;
++};
++struct cqspi_platform_data {
++	unsigned int bus_num;
++	unsigned int num_chipselect;
++	unsigned int qspi_ahb_phy;
++	unsigned int qspi_ahb_size;
++	unsigned int qspi_ahb_mask;
++	unsigned int master_ref_clk_hz;
++	unsigned int ext_decoder;
++	unsigned int fifo_depth;
++	unsigned int enable_dma;
++	unsigned int tx_dma_peri_id;
++	unsigned int rx_dma_peri_id;
++	struct cqspi_flash_pdata f_pdata[CQSPI_MAX_CHIP_SELECT];
++};
++struct struct_cqspi
++{
++	struct work_struct work;
++	struct workqueue_struct *workqueue;
++	wait_queue_head_t waitqueue;
++	struct list_head msg_queue;
++	struct platform_device *pdev;
++	struct clk *clk;
++	struct clk *fpi_clk;
++	struct reset_control *reset;
++	/* lock protects queue and registers */
++	spinlock_t lock;
++	/* Virtual base address of the controller */
++	void __iomem *iobase;
++	/* QSPI AHB virtual address */
++	void __iomem *qspi_ahb_virt;
++	/* phys mem */
++	struct resource *res;
++	/* AHB phys mem */
++	struct resource *res_ahb;
++	/* Interrupt */
++	int irq;
++	/* Interrupt status */
++	unsigned int irq_status;
++	/* Current chip select */
++	int current_cs;
++	/* Is queue running */
++	bool running;
++	/* DMA support */
++	struct dma_chan *txchan;
++	struct dma_chan *rxchan;
++	dma_addr_t dma_addr;
++	int dma_done;
++};
++/* Kernel function hook */
++#define CQSPI_WRITEL		__raw_writel
++#define CQSPI_READL		__raw_readl
++unsigned int cadence_qspi_init_timeout(const unsigned long timeout_in_ms);
++unsigned int cadence_qspi_check_timeout(const unsigned long timeout);
++#define debugline	// printk("[%s]%d caller address=0x%x\n", __func__, __LINE__, __builtin_return_address(0))
++#endif /* __CADENCE_QSPI_H__ */

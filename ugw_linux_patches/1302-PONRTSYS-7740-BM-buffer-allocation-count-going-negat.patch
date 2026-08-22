@@ -1,0 +1,119 @@
+From 31c4efadbffebdf6159e4913af50dcd3f4c73229 Mon Sep 17 00:00:00 2001
+From: Elad Fernandes <elad.fernandes@intel.com>
+Date: Thu, 14 May 2020 15:14:10 +0300
+Subject: [PATCH] PONRTSYS-7740: BM buffer allocation count going negative
+
+Reading cofiguration from DB instead of the HW RAM
+---
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c  | 39 +++++++++++-----------
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.c        | 16 ---------
+ include/linux/pp_buffer_mgr_api.h                  |  1 -
+ 3 files changed, 20 insertions(+), 36 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+index 1fb7ba57a3e5..d5bfc7dc0d78 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+@@ -1260,8 +1260,7 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 		}
+ 
+ 		/* Verify isolated pool is not used by any policy */
+-		if (db->pools[pool_id].params.flags &
+-		    POOL_ISOLATED) {
++		if (db->pools[pool_id].params.flags & POOL_ISOLATED) {
+ 			if (db->pools[pool_id].policy_ref_cnt) {
+ 				pr_err("Isolated Pool %d has a policy\n",
+ 				       pool_id);
+@@ -1698,7 +1697,8 @@ EXPORT_SYMBOL(pp_bmgr_policy_conf_get);
+ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 			     u16 policy_id)
+ {
+-	u32 num_pools_in_policy;
++	struct pp_bmgr_policy_params *param;
++	u8 pool_idx;
+ 	s32 ret = 0;
+ 
+ 	if (unlikely(!__bmgr_is_ready()))
+@@ -1723,22 +1723,23 @@ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 	if (unlikely(ret))
+ 		pr_err("bm_policy_stats_get %d failed\n", policy_id);
+ 
+-	num_pools_in_policy =
+-		db->policies[policy_id].params.num_pools_in_policy;
+-
+-	stats->policy_pools[0] = (stats->policy_pools_mapping & 0xFF);
+-	stats->policy_pools[1] =
+-		(num_pools_in_policy >= 2) ?
+-			(stats->policy_pools_mapping >> 8) & 0xFF :
+-			-1;
+-	stats->policy_pools[2] =
+-		(num_pools_in_policy >= 3) ?
+-			(stats->policy_pools_mapping >> 16) & 0xFF :
+-			-1;
+-	stats->policy_pools[3] =
+-		(num_pools_in_policy >= 4) ?
+-			(stats->policy_pools_mapping >> 24) & 0xFF :
+-			-1;
++	/* read configuration from DB only */
++	param = &db->policies[policy_id].params;
++	stats->policy_max_allowed = param->max_allowed;
++	stats->policy_min_guaranteed = param->min_guaranteed;
++	stats->policy_grp_association = db->policies[policy_id].group_id;
++
++	for (pool_idx = 0 ; pool_idx < PP_BM_MAX_POOLS_PER_PLCY ; pool_idx++) {
++		if (param->num_pools_in_policy > pool_idx) {
++			stats->policy_pools[pool_idx] =
++				param->pools_in_policy[pool_idx].pool_id;
++			stats->policy_max_allowed_per_pool[pool_idx] =
++				param->pools_in_policy[pool_idx].max_allowed;
++		} else {
++			stats->policy_pools[pool_idx] = -1;
++			stats->policy_max_allowed_per_pool[pool_idx] = 0;
++		}
++	}
+ 
+ 	return ret;
+ }
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+index 1cebf85659f6..cfb46d98a866 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+@@ -256,26 +256,10 @@ s32 bm_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 	reg_val = PP_REG_RD32(PP_BM_NULL_CNT_REG_IDX(policy_id));
+ 	stats->policy_null_ctr = FIELD_GET(PP_BM_NULL_CNT_MSK, reg_val);
+ 
+-	stats->policy_max_allowed =
+-		PP_REG_RD32(BM_PLCY_MAX_ALLOWED(policy_id));
+-
+-	stats->policy_min_guaranteed =
+-		PP_REG_RD32(BM_PLCY_MIN_GUARANTEED(policy_id));
+-
+-	stats->policy_grp_association =
+-		PP_REG_RD32(BM_PLCY_GRP_ASSOCIATED(policy_id));
+-
+-	stats->policy_pools_mapping =
+-		PP_REG_RD32(BM_PLCY_POOLS_MAPPING(policy_id));
+-
+ 	stats->policy_alloc_buff =
+ 		PP_REG_RD32(BM_PLCY_ALLOC_BUFF_CTR(policy_id));
+ 
+ 	for (pool_idx = 0 ; pool_idx < PP_BM_MAX_POOLS_PER_PLCY ; pool_idx++) {
+-		stats->policy_max_allowed_per_pool[pool_idx] =
+-			PP_REG_RD32(BM_PLCY_MAX_ALLOW_PER_POOL(policy_id,
+-							       pool_idx));
+-
+ 		stats->policy_alloc_buff_per_pool[pool_idx] =
+ 			PP_REG_RD32(BM_PLCY_ALOC_BUF_PR_POL_CTR(pool_idx,
+ 								policy_id));
+diff --git a/include/linux/pp_buffer_mgr_api.h b/include/linux/pp_buffer_mgr_api.h
+index 967ba5d31c59..cb3aecd45397 100644
+--- a/include/linux/pp_buffer_mgr_api.h
++++ b/include/linux/pp_buffer_mgr_api.h
+@@ -131,7 +131,6 @@ struct pp_bmgr_policy_stats {
+ 	u32 policy_grp_association;
+ 
+ 	/*! Mapped pools */
+-	u32 policy_pools_mapping;
+ 	s8  policy_pools[PP_BM_MAX_POOLS_PER_PLCY];
+ 
+ 	/*! Total allocated buffers */

@@ -1,0 +1,665 @@
+From 33e90e9554b9e870dd2ab0cc2e429ada70955c48 Mon Sep 17 00:00:00 2001
+From: Jack Ping CHNG <jack.ping.chng@linux.intel.com>
+Date: Thu, 30 Apr 2020 10:36:49 +0800
+Subject: [PATCH] Revert "DRV_DPM_SW-161: DPM merge dp_dev_list and
+ dp_bp_dev_tbl array"
+
+This reverts commit 1c976feeade387f71846e455ae037d3abe489752.
+---
+ drivers/net/datapath/dpm/datapath.h              |  7 ++
+ drivers/net/datapath/dpm/datapath_api.c          | 99 +++++++++++-------------
+ drivers/net/datapath/dpm/datapath_instance.c     | 74 +++++++++++-------
+ drivers/net/datapath/dpm/datapath_instance.h     | 25 +++---
+ drivers/net/datapath/dpm/datapath_logical_dev.c  |  2 +-
+ drivers/net/datapath/dpm/datapath_misc.c         |  8 +-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 51 ++++++------
+ 7 files changed, 139 insertions(+), 127 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 8c80818f3c0e..a4ac7dc239e7 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -657,6 +657,7 @@ struct pmac_port_info {
+ /*bridge port with pmapper supported dev structure */
+ struct bp_pmapper_dev {
+ 	int flag;/*0-FREE, 1-Used*/
++	struct net_device *dev; /*bridge port device pointer */
+ 	int pcp[DP_PMAP_PCP_NUM];  /*PCP table */
+ 	int dscp[DP_PMAP_DSCP_NUM]; /*DSCP table*/
+ 	int def_ctp; /*Untag & nonip*/
+@@ -821,6 +822,7 @@ extern struct pmac_port_info *dp_port_info[DP_MAX_INST];
+ extern struct q_info dp_q_tbl[DP_MAX_INST][DP_MAX_QUEUE_NUM];
+ extern struct dp_sched_info dp_sched_tbl[DP_MAX_INST][DP_MAX_SCHED_NUM];
+ extern struct cqm_port_info dp_deq_port_tbl[DP_MAX_INST][DP_MAX_CQM_DEQ];
++extern struct bp_pmapper_dev dp_bp_dev_tbl[DP_MAX_INST][DP_MAX_BP_NUM];
+ extern struct dma_chan_info *dp_dma_chan_tbl[DP_MAX_INST];
+ 
+ static inline struct inst_property *get_dp_port_prop(int inst)
+@@ -838,6 +840,11 @@ static inline struct cqm_port_info *get_dp_deqport_info(int inst, int idx)
+ 	return &dp_deq_port_tbl[inst][idx];
+ }
+ 
++static inline struct bp_pmapper_dev *get_dp_bp_info(int inst, int idx)
++{
++	return &dp_bp_dev_tbl[inst][idx];
++}
++
+ static inline struct q_info *get_dp_q_info(int inst, int idx)
+ {
+ 	return &dp_q_tbl[inst][idx];
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index d09720299b33..6ed69de0233d 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -70,6 +70,13 @@ int dp_inst_num;
+ struct inst_property dp_port_prop[DP_MAX_INST];
+ /* Keep all subif information per instance/LPID/subif */
+ struct pmac_port_info *dp_port_info[DP_MAX_INST];
++
++/* bp_mapper_dev[] is mainly for PON case
++ * Only if multiple gem port are attached to same bridge port,
++ * This bridge port device will be recorded into this bp_mapper_dev[].
++ * later other information, like pmapper ID/mapping table will be put here also
++ */
++struct bp_pmapper_dev dp_bp_dev_tbl[DP_MAX_INST][DP_MAX_BP_NUM];
+ /* q_tbl[] is mainly for the queue created/used during dp_register_subif_ext
+  */
+ struct q_info dp_q_tbl[DP_MAX_INST][DP_MAX_QUEUE_NUM];
+@@ -766,7 +773,10 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 
+ 	if (i < end) {
+ 		res = DP_SUCCESS;
+-		dp_inst_add_dev(dev, data->ctp_dev, subif_name,
++
++		if (get_dp_bp_info(inst, sif->bp)->ref_cnt > 1)
++			return res;
++		dp_inst_add_dev(dev, subif_name,
+ 				subif_id->inst, subif_id->port_id,
+ 				sif->bp,
+ 				subif_id->subif, flags);
+@@ -786,7 +796,7 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 				    u32 flags)
+ {
+ 	int res = DP_FAILURE;
+-	int i, j, port_id, cqm_port = 0, bp, idx;
++	int i, j, port_id, cqm_port = 0, bp;
+ 	u8 find = 0;
+ 	struct pmac_port_info *port_info;
+ 	struct cbm_dp_en_data cbm_data = {0};
+@@ -796,7 +806,6 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	struct inst_info *dp_info = get_dp_prop_info(inst);
+ 	struct dp_node_alloc port_node;
+ 	struct q_info *q_info;
+-	struct dp_dev *dp_dev;
+ 
+ 	port_id = subif_id->port_id;
+ 	port_info = get_dp_port_info(inst, port_id);
+@@ -855,6 +864,7 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	/* reset mib, flag, and others */
+ 	memset(&sif->mib, 0, sizeof(sif->mib));
+ 	sif->flags = 0;
++	sif->netif = NULL;
+ 	port_info->num_subif--;
+ 
+ 	/* subif_hw_reset */
+@@ -863,8 +873,6 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 		pr_err("subif_platform_set fail\n");
+ 		/*return res;*/
+ 	}
+-	sif->netif = NULL;
+-
+ 	if (!port_info->num_subif)
+ 		port_info->status = PORT_DEV_REGISTERED;
+ 	for (j = 0; j < sif->num_qid; j++) {
+@@ -915,9 +923,7 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	 *  2)for GRX350, bp/dev should be always zero/NULL at present
+ 	 *        before adapting to new datapath framework
+ 	 */
+-	idx = dp_dev_hash(dev, subif_name);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, subif_name, 0);
+-	if (dp_dev && get_dp_bp_ref_cnt(dp_dev) == 0) {
++	if (!get_dp_bp_info(inst, bp)->dev) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG, "%s for %s inst=%d bp=%d\n",
+ 			 "dp_inst_del_dev", dev->name, inst, bp);
+ 
+@@ -1030,9 +1036,9 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 
+ 	DP_LIB_LOCK(&dp_lock);
+ 	/* update the master device info to subif */
+-	idx = dp_dev_hash(info->new_dev, NULL);
+ 	if (info->new_dev != old_dev) {
+ 		/* check if exists in DP dev_list */
++		idx = dp_dev_hash(info->new_dev, NULL);
+ 		dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+ 				       info->new_dev, NULL, 0);
+ 		if (!dp_dev) {
+@@ -1046,26 +1052,30 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 				pr_err("Fail to alloc bridge port\n");
+ 				goto exit;
+ 			}
+-
+-			res = dp_inst_add_dev(info->new_dev, info->new_ctp_dev, NULL,
+-							info->inst, info->dp_port, bp, vap, 0);
+-			if (res) {
+-				pr_err("Fail to add dev\n");
+-				goto exit;
++			if (info->new_ctp_dev) {
++				DP_DEBUG(DP_DBG_FLAG_REG,
++					 "master dev with new bp(%d)\n", bp);
++				/* update bridge port table reference counter */
++				bp_info = get_dp_bp_info(info->inst, bp);
++				bp_info->dev = info->new_dev;
++				bp_info->ref_cnt = 1;
++				bp_info->flag = 1;
+ 			}
++			dp_inst_add_dev(info->new_dev, NULL, info->inst,
++					info->dp_port, bp, vap, 0);
+ 		} else {
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+ 				 "new master dev(%s) exists\n",
+ 				 info->new_dev->name);
+ 			bp = dp_dev->bp;
+ 			fid = dp_dev->fid;
+-			bp_info = &dp_dev->bp_info;
++			bp_info = get_dp_bp_info(info->inst, bp);
++			if (!bp_info->flag) {
++				pr_err("why bp_info->flag:%d(%s)?\n",
++				       bp_info->flag, "expect 1");
++				goto exit;
++			}
+ 			if (info->new_ctp_dev) {
+-				if (!bp_info->flag) {
+-					pr_err("why bp_info->flag:%d(%s)?\n",
+-					       bp_info->flag, "expect 1");
+-					goto exit;
+-				}
+ 				bp_info->ref_cnt++;
+ 
+ 				DP_DEBUG(DP_DBG_FLAG_REG,
+@@ -1082,17 +1092,12 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 		if (res)
+ 			goto exit;
+ 	}
+-
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+-				info->new_dev, NULL, 0);
+-	if (!dp_dev)
+-		goto exit;
+-
+-	bp_info = &dp_dev->bp_info;
++	bp_info = get_dp_bp_info(info->inst, sif->bp);
+ 	if (old_ctp_dev) {
+ 		if (old_ctp_dev != info->new_ctp_dev) {
+ 			bp_info->ref_cnt--;
+ 			if (!bp_info->ref_cnt) {
++				bp_info->dev = NULL;
+ 				bp_info->flag = 0;
+ 			}
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+@@ -1109,7 +1114,7 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 		old_data.ctp_dev = old_ctp_dev;
+ 	}
+ 	/* remove old dev */
+-	if ((!bp_info->ref_cnt) && (f_rem_old_dev)) {
++	if ((!bp_info->dev) && (f_rem_old_dev)) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+ 			 "del old master dev(%s) from dp_dev list\n",
+ 			 old_dev->name);
+@@ -1919,7 +1924,6 @@ int dp_get_port_subitf_via_dev_private(struct net_device *dev,
+ 			return DP_SUCCESS;
+ 		}
+ 	}
+-
+ 	return DP_FAILURE;
+ }
+ 
+@@ -2260,8 +2264,6 @@ int dp_set_pmapper(struct net_device *dev, struct dp_pmapper *mapper, u32 flag)
+ 	int res = DP_FAILURE;
+ 	struct bp_pmapper_dev *bp_info;
+ 	struct inst_info *dp_info;
+-	struct dp_dev *dp_dev;
+-	u32 idx;
+ 
+ 	if (!dev || !mapper) {
+ 		pr_err("dev or mapper is NULL\n");
+@@ -2327,13 +2329,7 @@ int dp_set_pmapper(struct net_device *dev, struct dp_pmapper *mapper, u32 flag)
+ 		goto EXIT;
+ 	}
+ 
+-	idx = dp_dev_hash(dev, NULL);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+-				       dev, NULL, 0);
+-	if (!dp_dev)
+-		goto EXIT;
+-
+-	bp_info = &dp_dev->bp_info;
++	bp_info = get_dp_bp_info(inst, bport);
+ 
+ 	/* update local table for pmapper */
+ 	bp_info->def_ctp = map->def_ctp;
+@@ -2650,29 +2646,26 @@ int dp_set_bp_attr(struct dp_bp_attr *conf, u32 flag)
+ }
+ EXPORT_SYMBOL(dp_set_bp_attr);
+ 
+-/*Return the bridge port index based on dev:
++/*Return the table entry index based on dev:
+  *success: >=0
+  *fail: DP_FAILURE
+  */
+ int bp_pmapper_dev_get(int inst, struct net_device *dev)
+ {
+-	u32 idx;
+-	struct dp_dev *dp_dev;
++	int i;
++	struct bp_pmapper_dev *bp_info;
+ 
+ 	if (!dev)
+ 		return -1;
+-
+-	idx = dp_dev_hash(dev, NULL);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+-				       dev, NULL, 0);
+-
+-	if (dp_dev && dp_dev->bp_info.flag &&
+-		dp_dev->dev == dev) {
+-		DP_DEBUG(DP_DBG_FLAG_PAE, "matched %s\n",
+-			dp_dev->dev->name);
+-		return dp_dev->bp;
++	for (i = 0; i < ARRAY_SIZE(dp_bp_dev_tbl[inst]); i++) {
++		bp_info = get_dp_bp_info(inst, i);
++		if (!bp_info->flag)
++			continue;
++		if (bp_info->dev == dev) {
++			DP_DEBUG(DP_DBG_FLAG_PAE, "matched %s\n", dev->name);
++			return i;
++		}
+ 	}
+-
+ 	return -1;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index 1c396c0b694b..3c5a949fe917 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -228,13 +228,14 @@ static int dp_ndo_setup_tc(struct net_device *dev,
+  *otherwise it should use its dev.
+  *it will not work if just dev->name as subif_name
+  */
+-int dp_inst_add_dev(struct net_device *dev, struct net_device *ctp_dev,
+-			char *subif_name, int inst, int ep, int bp, int ctp, u32 flag)
++int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
++		    int ep, int bp, int ctp, u32 flag)
+ {
+ 	struct dp_dev *dp_dev;
+ 	u8 new_f = 0;
+ 	u32 idx;
+ 	u32 vap;
++	struct subif_basic *subif;
+ 	struct dp_subif_info *sif;
+ #if IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)
+ 	int err = DP_SUCCESS;
+@@ -246,32 +247,33 @@ int dp_inst_add_dev(struct net_device *dev, struct net_device *ctp_dev,
+ 		return -1;
+ 	}
+ 	idx = dp_dev_hash(dev, subif_name);
++	subif = devm_kzalloc(&g_dp_dev->dev, sizeof(*subif), GFP_ATOMIC);
++	if (!subif)
++		return -1;
++
++	subif->subif = ctp;
+ 	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, subif_name, flag);
+ 	if (!dp_dev) { /*alloc new */
+ 		dp_dev = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_dev),
+ 				      GFP_ATOMIC);
+ 		if (dp_dev) {
++			dp_dev->count = 0;
+ 			dp_dev->subif_name[0] = 0;
+ 			dp_dev->fid = 0;
++			INIT_LIST_HEAD(&dp_dev->ctp_list);
+ 			new_f = 1;
+-		} else {
+-			return -1;
+ 		}
+ 	}
+-
++	if (!dp_dev) {
++		devm_kfree(&g_dp_dev->dev, subif);
++		return -1;
++	}
+ 	if (new_f) {
+ 		dp_dev->inst = inst;
+ 		dp_dev->dev = dev;
+ 		dp_dev->ep = ep;
+ 		dp_dev->bp = bp;
+ 		dp_dev->ctp = ctp;
+-		/* initialize pmapper bp info */
+-		if (ctp_dev) {
+-			DP_DEBUG(DP_DBG_FLAG_REG,
+-					 "master dev with new bp(%d)\n", bp);
+-			dp_dev->bp_info.flag = 1;
+-		}
+-
+ 		if (subif_name) {
+ 			strncpy(dp_dev->subif_name, subif_name,
+ 				sizeof(dp_dev->subif_name) - 1);
+@@ -292,8 +294,8 @@ int dp_inst_add_dev(struct net_device *dev, struct net_device *ctp_dev,
+ 				return DP_FAILURE;
+ 		}
+ #endif
+-		vap = GET_VAP(ctp, port_info->vap_offset,
+-				port_info->vap_mask);
++		vap = GET_VAP(subif->subif, port_info->vap_offset,
++			      port_info->vap_mask);
+ 		sif = get_dp_port_subif(port_info, vap);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ 		if ((!(flag & DP_F_SUBIF_LOGICAL)) &&
+@@ -304,19 +306,18 @@ int dp_inst_add_dev(struct net_device *dev, struct net_device *ctp_dev,
+ 		dp_register_ptp_ioctl(dp_dev, dev, inst);
+ #endif
+ 	}
+-
+-	/* update BP ref count for pmapper case */
+-	if (ctp_dev)
+-		dp_dev->bp_info.ref_cnt++;
++	dp_dev->count++;
++	list_add(&subif->list, &dp_dev->ctp_list);
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "%s:add new ctp=%d\n", __func__, ctp);
+ 	return 0;
+ }
+ 
+ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+-			int ep, u16 ctp, u32 flag)
++		    int ep, u16 ctp, u32 flag)
+ {
+ 	struct dp_dev *dp_dev;
+ 	u32 idx;
++	struct subif_basic *tmp;
+ 
+ 	idx = dp_dev_hash(dev, subif_name);
+ 	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, subif_name, flag);
+@@ -325,7 +326,11 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 		       dev ? dev->name : "NULL", subif_name);
+ 		return -1;
+ 	}
+-
++	if (dp_dev->count <= 0) {
++		pr_err("Count(%d) should > 0(%s_%s)\n", dp_dev->count,
++		       dev ? dev->name : "NULL", subif_name);
++		return -1;
++	}
+ 	if (dp_dev->inst != inst) {
+ 		pr_err("Why inst not same:%d_%d(%s_%s)\n", dp_dev->inst, inst,
+ 		       dev ? dev->name : "NULL", subif_name);
+@@ -336,16 +341,22 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 		       dev ? dev->name : "NULL", subif_name);
+ 		return -1;
+ 	}
+-
+-	if (get_dp_bp_ref_cnt(dp_dev) == 0) {
++	list_for_each_entry(tmp, &dp_dev->ctp_list, list) {
+ 		/* Check added to remove pmapper device from dp_dev list
+ 		 * if pmapper device is unregistered with last gem
+ 		 */
+-		hlist_del(&dp_dev->hlist);
+-		if (dev)
+-			dp_ops_reset(dp_dev, dev);
+-		devm_kfree(&g_dp_dev->dev, dp_dev);
+-		return 0;
++		if (dp_dev->dev == dev) {
++			list_del(&tmp->list);
++			dp_dev->count--;
++
++			if (!dp_dev->count) { /*move to free list */
++				hlist_del(&dp_dev->hlist);
++				if (dev)
++					dp_ops_reset(dp_dev, dev);
++				devm_kfree(&g_dp_dev->dev, dp_dev);
++			}
++			return 0;
++		}
+ 	}
+ 	DP_DEBUG(DP_DBG_FLAG_INST, "dp_del_dev fail(%s_%s): not found ctp=%d\n",
+ 		 dev ? dev->name : "NULL",
+@@ -467,6 +478,7 @@ static u32 dev_hash_index;
+ static struct dp_dev *dp_dev_proc;
+ int proc_inst_dev_dump(struct seq_file *s, int pos)
+ {
++	struct subif_basic *tmp;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return -1;
+@@ -495,9 +507,13 @@ int proc_inst_dev_dump(struct seq_file *s, int pos)
+ 		   dp_dev_proc->bp,
+ 		   "ctp",
+ 		   dp_dev_proc->ctp,
+-		   "ref_count",
+-		   get_dp_bp_ref_cnt(dp_dev_proc),
++		   "count",
++		   dp_dev_proc->count,
+ 		   dp_dev_proc);
++	seq_puts(s, "  ctp=");
++	list_for_each_entry(tmp, &dp_dev_proc->ctp_list, list) {
++		seq_printf(s, "%u ", tmp->subif);
++	}
+ 	seq_puts(s, "\n");
+ 	dp_dev_proc = hlist_entry_safe((dp_dev_proc)->hlist.next,
+ 				       struct dp_dev, hlist);
+diff --git a/drivers/net/datapath/dpm/datapath_instance.h b/drivers/net/datapath/dpm/datapath_instance.h
+index b5bc846b40c2..b863d013623f 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.h
++++ b/drivers/net/datapath/dpm/datapath_instance.h
+@@ -25,6 +25,16 @@ struct dp_dev *dp_dev_lookup(struct hlist_head *head,
+ 			     struct net_device *dev, char *subif_name,
+ 			     u32 flag);
+ 
++struct subif_basic {
++	struct list_head list;
++	int32_t subif:15;
++};
++
++struct ctp_list {
++	struct list_head list;
++	struct subif_basic subif;
++};
++
+ struct dp_mod {
+ 	struct hlist_node hlist;
+ 	struct module *mod;
+@@ -41,10 +51,8 @@ struct dp_dev {
+ 	int bp;
+ 	int ctp;
+ 	int fid;
+-	/* bp_mapper_dev is mainly for PON case
+-	 * to record BP ref count and pmapper info
+-	 */
+-	struct bp_pmapper_dev bp_info;
++	u32 count;
++	struct list_head ctp_list;
+ 	const struct net_device_ops *old_dev_ops;
+ 	struct net_device_ops new_dev_ops;
+ 	const struct ethtool_ops *old_ethtool_ops;
+@@ -55,18 +63,13 @@ struct dp_dev {
+ #endif
+ };
+ 
+-static inline int get_dp_bp_ref_cnt(struct dp_dev *dp_dev)
+-{
+-	return dp_dev->bp_info.ref_cnt;
+-}
+-
+ /*dp_inst_p: dp instance basic property */
+ int dp_get_inst_via_dev(struct net_device *dev,
+ 			char *subif_name, u32 flag);
+ int dp_get_inst_via_module(struct module *owner, u16 ep, u32 flag);
+ struct dp_hw_cap *match_hw_cap(struct dp_inst_info *info, u32 flag);
+-int dp_inst_add_dev(struct net_device *dev, struct net_device *ctp_dev,
+-			char *subif_name, int inst, int ep, int bp, int ctp, u32 flag);
++int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
++		    int ep, int bp, int ctp, u32 flag);
+ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 		    int ep, u16 ctp, u32 flag);
+ int dp_inst_insert_mod(struct module *owner, u16 ep, u32 inst, u32 flag);
+diff --git a/drivers/net/datapath/dpm/datapath_logical_dev.c b/drivers/net/datapath/dpm/datapath_logical_dev.c
+index 55daaae47faa..57d0145b7747 100644
+--- a/drivers/net/datapath/dpm/datapath_logical_dev.c
++++ b/drivers/net/datapath/dpm/datapath_logical_dev.c
+@@ -157,7 +157,7 @@ int add_logic_dev(int inst, int port_id, struct net_device *dev,
+ 
+ 	subif_id->bport = logic_dev_tmp->bp;
+ 	subif_id->subif = subif.subif;
+-	dp_inst_add_dev(dev, NULL, NULL,
++	dp_inst_add_dev(dev, NULL,
+ 			inst, port_id,
+ 			logic_dev_tmp->bp,
+ 			subif.subif, flags);
+diff --git a/drivers/net/datapath/dpm/datapath_misc.c b/drivers/net/datapath/dpm/datapath_misc.c
+index 20c5a9919e85..71a9ffd380d6 100644
+--- a/drivers/net/datapath/dpm/datapath_misc.c
++++ b/drivers/net/datapath/dpm/datapath_misc.c
+@@ -8,7 +8,6 @@
+ #include <net/ip.h>
+ #include <net/datapath_api.h>
+ #include "datapath.h"
+-#include "datapath_instance.h"
+ #if IS_ENABLED(CONFIG_PPA_API_SW_FASTPATH) || \
+ 	IS_ENABLED(CONFIG_LTQ_PPA_API_SW_FASTPATH)
+ #include <net/ppa/ppa_api.h>
+@@ -1022,8 +1021,6 @@ int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
+ {
+ 	void *subif_data = NULL;
+ 	struct pmac_port_info *port;
+-	struct dp_dev *dp_dev;
+-	u32 idx;
+ 
+ 	/* Note: to set dummy subif_data via subif_name for
+ 	 * DSL case when dev is NULL
+@@ -1052,10 +1049,7 @@ int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
+ 			dp_update_subif(dev, subif_data, &subif_id[0],
+ 					subif_name, flags, subifid_fn);
+ 
+-			idx = dp_dev_hash(dev, subif_name);
+-			dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+-				       dev, subif_name, 0);
+-			if (dp_dev && get_dp_bp_ref_cnt(dp_dev) <= 1)
++			if (get_dp_bp_info(0, subif_id->bport)->ref_cnt <= 1)
+ 				dp_notifier_invoke(0, dev, subif_id->port_id,
+ 						   DP_EVENT_REGISTER_SUBIF);
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index a9488ae226c1..3b9a200eddb5 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1682,6 +1682,7 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 	int q_flag = 0;
+ 	int qid;
+ 	struct cqm_port_info *deq_pinfo;
++	struct bp_pmapper_dev *bp_info;
+ 	struct q_info *q_info;
+ 
+ 	if (!data || !data->subif_data) {
+@@ -1732,13 +1733,22 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 		return 0;
+ 	}
+ 
+-	if (data->subif_data->ctp_dev)
++	bp_info = get_dp_bp_info(inst, bp);
++	if (data->subif_data->ctp_dev) {
++		DP_DEBUG(DP_DBG_FLAG_DBG,
++			 "dp_bp_dev_tbl[%d][%d]=%s current reg_cnt=%d\n",
++			 inst, bp, data->dev->name,
++			 bp_info->ref_cnt);
++		bp_info->dev = data->dev;
++		bp_info->ref_cnt++;
++		bp_info->flag = 1;
+ 		sif->ctp_dev = data->subif_data->ctp_dev;
+-
++	}
+ 	DP_DEBUG(DP_DBG_FLAG_DBG,
+-		 "inst=%d portid=%d dp numsubif=%d subif_ix=%d\n",
++		 "inst=%d portid=%d dp numsubif=%d subif_ix=%d pmapper.cnt=%d\n",
+ 		 inst, portid,
+-		 port_info->num_subif, subif_ix);
++		 port_info->num_subif, subif_ix,
++		 bp_info->ref_cnt);
+ 	if (data->subif_data)
+ 		deq_port_idx = data->subif_data->deq_port_idx;
+ 	if (port_info->deq_port_num < deq_port_idx + 1) {
+@@ -1957,36 +1967,18 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 	struct cqm_port_info *deq_pinfo;
+ 	struct bp_pmapper_dev *bp_info;
+ 	struct q_info *q_info;
+-	struct dp_dev *dp_dev;
+-	u32 idx;
+ 
+ 	if (!dp_dma_chan_tbl[inst]) {
+ 		pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
+ 		return DP_FAILURE;
+ 	}
+-
+-	bp = sif->bp;
+-	idx = dp_dev_hash(sif->netif, NULL);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+-				       sif->netif, NULL, 0);
+-	if (!dp_dev) {
+-		pr_err("dp_dev not found\n");
+-		return DP_FAILURE;
+-	}
+-	bp_info = &dp_dev->bp_info;
+-
+-	if (sif->ctp_dev &&
+-	    !bp_info->ref_cnt) {
+-		pr_err("Why bp_info.ref_cnt =%d for BP %d\n",
+-		       bp_info->ref_cnt, bp);
+-		return DP_FAILURE;
+-	}
+-
+ 	for (i = 0; i < sif->num_qid; i++) {
+ 		qid = sif->qid_list[i];
+ 		cqm_deq_port = sif->cqm_deq_port[i];
+ 		deq_pinfo = get_dp_deqport_info(inst, cqm_deq_port);
+ 		dma_ch_offset = deq_pinfo->dma_ch_offset;
++		bp = sif->bp;
++		bp_info = get_dp_bp_info(inst, bp);
+ 		q_info = get_dp_q_info(inst, qid);
+ 
+ 		/* santity check table */
+@@ -2000,6 +1992,12 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 			       inst, cqm_deq_port);
+ 			return DP_FAILURE;
+ 		}
++		if (sif->ctp_dev &&
++		    !bp_info->ref_cnt) {
++			pr_err("Why dp_bp_dev_tbl[%d][%d].ref_cnt =%d\n",
++			       inst, bp, bp_info->ref_cnt);
++			return DP_FAILURE;
++		}
+ 
+ 		/* update queue/port/sched/bp_pmapper table's ref_cnt */
+ 		q_info->ref_cnt--;
+@@ -2012,6 +2010,7 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 				sif->ctp_dev = NULL;
+ 				bp_info->ref_cnt--;
+ 				if (!bp_info->ref_cnt) {
++					bp_info->dev = NULL;
+ 					bp_info->flag = 0;
+ 					DP_DEBUG(DP_DBG_FLAG_REG,
+ 						 "ctp ref_cnt become zero:%s\n",
+@@ -2024,7 +2023,7 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 			if (port_info->ctp_max == 1) {
+ 				if (port_info->num_subif == 0) {
+ 					reset_ctp_bp(inst, 0, portid, bp);
+-					if (!bp_info->ref_cnt) {
++					if (!bp_info->dev) {
+ 						/*NULL already, then free it */
+ 						DP_DEBUG(DP_DBG_FLAG_PAE,
+ 							 "Free BP[%d] vap=%d\n",
+@@ -2034,7 +2033,7 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 				}
+ 			} else {
+ 				reset_ctp_bp(inst, subif_ix, portid, bp);
+-				if (!bp_info->ref_cnt) {
++				if (!bp_info->dev) {
+ 					/*NULL already, then free it */
+ 					DP_DEBUG(DP_DBG_FLAG_PAE,
+ 						 "Free BP[%d] vap=%d\n",

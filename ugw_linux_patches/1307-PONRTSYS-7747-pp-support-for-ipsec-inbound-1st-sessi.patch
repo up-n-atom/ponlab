@@ -1,0 +1,182 @@
+From 934c802ac7a3f78edb7d528a650b23b511315fca Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Wed, 27 May 2020 08:58:24 +0300
+Subject: [PATCH] PONRTSYS-7747: pp support for ipsec inbound 1st session
+
+Create new recipe for outer IP removal, w/o any modification to the inner layers
+Create session for supporting IP header removal ONLY for ESP packets
+
+Signed-off-by: Emergi Idan <idan.emergi@intel.com>
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 33 ++++++++++++++++++----
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c |  6 ++--
+ drivers/net/ppv4/pp-hal/modifier/modifier.h        |  4 +++
+ .../net/ppv4/pp-hal/modifier/modifier_recipes.c    | 16 +++++++++++
+ 4 files changed, 51 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index cdf48e914660..cfbc1f1b9f49 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -647,8 +647,20 @@ static inline bool __smgr_is_frag_supported(struct sess_info *s)
+  */
+ static inline bool __smgr_is_esp_supported(struct sess_info *s)
+ {
+-	/* for both cases tx must include esp and outer ipv4 */
+-	if (!(SESS_TX_IS_OUTER_ESP(s) && SESS_TX_IS_OUTER_V4(s)))
++	/* for all cases tx must include esp and outer ipv4 */
++	if (!SESS_TX_IS_OUTER_ESP(s))
++		return false;
++
++	/* decapsulation 1st session where outer ip doesn't exist */
++	if (SESS_RX_IS_OUTER_ESP(s) &&
++	    SESS_RX_IS_OUTER_V4(s) &&
++	    !SESS_TX_IS_OUTER_V4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_ESP_OUTER_IP_REM_BIT);
++		return true;
++	}
++
++	/* for all the following cases tx must include outer ipv4 */
++	if (!SESS_TX_IS_OUTER_V4(s))
+ 		return false;
+ 
+ 	/* encapsulation */
+@@ -2082,7 +2094,9 @@ static bool __smgr_is_sess_supported(struct sess_info *s)
+ 		pr_debug("rx outer packet unsupported l3\n");
+ 		goto not_supported;
+ 	}
+-	if (!SESS_TX_IS_OUTER_IP(s)) {
++
++	/* for ESP we have a special case where outer IP doesn't exist */
++	if (!SESS_TX_IS_OUTER_ESP(s) && !SESS_TX_IS_OUTER_IP(s)) {
+ 		pr_debug("tx outer packet unsupported l3\n");
+ 		goto not_supported;
+ 	}
+@@ -2509,7 +2523,12 @@ static void __smgr_si_newhdr_set(struct sess_info *s)
+ 			sce->tot_len_diff = dpu->nhdr_sz - dpu->nhdr_l3_off;
+ 		} else {
+ 			/* esp inbound/outbound tunnel session */
+-			dpu->nhdr_sz      = dpu->nhdr_l3_off;
++			if (SESS_TX_IS_OUTER_V4(s))
++				dpu->nhdr_sz = dpu->nhdr_l3_off;
++			else
++				dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s),
++							      PKTPRS_PROTO_ESP,
++							      HDR_OUTER);
+ 		}
+ 		/* TBD - for ipv6 need to reduce the ip header size
+ 		 * sce->tot_len_diff -= sizeof(struct ipv6hdr);
+@@ -2780,7 +2799,11 @@ static void __smgr_pppoe_mod_set(struct sess_info *s)
+  */
+ static void __smgr_si_l2_mod_set(struct sess_info *s)
+ {
+-	if (__smgr_is_outer_l2_changed(s) || SESS_TX_IS_OUTER_ESP(s))
++	/* for outer esp w/o ipv4 the recipe was already selected
++	 *  as it is not the regular header replace recipe
++	 */
++	if (__smgr_is_outer_l2_changed(s) ||
++	    (SESS_TX_IS_OUTER_ESP(s) && SESS_TX_IS_OUTER_V4(s)))
+ 		SESS_MOD_FLAG_SET(s, MOD_HDR_RPLC_BIT);
+ 
+ 	if (__smgr_is_pppoe_changed(s, HDR_INNER))
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index bd1d0e99c1fc..4bf8cc1e2866 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -2449,7 +2449,7 @@ void sess_update_set(char *cmd_buf, void *data)
+ {
+ 	u8 *field;
+ 	char *tok, *ptr, *pval;
+-	unsigned long res;
++	long res;
+ 	u32 id = 0;
+ 	u32 first_prop = 1;
+ 	struct pp_hw_si si = {0};
+@@ -2475,8 +2475,8 @@ void sess_update_set(char *cmd_buf, void *data)
+ 		*pval = '\0';
+ 		pval++;
+ 
+-		if (kstrtoul(pval, 0, &res)) {
+-			pr_err("kstrtoul failed\n");
++		if (kstrtol(pval, 0, &res)) {
++			pr_err("kstrtol failed\n");
+ 			goto out;
+ 		}
+ 
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier.h b/drivers/net/ppv4/pp-hal/modifier/modifier.h
+index 0025b2a5515e..62f141f141b0 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier.h
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier.h
+@@ -94,6 +94,8 @@ enum mod_rcp_type {
+ 	 *	without nat changes, only total length update
+ 	 */
+ 	MOD_RCP_ESP_V4_TUNNL_BPAS,
++	/*! recipe for removing the outer ip header of esp packet */
++	MOD_RCP_ESP_OUTER_IP_REM,
+ 	/*! Recipe for decapsulating L2TP v2 UDP tunnel over ipv4/ipv6 with
+ 	 *  inner [ipv4][tcp/udp] packet
+ 	 */
+@@ -161,6 +163,8 @@ enum mod_flags {
+ 	MOD_ESP_V4_TUNNL_ENCP_BIT,
+ 	/*! ESP V6 tunnel bypass */
+ 	MOD_ESP_V4_TUNNL_BPAS_BIT,
++	/*! ESP outer ip removal */
++	MOD_ESP_OUTER_IP_REM_BIT,
+ 	/*! L2TP (V2/V3) UDP over IPv4 was added */
+ 	MOD_L2TPUDP_IPV4_ENCP_BIT,
+ 	/*! L2TP (V2/V3) UDP over IPv6 was added */
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c b/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
+index 3af38c95d9c0..a5c91dc5bcaf 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
+@@ -40,6 +40,7 @@ static const char * const mod_rcp_str[MOD_RCPS_NUM + 2] = {
+ 	[MOD_RCP_6RD_DECP_ROUTED]         = "6RD decap",
+ 	[MOD_RCP_ESP_V4_TUNNL_ENCAP]      = "ESP over ipv4 encapsulation",
+ 	[MOD_RCP_ESP_V4_TUNNL_BPAS]       = "ESP over ipv4 bypass",
++	[MOD_RCP_ESP_OUTER_IP_REM]        = "ESP outer ip removal",
+ 	[MOD_RCP_L2TPUDP_DECP_IPV4_NAPT]  = "L2TP UDP decap inner ipv4 NAPT",
+ 	[MOD_RCP_L2TPUDP_DECP_IPV6_ROUTED] = "L2TP UDP decap inner ipv6 NAPT",
+ 	[MOD_RCP_L2TPIP_DECP_IPV4_NAPT]   = "L2TP IP decap inner ipv4 NAPT",
+@@ -69,6 +70,7 @@ static const char * const mod_flag_str[MOD_FLAG_NUM + 1] = {
+ 	[MOD_6RD_DECP_BIT]          = "6RD decap",
+ 	[MOD_ESP_V4_TUNNL_ENCP_BIT] = "ESPv4 tunnel encap",
+ 	[MOD_ESP_V4_TUNNL_BPAS_BIT] = "ESPv4 tunnel bypass",
++	[MOD_ESP_OUTER_IP_REM_BIT]  = "ESP outer ip removal",
+ 	[MOD_L2TPUDP_IPV4_ENCP_BIT] = "L2TPUDPv4 encap",
+ 	[MOD_L2TPUDP_IPV6_ENCP_BIT] = "L2TPUDPv6 encap",
+ 	[MOD_L2TPUDP_DECP_BIT]      = "L2TPUDP decap",
+@@ -96,6 +98,7 @@ static const char * const mod_flag_str[MOD_FLAG_NUM + 1] = {
+ #define MOD_6RD_DECP_MSK          BIT(MOD_6RD_DECP_BIT)
+ #define MOD_ESP_V4_TUNNL_ENCP_MSK BIT(MOD_ESP_V4_TUNNL_ENCP_BIT)
+ #define MOD_ESP_V4_TUNNL_BPAS_MSK BIT(MOD_ESP_V4_TUNNL_BPAS_BIT)
++#define MOD_ESP_OUTER_IP_REM_MSK  BIT(MOD_ESP_OUTER_IP_REM_BIT)
+ #define MOD_L2TPUDP_IPV4_ENCP_MSK BIT(MOD_L2TPUDP_IPV4_ENCP_BIT)
+ #define MOD_L2TPUDP_IPV6_ENCP_MSK BIT(MOD_L2TPUDP_IPV6_ENCP_BIT)
+ #define MOD_L2TPIP_IPV4_ENCP_MSK  BIT(MOD_L2TPIP_IPV4_ENCP_BIT)
+@@ -249,6 +252,13 @@ static const struct supp_mod supp_mod_types[] = {
+ 		.recipe = MOD_RCP_ESP_V4_TUNNL_BPAS
+ 	},
+ 	/* ================================================================ */
++	/*         ESP decapsulation with 1st session                       */
++	/* ================================================================ */
++	{ /* esp w/o outer ip layer */
++		.flags = MOD_ESP_OUTER_IP_REM_MSK,
++		.recipe = MOD_RCP_ESP_OUTER_IP_REM
++	},
++	/* ================================================================ */
+ 	/*                    GRE Decapsulation                             */
+ 	/* ================================================================ */
+ 	{ /* ETH IPv4 over GRE over IPv4/6 decapsulation */
+@@ -1234,6 +1244,12 @@ s32 mod_rcp_init(void)
+ 	if (unlikely(ret))
+ 		goto err;
+ 
++	/* recipe for esp w/o outer ip header at egress */
++	ret = mod_rcp_hdr_rplc_set(MOD_RCP_ESP_OUTER_IP_REM,
++				   EU_STW_SEL_L3_OFF1);
++	if (unlikely(ret))
++		goto err;
++
+ 	/* config recipe L2TP UDP in v6/v4 decapsulation with nat
+ 	 * changes in the inner v4 and udp/tcp
+ 	 * [l2][ipv4/6][udp][l2tp][ppp][ipv4][tcp/udp] => inner ipv4

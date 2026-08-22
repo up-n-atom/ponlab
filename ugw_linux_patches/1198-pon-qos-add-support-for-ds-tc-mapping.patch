@@ -1,0 +1,677 @@
+From 6261af1c1021bc1754621e5e1f4cc3fabf9d1559 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Tue, 28 Apr 2020 17:47:22 +0200
+Subject: [PATCH] pon_qos: add support for ds tc mapping
+
+The PON downstream traffic class mapping requires special handling as goes
+thought several pbit to traffic class assignments and reassignments. The
+traffic class is used to select the downstream queue and is defined by
+the application layers e.g., OMCI. The stages for TC assignment are shown
+below:
+
+ (extVLAN TC)  (extVLAN)  (PCP to TC)      (extVLAN)        (Force TC)
+   +-----+      +----+      +----+       +-----------+      +-----------+
+   | ctp |<-----| bp |<-----| BR |<------| bp (pmap) |<-----| ctp (gem) |
+   +-----+      +----+      +----+       +-----------+      +-----------+
+
+The traffic class is set during this stages:
+ - In case of GEM to queue mapping in downstream, force TC is enabled on the
+   GEM CTP port. This overrides all other TC assignments
+ - PCP to TC mapping is done in all cases based on the global switch tables.
+   This happens before any VLAN pbit translation/modifications.
+ - TC reassignment using extVLAN on egress LAN CTP port. This is needed to
+   take pbit changes during the VLAN translations.
+
+The above h/w configurations are being configured during queue configuration on
+the downstream ports. Only the pcp to TC table is configured during the
+module init.
+
+Signed-off-by: Zahari Doychev <zahari.doychev@intel.com>
+---
+ drivers/net/datapath/pon_qos/Makefile              |   3 +-
+ .../net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c  | 441 +++++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.c     |   9 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h     |   1 -
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c      |  81 +++-
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h      |  11 +
+ 6 files changed, 535 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index 4561f438a81b..f515b87c5cd0 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -14,4 +14,5 @@ pon_qos-objs := \
+ 	pon_qos_tc_vlan_filter.o \
+ 	pon_qos_tc_lct.o \
+ 	pon_qos_tc_pce.o \
+-	pon_qos_tc_mirred.o
++	pon_qos_tc_mirred.o \
++	pon_qos_tc_ds_tc_remap.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c
+new file mode 100644
+index 000000000000..551a541dd0e5
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c
+@@ -0,0 +1,441 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2019-2020 Intel Corporation
++ *
++ * For licensing information, see the file 'LICENSE' in the root folder of
++ * this software module.
++ *
++ *****************************************************************************/
++
++#include <linux/netdevice.h>
++#include <net/switch_api/gsw_types.h>
++#include <net/switch_api/lantiq_gsw.h>
++#include <net/switch_api/gsw_dev.h>
++#include <net/datapath_api_vlan.h>
++#include <net/datapath_api.h>
++#include "../dpm/datapath.h"
++#include "pon_qos_tc_qos.h"
++
++static int pon_qos_get_ctp_conf(struct net_device *dev,
++				struct core_ops *ops,
++				GSW_CTP_portConfig_t *ctp)
++{
++	dp_subif_t dp_subif = { 0 };
++	struct ctp_ops *cops = &ops->gsw_ctp_ops;
++	int ret = 0;
++
++	if (!dev || !ops || !ctp)
++		return -EINVAL;
++
++	memset(ctp, 0, sizeof(*ctp));
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++	if (ret != DP_SUCCESS)
++		return -ENODEV;
++
++	ctp->nLogicalPortId = dp_subif.port_id;
++	ctp->nSubIfIdGroup = dp_subif.subif_groupid;
++
++	ctp->eMask |= GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN;
++	ctp->eMask |= GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN_IGMP;
++	ret = cops->CTP_PortConfigGet(ops, ctp);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: failed: %d\n", __func__, ret);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++#define PON_QOS_EVBLK_INV	-1
++
++static int pon_qos_get_ev_blk(struct net_device *dev)
++{
++	struct core_ops *gswops;
++	GSW_CTP_portConfig_t ctp = {0};
++	int blk, blk_igmp, ret = 0;
++
++	gswops = gsw_get_swcore_ops(0);
++	if (!gswops)
++		return -EINVAL;
++
++	ret = pon_qos_get_ctp_conf(dev, gswops, &ctp);
++	if (ret < 0)
++		return ret;
++
++	blk = ctp.nEgressExtendedVlanBlockId;
++	blk_igmp = ctp.nEgressExtendedVlanBlockIdIgmp;
++	if (ctp.bEgressExtendedVlanIgmpEnable &&
++	    ctp.bEgressExtendedVlanEnable && blk == blk_igmp)
++		return blk;
++
++	return PON_QOS_EVBLK_INV;
++}
++
++static int pon_qos_ev_assign_blk(struct net_device *dev, int blk)
++{
++	struct core_ops *gswops;
++	GSW_CTP_portConfig_t ctp = {0}, ctp2 = {0};
++	int ret;
++
++	gswops = gsw_get_swcore_ops(0);
++	if (!gswops)
++		return -EINVAL;
++
++	ret = pon_qos_get_ctp_conf(dev, gswops, &ctp);
++	if (ret < 0)
++		return ret;
++
++	ctp2.nLogicalPortId = ctp.nLogicalPortId;
++	ctp2.nSubIfIdGroup = ctp.nSubIfIdGroup;
++
++	ctp2.eMask |= GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN;
++	ctp2.eMask |= GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN_IGMP;
++	if (blk >= 0) {
++		ctp2.bEgressExtendedVlanEnable = 1;
++		ctp2.bEgressExtendedVlanIgmpEnable = 1;
++		ctp2.nEgressExtendedVlanBlockId = blk;
++		ctp2.nEgressExtendedVlanBlockSize = 0;
++		ctp2.nEgressExtendedVlanBlockIdIgmp = blk;
++		ctp2.nEgressExtendedVlanBlockSizeIgmp = 0;
++	} else {
++		ctp2.bEgressExtendedVlanEnable = 0;
++		ctp2.bEgressExtendedVlanIgmpEnable = 0;
++		ctp2.nEgressExtendedVlanBlockId = 0;
++		ctp2.nEgressExtendedVlanBlockSize = 0;
++		ctp2.nEgressExtendedVlanBlockIdIgmp = 0;
++		ctp2.nEgressExtendedVlanBlockSizeIgmp = 0;
++	}
++	ret = gswops->gsw_ctp_ops.CTP_PortConfigSet(gswops, &ctp2);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: failed: %d\n", __func__, ret);
++		return -EIO;
++	}
++
++	return 0;
++}
++
++static void pon_qos_ev_flt_init(struct dp_pattern_vlan *p)
++{
++	if (!p)
++		return;
++
++	p->vid = DP_VLAN_PATTERN_NOT_CARE;
++	p->tpid = DP_VLAN_PATTERN_NOT_CARE;
++	p->dei = DP_VLAN_PATTERN_NOT_CARE;
++	p->proto = DP_VLAN_PATTERN_NOT_CARE;
++	p->prio = DP_VLAN_PATTERN_NOT_CARE;
++}
++
++static void pon_qos_ev_free_stag_rules(struct list_head *l)
++{
++	struct dp_vlan1 *p, *n;
++
++	list_for_each_entry_safe(p, n, l, list) {
++		list_del(&p->list);
++		kfree(p);
++	}
++
++	kfree(l);
++}
++
++static void pon_qos_ev_free_dtag_rules(struct list_head *l)
++{
++	struct dp_vlan2 *p, *n;
++
++	list_for_each_entry_safe(p, n, l, list) {
++		list_del(&p->list);
++		kfree(p);
++	}
++
++	kfree(l);
++}
++
++/* This function adds default extVLAN rules to assign new traffic class based
++ * on Pbit. Currently the switch hardware Pbit to TC table is consulted before
++ * the extVLAN translation which can change the Pbit value. The rules make sure
++ * that the right TC is assigned in this case.
++ */
++static int pon_qos_ev_assign_tc(struct net_device *dev,
++				struct pon_qos_dot1p *dot1p,
++				unsigned int dot1p_sz,
++				int *nblk)
++{
++	struct dp_tc_vlan dp_vlan = {0};
++	struct list_head *list1 = NULL;
++	struct list_head *list2 = NULL;
++	unsigned int idx = 0;
++	int i, ret = 0;
++
++	if (!dev || !dot1p || !nblk || dot1p_sz > PON_QOS_DOT1P_SZ)
++		return -EINVAL;
++
++	list1 = kzalloc(sizeof(*list1), GFP_KERNEL);
++	if (!list1)
++		return -ENOMEM;
++
++	list2 = kzalloc(sizeof(*list2), GFP_KERNEL);
++	if (!list2) {
++		kfree(list1);
++		return -ENOMEM;
++	}
++
++	INIT_LIST_HEAD(list1);
++	INIT_LIST_HEAD(list2);
++	dp_vlan.vlan1_head = list1;
++	dp_vlan.vlan2_head = list2;
++
++	/* HACK: remove the block first to avoid fragmentation so early */
++	dp_vlan.dev = dev;
++	dp_vlan.def_apply = DP_VLAN_APPLY_CTP;
++	dp_vlan.dir = DP_DIR_EGRESS;
++	dp_vlan.n_vlan0 = 0;
++	dp_vlan.n_vlan1 = 0;
++	dp_vlan.n_vlan2 = 0;
++
++	ret = dp_vlan_set(&dp_vlan, 0);
++	if (ret < 0)
++		pr_err("Error configuring evlan TC assign\n");
++
++	for (i = 0; i < dot1p_sz; i++) {
++		struct dp_vlan1 *r1 = NULL;
++		struct dp_vlan2 *r2 = NULL;
++
++		if (dot1p[i].en) {
++			r1 = kzalloc(sizeof(*r1), GFP_KERNEL);
++			if (!r1) {
++				ret = -ENOMEM;
++				goto exit_free;
++			}
++
++			/* Add single tagged rule for TC assign based on Pbit */
++			pon_qos_ev_flt_init(&r1->outer);
++			r1->outer.prio = i;
++			r1->act.ract.new_tc = i;
++			r1->act.ract.act = DP_TC_REASSIGN;
++			list_add_tail(&r1->list, list1);
++
++			/* Add double tagged rule for TC assign based on Pbit */
++			r2 = kzalloc(sizeof(*r2), GFP_KERNEL);
++			if (!r2) {
++				ret = -ENOMEM;
++				goto exit_free;
++			}
++
++			pon_qos_ev_flt_init(&r2->outer);
++			pon_qos_ev_flt_init(&r2->inner);
++			r2->outer.prio = i;
++			r2->act.ract.new_tc = i;
++			r2->act.ract.act = DP_TC_REASSIGN;
++			list_add_tail(&r2->list, list2);
++			idx++;
++		}
++	}
++
++	dp_vlan.dev = dev;
++	dp_vlan.def_apply = DP_VLAN_APPLY_CTP;
++	dp_vlan.dir = DP_DIR_EGRESS;
++	dp_vlan.n_vlan0 = 0;
++	dp_vlan.n_vlan1 = idx;
++	dp_vlan.n_vlan2 = idx;
++
++	ret = dp_vlan_set(&dp_vlan, 0);
++	if (ret < 0)
++		pr_err("%s: error configuring evlan TC assign\n", __func__);
++
++exit_free:
++	/* free the lists with tc reassign rules */
++	pon_qos_ev_free_stag_rules(list1);
++	pon_qos_ev_free_dtag_rules(list2);
++
++	if (!ret) {
++		*nblk = pon_qos_get_ev_blk(dev);
++		pr_debug("%s: blk %d idx: %d\n", __func__, *nblk, idx);
++		if (*nblk < 0 && idx) {
++			pr_err("%s: evblk get failed\n", __func__);
++			return -ENODEV;
++		}
++	}
++
++	pr_debug("%s: TC reassign exit: %d\n", __func__, ret);
++	return ret;
++}
++
++#define PON_QOS_DS_SUBIFS 4
++#define PON_QOS_DS_STIDX 2
++/**
++ * The CTP network devices on the UNI ports should not have any EVLAN rules
++ * configured on the egress CTP ports otherwise the queue assignment can be
++ * broken. LCT interface is skipped as TC comes in the skb->priority there.
++ * TODO: This code has to be removed when the DP APIs are extended to support
++ * block set functions similar to the switch APIs. This should come together
++ * with the block management and multicast ops. There is need for API to get
++ * the CTP netdevs by using the based one.
++ */
++static int pon_qos_evblk_ctpdev_set(struct net_device *dev, int nblk)
++{
++	struct net_device *sdev;
++	char intf[IFNAMSIZ];
++	int i, rv = 0;
++
++	for (i = PON_QOS_DS_STIDX; i < PON_QOS_DS_SUBIFS; i++) {
++		/* TODO: only eth0_x_2/3, add better way to find them later */
++		snprintf(intf, IFNAMSIZ, "%s_%d", dev->name, i);
++		sdev = dev_get_by_name(&init_net, intf);
++		if (!sdev)
++			continue;
++
++		rv = pon_qos_ev_assign_blk(sdev, nblk);
++		if (rv < 0)
++			pr_err("%s:%s evblk assign failed\n",
++			       __func__, intf);
++
++		dev_put(sdev);
++	}
++
++	return rv;
++}
++
++static int pon_qos_ev_assign_tc_upd(struct net_device *dev,
++				    struct pon_qos_dot1p *dot1p,
++				    unsigned int dot1p_sz)
++{
++	int rv = 0;
++	int nblk = PON_QOS_EVBLK_INV;
++
++	rv = pon_qos_evblk_ctpdev_set(dev, PON_QOS_EVBLK_INV);
++	if (rv < 0) {
++		pr_err("%s: evlan tc unassign failed\n", __func__);
++		return rv;
++	}
++
++	rv = pon_qos_ev_assign_tc(dev, dot1p, dot1p_sz, &nblk);
++	if (rv < 0) {
++		pr_err("%s: evlan tc conf failed\n", __func__);
++		return rv;
++	}
++
++	rv = pon_qos_evblk_ctpdev_set(dev, nblk);
++
++	return rv;
++}
++
++int pon_qos_ev_tc_assign(struct pon_qos_qdisc *sch, u8 tc)
++{
++	struct net_device *dev = sch->dev;
++	struct pon_qos_dot1p *dot1p = sch->dot1p;
++	unsigned int dot1p_sz = ARRAY_SIZE(sch->dot1p);
++
++	if (tc < dot1p_sz && !dot1p[tc].en) {
++		dot1p[tc].en = 1;
++		dot1p[tc].tcid = tc;
++	}
++
++	return pon_qos_ev_assign_tc_upd(dev, dot1p, dot1p_sz);
++}
++
++int pon_qos_ev_tc_unassign(struct pon_qos_qdisc *sch, u8 tc)
++{
++	struct net_device *dev = sch->dev;
++	struct pon_qos_dot1p *dot1p = sch->dot1p;
++	unsigned int dot1p_sz = ARRAY_SIZE(sch->dot1p);
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(sch->dot1p); i++) {
++		if (dot1p[i].en && dot1p[i].tcid == tc) {
++			dot1p[i].en = 0;
++			break;
++		}
++	}
++
++	return pon_qos_ev_assign_tc_upd(dev, dot1p, dot1p_sz);
++}
++
++/* TODO: remove this when CPU trap action is implemented */
++static int pon_qos_set_omci_tc(struct core_ops *gsw_handle)
++{
++	GSW_PCE_rule_t *rule;
++	GSW_return_t ret = 0;
++
++	if (!gsw_handle)
++		return -EINVAL;
++
++	/* Needed as rule struct is too large and triggers gcc warning */
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	/* TODO: Set ingress ds TC=8 for PON port subif=0 (OMCI) */
++	rule->pattern.nIndex = 0;
++	rule->pattern.bEnable = 1;
++	rule->pattern.bPortIdEnable = 1;
++	rule->pattern.nPortId = 2;
++	rule->pattern.bSubIfIdEnable = 1;
++	rule->pattern.nSubIfId = 0;
++
++	rule->action.eTrafficClassAction = 2;
++	rule->action.nTrafficClassAlternate = 8;
++	rule->action.ePortMapAction = 3;
++	rule->action.nForwardPortMap[0] = 1;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle, rule);
++	if (ret != GSW_statusOk)
++		pr_err("%s: CPU ingress tc set failed: %d\n", __func__, ret);
++
++	kfree(rule);
++
++	return ret;
++}
++
++int pon_qos_tc_mappings_init(void)
++{
++	struct core_ops *gsw_handle = NULL;
++	GSW_return_t ret = 0;
++	GSW_QoS_DSCP_ClassCfg_t dscp2tc = {
++		.nTrafficClass = {
++			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
++			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
++			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
++			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
++	};
++	GSW_QoS_SVLAN_PCP_ClassCfg_t spcp2tc = {
++		.nTrafficClass = { 0, 1, 2, 3, 4, 5, 6, 7 },
++	};
++	GSW_QoS_portCfg_t qosPortCfg = {
++		/* FIXME: hardcode the PON port number for now */
++		.nPortId = 2,
++		.eClassMode = GSW_QOS_CLASS_SELECT_SPCP_DSCP,
++	};
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle) {
++		pr_err("%s: Open SWAPI device FAILED!\n", __func__);
++		return -EINVAL;
++	}
++
++	ret = gsw_handle->gsw_qos_ops.QoS_DSCP_ClassSet(gsw_handle, &dscp2tc);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: QoS_DSCP_ClassSet failed: %d\n", __func__, ret);
++		return ret;
++	}
++
++	ret = gsw_handle->gsw_qos_ops.QoS_SVLAN_PCP_ClassSet(gsw_handle,
++							     &spcp2tc);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: QoS_SVLAN_PCP_ClassSet err: %d\n", __func__, ret);
++		return ret;
++	}
++
++	ret = gsw_handle->gsw_qos_ops.QoS_PortCfgSet(gsw_handle, &qosPortCfg);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: QoS_PortCfgSet failed: %d\n", __func__, ret);
++		return ret;
++	}
++
++	ret = pon_qos_set_omci_tc(gsw_handle);
++	if (ret)
++		pr_err("%s: cannot set omci tc\n", __func__);
++
++	return ret;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+index bafa90997bac..c8fbc89c62e8 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+@@ -74,14 +74,21 @@ EXPORT_SYMBOL(pon_qos_setup_tc_gen);
+ 
+ static int __init pon_qos_init(void)
+ {
++	int ret = 0;
++
++	rtnl_lock();
+ 	pon_qos_setup_tc_fn = pon_qos_setup_tc;
+-	return 0;
++	ret = pon_qos_tc_mappings_init();
++	rtnl_unlock();
++
++	return ret;
+ }
+ 
+ static void __exit pon_qos_destroy(void)
+ {
+ 	rtnl_lock();
+ 	pon_qos_ports_cleanup();
++	pon_qos_setup_tc_fn = NULL;
+ 	rtnl_unlock();
+ }
+ 
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
+index 33c430fc8b0d..73e237e456d4 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
+@@ -12,5 +12,4 @@ int pon_qos_tc_flower_assign_tc(struct net_device *dev,
+ 
+ int pon_qos_tc_flower_unassign_tc(struct net_device *dev,
+ 				  void *list_node);
+-
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 14a9f732c05b..c1ff8079b59a 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -799,6 +799,59 @@ static int pon_qos_config_cpu_port(struct pon_qos_q_data *qid,
+ 	return ret;
+ }
+ 
++static int pon_qos_force_tc(struct net_device *dev, int pqn, bool en)
++{
++	struct dp_tc_cfg tc_n = {};
++	int ret;
++
++	if (en) {
++		tc_n.dev = dev;
++		/* Force the TC based on the PQ number i.e.,
++		 * PQN = 1 e [1..8] goes to TC = 7 e [0..7]
++		 */
++		tc_n.tc = (PON_QOS_8021P_HIGHEST_PRIO - (pqn - 1));
++		tc_n.force = 1;
++	} else {
++		tc_n.dev = dev;
++		tc_n.tc = 0;
++		tc_n.force = 0;
++	}
++
++	ret = dp_ingress_ctp_tc_map_set(&tc_n, 0);
++	if (ret != 0)
++		netdev_err(dev, "%s: force tc fail\n", __func__);
++
++	return ret;
++}
++
++static int pon_qos_reassign_tc(struct pon_qos_qdisc *sch, int tc, bool en)
++{
++	int ret = -1;
++
++	if (en)
++		ret = pon_qos_ev_tc_assign(sch, tc);
++	else
++		ret = pon_qos_ev_tc_unassign(sch, tc);
++
++	return ret;
++}
++
++static int pon_qos_map_qid(struct pon_qos_q_data *qid,
++			   int port, int tc, bool en)
++{
++	int ret;
++
++	ret = pon_qos_set_qmap(qid, port, tc, en);
++	if (ret != 0)
++		return -EFAULT;
++
++	if (!en)
++		atomic_dec(&qid->ref_cnt);
++	else
++		atomic_inc(&qid->ref_cnt);
++
++	return ret;
++}
+ int pon_qos_update_qmap(struct net_device *dev,
+ 			struct pon_qos_qmap_tc *q_tc, bool en)
+ {
+@@ -839,15 +892,27 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 	if (!sch->port) {
+ 		ret = pon_qos_config_cpu_port(qid, sch->port, tc, en);
+ 	} else {
+-		/* TODO: Queue sharing case */
+-		ret = pon_qos_set_qmap(qid, sch->port, tc, en);
+-		if (ret != 0)
+-			netdev_err(dev, "%s: qmap set failed\n", __func__);
++		if (sch->ds && q_tc->indev) {
++			/* Get the queue id from the handle. In PON pq = 1 is
++			 * the one with the highest priority e.g.
++			 * handle 100:1 has higher prio than 100:7
++			 */
++			int pqn = TC_H_MIN(q_tc->handle);
++
++			return pon_qos_force_tc(q_tc->indev, pqn, en);
++		}
++
++		ret = pon_qos_map_qid(qid, sch->port, tc, en);
++		if (ret != 0) {
++			netdev_err(dev, "%s: qid map err\n", __func__);
++			return -EFAULT;
++		}
+ 
+-		if (!en)
+-			atomic_dec(&qid->ref_cnt);
+-		else
+-			atomic_inc(&qid->ref_cnt);
++		if (!q_tc->indev && sch->ds && sch->dev == dev) {
++			ret = pon_qos_reassign_tc(sch, tc, en);
++			if (ret != 0)
++				netdev_err(dev, "%s: tc remap err\n", __func__);
++		}
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index 7b7a722da0ba..31aa44db3c34 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -13,7 +13,9 @@
+ #include <linux/types.h>
+ 
+ #define PON_QOS_TC_MAX_Q 8
++#define PON_QOS_DOT1P_SZ 8
+ #define PON_QOS_SCH_MAX_LEVEL 3
++#define PON_QOS_8021P_HIGHEST_PRIO 7
+ 
+ enum pon_qos_qdisc_type {
+ 	PON_QOS_QDISC_NONE,
+@@ -37,6 +39,11 @@ struct pon_qos_q_data {
+ 	int p_w;
+ };
+ 
++struct pon_qos_dot1p {
++	bool en;
++	unsigned int tcid;
++};
++
+ struct pon_qos_qdisc {
+ 	struct net_device *dev;
+ 	enum pon_qos_qdisc_type type;
+@@ -52,6 +59,7 @@ struct pon_qos_qdisc {
+ 	int epn;
+ 	u16 def_q;
+ 	bool ds;
++	struct pon_qos_dot1p dot1p[PON_QOS_DOT1P_SZ];
+ 
+ 	unsigned int num_q;
+ 	struct pon_qos_q_data qids[PON_QOS_TC_MAX_Q];
+@@ -132,6 +140,9 @@ int pon_qos_tc_sched_status(struct pon_qos_port *p, struct pon_qos_qdisc *root);
+ 
+ int pon_qos_update_qmap(struct net_device *dev,
+ 			struct pon_qos_qmap_tc *q_tc, bool en);
++int pon_qos_ev_tc_assign(struct pon_qos_qdisc *sch, u8 tc);
++int pon_qos_ev_tc_unassign(struct pon_qos_qdisc *sch, u8 tc);
++int pon_qos_tc_mappings_init(void);
+ 
+ int pon_qos_ports_cleanup(void);
+ 

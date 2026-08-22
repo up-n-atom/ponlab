@@ -1,0 +1,262 @@
+From 33daee83982471cca328b554d7086d409407dffa Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <pczarnota@maxlinear.com>
+Date: Mon, 5 Jul 2021 13:59:18 +0200
+Subject: [PATCH] PONRTSYS-9098: Add support for mapping extracted packets to
+ CPU queue
+
+- Add support for extraction mapping
+
+This change adds support for mapping extracted packets to cpu queues.
+
+For the following command
+
+    tc filter add dev eth0_0 egress protocol all flower skip_sw indev pon0 \
+                  classid 1001:1 action ok
+
+The driver checks that indev belongs to the CPU port and that the direction is
+egress, and if it is so, it creates extraction mapping. The classid has to be
+a valid QID from the CPU port.
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c |   6 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c  | 142 ++++++++++++++++++++++---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h  |   3 +
+ 3 files changed, 134 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index edae2966ba01..979e4bf53409 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -145,6 +145,11 @@ static int pon_qos_get_subif_idx(struct net_device *dev, int *subif)
+ 	if (!dev)
+ 		return -EINVAL;
+ 
++	if (pon_qos_is_netdev_cpu_port(dev)) {
++		*subif = 0;
++		return 0;
++	}
++
+ 	ret = dp_get_netif_subifid(dev, NULL, NULL, 0, &dp_subif, 0);
+ 	if (ret < 0) {
+ 		netdev_err(dev, "%s: subif idx get failed\n", __func__);
+@@ -182,6 +187,7 @@ static int __pon_qos_tc_map(struct net_device *dev,
+ 	/* when Q is removed we should unmap the same classid */
+ 	qmap.handle = map->classid;
+ 	qmap.tc_cookie = map->tc_cookie;
++	qmap.ingress = map->ingress;
+ 	ret = pon_qos_update_qmap(dev, &qmap, en);
+ 	if (ret < 0) {
+ 		netdev_err(dev, "%s: queue unmap fail\n", __func__);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index e34b23df8a97..45dcc1514c17 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -819,8 +819,8 @@ int pon_qos_tc_sched_status(struct pon_qos_port *p, struct pon_qos_qdisc *root)
+ 	return 0;
+ }
+ 
+-static int pon_qos_set_qmap(struct pon_qos_q_data *qid,
+-			    int port, int subif, int tc_cookie, bool en)
++static int pon_qos_set_qmap(struct pon_qos_q_data *qid, int port, int subif,
++			    int tc_cookie, bool en)
+ {
+ 	struct dp_queue_map_set qmap_set = {0};
+ 	int ret;
+@@ -838,14 +838,12 @@ static int pon_qos_set_qmap(struct pon_qos_q_data *qid,
+ 	else
+ 		qmap_set.map.class = tc_cookie;
+ 
+-	/* Do not set the flags below for the CPU port otherwise the lookup
+-	 * table entry for the re-insert queue is overwritten. The re-inserted
+-	 * packets carry enc = 1,dec = 0, mpe1 = 0 and mpe = 0 in the DMA
+-	 * descriptor and they have to be kept.
+-	 */
+ 	if (!pon_qos_is_cpu_port(port)) {
+-		qmap_set.mask.enc = 1;
+-		qmap_set.mask.dec = 1;
++		/* Do not set the flags below for the CPU port otherwise the
++		 * lookup table entry for the re-insert queue is overwritten.
++		 * The re-inserted packets carry mpe1 = 0 and
++		 * mpe = 0 in the DMA descriptor and they have to be kept.
++		 */
+ 		qmap_set.mask.mpe1 = 1;
+ 		qmap_set.mask.mpe2 = 1;
+ 	}
+@@ -876,6 +874,39 @@ static int pon_qos_config_cpu_port(struct pon_qos_q_data *qid,
+ 	return ret;
+ }
+ 
++static int pon_qos_set_qmap_extraction(struct pon_qos_q_data *qid, int port,
++				       bool en)
++{
++	int ret;
++	struct dp_queue_map_set qmap_set = {
++		.inst = 0,
++		.q_id = en ? qid->qid : 0,
++		.map = {
++			.dp_port = port,
++			.mpe1 = 0,
++			.mpe2 = 1,
++		},
++		.mask = {
++			.subif = 1,
++			.class = 1,
++			.flowid = 1,
++		}
++	};
++
++	ret = dp_queue_map_set(&qmap_set, 0);
++	if (ret == DP_FAILURE) {
++		pr_err("%s: queue map set failed\n", __func__);
++		return -EINVAL;
++	}
++
++	if (!en)
++		atomic_dec(&qid->ref_cnt);
++	else
++		atomic_inc(&qid->ref_cnt);
++
++	return 0;
++}
++
+ static int pon_qos_force_tc(struct net_device *dev, int pqn, bool en)
+ {
+ 	struct dp_tc_cfg tc_n = {};
+@@ -1049,9 +1080,71 @@ int pon_qos_update_ds_qmap(struct net_device *dev,
+ 	return 0;
+ }
+ 
+-int pon_qos_update_qmap(struct net_device *dev,
+-			struct pon_qos_qmap_tc *q_tc,
+-			bool en)
++/*
++ * If mapping is egress and it has indev specified as cpu port,
++ * then it is an extraction mapping
++ */
++static bool pon_qos_is_extraction(struct pon_qos_qmap_tc *q_tc)
++{
++	if (q_tc->ingress)
++		return false;
++	if (!q_tc->indev)
++		return false;
++
++	return pon_qos_is_netdev_cpu_port(q_tc->indev);
++}
++
++/*
++ * Does the qmap update for extraction mapping (mapping for which
++ * pon_qos_is_extraction() returns true)
++ */
++static int pon_qos_update_qmap_extraction(struct net_device *dev,
++					  struct pon_qos_qmap_tc *q_tc, bool en)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *sch = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port)
++		return -ENODEV;
++
++	sch = &port->root_qdisc;
++
++	ret = pon_qos_get_grandparent_queue_by_handle(q_tc->indev, q_tc->handle,
++						      &qid);
++	if (ret < 0 || !qid) {
++		ret = pon_qos_get_queue_by_handle(q_tc->indev, q_tc->handle,
++						  &qid);
++		if (ret < 0 || !qid) {
++			netdev_err(dev, "%s: en=%d, handle %#x not found err %d\n",
++				   __func__, en, q_tc->handle, ret);
++			return -EINVAL;
++		}
++	}
++
++	netdev_dbg(dev, "port:%d deq_i:%d q:%d cls:%#x tc:%d/%u ds:%s en:%d\n",
++		   sch->port, sch->deq_idx, qid->qid, q_tc->handle,
++		   q_tc->tc, q_tc->tc_cookie,
++		   sch->ds ? "true" : "false", en);
++
++	trace_pon_qos_update_qmap_enter(dev, sch, qid, q_tc, en);
++
++	ret = pon_qos_set_qmap_extraction(qid, sch->port, en);
++	if (ret != 0) {
++		netdev_err(dev, "%s: qid map err\n", __func__);
++		return -EFAULT;
++	}
++
++	trace_pon_qos_update_qmap_exit(dev, sch, qid, q_tc, en);
++
++	return ret;
++}
++
++/* Updates the qmap for most of the queue mapping cases (except extraction) */
++static int pon_qos_update_qmap_default(struct net_device *dev,
++				       struct pon_qos_qmap_tc *q_tc, bool en)
+ {
+ 	struct pon_qos_port *port = NULL;
+ 	struct pon_qos_qdisc *sch = NULL;
+@@ -1063,8 +1156,6 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 		return -ENODEV;
+ 
+ 	sch = &port->root_qdisc;
+-	if (!sch)
+-		return -EINVAL;
+ 
+ 	ret = pon_qos_get_grandparent_queue_by_handle(dev, q_tc->handle, &qid);
+ 	if (ret < 0 || !qid) {
+@@ -1106,6 +1197,15 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 	return ret;
+ }
+ 
++int pon_qos_update_qmap(struct net_device *dev, struct pon_qos_qmap_tc *q_tc,
++			bool en)
++{
++	if (pon_qos_is_extraction(q_tc))
++		return pon_qos_update_qmap_extraction(dev, q_tc, en);
++
++	return pon_qos_update_qmap_default(dev, q_tc, en);
++}
++
+ int pon_qos_ports_cleanup(void)
+ {
+ 	struct pon_qos_port *p, *n;
+@@ -1333,8 +1433,16 @@ int pon_qos_shaper_remove(struct pon_qos_qdisc *sch,
+ 
+ bool pon_qos_is_cpu_port(int port)
+ {
+-	if (port == PON_QOS_CPU_PORT)
+-		return true;
++	return port == PON_QOS_CPU_PORT;
++}
++
++bool pon_qos_is_netdev_cpu_port(struct net_device *dev)
++{
++	struct pon_qos_port *port = NULL;
++
++	port = pon_qos_port_get(dev);
++	if (!port)
++		return false;
+ 
+-	return false;
++	return pon_qos_is_cpu_port(port->root_qdisc.port);
+ }
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index cb04083a550b..0ebdf98dc05d 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -125,6 +125,7 @@ struct pon_qos_qmap_tc {
+ 	struct net_device *indev;
+ 	int tc;
+ 	char tc_cookie;
++	bool ingress;
+ };
+ 
+ int pon_qos_get_queue_by_handle(struct net_device *dev,
+@@ -193,4 +194,6 @@ int pon_qos_shaper_remove(struct pon_qos_qdisc *sch,
+ 
+ bool pon_qos_is_cpu_port(int port);
+ 
++bool pon_qos_is_netdev_cpu_port(struct net_device *dev);
++
+ #endif

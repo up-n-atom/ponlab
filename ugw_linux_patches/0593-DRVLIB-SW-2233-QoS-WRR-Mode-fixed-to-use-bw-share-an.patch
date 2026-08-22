@@ -1,0 +1,325 @@
+From 021f37174e7796c38edef970f2ede6633a854960 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Wed, 8 May 2019 11:15:36 +0800
+Subject: [PATCH] DRVLIB_SW-2233: QoS WRR Mode fixed to use bw_share and WSP
+ uses priority
+
+---
+ .../net/ethernet/lantiq/datapath/datapath_proc.c   |   7 +-
+ .../lantiq/datapath/gswip31/datapath_ppv4_api.c    | 194 ++++++++++++++-------
+ 2 files changed, 137 insertions(+), 64 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+index 4a2f5532580a..37c864386308 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+@@ -495,9 +495,10 @@ ssize_t proc_dbg_write(struct file *file, const char *buf, size_t count,
+ 	}
+ 
+ 	for (i = 1; i < num; i++) {
+-		for (j = 0; j < get_dp_dbg_flag_str_size(); j++)
+-			if (dp_strncmpi(param_list[i], dp_dbg_flag_str[j], strlen(dp_dbg_flag_str[j])) ==
+-			    0) {
++		for (j = 0; j < get_dp_dbg_flag_str_size()-1; j++)
++			if (dp_strncmpi(param_list[i],
++				dp_dbg_flag_str[j],
++				strlen(dp_dbg_flag_str[j]) + 1) == 0) {
+ 				set_ltq_dbg_flag(dp_dbg_flag, f_enable,
+ 						 dp_dbg_flag_list[j]);
+ 				break;
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c
+index 1d92b05e43a3..16ecda329382 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c
+@@ -2071,6 +2071,56 @@ static int dp_qos_parent_chk(struct dp_node_link *info, int flag)
+ 	return DP_FAILURE;
+ }
+ 
++/* get_parent_arbi API
++ * return parent's arbi of given node
++ * else return DP_FAILURE
++ */
++static int get_parent_arbi(int inst, int node_id, int flag)
++{
++	int pid, arbi;
++	struct hal_priv *priv = HAL(inst);
++	struct pp_qos_sched_conf sched_cfg = {0};
++	struct pp_qos_port_conf port_cfg = {0};
++
++	if (priv->qos_sch_stat[node_id].parent.flag == PP_NODE_FREE) {
++		PR_ERR("Parent is not set for node\n");
++		return DP_FAILURE;
++	}
++	pid = priv->qos_sch_stat[node_id].parent.node_id;
++
++	if (priv->qos_sch_stat[node_id].parent.type == DP_NODE_SCH) {
++		if (qos_sched_conf_get(priv->qdev, pid, &sched_cfg)) {
++			PR_ERR("fail to get sched config\n");
++			return DP_FAILURE;
++		}
++		arbi = arbi_pp2dp(sched_cfg.sched_parent_prop.arbitration);
++		if (arbi == DP_FAILURE)
++			PR_ERR("Wrong pp_arbitrate: %d for %s:%d\n",
++			       port_cfg.port_parent_prop.arbitration,
++			       (priv->qos_sch_stat[node_id].type == DP_NODE_SCH)
++			       ? "sched" : "Q",
++			       node_id);
++	} else if (priv->qos_sch_stat[node_id].parent.type == DP_NODE_PORT) {
++		if (qos_port_conf_get(priv->qdev, pid, &port_cfg)) {
++			PR_ERR("fail to get port config\n");
++			return DP_FAILURE;
++		}
++		arbi = arbi_pp2dp(port_cfg.port_parent_prop.arbitration);
++		if (arbi == DP_FAILURE)
++			PR_ERR("Wrong pp_arbitrate: %d for %s:%d\n",
++			       port_cfg.port_parent_prop.arbitration,
++			       (priv->qos_sch_stat[node_id].type == DP_NODE_SCH)
++			       ? "sched" : "Q",
++			       node_id);
++	} else {
++		PR_ERR("incorrect parent type:0x%x for node:%d.\n",
++		       priv->qos_sch_stat[node_id].parent.type,
++		       node_id);
++		return DP_FAILURE;
++	}
++	return arbi;
++}
++
+ /* dp_node_link_get_31 API
+  * upon success check node link info and return DP_SUCCESS
+  * else return DP_FAILURE
+@@ -2080,7 +2130,7 @@ int dp_node_link_get_31(struct dp_node_link *info, int flag)
+ 	struct pp_qos_queue_conf queue_cfg = {0};
+ 	struct pp_qos_sched_conf sched_cfg = {0};
+ 	struct hal_priv *priv;
+-	int node_id;
++	int node_id, arbi;
+ 
+ 	if (!info) {
+ 		PR_ERR("info cannot be NULL\n");
+@@ -2109,8 +2159,21 @@ int dp_node_link_get_31(struct dp_node_link *info, int flag)
+ 			queue_cfg.queue_child_prop.parent;
+ 		info->p_node_type = get_node_type_by_node_id(info->inst,
+ 				queue_cfg.queue_child_prop.parent, flag);
+-		info->prio_wfq = queue_cfg.queue_child_prop.priority;
+-		info->arbi = 0;
++
++		arbi = get_parent_arbi(info->inst, node_id, flag);
++
++		if (arbi == DP_FAILURE) {
++			return DP_FAILURE;
++		}
++		info->arbi = arbi;
++
++		if (info->arbi == ARBITRATION_WRR) {
++			info->prio_wfq =
++				queue_cfg.queue_child_prop.bandwidth_share;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			info->prio_wfq =
++				queue_cfg.queue_child_prop.priority;
++		}
+ 		info->leaf = 0;
+ 		return DP_SUCCESS;
+ 	} else if (info->node_type == DP_NODE_SCH) {
+@@ -2133,9 +2196,16 @@ int dp_node_link_get_31(struct dp_node_link *info, int flag)
+ 		info->p_node_id.sch_id = sched_cfg.sched_child_prop.parent;
+ 		info->p_node_type = get_node_type_by_node_id(info->inst,
+ 				sched_cfg.sched_child_prop.parent, flag);
+-		info->prio_wfq = sched_cfg.sched_child_prop.priority;
+ 		info->arbi =
+ 			arbi_pp2dp(sched_cfg.sched_parent_prop.arbitration);
++
++		if (info->arbi == ARBITRATION_WRR) {
++			info->prio_wfq =
++				sched_cfg.sched_child_prop.bandwidth_share;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			info->prio_wfq =
++				sched_cfg.sched_child_prop.priority;
++		}
+ 		info->leaf = 0;
+ 		return DP_SUCCESS;
+ 	}
+@@ -2165,11 +2235,16 @@ static int dp_link_set(struct dp_node_link *info, int parent_node, int flag)
+ 		queue_cfg->queue_child_prop.parent = parent_node;
+ 		queue_cfg->wred_enable = 0;
+ 		queue_cfg->queue_wred_max_allowed = DEF_QRED_MAX_ALLOW;
+-		queue_cfg->queue_child_prop.priority = info->prio_wfq;
+ 		/* convert q_id to logical node id and pass it to
+ 		 * low level api
+ 		 */
+ 		node_id = priv->qos_queue_stat[info->node_id.q_id].node_id;
++		if (info->arbi == ARBITRATION_WRR) {
++			queue_cfg->queue_child_prop.bandwidth_share = 
++				info->prio_wfq;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			queue_cfg->queue_child_prop.priority = info->prio_wfq;
++		}				
+ 		DP_DEBUG(DP_DBG_FLAG_QOS,
+ 			 "Try to link Q[%d/%d] to parent[%d/%d] port[%d]\n",
+ 			 info->node_id.q_id,
+@@ -2186,7 +2261,14 @@ static int dp_link_set(struct dp_node_link *info, int parent_node, int flag)
+ 	} else if (info->node_type == DP_NODE_SCH) {
+ 		qos_sched_conf_set_default(sched_cfg);
+ 		sched_cfg->sched_child_prop.parent = parent_node;
+-		sched_cfg->sched_child_prop.priority = info->prio_wfq;
++
++		if (info->arbi == ARBITRATION_WRR) {
++			sched_cfg->sched_child_prop.bandwidth_share = 
++				info->prio_wfq;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			sched_cfg->sched_child_prop.priority = info->prio_wfq;
++		}
++		
+ 		sched_cfg->sched_parent_prop.arbitration = arbi_dp2pp(info->arbi);
+ 		node_id = info->node_id.sch_id;
+ 
+@@ -2229,55 +2311,6 @@ static int dp_link_set(struct dp_node_link *info, int parent_node, int flag)
+ 	return res;
+ }
+ 
+-/* get_parent_arbi API
+- * return parent's arbi of given node
+- * else return DP_FAILURE
+- */
+-static int get_parent_arbi(int inst, int node_id, int flag)
+-{
+-	int pid, arbi;
+-	struct hal_priv *priv = HAL(inst);
+-	struct pp_qos_sched_conf sched_cfg = {0};
+-	struct pp_qos_port_conf port_cfg = {0};
+-
+-	if (priv->qos_sch_stat[node_id].parent.flag == PP_NODE_FREE) {
+-		PR_ERR("Parent is not set for node\n");
+-		return DP_FAILURE;
+-	}
+-	pid = priv->qos_sch_stat[node_id].parent.node_id;
+-
+-	if (priv->qos_sch_stat[node_id].parent.type == DP_NODE_SCH) {
+-		if (qos_sched_conf_get(priv->qdev, pid, &sched_cfg)) {
+-			PR_ERR("fail to get sched config\n");
+-			return DP_FAILURE;
+-		}
+-		arbi = arbi_pp2dp(sched_cfg.sched_parent_prop.arbitration);
+-		if (arbi == DP_FAILURE)
+-			PR_ERR("Wrong pp_arbitrate: %d for %s:%d\n",
+-			       port_cfg.port_parent_prop.arbitration,
+-			       (priv->qos_sch_stat[node_id].type == DP_NODE_SCH)
+-			       ? "sched" : "Q",
+-			       node_id);
+-	} else if (priv->qos_sch_stat[node_id].parent.type == DP_NODE_PORT) {
+-		if (qos_port_conf_get(priv->qdev, pid, &port_cfg)) {
+-			PR_ERR("fail to get port config\n");
+-			return DP_FAILURE;
+-		}
+-		arbi = arbi_pp2dp(port_cfg.port_parent_prop.arbitration);
+-		if (arbi == DP_FAILURE)
+-			PR_ERR("Wrong pp_arbitrate: %d for %s:%d\n",
+-			       port_cfg.port_parent_prop.arbitration,
+-			       (priv->qos_sch_stat[node_id].type == DP_NODE_SCH)
+-			       ? "sched" : "Q",
+-			       node_id);
+-	} else {
+-		PR_ERR("incorrect parent type:0x%x for node:%d.\n",
+-		       priv->qos_sch_stat[node_id].parent.type,
+-		       node_id);
+-		return DP_FAILURE;
+-	}
+-	return arbi;
+-}
+ 
+ /* set_parent_arbi API
+  * set arbitration of node_id's all children and return DP_SUCCESS
+@@ -2371,7 +2404,13 @@ int dp_qos_link_prio_set_31(struct dp_node_prio *info, int flag)
+ 			PR_ERR("fail to get queue prio and parent\n");
+ 			return DP_FAILURE;
+ 		}
+-		queue_cfg.queue_child_prop.priority = info->prio_wfq;
++		if (info->arbi == ARBITRATION_WRR) {
++			queue_cfg.queue_child_prop.bandwidth_share = 
++				info->prio_wfq;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			queue_cfg.queue_child_prop.priority = info->prio_wfq;
++		}		
++
+ 		DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
+ 			 "Prio:%d paased to low level for queue[%d]\n",
+ 			 info->prio_wfq, info->id.q_id);
+@@ -2406,7 +2445,12 @@ int dp_qos_link_prio_set_31(struct dp_node_prio *info, int flag)
+ 			PR_ERR("fail to get sched prio and parent\n");
+ 			return DP_FAILURE;
+ 		}
+-		sched_cfg.sched_child_prop.priority = info->prio_wfq;
++		if (info->arbi == ARBITRATION_WRR) {
++			sched_cfg.sched_child_prop.bandwidth_share = 
++				info->prio_wfq;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			sched_cfg.sched_child_prop.priority = info->prio_wfq;
++		}				
+ 		DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
+ 			 "Prio:%d paased to low level for Sched[%d]\n",
+ 			 info->prio_wfq, info->id.sch_id);
+@@ -2474,7 +2518,13 @@ int dp_qos_link_prio_get_31(struct dp_node_prio *info, int flag)
+ 			return DP_FAILURE;
+ 		}
+ 		info->arbi = arbi;
+-		info->prio_wfq = queue_cfg.queue_child_prop.priority;
++		if (info->arbi == ARBITRATION_WRR) {
++			info->prio_wfq =
++				queue_cfg.queue_child_prop.bandwidth_share;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			info->prio_wfq =
++				queue_cfg.queue_child_prop.priority;
++		}
+ 		return DP_SUCCESS;
+ 	} else if (info->type == DP_NODE_SCH) {
+ 		if ((info->id.sch_id < 0) ||
+@@ -2500,7 +2550,15 @@ int dp_qos_link_prio_get_31(struct dp_node_prio *info, int flag)
+ 			return DP_FAILURE;
+ 		}
+ 		info->arbi = arbi;
+-		info->prio_wfq = sched_cfg.sched_child_prop.priority;
++
++		if (info->arbi == ARBITRATION_WRR) {
++			info->prio_wfq =
++				sched_cfg.sched_child_prop.bandwidth_share;
++		} else if (info->arbi == ARBITRATION_WSP) {
++			info->prio_wfq =
++				sched_cfg.sched_child_prop.priority;
++		}
++
+ 		return DP_SUCCESS;
+ 	}
+ 	PR_ERR("incorrect info type provided:0x%x\n", info->type);
+@@ -3431,7 +3489,14 @@ int dp_link_get_31(struct dp_qos_link *cfg, int flag)
+ 	cfg->q_arbi = get_parent_arbi(cfg->inst, node_id, 0);
+ 	cfg->q_leaf = 0;
+ 	cfg->n_sch_lvl = 0;
+-	cfg->q_prio_wfq = queue_cfg.queue_child_prop.priority;
++
++	if (cfg->q_arbi == ARBITRATION_WRR) {
++		cfg->q_prio_wfq =
++			queue_cfg.queue_child_prop.bandwidth_share;
++	} else if (cfg->q_arbi == ARBITRATION_WSP) {
++		cfg->q_prio_wfq =
++			queue_cfg.queue_child_prop.priority;
++	}
+ 
+ 	if (priv->qos_sch_stat[node_id].parent.type == DP_NODE_PORT) {
+ 		cfg->cqm_deq_port = priv->qos_sch_stat[node_id].parent.node_id;
+@@ -3453,8 +3518,15 @@ int dp_link_get_31(struct dp_qos_link *cfg, int flag)
+ 				       cfg->sch[i].id);
+ 				return DP_FAILURE;
+ 			}
+-			cfg->sch[i].prio_wfq =
++
++			if (cfg->sch[i].arbi == ARBITRATION_WRR) {
++				cfg->sch[i].prio_wfq =
++					sched_cfg.sched_child_prop.bandwidth_share;
++			} else if (cfg->sch[i].arbi == ARBITRATION_WSP) {
++				cfg->sch[i].prio_wfq =
+ 					sched_cfg.sched_child_prop.priority;
++			}
++
+ 			if (priv->qos_sch_stat[cfg->sch[i].id].parent.type ==
+ 			    DP_NODE_PORT)
+ 				break;

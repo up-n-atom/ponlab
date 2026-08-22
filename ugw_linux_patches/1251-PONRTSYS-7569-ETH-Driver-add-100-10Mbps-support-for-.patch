@@ -1,0 +1,567 @@
+From 332c2692e850c11737de78f31a878879b9b5963f Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Thu, 18 Jun 2020 21:08:14 +0800
+Subject: [PATCH] PONRTSYS-7569: ETH Driver - add 100/10Mbps support for 1G
+ SGMII Non-ANEG mode, add debug facilities
+
+---
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c |   1 -
+ drivers/net/ethernet/lantiq/xpcs/xpcs.c          |  77 +++++--
+ drivers/net/ethernet/lantiq/xpcs/xpcs.h          |  18 +-
+ drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c    | 275 +++++++++++++++++++++--
+ 4 files changed, 329 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index 0b820f966504..c9b05ee50faa 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -2044,7 +2044,6 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 			priv->xpcs_node = of_parse_phandle(mac_np, "xpcs", 0);
+ 			if (!priv->xpcs_node) {
+ 				pr_info("Cannot get xpcs node\n");
+-				return -EINVAL;
+ 			}
+ 		}
+ 	ret = of_property_read_u32(iface, "intel,lct-en",
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+index aeac5a6573db..841b3526d894 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+@@ -689,8 +689,14 @@ static int xpcs_teng_xaui_mode(struct xpcs_prv_data *pdata)
+ 		return XPCS_FAILURE;
+ 
+ 	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable Autoneg */
++		/* Disable CL73 Autoneg */
+ 		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++		/* Disable Backplane CL37 Autonegotiation */
++		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
++		/* Disable CL37 Autoneg */
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
++		/* Disable Auto Speed Mode Change after CL37 AN */
++		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
+ 	} else {
+ 		xpcs_cl73_an(pdata);
+ 	}
+@@ -753,8 +759,14 @@ static int xpcs_teng_kr_mode(struct xpcs_prv_data *pdata)
+ 	 * disabled
+ 	 */
+ 	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable Autoneg */
++		/* Disable CL73 Autoneg */
+ 		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++		/* Disable Backplane CL37 Autonegotiation */
++		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
++		/* Disable CL37 Autoneg */
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
++		/* Disable Auto Speed Mode Change after CL37 AN */
++		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
+ 	} else {
+ 		xpcs_cl73_an(pdata);
+ 	}
+@@ -772,9 +784,9 @@ static int xpcs_teng_kr_mode(struct xpcs_prv_data *pdata)
+ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ {
+ 	struct xpcs_serdes_cfg *serdes_cfg = pdata->serdes_cfg;
++	u32 spd;
+ 
+ 	pdata->mpllb = 0;
+-	pdata->sgmii_type = PHY_SIDE_SGMII;
+ 
+ 	if (xpcs_byp_pwrupseq(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+@@ -802,9 +814,17 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ 	XPCS_RGWR_VAL(pdata, PMA_CTRL2, PMA_TYPE,
+ 		      pdata->mode_cfg->pma_type);
+ 
+-	/* 1Gbps SGMII Mode */
+-	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS13, 0);
+-	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS6, 1);
++	/* 1Gbps SGMII Mode or speed for Non-ANEG mode */
++	/* 0 - 10M, 1 - 100M, 2 - 1G */
++	spd = 2;
++	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
++		if (pdata->speed == SPEED_10)
++			spd = 0;
++		else if (pdata->speed == SPEED_100)
++			spd = 1;
++	}
++	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS13, spd & BIT(0));
++	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS6, (spd >> 1) & BIT(0));
+ 
+ 	xpcs_cfg_table(pdata);
+ 
+@@ -836,8 +856,14 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ 		return XPCS_FAILURE;
+ 
+ 	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable Autoneg */
++		/* Disable CL73 Autoneg */
+ 		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++		/* Disable Backplane CL37 Autonegotiation */
++		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
++		/* Disable CL37 Autoneg */
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
++		/* Disable Auto Speed Mode Change after CL37 AN */
++		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
+ 	} else {
+ 		/* Enable Clause 37 Auto-negotiation */
+ 		xpcs_cl37_an(pdata);
+@@ -935,8 +961,14 @@ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata)
+ 		return XPCS_FAILURE;
+ 
+ 	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable Autoneg */
++		/* Disable CL73 Autoneg */
+ 		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++		/* Disable Backplane CL37 Autonegotiation */
++		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
++		/* Disable CL37 Autoneg */
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
++		/* Disable Auto Speed Mode Change after CL37 AN */
++		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
+ 	} else {
+ 		/* Enable Clause 37 Auto-negotiation */
+ 		xpcs_cl37_an(pdata);
+@@ -970,27 +1002,28 @@ static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ 		/* PHY Side SGMII */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, TX_CONFIG, 1);
+ 		/* Autonegotiation will advertise the values programmed to:
+-		 * SGMII_LINK_STS, SS13, SS6 of SR MII MMD and FD
++		 * SGMII_LINK_STS of VR_MII_AN_CTRL, SS13, SS6 of SR_MII_CTRL
++		 * and FD of SR_MII_AN_ADV
+ 		 */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, PHY_MODE_CTRL, 0);
+ 		/* Enable SGMII Link */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS, 1);
+ 		/* 1 Full Duplex, 0 Half Duplex */
+-		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, DUPLEX_MODE, 1);
+-
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, FD, 1);
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, HD, 0);
+ 	} else {
+ 		/* MAC Side SGMII */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, TX_CONFIG, 0);
+ 	}
+ 
+-	/* 8-BIT MII Interface */
+-	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, MII_CONTROL, 1);
++	/* 4-BIT MII Interface */
++	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, MII_CONTROL, 0);
+ 
+ 	/* Automatic Speed Mode Change after CL37 AN, xpcs automatically
+ 	 * switches to the negotiated SGMII/USXGMII/QSGMII(port0) speed, after
+ 	 * the completion of Clause 37 auto-negotiation.
+ 	 */
+-	XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++	XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 1);
+ 
+ 	/* 2.5G Mode */
+ 	if (pdata->mode == TWOP5G_SGMII_MODE) {
+@@ -1459,7 +1492,7 @@ static int xpcs_power_on(struct device *dev)
+ 	return ret;
+ }
+ 
+-static int xpcs_reinit(struct device *dev, u32 mode)
++int xpcs_reinit(struct device *dev, u32 mode)
+ {
+ 	struct xpcs_prv_data *pdata;
+ 	int ret;
+@@ -1522,18 +1555,24 @@ static int xpcs_ethtool_ksettings_set(struct device *dev,
+ 
+ 	if (speed != SPEED_10000 &&
+ 	    speed != SPEED_1000 &&
++	    speed != SPEED_100 &&
++	    speed != SPEED_10 &&
+ 	    speed != SPEED_2500)
+ 		return -EINVAL;
+ 
+-	if (speed == SPEED_10000 && (pdata->mode != TENG_KR_MODE))
+-		mode = TENG_KR_MODE;
+-	else if (speed == SPEED_1000 && (pdata->mode != ONEG_XAUI_MODE))
++	if ((speed == SPEED_1000 || speed == SPEED_100 || speed == SPEED_10)
++	    && ((pdata->conntype == CONN_TYPE_ANEG_DIS && pdata->speed != speed)
++		|| pdata->mode != ONEG_XAUI_MODE)) {
+ 		mode = ONEG_XAUI_MODE;
++	} else if (speed == SPEED_10000 && (pdata->mode != TENG_KR_MODE))
++		mode = TENG_KR_MODE;
+ 	else if (speed == SPEED_2500 && (pdata->mode != TWOP5G_SGMII_MODE))
+ 		mode = TWOP5G_SGMII_MODE;
+ 	else
+ 		return -1;
+ 
++	pdata->speed = speed;
++
+ 	/* Restart Xpcs & PHY */
+ 	xpcs_reinit(pdata->dev, mode);
+ 
+@@ -1556,7 +1595,7 @@ static void xpcs_link_poll_work(struct work_struct *work)
+ 	 */
+ 	if (pdata->link_mode > (MAX_XPCS_MODE - 1))
+ 		pdata->link_mode = 0;
+-	
++
+ 	mode = pdata->link_change_seq[pdata->link_mode];
+ 	xpcs_reinit(pdata->dev, mode);
+ 	pdata->link_mode++;
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.h b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+index 99395336c2ac..b3486ca6a895 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.h
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+@@ -304,6 +304,11 @@
+ #define SR_MII_CTRL_AN_ENABLE_POS		12
+ #define SR_MII_CTRL_AN_ENABLE_WIDTH		1
+ 
++#define SR_MII_AN_ADV_FD_POS			5
++#define SR_MII_AN_ADV_FD_WIDTH			1
++#define SR_MII_AN_ADV_HD_POS			6
++#define SR_MII_AN_ADV_HD_WIDTH			1
++
+ #define VR_MII_AN_CTRL_PCS_MODE_POS		1
+ #define VR_MII_AN_CTRL_PCS_MODE_WIDTH		2
+ #define VR_MII_AN_CTRL_TX_CONFIG_POS		3
+@@ -593,8 +598,8 @@ enum {
+ 
+ enum {
+ 	CONN_TYPE_ANEG_DIS = 0,
+-	CONN_TYPE_ANEG_PHY = 1,
+-	CONN_TYPE_ANEG_MAC = 2,
++	CONN_TYPE_ANEG_MAC = 1,
++	CONN_TYPE_ANEG_PHY = 2,
+ 	CONN_TYPE_MAX,
+ };
+ 
+@@ -795,12 +800,16 @@ struct xpcs_prv_data {
+ 	/* PCS Mode */
+ 	u32 pcs_mode;
+ 
+-	u32 sgmii_type;
++	u32 speed;
+ 	u32 duplex;
+ 
+ 	u32 mpllb;
+ 
+-	/* Connection Type SFP or PHY */
++	/* ANEG mode
++	 * 0 - disable
++	 * 1 - CL73 enable or CL37 MAC Side
++	 * 2 - CL73 enable or CL37 PHY Side
++	 */
+ 	u32 conntype;
+ 
+ 	/* Power save mode 0 - Normal Mode, 1 - power save mode */
+@@ -906,6 +915,7 @@ static inline void XPCS_RGWR(struct xpcs_prv_data *pdata, u32 reg, u32 val)
+ 		XPCS_RGWR(pdata, reg, reg_val);			\
+ 	} while (0)
+ 
++int xpcs_reinit(struct device *dev, u32 mode);
+ int xpcs_sysfs_init(struct xpcs_prv_data *priv);
+ 
+ static inline struct xpcs_ops *xpcs_pdev_ops(struct platform_device *pdev)
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+index f62fc844b526..9990affabf3a 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+@@ -536,6 +536,25 @@ static ssize_t xpcs_status_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(xpcs_status);
+ 
++static ssize_t reg_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	int off = 0;
++
++	pdata = dev_get_drvdata(dev);
++
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
++	off += sprintf(buf + off, "Usage:\n");
++	off += sprintf(buf + off, "    read:  echo <addr> > reg\n");
++	off += sprintf(buf + off, "    write: echo <addr> <value> > reg\n");
++	off += sprintf(buf + off, "  notes: all parameters are HEX format\n");
++
++	return off;
++}
++
+ static ssize_t reg_store(struct device *dev,
+ 			 struct device_attribute *attr,
+ 			 const char *buf, size_t count)
+@@ -560,31 +579,248 @@ static ssize_t reg_store(struct device *dev,
+ 
+ 	token = strsep(&b, " ");
+ 	if (!token)
+-		return -EINVAL;
+-	err = kstrtoul(token, 0, &reg_off);
+-	if (err)
+-		return err;
+-	if (count > 11) {
+-		token = strsep(&b, " ");
+-	if (!token)
+-		return -EINVAL;
+-	err = kstrtoul(token, 0, &reg_val);
+-	if (err)
+-		return err;
+-	pr_info("%s: write off %08x val %08x\n", pdata->name,
+-		(u32)reg_off, (u32)reg_val);
+-	XPCS_RGWR(pdata, reg_off, reg_val);
+-	val = XPCS_RGRD(pdata, reg_off);
+-	pr_info("%s: read off %08x val %08x\n", pdata->name, (u32)reg_off, val);
+-	return count;
++		return count;
++	err = kstrtoul(token, 16, &reg_off);
++	if (err) {
++		pr_err("incorrect XPCS register offset: %s\n", token);
++		return count;
++	}
++	token = strsep(&b, " ");
++	if (token) {
++		err = kstrtoul(token, 16, &reg_val);
++		if (err) {
++			pr_err("incorrect value: %s\n", token);
++			return count;
++		}
++		pr_info("%s: write off %08x val %08x\n", pdata->name,
++			(u32)reg_off, (u32)reg_val);
++		XPCS_RGWR(pdata, reg_off, reg_val);
+ 	}
+ 	val = XPCS_RGRD(pdata, reg_off);
+ 	pr_info("%s: read off %08x val %08x\n",
+ 		pdata->name, (u32)reg_off, val);
+ 	return count;
+ }
++static DEVICE_ATTR_RW(reg);
++
++static ssize_t rxeq_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	struct xpcs_serdes_cfg *pserdes = pdata->serdes_cfg;
++	int off = 0;
++	u32 val;
++
++	pdata = dev_get_drvdata(dev);
++
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
++	off += sprintf(buf + off, "Register:\n");
++	val = XPCS_RGRD(pdata, PMA_RX_EQ_CTRL0);
++	off += sprintf(buf + off, "  vga1_gain:  %d\n", (val >> 12) & 0x0F);
++	off += sprintf(buf + off, "  vga2_gain:  %d\n", (val >> 8) & 0x0F);
++	off += sprintf(buf + off, "  ctle_pole:  %d\n", (val >> 5) & 0x07);
++	off += sprintf(buf + off, "  ctle_boost: %d\n", val & 0x1F);
++	val = XPCS_RGRD(pdata, PMA_RX_ATTN_CTRL);
++	off += sprintf(buf + off, "  attn_lvl:   %d\n", val & 0x0F);
++
++	off += sprintf(buf + off, "Configure:\n");
++	off += sprintf(buf + off, "  vga1_gain:  %d\n", pserdes->rx_vga1_gain[pdata->mode]);
++	off += sprintf(buf + off, "  vga2_gain:  %d\n", pserdes->rx_vga2_gain[pdata->mode]);
++	off += sprintf(buf + off, "  ctle_pole:  %d\n", pserdes->rx_ctle_pole[pdata->mode]);
++	off += sprintf(buf + off, "  ctle_boost: %d\n", pserdes->rx_ctle_boost[pdata->mode]);
++	off += sprintf(buf + off, "  attn_lvl:   %d\n", pserdes->rx_attn_lvl[pdata->mode]);
++
++	off += sprintf(buf + off, "Calibration: %d\n", pserdes->no_phy_rx_auto_adapt ^ 0x01);
++
++	return off;
++}
++
++static ssize_t rxeq_store(struct device * dev, struct device_attribute * attr,
++			 const char * buf, size_t count)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	struct xpcs_serdes_cfg *pserdes = pdata->serdes_cfg;
++	char lbuf[256];
++	size_t n, len;
++	u32 val;
++
++	if (!pdata->state) {
++		pr_err("\n%s: power off\n", pdata->name);
++		return count;
++	}
++
++	len = min(count, sizeof(lbuf)-1);
++	memcpy(lbuf, buf, len);
++	lbuf[len] = 0;
++
++	for (n = 0; n < len && lbuf[n] > ' '; n++);
++	lbuf[n] = 0;
++	for (; n < len && lbuf[n] <= ' '; n++);
++
++	if (n >= len) {
++		pr_err("echo <param> <val> > rxeq\n");
++		return count;
++	}
++
++	val = simple_strtoull(&lbuf[n], NULL, 0);
++	if (strncasecmp(lbuf, "vga1_gain", n) == 0)
++		pserdes->rx_vga1_gain[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "vga2_gain", n) == 0)
++		pserdes->rx_vga2_gain[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "ctle_pole", n) == 0)
++		pserdes->rx_ctle_pole[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "ctle_boost", n) == 0)
++		pserdes->rx_ctle_boost[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "attn_lvl", n) == 0)
++		pserdes->rx_attn_lvl[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "rx_cali", n) == 0
++		|| strncasecmp(lbuf, "Calibration", n) == 0)
++		pserdes->no_phy_rx_auto_adapt = val ? 0 : 1;
++	else {
++		pr_err("valid param:\n");
++		pr_err("  vga1_gain\n");
++		pr_err("  vga2_gain\n");
++		pr_err("  ctle_pole\n");
++		pr_err("  ctle_boost\n");
++		pr_err("  att_lvl\n");
++		pr_err("  rx_cali\n");
++		pr_err("input:\n");
++		pr_err("  \"%s\"\n", lbuf);
++	}
++
++	return count;
++}
++static DEVICE_ATTR_RW(rxeq);
+ 
+-static DEVICE_ATTR_WO(reg);
++static ssize_t txeq_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	struct xpcs_serdes_cfg *pserdes = pdata->serdes_cfg;
++	int off = 0;
++	u32 val;
++
++	pdata = dev_get_drvdata(dev);
++
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
++	off += sprintf(buf + off, "Register:\n");
++	val = XPCS_RGRD(pdata, PMA_TX_EQ_C0);
++	off += sprintf(buf + off, "  main:    %d\n", XPCS_GET_VAL(val, PMA_TX_EQ_C0, TX_EQ_MAIN));
++	off += sprintf(buf + off, "  pre:     %d\n", XPCS_GET_VAL(val, PMA_TX_EQ_C0, TX_EQ_PRE));
++	val = XPCS_RGRD(pdata, PMA_TX_EQ_C1);
++	off += sprintf(buf + off, "  post:    %d\n", XPCS_GET_VAL(val, PMA_TX_EQ_C1, TX_EQ_POST));
++	off += sprintf(buf + off, "  ovrride: %d\n", XPCS_GET_VAL(val, PMA_TX_EQ_C1, TX_EQ_OVR_RIDE));
++
++	off += sprintf(buf + off, "Configure:\n");
++	off += sprintf(buf + off, "  main:    %d\n", pserdes->tx_eq_main[pdata->mode]);
++	off += sprintf(buf + off, "  pre:     %d\n", pserdes->tx_eq_pre[pdata->mode]);
++	off += sprintf(buf + off, "  post:    %d\n", pserdes->tx_eq_post[pdata->mode]);
++	off += sprintf(buf + off, "  ovrride: %d\n", pdata->mode_cfg->tx_eq_ovrride);
++
++	return off;
++}
++
++static ssize_t txeq_store(struct device * dev, struct device_attribute * attr,
++			 const char * buf, size_t count)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	struct xpcs_serdes_cfg *pserdes = pdata->serdes_cfg;
++	char lbuf[256];
++	size_t n, len;
++	u32 val;
++
++	if (!pdata->state) {
++		pr_err("\n%s: power off\n", pdata->name);
++		return count;
++	}
++
++	len = min(count, sizeof(lbuf)-1);
++	memcpy(lbuf, buf, len);
++	lbuf[len] = 0;
++
++	for (n = 0; n < len && lbuf[n] > ' '; n++);
++	lbuf[n] = 0;
++	for (; n < len && lbuf[n] <= ' '; n++);
++
++	if (n >= len) {
++		pr_err("echo <param> <val> > rxeq\n");
++		return count;
++	}
++
++	val = simple_strtoull(&lbuf[n], NULL, 0);
++	if (strncasecmp(lbuf, "main", n) == 0)
++		pserdes->tx_eq_main[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "pre", n) == 0)
++		pserdes->tx_eq_pre[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "post", n) == 0)
++		pserdes->tx_eq_post[pdata->mode] = val;
++	else if (strncasecmp(lbuf, "ovrride", n) == 0)
++		pdata->mode_cfg->tx_eq_ovrride = val;
++	else {
++		pr_err("valid param:\n");
++		pr_err("  main\n");
++		pr_err("  pre\n");
++		pr_err("  post\n");
++		pr_err("  ovrride\n");
++		pr_err("input:\n");
++		pr_err("  \"%s\"\n", lbuf);
++	}
++
++	return count;
++}
++static DEVICE_ATTR_RW(txeq);
++
++static ssize_t mode_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	int off = 0;
++	const char *mode_name[] = {"10G_KR", "10G_XAUI", "1G_SGMII", "2.5G_SGMII"};
++
++	pdata = dev_get_drvdata(dev);
++
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
++	off += sprintf(buf, "%s\n", mode_name[pdata->mode_cfg->id]);
++
++	return off;
++}
++
++static ssize_t mode_store(struct device * dev, struct device_attribute * attr,
++			 const char * buf, size_t count)
++{
++	const char *mode_name[] = {"10G_KR", "10G_XAUI", "1G_SGMII", "2.5G_SGMII"};
++	char lbuf[256];
++	size_t n, len;
++
++	len = min(count, sizeof(lbuf)-1);
++	for (n = 0; n < len && buf[n] > ' '; n++)
++		lbuf[n] = buf[n];
++	lbuf[n] = 0;
++	len = n;
++
++	for (n = 0; n < ARRAY_SIZE(mode_name); n++) {
++		if (strncasecmp(lbuf, mode_name[n], len))
++			continue;
++		xpcs_reinit(dev, n);
++		return count;
++	}
++	if (n >= ARRAY_SIZE(mode_name)) {
++		pr_err("valid modes:\n");
++		for (n = 0; n < ARRAY_SIZE(mode_name); n++)
++			pr_err("  %s\n", mode_name[n]);
++		pr_err("input:\n");
++		pr_err("  \"%s\"\n", lbuf);
++	}
++
++	return count;
++}
++static DEVICE_ATTR_RW(mode);
+ 
+ static struct attribute *xpcs_attrs[] = {
+ 	&dev_attr_xpcs_cl73_info.attr,
+@@ -592,6 +828,9 @@ static struct attribute *xpcs_attrs[] = {
+ 	&dev_attr_xpcs_table.attr,
+ 	&dev_attr_xpcs_linksts.attr,
+ 	&dev_attr_reg.attr,
++	&dev_attr_rxeq.attr,
++	&dev_attr_txeq.attr,
++	&dev_attr_mode.attr,
+ 	NULL,
+ };
+ 

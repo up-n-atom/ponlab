@@ -1,0 +1,398 @@
+From c935995c63e41f493999774ee5f574a435bf8d79 Mon Sep 17 00:00:00 2001
+From: Gu Chao <gux.chao@intel.com>
+Date: Mon, 29 Jun 2020 17:07:48 +0800
+Subject: [PATCH] DRV_DPM_SW-299: FLM DPM replace time critical kmalloc with
+ kmem_cache
+
+- list of following structs are allocated via kmem cache:
+  dp_subif_cache, br_info, bridge_id_entry_item, bridge_member_port
+- add dp_inst_free() and dp_subif_list_free()
+- replace dp_kfree() with dp_kfree_br_entry() to utilize kmem_cache_free()
+---
+ drivers/net/datapath/dpm/datapath.h          |  2 +
+ drivers/net/datapath/dpm/datapath_instance.c | 32 +++++++----
+ drivers/net/datapath/dpm/datapath_misc.c     | 18 +++++--
+ drivers/net/datapath/dpm/datapath_swdev.c    | 80 +++++++++++++++++++---------
+ 4 files changed, 93 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index f5dfee3771e6..3128769b5d66 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -922,6 +922,7 @@ int dp_get_port_subitf_via_dev_private(struct net_device *dev,
+ int get_vlan_via_dev(struct net_device *dev, struct vlan_prop *vlan_prop);
+ void dp_parser_info_refresh(u32 cpu, u32 mpe1, u32 mpe2, u32 mpe3, u32 verify);
+ int dp_inst_init(u32 flag);
++void dp_inst_free(void);
+ int request_dp(u32 flag);
+ int dp_init_module(void);
+ void dp_cleanup_module(void);
+@@ -1003,6 +1004,7 @@ struct dp_subif_cache *dp_subif_lookup_safe(struct hlist_head *head,
+ 					    struct net_device *dev,
+ 					    void *data);
+ int dp_subif_list_init(void);
++void dp_subif_list_free(void);
+ int parser_enabled(int ep, struct dma_rx_desc_1 *desc_1);
+ int dp_lan_wan_bridging(int port_id, struct sk_buff *skb);
+ int get_dma_chan_idx(int inst, int num_dma_chan);
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index f822110139ff..1b160ee3a951 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -20,6 +20,9 @@ struct hlist_head dp_dev_list[DP_DEV_HASH_SIZE];
+ /*Module hash list */
+ struct hlist_head dp_mod_list[DP_MOD_HASH_SIZE];
+ 
++static struct kmem_cache *cache_dev_list;
++static struct kmem_cache *cache_mod_list;
++
+ struct hlist_head *get_dp_dev_list(void)
+ {
+ 	return dp_dev_list;
+@@ -240,8 +243,7 @@ int dp_inst_add_dev(struct net_device *dev, int inst,
+ 
+ 	dp_dev = dp_dev_lookup(dev);
+ 	if (!dp_dev) {
+-		dp_dev = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_dev),
+-				      GFP_ATOMIC);
++		dp_dev = kmem_cache_zalloc(cache_dev_list, GFP_ATOMIC);
+ 		if (dp_dev)
+ 			new_f = 1;
+ 		else
+@@ -389,8 +391,7 @@ int dp_set_net_dev_ops_priv(struct net_device *dev, void *ops_cb,
+ 	if (!dp_dev && !(flag & DP_OPS_RESET)) {
+ 		/* New net_device, create and add to dp_dev_list */
+ 		idx = dp_dev_hash(dev);
+-		dp_dev = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_dev),
+-				      GFP_ATOMIC);
++		dp_dev = kmem_cache_zalloc(cache_dev_list, GFP_ATOMIC);
+ 		if (dp_dev) {
+ 			dp_dev->dev = dev;
+ 			dp_dev->owner = flag & DP_OPS_OWNER_EXT;
+@@ -478,7 +479,7 @@ int dp_set_net_dev_ops_priv(struct net_device *dev, void *ops_cb,
+ 	if (!dp_dev->cb_cnt && !(dp_dev->owner & DP_OPS_OWNER_DPM)) {
+ 		hlist_del(&dp_dev->hlist);
+ 		dp_ops_reset(dp_dev, dev);
+-		devm_kfree(&g_dp_dev->dev, dp_dev);
++		kmem_cache_free(cache_dev_list, dp_dev);
+ 	}
+ 
+ EXIT:
+@@ -519,8 +520,7 @@ int dp_inst_insert_mod(struct module *owner, u16 ep, u32 inst, u32 flag)
+ 	DP_DEBUG(DP_DBG_FLAG_INST, "%s:idx=%u\n", __func__, idx);
+ 	dp_mod = dp_mod_lookup(&dp_mod_list[idx], owner, ep, flag);
+ 	if (!dp_mod) { /*alloc new */
+-		dp_mod = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_mod),
+-				      GFP_ATOMIC);
++		dp_mod = kmem_cache_zalloc(cache_mod_list, GFP_ATOMIC);
+ 		if (dp_mod) {
+ 			dp_mod->mod = owner;
+ 			dp_mod->ep = ep;
+@@ -553,7 +553,7 @@ int dp_inst_del_mod(struct module *owner, u16 ep, u32 flag)
+ 		return -1;
+ 	}
+ 	hlist_del(&dp_mod->hlist);
+-	devm_kfree(&g_dp_dev->dev, dp_mod);
++	kmem_cache_free(cache_mod_list, dp_mod);
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_INST, "%s ok: %s:\n", __func__, owner->name);
+ 	return 0;
+@@ -768,7 +768,21 @@ int dp_inst_init(u32 flag)
+ 	memset(hw_cap_list, 0, sizeof(hw_cap_list));
+ 	for (i = 0; i < DP_DEV_HASH_SIZE; i++)
+ 		INIT_HLIST_HEAD(&dp_dev_list[i]);
+-
++	cache_dev_list = kmem_cache_create("dp_dev_list", sizeof(struct dp_dev),
++					   0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!cache_dev_list)
++		return -ENOMEM;
++	cache_mod_list = kmem_cache_create("dp_mod_list", sizeof(struct dp_mod),
++					   0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!cache_dev_list) {
++		kmem_cache_destroy(cache_dev_list);
++		return -ENOMEM;
++	}
+ 	return 0;
+ }
+ 
++void dp_inst_free(void)
++{
++	kmem_cache_destroy(cache_mod_list);
++	kmem_cache_destroy(cache_dev_list);
++}
+diff --git a/drivers/net/datapath/dpm/datapath_misc.c b/drivers/net/datapath/dpm/datapath_misc.c
+index 9e716ffdd7aa..ecf37690fe25 100644
+--- a/drivers/net/datapath/dpm/datapath_misc.c
++++ b/drivers/net/datapath/dpm/datapath_misc.c
+@@ -22,6 +22,8 @@ static int dp_coc_cpufreq_policy_notifier(struct notifier_block *nb,
+ #endif
+ 
+ struct hlist_head dp_subif_list[DP_SUBIF_LIST_HASH_SIZE];
++static struct kmem_cache *cache_subif_list;
++
+ char *parser_flags_str[] = {
+ 	"PARSER_FLAGS_NO",
+ 	"PARSER_FLAGS_END",
+@@ -894,9 +896,19 @@ int dp_subif_list_init(void)
+ 	for (i = 0; i < DP_SUBIF_LIST_HASH_SIZE; i++)
+ 		INIT_HLIST_HEAD(&dp_subif_list[i]);
+ 
++	cache_subif_list = kmem_cache_create("dp_subif_list",
++					     sizeof(struct dp_subif_cache),
++					     0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!cache_subif_list)
++		return -ENOMEM;
+ 	return 0;
+ }
+ 
++void dp_subif_list_free(void)
++{
++	kmem_cache_destroy(cache_subif_list);
++}
++
+ struct dp_subif_cache *dp_subif_lookup_safe(struct hlist_head *head,
+ 					    struct net_device *dev, void *data)
+ {
+@@ -940,8 +952,7 @@ int32_t dp_update_subif(struct net_device *netif, void *data,
+ 	idx = dp_subif_hash(netif);
+ 	dp_subif = dp_subif_lookup_safe(&dp_subif_list[idx], netif, data);
+ 	if (!dp_subif) { /*alloc new */
+-		dp_subif = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_subif),
+-					GFP_ATOMIC);
++		dp_subif = kmem_cache_zalloc(cache_subif_list, GFP_ATOMIC);
+ 		if (!dp_subif)
+ 			return -1;
+ 		memcpy(&dp_subif->subif, subif, sizeof(dp_subif_t));
+@@ -953,8 +964,7 @@ int32_t dp_update_subif(struct net_device *netif, void *data,
+ 		dp_subif->subif_fn = subifid_fn_t;
+ 		hlist_add_head_rcu(&dp_subif->hlist, &dp_subif_list[idx]);
+ 	} else {
+-		dp_subif_new = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_subif),
+-					    GFP_ATOMIC);
++		dp_subif_new = kmem_cache_zalloc(cache_subif_list, GFP_ATOMIC);
+ 		if (!dp_subif_new)
+ 			return -1;
+ 		memcpy(&dp_subif_new->subif, subif, sizeof(dp_subif_t));
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index e1cc19e84f33..2aee056e65a9 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -22,17 +22,21 @@ static int dp_swdev_del_bport_from_list(struct br_info *br_item, int bport);
+ 
+ struct hlist_head g_bridge_id_entry_hash_table[BR_ID_ENTRY_HASH_TABLE_SIZE];
+ 
++static struct kmem_cache *cache_br_info_list;
++static struct kmem_cache *cache_br_entry_list;
++static struct kmem_cache *cache_br_port_list;
++
+ static inline u32 dp_swdev_cal_hash(const void *ptr)
+ {
+ 	return hash_long((unsigned long)ptr, BRIDGE_ID_ENTRY_HASH_LENGTH);
+ }
+ 
+-/* dp_kfree - used as destructor for
++/* dp_kfree_br_entry - used as destructor for
+  * switchdev_trans_item_enqueue() API
+  */
+-void dp_kfree(void const *ptr)
++void dp_kfree_br_entry(void const *ptr)
+ {
+-	devm_kfree(&g_dp_dev->dev, (void *)ptr);
++	kmem_cache_free(cache_br_entry_list, (void *)ptr);
+ }
+ 
+ struct hlist_head *get_dp_g_bridge_id_entry_hash_table_info(int idx)
+@@ -137,7 +141,7 @@ static void dp_swdev_remove_bridge_id_entry(struct br_info *br_item)
+ 
+ 	synchronize_rcu();
+ 
+-	devm_kfree(&g_dp_dev->dev, br_item);
++	kmem_cache_free(cache_br_info_list, br_item);
+ }
+ 
+ static void dp_swdev_insert_bridge_id_entry(struct br_info *br_item)
+@@ -168,6 +172,10 @@ void dp_swdev_bridge_id_entry_free(void)
+ 			dp_swdev_remove_bridge_id_entry(br_item);
+ 		}
+ 	}
++	kmem_cache_destroy(cache_br_port_list);
++	kmem_cache_destroy(cache_br_entry_list);
++	kmem_cache_destroy(cache_br_info_list);
++	return DP_SUCCESS;
+ }
+ 
+ int dp_swdev_bridge_id_entry_init(void)
+@@ -177,7 +185,31 @@ int dp_swdev_bridge_id_entry_init(void)
+ 	for (i = 0; i < BR_ID_ENTRY_HASH_TABLE_SIZE; i++)
+ 		INIT_HLIST_HEAD(&g_bridge_id_entry_hash_table[i]);
+ 
++	cache_br_info_list = kmem_cache_create("dp_br_info_list",
++					       sizeof(struct br_info),
++					       0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!cache_br_info_list)
++		return DP_FAILURE;
++
++	cache_br_entry_list =
++		kmem_cache_create("dp_br_entry_list",
++				  sizeof(struct bridge_id_entry_item),
++				  0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!cache_br_entry_list)
++		goto ERR;
++
++	cache_br_port_list =
++		kmem_cache_create("dp_br_port_list",
++				  sizeof(struct bridge_member_port),
++				  0, SLAB_HWCACHE_ALIGN, NULL);
++	if (!cache_br_port_list)
++		goto ERR;
++
+ 	return DP_SUCCESS;
++ERR:
++	kmem_cache_destroy(cache_br_entry_list);
++	kmem_cache_destroy(cache_br_info_list);
++	return DP_FAILURE;
+ }
+ 
+ static int dp_swdev_del_bport_from_list(struct br_info *br_item,
+@@ -196,7 +228,7 @@ static int dp_swdev_del_bport_from_list(struct br_info *br_item,
+ 	if (found) {
+ 		list_del(&bmp->list);
+ 
+-		devm_kfree(&g_dp_dev->dev, bmp);
++		kmem_cache_free(cache_br_port_list, bmp);
+ 
+ 		return DP_SUCCESS;
+ 	}
+@@ -218,8 +250,7 @@ static int dp_swdev_add_bport_to_list(struct br_info *br_item,
+ 	}
+ 
+ 	if (!found) {
+-		bmp = devm_kzalloc(&g_dp_dev->dev, sizeof(*bmp),
+-				   GFP_ATOMIC);
++		bmp = kmem_cache_zalloc(cache_br_port_list, GFP_ATOMIC);
+ 		if (!bmp)
+ 			return DP_FAILURE;
+ 
+@@ -357,8 +388,7 @@ static int dp_swdev_filter_vlan(struct net_device *dev,
+ 			return ret;
+ 		}
+ 
+-		br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item),
+-				       GFP_ATOMIC);
++		br_item = kmem_cache_zalloc(cache_br_entry_list, GFP_ATOMIC);
+ 		if (!br_item)
+ 			return ret;
+ 
+@@ -374,13 +404,13 @@ static int dp_swdev_filter_vlan(struct net_device *dev,
+ 		} else {
+ 			rcu_read_unlock();
+ 
+-			devm_kfree(&g_dp_dev->dev, br_item);
++			kmem_cache_free(cache_br_entry_list, br_item);
+ 
+ 			return ret;
+ 		}
+ 
+-		switchdev_trans_item_enqueue(trans, br_item,
+-					     dp_kfree, &br_item->tritem);
++		switchdev_trans_item_enqueue(trans, br_item, dp_kfree_br_entry,
++					     &br_item->tritem);
+ 
+ 		rcu_read_unlock();
+ 
+@@ -393,7 +423,7 @@ static int dp_swdev_filter_vlan(struct net_device *dev,
+ 
+ 	if (br_item) {
+ 		dp_swdev_cfg_vlan(br_item, dev);
+-		dp_kfree(br_item);
++		kmem_cache_free(cache_br_entry_list, br_item);
+ 	}
+ 
+ 	DP_LIB_UNLOCK(&dp_lock);
+@@ -417,8 +447,8 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 
+ 		ret = i_info->swdev_bridge_cfg_set(br_item->inst, br_item->fid);
+ 		if (ret == 0) {
+-			br_info = devm_kzalloc(&g_dp_dev->dev,
+-					       sizeof(*br_info), GFP_ATOMIC);
++			br_info = kmem_cache_zalloc(cache_br_info_list,
++						    GFP_ATOMIC);
+ 			if (!br_info)
+ 				/* Cannot return failure in switchdev commit */
+ 				return DP_SUCCESS;
+@@ -603,8 +633,7 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 
+ 	/* SWITCHDEV_TRANS_PREPARE phase */
+ 	if (switchdev_trans_ph_prepare(trans)) {
+-		br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item),
+-				       GFP_ATOMIC);
++		br_item = kmem_cache_zalloc(cache_br_entry_list, GFP_ATOMIC);
+ 		if (!br_item)
+ 			/*need to check dequeue if no memory*/
+ 			return -ENOMEM;
+@@ -642,7 +671,8 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 				} else {
+ 					pr_err("Switch config failed\n");
+ 
+-					devm_kfree(&g_dp_dev->dev, br_item);
++					kmem_cache_free(cache_br_entry_list,
++							br_item);
+ 
+ 					rcu_read_unlock();
+ 
+@@ -655,7 +685,7 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 
+ 		rcu_read_unlock();
+ 
+-		switchdev_trans_item_enqueue(trans, br_item, dp_kfree,
++		switchdev_trans_item_enqueue(trans, br_item, dp_kfree_br_entry,
+ 					     &br_item->tritem);
+ 
+ 		return DP_SUCCESS;
+@@ -673,7 +703,7 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 			dp_swdev_cfg_vlan(br_item, dev);
+ 
+ 		DP_LIB_UNLOCK(&dp_lock);
+-		dp_kfree(br_item);
++		kmem_cache_free(cache_br_entry_list, br_item);
+ 	}
+ 
+ 	return DP_SUCCESS;
+@@ -704,8 +734,7 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 	}
+ 
+ 	if (switchdev_trans_ph_prepare(trans)) {
+-		br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item),
+-				       GFP_ATOMIC);
++		br_item = kmem_cache_zalloc(cache_br_entry_list, GFP_ATOMIC);
+ 		if (!br_item)
+ 			/* TODO need to check dequeue if no memory */
+ 			return -ENOMEM;
+@@ -744,7 +773,7 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 		rcu_read_unlock();
+ 
+ 		/*check return value & enqueue*/
+-		switchdev_trans_item_enqueue(trans, br_item, dp_kfree,
++		switchdev_trans_item_enqueue(trans, br_item, dp_kfree_br_entry,
+ 					     &br_item->tritem);
+ 		return DP_SUCCESS;
+ 	}
+@@ -767,7 +796,7 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 		dp_del_swdev_reg_vlan(br_item, dev, addr);
+ 
+ 	if (flags != DP_SWDEV_BRIDGE_ITEM)
+-		dp_kfree(br_item);
++		kmem_cache_free(cache_br_entry_list, br_item);
+ 
+ 	return DP_SUCCESS;
+ }
+@@ -1039,8 +1068,7 @@ int dp_notif_br_alloc(struct net_device *br_dev)
+ 	}
+ 
+ 	if (!dp_info->swdev_bridge_cfg_set(0, br_id)) {
+-		br_info = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_info),
+-				       GFP_ATOMIC);
++		br_info = kmem_cache_zalloc(cache_br_info_list, GFP_ATOMIC);
+ 		if (!br_info) {
+ 			dp_info->swdev_free_brcfg(0, br_id);
+ 			return DP_FAILURE;

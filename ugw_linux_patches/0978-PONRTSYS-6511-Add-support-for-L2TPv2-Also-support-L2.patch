@@ -1,0 +1,1071 @@
+From 46cb62b55874ef0ee49098794b910b8d61041bb5 Mon Sep 17 00:00:00 2001
+From: Ricardo Martinez <ricardo.martinez@intel.com>
+Date: Wed, 28 Aug 2019 11:22:23 -0700
+Subject: [PATCH] PONRTSYS-6511: Add support for L2TPv2 Also support L2TPv3 UDP
+ Encapsulate
+
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |  84 ++++-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c |  25 +-
+ .../pp-session-mgr/pp_session_mgr_internal.h       |   3 +-
+ drivers/net/ppv4/pp-hal/field-vector/pp_fv.c       |   4 +-
+ drivers/net/ppv4/pp-hal/field-vector/pp_fv.h       |   2 +-
+ drivers/net/ppv4/pp-hal/modifier/modifier.h        |  32 +-
+ drivers/net/ppv4/pp-hal/modifier/modifier_core.c   |   6 +-
+ .../net/ppv4/pp-hal/modifier/modifier_recipes.c    |  76 ++++-
+ drivers/net/ppv4/pp-hal/parser/parser_protocols.c  | 378 ++++++++++++++++-----
+ drivers/net/ppv4/pp-hal/parser/parser_protocols.h  |  33 +-
+ 10 files changed, 521 insertions(+), 122 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 888876381d32..e473ed9037d6 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -845,6 +845,76 @@ static inline bool __smgr_is_6rd_term_sess(struct sess_info *sess)
+ 	return false;
+ }
+ 
++/**
++ * @brief Check whether a session is a supported L2TP UDP termination session
++ *        ONLY w/o any other tunnels
++ * @note this API also set the mod_flags to avoid double
++ *       checking later
++ * @param sess the session to test
++ * @return bool true if it is, false otherwise
++ * TBD: Add support for L2TPV3_UDP
++ */
++static inline bool __smgr_is_l2tpudp_term_sess(struct sess_info *sess)
++{
++	__u32 tunnel_bitmap = SESS_INGRS_TUNN_BMAP(sess) &
++			      ~FV_TUNNEL_L2TP_FLAGS;
++
++	/* decapsulation v2 */
++	if (tunnel_bitmap == FV_TUNNEL_L2TPV2_UDP                     &&
++	    (SESS_INGRS_TUNN_BMAP(sess) & FV_TUNNEL_L2TP_PPP)         &&
++	     !(SESS_INGRS_TUNN_BMAP(sess) & FV_TUNNEL_L2TP_O)         &&
++	    (SESS_EGRS_TUNN_BMAP(sess)  == 0)                         &&
++	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
++	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
++		SESS_MOD_FLAG_SET(sess, MOD_L2TPUDP_DECP_BIT);
++		return true;
++	}
++	/* encapsulation v2/v3 */
++	tunnel_bitmap = SESS_EGRS_TUNN_BMAP(sess) & ~FV_TUNNEL_L2TP_FLAGS;
++	if ((tunnel_bitmap == FV_TUNNEL_L2TPV2_UDP                   ||
++	     tunnel_bitmap == FV_TUNNEL_L2TPV3_UDP)                  &&
++	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
++	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
++	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
++		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)))
++			SESS_MOD_FLAG_SET(sess, MOD_L2TPUDP_IPV4_ENCP_BIT);
++		else if (__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
++			SESS_MOD_FLAG_SET(sess, MOD_L2TPUDP_IPV6_ENCP_BIT);
++		return true;
++	}
++
++	return false;
++}
++
++/**
++ * @brief Check whether a session is L2TPIP termination session
++ *        ONLY w/o any other tunnels
++ * @note this API also set the mod_flags to avoid double
++ *       checking later
++ * @param sess the session to test
++ * @return bool true if it is, false otherwise
++ * TBD: Enable support for L2TPV3_IP
++ */
++static inline bool __smgr_is_l2tpip_term_sess(struct sess_info *sess)
++{
++	/* decapsulation */
++	if ((SESS_INGRS_TUNN_BMAP(sess) == FV_TUNNEL_L2TPV3_IP)       &&
++	    (SESS_EGRS_TUNN_BMAP(sess) == 0)                          &&
++	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
++	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
++		return false;
++	}
++	/* encapsulation */
++	if ((SESS_EGRS_TUNN_BMAP(sess) == FV_TUNNEL_L2TPV3_IP)       &&
++	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
++	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
++	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
++		return false;
++	}
++
++	return false;
++}
++
+ /**
+  * @brief Check whether a session is ESP at ingress
+  * @param sess the session to test
+@@ -2155,6 +2225,18 @@ static bool __smgr_is_sess_supported(struct sess_info *sess)
+ 		return true;
+ 	}
+ 
++	/* L2TPUDP */
++	if (__smgr_is_l2tpudp_term_sess(sess)) {
++		pr_debug("l2tpudp termination session\n");
++		return true;
++	}
++
++	/* L2TPIP */
++	if (__smgr_is_l2tpip_term_sess(sess)) {
++		pr_debug("l2tpip termination session\n");
++		return true;
++	}
++
+ 	/* don't support all other tunnels terminations */
+ not_supported:
+ 	pr_debug("unsupported session\n");
+@@ -2693,7 +2775,7 @@ static void __smgr_si_pkt_len_diff_set(struct sess_info *sess)
+ 	/* Calculate the packet length diff */
+ 	if (__smgr_is_esp_encp_sess(sess)) {
+ 		/* for ESP encapsulation the egress header
+-		 * len exluded any inner headers
++		 * len excluded any inner headers
+ 		 */
+ 		sess->si.pkt_len_diff = SESS_EGRS_HDR_LEN(sess) -
+ 					SESS_INGRS_OUTER_OFFSETS(sess).l3;
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 4876520fbad0..168cf4bce4a5 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -756,17 +756,19 @@ static void __smgr_pr_learn_tunn(struct seq_file *f, union fv_tunnel *tunn,
+ 	seq_printf(f, " %-20s = ", "Tunnel Type");
+ 	if (FV_L2_PPPOE   & flags)
+ 		seq_puts(f, "[PPPoE]");
+-	if (FV_TUNNEL_L2TPUDP & tunn_flags)
+-		seq_puts(f, "[UDP][L2TP]");
++	if (FV_TUNNEL_L2TPV2_UDP & tunn_flags)
++		seq_puts(f, "[UDP][L2TPV2]");
++	if (FV_TUNNEL_L2TPV3_UDP & tunn_flags)
++		seq_puts(f, "[UDP][L2TPV3]");
+ 	if (FV_TUNNEL_VXLAN   & tunn_flags)
+ 		seq_puts(f, "[UDP][VXLAN]");
+ 	if (FV_TUNNEL_GNV     & tunn_flags)
+ 		seq_puts(f, "[UDP][GENEVE]");
+ 	if (FV_L4_SCTP    & flags)
+ 		seq_puts(f, "[SCTP]");
+-	if (FV_TUNNEL_L2TPIP  & tunn_flags)
++	if (FV_TUNNEL_L2TPV3_IP & tunn_flags)
+ 		seq_puts(f, "[L2TPIP]");
+-	if (FV_TUNNEL_GRE_IP  & tunn_flags)
++	if (FV_TUNNEL_GRE_IP & tunn_flags)
+ 		seq_puts(f, "[IPoGRE]");
+ 	if (FV_TUNNEL_GRE_ETH & tunn_flags)
+ 		seq_puts(f, "[EoGRE]");
+@@ -778,22 +780,20 @@ static void __smgr_pr_learn_tunn(struct seq_file *f, union fv_tunnel *tunn,
+ 		seq_puts(f, "[IPSec]");
+ 	seq_puts(f, "\n");
+ 
+-	if (FV_TUNNEL_VXLAN & tunn_flags) {
++	if (FV_TUNNEL_VXLAN & tunn_flags)
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "VNI",
+ 			   ntohl(tunn->vxlan.vni),
+ 			   ntohl(tunn->vxlan.vni));
+-	}
+-	if (FV_TUNNEL_GNV & tunn_flags) {
++	if (FV_TUNNEL_GNV & tunn_flags)
+ 		seq_printf(f, " %-20s = %#02x%02x%02x\n", "VNI",
+ 			   tunn->geneve.vni[2],
+ 			   tunn->geneve.vni[1],
+ 			   tunn->geneve.vni[0]);
+-	}
+-	if (FV_TUNNEL_L2TPIP & tunn_flags) {
++	if (FV_TUNNEL_L2TPV3_IP & tunn_flags)
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "Session ID",
+ 			   l4->l2tpoip.session_id, l4->l2tpoip.session_id);
+-	}
+-	if (FV_TUNNEL_L2TPUDP & tunn_flags) {
++	// TBD: Add L2TPV3_UDP
++	if (FV_TUNNEL_L2TPV2_UDP & tunn_flags) {
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "Session ID",
+ 			   tunn->l2tpoudp.session_id,
+ 			   tunn->l2tpoudp.session_id);
+@@ -801,11 +801,10 @@ static void __smgr_pr_learn_tunn(struct seq_file *f, union fv_tunnel *tunn,
+ 			   tunn->l2tpoudp.tunnel_id,
+ 			   tunn->l2tpoudp.tunnel_id);
+ 	}
+-	if (FV_L4_SCTP & flags) {
++	if (FV_L4_SCTP & flags)
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "VTAG",
+ 			   ntohl(tunn->sctp.vtag),
+ 			   ntohl(tunn->sctp.vtag));
+-	}
+ }
+ 
+ static void __smgr_pr_learn_pkt(struct seq_file *f, struct fv_pkt_info *pkt)
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 66e857c9a311..1790ebd744e0 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -87,7 +87,8 @@ enum smgr_sess_flags {
+  *        tunnel exist in a learning field vector
+  */
+ #define LEARN_FV_TUNN_FLAGS \
+-	(FV_TUNNEL_VXLAN | FV_TUNNEL_GNV | FV_TUNNEL_L2TPUDP)
++	(FV_TUNNEL_VXLAN | FV_TUNNEL_GNV | \
++	 FV_TUNNEL_L2TPV2_UDP | FV_TUNNEL_L2TPV3_UDP)
+ 
+ /**
+  * @brief Shortcuts for session entry flags operations
+diff --git a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c
+index 41afb84ee032..299684ff0c0d 100644
+--- a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c
++++ b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c
+@@ -118,7 +118,7 @@ static void  __pp_learn_fv_tunn_to_pp_fv_tunn(union fv_tunnel *learn,
+ 	} else if (bmap & FV_TUNNEL_GNV) {
+ 		memcpy(&pp->geneve.vni, &learn->geneve.vni,
+ 		       sizeof(pp->geneve.vni));
+-	} else if (bmap & FV_TUNNEL_L2TPUDP) {
++	} else if (bmap & (FV_TUNNEL_L2TPV2_UDP | FV_TUNNEL_L2TPV3_UDP)) {
+ 		pp->l2tpoudp.sess_id = learn->l2tpoudp.session_id;
+ 		pp->l2tpoudp.tunn_id = learn->l2tpoudp.tunnel_id;
+ 	}
+@@ -150,7 +150,7 @@ u8 pp_learn_pkt_to_pp_fv_proto(u32 pkt_bmap, u32 tunn_bmap)
+ 		   FV_L4_ESP   |
+ 		   FV_L4_ICMP4 |
+ 		   FV_L4_ICMP6;
+-	tunn_other_l4 = FV_TUNNEL_L2TPIP  |
++	tunn_other_l4 = FV_TUNNEL_L2TPV3_IP  |
+ 			FV_TUNNEL_GRE_ETH |
+ 			FV_TUNNEL_GRE_IP  |
+ 			FV_TUNNEL_IPSEC;
+diff --git a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h
+index 2aeee5c38e6d..dec6cc36f9a6 100644
+--- a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h
++++ b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h
+@@ -166,7 +166,7 @@ struct pp_fv_esp {
+  * @brief PP field vector l2tp over ip fields
+  */
+ struct pp_fv_l2tpoip {
+-	__be32 sess_id;
++	__be32 sess_id; // can we unify pp_fv_l2tpoip and pp_fv_l2tpoudp?
+ } __packed;
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier.h b/drivers/net/ppv4/pp-hal/modifier/modifier.h
+index 0506811f4fa9..1f078ea31adb 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier.h
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier.h
+@@ -94,6 +94,22 @@ enum mod_rcp_type {
+ 	 *	without nat changes in the inner headers
+ 	 */
+ 	MOD_RCP_ESP_V6_TUNNL_ENCAP,
++	/*! Recipe for decapsulating L2TP v2 UDP tunnel over ipv4/ipv6 with
++	 *  inner [ipv4][tcp/udp] packet
++	 */
++	MOD_RCP_L2TPUDP_DECP_IPV4_NAPT,
++	/*! Recipe for decapsulating L2TP v2 UDP tunnel over ipv4/ipv6 with
++	 *  inner [ipv6][tcp/udp] packet
++	 */
++	MOD_RCP_L2TPUDP_DECP_IPV6_ROUTED,
++	/*! Recipe for decapsulating L2TP IP tunnel over ipv4/ipv6 with inner
++	 *  [ipv4][tcp/udp] packet
++	 */
++	MOD_RCP_L2TPIP_DECP_IPV4_NAPT,
++	/*! Recipe for decapsulating L2TP IP tunnel over ipv4/ipv6 with inner
++	 *  [ipv6][tcp/udp] packet
++	 */
++	MOD_RCP_L2TPIP_DECP_IPV6_ROUTED,
+ 	/*! Custom recipe for debug, KEEP THIS AS THE LAST RECIPE */
+ 	MOD_RCP_CUSTOM,
+ 	MOD_RCP_LAST    = MOD_RCP_CUSTOM,
+@@ -145,8 +161,20 @@ enum mod_flags {
+ 	MOD_ESP_V4_TUNNL_ENCP_BIT,
+ 	/*! ESP V6 tunnel was added */
+ 	MOD_ESP_V6_TUNNL_ENCP_BIT,
+-
+-	MOD_FLAG_LAST = MOD_ESP_V6_TUNNL_ENCP_BIT,
++	/*! L2TP (V2/V3) UDP over IPv4 was added */
++	MOD_L2TPUDP_IPV4_ENCP_BIT,
++	/*! L2TP (V2/V3) UDP over IPv6 was added */
++	MOD_L2TPUDP_IPV6_ENCP_BIT,
++	/*! L2TP V2 UDP was removed */
++	MOD_L2TPUDP_DECP_BIT,
++	/*! L2TPIP over IPv4 was added */
++	MOD_L2TPIP_IPV4_ENCP_BIT,
++	/*! L2TPIP over IPv6 was added */
++	MOD_L2TPIP_IPV6_ENCP_BIT,
++	/*! L2TPIP was removed */
++	MOD_L2TPIP_DECP_BIT,
++
++	MOD_FLAG_LAST = MOD_L2TPIP_DECP_BIT,
+ 	MOD_FLAG_NUM
+ };
+ 
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier_core.c b/drivers/net/ppv4/pp-hal/modifier/modifier_core.c
+index f2b49b3dde02..44f06716d52e 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier_core.c
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier_core.c
+@@ -388,7 +388,7 @@ s32 mod_bce_ip_nat_cpy(struct mod_recipe *rcp, s32 bce_off, s32 dst_layer)
+ 	if (unlikely(ret))
+ 		return ret;
+ 
+-	/* SI0 = SI[si_mux0] (nat tamplate size) */
++	/* SI0 = SI[si_mux0] (nat template size) */
+ 	eu.si_mux0 = EU_SI_SEL_NAT_SZ;
+ 	/* SI1 = SI[si_mux1] (0) */
+ 	eu.si_mux1 = 0;
+@@ -403,7 +403,7 @@ s32 mod_bce_ip_nat_cpy(struct mod_recipe *rcp, s32 bce_off, s32 dst_layer)
+ 	eu.jm_load0 = EU_LOAD0_RAW;
+ 
+ 	eu.load1 = 0;
+-	/* load1 = load1(0) + SI0 (nat tamplate size) */
++	/* load1 = load1(0) + SI0 (nat template size) */
+ 	eu.jm_load1 = EU_LOAD1_SI0;
+ 
+ 	/* ips offset in ipv4 header */
+@@ -773,7 +773,7 @@ s32 mod_hdr_rplc(struct mod_recipe *rcp, u32 bce_off, s32 end_trim_layer)
+ 	eu.jm_load0   = EU_LOAD0_RAW;
+ 	/* load1 = 0 */
+ 	eu.load1      = 0;
+-	/* load1 = load1 + SI0 (si tamplate size) */
++	/* load1 = load1 + SI0 (si template size) */
+ 	eu.jm_load1   = EU_LOAD1_SI0;
+ 	/* always start trim from the packet start */
+ 	eu.store      = 0;
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c b/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
+index 2f11fda80b16..be1b5425e30a 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
+@@ -40,6 +40,10 @@ static const char * const mod_rcp_str[MOD_RCPS_NUM + 2] = {
+ 	[MOD_RCP_6RD_DECP_ROUTED]         = "6RD decap",
+ 	[MOD_RCP_ESP_V4_TUNNL_ENCAP]      = "ESP over ipv4 encapsulation",
+ 	[MOD_RCP_ESP_V6_TUNNL_ENCAP]      = "ESP over ipv6 encapsulation",
++	[MOD_RCP_L2TPUDP_DECP_IPV4_NAPT]  = "L2TP UDP decap inner ipv4 NAPT",
++	[MOD_RCP_L2TPUDP_DECP_IPV6_ROUTED] = "L2TP UDP decap inner ipv6 NAPT",
++	[MOD_RCP_L2TPIP_DECP_IPV4_NAPT]   = "L2TP IP decap inner ipv4 NAPT",
++	[MOD_RCP_L2TPIP_DECP_IPV6_ROUTED] = "L2TP IP decap inner ipv6 NAPT",
+ 	[MOD_RCP_CUSTOM]                  = "CUSTOM",
+ 	[MOD_RCPS_NUM]                    = "NOP",
+ 	[MOD_RCPS_NUM + 1]                = "INVALID",
+@@ -65,6 +69,11 @@ static const char * const mod_flag_str[MOD_FLAG_NUM + 1] = {
+ 	[MOD_6RD_DECP_BIT]          = "6RD decap",
+ 	[MOD_ESP_V4_TUNNL_ENCP_BIT] = "ESPv4 tunnel encap",
+ 	[MOD_ESP_V6_TUNNL_ENCP_BIT] = "ESPv6 tunnel encap",
++	[MOD_L2TPUDP_IPV4_ENCP_BIT] = "L2TPUDPv4 encap",
++	[MOD_L2TPUDP_IPV6_ENCP_BIT] = "L2TPUDPv6 encap",
++	[MOD_L2TPUDP_DECP_BIT]      = "L2TPUDP decap",
++	[MOD_L2TPIP_IPV4_ENCP_BIT]  = "L2TPIPv4 encap",
++	[MOD_L2TPIP_IPV6_ENCP_BIT]  = "L2TPIPv6 encap",
+ 	[MOD_FLAG_NUM]              = "INVALID",
+ };
+ 
+@@ -86,6 +95,12 @@ static const char * const mod_flag_str[MOD_FLAG_NUM + 1] = {
+ #define MOD_6RD_DECP_MSK          BIT(MOD_6RD_DECP_BIT)
+ #define MOD_ESP_V4_TUNNL_ENCP_MSK BIT(MOD_ESP_V4_TUNNL_ENCP_BIT)
+ #define MOD_ESP_V6_TUNNL_ENCP_MSK BIT(MOD_ESP_V6_TUNNL_ENCP_BIT)
++#define MOD_L2TPUDP_IPV4_ENCP_MSK BIT(MOD_L2TPUDP_IPV4_ENCP_BIT)
++#define MOD_L2TPUDP_IPV6_ENCP_MSK BIT(MOD_L2TPUDP_IPV6_ENCP_BIT)
++#define MOD_L2TPIP_IPV4_ENCP_MSK  BIT(MOD_L2TPIP_IPV4_ENCP_BIT)
++#define MOD_L2TPIP_IPV6_ENCP_MSK  BIT(MOD_L2TPIP_IPV6_ENCP_BIT)
++#define MOD_L2TPUDP_DECP_MSK      BIT(MOD_L2TPUDP_DECP_BIT)
++#define MOD_L2TPIP_DECP_MSK       BIT(MOD_L2TPIP_DECP_BIT)
+ 
+ enum rcp_new_hdr_ip_type {
+ 	RCP_NEW_HDR_V4,
+@@ -143,6 +158,11 @@ static const struct supp_mod supp_mod_types[] = {
+ 			  MOD_L4_NAPT_MSK,
+ 		.recipe = MOD_RCP_IPV6_IPV4_ENCAP
+ 	},
++	{ /* IPv4 over L2TP UDP over IPv6 encapsulation */
++		.flags  = MOD_L2TPUDP_IPV6_ENCP_MSK | MOD_IPV4_NAT_MSK |
++			  MOD_L4_NAPT_MSK,
++		.recipe = MOD_RCP_IPV6_IPV4_ENCAP
++	},
+ 	/* ================================================================ */
+ 	/*          IPv6(inner) over IPv6(outer) Encapsulation              */
+ 	/* ================================================================ */
+@@ -154,6 +174,10 @@ static const struct supp_mod supp_mod_types[] = {
+ 		.flags  = MOD_IPOGRE_V6_ENCP_MSK | MOD_IPV6_HOPL_MSK,
+ 		.recipe = MOD_RCP_IPV6_IPV6_ENCAP
+ 	},
++	{ /* IPv6 over L2TP UDP over IPv6 encapsulation */
++		.flags  = MOD_L2TPUDP_IPV6_ENCP_MSK | MOD_IPV6_HOPL_MSK,
++		.recipe = MOD_RCP_IPV6_IPV6_ENCAP
++	},
+ 	/* ================================================================ */
+ 	/*          IPv6(inner) over IPv4(outer) Encapsulation              */
+ 	/* ================================================================ */
+@@ -161,14 +185,18 @@ static const struct supp_mod supp_mod_types[] = {
+ 		.flags	= MOD_6RD_ENCP_MSK | MOD_IPV6_HOPL_MSK,
+ 		.recipe = MOD_RCP_IPV4_IPV6_ENCAP
+ 	},
+-	{ /* IPv4 over GRE over IPv6 encapsulation */
++	{ /* IPv6 over GRE over IPv4 encapsulation */
+ 		.flags  = MOD_IPOGRE_V4_ENCP_MSK | MOD_IPV6_HOPL_MSK,
+ 		.recipe = MOD_RCP_IPV4_IPV6_ENCAP
+ 	},
+-	{ /* ETH IPv4 over GRE over IPv6 encapsulation */
++	{ /* ETH IPv6 over GRE over IPv4 encapsulation */
+ 		.flags  = MOD_EOGRE_V4_ENCP_MSK | MOD_IPV6_HOPL_MSK,
+ 		.recipe = MOD_RCP_IPV4_IPV6_ENCAP
+ 	},
++	{ /* IPv6 over L2TP UDP over IPv4 encapsulation */
++		.flags  = MOD_L2TPUDP_IPV4_ENCP_MSK | MOD_IPV6_HOPL_MSK,
++		.recipe = MOD_RCP_IPV4_IPV6_ENCAP
++	},
+ 	/* ================================================================ */
+ 	/*          IPv4(inner) over IPv4(outer) Encapsulation              */
+ 	/* ================================================================ */
+@@ -182,6 +210,11 @@ static const struct supp_mod supp_mod_types[] = {
+ 			  MOD_L4_NAPT_MSK,
+ 		.recipe = MOD_RCP_IPV4_IPV4_ENCAP
+ 	},
++	{ /* IPv4 over L2TP UDP over IPv4 encapsulation */
++		.flags  = MOD_L2TPUDP_IPV4_ENCP_MSK | MOD_IPV4_NAT_MSK |
++			  MOD_L4_NAPT_MSK,
++		.recipe = MOD_RCP_IPV4_IPV4_ENCAP
++	},
+ 	/* ================================================================ */
+ 	/*         ESP tunnel mode over IPv4(outer) Encapsulation           */
+ 	/* ================================================================ */
+@@ -228,10 +261,22 @@ static const struct supp_mod supp_mod_types[] = {
+ 	/* ================================================================ */
+ 	/*                    6RD Decapsulation                             */
+ 	/* ================================================================ */
+-	{ /* 6RD inner IPv6 NAPT decapsulation */
++	{ /* 6RD inner IPv6 decapsulation */
+ 		.flags  = MOD_6RD_DECP_MSK | MOD_IPV6_HOPL_MSK,
+ 		.recipe = MOD_RCP_6RD_DECP_ROUTED
+ 	},
++	/* ================================================================ */
++	/*                    L2TP Decapsulation                            */
++	/* ================================================================ */
++	{ /* Inner IPv6 over L2TP UDP  */
++		.flags  = MOD_L2TPUDP_DECP_MSK | MOD_IPV6_HOPL_MSK,
++		.recipe = MOD_RCP_L2TPUDP_DECP_IPV6_ROUTED
++	},
++	{ /* Inner IPv4 NAPT over L2TP UDP  */
++		.flags  = MOD_L2TPUDP_DECP_MSK | MOD_IPV4_NAT_MSK |
++			  MOD_L4_NAPT_MSK,
++		.recipe = MOD_RCP_L2TPUDP_DECP_IPV4_NAPT
++	},
+ };
+ 
+ s32 mod_recipe_select(unsigned long mod_bmap, u8 *rcp)
+@@ -664,14 +709,13 @@ static s32 mod_rcp_ipv4_routed_set(s32 rcp_idx, enum mod_eu_stw_mux_sel l3_off,
+ 	/*======================================================*/
+ 	/* copy from dpu registers to packet new header (reps1) */
+ 	/*======================================================*/
+-	if (pppoe_encap) {
++	if (pppoe_encap)
+ 		ret |= mod_reg_to_new_hdr_cpy(&rcp, pppoe_len,
+ 					      EU_SI_SEL_PPPOE_OFF,
+ 					      offsetof(struct pppoe_hdr,
+ 						       length),
+ 					      FIELD_SIZEOF(struct pppoe_hdr,
+ 							   length));
+-	}
+ 
+ 	if (nhdr == RCP_NEW_HDR_V6) {
+ 		/* Replace L3 payload length with inner total length */
+@@ -1080,6 +1124,28 @@ s32 mod_rcp_init(void)
+ 	if (unlikely(ret))
+ 		goto err;
+ 
++	/* config recipe L2TP UDP in v6/v4 decapsulation with nat
++	 * changes in the inner v4 and udp/tcp
++	 * [l2][ipv4/6][udp][l2tp][ppp][ipv4][tcp/udp] => inner ipv4
++	 * offset is fourth. For tcp/udp we also specify we need l4 nat
++	 */
++	ret = mod_rcp_ipv4_routed_set(MOD_RCP_L2TPUDP_DECP_IPV4_NAPT,
++				      EU_STW_SEL_L3_OFF3, true,
++				      RCP_NEW_HDR_NO_IP, false);
++	if (unlikely(ret))
++		goto err;
++
++	/* config recipe L2TP UDP in v6/v4 decapsulation with hop limit
++	 * decrement in the inner v6
++	 * [l2][ipv4/6][udp][l2tp][ppp][ipv6][tcp/udp] => inner ipv6
++	 * offset is fourth
++	 */
++	ret = mod_rcp_ipv6_routed_set(MOD_RCP_L2TPUDP_DECP_IPV6_ROUTED,
++				      EU_STW_SEL_L3_OFF3, RCP_NEW_HDR_NO_IP,
++				      false);
++	if (unlikely(ret))
++		goto err;
++
+ 	return 0;
+ 
+ err:
+diff --git a/drivers/net/ppv4/pp-hal/parser/parser_protocols.c b/drivers/net/ppv4/pp-hal/parser/parser_protocols.c
+index 17bb1c638a54..0901bfd5a61c 100644
+--- a/drivers/net/ppv4/pp-hal/parser/parser_protocols.c
++++ b/drivers/net/ppv4/pp-hal/parser/parser_protocols.c
+@@ -1701,27 +1701,27 @@ static s32 __proto_l2tpv3_ip_init(struct protocol_info *info)
+ {
+ 	struct prsr_up_layer_proto_params *params;
+ 	struct field_ext_info *fld;
+-	struct skip_info      *skip;
+-	struct np_info        *np;
++	struct skip_info *skip;
++	struct np_info *np;
+ 	s32 n;
+ 
+ 	if (unlikely(ptr_is_null(info)))
+ 		return -EINVAL;
+ 
+-	params      = &info->up;
+-	info->id       = PRSR_PROTO_L2TPV3_IP;
+-	info->prof_id  = PRSR_PROFILE_COMMON;
+-	info->name     = params->name; /* a reference to the name */
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TPV3_IP;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
+ 	n = strscpy(params->name, "L2TPv3 IP", sizeof(params->name));
+ 	/* parsing info */
+-	params->proto_id   = IPPROTO_L2TP;
+-	params->hw_idx     = TABLE_ENTRY_INVALID_IDX;
+-	params->hdr_len    = 15;
++	params->proto_id = IPPROTO_L2TP;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 15;
+ 	params->entry_type = ETYPE_NONE;
+ 	/* next protocol info - next protocol is always MAC header */
+ 	np = &params->np;
+ 	np->logic = NP_LOGIC_END;
+-	np->dflt  = PRSR_PROTO_MAC_INT;
++	np->dflt = PRSR_PROTO_MAC_INT;
+ 	/* header skip info */
+ 	skip = &params->skip;
+ 	skip->hdr_len_im = L2TPV3IP_HDR_LEN;
+@@ -1730,17 +1730,16 @@ static s32 __proto_l2tpv3_ip_init(struct protocol_info *info)
+ 	params->n_pre = 2;
+ 	/* IPv4 -> L2TPv3 over IP */
+ 	params->pre[0].np_logic = NP_LOGIC_IPV4;
+-	params->pre[0].val      = IPPROTO_L2TP;
++	params->pre[0].val = IPPROTO_L2TP;
+ 	/* IPv6 -> L2TPv3 over IP */
+ 	params->pre[1].np_logic = NP_LOGIC_IPV6;
+-	params->pre[1].val      = IPPROTO_L2TP;
+-	/* extract info */
++	params->pre[1].val = IPPROTO_L2TP;
+ 	/* extract session id */
+ 	fld = &params->ext.fld[params->ext.n_fld++];
+ 	fld->fv_idx = offsetof(struct pp_fv, first.l4.l2tpoip);
+-	fld->len    = L2TPV3IP_SESS_ID_SZ;
+-	fld->off    = 0;
+-	fld->mask   = 0;
++	fld->len = L2TPV3IP_SESS_ID_SZ;
++	fld->off = 0;
++	fld->mask = 0;
+ 	__proto_pr_debug(info);
+ 	pr_debug("done\n");
+ 
+@@ -1748,42 +1747,46 @@ static s32 __proto_l2tpv3_ip_init(struct protocol_info *info)
+ }
+ 
+ /**
+- * @brief Init l2tp select info, to detect l2tp v3 or v2 for over udp
++ * @brief Init l2tpv3 over udp protocol info
+  */
+-static s32 __proto_l2tp_select_init(struct protocol_info *info)
++static s32 __proto_l2tpv3_udp_init(struct protocol_info *info)
+ {
+ 	struct prsr_up_layer_proto_params *params;
+-	struct np_info   *np;
++	struct field_ext_info *fld;
++	struct np_info *np;
+ 	s32 n;
+ 
+ 	if (unlikely(ptr_is_null(info)))
+ 		return -EINVAL;
+ 
+-	params      = &info->up;
+-	info->id       = PRSR_PROTO_L2TP_SEL;
+-	info->prof_id  = PRSR_PROFILE_COMMON;
+-	info->name     = params->name; /* a reference to the name */
+-	n = strscpy(params->name, "L2TP Select", sizeof(params->name));
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TPV3_UDP;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "L2TPv3 UDP", sizeof(params->name));
+ 	/* parsing info */
+-	params->proto_id   = U16_MAX;
+-	params->hw_idx     = TABLE_ENTRY_INVALID_IDX;
+-	params->hdr_len    = 2;
++	params->proto_id = L2TPV3_UDP_VER;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 15;
+ 	params->entry_type = ETYPE_NONE;
+-	params->ignore     = true;
+ 	/* next protocol info - next protocol is always MAC header */
+ 	np = &params->np;
+ 	np->logic = NP_LOGIC_END;
+-	np->off   = L2TP_SELECT_VER_OFF;
+-	np->len   = L2TP_SELECT_VER_LEN;
+-	np->logic = NP_LOGIC_TUNN;
+-	np->dflt  = PRSR_PROTO_PAYLOAD;
++	np->dflt = PRSR_PROTO_MAC_INT;
+ 	/* header skip info */
+ 	params->skip.logic = SKIP_LOGIC_IM;
++	params->skip.hdr_len_im = L2TPV3_UDP_HDR_SZ;
+ 	/* preceding protocols */
+ 	params->n_pre = 1;
+ 	/* UDP -> L2TP select */
+ 	params->pre[0].np_logic = NP_LOGIC_UDP;
+-	params->pre[0].val      = L2TP_UDP_DPORT;
++	params->pre[0].val = L2TPV3_UDP_VER;
++	/* extract tunnel id and session id */
++	fld = &params->ext.fld[params->ext.n_fld++];
++	fld->fv_idx = offsetof(struct pp_fv, tunn.l2tpoudp);
++	fld->off = L2TPV3_TUNN_SESS_OFF;
++	fld->len = L2TPV3_TUNN_SESS_LEN;
++	fld->mask = 0;
+ 	__proto_pr_debug(info);
+ 	pr_debug("done\n");
+ 
+@@ -1791,51 +1794,143 @@ static s32 __proto_l2tp_select_init(struct protocol_info *info)
+ }
+ 
+ /**
+- * @brief Init l2tpv2 protocol info, always over udp
++ * @brief Init l2tp select info
++ * The purpose is just to distinguish between L2TP v3 or v2
+  */
+-static s32 __proto_l2tpv2_init(struct protocol_info *info)
++static s32 __proto_l2tp_select_init(struct protocol_info *info)
++{
++	struct prsr_up_layer_proto_params *params;
++	struct np_info *np;
++	s32 n;
++
++	if (unlikely(ptr_is_null(info)))
++		return -EINVAL;
++
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TP_SEL;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "L2TP Select", sizeof(params->name));
++	/* parsing info */
++	params->proto_id = U16_MAX;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 2;
++	params->entry_type = ETYPE_NONE;
++	params->ignore = true;
++	/* next protocol info. Next protocol is based on the L2TP version */
++	np = &params->np;
++	np->off = L2TP_SELECT_VER_OFF;
++	np->len = L2TP_SELECT_VER_LEN;
++	np->logic = NP_LOGIC_UDP;
++	np->dflt = PRSR_PROTO_PAYLOAD;
++	/* header skip info. Do not skip the header */
++	params->skip.hdr_len_im = 0;
++	params->skip.logic = SKIP_LOGIC_IM;
++	/* preceding protocols */
++	params->n_pre = 1;
++	/* UDP -> L2TP select */
++	params->pre[0].np_logic = NP_LOGIC_UDP;
++	params->pre[0].val = L2TP_UDP_DPORT;
++	__proto_pr_debug(info);
++	pr_debug("done\n");
++
++	return 0;
++}
++
++/**
++ * @brief Init l2tpv2 protocol entry point
++ * Helper parsing stage to check if the optional length field is present,
++ * next protocol will continue parsing the header.
++ */
++static s32 __proto_l2tpv2_start_init(struct protocol_info *info)
++{
++	struct prsr_up_layer_proto_params *params;
++	struct np_info *np;
++	s32 n;
++
++	if (unlikely(ptr_is_null(info)))
++		return -EINVAL;
++
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TPV2_START;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "L2TPv2 start", sizeof(params->name));
++	/* parsing info */
++	params->proto_id = U16_MAX;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 2;
++	params->entry_type = ETYPE_NONE;
++	params->ignore = true;
++	/* next protocol info.
++	 * Look at the first four bits of the header,
++	 * those bits indicate if this is a control packet and if the optional
++	 * length field is present (|T|L|x|x|)
++	 */
++	np = &params->np;
++	np->off = 0;
++	np->len = 4;
++	np->logic = NP_LOGIC_UDP;
++	np->dflt = PRSR_PROTO_PAYLOAD;
++	/* header skip info */
++	params->skip.hdr_len_im = 0;
++	params->skip.logic = SKIP_LOGIC_IM;
++	/* preceding protocols */
++	params->n_pre = 1;
++	/* L2TP select -> L2TPv2 start */
++	params->pre[0].np_logic = NP_LOGIC_UDP;
++	params->pre[0].val = L2TPV2_START;
++	__proto_pr_debug(info);
++	pr_debug("done\n");
++
++	return 0;
++}
++
++/**
++ * @brief Init l2tp v2 protocol with optional length field present
++ */
++static s32 __proto_l2tpv2_op_len_init(struct protocol_info *info)
+ {
+ 	struct prsr_up_layer_proto_params *params;
+ 	struct field_ext_info *fld;
+-	struct np_info        *np;
++	struct np_info *np;
+ 	s32 n;
+ 
+ 	if (unlikely(ptr_is_null(info)))
+ 		return -EINVAL;
+ 
+-	params      = &info->up;
+-	info->id       = PRSR_PROTO_L2TPV2;
+-	info->prof_id  = PRSR_PROFILE_COMMON;
+-	info->name     = params->name; /* a reference to the name */
+-	n = strscpy(params->name, "L2TPv2", sizeof(params->name));
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TPV2_LEN;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "L2TPv2 len field", sizeof(params->name));
+ 	/* parsing info */
+-	params->proto_id   = L2TPV2_UDP_VER;
+-	params->hw_idx     = TABLE_ENTRY_INVALID_IDX;
+-	params->hdr_len    = 10;
++	params->proto_id = U16_MAX;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 8;
+ 	params->entry_type = ETYPE_NONE;
+-	/* next protocol info - next protocol is always MAC header */
++	/* next protocol info - next protocol is always PPP */
+ 	np = &params->np;
+ 	np->logic = NP_LOGIC_END;
+-	np->off   = L2TPV2_NEXT_HDR_OFF;
+-	np->len   = L2TPV2_NEXT_HDR_LEN;
+-	np->logic = NP_LOGIC_TUNN;
+-	np->dflt  = PRSR_PROTO_PAYLOAD;
+-	/* header skip info */
+-	params->skip.logic      = SKIP_LOGIC_IM;
+-	params->skip.hdr_len_im = L2TPV2_HDR_LEN;
+-	params->skip.op         = ALU_OP_LEN_AND_IM;
++	np->dflt = PRSR_PROTO_PPP;
++	/* header skip info, based on what the length field says */
++	params->skip.hdr_len_off = L2TPV2_OPT_LEN_OFF * BITS_PER_BYTE;
++	params->skip.hdr_len_sz = L2TPV2_OPT_LEN_LEN * BITS_PER_BYTE;
++	params->skip.logic = SKIP_LOGIC_ALU;
++	params->skip.hdr_len_im = 0;
++	params->skip.op = ALU_OP_LEN_PLUS_IM;
+ 	/* preceding protocols */
+ 	params->n_pre = 1;
+-	/* UDP -> L2TP select */
++	/* L2TP v2 start -> L2TP v2 with length field */
+ 	params->pre[0].np_logic = NP_LOGIC_UDP;
+-	params->pre[0].val      = L2TPV2_UDP_VER;
+-	/* extract info */
++	params->pre[0].val = L2TPV2_LEN_PRESENT;
+ 	/* extract tunnel id and session id */
+ 	fld = &params->ext.fld[params->ext.n_fld++];
+ 	fld->fv_idx = offsetof(struct pp_fv, tunn.l2tpoudp);
+-	fld->off    = L2TPV2_TUNN_SESS_OFF;
+-	fld->len    = L2TPV2_TUNN_SESS_LEN;
+-	fld->mask   = 0;
++	/* tunnel and session ids are right after the optional length field */
++	fld->off = L2TPV2_TUNN_SESS_OFF + L2TPV2_OPT_LEN_LEN;
++	fld->len = L2TPV2_TUNN_SESS_LEN;
++	fld->mask = 0;
+ 	__proto_pr_debug(info);
+ 	pr_debug("done\n");
+ 
+@@ -1843,47 +1938,154 @@ static s32 __proto_l2tpv2_init(struct protocol_info *info)
+ }
+ 
+ /**
+- * @brief Init l2tpv3 over udp protocol info
++ * @brief Init l2tp v2 protocol with no length field.
++ * The purpose of this helper parsing stage is to look at the other
++ * optional fields in order to call the right parsing protocol that knows
++ * how to calculate the header length.
+  */
+-static s32 __proto_l2tpv3_udp_init(struct protocol_info *info)
++static s32 __proto_l2tpv2_no_op_len_init(struct protocol_info *info)
+ {
+ 	struct prsr_up_layer_proto_params *params;
+-	struct field_ext_info *fld;
+-	struct np_info        *np;
++	struct np_info *np;
+ 	s32 n;
+ 
+ 	if (unlikely(ptr_is_null(info)))
+ 		return -EINVAL;
+ 
+-	params      = &info->up;
+-	info->id       = PRSR_PROTO_L2TPV3_UDP;
+-	info->prof_id  = PRSR_PROFILE_COMMON;
+-	info->name     = params->name; /* a reference to the name */
+-	n = strscpy(params->name, "L2TPv3 UDP", sizeof(params->name));
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TPV2_NO_LEN;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "L2TPv2 no len field", sizeof(params->name));
+ 	/* parsing info */
+-	params->proto_id   = L2TPV3_UDP_VER;
+-	params->hw_idx     = TABLE_ENTRY_INVALID_IDX;
+-	params->hdr_len    = 15;
++	params->proto_id = U16_MAX;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 2;
+ 	params->entry_type = ETYPE_NONE;
+-	/* next protocol info - next protocol is always MAC header */
++	params->ignore = true;
++	/* next protocol info.
++	 * Look at the first seven bits of the header (|T|L|x|x|S|x|O),
++	 * Note that we only really care about S and O since we already know
++	 * both T and L flags are clear.
++	 */
+ 	np = &params->np;
+-	np->logic = NP_LOGIC_END;
+-	np->dflt  = PRSR_PROTO_MAC_INT;
++	np->off = 0;
++	np->len = 7;
++	np->logic = NP_LOGIC_IPV4_2;//NP_LOGIC_TUNN;
++	np->dflt = PRSR_PROTO_PAYLOAD;
+ 	/* header skip info */
+-	params->skip.logic      = SKIP_LOGIC_IM;
+-	params->skip.hdr_len_im = L2TPV3_UDP_HDR_SZ;
++	params->skip.hdr_len_im = 0;
++	params->skip.logic = SKIP_LOGIC_IM;
+ 	/* preceding protocols */
+ 	params->n_pre = 1;
+-	/* UDP -> L2TP select */
++	/* L2TP v2 start -> L2TP v2 with no length field */
+ 	params->pre[0].np_logic = NP_LOGIC_UDP;
+-	params->pre[0].val      = L2TPV3_UDP_VER;
+-	/* extract info */
++	params->pre[0].val = L2TPV2_NO_LEN_PRESENT;
++	__proto_pr_debug(info);
++	pr_debug("done\n");
++
++	return 0;
++}
++
++/**
++ * @brief Init l2tp v2 protocol with no length info and no padding.
++ * At this point we know the header flags look like:
++ * |T|L|x|x|S|x|O|P|x|x|x|x|  Ver  |
++ * |0|0|0|0|S|0|0|P|0|0|0|0|0|0|1|0|
++ */
++static s32 __proto_l2tpv2_no_op_pad_init(struct protocol_info *info)
++{
++	struct prsr_up_layer_proto_params *params;
++	struct field_ext_info *fld;
++	struct np_info *np;
++	s32 n;
++
++	if (unlikely(ptr_is_null(info)))
++		return -EINVAL;
++
++	params = &info->up;
++	info->id = PRSR_PROTO_L2TPV2_NO_PAD;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "L2TPv2 no padding",
++		    sizeof(params->name));
++	/* parsing info */
++	params->proto_id = U16_MAX;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = 6;
++	params->entry_type = ETYPE_NONE;
++	/* next protocol info - next protocol is always PPP */
++	np = &params->np;
++	np->logic = NP_LOGIC_END;
++	np->dflt = PRSR_PROTO_PPP;
++	/* header skip info. This will be the size of the header with no
++	 * optional fields, if the Sequence fields are present then add 4 extra
++	 * bytes. We can achieve this by taking advantage of the header flags
++	 * and using the ALU to calculate the header length as:
++	 * header size = |S|x|O| flags + base_hdr_size
++	 */
++	params->skip.hdr_len_off = 4; // Start of |S|x|O| flags
++	params->skip.hdr_len_sz = 3;
++	params->skip.logic = SKIP_LOGIC_ALU;
++	params->skip.hdr_len_im = L2TPV2_BASE_HDR_SIZE;
++	params->skip.op = ALU_OP_LEN_PLUS_IM;
++	/* preceding protocols */
++	params->n_pre = 2;
++	/* L2TP v2 without length field -> L2TP v2 without padding field */
++	params->pre[0].np_logic = NP_LOGIC_IPV4_2;//NP_LOGIC_TUNN;
++	params->pre[0].val = L2TPV2_NO_SEQ_NO_PAD;
++	params->pre[1].np_logic = NP_LOGIC_IPV4_2;//NP_LOGIC_TUNN;
++	params->pre[1].val = L2TPV2_SEQ_NO_PAD;
+ 	/* extract tunnel id and session id */
+ 	fld = &params->ext.fld[params->ext.n_fld++];
+ 	fld->fv_idx = offsetof(struct pp_fv, tunn.l2tpoudp);
+-	fld->off    = L2TPV3_TUNN_SESS_OFF;
+-	fld->len    = L2TPV3_TUNN_SESS_LEN;
+-	fld->mask   = 0;
++	/* tunnel and session ids are right after the version field */
++	fld->off = L2TPV2_TUNN_SESS_OFF;
++	fld->len = L2TPV2_TUNN_SESS_LEN;
++	fld->mask = 0;
++	__proto_pr_debug(info);
++	pr_debug("done\n");
++
++	return 0;
++}
++
++/**
++ * @brief Init ppp protocol info
++ */
++static s32 __proto_ppp_init(struct protocol_info *info)
++{
++	struct prsr_up_layer_proto_params *params;
++	struct np_info *np;
++	s32 n;
++
++	if (unlikely(ptr_is_null(info)))
++		return -EINVAL;
++
++	params = &info->up;
++	info->id = PRSR_PROTO_PPP;
++	info->prof_id = PRSR_PROFILE_COMMON;
++	info->name = params->name;
++	n = strscpy(params->name, "PPP", sizeof(params->name));
++	/* parsing info */
++	params->proto_id = L2TPV2_VER;
++	params->hw_idx = TABLE_ENTRY_INVALID_IDX;
++	params->hdr_len = PPP_HDRLEN;
++	params->entry_type = ETYPE_NONE;
++	params->ignore = true;
++	/* next protocol info */
++	np = &params->np;
++	np->off = PPP_PROTO_OFF * BITS_PER_BYTE;
++	np->len = PPP_PROTO_LEN * BITS_PER_BYTE;
++	np->logic = NP_LOGIC_TUNN;
++	np->dflt = PRSR_PROTO_IPV4_INT;
++	/* header skip info */
++	params->skip.hdr_len_im = PPP_HDR_LEN;
++	params->skip.logic = SKIP_LOGIC_IM;
++	/* preceding protocols */
++	params->n_pre = 1;
++	/* L2TP -> PPP */
++	params->pre[0].np_logic = NP_LOGIC_TUNN;
++	params->pre[0].val = U16_MAX; // Not used
+ 	__proto_pr_debug(info);
+ 	pr_debug("done\n");
+ 
+@@ -1922,7 +2124,7 @@ static s32 __proto_vxlan_init(struct protocol_info *info)
+ 	params->skip.hdr_len_im = sizeof(struct vxlanhdr);
+ 	/* preceding protocols */
+ 	params->n_pre = 1;
+-	/* UDP -> L2TP select */
++	/* UDP -> vxlan select */
+ 	params->pre[0].np_logic = NP_LOGIC_UDP;
+ 	params->pre[0].val      = VXLAN_UDP_DPORT;
+ 	/* extract info */
+@@ -1985,7 +2187,7 @@ static s32 __proto_geneve_init(struct protocol_info *info)
+ 	skip->op          = ALU_OP_4XLEN_PLUS_IM;
+ 	/* preceding protocols */
+ 	params->n_pre = 1;
+-	/* UDP -> L2TP select */
++	/* UDP -> geneve select */
+ 	params->pre[0].np_logic = NP_LOGIC_UDP;
+ 	params->pre[0].val      = GENEVE_UDP_DPORT;
+ 	/* extract info */
+@@ -2049,7 +2251,7 @@ static s32 __proto_sctp_init(struct protocol_info *info)
+ 	/* IPv4 Internal -> SCTP */
+ 	params->pre[1].np_logic = NP_LOGIC_IPV4_2;
+ 	params->pre[1].val      = IPPROTO_SCTP;
+-	/* IPv6 -> L2TPv3 over IP */
++	/* IPv6 -> SCTP */
+ 	params->pre[2].np_logic = NP_LOGIC_IPV6;
+ 	params->pre[2].val      = IPPROTO_SCTP;
+ 	/* IPv6 Internal -> SCTP */
+@@ -2158,9 +2360,13 @@ s32 __prsr_protocols_init(struct protocols *protos)
+ 	INIT_PROTO(__proto_tcp_int_init,        protos, ret, i);
+ 	INIT_PROTO(__proto_udp_int_init,        protos, ret, i);
+ 	INIT_PROTO(__proto_esp_int_init,        protos, ret, i);
++	INIT_PROTO(__proto_ppp_init,            protos, ret, i);
+ 	INIT_PROTO(__proto_l2tpv3_ip_init,      protos, ret, i);
+ 	INIT_PROTO(__proto_l2tp_select_init,    protos, ret, i);
+-	INIT_PROTO(__proto_l2tpv2_init,         protos, ret, i);
++	INIT_PROTO(__proto_l2tpv2_start_init,   protos, ret, i);
++	INIT_PROTO(__proto_l2tpv2_op_len_init,  protos, ret, i);
++	INIT_PROTO(__proto_l2tpv2_no_op_pad_init, protos, ret, i);
++	INIT_PROTO(__proto_l2tpv2_no_op_len_init, protos, ret, i);
+ 	INIT_PROTO(__proto_l2tpv3_udp_init,     protos, ret, i);
+ 	INIT_PROTO(__proto_ipv6_int_init,       protos, ret, i);
+ 	INIT_PROTO(__proto_gre_init,            protos, ret, i);
+diff --git a/drivers/net/ppv4/pp-hal/parser/parser_protocols.h b/drivers/net/ppv4/pp-hal/parser/parser_protocols.h
+index 6ce88da205a1..9becdcf96804 100644
+--- a/drivers/net/ppv4/pp-hal/parser/parser_protocols.h
++++ b/drivers/net/ppv4/pp-hal/parser/parser_protocols.h
+@@ -70,8 +70,12 @@ enum prsr_proto_id {
+ 	PRSR_PROTO_IPV6EXT, /* IPPROTO_HOPOPTS/ROUTING/DSTOPTS */
+ 	PRSR_PROTO_IPV6FRAG, /* IPPROTO_FRAGMENT */
+ 	PRSR_PROTO_ICMPV6, /* IPPROTO_ICMPV6 */
++	PRSR_PROTO_PPP, /* PPP always following L2TP */
+ 	PRSR_PROTO_L2TP_SEL, /* L2TP_UDP_DPORT */
+-	PRSR_PROTO_L2TPV2, /* L2TPV2_UDP_VER */
++	PRSR_PROTO_L2TPV2_START, /* L2TPV2_START */
++	PRSR_PROTO_L2TPV2_LEN, /* L2TPV2_LEN_PRESENT */
++	PRSR_PROTO_L2TPV2_NO_LEN, /* L2TPV2_NO_LEN_PRESENT */
++	PRSR_PROTO_L2TPV2_NO_PAD, /* L2TPV2_NO_SEQ_NO_PAD/L2TPV2_SEQ_NO_PAD */
+ 	PRSR_PROTO_L2TPV3_UDP, /* L2TPV3_UDP_VER */
+ 	PRSR_PROTO_VXLAN, /* VXLAN_UDP_DPORT */
+ 	PRSR_PROTO_GENEVE, /* GENEVE_UDP_DPORT */
+@@ -99,8 +103,7 @@ enum prsr_proto_id {
+ 	PRSR_PROTO_RSRV_6,
+ 	PRSR_PROTO_RSRV_7,
+ 	PRSR_PROTO_RSRV_8,
+-	PRSR_PROTO_RSRV_9,
+-	PRSR_PROTO_RSRV_LAST = PRSR_PROTO_RSRV_9,
++	PRSR_PROTO_RSRV_LAST = PRSR_PROTO_RSRV_8,
+ 	PRSR_PROTO_UPPER_LAST = PRSR_PROTO_RSRV_LAST,
+ 
+ 	/* Last Entry !!! */
+@@ -142,12 +145,26 @@ enum prsr_proto_id {
+ #define L2TP_UDP_DPORT         1701
+ 
+ /* L2TPv2 stuff */
+-#define L2TPV2_UDP_VER         2
+-#define L2TPV2_NEXT_HDR_OFF    64
+-#define L2TPV2_NEXT_HDR_LEN    16
+-#define L2TPV2_HDR_LEN         10
+-#define L2TPV2_TUNN_SESS_OFF   12
++#define L2TPV2_VER             2
+ #define L2TPV2_TUNN_SESS_LEN   4
++#define L2TPV2_TUNN_SESS_OFF   2  // Offset when there are no optional fields
++#define L2TPV2_BASE_HDR_SIZE   6  // Header size with no optional fields
++
++/* L2TPv2 keys to np_select table */
++#define L2TPV2_START           (L2TPV2_VER) // Key to start parsing L2TP v2
++#define L2TPV2_LEN_PRESENT     4  // |T|L|x|x| => 0100
++#define L2TPV2_NO_LEN_PRESENT  0  // |T|L|x|x| => 0000
++#define L2TPV2_NO_SEQ_NO_PAD   0  // |T|L|x|x|S|x|O| => 0000000
++#define L2TPV2_SEQ_NO_PAD      4  // |T|L|x|x|S|x|O| => 0000100
++
++/* Optional L2TPv2 length field */
++#define L2TPV2_OPT_LEN_OFF     2
++#define L2TPV2_OPT_LEN_LEN     2
++
++/* PPP */
++#define PPP_HDR_LEN            4
++#define PPP_PROTO_OFF          2
++#define PPP_PROTO_LEN          2
+ 
+ /* L2TPv3 stuff */
+ #define L2TPV3_UDP_VER         3

@@ -1,0 +1,1419 @@
+From 3750180ff286b159665799436736e30b5dd5c160 Mon Sep 17 00:00:00 2001
+From: moinakde <moinak.debnath@intel.com>
+Date: Thu, 9 Jan 2020 15:17:59 +0530
+Subject: [PATCH] UGW_SW-46677: HW Litepath Support
+
+---
+ drivers/net/datapath/dpm/gswip30/datapath_misc.c  |  12 +-
+ drivers/net/datapath/dpm/gswip30/datapath_misc.h  |   7 +
+ drivers/net/ethernet/lantiq/ltq_toe_drv.c         | 822 ++++++++++++++--------
+ drivers/net/ethernet/lantiq/ltq_toe_drv.h         |  34 +-
+ drivers/net/ethernet/lantiq/ppa/ppa_drv_wrapper.c |  11 +
+ include/net/ppa/ltq_tmu_hal_api.h                 |   2 +
+ include/net/ppa/ppa_api.h                         |   1 +
+ 7 files changed, 594 insertions(+), 295 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_misc.c b/drivers/net/datapath/dpm/gswip30/datapath_misc.c
+index cb62a8a1d402..2a20b8c45d74 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip30/datapath_misc.c
+@@ -227,13 +227,15 @@ static void init_dma_pmac_template(int portid, u32 flags)
+ 		dp_info->dma1_mask_template[TEMPL_NORMAL].field.dec = 0;
+ 		dp_info->dma1_mask_template[TEMPL_NORMAL].field.mpe2 = 0;
+ 
+-		/*dirctpath with checksum support */
+-		dp_info->pmac_template[TEMPL_CHECKSUM].port_map_en = 1;
+-		dp_info->pmac_template[TEMPL_CHECKSUM].sppid = PMAC_CPU_ID;
+-		dp_info->pmac_template[TEMPL_CHECKSUM].redirect = 1;
++		/* directpath with checksum support, used only for HW Litepath */
++		dp_info->pmac_template[TEMPL_CHECKSUM].port_map_en = 0;
++		dp_info->pmac_template[TEMPL_CHECKSUM].sppid = portid;
++		dp_info->pmac_template[TEMPL_CHECKSUM].redirect = 0;
+ 		dp_info->pmac_template[TEMPL_CHECKSUM].tcp_chksum = 1;
+ 		dp_info->pmac_template[TEMPL_CHECKSUM].class_en = 1;
+-		SET_PMAC_PORTMAP(&dp_info->pmac_template[TEMPL_CHECKSUM],
++		dp_info->pmac_template[TEMPL_CHECKSUM].port_map = 0xff;
++		dp_info->pmac_template[TEMPL_CHECKSUM].port_map2 = 0xff;
++		RESET_PMAC_PORTMAP(&dp_info->pmac_template[TEMPL_CHECKSUM],
+ 				 portid);
+ 		dp_info->dma1_template[TEMPL_CHECKSUM].field.enc = 1;
+ 		dp_info->dma1_template[TEMPL_CHECKSUM].field.dec = 1;
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_misc.h b/drivers/net/datapath/dpm/gswip30/datapath_misc.h
+index 45fcb4cb2d9f..2b92a36ca79e 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip30/datapath_misc.h
+@@ -40,6 +40,13 @@ struct dp_coc_threshold {
+ };
+ #endif
+ 
++#define RESET_PMAC_PORTMAP(pmac, port_id) do { \
++	if ((port_id) <= 7) \
++		(pmac)->port_map2 = ~(1 << (port_id)); \
++	else \
++		(pmac)->port_map = ~(1 << (port_id - 8)); } \
++	while (0)
++
+ #define SET_PMAC_PORTMAP(pmac, port_id) do { \
+ 	if ((port_id) <= 7) \
+ 		(pmac)->port_map2 = 1 << (port_id); \
+diff --git a/drivers/net/ethernet/lantiq/ltq_toe_drv.c b/drivers/net/ethernet/lantiq/ltq_toe_drv.c
+index dc9b69f25c70..57b5dc8aab89 100644
+--- a/drivers/net/ethernet/lantiq/ltq_toe_drv.c
++++ b/drivers/net/ethernet/lantiq/ltq_toe_drv.c
+@@ -72,9 +72,10 @@ static unsigned char __iomem *ltq_toe_membase; /* Virtual */
+ /*static const unsigned char __iomem *lro_sram_membase_res0 = (unsigned char *)0xE2013000;*/
+ static unsigned char __iomem *lro_sram_membase_res0;
+ /*static unsigned int lro_sram_membase_res1 = 0xE2013100;*/
+-static u32 g_tso_polling_mode = 1;
+-static u32 g_tso_irq_mode;
+-
++static u32 g_tso_irq_mode = 1;
++static struct proc_dir_entry *g_toe_dir;
++static inline int process_tso_results(ltq_tso_port_t* tsoPort);
++static inline void tso_write_stats(ltq_tso_port_t* ,struct sk_buff*);
+ static struct device *g_toe_dev;
+ 
+ #undef LRO_DEBUG
+@@ -90,12 +91,9 @@ struct lro_dbg_info {
+ static struct lro_dbg_info dbg_info[LRO_MAX_DBG_INFO];
+ u32 dbg_head = 0;
+ #endif
+-static unsigned int tso_num_tx[LTQ_MAX_TSO_PORTS];
+-static unsigned int g_tso_done[LTQ_MAX_TSO_PORTS];
+ 
+-static unsigned char ltq_large_buf[NR_CPUS][65536]__attribute__((aligned(32)));
+-unsigned char *toe_large_debug_ptr;
+-static struct proc_dir_entry *g_toe_dir;
++static unsigned char ltq_large_buf[NR_CPUS*SG_BUFFER_PER_PORT][65536]__attribute__((aligned(32)));
++
+ #define LRO_MAX_EXCEPTION_COUNT 9
+ static u32 lro_num_except[LRO_MAX_EXCEPTION_COUNT], lro_num_success;
+ static u32 lro_budget_left[21];
+@@ -105,10 +103,8 @@ static u32 g_unmatched_entry;
+ static int ltq_toe_exit(struct platform_device *pdev);
+ static int tso_configure_dma(void);
+ static void configure_tso(void);
+-
+-static void ltq_tso_tasklet(unsigned long);
+ static irqreturn_t ltq_tso_tx_int(int irq, void *_port);
+-static struct tasklet_struct tso_tasklet[NR_CPUS];
++static void ltq_tso_tasklet(unsigned long);
+ 
+ #ifdef USE_TIMER_FOR_SESSION_STOP
+ static void lro_timer_fn(unsigned long data);
+@@ -127,8 +123,9 @@ int lro_stop_flow (int session_id, int timeout, int flags);
+ int lro_start_flow (int *session_id, int timeout, int flags, struct cpumask cpumask);
+ static void lro_process_output_context(int port, int oc_flag_no);
+ 
+-spinlock_t tso_tx_lock;	/*!< spin lock */
+-spinlock_t tso_register_lock;
++spinlock_t tso_irq_lock;	/*!< spin lock */
++spinlock_t tso_tx_lock;		/*!< spin lock */
++spinlock_t lro_register_lock;
+ 
+ #define skb_tso_size(x)       (skb_shinfo(x)->gso_size)
+ 
+@@ -152,15 +149,15 @@ spinlock_t tso_register_lock;
+ #define ltq_lro_sram_except_mem(x, y) \
+ 	ltq_r32(lro_sram_membase_res0 + 0xB00 + (0x10*x) + (y))
+ 
+-#define toe_fill_cmd0(sphy, dphy, ie, g, chunk, len, others, port) do {   \
+-  unsigned int reg=(others);                      \
++#define toe_fill_cmd0(sphy, dphy, ie, g, chunk, len, last, port) do {   \
++  unsigned int reg = 0 ;                      \
+   reg = (sphy) << PORT_REQ_CMD_REG0_0_SPHY_POS |  \
+         (dphy) << PORT_REQ_CMD_REG0_0_DPHY_POS | \
+         (ie) << PORT_REQ_CMD_REG0_0_IE_POS | \
+         (g) << PORT_REQ_CMD_REG0_0_G_POS | \
+         (chunk) << PORT_REQ_CMD_REG0_0_CHUNK_SIZ_POS | \
+-        (len) << PORT_REQ_CMD_REG0_0_LEN_POS | \
+-        (others) ;                                        \
++	(last << PORT_REQ_CMD_REG0_0_LAST_POS) | \
++        (len) << PORT_REQ_CMD_REG0_0_LEN_POS ; \
+  /*   printk("REG0 = %X\n", reg); */\
+ 		ltq_toe_w32(reg, PORT_REQ_CMD_REG0(port));  \
+ }while(0)
+@@ -173,7 +170,7 @@ spinlock_t tso_register_lock;
+ 		physaddr = dma_map_single(g_toe_dev, (void *) srcbuf, lenn, DMA_TO_DEVICE); 	\
+ 			if (dma_mapping_error(g_toe_dev, physaddr)) { \
+ 				pr_err("%s DMA map failed\n", __func__); \
+-				return -1; \
++				goto tsoXmitDoneErr;	\
+ 			} \
+     }\
+ 	/* CMD1 */  \
+@@ -196,7 +193,7 @@ spinlock_t tso_register_lock;
+ 							lenn, DMA_BIDIRECTIONAL); \
+ 			if (dma_mapping_error(g_toe_dev, physaddr)) { \
+ 				pr_err("%s DMA map failed\n", __func__); \
+-				return -1; \
++				goto tsoXmitDoneErr;	\
+ 			} \
+     }\
+ 	/* CMD1 */  \
+@@ -262,6 +259,52 @@ spinlock_t tso_register_lock;
+   }while (!test_bit(31, &OwnReg)); \
+ }
+ 
++static inline int is_tso_IRQMode(void)
++{
++	return (g_tso_irq_mode == 1);
++}
++
++static inline int is_tso_PollingMode(void)
++{
++	return (g_tso_irq_mode == 0);
++}
++
++static inline void tso_set_IRQMode(void)
++{
++	g_tso_irq_mode = 1;
++}
++
++static inline void tso_set_pollingMode(void)
++{
++	g_tso_irq_mode = 0;
++}
++
++static inline int tso_results_pending(ltq_tso_port_t* tsoPort)
++{
++	return (SG_BUFFER_PER_PORT != atomic_read(&(tsoPort->availBuffs)));
++}
++
++static inline int tso_sgbuffs_available(ltq_tso_port_t* tsoPort)
++{
++	return atomic_read(&(tsoPort->availBuffs));
++}
++
++static inline int toe_tso_port_ready(int port, int waitThreshold)
++{
++	unsigned long OwnReg;
++
++	do {
++		OwnReg = ltq_toe_r32(PORT_REQ_CMD_REG5(port));
++		--waitThreshold;
++	} while ( waitThreshold && !test_bit(31, &OwnReg) );
++
++	return test_bit(31, &OwnReg);
++}
++
++static inline u64 maxV(u64 x, u64 y)
++{
++	return (x > y ? x : y);
++}
+ 
+ enum tso_desc_base {
+ 	/* TSO Port 0 */
+@@ -324,7 +367,7 @@ static irqreturn_t lro_port_except_isr (int irq, void *priv)
+ 	/* Mask the interrupt */
+ 	ltq_toe_w32_mask((1 << TOE_INT_MASK_LRO_EXP_POS), 0, TOE_INT_EN);
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 
+ 	/* Clear the exception and interrupt if there is any */
+ 	int_status = ltq_toe_r32(TOE_INT_STAT);
+@@ -333,10 +376,10 @@ static irqreturn_t lro_port_except_isr (int irq, void *priv)
+ 	} else {
+ 		/* Unmask the interrupt */
+ 		ltq_toe_w32_mask(0, (1 << TOE_INT_MASK_LRO_EXP_POS), TOE_INT_EN);
+-		spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 		return IRQ_HANDLED;
+ 	}
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 
+ 	except_entries = ltq_toe_r32(LRO_EXP_EFLAG);
+ 	for(i=0; i<32; i++) {
+@@ -371,7 +414,7 @@ static void ltq_lro_ovflow_tasklet(unsigned long dev)
+ 		}
+ 	}
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 	if (flag_wr) {
+ 		pr_info("ecovfl writing: %x bcos except_flag = %x at pos =%d !\n", (unsigned int)flag_wr, (unsigned int)except_flag, pos);
+ 		ltq_toe_w32(flag_wr, LRO_EXP_EFLAG);
+@@ -380,16 +423,16 @@ static void ltq_lro_ovflow_tasklet(unsigned long dev)
+ 	/* unmask the interrupt */
+ 	//ltq_toe_w32_mask((1 << TOE_INT_MASK_S22_POS), 0 , TOE_INT_MASK);
+ 	ltq_toe_w32_mask(0, (1 << TOE_INT_EN_S22_POS), TOE_INT_EN);
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ }
+ 
+ static irqreturn_t lro_port_overflow_isr (int irq, void *priv)
+ {
+ 	unsigned long tso_rl_flags;
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 	ltq_toe_w32_mask((1 << TOE_INT_EN_S22_POS), 0, TOE_INT_EN);
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -401,7 +444,7 @@ static irqreturn_t lro_port_context_isr (int irq, void *priv)
+ 	pr_info_once("%s called with irq: %d\n", __func__, irq);
+ 
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 	int_status = ltq_toe_r32(TOE_INT_STAT);
+ 	if (!(int_status & (1 << (pport->port_num + TOE_INT_MASK_LRO0_POS)))) {
+ #if 0
+@@ -413,7 +456,7 @@ static irqreturn_t lro_port_context_isr (int irq, void *priv)
+ 				ltq_toe_r32(TOE_INT_MASK),
+ 				ltq_toe_r32(LRO_DBG_INFO));
+ #endif
+-		spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 	    return IRQ_NONE;
+ 	}
+ 
+@@ -422,7 +465,7 @@ static irqreturn_t lro_port_context_isr (int irq, void *priv)
+ 	//ltq_toe_w32_mask(0, (1 << (pport->port_num + TOE_INT_MASK_LRO0_POS)), TOE_INT_MASK);
+ 
+ 	wmb();
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 
+ 	/* Schedule the tasklet for housekeeping */
+ 	tasklet_schedule(&lro_tasklet[pport->port_num]);
+@@ -444,9 +487,6 @@ static void lro_process_output_context(int port, int oc_flag_no)
+ #endif
+ 	struct sk_buff *frag_skb = NULL, *last_frag_skb = NULL;
+ 	unsigned long tso_rl_flags;
+-	struct iphdr	*ip_hdr;
+-	struct ethhdr	*eth;
+-	int network_depth = 0;
+ 
+ 	oc_flag = ltq_toe_r32(LRO_OC_FLAG(port, oc_flag_no));
+ 	pr_debug("LRO done and OC_FLAG: %x\n", oc_flag);
+@@ -511,6 +551,7 @@ static void lro_process_output_context(int port, int oc_flag_no)
+ 					skb->DW3 = desc3;
+ 					skb_put(skb, data_len);
+ 				} else {
++					cbm_buffer_free(smp_processor_id(), data_ptr, 0);
+ 					pr_err("failure in allocating skb\r\n");
+ 					return;
+ 				}
+@@ -555,15 +596,13 @@ static void lro_process_output_context(int port, int oc_flag_no)
+ 				dbg_info[dbg_head].aggr_len = skb->len - 62;
+ 				dbg_head = (dbg_head + 1) % LRO_MAX_DBG_INFO;
+ #endif
+-				/* re-compute the IP header checksum since HW has modified
+-				the IP header's total_len field */
+-				eth = (struct ethhdr *)(skb->data + PMAC_HDR_SIZE);
+-				skb->mac_len = ETH_HLEN + PMAC_HDR_SIZE;
+-				__vlan_get_protocol(skb, eth->h_proto, &network_depth);
+-				ip_hdr = (struct iphdr *)(skb->data + network_depth);
+-				ip_hdr->check = 0;
+-				ip_hdr->check = ip_fast_csum((unsigned char *)ip_hdr, ip_hdr->ihl);
+-				skb->mac_len = 0;
++				/*
++				 * TCP/IP header checksum is wrong here,
++				 * since HW has modified the TCP Payload and IP header's total_len field.
++				 *
++				 * So, mark skb->ip_summed as CHECKSUM_UNNECESSARY.
++				 */
++				skb->ip_summed = CHECKSUM_UNNECESSARY;
+ 
+ 				/* Send it to datapath library */
+ 				dp_rx(skb, 0);
+@@ -601,6 +640,7 @@ static void lro_process_output_context(int port, int oc_flag_no)
+ 				skb->DW3 = desc3;
+ 				skb_put(skb, data_len);
+ 			} else {
++				cbm_buffer_free(smp_processor_id(), data_ptr, 0);
+ 				pr_err("failure in allocating skb\r\n");
+ 				return;
+ 			}
+@@ -623,7 +663,7 @@ static void lro_process_output_context(int port, int oc_flag_no)
+ 				pr_debug("eflag = %x\n", ltq_toe_r32(LRO_EXP_EFLAG));
+ 	}
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 
+ 	/* Give the ownership back to LRO */
+ 	ltq_toe_w32(LRO_OC_OWNER_0_OWNER_MASK, LRO_OC_OWNER(port,oc_flag_no));
+@@ -635,7 +675,7 @@ static void lro_process_output_context(int port, int oc_flag_no)
+ 	}
+ 	asm("sync");
+ 
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 
+ #if 0
+ 	i=0;
+@@ -675,14 +715,14 @@ static void ltq_lro_exception_tasklet(unsigned long dev __maybe_unused)
+ #ifdef ZERO_SRAM_DBG
+ 		ltq_w32(0xffffffff, lro_sram_membase_res0 + 0xA80 + (0x10*i) + (8));
+ #endif
+-		spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++		spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 
+ 		clear_entries = 1 << (i + LRO_EXP_EFLAG_UNMATCH_POS);
+ 		ltq_toe_w32(clear_entries, LRO_EXP_EFLAG);
+ 
+ 		asm("sync");
+ 
+-		spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 
+ 		/* Build the SKB */
+ 		data_len = desc3 & 0x0000FFFF;
+@@ -705,6 +745,7 @@ static void ltq_lro_exception_tasklet(unsigned long dev __maybe_unused)
+ 			skb->DW3 = desc3;
+ 			skb_put(skb, data_len);
+ 		} else {
++			cbm_buffer_free(smp_processor_id(), data_ptr, 0);
+ 			pr_err("failure in allocating skb\r\n");
+ 			return;
+ 		}
+@@ -718,9 +759,9 @@ static void ltq_lro_exception_tasklet(unsigned long dev __maybe_unused)
+ 	read_pos = i;
+ 
+ 	/* Unmask the interrupt */
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 	ltq_toe_w32_mask(0, (1 << TOE_INT_MASK_LRO_EXP_POS), TOE_INT_EN);
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 	return;
+ }
+ 
+@@ -773,11 +814,11 @@ static void ltq_lro_tasklet (unsigned long dev)
+ 	}
+ 
+ leave:
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 	/* Unmask the interrupt for other output context */
+ 	ltq_toe_w32_mask(0, (1 << (port + TOE_INT_MASK_LRO0_POS)), TOE_INT_EN);
+ 	//ltq_toe_w32_mask((1 << (port + TOE_INT_MASK_LRO0_POS)), 0, TOE_INT_MASK);
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 	if((ltq_toe_r32(TOE_INT_STAT) & (1 << (port + TOE_INT_MASK_LRO0_POS))))
+ 		tasklet_schedule(&lro_tasklet[port]);
+ 	atomic_dec(&scheduled[port]);
+@@ -827,7 +868,7 @@ int lro_start_flow (int *session_id, int timeout, int flags, struct cpumask cpum
+ 
+ 	/*pr_info("%s called with session_id = %x and port is: %d \n", __func__,*session_id & LRO_FID_0_LRO_FID_MASK, port);*/
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 	ltq_toe_w32(timeout, LRO_TO_REG(port));
+ 
+ 	/* Test values */
+@@ -842,7 +883,7 @@ int lro_start_flow (int *session_id, int timeout, int flags, struct cpumask cpum
+ 
+ 	/* Set the Flow ID */
+ 	ltq_toe_w32((*session_id & LRO_FID_0_LRO_FID_MASK) << LRO_FID_0_LRO_FID_POS, LRO_FID(port));
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 
+ 	wmb ();
+ 
+@@ -899,7 +940,7 @@ int lro_real_stop_flow (int session_id, int timeout, int flags)
+ 
+ 	port = pport->port_num;
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 
+ 	/* Set the S_END */
+ 	ltq_toe_w32_mask(0, 1 << LRO_FID_0_S_END_POS, LRO_FID(port));
+@@ -907,7 +948,7 @@ int lro_real_stop_flow (int session_id, int timeout, int flags)
+ 	/* Clear the OWNER */
+ 	ltq_toe_w32_mask(LRO_FID_0_OWNER_MASK, 0,  LRO_FID(port));
+ 
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 	wmb();
+ 	mdelay(5);
+ 
+@@ -994,7 +1035,7 @@ int lro_stop_flow (int session_id, int timeout, int flags)
+ 	}
+ #endif
+ 
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+ 
+ 	/* Set the S_END */
+ 	ltq_toe_w32_mask(0, 1 << LRO_FID_0_S_END_POS, LRO_FID(port));
+@@ -1002,7 +1043,7 @@ int lro_stop_flow (int session_id, int timeout, int flags)
+ 	/* Clear the OWNER */
+ 	ltq_toe_w32_mask(LRO_FID_0_OWNER_MASK, 0,  LRO_FID(port));
+ 
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 	wmb();
+ 
+ 	pr_debug("stopped flow %u for session_id = %x\n", port, ltq_toe_r32(LRO_FID(port)));
+@@ -1604,7 +1645,7 @@ static void configure_tso (void)
+ 	ltq_toe_w32_mask(0, (1 << TSO_INTL_INT_EN_MCPY2_DONE_POS), TSO_INTL_INT_EN);
+ 	ltq_toe_w32_mask(0, (1 << TSO_INTL_INT_EN_MCPY3_DONE_POS), TSO_INTL_INT_EN);
+ 
+-	if (g_tso_irq_mode) {
++	if (is_tso_IRQMode()) {
+ 		/* Enable the interrupts */
+ 		ltq_toe_w32_mask(0, (1 << TOE_INT_EN_TOE0_POS), TOE_INT_EN);
+ 		ltq_toe_w32_mask(0, (1 << TOE_INT_EN_TOE1_POS), TOE_INT_EN);
+@@ -1619,223 +1660,319 @@ static void configure_tso (void)
+ 	}
+ }
+ 
+-static void ltq_tso_tasklet(unsigned long dev)
++static inline struct toe_sg_buffer* tso_get_sgbuff(ltq_tso_port_t* tsoPort)
+ {
+-	u32 tso_done;
+-	ltq_tso_port_t *pport = (ltq_tso_port_t *) dev;
+-	struct sk_buff *skb;
+-	u32 int_stat, port;
+-	uint8_t tso_tx_tasklet_budget = 20;
+-	unsigned long tso_rl_flags;
+-
+-	port = pport->port_number;
+-
+-	pr_info_once("port = %d\n", port);
+-
+-	do {
+-		/* Clear the interrupt */
+-		spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
+-		ltq_toe_w32((1<<port), TOE_INT_STAT);
+-		spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
+-
+-		wmb();
+-
+-		/* free the skb */
+-		skb = (struct sk_buff *) ltq_toe_r32(PORT_RES_REG0(port));
+-		pr_debug("skb = %x\n", (unsigned int)skb);
++	struct toe_sg_buffer* sgBuff;
+ 
+-    	tso_done = ltq_toe_r32(PORT_RES_REG1(port));
+-		pr_info_once("tso_done = %x\n", tso_done);
+-
+-    	if (tso_done) {
+-			dev_kfree_skb_any(skb);
+-			g_tso_done[port]++;
+-		} else {
+-			pr_err("TSO not done ! but got the interrupt \n");
+-		}
++	if (0 == atomic_read(&(tsoPort->availBuffs))) {
++		return NULL;
++	}
+ 
+-		int_stat = ltq_toe_r32(TOE_INT_STAT) & (1 << (port));
+-	} while (int_stat && --tso_tx_tasklet_budget);
++	atomic_dec(&(tsoPort->availBuffs));
++	sgBuff = (tsoPort->sgBuffs+tsoPort->rPos);
++	tsoPort->rPos = ((tsoPort->rPos+1)%SG_BUFFER_PER_PORT);
+ 
+-	/* Unmask the interrupt */
+-	spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
+-	ltq_toe_w32_mask(0, (1 << port), TOE_INT_EN);
+-	spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
+-	return;
++	return sgBuff;
+ }
+ 
+-static irqreturn_t ltq_tso_tx_int(int irq, void *_port)
++static inline void tso_free_toebuf(ltq_tso_port_t* tsoPort, struct toe_sg_buffer* sgBuff, int error)
+ {
+-	struct sk_buff *skb;
+-	u32 tso_done;
+-	unsigned long tso_rl_flags;
+-	struct ltq_tso_port *tso_port = (struct ltq_tso_port *)_port;
+-	int port;
+-
+-	port = tso_port->port_number;
+-
+-	if (ltq_toe_r32(TOE_INT_STAT) & (1 << port)) {
+-			spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
+-			/* Mask the interrupt */
+-			ltq_toe_w32_mask((1<<port), 0, TOE_INT_EN);
+-			/* Clear the interrupt */
+-			ltq_toe_w32((1<<port), TOE_INT_STAT);
+-			wmb();
+-			spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
+-
+-#if 1
+-			skb = (struct sk_buff *) ltq_toe_r32(PORT_RES_REG0(port));
+-			pr_debug("skb = %x\n", (unsigned int)skb);
+-
+-			tso_done = ltq_toe_r32(PORT_RES_REG1(port));
+-
+-			if (tso_done & PORT_RES_REG1_0_ERR_MASK) {
+-				pr_err ("tso error !!\n");
+-			} else {
+-				g_tso_done[port]++;
+-				/*dev_kfree_skb_irq(skb);*/
+-				dev_kfree_skb_any(skb);
+-			}
+-
+-			/* Unmask the interrupt */
+-			spin_lock_irqsave(&tso_register_lock, tso_rl_flags);
+-			ltq_toe_w32_mask(0, (1<<port), TOE_INT_EN);
+-			wmb();
+-			spin_unlock_irqrestore(&tso_register_lock, tso_rl_flags);
++	/*
++	 * Expected to be exucted on one CPU and no scheduling expected when
++	 * this function is invoked.
++	 */
++
++	dev_kfree_skb_any(sgBuff->skb);
++	sgBuff->skb = NULL;
++	if (error)  {
++		pr_info("TSO: TSO transmit error\n");
++		++tsoPort->TxHwError;
+ 	} else {
+-		pr_err("dummy interrupt in TSO on port: %d!!\n", port);
++		++tsoPort->TxDonePackets;
+ 	}
+-#else
+-	pr_info_once("irq on port = %d\n", port);
+-	/* Schedule the tasklet for housekeeping */
+-	tasklet_schedule(&tso_tasklet[port]);
+-#endif
+-	return IRQ_HANDLED;
++	tsoPort->wPos = ((tsoPort->wPos + 1) % SG_BUFFER_PER_PORT);
++	atomic_inc(&(tsoPort->availBuffs));
+ }
+ 
+-int ltq_tso_xmit (struct sk_buff *skb, struct pmac_tx_hdr *pmac, int hdr_size, int flags)
++int tso_enqueue_hw(ltq_tso_port_t* tsoPort,
++			struct toe_sg_buffer* sgBuff)
+ {
+-	int i, len;
+-	unsigned long tso_done = 0;
++	int nfrags, len;
+ 	void *frag_addr;
+ 	const skb_frag_t *frag;
+ 	int port;
+-	struct skb_shared_info *shinfo=NULL;
+-  	unsigned long toe_g = 1;
+-  	unsigned long toe_sioc = 0;
+-  	unsigned long toe_last = 0;
+-  	unsigned char *cmd4_buf;
++	struct skb_shared_info *shinfo = NULL;
++	unsigned int toe_g = 1;
++	unsigned int toe_sioc = 0;
++	unsigned int toe_last = 0;
++	unsigned int ie = 1;
++	unsigned short gso_size;
++	int ret = 0;
++	struct sk_buff *skb= sgBuff->skb;
+ 
+-	pr_debug("%s: called.. with len:%d data:%x on port: %d nr_frags: %d\n",
+-					__FUNCTION__, skb->len, (unsigned int)skb->data, port, shinfo->nr_frags);
++	port = tsoPort->port_number;
++	shinfo = skb_shinfo(skb);
+ 
+-	/* if there is no headroom for PMAC header, try to expand */
+-	if (skb_headroom(skb) < hdr_size) {
+-		if (pskb_expand_head(skb, hdr_size, 0, GFP_ATOMIC)) {
+-			dev_kfree_skb_any(skb);
+-			return -1;
+-		}
+-	}
+ 
+-	/* copy the pmac header to the tx data */
+-	skb_push(skb, hdr_size);
+-	memcpy(skb->data, pmac, hdr_size);
++	if (!toe_tso_port_ready(port,10000)) {
++		pr_err("TSO Error: TSO port(%d) is not ready\n",port);
++		ret = -1; //TSO port not available
++		goto tsoXmitDoneErr;
++	}
+ 
+-	port = smp_processor_id();
+-  	cmd4_buf = (unsigned char *)ltq_large_buf[port];
+-  	shinfo = skb_shinfo(skb);
+-
+-  	if (skb->data) {
+-		 if (shinfo->nr_frags == 0) {
+-		   toe_g = 0;
+-		   cmd4_buf = (unsigned char *)skb;
+-		   /* toe_last |= (1 << PORT_REQ_CMD_REG0_0_LAST_POS); */
+-		 }
+-    } else if (shinfo->nr_frags == 1) {
++	if (!(shinfo->nr_frags)) {
+ 		 toe_g = 0;
+-   	 	 cmd4_buf = (unsigned char *)skb;
+-   	     /* toe_last |= (1 << PORT_REQ_CMD_REG0_0_LAST_POS); */
+   	}
++	gso_size = ((shinfo->gso_size) > 1546) ? 1546 : (shinfo->gso_size);
+ 
+  	/* Setup 1st command of gather in cmd registers */
+  	/* Check that CMD port is available */
+- 	toe_get_cmd_own(port);
+  	len = skb->len - skb->data_len;
+-	toe_fill_cmd0(1, 1, 1, toe_g, 2, len, toe_last, port);
++	toe_fill_cmd0(1, 1, ie, toe_g, 2, len, toe_last, port);
+  	toe_fill_cmd1(skb->data, ~toe_sioc, port, len);
+  	toe_fill_cmd2(skb->DW0, port);
+  	toe_fill_cmd3(skb->DW1, port);
+ 
+-	if (!(shinfo->nr_frags))
+-		toe_fill_cmd4_sbk((u32)skb, port);
+-	else
+- 		toe_fill_cmd4(cmd4_buf, port);
+-
+-	/*udelay(10);*/
++	if (likely(toe_g)) {
++		toe_fill_cmd4((sgBuff->sgBuffer), port);
++	} else {
++		toe_fill_cmd4_sbk((u32)(sgBuff), port);
++	}
+ 	wmb();
+-	if (skb_tso_size(skb) > 1546)
+- 		toe_fill_cmd5(1546, 1, port);
+-	else
+- 		toe_fill_cmd5(skb_tso_size(skb), 1, port);
++	toe_fill_cmd5(gso_size, 1, port);
+ 
+ 	/* Write the command registers to start the gathering*/
+-	for (i = 0; i < shinfo->nr_frags ; i++) {
++	for (nfrags = 0; nfrags < shinfo->nr_frags ; nfrags++) {
+ 			/* Check if last segment of Gather */
+-			if (i == (shinfo->nr_frags - 1)) {
+-				toe_last = (1 << PORT_REQ_CMD_REG0_0_LAST_POS) | (1 << PORT_REQ_CMD_REG0_0_IE_POS);
++			if (nfrags == (shinfo->nr_frags - 1)) {
++				toe_last = 1 ;
+ 			}
+-			frag = &shinfo->frags[i];
++			frag = &shinfo->frags[nfrags];
+ 
+ 			/* Check that CMD port is available */
+-			toe_get_cmd_own(port);
++			while (!toe_tso_port_ready(port,3000)) {
++				pr_err("TSO: Waiting to finish SG job for %d port frags=%d/%d \n DEBUG_CFG=0x%X Internal INT_STAT=0x%X\n",
++						port, nfrags,shinfo->nr_frags,ltq_toe_r32(TSO_DEBUG_CFG),ltq_toe_r32(TSO_INTL_INT_STAT));
++			}
+ 			/* CMD0 - Fill frag length */
+-			toe_fill_cmd0(1, 1, 1, toe_g, 2, skb_frag_size(frag), toe_last, port);
++			toe_fill_cmd0(1, 1, ie, 1, 2, skb_frag_size(frag), toe_last, port);
+ 
+-			/* CMD1 - Fill frag i */
++			/* CMD1 - Fill frag  */
+ 			frag_addr = skb_frag_address(frag);
+ 			toe_fill_cmd1_frags(frag_addr, ~toe_sioc, port, skb_frag_size(frag));
+ 
+ 			/* */
+-			toe_fill_cmd4_sbk((u32)skb, port);
++			toe_fill_cmd4_sbk((u32)sgBuff, port);
++			wmb();
+ 
+ 			/* CMD5 */
+-		if (skb_tso_size(skb) > 1546)
+- 			toe_fill_cmd5(1546, 1, port);
+-		else
+-			toe_fill_cmd5(skb_tso_size(skb), 1, port);
++			toe_fill_cmd5(gso_size, 1, port);
++
++			pr_debug ("TSO: SG for frag:%d with G.. \n", nfrags);
++	}
++
++	tso_write_stats(tsoPort,skb);
++
++	return 0;
++
++tsoXmitDoneErr:  //FIX: If TSO commands return with error, then sgBuffer is lost
++	++tsoPort->TxErrorPackets;
++	return ret;
++}
++
++static void tso_timer(unsigned long data)
++{
++	ltq_tso_port_t* tsoPort = (ltq_tso_port_t*)(data);
++
++	pr_info_once("TSO timer for  = %d\n", tsoPort->port_number);
++
++	if (skb_queue_len(&tsoPort->processQ) ||
++			tso_results_pending(tsoPort)) {
++		tasklet_schedule(&tsoPort->tasklet);
++	}
++	return;
++}
++
++static void ltq_tso_tasklet(unsigned long dev)
++{
++	u32 tso_done;
++	ltq_tso_port_t *tsoPort = (ltq_tso_port_t *) dev;
++	u32 port;
++	unsigned long tso_rl_flags;
++	int tsoBudget = SG_BUFFER_PER_PORT;
++
++	port = tsoPort->port_number;
++
++	pr_info_once("TSO tasklet port = %d\n", port);
++
++	wmb();
++	process_tso_results(tsoPort); /* Process TSO result"S" of this port*/
++	tsoPort->processQ_maxL = maxV(skb_queue_len(&tsoPort->processQ),
++					tsoPort->processQ_maxL);
++
++	while (skb_queue_len(&tsoPort->processQ) &&
++			tso_sgbuffs_available(tsoPort) &&
++			tsoBudget) {
++
++		struct toe_sg_buffer* sgBuff;
+ 
+-			pr_debug ("start for packet:%d with G.. \n", i);
++		sgBuff = tso_get_sgbuff(tsoPort);
++		BUG_ON(sgBuff == NULL);
++		sgBuff->skb = skb_dequeue(&tsoPort->processQ);
++		if (tso_enqueue_hw(tsoPort, sgBuff)) {
++			tso_free_toebuf(tsoPort, sgBuff, 1);
++			break;
++		}
++		--tsoBudget;
++	}
++
++	if (skb_queue_len(&tsoPort->processQ) ||
++		tso_results_pending(tsoPort)) {
++		mod_timer(&tsoPort->timer, jiffies + usecs_to_jiffies(10));
+ 	}
+ 
+-	tso_num_tx[port]++;
++	return;
++}
++
++#define TSO_USE_TASKLET_IN_IRQ 1
++static irqreturn_t ltq_tso_tx_int(int irq, void *data)
++{
++	struct sk_buff *skb;
++	unsigned long tso_done;
++	unsigned long tso_rl_flags;
++	struct ltq_tso_port *tsoPort = (struct ltq_tso_port *)(data);
++	int port;
++
++	port = tsoPort->port_number;
++
++	if (ltq_toe_r32(TOE_INT_STAT) & (1 << port)) {
++#ifndef TSO_USE_TASKLET_IN_IRQ
++		spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++		/* Mask the interrupt */
++		ltq_toe_w32_mask((1<<port), 0, TOE_INT_EN);
++
++		wmb();
++		spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++
++		process_tso_results(tsoPort); /* Process TSO result"S" of this port */
++
++		spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++		ltq_toe_w32((1<<port), TOE_INT_STAT);	/* Clear the interrupt */
++		ltq_toe_w32_mask(0, (1<<port), TOE_INT_EN);	/* Unmask the interrupt */
++		wmb();
++#error "Unexcpted compilation"
++		spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++#else
++		/* Schedule the tasklet for housekeeping */
++		spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++		ltq_toe_w32((1<<port), TOE_INT_STAT);	/* Clear the interrupt */
++		spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++		tasklet_schedule(&tsoPort->tasklet);
++#endif
++	} else {
++		pr_err("TSO: Interrupt error. Unexpected on CPU %d ( stat = %X) !!\n", (1 << port), ltq_toe_r32(TOE_INT_STAT));
++	}
++	return IRQ_HANDLED;
++}
++
++
++#define TSO_DELAY() asm("nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop")
++
++static inline int process_tso_results(ltq_tso_port_t* tsoPort)
++{
++	u32 port =  tsoPort->port_number;
++        u32 resReg1 = 0;
++	int results = 0;
++	struct toe_sg_buffer* sgBuff_prev = NULL;
++	struct toe_sg_buffer* sgBuff_curr = NULL;
++	int done;
++
++
++	do {
++		done = 0;
++		sgBuff_curr = (struct toe_sg_buffer *) ltq_toe_r32(PORT_RES_REG0(port));
++		resReg1 = ltq_toe_r32(PORT_RES_REG1(port));
++
++		if(  ( resReg1 & (PORT_RES_REG1_0_DONE_MASK |PORT_RES_REG1_0_ERR_MASK )) )  {
++			/* Make sure current buffer is not same as previous
++			 * released buffer */
++			if( sgBuff_curr )
++			tso_free_toebuf(tsoPort, sgBuff_curr, ( resReg1 & PORT_RES_REG1_0_ERR_MASK ) ) ;
++			else
++				pr_err("TSO: Process Result has no packet buffer info\n");
++			sgBuff_prev = sgBuff_curr;
++			done = 1;
++			++results;
++		}
++		TSO_DELAY(); /* delay before read next TSO result*/
++	} while (done);
++
++	return results;
++}
++
+ 
+-	if (g_tso_polling_mode) {
+-			do {
+-				tso_done = ltq_toe_r32(PORT_RES_REG1(port));
+-				pr_debug ("checking tso status: %x\n", (unsigned int)tso_done);
+-				tso_done = 1 & (tso_done >> PORT_RES_REG1_0_DONE_POS);
+-				if (tso_done)
+-					break;
+-			} while (1);
++static inline void tso_write_stats(ltq_tso_port_t* tsoPort,struct sk_buff* skb)
++{
++	int frIndex = skb_shinfo(skb)->nr_frags;
++
++	++tsoPort->TxPackets;
++	frIndex = (frIndex >=  MAX_TSO_FRAGS_STATS) ? (MAX_TSO_FRAGS_STATS) : (frIndex);
++	++tsoPort->fragsStats[frIndex].TxPackets;
++	tsoPort->fragsStats[frIndex].TxBytes += skb->len;
++	tsoPort->fragsStats[frIndex].TxMaxBytes =
++		maxV(skb->len, tsoPort->fragsStats[frIndex].TxMaxBytes);
++
++}
++
++int ltq_tso_xmit(struct sk_buff *skb,
++			struct pmac_tx_hdr *pmac,
++			int hdr_size, int flags )
++{
++	int port;
++	ltq_tso_port_t *tsoPort;
+ 
+-			if (skb_is_nonlinear(skb))
+-				pr_debug("!");
+-			pr_debug("tso_done !!!\n");
++	tsoPort = (ltq_tso_port + smp_processor_id());
++	port = tsoPort->port_number;
+ 
+-			/* Free the SKB */
+-			dev_kfree_skb_any(skb);
+-			g_tso_done[port]++;
++	pr_debug("%s: called.. with len:%d data:%x on port: %d nr_frags: %d\n",
++			__FUNCTION__, skb->len,
++			(unsigned int)skb->data,
++			port,
++			skb_shinfo(skb)->nr_frags);
++
++
++	/* if there is no headroom for PMAC header, try to expand */
++	if (skb_headroom(skb) < hdr_size) {
++		pr_err("TSO: headroom is lesser than expeted (port=%d)\n",port);
++		if (pskb_expand_head(skb, hdr_size, 0, GFP_ATOMIC)) {
++			goto tsoErr;
++		}
+ 	}
+ 
++	/* copy the pmac header to the tx data */
++	skb_push(skb, hdr_size);
++	memcpy(skb->data, pmac, hdr_size);
++	/* enqueue to processQ */
++	skb_queue_tail(&tsoPort->processQ, skb);
++	tasklet_schedule(&tsoPort->tasklet);
++
+ 	return 0;
++
++tsoErr:
++	dev_kfree_skb_any(skb);
++	++tsoPort->TxErrorPackets;
++	return -1;
+ }
+ EXPORT_SYMBOL(ltq_tso_xmit);
+ 
+ static int toe_reg_read_proc(struct seq_file *s, void *v)
+ {
++	int port;
++
+ 	if (!capable(CAP_NET_ADMIN))
+ 		return -EPERM;
+-	seq_puts(s, "===============Global Regs ==================\n");
++
++	seq_puts(s, "===============TOE GLobal Registers ==================\n");
+ 	seq_printf(s, "ToE base address 0x%08x\n", (unsigned int) ltq_toe_membase);
+ 	seq_printf(s, "TSO_GCTRL: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(TSO_GCTRL));
+ 	seq_printf(s, "HDR_BASE_SEG0: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + HDR_BASE_SEG0), ltq_toe_r32(HDR_BASE_SEG0));
+@@ -1843,17 +1980,32 @@ static int toe_reg_read_proc(struct seq_file *s, void *v)
+ 	seq_printf(s, "TOE_INT_MASK: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TOE_INT_MASK), ltq_toe_r32(TOE_INT_MASK));
+ 	seq_printf(s, "TOE_INT_STAT: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TOE_INT_STAT), ltq_toe_r32(TOE_INT_STAT));
+ 	seq_printf(s, "TOE_INT_EN: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TOE_INT_EN), ltq_toe_r32(TOE_INT_EN));
+-	seq_printf(s, "=============== Port 0 TSO CMD Regs ============\n");
+-	seq_printf(s, "PORT_REQ_CMD_REG0_0: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(PORT_REQ_CMD_REG0_0));
+-	seq_printf(s, "PORT_REQ_CMD_REG1_0: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(PORT_REQ_CMD_REG1_0));
+-	seq_printf(s, "PORT_REQ_CMD_REG2_0: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(PORT_REQ_CMD_REG2_0));
+-	seq_printf(s, "PORT_REQ_CMD_REG3_0: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(PORT_REQ_CMD_REG3_0));
+-	seq_printf(s, "PORT_REQ_CMD_REG4_0: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(PORT_REQ_CMD_REG4_0));
+-	seq_printf(s, "PORT_REQ_CMD_REG5_0: addr 0x%08x value 0x%08x\t\n", (unsigned int)(ltq_toe_membase + TSO_GCTRL), ltq_toe_r32(PORT_REQ_CMD_REG5_0));
+-	seq_printf(s, "=============== Port 0 LRO Regs ============\n");
+-	seq_printf(s, "LRO_FID_0: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_FID_0), ltq_toe_r32(LRO_FID_0));
+-	seq_printf(s, "LRO_TO_REG_0: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_TO_REG_0), ltq_toe_r32(LRO_TO_REG_0));
+-	seq_printf(s, "LRO_OC_FLAG_0: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_OC_FLAG_0), ltq_toe_r32(LRO_OC_FLAG_0));
++
++	for (port = 0; port < LTQ_MAX_LRO_PORTS; port++) {
++		seq_printf(s, "==========Port %d LRO Registers Info ============\n",port );
++		seq_printf(s, "LRO_FID: 0x%08X\t\n",  ltq_toe_r32(LRO_FID(port)));
++		seq_printf(s, "LRO_TO_REG: 0x%08X\t\n", ltq_toe_r32(LRO_TO_REG(port)));
++		seq_printf(s, "LRO_OC_FLAG-1: 0x%08X\tLRO_OC_FLAG-2=0x%08X\n", ltq_toe_r32(LRO_OC_FLAG(port,0)),ltq_toe_r32(LRO_OC_FLAG(port,1)));
++		seq_printf(s, "LRO_OC_OWNER_1: Ctx1 0x%08X\tCtx2: 0x%08X\n", ltq_toe_r32(LRO_OC_OWNER(port,0)),ltq_toe_r32(LRO_OC_OWNER(port,1)) );
++
++	}
++
++	seq_printf(s, "TSO_DEBUG_CFG=0x%08X INTL_INT_STAT=0x%08X\nTSO_INTL_INT_EN=0x%08X\tTSO_INTL_INT_MASK=0x%08X\n",
++			ltq_toe_r32(TSO_DEBUG_CFG),
++			ltq_toe_r32(TSO_INTL_INT_STAT),
++			ltq_toe_r32(TSO_INTL_INT_EN),
++			ltq_toe_r32(TSO_INTL_INT_MASK));
++
++	for_each_online_cpu(port) {
++		seq_printf(s, "=============== Port %d TSO CMD Regs ============\n",port);
++		seq_printf(s, "REQ_CMD_REG0:  0x%08x\n",  ltq_toe_r32(PORT_REQ_CMD_REG0(port)));
++		seq_printf(s, "REQ_CMD_REG1:  0x%08x\n",  ltq_toe_r32(PORT_REQ_CMD_REG1(port)));
++		seq_printf(s, "REQ_CMD_REG2:  0x%08x\n",  ltq_toe_r32(PORT_REQ_CMD_REG2(port)));
++		seq_printf(s, "REQ_CMD_REG3:  0x%08x\n",  ltq_toe_r32(PORT_REQ_CMD_REG3(port)));
++		seq_printf(s, "REQ_CMD_REG4:  0x%08x\n",  ltq_toe_r32(PORT_REQ_CMD_REG4(port)));
++		seq_printf(s, "REQ_CMD_REG5:  0x%08x\n",  ltq_toe_r32(PORT_REQ_CMD_REG5(port)));
++		seq_printf(s, "Result REG offsets:  RES-1 : 0x%08x\tRES-2: 0x%08X\n",  (unsigned int)(PORT_RES_REG1(port)), (unsigned int)(PORT_RES_REG0(port)));
++	}
+ 	return 0;
+ }
+ 
+@@ -1869,28 +2021,83 @@ static const struct file_operations ltq_toe_reg_proc_fops = {
+ 	.release = seq_release,
+ };
+ 
++ssize_t ltq_stats_write (struct file *file, const char *user_buf,
++	size_t count, loff_t *ppos)
++{
++	int len = 0, tmp = 0, cpu;
++	char str[25] = {0};
++	char *p = NULL;
++	ltq_tso_port_t *tsoPort;
++
++        if (!capable(CAP_NET_ADMIN)) {
++             printk ("Write Permission denied");
++             return 0;
++        }
++
++	len = min(count, (size_t)(sizeof(str) - 1));
++	len -= copy_from_user(str, user_buf, len);
++	while (len && str[len - 1] <= ' ')
++		len--;
++
++	str[len] = 0;
++
++	for (p = str; *p && *p <= ' '; p++, len--)
++	;
++
++	if (!*p)
++		return count;
++
++	kstrtol(p, 10, (long *)&tmp);
++
++	if (tmp == 0) {
++		for_each_online_cpu(cpu) {
++			ltq_tso_port_t *tsoPort = (ltq_tso_port + cpu);
++			memset(tsoPort->fragsStats, 0, sizeof(struct tso_frags_stats) * MAX_TSO_FRAGS_STATS);
++		}
++	} else {
++		pr_info("Invalid input!\n");
++		pr_info("echo 0 > /proc/driver/ltq_toe/stats to clear\n");
++	}
++	return len;
++}
++
+ static int lro_stats_read_proc(struct seq_file *s, void *v)
+ {
+-	int i,port;
++	int port;
++	int cpu;
++	int frFrags;
+ 
+-	if (!capable(CAP_NET_ADMIN))
+-		return -EPERM;
+ 	seq_puts(s, "===============LRO Stats==================\n");
+-	for (i=0; i<LRO_MAX_EXCEPTION_COUNT; i++)
+-		seq_printf(s, "Exceptions %i: %d\t\n", i, (unsigned int) lro_num_except[i]);
+-	seq_printf(s, "Number of success %d\t\n", (unsigned int) lro_num_success);
+-	seq_printf(s, "=============== Port 0 LRO Regs ============\n");
+-	seq_printf(s, "LRO_OC_FLAG_0: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_OC_FLAG_0), ltq_toe_r32(LRO_OC_FLAG_0));
+-	seq_printf(s, "LRO_OC_FLAG_1: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_OC_FLAG_1), ltq_toe_r32(LRO_OC_FLAG_1));
+-	seq_printf(s, "LRO_OC_OWNER_0: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_OC_OWNER_0), ltq_toe_r32(LRO_OC_OWNER_0));
+-	seq_printf(s, "LRO_OC_OWNER_1: addr 0x%08x value 0x%08x\t\n", (unsigned int) (ltq_toe_membase + LRO_OC_OWNER_1), ltq_toe_r32(LRO_OC_OWNER_1));
+-	seq_puts(s, "===============TSO Stats==================\n");
+-	for (port=0; port < LTQ_MAX_TSO_PORTS; port++)
+-		seq_printf(s, "Number of tx %d\t num_done %d\n", (unsigned int) tso_num_tx[port],(unsigned int) g_tso_done[port]);
++	for (port = 0; port < LRO_MAX_EXCEPTION_COUNT; port++)
++		seq_printf(s, "Exceptions %i: %d\t\n", port, (unsigned int) lro_num_except[port]);
++
++	seq_printf(s, "Number of success %d\t\n\n", (unsigned int) lro_num_success);
++
++	for_each_online_cpu(cpu) {
++		ltq_tso_port_t *tsoPort = (ltq_tso_port + cpu);
++		seq_printf(s, "=============== TSO port %d Stats==================\n", cpu);
++		seq_printf(s, "TxPkts: %d\tTxDone: %d\tTxErr: %d\tTxHWErr: %d\tSG Buffs: %d\tPrcsQ len: %u\tPrcsQ MaxL: %u\n\n",
++			tsoPort->TxPackets,
++			tsoPort->TxDonePackets,
++			tsoPort->TxErrorPackets,
++			tsoPort->TxHwError,
++			atomic_read(&(tsoPort->availBuffs)),
++			skb_queue_len(&tsoPort->processQ),
++			tsoPort->processQ_maxL);
++		for (frFrags = 0; frFrags <  MAX_TSO_FRAGS_STATS + 1; ++frFrags) {
++			if (tsoPort->fragsStats[frFrags].TxPackets != 0) {
++				seq_printf(s, "[%u]:\t %u\t %llu\t %u\n",
++				frFrags,
++				tsoPort->fragsStats[frFrags].TxPackets,
++				tsoPort->fragsStats[frFrags].TxBytes,
++				tsoPort->fragsStats[frFrags].TxMaxBytes);
++			}
++		}
++	}
+ 	return 0;
+ }
+ 
+-static int ltq_lro_stats_seq_open(struct inode *inode, struct file *file)
++static int ltq_stats_seq_open(struct inode *inode, struct file *file)
+ {
+ 	return single_open(file, lro_stats_read_proc, NULL);
+ }
+@@ -1900,6 +2107,9 @@ ssize_t lro_proc_write(struct file *file, const char *buf, size_t count,
+ {
+ 	u32 flow_id;
+ 
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
+ 	/* Read the Flow ID */
+ 	flow_id = ltq_toe_r32(LRO_FID(0)) & LRO_FID_0_LRO_FID_MASK;
+ 	pr_info("current flow id = %d\n", flow_id);
+@@ -1909,24 +2119,41 @@ ssize_t lro_proc_write(struct file *file, const char *buf, size_t count,
+ 		pr_err("session couldn't be deleted..\n");
+ 	else
+ 		pr_info("session %d deleted..\n", flow_id);
++
+ 	return count;
+ }
+ 
+-static const struct file_operations ltq_lro_stats_proc_fops = {
+-	.open = ltq_lro_stats_seq_open,
++static int lro_lroFlow_read_proc(struct seq_file *s, void *v)
++{
++	seq_puts(s, "LRO Flow\n");
++	return 0;
++}
++
++static int ltq_lroFlow_seq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, lro_lroFlow_read_proc, NULL);
++}
++
++static const struct file_operations ltq_lro_proc_fops = {
++	.open = ltq_lroFlow_seq_open,
+ 	.read = seq_read,
+ 	.write = lro_proc_write,
+ 	.llseek = seq_lseek,
+ 	.release = seq_release,
+ };
++static const struct file_operations ltq_stats_proc_fops = {
++	.open = ltq_stats_seq_open,
++	.read = seq_read,
++	.write = ltq_stats_write,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
+ 
+ /* TSO XMIT mode related proc ops */
+ 
+ static int tso_xmit_mode_read_proc(struct seq_file *s, void *v)
+ {
+-	seq_printf(s, "TSO xmit IRQ mode: %d\n", g_tso_irq_mode);
+-	seq_printf(s, "TSO xmit Polling mode: %d\n", g_tso_polling_mode);
+-
++	seq_printf(s, "TSO is in %s\n", is_tso_IRQMode()?("IRQ Mode"):("POLLING Mode") );
+ 	return 0;
+ }
+ 
+@@ -1943,6 +2170,9 @@ ssize_t tso_xmit_mode_proc_write(struct file *file, const char *user_buf, size_t
+ 	char *param_list[2];
+ 	unsigned char *str;
+ 
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
+ 	if (copy_from_user(buf, user_buf, min(count, (sizeof(buf) - 1))))
+ 		return -EFAULT;
+ 
+@@ -1956,28 +2186,31 @@ ssize_t tso_xmit_mode_proc_write(struct file *file, const char *user_buf, size_t
+ 	str = param_list[0];
+ 
+ 	if(strcmp(str, "irq") == 0) {
+-		g_tso_irq_mode = 1;
+-		g_tso_polling_mode = 0;
+-		enable_irq(80);
+-		enable_irq(82);
+-
+-		/* Enable the irqs at HW level */
+-		ltq_toe_w32_mask(0, (1 << TOE_INT_EN_TOE0_POS), TOE_INT_EN);
+-		ltq_toe_w32_mask(0, (1 << TOE_INT_EN_TOE2_POS), TOE_INT_EN);
+-		ltq_toe_w32_mask((1 << TOE_INT_MASK_TOE0_POS), 0, TOE_INT_MASK);
+-		ltq_toe_w32_mask((1 << TOE_INT_MASK_TOE2_POS), 0, TOE_INT_MASK);
++		int cpu;
++		struct cpumask cpumask;
++
++		tso_set_IRQMode();
++		for_each_online_cpu(cpu) {
++			enable_irq(ltq_tso_port[cpu].irq);
++			ltq_toe_w32_mask(0, (1 << cpu), TOE_INT_EN);
++			ltq_toe_w32_mask((1 << cpu), 0, TOE_INT_MASK);
++			cpumask.bits[0] = (1 << cpu);
++			if (irq_set_affinity(ltq_tso_port[cpu].irq, &cpumask))
++				pr_err("TSO: FAILED. Can not set affinity for IRQ - %d and port %d\n", ltq_tso_port[cpu].irq, cpu);
++			else
++				pr_err("TSO: Interrupt affinity for irq %d to cpu %d\n", ltq_tso_port[cpu].irq, (1 << cpu));
++		}
+ 
+ 	} else if(strcmp(str, "polling") == 0) {
+-		g_tso_polling_mode = 1;
+-		g_tso_irq_mode = 0;
+-		disable_irq(80);
+-		disable_irq(82);
+-
+-		/* Disable the irqs at HW level */
+-		ltq_toe_w32_mask((1 << TOE_INT_EN_TOE0_POS), 0, TOE_INT_EN);
+-		ltq_toe_w32_mask((1 << TOE_INT_EN_TOE2_POS), 0, TOE_INT_EN);
+-		ltq_toe_w32_mask(0, (1 << TOE_INT_MASK_TOE0_POS), TOE_INT_MASK);
+-		ltq_toe_w32_mask(0, (1 << TOE_INT_MASK_TOE2_POS), TOE_INT_MASK);
++		int cpu;
++
++		tso_set_pollingMode();
++		for_each_online_cpu(cpu) {
++			disable_irq(ltq_tso_port[cpu].irq);
++			/* Disable the irqs at HW level */
++			ltq_toe_w32_mask((1 << cpu), 0, TOE_INT_EN);
++			ltq_toe_w32_mask(0, (1 << cpu), TOE_INT_MASK);
++		}
+ 	} else {
+ 		pr_info("Unknown TSO xmit mode !\n");
+ 		pr_info("echo irq/polling > /proc/driver/ltq_toe/tso_xmit_mode \n");
+@@ -2056,25 +2289,24 @@ static int ltq_toe_proc_init (void)
+ 	if (!g_toe_dir)
+ 		return -ENOMEM;
+ 
+-	entry = proc_create("register", 0,
+-			g_toe_dir, &ltq_toe_reg_proc_fops);
++	entry = proc_create("register", 0, g_toe_dir, &ltq_toe_reg_proc_fops);
+ 	if (!entry)
+ 		goto err1;
+ 
+-	entry = proc_create("lro_stats", 0,
+-			g_toe_dir, &ltq_lro_stats_proc_fops);
++	entry = proc_create("stats", 0, g_toe_dir, &ltq_stats_proc_fops);
++	if (!entry)
++		goto err1;
++	entry = proc_create("lroflow", 0, g_toe_dir, &ltq_lro_proc_fops);
+ 	if (!entry)
+ 		goto err1;
+ 
+ #ifdef LRO_DEBUG
+-	entry = proc_create("lro_dbg_info", 0,
+-			g_toe_dir, &ltq_lro_debug_info_proc_fops);
++	entry = proc_create("lro_dbg_info", 0, g_toe_dir, &ltq_lro_debug_info_proc_fops);
+ 	if (!entry)
+ 		goto err1;
+ #endif
+ 
+-	entry = proc_create("tso_xmit_mode", 0,
+-			g_toe_dir, &tso_xmit_mode_proc_fops);
++	entry = proc_create("tso_xmit_mode", 0, g_toe_dir, &tso_xmit_mode_proc_fops);
+ 	if (!entry)
+ 		goto err1;
+ 
+@@ -2088,10 +2320,11 @@ static int ltq_toe_init(struct platform_device *pdev)
+ {
+ 	struct resource *r;
+ 	struct resource irqres[15];
+-	int tso_irq;
+ 	struct cpumask cpumask;
+ 	struct device_node *node = pdev->dev.of_node;
+ 	int ret_val, i;
++	int cpu;
++	int sgNo;
+ 
+ 	/* Get the TOE base address */
+ 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+@@ -2153,30 +2386,44 @@ static int ltq_toe_init(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
+-	pr_info("ltq_toe_membase: %x and lro_sram_membase_res0: %x\n", (unsigned int)ltq_toe_membase, (unsigned int)lro_sram_membase_res0);
++	pr_info("ltq_toe_membase: %x and lro_sram_membase_res0: %x\n",
++			(unsigned int)ltq_toe_membase,
++			(unsigned int)lro_sram_membase_res0);
+ 
+ 	/* Initialise the 4 ports */
+-	for_each_online_cpu(i) {
+-		ltq_tso_port[i].membase = ltq_toe_membase + (i*0x20);
+-		ltq_tso_port[i].port_number = i;
++	for_each_online_cpu(cpu) {
++		ltq_tso_port_t	*tsoPort =  (ltq_tso_port + cpu);
++
++		tsoPort->membase = ltq_toe_membase + (cpu*0x20);
++		tsoPort->port_number = cpu;
++		atomic_set( &(tsoPort->availBuffs),SG_BUFFER_PER_PORT);
++		tsoPort->rPos = tsoPort->wPos = 0;
++		for(sgNo = 0; sgNo < SG_BUFFER_PER_PORT; ++sgNo) {
++			tsoPort->sgBuffs[sgNo].sgBuffer = ltq_large_buf[(cpu*SG_BUFFER_PER_PORT)+sgNo];
++			tsoPort->sgBuffs[sgNo].skb =  NULL;
++		}
++		tsoPort->irq = irqres[cpu+1].start;
++		skb_queue_head_init(&tsoPort->processQ);
++
++		init_timer(&tsoPort->timer);
++		tsoPort->timer.data = (unsigned long)(tsoPort);
++		tsoPort->timer.function = tso_timer;
+ 
+ 		/* Register the interrupt handler for TSO */
+-		tso_irq = irqres[i+1].start;
+-		ret_val = request_irq(tso_irq, ltq_tso_tx_int,
+-										0, "tso_irq", &ltq_tso_port[i]);
++		ret_val = request_irq(tsoPort->irq, ltq_tso_tx_int, 0, "tso_irq", tsoPort);
+ 		if (ret_val) {
+ 			pr_err("failed to request tso_tx_irq \n");
+ 			return ret_val;
+ 		}
+ 
+ 		/* Set the affinity */
+-		cpumask.bits[0] = (1 << i);
+-		if (irq_set_affinity(tso_irq, &cpumask))
+-			pr_err("can not set affinity for IRQ - %d", tso_irq);
++		cpumask.bits[0] = (1 << cpu);
++		if (irq_set_affinity(tsoPort->irq, &cpumask))
++			pr_err("can not set affinity for IRQ - %d", tsoPort->irq);
+ 
+-		tasklet_init(&tso_tasklet[i], ltq_tso_tasklet, (unsigned long)&ltq_tso_port[i]);
+-		if (g_tso_polling_mode)
+-			disable_irq(tso_irq);
++		tasklet_init(&tsoPort->tasklet, ltq_tso_tasklet, (unsigned long)(tsoPort));
++		if (is_tso_PollingMode())
++			disable_irq(tsoPort->irq);
+ 	}
+ 
+ 	/* Register the interrupt handlers for the LRO */
+@@ -2237,7 +2484,8 @@ static int ltq_toe_init(struct platform_device *pdev)
+ 	/* Initialise the proc filesystem */
+ 	ltq_toe_proc_init();
+ 
+-	spin_lock_init(&tso_register_lock);
++	spin_lock_init(&lro_register_lock);
++	spin_lock_init(&tso_irq_lock);
+ 	spin_lock_init(&tso_tx_lock);
+ 
+ 	g_toe_dev = &pdev->dev;
+diff --git a/drivers/net/ethernet/lantiq/ltq_toe_drv.h b/drivers/net/ethernet/lantiq/ltq_toe_drv.h
+index d4e90fc0b872..7df36cac4aef 100644
+--- a/drivers/net/ethernet/lantiq/ltq_toe_drv.h
++++ b/drivers/net/ethernet/lantiq/ltq_toe_drv.h
+@@ -2,11 +2,39 @@
+ #define MAX_NUMBER_OF_CMDS 100
+ #define LTQ_MAX_LRO_PORTS 8
+ 
+-#define USE_TIMER_FOR_SESSION_STOP
++#define 	USE_TIMER_FOR_SESSION_STOP
++#define  	SG_BUFFER_PER_PORT	1
++#define 	MAX_TSO_FRAGS_STATS	6
++
++struct toe_sg_buffer {
++	unsigned char* 	sgBuffer;
++	struct sk_buff*	skb;
++};
++
++struct tso_frags_stats
++{
++	u64	TxBytes;
++	u32	TxPackets;
++	u32	TxMaxBytes;
++};
+ 
+ typedef struct ltq_tso_port {
+-	unsigned char __iomem *membase; /* Virtual */
+-	u32 port_number;
++	unsigned char __iomem 	*membase;	/* Virtual */
++	struct tasklet_struct	tasklet;	/* TSO tasklet */
++	u32			port_number;	/* TSO port number */
++	u32			TxPackets;	/* Total GSO packets transmitted */
++	u32			TxErrorPackets;	/* Total Tx trasnmit error Packets */
++	u32			TxHwError;	/* Total Tx HW Error Packets */
++	u32			TxDonePackets;	/* Total GSO completed */
++	u32			irq;		/* TSO port IRQ number */
++	u32			rPos;		/* Avaialble SG buffer pos */
++	u32			wPos;		/* Expected SG buffer pos */
++	atomic_t		availBuffs;	/** Available SG buffers */
++	struct timer_list	timer;		/* Timer */
++	struct toe_sg_buffer 	sgBuffs[SG_BUFFER_PER_PORT]; 	/*! SG Buffer for tso port */
++	struct tso_frags_stats	fragsStats[MAX_TSO_FRAGS_STATS + 1];
++	struct sk_buff_head     processQ;
++	u32			processQ_maxL;
+ } ltq_tso_port_t;
+ 
+ typedef struct ltq_lro_port {
+diff --git a/drivers/net/ethernet/lantiq/ppa/ppa_drv_wrapper.c b/drivers/net/ethernet/lantiq/ppa/ppa_drv_wrapper.c
+index a766edd3a0c1..80f5c17914b2 100644
+--- a/drivers/net/ethernet/lantiq/ppa/ppa_drv_wrapper.c
++++ b/drivers/net/ethernet/lantiq/ppa/ppa_drv_wrapper.c
+@@ -229,6 +229,9 @@ EXPORT_SYMBOL(tmu_hal_setup_dp_ingress_connectivity_hook_fn);
+ int32_t (*tmu_hal_set_checksum_queue_map_hook_fn)(uint32_t pmac_port) = NULL;
+ EXPORT_SYMBOL(tmu_hal_set_checksum_queue_map_hook_fn);
+ 
++int32_t (*tmu_hal_set_lro_queue_map_hook_fn)(uint32_t pmac_port) = NULL;
++EXPORT_SYMBOL(tmu_hal_set_lro_queue_map_hook_fn);
++
+ int32_t (*mpe_hal_set_checksum_queue_map_hook_fn)(
+ 		uint32_t pmac_port, bool is_pmac_hdr_req) = NULL;
+ EXPORT_SYMBOL(mpe_hal_set_checksum_queue_map_hook_fn);
+@@ -307,6 +310,14 @@ int32_t ppa_drv_tmu_set_checksum_queue_map(uint32_t pmac_port)
+ }
+ EXPORT_SYMBOL(ppa_drv_tmu_set_checksum_queue_map);
+ 
++int32_t ppa_drv_tmu_set_lro_queue_map(uint32_t pmac_port)
++{
++	if(!tmu_hal_set_lro_queue_map_hook_fn)
++		return PPA_EINVAL;
++	return tmu_hal_set_lro_queue_map_hook_fn (pmac_port);
++}
++EXPORT_SYMBOL(ppa_drv_tmu_set_lro_queue_map);
++
+ int32_t ppa_drv_mpe_set_checksum_queue_map(uint32_t pmac_port, bool is_pmac_hdr_req)
+ {
+ 	if(!mpe_hal_set_checksum_queue_map_hook_fn)
+diff --git a/include/net/ppa/ltq_tmu_hal_api.h b/include/net/ppa/ltq_tmu_hal_api.h
+index 2f7797be1a66..8e0fb647f7cb 100644
+--- a/include/net/ppa/ltq_tmu_hal_api.h
++++ b/include/net/ppa/ltq_tmu_hal_api.h
+@@ -52,6 +52,8 @@ extern int32_t (*tmu_hal_clear_qos_mib_hook_fn)(
+ #endif
+ extern int (*tmu_hal_set_checksum_queue_map_hook_fn)
+ 		(uint32_t pmac_port);
++extern int(*tmu_hal_set_lro_queue_map_hook_fn)
++		(uint32_t pmac_port);
+ extern int (*tmu_hal_remove_dp_egress_connectivity_hook_fn)
+ 		(struct net_device *netdev, uint32_t pmac_port);
+ extern int (*tmu_hal_setup_dp_egress_connectivity_hook_fn)
+diff --git a/include/net/ppa/ppa_api.h b/include/net/ppa/ppa_api.h
+index 14db6f8f5217..2d6d3957ab4c 100644
+--- a/include/net/ppa/ppa_api.h
++++ b/include/net/ppa/ppa_api.h
+@@ -523,6 +523,7 @@ typedef struct {
+ 	struct net_device *tx_dev;
+ } PPA_TUNNEL_INFO;
+ typedef struct {
++	void *p_item; 	/* pointer to the uc_session_node */
+ 	uint8_t f_ipv6;
+ 	IP_ADDR src_ip;
+ 	IP_ADDR dst_ip;

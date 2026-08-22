@@ -1,0 +1,2219 @@
+From 1d2ae2d5ab23e1c38228756fcca369910bce6b9b Mon Sep 17 00:00:00 2001
+From: Jack Ping CHNG <jchng@maxlinear.com>
+Date: Mon, 15 Feb 2021 16:47:25 +0800
+Subject: [PATCH] DRV_DPM_SW-433-DPM re-structure proc APIs
+
+---
+ drivers/net/datapath/dpm/datapath.h              |  12 +-
+ drivers/net/datapath/dpm/datapath_api.c          |   4 +-
+ drivers/net/datapath/dpm/datapath_proc.c         | 997 +++++++++++++++--------
+ drivers/net/datapath/dpm/datapath_proc_qos.c     |  43 +-
+ drivers/net/datapath/dpm/gswip30/datapath_misc.c |   2 +-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c |   7 +-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h |  12 +-
+ drivers/net/datapath/dpm/gswip31/datapath_proc.c | 391 +++------
+ 8 files changed, 815 insertions(+), 653 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index c7abbb627b91..b5edc2b9bb0f 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -609,7 +609,7 @@ struct pmac_port_info {
+ 			 */
+ 	u32 num_dma_chan; /*For G.INT it's 8 or 16, for other 1*/
+ 	u32 lct_idx; /* LCT subif register flag */
+-	u32 dma_ch_base; /*! Base entry index of dp_dma_chan_tbl */
++	u32 dma_chan_tbl_idx; /*! Base entry index of dp_dma_chan_tbl */
+ 	u32 res_qid_base; /* Base entry for the device's reserved Q */
+ 	u32 num_resv_q; /* Num of reserved Q per device */
+ 	u32 f_ptp: 1; /* PTP1588 support enablement */
+@@ -647,9 +647,8 @@ struct pmac_port_info {
+ 	u32 num_rx_ring; /* Num of Rx ring */
+ 	struct dp_rx_ring rx_ring[DP_RX_RING_NUM]; /*!< DC rx ring info	*/
+ 	struct dp_tx_ring tx_ring[DP_TX_RING_NUM]; /*!< DC tx ring info	*/
+-#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
+-	struct dp_umt_port umt; /*!< UMT Param */
+-#endif
++	u8 num_umt_port; /* Num of UMT port */
++	struct dp_umt_port umt[DP_MAX_UMT]; /*!< UMT Param */
+ 	enum DP_DATA_PORT_TYPE type;
+ 	u32 blk_size;	/*!< PCE Block Size */
+ 	/* These members must be end. */
+@@ -943,8 +942,8 @@ int mpe_fh_netfiler_install(void);
+ int dp_cpufreq_notify_init(int inst);
+ int dp_cpufreq_notify_exit(void);
+ #endif
+-int qos_dump_start(void);
+-int qos_dump(struct seq_file *s, int pos);
++int proc_qos_init(void);
++int proc_qos_dump(struct seq_file *s, int pos);
+ ssize_t proc_qos_write(struct file *file, const char *buf,
+ 		       size_t count, loff_t *ppos);
+ void dump_parser_flag(char *buf);
+@@ -1098,6 +1097,7 @@ void dp_print_err_info(int res);
+ int dp_notifier_invoke(int inst,
+ 		       struct net_device *dev, u32 port_id, u32 subif_id,
+ 		       enum DP_EVENT_TYPE type);
++int proc_dp_event_list_dump(struct seq_file *s, int pos);
+ 
+ int dp_dealloc_cqm_port(struct module *owner, u32 dev_port,
+ 			struct pmac_port_info *port,
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 2af6c57bb5a4..42ef26732bf0 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -549,7 +549,7 @@ static int32_t dp_alloc_port_private(int inst,
+ 			memset(port, 0, offsetof(struct pmac_port_info, tail));
+ 			return DP_FAILURE;
+ 		}
+-		port->dma_ch_base = dma_ch_base;
++		port->dma_chan_tbl_idx = dma_ch_base;
+ 	}
+ 	/*save info to port data*/
+ 	data->deq_port_base = port->deq_port_base;
+@@ -1449,7 +1449,7 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 
+ 			p = get_dp_deqport_info(inst, port_info->deq_port_base);
+ 			if (p->ref_cnt_umt && !(--p->ref_cnt_umt))
+-				remove_umt(inst, &port_info->umt);
++				remove_umt(inst, &port_info->umt[0]);
+ #endif
+ 			DP_CB(inst, dev_platform_set)(inst, port_id, data,
+ 						      flags);
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index 0ba3631f9c60..1aa289a7882a 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -1,115 +1,161 @@
+ // SPDX-License-Identifier: GPL-2.0
+-/* Copyright (C) Intel Corporation
+- * Author: Shao Guohua <guohua.shao@intel.com>
++/* Copyright (C) 2016-2020 Intel Corporation
++ * Copyright (C) 2020 MaxLinear
+  */
+-
+-#include <linux/module.h>
+-#include <net/datapath_proc_api.h>	/*for proc api */
++#include <linux/list.h>
+ #include <net/datapath_api.h>
+ #include <net/datapath_api_vlan.h>
+-#include <linux/version.h>
+-#include <linux/list.h>
+-#include <linux/of_device.h>
+-#include <linux/of_platform.h>
++#include <net/datapath_proc_api.h>
+ #include "datapath.h"
+ #include "datapath_instance.h"
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ #include "datapath_swdev_api.h"
++#endif
+ 
+-/*meter alloc,add macros*/
+-#define DP_METER_ALLOC(inst, id, flag) \
+-	dp_port_prop[(inst)].info.dp_meter_alloc(inst, &(id), (flag))
+-#define DP_METER_CFGAPI(inst, func, dev, meter, flag, mtr_subif) \
+-	dp_port_prop[(inst)].info.func((dev), &(meter), (flag), (mtr_subif))
++#define DP_DBGFS_NAME		"dp"
++#define DBGFS_DBG		"dbg"
++#define DBGFS_EVENT		"event"
++#define DBGFS_INST		"inst"
++#define DBGFS_INST_DEV		"inst_dev"
++#define DBGFS_INST_HAL		"inst_hal"
++#define DBGFS_INST_MOD		"inst_mod"
++#define DBGFS_MIB_GLOBAL	"mib_global_stats"
++#define DBGFS_PCE		"pce"
++#define DBGFS_CTP_LIST		"pmap_ctp_list"
++#define DBGFS_PORT		"port"
++#define DBGFS_QOS		"qos"
++#define DBGFS_BR_VLAN		"vlan"
++
++#define DEBUGFS_DBG DP_DEBUGFS_PATH	"/" DBGFS_DBG
++#define DBG_CTP DP_DEBUGFS_PATH		"/" DBGFS_CTP_LIST
++#define DBG_PORT DP_DEBUGFS_PATH	"/" DBGFS_PORT
++
++/* NOTE: keep in sync with enum DP_RXOUT_QOS_MODE */
++const char *dp_rxout_qos_mode_str[] = {
++	"bypass QoS only",	/* DP_RXOUT_BYPASS_QOS_ONLY */
++	"with QoS",		/* DP_RXOUT_QOS */
++	"bypass QoS and FSQM",	/* DP_RXOUT_BYPASS_QOS_FSQM */
++	"invalid"		/* DP_RXOUT_QOS_MAX */
++};
++
++/* NOTE: keep in sync with enum umt_sw_msg */
++const char *umt_sw_msg_str[] = {
++	"No MSG",		/* UMT_NO_MSG */
++	"MSG0 only",		/* UMT_MSG0_ONLY */
++	"MSG1 only",		/* UMT_MSG1_ONLY */
++	"MSG0 and MSG1"		/* UMT_MSG0_MSG1 */
++};
++
++/* CQM Lookup Mode for LGM */
++const char *cqm_lookup_mode_lgm[] = {
++	"subif_id[13:8] + class[1:0]",
++	"subif_id[7:0]",
++	"subif_id[11:8] + class[3:0]",
++	"subif_id[4:0] + class[2:0]",
++	"class[1:0] + subif_id[5:0]",
++	"subif_id[15:8]",
++	"subif_id[1:0] + class[3:0] + color[1:0]",
++	"subif_id[14:8] + class[0]"
++};
+ 
+-#define DP_DBGFS_NAME  "dp"
++/* CQM Lookup Mode for FMx */
++const char *cqm_lookup_mode_fmx[] = {
++	"flowid[7:6] + dec + enc + class[3:0]",
++	"subif_id[7:0]",
++	"subif_id[11:8] + class[3:0]",
++	"subif_id[4:0] + class[2:0]"
++};
+ 
+-#define DBGFS_DBG      "dbg"
+-#define DBGFS_PORT     "port"
+-#define DBGFS_INST_DEV "inst_dev"
+-#define DBGFS_INST_MOD "inst_mod"
+-#define DBGFS_INST_HAL "inst_hal"
+-#define DBGFS_INST     "inst"
+-#define DBGFS_QOS      "qos"
+-#define DBGFS_EVENT    "event"
+-#define DBGFS_MIB_GLOBAL    "mib_global_stats"
+-#define DBGFS_BR_VLAN  "vlan"
+-#define DBGFS_PCE      "pce"
+-#define DBGFS_CTP_LIST "pmap_ctp_list"
++const char *dp_port_type[] = {
++	"Linux",
++	"DPDK"
++};
+ 
++const char *gsw_port_mode[] = {
++	"8BIT_WLAN",
++	"9BIT_WLAN",
++	"PORT_GPON",
++	"PORT_EPON",
++	"PORT_GINT"
++};
+ 
+-#define DEBUGFS_DBG DP_DEBUGFS_PATH "/" DBGFS_DBG
++const char *dp_spl_conn_type[] = {
++	"DP_SPL_TOE",
++	"DP_SPL_VOICE",
++	"DP_SPL_VPNA",
++	"DP_SPL_APP_LITEPATH",
++	"DP_SPL_PP_NF",
++	"NO VALID"
++};
+ 
+ typedef int (*print_ctp_bp_t)(struct seq_file *s, int inst,
+ 			      struct pmac_port_info *port,
+ 			      int subif_index, u32 flag);
+ 
+-static int tmp_inst;
+-#if defined(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
+-static void proc_dbg_read(struct seq_file *s);
+-static ssize_t proc_dbg_write(struct file *, const char *, size_t, loff_t *);
+-#endif
+-
+ #define PROC_WRITE_PORT_DEF -1
++static int tmp_inst;
+ static int proc_write_port = PROC_WRITE_PORT_DEF;
+ static int proc_write_vap = PROC_WRITE_PORT_DEF;
+-static bool dump_one_port = false;
+-static bool dump_one_vap = false;
+-static int proc_port_dump(struct seq_file *s, int pos);
++static bool dump_one_port;
++static bool dump_one_vap;
+ static int proc_port_init(void);
++static int proc_port_dump(struct seq_file *s, int pos);
+ static ssize_t proc_port_write(struct file *file, const char *buf,
+ 			       size_t count, loff_t *ppos);
+-int proc_dp_event_list_dump(struct seq_file *s, int pos);
++#if defined(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
++static void proc_dbg_read(struct seq_file *s);
++static ssize_t proc_dbg_write(struct file *, const char *, size_t, loff_t *);
++#endif
+ 
+-#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
+-static struct br_info *brdev_info;
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ static int proc_brvlan_dump(struct seq_file *s, int pos)
+ {
+-	struct bridge_member_port *tmp = NULL;
+-	struct vlist_entry *vlist_entry = NULL;
+-	int bp_entry = 0, vlan_entry = 0, i = 0;
+-	struct vlan_entry *v;
+-	struct pce_entry *p;
+-	dp_subif_t subif;
+ 	struct pmac_port_info *port_info;
+-	int vap;
++	struct bridge_member_port *bmp;
++	struct br_info *brdev_info;
++	struct vlist_entry *vlist;
++	struct vlan_entry *vlan;
+ 	struct hlist_head *head;
++	struct pce_entry *pce;
++	dp_subif_t subif;
++	int i, vap;
++	bool entry;
+ 
+ 	if (pos == 0) {
+-		seq_printf(s,
+-			   "|%-10s|%-10s|%-10s|%-10s|%-10s|%-5s|%-5s|%-10s|%-10s|%-15s\n",
+-			   "Br", "BrFid", "BrVlanID",
+-			   "Dev", "Bp", "VID", "FiD", "RefCnt",
+-			   "PCE Idx", "PCE Status");
++		seq_printf(s, "|%-10s|%-10s|%-10s|%-10s|%-10s|%-5s",
++			   "Br", "BrFid", "BrVlanID", "Dev", "Bp", "VID");
++		seq_printf(s, "|%-5s|%-10s|%-10s|%-15s\n",
++			   "FiD", "RefCnt", "PCE Idx", "PCE Status");
+ 		for (i = 0; i < 100; i++)
+-			seq_printf(s, "=");
+-		seq_printf(s, "\n");
++			seq_puts(s, "=");
++		seq_puts(s, "\n");
+ 	}
+ 
+ 	head = get_dp_g_bridge_id_entry_hash_table_info(pos);
+ 	brdev_info = hlist_entry_safe(head->first, struct br_info, br_hlist);
+-
+ 	if (!brdev_info || !brdev_info->br_vlan_en)
+-		goto EXIT;
++		goto exit;
+ 
+-	bp_entry = 0;
+-	list_for_each_entry(vlist_entry, &brdev_info->br_vlan_list, list) {
+-		if (!vlist_entry->vlan_entry)
++	entry = false;
++	list_for_each_entry(vlist, &brdev_info->br_vlan_list, list) {
++		if (!vlist->vlan_entry)
+ 			continue;
+-		if (bp_entry)
+-			seq_printf(s, "\n");
++		if (entry)
++			seq_puts(s, "\n");
+ 
+ 		seq_printf(s, "|%-10s", brdev_info->dev->name);
+ 		seq_printf(s, "|%-10d", brdev_info->fid);
+-		seq_printf(s, "|%-10d", vlist_entry->vlan_entry->vlan_id);
+-		bp_entry = 1;
++		seq_printf(s, "|%-10d", vlist->vlan_entry->vlan_id);
++		entry = true;
+ 	}
+ 
+-	if (bp_entry == 0)
++	if (!entry)
+ 		seq_printf(s, "%-11s", "");
+-	list_for_each_entry(tmp, &brdev_info->bp_list, list) {
+-		seq_printf(s, "\n");
++
++	list_for_each_entry(bmp, &brdev_info->bp_list, list) {
++		seq_puts(s, "\n");
+ 		seq_printf(s, "%-11s%-11s%-11s", "", "", "");
+-		if (dp_get_netif_subifid(tmp->dev, NULL, NULL, NULL,
++		if (dp_get_netif_subifid(bmp->dev, NULL, NULL, NULL,
+ 					 &subif, 0)) {
+ 			seq_printf(s, "%s: dp_get_netif_subifid failed\n",
+ 				   __func__);
+@@ -118,42 +164,45 @@ static int proc_brvlan_dump(struct seq_file *s, int pos)
+ 		port_info = get_dp_port_info(subif.inst, subif.port_id);
+ 		vap = GET_VAP(subif.subif, port_info->vap_offset,
+ 			      port_info->vap_mask);
+-		vlan_entry = 0;
+-		list_for_each_entry(vlist_entry, &tmp->bport_vlan_list, list) {
+-			if (!vlist_entry->vlan_entry)
++		entry = false;
++		list_for_each_entry(vlist, &bmp->bport_vlan_list, list) {
++			if (!vlist->vlan_entry)
+ 				continue;
+-			v = vlist_entry->vlan_entry;
+-			if (vlan_entry) {
+-				seq_printf(s, "\n");
++			vlan = vlist->vlan_entry;
++			if (entry) {
++				seq_puts(s, "\n");
+ 				seq_printf(s, "%-11s%-11s%-11s",
+ 					   "", "", "");
+ 			}
+-			seq_printf(s, "|%-10s", tmp->dev->name);
+-			seq_printf(s, "|%-10d", tmp->bportid);
++			seq_printf(s, "|%-10s", bmp->dev->name);
++			seq_printf(s, "|%-10d", bmp->bportid);
+ 			seq_printf(s, "|%-5d|%-5d|%-10d",
+-				   v->vlan_id, v->fid, v->ref_cnt);
+-			vlan_entry = 1;
+-			p = get_pce_entry_from_ventry(v, subif.port_id, vap);
+-			if (!p)
++				   vlan->vlan_id, vlan->fid, vlan->ref_cnt);
++			entry = true;
++			pce =
++			   get_pce_entry_from_ventry(vlan, subif.port_id, vap);
++			if (!pce)
+ 				continue;
+ 			seq_printf(s, "|%-10d|%-15s",
+-				   (p->blk_info->info.subblk_firstidx + p->idx),
+-				   p->disable ? "Disabled" : "Enabled");
++				   pce->blk_info->info.subblk_firstidx +
++				   pce->idx,
++				   pce->disable ? "Disabled" : "Enabled");
+ 		}
+ 	}
+ 	seq_puts(s, "\n");
+ 
+-EXIT:
++exit:
+ 	if (!seq_has_overflowed(s)) {
+ 		pos++;
+ 		if (pos == BR_ID_ENTRY_HASH_TABLE_SIZE)
+ 			pos = -1;
+ 	}
++
+ 	return pos;
+ }
+ #endif
+ 
+-static int proc_dp_mib_global_stats(struct seq_file *s, int pos)
++static int proc_mib_stats_dump(struct seq_file *s, int pos)
+ {
+ 	struct mib_global_stats stats = {0};
+ 	int cpu;
+@@ -164,16 +213,14 @@ static int proc_dp_mib_global_stats(struct seq_file *s, int pos)
+ 	for_each_online_cpu(cpu) {
+ 		stats.rx_rxif_pkts += MIB_G_STATS_GET(rx_rxif_pkts, cpu);
+ 		stats.rx_txif_pkts += MIB_G_STATS_GET(rx_txif_pkts, cpu);
+-		stats.rx_rxif_clone += MIB_G_STATS_GET(rx_rxif_clone, cpu);
+ 		stats.rx_drop += MIB_G_STATS_GET(rx_drop, cpu);
+ 		stats.tx_pkts += MIB_G_STATS_GET(tx_pkts, cpu);
+ 		stats.tx_drop += MIB_G_STATS_GET(tx_drop, cpu);
+ 	}
+ 
+-	seq_printf(s, "MIB Global Rx/Tx counters\n");
++	seq_puts(s, "MIB Global Rx/Tx counters\n");
+ 	seq_printf(s, "rx_rxif_pkts  = %llu\n", stats.rx_rxif_pkts);
+ 	seq_printf(s, "rx_txif_pkts  = %llu\n", stats.rx_txif_pkts);
+-	seq_printf(s, "rx_rxif_clone = %llu\n", stats.rx_rxif_clone);
+ 	seq_printf(s, "rx_drop       = %llu\n", stats.rx_drop);
+ 	seq_printf(s, "tx_pkts       = %llu\n", stats.tx_pkts);
+ 	seq_printf(s, "tx_drop       = %llu\n", stats.tx_drop);
+@@ -181,73 +228,61 @@ static int proc_dp_mib_global_stats(struct seq_file *s, int pos)
+ 	return -1;
+ }
+ 
+-ssize_t proc_dp_mib_g_stats_write(struct file *file, const char *buf,
+-			   size_t count, loff_t *ppos)
++ssize_t proc_mib_stats_write(struct file *file, const char *buf, size_t count,
++			     loff_t *ppos)
+ {
+-	int len, cpu;
+-	char str[2];
++	int cpu;
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+ 	/* only clear action is supported i.e. '0' */
+-	if (count > 2)
+-		goto usage;
+-
+-	len = count;
+-	len -= copy_from_user(str, buf, count);
+-	str[len] = 0;
+-
+-	if (str[0] != '0')
+-		goto usage;
+-
+-	for_each_online_cpu(cpu) {
+-		MIB_G_STATS_RESET(rx_rxif_pkts, cpu);
+-		MIB_G_STATS_RESET(rx_txif_pkts, cpu);
+-		MIB_G_STATS_RESET(rx_rxif_clone, cpu);
+-		MIB_G_STATS_RESET(rx_drop, cpu);
+-		MIB_G_STATS_RESET(tx_pkts, cpu);
+-		MIB_G_STATS_RESET(tx_drop, cpu);
++	if (count > 2 || buf[0] != '0') {
++		pr_info("usage: to clear stats\n");
++		pr_info("  echo 0 > %s\n", DBGFS_MIB_GLOBAL);
++	} else {
++		for_each_online_cpu(cpu) {
++			MIB_G_STATS_RESET(rx_rxif_pkts, cpu);
++			MIB_G_STATS_RESET(rx_txif_pkts, cpu);
++			MIB_G_STATS_RESET(rx_drop, cpu);
++			MIB_G_STATS_RESET(tx_pkts, cpu);
++			MIB_G_STATS_RESET(tx_drop, cpu);
++		}
+ 	}
+ 
+ 	return count;
+-
+-usage:
+-	pr_info("usage: to clear stats\n");
+-	pr_info("  echo 0 > %s\n", DBGFS_MIB_GLOBAL);
+-	return count;
+ }
+ 
+ int proc_port_init(void)
+ {
+ 	tmp_inst = 0;
+-
+-	dump_one_port = false;
+ 	dump_one_vap = false;
++	dump_one_port = false;
+ 
+-	/* check if we have been requsted to dump only specific port */
++	/* Check if we have been requested to dump only a specific port */
+ 	if (proc_write_port != PROC_WRITE_PORT_DEF) {
+ 		dump_one_port = true;
+ 		if (proc_write_vap != PROC_WRITE_PORT_DEF)
+ 			dump_one_vap = true;
+-		return proc_write_port; /* change to requested port id */
++		/* Change to requested port id */
++		return proc_write_port;
+ 	}
+ 
+ 	return 0;
+ }
+ 
+-int dump_dc_info(struct seq_file *s, struct pmac_port_info *port)
++static int dump_dc_info(struct seq_file *s, struct pmac_port_info *port)
+ {
+ 	u8 cid, pid;
+-	int i = 0;
+ 	u16 nid;
++	int i;
+ 
+ 	for (i = 0; i < port->num_tx_ring; i++) {
+ 		seq_printf(s, "    DC TxRing:         %d\n", i);
+-		seq_printf(s, "      TXIN  DeqRingSize/paddr:      %d/0x%p\n",
++		seq_printf(s, "      TXIN  DeqRingSize/paddr:      %d/0x%px\n",
+ 			   port->tx_ring[i].in_deq_ring_size,
+ 			   port->tx_ring[i].in_deq_paddr);
+-		seq_printf(s, "      TXOUT FreeRingSize/paddr:     %d/0x%p\n",
++		seq_printf(s, "      TXOUT FreeRingSize/paddr:     %d/0x%px\n",
+ 			   port->tx_ring[i].out_free_ring_size,
+ 			   port->tx_ring[i].out_free_paddr);
+ 		seq_printf(s, "      TXOUT PolicyBase/Poolid:      %d/%d\n",
+@@ -262,7 +297,7 @@ int dump_dc_info(struct seq_file *s, struct pmac_port_info *port)
+ 
+ 	for (i = 0; i < port->num_rx_ring; i++) {
+ 		seq_printf(s, "    DC RxRing:         %d\n", i);
+-		seq_printf(s, "      RXOUT EnqRingSize/paddr/pid:  %d/0x%p/%d\n",
++		seq_printf(s, "      RXOUT EnqRingSize/paddr/pid:  %d/0x%px/%d\n",
+ 			   port->rx_ring[i].out_enq_ring_size,
+ 			   port->rx_ring[i].out_enq_paddr,
+ 			   port->rx_ring[i].out_enq_port_id);
+@@ -275,30 +310,175 @@ int dump_dc_info(struct seq_file *s, struct pmac_port_info *port)
+ 		seq_printf(s, "      RXOUT NumOfCqmDqPort/pid:     %d/%d\n",
+ 			   port->rx_ring[i].num_out_cqm_deq_port,
+ 			   port->rx_ring[i].out_cqm_deq_port_id);
+-		seq_printf(s, "      RXIN  InAllocRingSize/Paddr:  %d/0x%p\n",
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++		seq_printf(s, "      RXOUT Poolid:                 %d\n",
++			   port->rx_ring[i].rx_poolid);
++#endif
++		seq_printf(s, "      RXIN  InAllocRingSize/Paddr:  %d/0x%px\n",
+ 			   port->rx_ring[i].in_alloc_ring_size,
+ 			   port->rx_ring[i].in_alloc_paddr);
+ 		seq_printf(s, "      NumPkt/Pktsize/Policybase:    %d/%d/%d\n",
+ 			   port->rx_ring[i].num_pkt,
+ 			   port->rx_ring[i].rx_pkt_size,
+ 			   port->rx_ring[i].rx_policy_base);
+-		seq_printf(s, "      PreFillPktNum/PktBase:        %d/0x%p\n",
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++		seq_printf(s, "      PolicyNum:                    %d\n",
++			   port->rx_ring[i].policy_num);
++		seq_printf(s, "      RXOUT MsgMode/QosMode:        %d/%d\n",
++			   port->rx_ring[i].out_msg_mode,
++			   port->rx_ring[i].out_qos_mode);
++#endif
++		seq_printf(s, "      PreFillPktNum/PktBase:        %d/0x%px\n",
+ 			   port->rx_ring[i].prefill_pkt_num,
+ 			   port->rx_ring[i].pkt_base_paddr);
+ 	}
+-#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
+-	seq_printf(s, "    UMT id/CqmDeqPid/msg_mode:      %d/%d/%d\n",
+-		   port->umt.ctl.id,
+-		   port->umt.res.cqm_dq_pid,
+-		   port->umt.ctl.msg_mode);
+-	seq_printf(s, "    UMT period/daddr:               %d/0x%08x\n",
+-		   port->umt.ctl.msg_interval,
+-		   port->umt.ctl.daddr);
+-#endif
++
++	for (i = 0; i < port->num_umt_port; i++) {
++		seq_printf(s, "    UMT[%d] id/CqmDeqPid/msg_mode:  %d/%d/%d\n",
++			   i, port->umt[i].ctl.id, port->umt[i].res.cqm_dq_pid,
++			   port->umt[i].ctl.msg_mode);
++		seq_printf(s, "    UMT[%d] period/daddr:           %d/0x%llx\n",
++			   i, port->umt[i].ctl.msg_interval,
++			   (unsigned long long)port->umt[i].ctl.daddr);
++	}
+ 
+ 	return 0;
+ }
+ 
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++static void dump_subif_spl_cfg_info(struct seq_file *s,
++				    struct dp_subif_info *sif)
++{
++	struct dp_spl_cfg *cfg = sif->spl_cfg;
++	struct dp_spl_igp *igp;
++	struct dp_spl_egp *egp;
++	u8 cid, pid;
++	u16 nid;
++	int i;
++
++	seq_puts(s, "           CPU Special config info:\n");
++	seq_printf(s, "           spl_conn_type:  %s\n",
++		   dp_spl_conn_type[cfg->type]);
++	seq_printf(s, "           spl_conn_idx:   %d\n", cfg->spl_id);
++
++	if (cfg->spl_gpid)
++		seq_printf(s, "           spl_gpid:       %d\n",
++			   cfg->spl_gpid);
++	seq_printf(s, "           dp_cb:          %px\n",
++		   cfg->dp_cb);
++
++	/* IGP info */
++	for (i = 0; i < cfg->num_igp; i++) {
++		igp = &cfg->igp[i];
++		seq_printf(s, "           igp[%d]:\n", i);
++		seq_printf(s, "             igp_id:               %d\n",
++			   igp->igp_id);
++		seq_printf(s, "             igp_ring_size:        %d\n",
++			   igp->igp_ring_size);
++		seq_printf(s, "             igp_paddr:            %px\n",
++			   igp->igp_paddr);
++		seq_printf(s, "             alloc_paddr:          %px\n",
++			   igp->alloc_paddr);
++		seq_printf(s, "             alloc_vaddr:          %px\n",
++			   igp->alloc_vaddr);
++		dp_dma_parse_id(igp->igp_dma_ch_to_gswip, &cid, &pid, &nid);
++		if (igp->num_out_tx_dma_ch)
++			seq_printf(s, "             dma-ctrl/port/chan:   %d/%d/%d\n",
++				   cid, pid, nid);
++		seq_printf(s, "             num_out_tx_dma_ch:    %d\n",
++			   igp->num_out_tx_dma_ch);
++		seq_printf(s, "             out_qos_mode:         %d:%s\n",
++			   igp->out_qos_mode,
++			   dp_rxout_qos_mode_str[igp->out_qos_mode]);
++		seq_printf(s, "             num_out_cqm_deq_port: %d\n",
++			   igp->num_out_cqm_deq_port);
++
++		if (igp->egp) {
++			seq_printf(s, "             igp->egp->egp_id:     %d\n",
++				   igp->egp->egp_id);
++			seq_printf(s, "             igp->egp->qid:        %d\n",
++				   igp->egp->qid);
++		}
++	}
++
++	/* EGP info */
++	for (i = 0; i < cfg->num_egp; i++) {
++		egp = &cfg->egp[i];
++		seq_printf(s, "           egp[%d]:\n", i);
++		seq_printf(s, "             egp_id:               %d\n",
++			   egp->egp_id);
++		seq_printf(s, "             port type:            to %s\n",
++			   egp->type ? "GSWIP" : "DEV");
++		seq_printf(s, "             pp_ring_size:         %d\n",
++			   egp->pp_ring_size);
++		seq_printf(s, "             egp_paddr:            %px\n",
++			   egp->egp_paddr);
++		seq_printf(s, "             tx_pkt_credit:        %d\n",
++			   egp->tx_pkt_credit);
++		seq_printf(s, "             tx_push_paddr_qos:    %px\n",
++			   egp->tx_push_paddr_qos);
++		seq_printf(s, "             free_paddr:           %px\n",
++			   egp->free_paddr);
++		seq_printf(s, "             free_vaddr:           %px\n",
++			   egp->free_vaddr);
++		if (egp->qid)
++			seq_printf(s, "             qid:                  %d\n",
++				   egp->qid);
++	}
++
++	/* SPL policy info */
++	if (cfg->f_policy) {
++		seq_puts(s, "           Policy:\n");
++		seq_printf(s, "             num_pkts:             %d\n",
++			   cfg->policy[0].num_pkt);
++		seq_printf(s, "             rx_pkt_size:          %d\n",
++			   cfg->policy[0].rx_pkt_size);
++		seq_printf(s, "             pool_id:              %d\n",
++			   cfg->policy[0].pool_id[0]);
++		seq_printf(s, "             policy_map:           0x%x\n",
++			   cfg->policy[0].policy_map);
++	}
++
++	/* UMT info - print only if explicitly enabled */
++	if (cfg->umt[0].ctl.enable == 1) {
++		struct umt_port_ctl *ctl = &cfg->umt[0].ctl;
++		struct umt_port_res *res = &cfg->umt[0].res;
++
++		seq_puts(s, "           UMT port:\n");
++		seq_printf(s, "             port id:              %d\n",
++			   ctl->id);
++		seq_printf(s, "             daddr:                0x%llx\n",
++			   ctl->daddr);
++		seq_printf(s, "             msg_interval:         %d\n",
++			   ctl->msg_interval);
++		seq_printf(s, "             msg_mode:             %d:%s\n",
++			   ctl->msg_mode, ctl->msg_mode ? "User" : "Self");
++		seq_printf(s, "             cnt_mode:             %d:%s count\n",
++			   ctl->cnt_mode,
++			   ctl->cnt_mode ? "Accumulate" : "Increamental");
++		seq_printf(s, "             sw_msg:               %d:%s\n",
++			   ctl->sw_msg, umt_sw_msg_str[ctl->sw_msg]);
++		seq_printf(s, "             rx_msg_mode:          %d:Rx %s\n",
++			   ctl->rx_msg_mode,
++			   ctl->rx_msg_mode ? "IN Add" : "OUT Sub");
++		seq_printf(s, "             enable:               %d\n",
++			   ctl->enable);
++		seq_printf(s, "             fflag:                0x%lx\n",
++			   ctl->fflag);
++		seq_printf(s, "             dma_id:               %d\n",
++			   res->dma_id);
++		seq_printf(s, "             dma_ch_num:           %d\n",
++			   res->dma_ch_num);
++		seq_printf(s, "             cqm_enq_pid:          %d\n",
++			   res->cqm_enq_pid);
++		seq_printf(s, "             cqm_dq_pid:           %d\n",
++			   res->cqm_dq_pid);
++		seq_printf(s, "             rx_src:               %d:from %s\n",
++			   res->rx_src, res->rx_src ? "DMA" : "CQM");
++	}
++}
++#endif
++
+ void dump_subif_info(struct seq_file *s, struct pmac_port_info *port, int n)
+ {
+ 	struct dp_subif_info *sif = get_dp_port_subif(port, n);
+@@ -309,48 +489,93 @@ void dump_subif_info(struct seq_file *s, struct pmac_port_info *port, int n)
+ 	int i, cqm_p;
+ 	u8 cid, pid;
+ 	u16 nid;
++	char *flag_other;
+ 
+ 	if (!sif->flags)
+ 		return;
+ 
++	flag_other = kzalloc(1024, GFP_ATOMIC);
++	if (!flag_other)
++		return;
++
+ 	seq_printf(s, "      [%02d]:%s=0x%04x %s=0x%0lx(%s=%s),%s=%s\n",
+ 		   n, "subif", sif->subif, "netif", (uintptr_t)sif->netif,
+ 		   "netif", sif->netif ? sif->netif->name : "NULL/DSL",
+ 		   "device_name", sif->device_name);
+-	seq_printf(s, "           subif_flag:     ");
++	seq_printf(s, "           subif_flag:     0x%08x", sif->subif_flag);
+ 	for (i = 0; i < get_dp_port_type_str_size(); i++) {
+-		if (sif->subif_flag & dp_port_flag[i]) {
+-			seq_puts(s, dp_port_type_str[i]);
+-			seq_puts(s, " ");
+-		}
++		if (sif->subif_flag & dp_port_flag[i])
++			seq_printf(s, " %s ", dp_port_type_str[i]);
+ 	}
+-	seq_printf(s, "\n");
+-	seq_printf(s, "           data_flag_ops  =0x%08x\n",
+-		   sif->data_flag_ops);
+-	seq_printf(s, "           rx_fn_rxif_pkt =0x%08x\n",
++	seq_puts(s, "\n");
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++	seq_printf(s, "           type:           %d (%s)\n", sif->type,
++		   dp_port_type[sif->type]);
++#endif
++
++	if (sif->data_flag_ops & DP_SUBIF_AUTO_NEW_Q)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_AUTO_NEW_Q");
++	if (sif->data_flag_ops & DP_SUBIF_SPECIFIC_Q)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_SPECIFIC_Q");
++	if (sif->data_flag_ops & DP_SUBIF_LCT)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_LCT");
++	if (sif->data_flag_ops & DP_SUBIF_VANI)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_VANI");
++	if (sif->data_flag_ops & DP_SUBIF_DEQPORT_NUM)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_DEQPORT_NUM");
++	if (sif->data_flag_ops & DP_SUBIF_RX_FLAG)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_RX_FLAG");
++	if (sif->data_flag_ops & DP_SUBIF_SWDEV)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_SWDEV");
++	if (sif->data_flag_ops & DP_SUBIF_PREL2)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_PREL2");
++	if (sif->data_flag_ops & DP_SUBIF_CPU_QMAP)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_CPU_QMAP");
++	if (sif->data_flag_ops & DP_SUBIF_NO_HOSTIF)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"DP_SUBIF_NO_HOSTIF");
++
++	seq_printf(s, "           data_flag_ops   0x%08x (%s)\n",
++		   sif->data_flag_ops, flag_other);
++	seq_printf(s, "           rx_fn_rxif_pkt  0x%08x\n",
+ 		   STATS_GET(mib->rx_fn_rxif_pkt));
+-	seq_printf(s, "           rx_fn_txif_pkt =0x%08x\n",
++	seq_printf(s, "           rx_fn_txif_pkt  0x%08x\n",
+ 		   STATS_GET(mib->rx_fn_txif_pkt));
+-	seq_printf(s, "           rx_fn_dropped  =0x%08x\n",
++	seq_printf(s, "           rx_fn_dropped   0x%08x\n",
+ 		   STATS_GET(mib->rx_fn_dropped));
+-	seq_printf(s, "           tx_cbm_pkt     =0x%08x\n",
++	seq_printf(s, "           tx_cbm_pkt      0x%08x\n",
+ 		   STATS_GET(mib->tx_cbm_pkt));
+-	seq_printf(s, "           tx_tso_pkt     =0x%08x\n",
++	seq_printf(s, "           tx_tso_pkt      0x%08x\n",
+ 		   STATS_GET(mib->tx_tso_pkt));
+-	seq_printf(s, "           tx_pkt_dropped =0x%08x\n",
++	seq_printf(s, "           tx_pkt_dropped  0x%08x\n",
+ 		   STATS_GET(mib->tx_pkt_dropped));
+-	seq_printf(s, "           tx_clone_pkt   =0x%08x\n",
++	seq_printf(s, "           tx_clone_pkt    0x%08x\n",
+ 		   STATS_GET(mib->tx_clone_pkt));
+-	seq_printf(s, "           tx_hdr_room_pkt=0x%08x\n",
++	seq_printf(s, "           tx_hdr_room_pkt 0x%08x\n",
+ 		   STATS_GET(mib->tx_hdr_room_pkt));
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++	seq_printf(s, "           rx_fn           0x%px\n", sif->rx_fn);
++	seq_printf(s, "           get_subifid_fn  0x%px\n",
++		   sif->get_subifid_fn);
++#endif
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+-	seq_printf(s, "           swdev:	   %d\n", sif->swdev_en);
++	seq_printf(s, "           swdev:	   %d (%s)\n", sif->swdev_en,
++		   sif->swdev_en ? "Enabled" : "Disabled");
+ #endif
+ 	seq_printf(s, "           subif_groupid:  %d\n",
+ 		   sif->subif_groupid);
+ 	if (print_ctp_bp)
+ 		print_ctp_bp(s, tmp_inst, port, n, 0);
+-	seq_printf(s, "           subif_qid:      %d\n", sif->num_qid);
++	seq_printf(s, "           num_qid:        %d\n", sif->num_qid);
+ 	seq_printf(s, "           dqport_idx:     %d\n", sif->cqm_port_idx);
+ 	for (i = 0; i < sif->num_qid; i++) {
+ 		seq_printf(s, "%13s[%02d]:qid/node:    %d/%d\n", "",
+@@ -369,49 +594,56 @@ void dump_subif_info(struct seq_file *s, struct pmac_port_info *port, int n)
+ 				   cid, pid, nid);
+ 		}
+ 	}
+-	seq_printf(s, "           mac_learn_dis:  %d\n",
+-		   sif->mac_learn_dis);
++	seq_printf(s, "           mac_learn_dis:  %d (%s)\n",
++		   sif->mac_learn_dis,
++		   sif->mac_learn_dis ? "Disabled" : "Enabled");
+ 	seq_printf(s, "           gpid:           %d\n", sif->gpid);
+-	seq_printf(s, "           cpu_port_en:    %d (%s)\n",
+-		   sif->cpu_port_en,
++	seq_printf(s, "           cpu_port_en:    %d (%s)\n", sif->cpu_port_en,
+ 		   sif->cpu_port_en ? "Enabled" : "Disabled");
+-	seq_printf(s, "           ctp_dev:        ");
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++	seq_printf(s, "           prel2_len:      %d (%s)\n", sif->prel2_len,
++		   sif->prel2_len ? "Enabled" : "Disabled");
++	seq_printf(s, "           spl_conn_type:  %s\n",
++		   dp_spl_conn_type[sif->spl_conn_type]);
++#endif
++	seq_puts(s, "           ctp_dev:        ");
+ 	if (sif->ctp_dev && sif->ctp_dev->name)
+ 		seq_puts(s, sif->ctp_dev->name);
+ 	else
+ 		seq_puts(s, "NULL");
+-	seq_printf(s, "\n");
++	seq_puts(s, "\n");
+ 	seq_printf(s, "           rx_en_flag:     %d\n",
+ 		   STATS_GET(sif->rx_flag));
+-	seq_printf(s, "           tx_policy:      %d/%d\n",
+-		   sif->policy_base, sif->policy_num);
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++	seq_printf(s, "           tx_policy base/num/map:      %d/%d/%x\n",
++		   sif->policy_base, sif->policy_num, sif->policy_map);
++	seq_printf(s, "           rx_policy base/num/map:      %d/%d/%x\n",
++		   sif->rx_policy_base, sif->rx_policy_num, sif->rx_policy_map);
++
++	/* CPU Special path config */
++	if (sif->spl_cfg)
++		dump_subif_spl_cfg_info(s, sif);
++#endif
++
++	kfree(flag_other);
+ }
+ 
+ int proc_port_dump(struct seq_file *s, int pos)
+ {
+-	int (*print_ctp_bp)(struct seq_file *s, int inst,
+-			    struct pmac_port_info *port,
+-			    int subif_index, u32 flag);
+-	struct dp_subif_info *sif;
++	struct inst_info *info = get_dp_prop_info(tmp_inst);
++	struct cqm_port_info *cqm_info;
+ 	struct pmac_port_info *port;
+-	u16 start = 0;
+-	u8 cid, pid;
+-	u16 nid;
++	struct dp_subif_info *sif;
+ 	int i, start_vap, end_vap;
+-	struct inst_info *info = NULL;
+-	struct cqm_port_info *cqm_info;
++	u16 start = 0, nid;
++	u8 cid, pid;
++	char *flag_other;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return -1;
+ 
+ 	port = get_dp_port_info(tmp_inst, pos);
+-	if (!port) {
+-		pr_err("Why port is NULL\n");
+-		return -1;
+-	}
+ 
+-	info = &dp_port_prop[tmp_inst].info;
+-	print_ctp_bp = DP_CB(tmp_inst, proc_print_ctp_bp_info);
+ 	DP_CB(tmp_inst, get_itf_start_end)(port->itf_info, &start, NULL);
+ 
+ 	if (port->status == PORT_FREE) {
+@@ -432,7 +664,7 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 				   "tx_err_drop", STATS_GET(port->tx_err_drop));
+ 		}
+ 
+-		goto EXIT;
++		goto exit;
+ 	}
+ 
+ 	seq_printf(s, "%02d:%s=0x%0lx(%s:%8s) %s=%02d %s=%02d %s=%d(%s) %s=%d\n",
+@@ -451,11 +683,24 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 			seq_printf(s, "%s ", dp_port_type_str[i]);
+ 	}
+ 	seq_puts(s, "\n");
+-	seq_printf(s, "    mode:              %d\n", port->cqe_lu_mode);
++	if (get_dp_port_prop(tmp_inst)->info.type < GSWIP32_TYPE)
++		seq_printf(s, "    Lookup mode:       %d [%s]\n",
++			   port->cqe_lu_mode,
++			   cqm_lookup_mode_fmx[port->cqe_lu_mode]);
++	else
++		seq_printf(s, "    Lookup mode:       %d [%s]\n",
++			   port->cqe_lu_mode,
++			   cqm_lookup_mode_lgm[port->cqe_lu_mode]);
++
++	seq_printf(s, "    gswip mode:        %d [%s]\n", port->gsw_mode,
++		   gsw_port_mode[port->gsw_mode]);
++	seq_printf(s, "    Port type:         %d (%s)\n", port->type,
++		   dp_port_type[port->type]);
+ 	seq_printf(s, "    LCT:               %d\n", port->lct_idx);
+ 	seq_printf(s, "    subif_max:         %d\n", port->subif_max);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+-	seq_printf(s, "    p_swdev:	       %d\n", port->swdev_en);
++	seq_printf(s, "    p_swdev:	       %d (%s)\n", port->swdev_en,
++		   port->swdev_en ? "Enabled" : "Disabled");
+ #endif
+ 	seq_printf(s, "    cb->rx_fn:         0x%px\n", port->cb.rx_fn);
+ 	seq_printf(s, "    cb->restart_fn:    0x%px\n", port->cb.restart_fn);
+@@ -465,17 +710,68 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	seq_printf(s, "    num_subif:         %d\n", port->num_subif);
+ 	seq_printf(s, "    vap_offset/mask:   %d/0x%x\n", port->vap_offset,
+ 		   port->vap_mask);
+-	seq_printf(s, "    flag_other:        0x%x\n", port->flag_other);
+-	seq_printf(s, "    resv_queue:        %d\n", port->num_resv_q);
++
++	flag_other = kzalloc(1024, GFP_ATOMIC);
++	if (!flag_other)
++		return -ENOBUFS;
++
++	if (port->flag_other & CBM_PORT_DP_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_DP_SET");
++	if (port->flag_other & CBM_PORT_DQ_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_DQ_SET");
++	if (port->flag_other & CBM_PORT_DMA_CHAN_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_DMA_CHAN_SET");
++	if (port->flag_other & CBM_PORT_PKT_CRDT_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_PKT_CRDT_SET");
++	if (port->flag_other & CBM_PORT_BYTE_CRDT_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_BYTE_CRDT_SET");
++	if (port->flag_other & CBM_PORT_RING_ADDR_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_RING_ADDR_SET");
++	if (port->flag_other & CBM_PORT_RING_SIZE_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_RING_SIZE_SET");
++	if (port->flag_other & CBM_PORT_RING_OFFSET_SET)
++		sprintf(flag_other + strlen(flag_other), "%s | ",
++			"CBM_PORT_RING_OFFSET_SET");
++
++	seq_printf(s, "    cbm_port_flags:    0x%x [%s]\n", port->flag_other,
++		   flag_other);
++
++	kfree(flag_other);
++
++	seq_printf(s, "    num_resv_queue:    %d\n", port->num_resv_q);
+ 	seq_printf(s, "    resv_queue_base:   %d\n", port->res_qid_base);
+ 	seq_printf(s, "    deq_port_base:     %d\n", port->deq_port_base);
+ 	seq_printf(s, "    deq_port_num:      %d\n", port->deq_port_num);
+ 	seq_printf(s, "    num_dma_chan:      %d\n", port->num_dma_chan);
+-	seq_printf(s, "    dma_chan:          0x%x\n", port->dma_chan);
+-	seq_printf(s, "    gpid_base:         %d\n", port->gpid_base);
++	dp_dma_parse_id(port->dma_chan, &cid, &pid, &nid);
++	seq_printf(s, "    dma_chan:          0x%x(dma-ctrl=%d,port=%d,channel=%d)\n",
++		   port->dma_chan, cid, pid, nid);
++	seq_printf(s, "    dma_chan_tbl_idx:  %d\n", port->dma_chan_tbl_idx);
++	seq_printf(s, "    gpid_base/spl:     %d/%d\n", port->gpid_base,
++		   port->gpid_spl);
+ 	seq_printf(s, "    gpid_num:          %d\n", port->gpid_num);
+-	seq_printf(s, "    policy_base:       %d\n", port->policy_base);
+-	seq_printf(s, "    policy_num:        %d\n", port->policy_num);
++	seq_printf(s, "    PTP:               %d (%s)\n", port->f_ptp,
++		   port->f_ptp ? "Enabled" : "Disabled");
++	seq_printf(s, "    loop_dis:          %d\n", port->loop_dis);
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++	seq_printf(s, "    tx_policy_base/num:%d/%d\n",
++		   port->tx_policy_base, port->tx_policy_num);
++	seq_printf(s, "    rx_policy_base/num:%d/%d\n",
++		   port->rx_policy_base, port->rx_policy_num);
++	seq_printf(s, "    spl_tx_policy_base/num/map:%d/%d/%x\n",
++		   port->spl_tx_policy_base, port->spl_tx_policy_num,
++		   port->spl_tx_policy_map);
++	seq_printf(s, "    spl_rx_policy_base/num/map:%d/%d/%x\n",
++		   port->spl_rx_policy_base, port->spl_rx_policy_num,
++		   port->spl_rx_policy_map);
++#endif
+ 	seq_printf(s, "    tx_pkt_credit:     %d\n", port->tx_pkt_credit);
+ 	seq_printf(s, "    tx_b_credit:       %02d\n", port->tx_b_credit);
+ 	seq_printf(s, "    txpush_addr:       0x%px\n", port->txpush_addr);
+@@ -504,20 +800,22 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	seq_printf(s, "    rx_err_drop=0x%08x  tx_err_drop=0x%08x\n",
+ 		   STATS_GET(port->rx_err_drop),
+ 		   STATS_GET(port->tx_err_drop));
+-EXIT:
++exit:
+ 	if (pos == 0 && reinsert_deq_port) {
+ 		cqm_info = get_dp_deqport_info(tmp_inst, reinsert_deq_port);
+-		seq_printf(s, "    insertion_qid:     %d\n",
++		seq_printf(s, "    insertion_qid:       %d\n",
+ 			   cqm_info->qid[0]);
+-		seq_printf(s, "    insertion_deqport: %d\n", reinsert_deq_port);
++		seq_printf(s, "    insertion_deqport:   %d\n",
++			   reinsert_deq_port);
+ 		dp_dma_parse_id(cqm_info->dma_chan, &cid, &pid, &nid);
+-		seq_printf(s, "    insertion_tx_dma_ch:   0x%x(dma-ctrl=%d,port=%d,channel=%d)\n",
+-			   cqm_info->dma_chan, cid, pid, nid);
++		seq_printf(s, "%s0x%x(%s=%d,%s=%d,%s=%d)\n",
++			   "    insertion_tx_dma_ch: ", cqm_info->dma_chan,
++			   "dma-ctrl", cid, "port", pid, "channel", nid);
+ 	}
+ 
+ 	if (!seq_has_overflowed(s))
+ 		pos++;
+-	if ((pos >= MAX_DP_PORTS) || dump_one_port) {
++	if (pos >= MAX_DP_PORTS || dump_one_port) {
+ 		tmp_inst++;
+ 		pos = 0;
+ 	}
+@@ -527,21 +825,15 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	return pos;
+ }
+ 
+-int display_port_info(int inst, u8 pos, int start_vap, int end_vap,
+-		      u32 flag)
++static
++void show_port_info(int inst, u8 pos, int vap_start, int vap_end, u32 flag)
+ {
+-	int i;
+-	int ret;
+ 	struct pmac_port_info *port = get_dp_port_info(inst, pos);
+-	u16 start = 0;
+-
+-	if (!port) {
+-		pr_err("Why port is NULL\n");
+-		return -1;
+-	}
++	u16 start;
++	int i;
+ 
+ 	if (port->status == PORT_FREE) {
+-		if (pos == 0)
++		if (!pos)
+ 			pr_info("%s:rx_err_drop=0x%08x  tx_err_drop=0x%08x\n",
+ 				"Reserved Port",
+ 				STATS_GET(port->rx_err_drop),
+@@ -553,21 +845,16 @@ int display_port_info(int inst, u8 pos, int start_vap, int end_vap,
+ 				STATS_GET(port->rx_err_drop),
+ 				STATS_GET(port->tx_err_drop));
+ 
+-		goto EXIT;
++		return;
+ 	}
+ 
+ 	DP_CB(tmp_inst, get_itf_start_end)(port->itf_info, &start, NULL);
+ 
+ 	pr_info("%02d: %s=0x0x%0lx(name:%8s) %s=%02d %s=%02d itf_base=%d(%s)\n",
+ 		pos,
+-		"module",
+-		(uintptr_t)port->owner, port->owner->name,
+-		"dev_port",
+-		port->dev_port,
+-		"dp_port",
+-		port->port_id,
+-		start,
+-		port->itf_info ? "Enabled" : "Not Enabled");
++		"module", (uintptr_t)port->owner, port->owner->name,
++		"dev_port", port->dev_port, "dp_port", port->port_id,
++		start, port->itf_info ? "Enabled" : "Not Enabled");
+ 	pr_info("    status:            %s\n",
+ 		dp_port_status_str[port->status]);
+ 	pr_info("    allocate_flags:    ");
+@@ -591,7 +878,7 @@ int display_port_info(int inst, u8 pos, int start_vap, int end_vap,
+ 		pr_info("    num_subif:         %02d\n", port->num_subif);
+ 	}
+ 
+-	for (i = start_vap; i < end_vap; i++) {
++	for (i = vap_start; i < vap_end; i++) {
+ 		struct dp_subif_info *sif = get_dp_port_subif(port, i);
+ 		struct dev_mib *mib = get_dp_port_subif_mib(sif);
+ 
+@@ -621,14 +908,11 @@ int display_port_info(int inst, u8 pos, int start_vap, int end_vap,
+ 		}
+ 	}
+ 
+-	ret = pr_info("    rx_err_drop=0x%08x  tx_err_drop=0x%08x\n",
+-		      STATS_GET(port->rx_err_drop),
+-		      STATS_GET(port->tx_err_drop));
+-EXIT:
+-	return 0;
++	pr_info("    rx_err_drop=0x%08x  tx_err_drop=0x%08x\n",
++		STATS_GET(port->rx_err_drop), STATS_GET(port->tx_err_drop));
+ }
+ 
+-static int set_switchdev(int inst, int ep, int vap, bool enable)
++static int set_switchdev(int inst, int ep, int vap, bool en)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ 	struct pmac_port_info *port = get_dp_port_info(inst, ep);
+@@ -641,7 +925,8 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ 		pr_err("subif not registered\n");
+ 		return DP_FAILURE;
+ 	}
+-	if (!sif->swdev_en == !enable)
++
++	if (!sif->swdev_en == !en)
+ 		return DP_SUCCESS;
+ 
+ 	dp_dev = dp_dev_lookup(dev);
+@@ -649,11 +934,12 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ 		pr_err("dp_dev lookup failed\n");
+ 		return DP_FAILURE;
+ 	}
++
+ 	rtnl_lock();
+ 	br_dev = netdev_master_upper_dev_get(dev);
+ 	rtnl_unlock();
+ 
+-	if (enable) {
++	if (en) {
+ 		sif->swdev_en = 1;
+ 		if (dp_register_switchdev_ops(dp_dev, 0)) {
+ 			pr_err("fail to register swdev ops\n");
+@@ -677,160 +963,157 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ 		sif->swdev_en = 0;
+ 		pr_info("swdev is disabled\n");
+ 	}
+-	return DP_SUCCESS;
+ #endif
++	return DP_SUCCESS;
+ }
+ 
+-#define DBG_PORT DP_DEBUGFS_PATH "/" DBGFS_PORT
+-
+ ssize_t proc_port_write(struct file *file, const char *buf, size_t count,
+ 			loff_t *ppos)
+ {
+-	char str[64];
+-	/*later need to put real inst value */
++	int inst, i, num, idx_s,  idx_e, vap_s, vap_e, swdev_en;
+ 	struct inst_info *info = &dp_port_prop[0].info;
+ 	struct pmac_port_info *port;
+-	int index_start = 0, index_end = MAX_DP_PORTS;
+-	int vap_start = 0, vap_end = info->cap.max_num_subif_per_port;
+-	char *param_list[10];
+-	int swdev_en, len, num, inst, i;
++	char *param_list[10], *str;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return count;
+-	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
+-	len -= copy_from_user(str, buf, len);
+-	str[len] = 0;
+ 
+-	memset(param_list, 0, sizeof(param_list));
+-	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
++	str = kzalloc(count, GFP_ATOMIC);
++	if (!str)
++		return -ENOMEM;
+ 
+-	if (num <= 1)
+-		goto help;
++	if (copy_from_user(str, buf, count))
++		return -EFAULT;
+ 
+-	if (param_list[1]) {
+-		index_start = dp_atoi(param_list[1]);
+-		index_end = index_start + 1;
++	for (num = 0; num < ARRAY_SIZE(param_list); num++) {
++		param_list[num] = strsep(&str, " \n");
++		if (!param_list[num])
++			break;
+ 	}
+ 
+-	if (param_list[2]) {
+-		vap_start = dp_atoi(param_list[2]);
+-		vap_end = vap_start + 1;
+-	}
+-
+-	if (index_start >= MAX_DP_PORTS) {
+-		pr_err("invalid port index, expect 0 ~ %d\n", MAX_DP_PORTS - 1);
+-		return count;
++	if (param_list[1]) {
++		idx_s = dp_atoi(param_list[1]);
++		if (idx_s >= MAX_DP_PORTS) {
++			pr_err("invalid port index, expect 0 ~ %d\n",
++			       info->cap.max_num_dp_ports - 1);
++			return count;
++		}
++		idx_e = idx_s + 1;
++	} else {
++		idx_s = 0;
++		idx_e = info->cap.max_num_dp_ports;
+ 	}
+ 
+-	if (vap_start >= info->cap.max_num_subif_per_port) {
+-		pr_err("invalid VAP index, expect 0 ~ %d\n",
+-		       info->cap.max_num_subif_per_port - 1);
+-		return count;
++	if (param_list[2]) {
++		vap_s = dp_atoi(param_list[2]);
++		if (vap_s >= info->cap.max_num_subif_per_port) {
++			pr_err("invalid VAP index, expect 0 ~ %d\n",
++			       info->cap.max_num_subif_per_port - 1);
++			return count;
++		}
++		vap_e = vap_s + 1;
++	} else {
++		vap_s = 0;
++		vap_e = info->cap.max_num_subif_per_port;
+ 	}
+ 
+-	if (strcasecmp(param_list[0], "help") == 0) {
+-		goto help;
+-	 } else if (strcasecmp(param_list[0], "mib") == 0) {
++	if (!strcasecmp(param_list[0], "mib")) {
+ 		for (inst = 0; inst < dp_inst_num; inst++)
+-			for (i = index_start; i < index_end; i++)
+-				display_port_info(inst, i, vap_start, vap_end,
+-						  1);
+-
+-	} else if (strcasecmp(param_list[0], "port") == 0) {
+-		if (proc_write_port != index_start) {
++			for (i = idx_s; i < idx_e; i++)
++				show_port_info(inst, i, vap_s, vap_e, 1);
++	} else if (!strcasecmp(param_list[0], "port")) {
++		if (proc_write_port != idx_s) {
+ 			pr_info("%s: changed port id to be dumped to %d\n",
+-			   __func__, index_start);
+-			proc_write_port = index_start;
++				__func__, idx_s);
++			proc_write_port = idx_s;
+ 		}
+ 
+-		if (param_list[2] && (proc_write_vap != vap_start)) {
++		if (param_list[2] && proc_write_vap != vap_s) {
+ 			pr_info("%s: changed sif id to be dumped to %d\n",
+-			   __func__, vap_start);
+-			proc_write_vap = vap_start;
++				__func__, vap_s);
++			proc_write_vap = vap_s;
+ 		}
+ 
+-		pr_info("%s: run 'cat %s' to dump requested port info\n", __func__, DEBUGFS_DBG);
+-	} else if (strcasecmp(param_list[0], "swdev") == 0) {
+-		if (num != 4)
+-			goto help;
++		pr_info("%s: run 'cat %s' to dump requested port info\n",
++			__func__, DEBUGFS_DBG);
++	} else if (!strcasecmp(param_list[0], "swdev") && num == 4) {
+ 		DP_LIB_LOCK(&dp_lock);
+-		port = get_dp_port_info(0, index_start);
++		port = get_dp_port_info(0, idx_s);
+ 		if (!port->num_subif) {
+-			pr_err("No subif available for port index %d\n",
+-			       index_start);
+-			goto unlock;
+-		}
+-		if (vap_start >= port->num_subif) {
++			pr_err("subif unavailable for port index %d\n", idx_s);
++		} else if (vap_s >= port->num_subif) {
+ 			pr_err("invalid VAP index, expect 0 ~ %d\n",
+ 			       port->num_subif - 1);
+-			goto unlock;
++		} else {
++			swdev_en = dp_atoi(param_list[3]);
++			set_switchdev(0, idx_s, vap_s, !!swdev_en);
+ 		}
+-		swdev_en = dp_atoi(param_list[3]);
+-		set_switchdev(0, index_start, vap_start, !!swdev_en);
+-unlock:
+ 		DP_LIB_UNLOCK(&dp_lock);
+ 	} else {
+-		goto help;
++		pr_info("usage:\n");
++		pr_info("  echo mib   [ep][vap] > %s\n", DBG_PORT);
++		pr_info("  echo port  [ep][vap] > %s\n", DBG_PORT);
++		pr_info("    to print all port info- echo port -1 > %s\n",
++			DBG_PORT);
++		pr_info("  echo swdev [ep][vap][swdev_en] > %s\n", DBG_PORT);
+ 	}
+ 
+-	return count;
+-help:
+-	pr_info("usage:\n");
+-	pr_info("  echo mib   [ep][vap] > %s\n", DBG_PORT);
+-	pr_info("  echo port  [ep][vap] > %s\n", DBG_PORT);
+-	pr_info("    to print all port info- echo port -1 > %s\n", DBG_PORT);
+-	pr_info("  echo swdev [ep][vap][swdev_en] > %s\n", DBG_PORT);
+ 	return count;
+ }
+ 
+-#define DBG_CTP DP_DEBUGFS_PATH "/" DBGFS_CTP_LIST
+ ssize_t proc_ctp_list_write(struct file *file, const char *buf, size_t count,
+ 			    loff_t *ppos)
+ {
+-	int len;
+-	char str[64];
++	char *param_list[5], *str;
+ 	int num;
+-	u16 bp = 0;
+-	char *param_list[5];
+-	struct ctp_dev *tmp;
+-	struct bp_pmapper *bp_info;
++	u16 bp;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return count;
+-	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
+-	len -= copy_from_user(str, buf, len);
+-	str[len] = 0;
+-	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
+ 
+-	if (num <= 1)
+-		goto help;
++	str = kzalloc(count, GFP_ATOMIC);
++	if (!str)
++		return -ENOMEM;
++
++	if (copy_from_user(str, buf, count))
++		return -EFAULT;
++
++	for (num = 0; num < ARRAY_SIZE(param_list); num++) {
++		param_list[num] = strsep(&str, " \n");
++		if (!param_list[num])
++			break;
++	}
++
+ 	if (param_list[1])
+ 		bp = dp_atoi(param_list[1]);
++	else
++		bp = 0;
++
++	if (!strcasecmp(param_list[0], "bp_ctp")) {
++		struct ctp_dev *ctp_dev;
++		struct bp_pmapper *bp_info;
+ 
+-	if (strcasecmp(param_list[0], "bp_ctp") == 0) {
+ 		bp_info = get_dp_bp_info(0, bp);
+ 		pr_info("%-10s%-10d\n", "Bp", bp);
++
+ 		if (!bp_info->ref_cnt) {
+ 			pr_info("dev(%s) is not a pmapper\n",
+ 				bp_info->dev ? bp_info->dev->name : "NULL");
+ 			return count;
+ 		}
+-		list_for_each_entry(tmp, &bp_info->ctp_dev, list) {
+-			if (!tmp->dev)
++
++		list_for_each_entry(ctp_dev, &bp_info->ctp_dev, list) {
++			if (!ctp_dev->dev)
+ 				continue;
+ 			pr_info("%-s:%-s(%-s:%-d)\n", "ctp_dev",
+-				tmp->dev->name, "ctp", tmp->ctp);
++				ctp_dev->dev->name, "ctp", ctp_dev->ctp);
+ 		}
+ 	} else {
+-		goto help;
++		pr_info("usage:\n");
++		pr_info("  echo bp_ctp [bp] > %s\n", DBG_CTP);
+ 	}
+ 
+ 	return count;
+-help:
+-	pr_info("usage:\n");
+-	pr_info("  echo bp_ctp [bp] > %s\n", DBG_CTP);
+-	return count;
+-
+ }
+ 
+ #if defined(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
+@@ -840,95 +1123,89 @@ void proc_dbg_read(struct seq_file *s)
+ 
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return;
+-	seq_printf(s, "dp_dbg_flag=0x%08x\n", dp_dbg_flag);
+ 
++	seq_printf(s, "dp_dbg_flag=0x%08x\n", dp_dbg_flag);
+ 	seq_printf(s, "Supported Flags =%d\n", get_dp_dbg_flag_str_size());
+ 	seq_printf(s, "Enabled Flags(0x%0x):", dp_dbg_flag);
+ 
+ 	for (i = 0; i < get_dp_dbg_flag_str_size(); i++)
+-		if ((dp_dbg_flag & dp_dbg_flag_list[i]) ==
+-		    dp_dbg_flag_list[i])
++		if ((dp_dbg_flag & dp_dbg_flag_list[i]) == dp_dbg_flag_list[i])
+ 			seq_printf(s, "%s ", dp_dbg_flag_str[i]);
+ 
+ 	seq_puts(s, "\n\n");
+-
+ 	seq_printf(s, "dp_drop_all_tcp_err=%d @ 0x%px\n", dp_drop_all_tcp_err,
+ 		   &dp_drop_all_tcp_err);
+ 	seq_printf(s, "dp_pkt_size_check=%d @ 0x%px\n", dp_pkt_size_check,
+ 		   &dp_pkt_size_check);
+-
+ 	seq_printf(s, "dp_rx_test_mode=%d @ 0x%px\n", dp_rx_test_mode,
+ 		   &dp_rx_test_mode);
+ 	seq_printf(s, "dp_dbg_err(flat to print error or not)=%d @ 0x%px\n",
+ 		   dp_dbg_err,
+ 		   &dp_dbg_err);
++
+ 	print_parser_status(s);
+ }
+ 
+ ssize_t proc_dbg_write(struct file *file, const char *buf, size_t count,
+ 		       loff_t *ppos)
+ {
+-	int len, i, j;
+-	char str[64];
+-	int num;
+-	char *param_list[20];
+-	int f_enable;
+-	char *tmp_buf;
+-#define BUF_SIZE_TMP 2000
++	int i, j, num, dbg_str_list;
++	char *param_list[20], *str;
++	int en;
++
+ 	if (!capable(CAP_SYS_ADMIN))
+ 		return -EPERM;
+ 
+-	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
+-	len -= copy_from_user(str, buf, len);
+-	str[len] = 0;
+-	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
++	str = kzalloc(count, GFP_ATOMIC);
++	if (!str)
++		return -ENOMEM;
+ 
+-	if (dp_strncmpi(param_list[0], "enable", strlen("enable")) == 0)
+-		f_enable = 1;
+-	else if (dp_strncmpi(param_list[0], "disable", strlen("disable")) == 0)
+-		f_enable = -1;
+-	else
+-		goto help;
++	if (copy_from_user(str, buf, count))
++		return -EFAULT;
+ 
+-	if (!param_list[1]) {	/*no parameter after enable or disable */
+-		set_ltq_dbg_flag(dp_dbg_flag, f_enable, -1);
+-		goto EXIT;
++	for (num = 0; num < ARRAY_SIZE(param_list); num++) {
++		param_list[num] = strsep(&str, " \n");
++		if (!param_list[num])
++			break;
++	}
++
++	dbg_str_list = get_dp_dbg_flag_str_size() - 1;
++
++	if (!strcasecmp(param_list[0], "enable")) {
++		en = 1;
++	} else if (!strcasecmp(param_list[0], "disable")) {
++		en = -1;
++	} else {
++		pr_info("echo <enable/disable> ");
++		for (i = 0; i < dbg_str_list; i++)
++			pr_cont("%s ", dp_dbg_flag_str[i]);
++		pr_cont(" > %s\n", DEBUGFS_DBG);
++		goto exit;
++	}
++
++	if (!param_list[1]) {
++		set_ltq_dbg_flag(dp_dbg_flag, en, -1);
++		return count;
+ 	}
+ 
+ 	for (i = 1; i < num; i++) {
+-		for (j = 0; j < get_dp_dbg_flag_str_size() - 1; j++)
+-			if (dp_strncmpi(param_list[i],
+-					dp_dbg_flag_str[j],
+-					strlen(dp_dbg_flag_str[j]) + 1) == 0) {
+-				set_ltq_dbg_flag(dp_dbg_flag, f_enable,
++		for (j = 0; j < dbg_str_list; j++)
++			if (!strcasecmp(param_list[i], dp_dbg_flag_str[j])) {
++				set_ltq_dbg_flag(dp_dbg_flag, en,
+ 						 dp_dbg_flag_list[j]);
+ 				break;
+ 			}
+ 	}
+ 
+-EXIT:
+-	return count;
+-help:
+-	tmp_buf = devm_kzalloc(&g_dp_dev->dev, BUF_SIZE_TMP, GFP_ATOMIC);
+-	if (!tmp_buf)
+-		return count;
+-	num = 0;
+-	num = snprintf(tmp_buf + num, BUF_SIZE_TMP - num - 1,
+-		       "echo <enable/disable> ");
+-	for (i = 0; i < get_dp_dbg_flag_str_size(); i++)
+-		num += snprintf(tmp_buf + num, BUF_SIZE_TMP - num - 1,
+-				"%s ", dp_dbg_flag_str[i]);
++exit:
++	kfree(str);
+ 
+-	num += snprintf(tmp_buf + num, BUF_SIZE_TMP - num - 1,
+-			" > %s\n", DEBUGFS_DBG);
+-	pr_info("%s", tmp_buf);
+-	devm_kfree(&g_dp_dev->dev, (tmp_buf));
+ 	return count;
+ }
+ #endif
+ 
+ static struct dp_proc_entry dp_proc_entries[] = {
+-	/*name single_callback_t multi_callback_t/_start write_callback_t */
++	/* name|single_callback|multi_callback|init_callback|write_callback */
+ #if defined(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
+ 	{DBGFS_DBG, proc_dbg_read, NULL, NULL, proc_dbg_write},
+ #endif
+@@ -937,16 +1214,15 @@ static struct dp_proc_entry dp_proc_entries[] = {
+ 	{DBGFS_INST_MOD, NULL, proc_inst_mod_dump, proc_inst_mod_start, NULL},
+ 	{DBGFS_INST_HAL, NULL, proc_inst_hal_dump, NULL, NULL},
+ 	{DBGFS_INST, NULL, proc_inst_dump, NULL, NULL},
+-	{DBGFS_QOS, NULL, qos_dump, qos_dump_start, proc_qos_write},
++	{DBGFS_QOS, NULL, proc_qos_dump, proc_qos_init, proc_qos_write},
+ 	{DBGFS_EVENT, NULL, proc_dp_event_list_dump, NULL, NULL},
+-	{DBGFS_MIB_GLOBAL, NULL, proc_dp_mib_global_stats, NULL,
+-		proc_dp_mib_g_stats_write},
+-#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	{DBGFS_MIB_GLOBAL, NULL, proc_mib_stats_dump, NULL, proc_mib_stats_write},
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ 	{DBGFS_BR_VLAN, NULL, proc_brvlan_dump, NULL, NULL},
+-	{DBGFS_CTP_LIST, NULL, NULL, NULL, proc_ctp_list_write},
+ #endif
++	{DBGFS_CTP_LIST, NULL, NULL, NULL, proc_ctp_list_write},
+ 	{DBGFS_PCE, NULL, proc_pce_dump, NULL, proc_pce_write},
+-	/*the last place holder */
++	/* last place holder */
+ 	{NULL, NULL, NULL, NULL, NULL}
+ };
+ 
+@@ -970,4 +1246,3 @@ struct dentry *dp_proc_install(void)
+ 
+ 	return dp_proc_node;
+ }
+-
+diff --git a/drivers/net/datapath/dpm/datapath_proc_qos.c b/drivers/net/datapath/dpm/datapath_proc_qos.c
+index 26c5f1077bc7..ce6f9959343a 100644
+--- a/drivers/net/datapath/dpm/datapath_proc_qos.c
++++ b/drivers/net/datapath/dpm/datapath_proc_qos.c
+@@ -677,6 +677,18 @@ char *dp_port_flag_str(int cqm_deq_port, int flag)
+ 				 port_flag_str(inst, i),
+ 				 i);
+ 			return port_flag;
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++		} else if (i == 0) {
++			const char *name;
++
++			name = dp_spl_conn_get_name_from_egp(inst,
++							     cqm_deq_port);
++			if (name) {
++				snprintf(port_flag, sizeof(port_flag),
++					 "SPL:%s", name);
++				return port_flag;
++			}
++#endif
+ 		}
+ 	}
+ 	snprintf(port_flag, sizeof(port_flag), "?:%d", cqm_deq_port);
+@@ -706,6 +718,13 @@ char *dp_port_dma_tx_str(int cqm_deq_port, int flag)
+ 			snprintf(dma_flag, sizeof(dma_flag), "CH%x",
+ 				 deq_pinfo->dma_chan);
+ 			return dma_flag;
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++		} else if (i == 0 &&
++			   dp_spl_conn_get_name_from_egp(inst, cqm_deq_port)) {
++			snprintf(dma_flag, sizeof(dma_flag), "CH%x",
++				 deq_pinfo->dma_chan);
++			return dma_flag;
++#endif
+ 		}
+ 	}
+ 	snprintf(dma_flag, sizeof(dma_flag), "?:%d", cqm_deq_port);
+@@ -919,7 +938,7 @@ static bool print_qos_entry(struct seq_file *s, u8 dpid, u8 egp)
+ 	return true;
+ }
+ 
+-int qos_dump(struct seq_file *s, int pos)
++int proc_qos_dump(struct seq_file *s, int pos)
+ {
+ 	int cnt;
+ 	int i;
+@@ -947,18 +966,32 @@ int qos_dump(struct seq_file *s, int pos)
+ 		if (seq_has_overflowed(s))
+ 			return pos;
+ 	}
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP32)
++	/* CPU special path */
++	if (pos == 0) {
++		u32 base = get_dp_port_info(qos_layout_inst, 0)->deq_port_base;
++		int egps[16];
+ 
++		cnt = dp_spl_conn_get_num_of_egps(qos_layout_inst, egps);
++		for (i = 0; i < cnt; i++) {
++			if (!print_qos_entry(s, pos, egps[i] - base))
++				break;
++			if (seq_has_overflowed(s))
++				return pos;
++		}
++	}
++#endif
+ 	return ++pos >= 16 ? -1 : pos;
+ }
+ 
+-int qos_dump_start(void)
++int proc_qos_init(void)
+ {
+ 	struct dp_qos_level dp = {0};
+ 
+ 	qos_layout_inst = 0;
+-	/* current just use maximum one. Later should check real QOS
+-	 * configuration and get its maxim hirachy layers
+-	 * qos_layout_max_lvl = PROC_MAX_BOX_LVL;
++	/* Current using maximum value. Should check real QOS
++	 * configuration and get its max hirachy layers
++	 * - qos_layout_max_lvl = PROC_MAX_BOX_LVL;
+ 	 */
+ 	dp_qos_level_get(&dp, 0);
+ 	qos_layout_max_lvl = dp.max_sch_lvl + 1;
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_misc.c b/drivers/net/datapath/dpm/gswip30/datapath_misc.c
+index 7668dc3956fa..29c81e5443a5 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip30/datapath_misc.c
+@@ -481,7 +481,7 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 	port_info->vap_mask = 0xF;
+ 	idx = port_info->deq_port_base;
+ 	dma_chan =  port_info->dma_chan;
+-	dma_ch_base = port_info->dma_ch_base;
++	dma_ch_base = port_info->dma_chan_tbl_idx;
+ 	for (i = 0; i < port_info->deq_port_num; i++) {
+ 		dp_deq_port_tbl[inst][i + idx].dp_port = ep;
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 8bd030e6fe0f..54a61dd6bea9 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1415,7 +1415,7 @@ static int dp_platform_set(int inst, u32 flag)
+ 		if (!inst) {
+ 			/*only inst zero need DMA descriptor */
+ 			init_dma_desc_mask();
+-			dp_sub_proc_install_31();
++			dp_sub_proc_install();
+ 		}
+ 
+ 		sif = get_dp_port_subif(pi, 0);
+@@ -1753,7 +1753,7 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 		port_info->bp_hairpin_cap = 1;
+ 
+ 	dma_chan =  port_info->dma_chan;
+-	dma_ch_base = port_info->dma_ch_base;
++	dma_ch_base = port_info->dma_chan_tbl_idx;
+ 	for (i = 0; i < port_info->deq_port_num; i++) {
+ 		deq_pinfo = get_dp_deqport_info(inst, (i + idx));
+ 		deq_pinfo->txpush_addr = port_info->txpush_addr +
+@@ -2825,7 +2825,6 @@ int register_dp_capability(int flag)
+ 	cap.info.dp_spl_conn = _dp_spl_conn;
+ 	cap.info.dp_spl_conn_get = _dp_spl_conn_get;
+ 	cap.info.dp_set_io_port = dp_set_io_port;
+-	cap.info.proc_print_ctp_bp_info = proc_print_ctp_bp_info_32;
+ #elif IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP31)
+ 	cap.info.cap.max_port_per_cpu = 1;
+ 	cap.info.vlan_aware_flag = 1;
+@@ -2837,8 +2836,8 @@ int register_dp_capability(int flag)
+ 	cap.info.dp_net_dev_get_ethtool_stats = NULL;
+ 	cap.info.swdev_port_learning_limit_set =
+ 		dp_swdev_port_learning_limit_set;
+-	cap.info.proc_print_ctp_bp_info = proc_print_ctp_bp_info;
+ #endif
++	cap.info.proc_print_ctp_bp_info = proc_print_ctp_bp_info;
+ 
+ 	if (dp_get_gswip_cap(&cap, flag)) {
+ 		pr_err("%s: dp_get_gswip_cap fail\n", __func__);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 91bcccc0abd8..c4b971ec4137 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -403,19 +403,17 @@ static inline char *parser_flag_str(u8 f)
+ 	else
+ 		return "Reserved";
+ }
++
+ #ifdef CONFIG_DEBUG_FS
+-int dp_sub_proc_install_31(void);
++int dp_sub_proc_install(void);
+ int proc_print_ctp_bp_info(struct seq_file *s, int inst,
+ 			   struct pmac_port_info *port,
+ 			   int subif_index, u32 flag);
+ #else
+-static inline int dp_sub_proc_install_31(void)
+-{
+-	return 0;
+-}
++static inline int dp_sub_proc_install(void) { return 0; }
+ static inline int proc_print_ctp_bp_info(struct seq_file *s, int inst,
+-		struct pmac_port_info *port,
+-		int subif_index, u32 flag)
++					 struct pmac_port_info *port,
++					 int subif_index, u32 flag)
+ {
+ 	return 0;
+ }
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_proc.c b/drivers/net/datapath/dpm/gswip31/datapath_proc.c
+index bd138fdb45ae..d210a8ac37a7 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_proc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_proc.c
+@@ -1,166 +1,107 @@
+ // SPDX-License-Identifier: GPL-2.0
+-/* Copyright (C) Intel Corporation
+- * Author: Shao Guohua <guohua.shao@intel.com>
++/* Copyright (C) 2016-2020 Intel Corporation
++ * Copyright (C) 2020 MaxLinear
+  */
+-
+-#include <linux/module.h>
+-#include <net/datapath_proc_api.h>	/*for proc api */
++#include <net/datapath_proc_api.h>
+ #include <net/datapath_api.h>
+ #include <linux/list.h>
+ #include "../datapath.h"
+ #include "datapath_misc.h"
+-#include "../datapath_swdev.h"
+ 
+ #define PROC_PARSER "parser"
+ 
+-struct list_head fdb_tbl_list;
+-
+-static void proc_parser_read(struct seq_file *s);
+-static ssize_t proc_parser_write(struct file *, const char *, size_t,
+-				 loff_t *);
+-
+ static void proc_parser_read(struct seq_file *s)
+ {
+-	s8 cpu, mpe1, mpe2, mpe3;
++	const char *str[] = {"cpu", "mpe1", "mpe2", "mpe3"};
++	s8 parser[4];
++	int i;
+ 
+ 	if (!capable(CAP_NET_ADMIN))
+ 		return;
++
++	dp_gsw_get_parser(&parser[0], &parser[1], &parser[2], &parser[3]);
++	for (i = 0; i < ARRAY_SIZE(str); i++)
++		seq_printf(s, "%-4s : %s with parser size = %d bytes\n",
++			   str[i], parser_flag_str(parser[i]),
++			   parser_size_via_index(i));
++}
++
++static void set_parser(char **parser, int parser_num, s8 val)
++{
++	s8 cpu, mpe1, mpe2, mpe3, flag = 0;
++	int i;
++
+ 	dp_gsw_get_parser(&cpu, &mpe1, &mpe2, &mpe3);
+-	seq_printf(s, "cpu : %s with parser size =%d bytes\n",
+-		   parser_flag_str(cpu), parser_size_via_index(0));
+-	seq_printf(s, "mpe1: %s with parser size =%d bytes\n",
+-		   parser_flag_str(mpe1), parser_size_via_index(1));
+-	seq_printf(s, "mpe2: %s with parser size =%d bytes\n",
+-		   parser_flag_str(mpe2), parser_size_via_index(2));
+-	seq_printf(s, "mpe3: %s with parser size =%d bytes\n",
+-		   parser_flag_str(mpe3), parser_size_via_index(3));
++	for (i = 1; i < parser_num; i++) {
++		if (!strncmp(parser[i], "cpu", strlen(parser[i]))) {
++			cpu = val;
++			flag |= F_MPE_NONE;
++		} else if (!strncmp(parser[i], "mpe1", strlen(parser[i]))) {
++			mpe1 = val;
++			flag |= F_MPE1_ONLY;
++		} else if (!strncmp(parser[i], "mpe2", strlen(parser[i]))) {
++			mpe2 = val;
++			flag |= F_MPE2_ONLY;
++		} else if (!strncmp(parser[i], "mpe3", strlen(parser[i]))) {
++			mpe3 = val;
++			flag |= F_MPE1_MPE2;
++		}
++	}
++
++	if (!flag) {
++		flag = F_MPE_NONE | F_MPE1_ONLY | F_MPE2_ONLY | F_MPE1_MPE2;
++		cpu = val;
++		mpe1 = val;
++		mpe2 = val;
++		mpe3 = val;
++	}
++
++	pr_info("flag=0x%x mpe3/2/1/cpu=%d/%d/%d/%d\n",
++		flag, mpe3, mpe2, mpe1, cpu);
++
++	dp_gsw_set_parser(flag, cpu, mpe1, mpe2, mpe3);
+ }
+ 
+ ssize_t proc_parser_write(struct file *file, const char *buf,
+ 			  size_t count, loff_t *ppos)
+ {
+-	int len;
+-	char str[64];
+-	int num, i;
+-	char *param_list[20];
+-	s8 cpu = 0, mpe1 = 0, mpe2 = 0, mpe3 = 0, flag = 0;
+-	int pce_rule_id;
+-	static GSW_PCE_rule_t pce;
+-	int inst = 0;
++	int num, pce_rule_id, inst = 0;
++	static GSW_PCE_rule_t pce = {0};
+ 	struct core_ops *gsw_handle;
+ 	struct tflow_ops *gsw_tflow;
++	char *param_list[20];
++	char *str;
+ 
+ 	if (!capable(CAP_NET_ADMIN))
+ 		return -EPERM;
+-	memset(&pce, 0, sizeof(pce));
+-	gsw_handle = dp_port_prop[inst].ops[GSWIP_R];
+-	gsw_tflow = &gsw_handle->gsw_tflow_ops;
+-	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
+-	len -= copy_from_user(str, buf, len);
+-	str[len] = 0;
+-	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
+-
+-	if (dp_strncmpi(param_list[0],
+-			"enable",
+-			strlen("enable")) == 0) {
+-		for (i = 1; i < num; i++) {
+-			if (dp_strncmpi(param_list[i],
+-					"cpu",
+-					strlen("cpu")) == 0) {
+-				flag |= 0x1;
+-				cpu = 2;
+-			}
+-
+-			if (dp_strncmpi(param_list[i],
+-					"mpe1",
+-					strlen("mpe1")) == 0) {
+-				flag |= 0x2;
+-				mpe1 = 2;
+-			}
+-
+-			if (dp_strncmpi(param_list[i],
+-					"mpe2",
+-					strlen("mpe2")) == 0) {
+-				flag |= 0x4;
+-				mpe2 = 2;
+-			}
+-
+-			if (dp_strncmpi(param_list[i],
+-					"mpe3",
+-					strlen("mpe3")) == 0) {
+-				flag |= 0x8;
+-				mpe3 = 2;
+-			}
+-		}
+ 
+-		if (!flag) {
+-			flag = 0x1 | 0x2 | 0x4 | 0x8;
+-			cpu = 2;
+-			mpe1 = 2;
+-			mpe2 = 2;
+-			mpe3 = 2;
+-		}
++	str = kzalloc(count, GFP_ATOMIC);
++	if (!str)
++		return -ENOMEM;
+ 
+-		DP_DEBUG(DP_DBG_FLAG_DBG,
+-			 "flag=0x%x mpe3/2/1/cpu=%d/%d/%d/%d\n", flag, mpe3,
+-			 mpe2, mpe1, cpu);
+-		dp_gsw_set_parser(flag, cpu, mpe1, mpe2, mpe3);
+-	} else if (dp_strncmpi(param_list[0],
+-			       "disable",
+-			       strlen("disable")) == 0) {
+-		for (i = 1; i < num; i++) {
+-			if (dp_strncmpi(param_list[i],
+-					"cpu",
+-					strlen("cpu")) == 0) {
+-				flag |= 0x1;
+-				cpu = 0;
+-			}
+-
+-			if (dp_strncmpi(param_list[i],
+-					"mpe1",
+-					strlen("mpe1")) == 0) {
+-				flag |= 0x2;
+-				mpe1 = 0;
+-			}
+-
+-			if (dp_strncmpi(param_list[i],
+-					"mpe2",
+-					strlen("mpe2")) == 0) {
+-				flag |= 0x4;
+-				mpe2 = 0;
+-			}
+-
+-			if (dp_strncmpi(param_list[i],
+-					"mpe3",
+-					strlen("mpe3")) == 0) {
+-				flag |= 0x8;
+-				mpe3 = 0;
+-			}
+-		}
++	if (copy_from_user(str, buf, count))
++		return -EFAULT;
+ 
+-		if (!flag) {
+-			flag = 0x1 | 0x2 | 0x4 | 0x8;
+-			cpu = 0;
+-			mpe1 = 0;
+-			mpe2 = 0;
+-			mpe3 = 0;
+-		}
++	gsw_handle = dp_port_prop[inst].ops[GSWIP_R];
++	gsw_tflow = &gsw_handle->gsw_tflow_ops;
++	for (num = 0; num < ARRAY_SIZE(param_list); num++) {
++		param_list[num] = strsep(&str, " \n");
++		if (!param_list[num])
++			break;
++	}
+ 
+-		DP_DEBUG(DP_DBG_FLAG_DBG,
+-			 "flag=0x%x mpe3/2/1/cpu=%d/%d/%d/%d\n", flag, mpe3,
+-			 mpe2, mpe1, cpu);
+-		dp_gsw_set_parser(flag, cpu, mpe1, mpe2, mpe3);
+-	} else if (dp_strncmpi(param_list[0],
+-			       "refresh",
+-			       strlen("refresh")) == 0) {
++	if (!strcasecmp(param_list[0], "enable")) {
++		set_parser(param_list, num, 2);
++	} else if (!strcasecmp(param_list[0], "disable")) {
++		set_parser(param_list, num, 0);
++	} else if (!strcasecmp(param_list[0], "refresh")) {
+ 		dp_gsw_get_parser(NULL, NULL, NULL, NULL);
+-		pr_info("value:cpu=%d mpe1=%d mpe2=%d mpe3=%d\n", pinfo[0].v,
+-			pinfo[1].v, pinfo[2].v, pinfo[3].v);
++		pr_info("value:cpu=%d mpe1=%d mpe2=%d mpe3=%d\n",
++			pinfo[0].v, pinfo[1].v, pinfo[2].v, pinfo[3].v);
+ 		pr_info("size :cpu=%d mpe1=%d mpe2=%d mpe3=%d\n",
+-			pinfo[0].size, pinfo[1].size, pinfo[2].size,
+-			pinfo[3].size);
+-		return count;
+-	} else if (dp_strncmpi(param_list[0], "mark", strlen("mark")) == 0) {
++			pinfo[0].size, pinfo[1].size,
++			pinfo[2].size, pinfo[3].size);
++	} else if (!strcasecmp(param_list[0], "mark")) {
+ 		int flag = dp_atoi(param_list[1]);
+ 
+ 		pce_rule_id = dp_atoi(param_list[2]);
+@@ -171,9 +112,8 @@ ssize_t proc_parser_write(struct file *file, const char *buf,
+ 			flag = 3;
+ 		pr_info("eProcessPath_Action set to %d\n", flag);
+ 		/*: All packets set to same mpe flag as specified */
+-		memset(&pce, 0, sizeof(pce));
+-		pce.pattern.nIndex = pce_rule_id;
+ 		pce.pattern.bEnable = 1;
++		pce.pattern.nIndex = pce_rule_id;
+ 
+ 		pce.pattern.bParserFlagMSB_Enable = 1;
+ 		/* rule.pce.pattern.nParserFlagMSB = 0x0021; */
+@@ -184,36 +124,26 @@ ssize_t proc_parser_write(struct file *file, const char *buf,
+ 		/* rule.pce.pattern.eDstIP_Select = 2; */
+ 
+ 		pce.pattern.nDstIP_Mask = 0xffffffff;
+-		pce.pattern.bDstIP_Exclude = 0;
+ 
+-		pce.action.bRtDstPortMaskCmp_Action = 1;
+-		pce.action.bRtSrcPortMaskCmp_Action = 1;
+ 		pce.action.bRtDstIpMaskCmp_Action = 1;
+ 		pce.action.bRtSrcIpMaskCmp_Action = 1;
++		pce.action.bRtDstPortMaskCmp_Action = 1;
++		pce.action.bRtSrcPortMaskCmp_Action = 1;
+ 
++		pce.action.bRMON_Action = 1;
+ 		pce.action.bRoutExtId_Action = 1;
+-		pce.action.nRoutExtId = 0; /*RT_EXTID_UDP; */
+-		pce.action.bRtAccelEna_Action = 1;
+ 		pce.action.bRtCtrlEna_Action = 1;
++		pce.action.bRtAccelEna_Action = 1;
+ 		pce.action.eProcessPath_Action = flag;
+-		pce.action.bRMON_Action = 1;
+-		pce.action.nRMON_Id = 0;	/*RMON_UDP_CNTR; */
+ 
+-		if (gsw_tflow->TFLOW_PceRuleWrite(gsw_handle, &pce)) {
++		if (gsw_tflow->TFLOW_PceRuleWrite(gsw_handle, &pce))
+ 			pr_err("PCE rule add fail: GSW_PCE_RULE_WRITE\n");
+-			return count;
+-		}
+-
+-	} else if (dp_strncmpi(param_list[0], "unmark", 6) == 0) {
++	} else if (!strcasecmp(param_list[0], "unmark")) {
+ 		/*: All packets set to same mpe flag as specified */
+-		memset(&pce, 0, sizeof(pce));
+ 		pce_rule_id = dp_atoi(param_list[1]);
+ 		pce.pattern.nIndex = pce_rule_id;
+-		pce.pattern.bEnable = 0;
+-		if (gsw_tflow->TFLOW_PceRuleWrite(gsw_handle, &pce)) {
++		if (gsw_tflow->TFLOW_PceRuleWrite(gsw_handle, &pce))
+ 			pr_err("PCE rule add fail:GSW_PCE_RULE_WRITE\n");
+-			return count;
+-		}
+ 	} else {
+ 		pr_info("Usage: echo %s [cpu] [mpe1] [mpe2] [mpe3] > parser\n",
+ 			"<enable/disable>");
+@@ -222,24 +152,23 @@ ssize_t proc_parser_write(struct file *file, const char *buf,
+ 		pr_info("Usage: echo %s > parser\n",
+ 			"mark eProcessPath_Action_value(0~3) pce_rule_id");
+ 		pr_info("Usage: echo unmark pce_rule_id > parser\n");
+-		return count;
+ 	}
+ 
++	kfree(str);
++
+ 	return count;
+ }
+ 
+-char *get_bp_member_string(int inst, u16 bp, char *buf, u32 len)
++static char *get_bp_member_string(int inst, u16 bp, int bp_num, char *buf)
+ {
+ 	GSW_BRIDGE_portConfig_t bp_cfg;
+-	int i, ret, idx = 0;
+ 	struct core_ops *gsw_handle;
+ 	struct brdgport_ops *gsw_bp;
+-	char tmp_buf[30] = {0};
++	int i, ret, idx = 0;
+ 
+ 	gsw_handle = dp_port_prop[inst].ops[GSWIP_L];
+ 	gsw_bp = &gsw_handle->gsw_brdgport_ops;
+-	if (!buf)
+-		return NULL;
++
+ 	buf[0] = 0;
+ 	bp_cfg.nBridgePortId = bp;
+ 	bp_cfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP |
+@@ -250,64 +179,75 @@ char *get_bp_member_string(int inst, u16 bp, char *buf, u32 len)
+ 		       bp_cfg.nBridgePortId);
+ 		return buf;
+ 	}
+-	for (i = 0; i < MAX_BP_NUM; i++) {
++
++	for (i = 0; i < bp_num; i++) {
+ 		if (GET_BP_MAP(bp_cfg.nBridgePortMap, i)) {
+-			sprintf(tmp_buf, "%d ", i);
+-			if ((idx + strlen(tmp_buf)) < len) {
+-				memcpy(buf + idx, tmp_buf, strlen(tmp_buf) + 1);
+-				idx += strlen(tmp_buf);
+-			}
++			sprintf(&buf[idx], "%d ", i);
++			idx = strlen(buf);
+ 		}
+ 	}
+-	sprintf(tmp_buf, " Fid=%d ", bp_cfg.nBridgeId);
+-	if ((idx + strlen(tmp_buf)) < len) {
+-		memcpy(buf + idx, tmp_buf, strlen(tmp_buf) + 1);
+-		idx += strlen(tmp_buf);
+-	}
++
++	sprintf(&buf[idx], "Fid=%d ", bp_cfg.nBridgeId);
++
+ 	return buf;
+ }
+ 
+-/* proc_print_ctp_bp_info is an callback API, not a standalone proc API */
++#define FID_LEN	16
++/* proc_print_ctp_bp_info is a callback API, not a standalone proc API */
+ int proc_print_ctp_bp_info(struct seq_file *s, int inst,
+ 			   struct pmac_port_info *port,
+ 			   int subif_index, u32 flag)
+ {
+-	struct logic_dev *tmp;
+ 	struct dp_subif_info *sif = get_dp_port_subif(port, subif_index);
++	char *buf, tmp[8] = {0};
++	struct logic_dev *ldev;
++	struct dp_cap cap;
+ 	int bp = sif->bp;
+-	unsigned char *buf = devm_kzalloc(&g_dp_dev->dev, MAX_BP_NUM * 5 + 1,
+-					  GFP_ATOMIC);
+-	u32 len = MAX_BP_NUM * 5 + 1;
++	int len, bp_num;
++
++	cap.inst = inst;
++	dp_get_cap(&cap, 0);
++	bp_num = cap.max_num_bridge_port;
++
++	/* Get max digit for bridge port
++	 * Assuming it is not more than 7 digits
++	 */
++	snprintf(tmp, 7, "%d ", bp_num);
++	len = bp_num * strlen(tmp) + FID_LEN;
+ 
+-	seq_printf(s, "           bp=%d(member:%s)\n", bp,
+-		   get_bp_member_string(inst, bp, buf, len));
+-	list_for_each_entry(tmp, &sif->logic_dev, list) {
++	buf = kzalloc(len, GFP_ATOMIC);
++	if (!buf)
++		return 0;
++
++	seq_printf(s, "           bp=%d(member:%s)\n",
++		   bp, get_bp_member_string(inst, bp, bp_num, buf));
++	list_for_each_entry(ldev, &sif->logic_dev, list) {
+ 		seq_printf(s, "             %s: bp=%d(member:%s)\n",
+-			   tmp->dev->name, tmp->bp,
+-			   get_bp_member_string(inst, tmp->bp, buf, len));
++			   ldev->dev->name, ldev->bp,
++			   get_bp_member_string(inst, ldev->bp, bp_num, buf));
+ 	}
+ 
+-	devm_kfree(&g_dp_dev->dev, buf);
++	kfree(buf);
++
+ 	return 0;
+ }
+ 
+ static struct dp_proc_entry dp_proc_entries[] = {
+-	/*name single_callback_t multi_callback_t/_start write_callback_t */
++	/* name single_callback multi_callback init_callback write_callback */
+ 	{PROC_PARSER, proc_parser_read, NULL, NULL, proc_parser_write},
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_CPUFREQ)
+ 	{PROC_COC, proc_coc_read, NULL, NULL, proc_coc_write},
+ #endif
+-
+-	/*the last place holder */
++	/* last place holder */
+ 	{NULL, NULL, NULL, NULL, NULL}
+ };
+ 
+-int dp_sub_proc_install_31(void)
++int dp_sub_proc_install(void)
+ {
+ 	int i;
+ 
+ 	if (!dp_proc_node) {
+-		pr_err("dp_sub_proc_install failed\n");
++		pr_err("%s fail\n", __func__);
+ 		return 0;
+ 	}
+ 
+@@ -315,86 +255,3 @@ int dp_sub_proc_install_31(void)
+ 		dp_proc_entry_create(dp_proc_node, &dp_proc_entries[i]);
+ 	return 0;
+ }
+-
+-#define INVALID_DMA_CH 255
+-char *get_dma_flags_str31(u32 epn, char *buf, int buf_len)
+-{
+-	char tmp[40];
+-	u32 flags;
+-	u32 tx_ch, k;
+-	u8 f_found;
+-	int i;
+-	int inst = 0;
+-
+-	if (!buf || buf_len < 1)
+-		return NULL;
+-	tx_ch = 0;
+-	flags = 0;
+-	tmp[0] = '\0';
+-	f_found = 0;
+-	for (i = 0; i < ARRAY_SIZE(dp_port_info); i++) {
+-		struct pmac_port_info *port = get_dp_port_info(inst, i);
+-
+-		if (port->flag_other & CBM_PORT_DMA_CHAN_SET &&
+-		    port->deq_port_base == epn) {
+-			tx_ch = port->dma_chan;
+-			flags = port->alloc_flags;
+-			break;
+-		}
+-	}
+-	if (i >= ARRAY_SIZE(dp_port_info))
+-		goto EXIT;
+-	sprintf(tmp, "--");
+-	if (tx_ch != INVALID_DMA_CH) {
+-		if (!(flags & DP_F_FAST_DSL))/*DSLupstrem no DMA1/2 TX CHannel*/
+-			sprintf(tmp + strlen(tmp), "CH%02d ", tx_ch);
+-		else
+-			sprintf(tmp + strlen(tmp), "CHXX ");
+-	} else {
+-		sprintf(tmp + strlen(tmp), "CHXX ");
+-	}
+-	if (flags == 0) {
+-		if (epn < 4)
+-			sprintf(tmp + strlen(tmp), "CPU");
+-		else
+-			sprintf(tmp + strlen(tmp), "Flag0");
+-
+-		goto EXIT;
+-	}
+-	for (k = 0; k < get_dp_port_type_str_size(); k++) {
+-		if (flags & dp_port_flag[k]) {
+-			sprintf(tmp + strlen(tmp), "%s ",
+-				dp_port_type_str[k]);
+-			f_found = 1;
+-		}
+-	}
+-	if (f_found == 1 &&
+-	    flags == DP_F_FAST_ETH_LAN) { /*try to find its ep */
+-		u32 i, num, j;
+-		cbm_tmu_res_t *res;
+-		struct pmac_port_info *port;
+-
+-		for (i = 3; i <= 4; i++) {	/*2 LAN port */
+-			num = 0;
+-			port = get_dp_port_info(inst, i);
+-			if (!port)
+-				continue;
+-			if (cbm_dp_port_resources_get
+-			    (&i, &num, &res, port->alloc_flags))
+-				continue;
+-			for (j = 0; j < num; j++) {
+-				if (res[j].tmu_port != epn)/* not match */
+-					continue;
+-				sprintf(tmp + strlen(tmp), "%d", i);
+-			}
+-			kfree(res);
+-		}
+-	}
+-	if (!f_found)
+-		sprintf(tmp + strlen(tmp), "Unknown[0x%x]\n", flags);
+-
+-EXIT:
+-	strncpy(buf, tmp, buf_len);
+-	return buf;
+-}
+-EXPORT_SYMBOL(get_dma_flags_str31);

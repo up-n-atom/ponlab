@@ -1,0 +1,722 @@
+From 108d7748290d1b0fdf0a1dbe5782994fb5d3b3b5 Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Thu, 6 Aug 2020 22:51:12 +0800
+Subject: [PATCH] DRVLIB_SW-3780: XPCS - add CL37 BaseX configuration and sysfs
+ to support CL37 runtime debug/change
+
+---
+ .../devicetree/bindings/net/intel-xpcs.txt         |  17 +-
+ drivers/net/ethernet/lantiq/xpcs/xpcs.c            | 145 ++++++----
+ drivers/net/ethernet/lantiq/xpcs/xpcs.h            |  29 +-
+ drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c      | 304 +++++++++++++++++++++
+ 4 files changed, 424 insertions(+), 71 deletions(-)
+
+diff --git a/Documentation/devicetree/bindings/net/intel-xpcs.txt b/Documentation/devicetree/bindings/net/intel-xpcs.txt
+index f2cc38751db0..54978a57cb37 100644
+--- a/Documentation/devicetree/bindings/net/intel-xpcs.txt
++++ b/Documentation/devicetree/bindings/net/intel-xpcs.txt
+@@ -20,9 +20,17 @@ Required properties:
+ 	 1 - 10GbE-XAUI
+ 	 2 - 1GbE-SGMII
+ 	 3 - 2.5GbE-SGMII
+-xpcs-conn:	Auto negotiate mode
+-	0 - Auto Negotiation(ANEG) Disabled
+-	1 - Auto Negotiation(ANEG) Enabled
++xpcs-cl73:	CL73 configuration
++	0 - CL73 ANEG disabled
++	1 - CL73 ANEG enabled
++xpcs-cl37:	CL37 configuration
++	0 - CL37 ANEG disabled
++	1 - CL37 ANEG enabled in SGMII MAC Side
++	2 - CL37 ANEG enabled in SGMII PHY Side
++	3 - CL37 ANEG enabled (BaseX)
++xpcs-conn:	Auto negotiate mode (for backward compatible)
++	0 - disable ANEG, overwritten by xpcs-cl37/xpcs-cl73
++	1 - enable ANEG, overwritten by xpcs-cl37/xpcs-cl73
+ power-save:	Tx current boost level on lane of the PHY
+ 	0 - Default Value
+ 	1 - 0xB
+@@ -80,7 +88,8 @@ Example:
+ 		reset-names = "xpcs_reset";
+ 		xpcs-name = "wan_xpcs";
+ 		xpcs-mode = <2>;
+-		xpcs-conn = <0>;
++		xpcs-cl73 = <0>;
++		xpcs-cl37 = <1>;
+ 		power-save = <1>;
+ 		xpcs-no-phy-rx-auto-adapt
+ 		/* xpcs RX EQ Settings */
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+index 8d587e40e218..8476e4b6459a 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+@@ -28,6 +28,8 @@
+ #define XPCS_IRQ_NAME			"xpcs_irq"
+ #define XPCS_RES_NAME			"xpcs_reg"
+ #define XPCS_MOD_NAME			"xpcs-name"
++#define XPCS_CL73			"xpcs-cl73"
++#define XPCS_CL37			"xpcs-cl37"
+ #define XPCS_CONN_TYPE			"xpcs-conn"
+ #define XPCS_MODE_NAME			"xpcs-mode"
+ #define XPCS_RESET_NAME			"xpcs_reset"
+@@ -51,7 +53,6 @@
+ #define LINK_POLL_TIME			"link_poll_interval"
+ #define LINK_MODE_CFG			"xpcs_mode_cfg_seq"
+ 
+-static void xpcs_cl37_an(struct xpcs_prv_data *pdata);
+ static void xpcs_cl73_an(struct xpcs_prv_data *pdata);
+ static void xpcs_cl72_startup(struct xpcs_prv_data *pdata);
+ static int xpcs_vs_reset(struct xpcs_prv_data *pdata);
+@@ -688,15 +689,8 @@ static int xpcs_teng_xaui_mode(struct xpcs_prv_data *pdata)
+ 	if (xpcs_vs_reset(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+ 
+-	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable CL73 Autoneg */
+-		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+-		/* Disable Backplane CL37 Autonegotiation */
+-		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
+-		/* Disable CL37 Autoneg */
+-		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
+-		/* Disable Auto Speed Mode Change after CL37 AN */
+-		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++	if (pdata->cl73 == CONN_TYPE_ANEG_DIS) {
++		xpcs_disable_an(pdata);
+ 	} else {
+ 		xpcs_cl73_an(pdata);
+ 	}
+@@ -758,15 +752,8 @@ static int xpcs_teng_kr_mode(struct xpcs_prv_data *pdata)
+ 	/* If connected to SFP module CL73 Auto-negotiation need to be
+ 	 * disabled
+ 	 */
+-	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable CL73 Autoneg */
+-		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+-		/* Disable Backplane CL37 Autonegotiation */
+-		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
+-		/* Disable CL37 Autoneg */
+-		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
+-		/* Disable Auto Speed Mode Change after CL37 AN */
+-		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++	if (pdata->cl73 == CONN_TYPE_ANEG_DIS) {
++		xpcs_disable_an(pdata);
+ 	} else {
+ 		xpcs_cl73_an(pdata);
+ 	}
+@@ -814,10 +801,16 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ 	XPCS_RGWR_VAL(pdata, PMA_CTRL2, PMA_TYPE,
+ 		      pdata->mode_cfg->pma_type);
+ 
++	/* Ensure 2.5G mode is disabled */
++	XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, EN_2_5G_MODE, 0);
++
++	/* Full duplex by default */
++	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, DUPLEX_MODE, 1);
++
+ 	/* 1Gbps SGMII Mode or speed for Non-ANEG mode */
+ 	/* 0 - 10M, 1 - 100M, 2 - 1G */
+ 	spd = 2;
+-	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
++	if (pdata->cl37 == CONN_TYPE_ANEG_DIS) {
+ 		if (pdata->speed == SPEED_10)
+ 			spd = 0;
+ 		else if (pdata->speed == SPEED_100)
+@@ -855,15 +848,8 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ 	if (xpcs_vs_reset(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+ 
+-	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable CL73 Autoneg */
+-		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+-		/* Disable Backplane CL37 Autonegotiation */
+-		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
+-		/* Disable CL37 Autoneg */
+-		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
+-		/* Disable Auto Speed Mode Change after CL37 AN */
+-		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++	if (pdata->cl37 == CONN_TYPE_ANEG_DIS) {
++		xpcs_disable_an(pdata);
+ 	} else {
+ 		/* Enable Clause 37 Auto-negotiation */
+ 		xpcs_cl37_an(pdata);
+@@ -907,6 +893,9 @@ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata)
+ 	/* 2.5G GMII Mode operation for 1000BaseX PCS Configuration */
+ 	XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, EN_2_5G_MODE, 1);
+ 
++	/* Full duplex by default */
++	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, DUPLEX_MODE, 1);
++
+ 	/* SGMII Mode */
+ 	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS13, 0);
+ 	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS6, 1);
+@@ -960,15 +949,8 @@ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata)
+ 	if (xpcs_vs_reset(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+ 
+-	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+-		/* Disable CL73 Autoneg */
+-		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+-		/* Disable Backplane CL37 Autonegotiation */
+-		XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
+-		/* Disable CL37 Autoneg */
+-		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
+-		/* Disable Auto Speed Mode Change after CL37 AN */
+-		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++	if (pdata->cl37 == CONN_TYPE_ANEG_DIS) {
++		xpcs_disable_an(pdata);
+ 	} else {
+ 		/* Enable Clause 37 Auto-negotiation */
+ 		xpcs_cl37_an(pdata);
+@@ -977,8 +959,24 @@ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata)
+ 	return XPCS_SUCCESS;
+ }
+ 
++void xpcs_disable_an(struct xpcs_prv_data *pdata)
++{
++	/* Disable CL73 Autoneg */
++	XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++	/* Disable Backplane CL37 Autonegotiation */
++	XPCS_RGWR_VAL(pdata, PCS_DIG_CTRL1, CL37_BP, 0);
++	/* Disable CL37 Autoneg */
++	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
++	/* Disable Auto Speed Mode Change after CL37 AN */
++	XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++	/* Reset MII Ctrl register */
++	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, PCS_MODE, 0);
++	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, TX_CONFIG, 0);
++	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, MII_AN_INTR_EN, 0);
++}
++
+ /* Programming seq to enable Clause 37 Autonegotiation */
+-static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
++void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ {
+ 	/* Disable CL73 Autoneg */
+ 	XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+@@ -989,16 +987,21 @@ static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ 	/* Disable CL37 Autoneg */
+ 	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 0);
+ 
+-	/* PCS_Mode = 2 SGMII Mode */
+-	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, PCS_MODE, 2);
++	if (pdata->cl37 == CONN_TYPE_ANEG_BX)
++		/* PCS_Mode = 0 1000/2500-BaseX Mode */
++		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, PCS_MODE, 0);
++	else
++		/* PCS_Mode = 2 SGMII Mode */
++		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, PCS_MODE, 2);
+ 
+ 	/* Enables the generation of Clause 37 autonegotiation complete
+ 	 * interrupt output
+ 	 */
+ 	XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, MII_AN_INTR_EN, 1);
+ 
+-	/* We are using PHY_SIDE_SGMII */
+-	if (pdata->conntype == CONN_TYPE_ANEG_PHY) {
++	XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
++
++	if (pdata->cl37 == CONN_TYPE_ANEG_PHY) {
+ 		/* PHY Side SGMII */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, TX_CONFIG, 1);
+ 		/* Autonegotiation will advertise the values programmed to:
+@@ -1008,13 +1011,19 @@ static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ 		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, PHY_MODE_CTRL, 0);
+ 		/* Enable SGMII Link */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS, 1);
++		/* SR_MII_AN_ADV must be written after Link Status and
++		 * Link Speed according to Synopsis Notes
++		 */
+ 		/* 1 Full Duplex, 0 Half Duplex */
+ 		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, FD, 1);
+ 		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, HD, 0);
+-		XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 0);
+-	} else {
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, RF, 0);
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, PAUSE, 0);
++	} else if (pdata->cl37 == CONN_TYPE_ANEG_MAC) {
+ 		/* MAC Side SGMII */
+ 		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, TX_CONFIG, 0);
++		/* Enable SGMII Link */
++		XPCS_RGWR_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS, 1);
+ 		/* MAC side SGMII Automatic Speed Mode Change after CL37 AN,
+ 		 * xpcs automatically  switches to the negotiated
+ 		 * SGMII/USXGMII/QSGMII(port0) speed, SGMII get ANEG Config
+@@ -1022,6 +1031,12 @@ static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ 		 * of Clause 37 auto-negotiation between PHY and Link Partner
+ 		 */
+ 		 XPCS_RGWR_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW, 1);
++	} else {
++		/* 1 Full Duplex, 0 Half Duplex */
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, FD, 1);
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, HD, 0);
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, RF, 0);
++		XPCS_RGWR_VAL(pdata, SR_MII_AN_ADV, PAUSE, 0);
+ 	}
+ 
+ 	/* 4-BIT MII Interface */
+@@ -1029,8 +1044,12 @@ static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ 
+ 	/* 2.5G Mode */
+ 	if (pdata->mode == TWOP5G_SGMII_MODE) {
+-		/* Link timer runs for 1.6 ms */
+-		XPCS_RGWR(pdata, VR_MII_LINK_TIMER_CTRL, 0x07A1);
++		if (pdata->cl37 == CONN_TYPE_ANEG_BX)
++			/* Link timer runs for 10 ms in BaseX mode */
++			XPCS_RGWR(pdata, VR_MII_LINK_TIMER_CTRL, 0x2FAF);
++		else
++			/* Link timer runs for 1.6 ms in SGMII mode */
++			XPCS_RGWR(pdata, VR_MII_LINK_TIMER_CTRL, 0x07A1);
+ 
+ 		/* If this bit is set, the value programmed to
+ 		 * VR MII MMD Link Timer Control Register will be used to
+@@ -1041,9 +1060,6 @@ static void xpcs_cl37_an(struct xpcs_prv_data *pdata)
+ 
+ 	/* Enable CL37 Autoneg */
+ 	XPCS_RGWR_VAL(pdata, SR_MII_CTRL, AN_ENABLE, 1);
+-
+-	/* Restart Autoneg */
+-	XPCS_RGWR_VAL(pdata, AN_CTRL, RSTRT_AN, 1);
+ }
+ 
+ /* Programming seq to enable Clause 73 Autonegotiation */
+@@ -1364,16 +1380,28 @@ static int xpcs_parse_dts(struct platform_device *pdev,
+ 
+ 	/* Retrieve the connection type */
+ 	if (!device_property_read_u32(dev, XPCS_CONN_TYPE, &prop)) {
+-		(*pdata)->conntype = prop;
++		if (prop >= CONN_TYPE_MAX) {
++			dev_err(dev, "Xpcs conntype: %u is invalid\n", prop);
++			return -EINVAL;
++		}
++		(*pdata)->cl73 = prop;
++		(*pdata)->cl37 = prop;
++	}
+ 
+-		if ((*pdata)->conntype >= CONN_TYPE_MAX) {
+-			dev_err(dev, "Xpcs conntype: %u is invalid\n",
+-				(*pdata)->conntype);
++	if (!device_property_read_u32(dev, XPCS_CL73, &prop)) {
++		if (prop >= CONN_TYPE_MAX) {
++			dev_err(dev, "Xpcs CL73: %u is invalid\n", prop);
+ 			return -EINVAL;
+ 		}
+-	} else {
+-		dev_err(dev, "Xpcs conn: cannot get property\n");
+-		return -EINVAL;
++		(*pdata)->cl73 = prop;
++	}
++
++	if (!device_property_read_u32(dev, XPCS_CL37, &prop)) {
++		if (prop >= CONN_TYPE_MAX) {
++			dev_err(dev, "Xpcs CL73: %u is invalid\n", prop);
++			return -EINVAL;
++		}
++		(*pdata)->cl37 = prop;
+ 	}
+ 
+ 	if (!device_property_read_u32(dev, POWER_SAVE_MODE, &prop)) {
+@@ -1570,8 +1598,7 @@ static int xpcs_ethtool_ksettings_set(struct device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	if ((speed == SPEED_1000 || speed == SPEED_100 || speed == SPEED_10) &&
+-	     pdata->conntype == CONN_TYPE_ANEG_DIS)
++	if (speed == SPEED_1000 || speed == SPEED_100 || speed == SPEED_10)
+ 		mode = ONEG_XAUI_MODE;
+ 	else if (speed == SPEED_10000)
+ 		mode = TENG_KR_MODE;
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.h b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+index 2d4cd791bab0..5e9a7839c72d 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.h
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+@@ -301,6 +301,8 @@
+ #define SR_MII_CTRL_SS5_WIDTH			1
+ #define SR_MII_CTRL_DUPLEX_MODE_POS		8
+ #define SR_MII_CTRL_DUPLEX_MODE_WIDTH		1
++#define SR_MII_CTRL_RESTART_ANEG_POS		9
++#define SR_MII_CTRL_RESTART_ANEG_WIDTH		1
+ #define SR_MII_CTRL_AN_ENABLE_POS		12
+ #define SR_MII_CTRL_AN_ENABLE_WIDTH		1
+ 
+@@ -308,6 +310,12 @@
+ #define SR_MII_AN_ADV_FD_WIDTH			1
+ #define SR_MII_AN_ADV_HD_POS			6
+ #define SR_MII_AN_ADV_HD_WIDTH			1
++#define SR_MII_AN_ADV_PAUSE_POS			7
++#define SR_MII_AN_ADV_PAUSE_WIDTH		2
++#define SR_MII_AN_ADV_RF_POS			12
++#define SR_MII_AN_ADV_RF_WIDTH			2
++#define SR_MII_AN_ADV_NP_POS			15
++#define SR_MII_AN_ADV_NP_WIDTH			1
+ 
+ #define VR_MII_AN_CTRL_PCS_MODE_POS		1
+ #define VR_MII_AN_CTRL_PCS_MODE_WIDTH		2
+@@ -594,15 +602,11 @@ enum {
+ 	LANE_MAX,
+ };
+ 
+-enum {
+-	PHY_SIDE_SGMII = 0,
+-	MAC_SIDE_SGMII = 1
+-};
+-
+ enum {
+ 	CONN_TYPE_ANEG_DIS = 0,
+ 	CONN_TYPE_ANEG_MAC = 1,
+ 	CONN_TYPE_ANEG_PHY = 2,
++	CONN_TYPE_ANEG_BX = 3,
+ 	CONN_TYPE_MAX,
+ };
+ 
+@@ -810,10 +814,17 @@ struct xpcs_prv_data {
+ 
+ 	/* ANEG mode
+ 	 * 0 - disable
+-	 * 1 - CL73 enable or CL37 MAC Side
+-	 * 2 - CL73 enable or CL37 PHY Side
++	 * 1 - CL37 enabled and configured in SGMII MAC Side
++	 * 2 - CL37 enabled and configured in SGMII PHY Side
++	 * 3 - CL37 enabled (BaseX mode)
++	 */
++	u32 cl37;
++
++	/* ANEG mode
++	 * 0 - disable
++	 * 1 - CL73 enable
+ 	 */
+-	u32 conntype;
++	u32 cl73;
+ 
+ 	/* Power save mode 0 - Normal Mode, 1 - power save mode */
+ 	u8 power_save;
+@@ -918,6 +929,8 @@ static inline void XPCS_RGWR(struct xpcs_prv_data *pdata, u32 reg, u32 val)
+ 		XPCS_RGWR(pdata, reg, reg_val);			\
+ 	} while (0)
+ 
++void xpcs_disable_an(struct xpcs_prv_data *pdata);
++void xpcs_cl37_an(struct xpcs_prv_data *pdata);
+ int xpcs_reinit(struct device *dev, u32 mode);
+ int xpcs_sysfs_init(struct xpcs_prv_data *priv);
+ 
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+index b07854a3b5be..1e0e1c8dd0c0 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+@@ -827,6 +827,309 @@ static ssize_t mode_store(struct device * dev, struct device_attribute * attr,
+ }
+ static DEVICE_ATTR_RW(mode);
+ 
++static ssize_t cl37_show(struct device *dev, struct device_attribute *attr,
++			char *buf)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	const char *an_name[] = {"disable", "SGMII MAC Side", "SGMII PHY Side", "1000/2500-BaseX"};
++	const struct {
++		const char *name;
++		u32 addr;
++	} cl37_regs[] = {
++		{"SR_AN_CTRL", AN_CTRL},
++		{"SR_MII_CTRL", SR_MII_CTRL},
++		{"SR_MII_AN_ADV", SR_MII_AN_ADV},
++		{"SR_MII_LP_BABL", SR_MII_LP_BABL},
++		{"SR_MII_EXPN", SR_MII_EXPN},
++		{"VR_MII_DIG_CTRL1", VR_MII_DIG_CTRL1},
++		{"VR_MII_AN_CTRL", VR_MII_AN_CTRL},
++		{"VR_MII_AN_INTR_STS", VR_MII_AN_INTR_STS},
++		{"VR_MII_LINK_TIMER_CTRL", VR_MII_LINK_TIMER_CTRL},
++	};
++	ssize_t off = 0, i;
++	u32 mode, phy_side, val;
++	const char *str1, *str2, *str3;
++	const char *linksts = NULL;
++
++	pdata = dev_get_drvdata(dev);
++
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
++	off += sprintf(buf, "xpcs-cl37: %u, %s\n", pdata->cl37,
++			an_name[pdata->cl37]);
++
++	off += sprintf(buf + off, "CL37 Registers:\n");
++	for (i = 0; i < ARRAY_SIZE(cl37_regs); i++)
++		off += sprintf(buf + off, "  %22s (0x%06x) - 0x%04x\n",
++				cl37_regs[i].name, cl37_regs[i].addr,
++				XPCS_RGRD(pdata, cl37_regs[i].addr) & 0xFFFF);
++
++	off += sprintf(buf + off, "CL37 Status:\n");
++	str1 = XPCS_RGRD_VAL(pdata, AN_CTRL, AN_EN) ? "enabled" : "disabled";
++	off += sprintf(buf + off, "  CL73              - %s\n", str1);
++	str1 = XPCS_RGRD_VAL(pdata, PCS_DIG_CTRL1, CL37_BP)
++		? "enabled" : "disabled";
++	off += sprintf(buf + off, "  CL37 in backplane - %s\n", str1);
++	str1 = XPCS_RGRD_VAL(pdata, SR_MII_CTRL, AN_ENABLE)
++		? "enabled" : "disabled";
++	off += sprintf(buf + off, "  CL37              - %s\n", str1);
++
++	phy_side = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, TX_CONFIG);
++	mode = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, PCS_MODE);
++	switch (mode) {
++	case 0:
++		off += sprintf(buf + off, "  ANEG Mode         - BaseX\n");
++		off += sprintf(buf + off, "    Advertised    15 Next Page %u\n",
++				XPCS_RGRD_VAL(pdata, SR_MII_AN_ADV, NP));
++		val = XPCS_RGRD_VAL(pdata, SR_MII_AN_ADV, RF);
++		switch (val) {
++		case 0: linksts = "No Error"; break;
++		case 1: linksts = "Offline"; break;
++		case 2: linksts = "Link Failure"; break;
++		case 3: linksts = "ANEG Error"; break;
++		default: linksts = "Unkown";
++		}
++		off += sprintf(buf + off, "               12~13 %s (%u)\n",
++				linksts, val);
++		val = XPCS_RGRD_VAL(pdata, SR_MII_AN_ADV, PAUSE);
++		switch (val) {
++		case 0:
++			str1 = "No Pause";
++			break;
++		case 1:
++			str1 = "Asymmetric Pause towards the link partner";
++			break;
++		case 2:
++			str1 = "Symmetric Pause";
++			break;
++		case 3:
++			str1 = "Symmetric Pause and Asymmetric Pause towards the local device";
++			break;
++		default:
++			str1 = "Unkown";
++		}
++		off += sprintf(buf + off, "                 7~8 %s (%u)\n",
++				str1, val);
++		if (XPCS_RGRD_VAL(pdata, SR_MII_AN_ADV, HD))
++			str1 = "Supported";
++		else
++			str1 = "Not Supported";
++		off += sprintf(buf + off, "                   6 Half Duplex %s\n",
++				str1);
++		if (XPCS_RGRD_VAL(pdata, SR_MII_AN_ADV, FD))
++			str1 = "Supported";
++		else
++			str1 = "Not Supported";
++		off += sprintf(buf + off, "                   5 Full Duplex %s\n",
++				str1);
++		break;
++	case 2:
++	case 3:
++		str1 = mode == 2 ? "SGMII" : "QSGMII";
++		str2 = phy_side ? "PHY" : "MAC";
++		off += sprintf(buf + off, "  ANEG Mode         - %s %s Side\n",
++				str1, str2);
++		if (!phy_side) {
++			off += sprintf(buf + off, "    Advertised Word 0x4001\n");
++			break;
++		}
++		if (XPCS_RGRD_VAL(pdata, VR_MII_DIG_CTRL1, PHY_MODE_CTRL)) {
++			off += sprintf(buf + off, "    Advertised    15 xpcs_sgmii_link_sts_i\n");
++			off += sprintf(buf + off, "                  14 1\n");
++			off += sprintf(buf + off, "                  12 xpcs_sgmii_full_duplex_i\n");
++			off += sprintf(buf + off, "               10~11 xpcs_sgmii_link_speed_i[1:0]\n");
++			off += sprintf(buf + off, "                   0 1\n");
++			break;
++		}
++		val = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS);
++		linksts = val ? "Link Up" : "Link Down";
++		off += sprintf(buf + off, "    Advertised    15 %s (%u)\n",
++				linksts, val);
++		off += sprintf(buf + off, "                  14 1\n");
++		val = XPCS_RGRD_VAL(pdata, SR_MII_AN_ADV, FD);
++		str1 = val ? "Full Duplex" : "Half Duplex";
++		off += sprintf(buf + off, "                  12 %s (%u)\n",
++				str1, val);
++		val = XPCS_RGRD_VAL(pdata, SR_MII_CTRL, SS6) << 1;
++		val |= XPCS_RGRD_VAL(pdata, SR_MII_CTRL, SS13);
++		switch (val) {
++		case 0: str1 = "10Mbps"; break;
++		case 1: str1 = "100Mbps"; break;
++		case 2: str1 = "1000Mbps"; break;
++		default: str1 = "Unknown";
++		}
++		off += sprintf(buf + off, "               10~11 %s (%u)\n",
++				str1, val);
++		off += sprintf(buf + off, "                   0 1\n");
++		break;
++	default:
++		off += sprintf(buf + off, "  ANEG Mode         - Unknown (%u)\n",
++				mode);
++	}
++
++	if (XPCS_RGRD_VAL(pdata, VR_MII_DIG_CTRL1, CL37_TMR_OVR_RIDE)) {
++		val = XPCS_RGRD(pdata, VR_MII_LINK_TIMER_CTRL) & 0xFFFF;
++		off += sprintf(buf + off, "  Link Timer        - 0x%04x\n", val);
++	} else
++		off += sprintf(buf + off, "  Link Timer        - default\n");
++	str1 = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, MII_CONTROL)
++		? "8-bit GMII Mode" : "4-bit MII Mode";
++	off += sprintf(buf + off, "  MII (100/10Mbps)  - %s\n", str1);
++	str1 = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, MII_AN_INTR_EN)
++		? "enabled" : "disabled";
++	off += sprintf(buf + off, "  ANEG Complete Int - %s\n", str1);
++	str1 = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, MII_AN_INTR_EN)
++		? "enabled" : "disabled";
++
++	val = XPCS_RGRD(pdata, VR_MII_AN_INTR_STS) & 0xFFFF;
++	XPCS_RGWR(pdata, VR_MII_AN_INTR_STS, val & ~1);
++	str1 = (val & BIT(0)) ? "completed" : "not completed";
++	off += sprintf(buf + off, "  ANEG Result       - %s\n", str1);
++	str1 = (val & BIT(4)) ? "link up" : "link down";
++	off += sprintf(buf + off, "                      %s\n", str1);
++	str2 = (val & BIT(1)) ? "full duplex" : "half duplex";
++	off += sprintf(buf + off, "                      %s\n", str2);
++	switch ((val >> 2) & 0x03) {
++	case 0: str3 = "10Mbps"; break;
++	case 1: str3 = "100Mbps"; break;
++	case 2: str3 = "1000Mbps"; break;
++	default: str3 = "unknown speed (3)";
++	}
++	off += sprintf(buf + off, "                      %s\n", str3);
++
++	if (XPCS_RGRD_VAL(pdata, VR_MII_DIG_CTRL1, PHY_MODE_CTRL)) {
++		off += sprintf(buf + off, "  Setting aft. ANEG - input signals\n");
++		off += sprintf(buf + off, "                      xpcs_sgmii_link_sts_i\n");
++		off += sprintf(buf + off, "                      xpcs_sgmii_full_duplex_i\n");
++		off += sprintf(buf + off, "                      xpcs_sgmii_link_speed_i[1:0]\n");
++	} else if (XPCS_RGRD_VAL(pdata, VR_MII_DIG_CTRL1, MAC_AUTO_SW)) {
++		off += sprintf(buf + off, "  Setting aft. ANEG - ANEG result\n");
++		off += sprintf(buf + off, "                      %s\n", str1);
++		off += sprintf(buf + off, "                      %s\n", str2);
++		off += sprintf(buf + off, "                      %s\n", str3);
++	} else {
++		off += sprintf(buf + off, "  Setting aft. ANEG - MII Settings\n");
++
++		off += sprintf(buf + off, "                      %s\n", linksts);
++		str1 = XPCS_RGRD_VAL(pdata, SR_MII_CTRL, DUPLEX_MODE)
++			? "full duplex" : "half duplex";
++		off += sprintf(buf + off, "                      %s\n", str1);
++		val = XPCS_RGRD_VAL(pdata, SR_MII_CTRL, SS6) << 1;
++		val |= XPCS_RGRD_VAL(pdata, SR_MII_CTRL, SS13);
++		switch (val) {
++		case 0: str1 = "10Mbps"; break;
++		case 1: str1 = "100Mbps"; break;
++		case 2: str1 = "1000Mbps"; break;
++		default: str1 = "Unknown";
++		}
++		off += sprintf(buf + off, "                      %s\n", str1);
++	}
++
++	return off;
++}
++
++static void cl37_help(void)
++{
++	pr_info("Usage:\n");
++	pr_info("  echo <cmd> [mac|phy] [speed <10|100|1000|2500>] > cl37\n");
++	pr_info("  cmd: help    - this page\n");
++	pr_info("       disable - disable CL37\n");
++	pr_info("       sgmii   - enable SGMII ANEG, take parameters MAC, PHY, speed\n");
++	pr_info("       basex   - enable 1000/2500-BaseX ANEG\n");
++	pr_info("       restart - restart ANEG\n");
++}
++
++static ssize_t cl37_store(struct device * dev, struct device_attribute * attr,
++			 const char * buf, size_t count)
++{
++	const char *ct = " \t\n";
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	char lbuf[256];
++	size_t len;
++	char *p, *token;
++
++	len = min(count, sizeof(lbuf)-1);
++	memcpy(lbuf, buf, len);
++	lbuf[len] = '\0';
++
++	p = lbuf;
++	token = strsep(&p, ct);
++	if (!token) {
++		cl37_help();
++		return count;
++	}
++
++	len = strlen(token);
++	if (strncasecmp(token, "disable", min_t(size_t, len, 7UL)) == 0) {
++		pdata->cl37 = CONN_TYPE_ANEG_DIS;
++		if (pdata->mode == TWOP5G_SGMII_MODE)
++			pdata->speed = SPEED_2500;
++		else
++			pdata->speed = SPEED_1000;
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS13, 0);
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS6, 1);
++		xpcs_disable_an(pdata);
++		pr_info("Disable Clause 37\n");
++	} else if (strncasecmp(token, "sgmii", min_t(size_t, len, 5UL)) == 0) {
++		u32 set_phy = 0, set_speed = 0;
++		u32 speed = 2;
++
++		for (token = strsep(&p, ct); token; token = strsep(&p, ct)) {
++			len = strlen(token);
++			if (!len)
++				continue;
++
++			if (set_speed) {
++				switch (simple_strtoull(token, NULL, 0)) {
++				case 10:  speed = 0; break;
++				case 100: speed = 1; break;
++				default: break;
++				}
++				set_speed = 0;
++				continue;
++			}
++
++			if (strncasecmp(token, "PHY", min_t(size_t, len, 3UL)) == 0)
++				set_phy = 1;
++			else if (strncasecmp(token, "speed", min_t(size_t, len, 5UL)) == 0)
++				set_speed = 1;
++		}
++
++		pdata->cl37 = set_phy ? CONN_TYPE_ANEG_PHY : CONN_TYPE_ANEG_MAC;
++		switch (speed) {
++		case 0: pdata->speed = SPEED_10; break;
++		case 1: pdata->speed = SPEED_100; break;
++		default: pdata->speed = pdata->mode == TWOP5G_SGMII_MODE ?
++					SPEED_2500 : SPEED_1000;
++		}
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS13, speed & BIT(0));
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS6, (speed >> 1) & BIT(0));
++		xpcs_cl37_an(pdata);
++		if (set_phy)
++			pr_info("Enable Clause 37, SGMII PHY Side ANEG\n");
++		else
++			pr_info("Enable Clause 37, SGMII MAC Side ANEG\n");
++	} else if (strncasecmp(token, "basex", min_t(size_t, len, 5UL)) == 0) {
++		pdata->cl37 = CONN_TYPE_ANEG_BX;
++		if (pdata->mode == TWOP5G_SGMII_MODE)
++			pdata->speed = SPEED_2500;
++		else
++			pdata->speed = SPEED_1000;
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS13, 0);
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, SS6, 1);
++		xpcs_cl37_an(pdata);
++		pr_info("Enable Clause 37, 1000/2500-BaseX ANEG\n");
++	} else if (strncasecmp(token, "restart", min_t(size_t, len, 7UL)) == 0
++		|| strncasecmp(token, "reaneg", min_t(size_t, len, 6UL)) == 0) {
++		XPCS_RGWR_VAL(pdata, SR_MII_CTRL, RESTART_ANEG, 1);
++	} else
++		cl37_help();
++
++	return count;
++}
++static DEVICE_ATTR_RW(cl37);
++
+ static struct attribute *xpcs_attrs[] = {
+ 	&dev_attr_xpcs_cl73_info.attr,
+ 	&dev_attr_xpcs_status.attr,
+@@ -836,6 +1139,7 @@ static struct attribute *xpcs_attrs[] = {
+ 	&dev_attr_rxeq.attr,
+ 	&dev_attr_txeq.attr,
+ 	&dev_attr_mode.attr,
++	&dev_attr_cl37.attr,
+ 	NULL,
+ };
+ 

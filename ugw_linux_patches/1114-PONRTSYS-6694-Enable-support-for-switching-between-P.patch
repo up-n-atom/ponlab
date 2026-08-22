@@ -1,0 +1,163 @@
+From f001a188719f2f719c775f299b9d45650f5b924f Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <przemyslawx.czarnota@intel.com>
+Date: Mon, 16 Mar 2020 06:45:30 +0100
+Subject: [PATCH] PONRTSYS-6694: Enable support for switching between PON QoS
+ and QoS Mgr driver
+
+- Support switching between PON QoS and QoS Mgr
+- Add missing dev_put()
+---
+ drivers/net/datapath/dpm/datapath_instance.c   | 17 ++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.c | 31 +++++++++++++++++++-------
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c | 14 +++++++-----
+ include/net/pon_qos_tc.h                       |  5 +++++
+ 4 files changed, 54 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index b71a382f145f..59b2a9cd4d46 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -5,6 +5,7 @@
+ 
+ #include <linux/types.h>
+ #include <net/datapath_api.h>
++#include <net/pon_qos_tc.h>
+ #include "datapath.h"
+ #include "datapath_instance.h"
+ #include "datapath_swdev_api.h"
+@@ -187,11 +188,27 @@ struct dp_dev *dp_dev_lookup(struct hlist_head *head,
+ 	return NULL;
+ }
+ 
++#if IS_ENABLED(CONFIG_PON_QOS)
++int (*pon_qos_setup_tc_fn)(struct net_device *dev,
++			   u32 handle,
++			   __be16 protocol,
++			   struct tc_to_netdev *tc,
++			   int port_id,
++			   int deq_idx);
++EXPORT_SYMBOL(pon_qos_setup_tc_fn);
++
++#endif
++
+ #if IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(4, 13, 0)
+ static int dp_ndo_setup_tc(struct net_device *dev, u32 handle,
+ 			   __be16 protocol, struct tc_to_netdev *tc)
+ {
++#if IS_ENABLED(CONFIG_PON_QOS)
++	if (pon_qos_setup_tc_fn)
++		return pon_qos_setup_tc_fn(dev, handle, protocol, tc, -1, -1);
++#endif
++
+ #if IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)
+ 	if (qos_mgr_hook_setup_tc)
+ 		return qos_mgr_hook_setup_tc(dev, handle, protocol, tc);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+index ee723464162c..5e6ab49b1ff9 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+@@ -8,17 +8,12 @@
+ #include <net/pon_qos_tc.h>
+ #include "pon_qos_tc_main.h"
+ #include "pon_qos_tc_qos.h"
++#if IS_ENABLED(CONFIG_QOS_MGR)
++#include <net/ppa/qos_mgr_tc_hook.h>
++#endif
+ 
+ #define DRV_NAME	"mod_pon_qos"
+ 
+-int (*pon_qos_setup_tc_fn)(struct net_device *dev,
+-			   u32 handle,
+-			   __be16 protocol,
+-			   struct tc_to_netdev *tc,
+-			   int port_id,
+-			   int deq_idx);
+-EXPORT_SYMBOL(pon_qos_setup_tc_fn);
+-
+ int pon_qos_setup_tc(struct net_device *dev,
+ 		     u32 handle,
+ 		     __be16 protocol,
+@@ -57,6 +52,26 @@ int pon_qos_setup_tc(struct net_device *dev,
+ }
+ EXPORT_SYMBOL(pon_qos_setup_tc);
+ 
++int pon_qos_setup_tc_gen(struct net_device *dev,
++			 u32 handle,
++			 __be16 protocol,
++			 struct tc_to_netdev *tc)
++{
++	int ret;
++	ret = pon_qos_setup_tc(dev, handle, protocol, tc, -1, -1);
++	if (!ret)
++		return ret;
++/* TODO: this has to be removed when all features are implemented in this
++ * driver
++ */
++#if IS_ENABLED(CONFIG_QOS_MGR)
++	if (qos_mgr_hook_setup_tc)
++		return qos_mgr_hook_setup_tc(dev, handle, protocol, tc);
++#endif
++	return ret;
++}
++EXPORT_SYMBOL(pon_qos_setup_tc_gen);
++
+ static int __init pon_qos_init(void)
+ {
+ 	pon_qos_setup_tc_fn = pon_qos_setup_tc;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index 9b6b53d720f3..bfd89a9eaa2e 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -130,17 +130,19 @@ int pon_qos_tc_flower_assign_tc(struct net_device *dev,
+ 
+ 	if (ifi) {
+ 		indev = dev_get_by_index(dev_net(dev), ifi);
+-		if (!indev)
+-			return -1;
++		if (!indev) {
++			ret = -1;
++			goto err;
++		}
+ 	}
+ 
+ 	ret = pon_qos_tc_flower_action_valid(f->exts);
+ 	if (ret < 0)
+-		return -EINVAL;
++		goto err;
+ 
+ 	ret = pon_qos_parse_tc_flower(f, &map);
+ 	if (ret < 0)
+-		return -EINVAL;
++		goto err;
+ 
+ 	map->dev = dev;
+ 	map->indev = indev;
+@@ -156,8 +158,10 @@ int pon_qos_tc_flower_assign_tc(struct net_device *dev,
+ 	list_add(&map->list, &tc_class_list);
+ 	return 0;
+ err:
++	if (map->indev)
++		dev_put(map->indev);
+ 	kfree(map);
+-	return -EINVAL;
++	return ret;
+ }
+ EXPORT_SYMBOL(pon_qos_tc_flower_assign_tc);
+ 
+diff --git a/include/net/pon_qos_tc.h b/include/net/pon_qos_tc.h
+index 6a512843573c..7efd51630b8e 100644
+--- a/include/net/pon_qos_tc.h
++++ b/include/net/pon_qos_tc.h
+@@ -14,6 +14,11 @@ int pon_qos_setup_tc(struct net_device *dev,
+ 		      int port_id,
+ 		      int deq_idx);
+ 
++int pon_qos_setup_tc_gen(struct net_device *dev,
++			 u32 handle,
++			 __be16 protocol,
++			 struct tc_to_netdev *tc);
++
+ extern int (*pon_qos_setup_tc_fn)(struct net_device *dev,
+ 			  u32 handle,
+ 			  __be16 protocol,

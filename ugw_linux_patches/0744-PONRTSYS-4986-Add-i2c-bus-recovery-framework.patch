@@ -1,0 +1,153 @@
+From d5bcd18c3528b1a124587a8e280c74c83b95ba95 Mon Sep 17 00:00:00 2001
+From: Peter Harliman Liem <peter.harliman.liem@intel.com>
+Date: Thu, 15 Aug 2019 22:26:43 +0800
+Subject: [PATCH] PONRTSYS-4986 - Add i2c bus recovery framework
+
+This adds i2c bus recovery framework in i2c-lantiq,
+using i2c-imx.c as reference.
+
+We use gpio method since there are no other viable way
+of manually controlling scl/sda.
+---
+ drivers/i2c/busses/i2c-lantiq.c | 72 +++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 65 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/i2c/busses/i2c-lantiq.c b/drivers/i2c/busses/i2c-lantiq.c
+index 2ff124caec1c..0664b2123af1 100644
+--- a/drivers/i2c/busses/i2c-lantiq.c
++++ b/drivers/i2c/busses/i2c-lantiq.c
+@@ -31,6 +31,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/platform_device.h>
+ #include <linux/io.h>
++#include <linux/of_gpio.h>
+ #include <linux/of_irq.h>
+ #include <linux/i2c.h>
+ #include <linux/pinctrl/consumer.h>
+@@ -81,6 +82,10 @@
+ struct ltq_i2c {
+ 	struct mutex mutex;
+ 
++	struct i2c_bus_recovery_info rinfo;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pinctrl_pins_default;
++	struct pinctrl_state *pinctrl_pins_gpio;
+ 
+ 	/* active clock settings */
+ 	unsigned int input_clock;	/* clock input for i2c hardware block */
+@@ -513,6 +518,7 @@ static int ltq_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
+ 	ret = ltq_i2c_wait_bus_not_busy(priv);
+ 	if (ret) {
+ 		dev_err(priv->dev, "%s: bus is busy %x\n", __func__, ret);
++		i2c_recover_bus(adap);
+ 		ltq_i2c_hw_init(adap);
+ 		goto done;
+ 	}
+@@ -524,6 +530,7 @@ static int ltq_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
+ 		ret = wait_for_completion_interruptible_timeout(
+ 			&priv->cmd_complete, LTQ_I2C_XFER_TIMEOUT);
+ 		if (ret == 0) {
++			i2c_recover_bus(adap);
+ 			ltq_i2c_hw_init(adap);
+ 			dev_err(priv->dev, "controller timed out 0x%x\n",
+ 				priv->msg_err);
+@@ -547,6 +554,7 @@ static int ltq_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[],
+ 					dev_err(priv->dev, " rx underflow\n");
+ 
+ 				ret = -EREMOTEIO;
++				i2c_recover_bus(adap);
+ 				ltq_i2c_hw_init(adap);
+ 			}
+ 
+@@ -782,13 +790,67 @@ static struct i2c_algorithm ltq_i2c_algorithm = {
+ 	.functionality	= ltq_i2c_functionality,
+ };
+ 
++static void ltq_i2c_prepare_recovery(struct i2c_adapter *adap)
++{
++	struct ltq_i2c *priv = i2c_get_adapdata(adap);
++
++	pinctrl_select_state(priv->pinctrl, priv->pinctrl_pins_gpio);
++}
++
++static void ltq_i2c_unprepare_recovery(struct i2c_adapter *adap)
++{
++	struct ltq_i2c *priv = i2c_get_adapdata(adap);
++
++	pinctrl_select_state(priv->pinctrl, priv->pinctrl_pins_default);
++}
++
++static int ltq_i2c_init_recovery_info(struct ltq_i2c *priv,
++				      struct platform_device *pdev)
++{
++	struct i2c_bus_recovery_info *rinfo = &priv->rinfo;
++
++	priv->pinctrl = devm_pinctrl_get(&pdev->dev);
++	if (IS_ERR_OR_NULL(priv->pinctrl)) {
++		dev_info(&pdev->dev,
++			 "can't get pinctrl, bus recovery not supported\n");
++		return PTR_ERR(priv->pinctrl);
++	}
++
++	priv->pinctrl_pins_default =
++		pinctrl_lookup_state(priv->pinctrl, PINCTRL_STATE_DEFAULT);
++	priv->pinctrl_pins_gpio = pinctrl_lookup_state(priv->pinctrl,
++						       "gpio");
++	rinfo->sda_gpio = of_get_named_gpio(pdev->dev.of_node, "sda-gpios", 0);
++	rinfo->scl_gpio = of_get_named_gpio(pdev->dev.of_node, "scl-gpios", 0);
++
++	if (rinfo->sda_gpio == -EPROBE_DEFER ||
++	    rinfo->scl_gpio == -EPROBE_DEFER) {
++		return -EPROBE_DEFER;
++	} else if (!gpio_is_valid(rinfo->sda_gpio) ||
++		   !gpio_is_valid(rinfo->scl_gpio) ||
++		   IS_ERR(priv->pinctrl_pins_default) ||
++		   IS_ERR(priv->pinctrl_pins_gpio)) {
++		dev_dbg(&pdev->dev, "recovery information incomplete\n");
++		return 0;
++	}
++
++	dev_dbg(&pdev->dev, "using scl-gpio %d and sda-gpio %d for recovery\n",
++		rinfo->sda_gpio, rinfo->scl_gpio);
++
++	rinfo->prepare_recovery = ltq_i2c_prepare_recovery;
++	rinfo->unprepare_recovery = ltq_i2c_unprepare_recovery;
++	rinfo->recover_bus = i2c_generic_gpio_recovery;
++	priv->adap.bus_recovery_info = rinfo;
++
++	return 0;
++}
++
+ static int ltq_i2c_probe(struct platform_device *pdev)
+ {
+ 	struct device_node *node = pdev->dev.of_node;
+ 	struct ltq_i2c *priv;
+ 	struct i2c_adapter *adap;
+ 	struct resource *mmres, irqres[4];
+-	struct pinctrl *pinctrl;
+ 	int ret = 0;
+ 
+ 	dev_dbg(&pdev->dev, "probing\n");
+@@ -800,12 +862,7 @@ static int ltq_i2c_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
+-	pinctrl = devm_pinctrl_get_select_default(&pdev->dev);
+-	if (IS_ERR(pinctrl))
+-		dev_warn(&pdev->dev, "pins are not configured from the driver\n");
+-
+ 	/* allocate private data */
+-
+ 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv) {
+ 		dev_err(&pdev->dev, "can't allocate private data\n");
+@@ -914,7 +971,8 @@ static int ltq_i2c_probe(struct platform_device *pdev)
+ 
+ 	adap->dev.of_node = node;
+ 
+-
++	/* optional bus recovery */
++	ltq_i2c_init_recovery_info(priv, pdev);
+ 
+ 	platform_set_drvdata(pdev, priv);
+ 

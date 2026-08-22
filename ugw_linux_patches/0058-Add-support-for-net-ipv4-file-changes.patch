@@ -1,0 +1,716 @@
+From 29792468771f6b1ef41a81390a45417686906ceb Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:12 +0800
+Subject: [PATCH] Add support for net ipv4 file changes
+
+---
+ net/ipv4/Kconfig                 |   4 +
+ net/ipv4/Makefile                |   1 +
+ net/ipv4/igmp.c                  |  24 ++++
+ net/ipv4/ip_gre.c                |  16 +++
+ net/ipv4/ip_output.c             |  17 ++-
+ net/ipv4/ipmr.c                  |  30 ++--
+ net/ipv4/netfilter/Kconfig       |  11 ++
+ net/ipv4/netfilter/Makefile      |   1 +
+ net/ipv4/netfilter/ipt_TRIGGER.c | 294 +++++++++++++++++++++++++++++++++++++++
+ net/ipv4/tcp_output.c            |  22 ++-
+ net/ipv4/udp_redirect_symb.c     |  21 +++
+ 11 files changed, 430 insertions(+), 11 deletions(-)
+
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 4d265d4a0dbe..d3b8d41266c7 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -729,3 +729,7 @@ config TCP_MD5SIG
+ 	  on the Internet.
+ 
+ 	  If unsure, say N.
++
++config MCAST_LATENCY_OPTIMIZATION
++	bool "Lantiq Multicast Latency Optimization"
++	default y
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index bc6a6c8b9bcd..b9067f45e342 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -14,6 +14,7 @@ obj-y     := route.o inetpeer.o protocol.o \
+ 	     fib_frontend.o fib_semantics.o fib_trie.o \
+ 	     inet_fragment.o ping.o ip_tunnel_core.o gre_offload.o
+ 
++obj-$(CONFIG_UDP_REDIRECT) += udp_redirect_symb.o
+ obj-$(CONFIG_NET_IP_TUNNEL) += ip_tunnel.o
+ obj-$(CONFIG_SYSCTL) += sysctl_net_ipv4.o
+ obj-$(CONFIG_PROC_FS) += proc.o
+diff --git a/net/ipv4/igmp.c b/net/ipv4/igmp.c
+index f4a827964b68..bbf98350b810 100644
+--- a/net/ipv4/igmp.c
++++ b/net/ipv4/igmp.c
+@@ -113,7 +113,13 @@
+ 
+ #define IGMP_V1_ROUTER_PRESENT_TIMEOUT		(400*HZ)
+ #define IGMP_V2_ROUTER_PRESENT_TIMEOUT		(400*HZ)
++
++#ifdef CONFIG_MCAST_LATENCY_OPTIMIZATION
++#define IGMP_V2_UNSOLICITED_REPORT_INTERVAL     (2*HZ)
++#else
+ #define IGMP_V2_UNSOLICITED_REPORT_INTERVAL	(10*HZ)
++#endif
++
+ #define IGMP_V3_UNSOLICITED_REPORT_INTERVAL	(1*HZ)
+ #define IGMP_QUERY_RESPONSE_INTERVAL		(10*HZ)
+ #define IGMP_QUERY_ROBUSTNESS_VARIABLE		2
+@@ -1289,7 +1295,13 @@ static void igmp_group_dropped(struct ip_mc_list *im)
+ 		/* IGMPv3 */
+ 		igmpv3_add_delrec(in_dev, im);
+ 
++#ifdef CONFIG_MCAST_LATENCY_OPTIMIZATION
++		in_dev->mr_ifc_count = in_dev->mr_qrv ? in_dev->mr_qrv : IGMP_QUERY_ROBUSTNESS_VARIABLE;
++		in_dev_hold(in_dev);
++		igmp_ifc_timer_expire((unsigned long)in_dev);
++#else
+ 		igmp_ifc_event(in_dev);
++#endif
+ 	}
+ #endif
+ }
+@@ -1315,16 +1327,28 @@ static void igmp_group_added(struct ip_mc_list *im)
+ 	if (in_dev->dead)
+ 		return;
+ 	if (IGMP_V1_SEEN(in_dev) || IGMP_V2_SEEN(in_dev)) {
++#ifdef CONFIG_MCAST_LATENCY_OPTIMIZATION
++		atomic_inc(&im->refcnt);
++		igmp_timer_expire((unsigned long)im);
++#else
+ 		spin_lock_bh(&im->lock);
+ 		igmp_start_timer(im, IGMP_INITIAL_REPORT_DELAY);
+ 		spin_unlock_bh(&im->lock);
++#endif
+ 		return;
+ 	}
+ 	/* else, v3 */
+ 
+ 	im->crcount = in_dev->mr_qrv ?: net->ipv4.sysctl_igmp_qrv;
++
++#ifdef CONFIG_MCAST_LATENCY_OPTIMIZATION
++	in_dev->mr_ifc_count = in_dev->mr_qrv ? in_dev->mr_qrv : IGMP_QUERY_ROBUSTNESS_VARIABLE;
++	in_dev_hold(in_dev);
++	igmp_ifc_timer_expire((unsigned long)in_dev);
++#else
+ 	igmp_ifc_event(in_dev);
+ #endif
++#endif
+ }
+ 
+ 
+diff --git a/net/ipv4/ip_gre.c b/net/ipv4/ip_gre.c
+index 9609ad71dd26..e14b1c434ded 100644
+--- a/net/ipv4/ip_gre.c
++++ b/net/ipv4/ip_gre.c
+@@ -1185,6 +1185,15 @@ static struct pernet_operations ipgre_tap_net_ops = {
+ 	.size = sizeof(struct ip_tunnel_net),
+ };
+ 
++#ifdef CONFIG_PPA
++extern uint32_t (*ppa_is_ipv4_gretap_fn)(struct net_device *dev);
++
++static u32 ppa_is_ipv4_gretap(struct net_device *dev)
++{
++	return (dev && (dev->netdev_ops == (&gre_tap_netdev_ops)));
++}
++#endif
++
+ static int __init ipgre_init(void)
+ {
+ 	int err;
+@@ -1213,6 +1222,10 @@ static int __init ipgre_init(void)
+ 	if (err < 0)
+ 		goto tap_ops_failed;
+ 
++#ifdef CONFIG_PPA
++	ppa_is_ipv4_gretap_fn = ppa_is_ipv4_gretap;
++#endif
++
+ 	return 0;
+ 
+ tap_ops_failed:
+@@ -1228,6 +1241,9 @@ static int __init ipgre_init(void)
+ 
+ static void __exit ipgre_fini(void)
+ {
++#ifdef CONFIG_PPA
++	ppa_is_ipv4_gretap_fn = NULL;
++#endif
+ 	rtnl_link_unregister(&ipgre_tap_ops);
+ 	rtnl_link_unregister(&ipgre_link_ops);
+ 	gre_del_protocol(&ipgre_protocol, GREPROTO_CISCO);
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index 3164bae4024a..4d772de0d3ca 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -300,8 +300,12 @@ static int ip_finish_output(struct net *net, struct sock *sk, struct sk_buff *sk
+ 	if (skb_is_gso(skb))
+ 		return ip_finish_output_gso(net, sk, skb, mtu);
+ 
+-	if (skb->len > mtu || IPCB(skb)->frag_max_size)
+-		return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
++	if (skb->len > mtu || IPCB(skb)->frag_max_size) {
++		 if (skb->dev->type == ARPHRD_TUNNEL6) {
++			return ip_finish_output2(net, sk, skb);
++		 }
++		 return ip_fragment(net, sk, skb, mtu, ip_finish_output2);
++	}
+ 
+ 	return ip_finish_output2(net, sk, skb);
+ }
+@@ -554,6 +558,9 @@ int ip_do_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 	__be16 not_last_frag;
+ 	struct rtable *rt = skb_rtable(skb);
+ 	int err = 0;
++#ifdef CONFIG_INTEL_IPQOS_MARK_SKBPRIO
++	__u32 old_priority = skb->priority;
++#endif
+ 
+ 	/* for offloaded checksums cleanup checksum before fragmentation */
+ 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
+@@ -648,6 +655,9 @@ int ip_do_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 				ip_send_check(iph);
+ 			}
+ 
++#ifdef CONFIG_INTEL_IPQOS_MARK_SKBPRIO
++			skb->priority = old_priority;
++#endif
+ 			err = output(net, sk, skb);
+ 
+ 			if (!err)
+@@ -785,6 +795,9 @@ int ip_do_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 
+ 		ip_send_check(iph);
+ 
++#ifdef CONFIG_INTEL_IPQOS_MARK_SKBPRIO
++		skb2->priority = old_priority;
++#endif
+ 		err = output(net, sk, skb2);
+ 		if (err)
+ 			goto fail;
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 354926e61f06..03443e764f4f 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -67,6 +67,7 @@
+ #include <net/fib_rules.h>
+ #include <linux/netconf.h>
+ #include <net/nexthop.h>
++#include<linux/mroute6.h>
+ 
+ #include <linux/nospec.h>
+ 
+@@ -114,6 +115,11 @@ static void mroute_netlink_event(struct mr_table *mrt, struct mfc_cache *mfc,
+ static void mroute_clean_tables(struct mr_table *mrt, bool all);
+ static void ipmr_expire_process(unsigned long arg);
+ 
++#if IS_ENABLED(CONFIG_MCAST_HELPER)
++void (*five_tuple_info_ptr)(struct sk_buff *skb, char iface_name[20]) = NULL;
++EXPORT_SYMBOL(five_tuple_info_ptr);
++#endif
++
+ #ifdef CONFIG_IP_MROUTE_MULTIPLE_TABLES
+ #define ipmr_for_each_table(mrt, net) \
+ 	list_for_each_entry_rcu(mrt, &net->ipv4.mr_tables, list)
+@@ -484,7 +490,7 @@ static void reg_vif_setup(struct net_device *dev)
+ 	dev->features		|= NETIF_F_NETNS_LOCAL;
+ }
+ 
+-static struct net_device *ipmr_reg_vif(struct net *net, struct mr_table *mrt)
++static struct net_device *ipmr_reg_vif (struct net *net, struct mr_table *mrt)
+ {
+ 	struct net_device *dev;
+ 	char name[IFNAMSIZ];
+@@ -559,7 +565,7 @@ static int __pim_rcv(struct mr_table *mrt, struct sk_buff *skb,
+ 	return NET_RX_SUCCESS;
+ }
+ #else
+-static struct net_device *ipmr_reg_vif(struct net *net, struct mr_table *mrt)
++static struct net_device *ipmr_reg_vif (struct net *net, struct mr_table *mrt)
+ {
+ 	return NULL;
+ }
+@@ -749,7 +755,7 @@ static int vif_add(struct net *net, struct mr_table *mrt,
+ 		 */
+ 		if (mrt->mroute_reg_vif_num >= 0)
+ 			return -EADDRINUSE;
+-		dev = ipmr_reg_vif(net, mrt);
++		dev = ipmr_reg_vif (net, mrt);
+ 		if (!dev)
+ 			return -ENOBUFS;
+ 		err = dev_set_allmulti(dev, 1);
+@@ -984,6 +990,14 @@ static int ipmr_cache_report(struct mr_table *mrt,
+ 		ip_hdr(skb)->tot_len = htons(ntohs(ip_hdr(pkt)->tot_len) +
+ 					     sizeof(struct iphdr));
+ 	} else {
++
++#if IS_ENABLED(CONFIG_MCAST_HELPER)
++		/* Send five tuple info to mcast helper */
++		if (ip_hdr(pkt)->protocol == 17)
++			if (five_tuple_info_ptr != NULL)
++				five_tuple_info_ptr(pkt, mrt->vif_table[vifi].dev->name);
++#endif
++
+ 		/* Copy the IP header */
+ 		skb_set_network_header(skb, skb->len);
+ 		skb_put(skb, ihl);
+@@ -1773,7 +1787,7 @@ static void ipmr_queue_xmit(struct net *net, struct mr_table *mrt,
+ 	kfree_skb(skb);
+ }
+ 
+-static int ipmr_find_vif(struct mr_table *mrt, struct net_device *dev)
++static int ipmr_find_vif (struct mr_table *mrt, struct net_device *dev)
+ {
+ 	int ct;
+ 
+@@ -1791,7 +1805,7 @@ static void ip_mr_forward(struct net *net, struct mr_table *mrt,
+ {
+ 	int psend = -1;
+ 	int vif, ct;
+-	int true_vifi = ipmr_find_vif(mrt, skb->dev);
++	int true_vifi = ipmr_find_vif (mrt, skb->dev);
+ 
+ 	vif = cache->mfc_parent;
+ 	cache->mfc_un.res.pkt++;
+@@ -2153,7 +2167,7 @@ int ipmr_get_route(struct net *net, struct sk_buff *skb,
+ 	rcu_read_lock();
+ 	cache = ipmr_cache_find(mrt, saddr, daddr);
+ 	if (!cache && skb->dev) {
+-		int vif = ipmr_find_vif(mrt, skb->dev);
++		int vif = ipmr_find_vif (mrt, skb->dev);
+ 
+ 		if (vif >= 0)
+ 			cache = ipmr_cache_find_any(mrt, daddr, vif);
+@@ -2172,7 +2186,7 @@ int ipmr_get_route(struct net *net, struct sk_buff *skb,
+ 		dev = skb->dev;
+ 		read_lock(&mrt_lock);
+ 		if (dev)
+-			vif = ipmr_find_vif(mrt, dev);
++			vif = ipmr_find_vif (mrt, dev);
+ 		if (vif < 0) {
+ 			read_unlock(&mrt_lock);
+ 			rcu_read_unlock();
+@@ -2458,7 +2472,7 @@ static int rtm_to_ipmr_mfcc(struct net *net, struct nlmsghdr *nlh,
+ 	*mrtret = mrt;
+ 	*mrtsock = rtm->rtm_protocol == RTPROT_MROUTED ? 1 : 0;
+ 	if (dev)
+-		mfcc->mfcc_parent = ipmr_find_vif(mrt, dev);
++		mfcc->mfcc_parent = ipmr_find_vif (mrt, dev);
+ 
+ out:
+ 	return ret;
+diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
+index d613309e3e5d..39c9f4ab9cd1 100644
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@ -252,6 +252,17 @@ config IP_NF_TARGET_SYNPROXY
+ 
+ 	  To compile it as a module, choose M here. If unsure, say N.
+ 
++config IP_NF_TARGET_TRIGGER
++        tristate "TRIGGER target support (port-trigger)"
++	    depends on NF_CONNTRACK && NETFILTER_ADVANCED
++        help
++          Port triggering is a specialized form of port forwarding in which
++          outbound traffic on predetermined ports "triggering ports") causes
++          inbound traffic to specific incoming ports to be dynamically
++          forwarded to the initiating host while the outbound ports are in use.
++
++          To compile it as a module, choose M here.  If unsure, say N.
++
+ # NAT + specific targets: nf_conntrack
+ config IP_NF_NAT
+ 	tristate "iptables NAT support"
+diff --git a/net/ipv4/netfilter/Makefile b/net/ipv4/netfilter/Makefile
+index 853328f8fd05..792cc88b1ec9 100644
+--- a/net/ipv4/netfilter/Makefile
++++ b/net/ipv4/netfilter/Makefile
+@@ -59,6 +59,7 @@ obj-$(CONFIG_IP_NF_TARGET_ECN) += ipt_ECN.o
+ obj-$(CONFIG_IP_NF_TARGET_MASQUERADE) += ipt_MASQUERADE.o
+ obj-$(CONFIG_IP_NF_TARGET_REJECT) += ipt_REJECT.o
+ obj-$(CONFIG_IP_NF_TARGET_SYNPROXY) += ipt_SYNPROXY.o
++obj-$(CONFIG_IP_NF_TARGET_TRIGGER) += ipt_TRIGGER.o
+ 
+ # generic ARP tables
+ obj-$(CONFIG_IP_NF_ARPTABLES) += arp_tables.o
+diff --git a/net/ipv4/netfilter/ipt_TRIGGER.c b/net/ipv4/netfilter/ipt_TRIGGER.c
+new file mode 100644
+index 000000000000..653ee65773e8
+--- /dev/null
++++ b/net/ipv4/netfilter/ipt_TRIGGER.c
+@@ -0,0 +1,294 @@
++/* Kernel module to match the port-ranges, trigger related port-ranges, 
++  * and alters the destination to a local IP address. 
++  * 
++  * Copyright (C) 2003, CyberTAN Corporation 
++  * All Rights Reserved. 
++  * 
++  * Description: 
++  *   This is kernel module for port-triggering. 
++  * 
++  *   The module follows the Netfilter framework, called extended packet  
++  *   matching modules.  
++  *
++  * This program is free software; you can redistribute it and/or modify
++  * it under the terms of the GNU General Public License version 2 as
++  * published by the Free Software Foundation.
++  */
++
++#include <linux/types.h>
++#include <linux/ip.h>
++#include <linux/tcp.h>
++#include <linux/timer.h>
++#include <linux/module.h>
++#include <linux/netfilter.h>
++#include <linux/netdevice.h>
++#include <linux/if.h>
++#include <linux/inetdevice.h>
++#include <net/protocol.h>
++#include <net/checksum.h>
++
++#include <linux/netfilter_ipv4.h>
++#include <linux/netfilter/x_tables.h>
++#include <net/netfilter/nf_nat.h>
++
++#include <net/netfilter/nf_conntrack.h>
++#include <linux/netfilter_ipv4/ipt_TRIGGER.h>
++
++DEFINE_RWLOCK(ip_conntrack_lock);
++
++struct ipt_trigger {
++	struct list_head list;	/* Trigger list */
++	struct timer_list timeout;	/* Timer for list destroying */
++	u_int32_t srcip;	/* Outgoing source address */
++	u_int32_t dstip;	/* Outgoing destination address */
++	u_int16_t mproto;	/* Trigger protocol */
++	u_int16_t rproto;	/* Related protocol */
++	struct ipt_trigger_ports ports;	/* Trigger and related ports */
++	u_int8_t reply;		/* Confirm a reply connection */
++};
++
++LIST_HEAD(trigger_list);
++
++static void trigger_refresh(struct ipt_trigger *trig, unsigned long extra_jiffies)
++{
++	NF_CT_ASSERT(trig);
++	write_lock_bh(&ip_conntrack_lock);
++	/* Need del_timer for race avoidance (may already be dying). */
++	if (del_timer(&trig->timeout)) {
++		trig->timeout.expires = jiffies + extra_jiffies;
++		add_timer(&trig->timeout);
++	}
++
++	write_unlock_bh(&ip_conntrack_lock);
++}
++
++static void __del_trigger(struct ipt_trigger *trig)
++{
++	NF_CT_ASSERT(trig);
++
++	/* delete from 'trigger_list' */
++	list_del(&trig->list);
++	kfree(trig);
++}
++
++static void trigger_timeout(unsigned long ul_trig)
++{
++	struct ipt_trigger *trig = (void *)ul_trig;
++
++	pr_debug("trigger list %p timed out\n", trig);
++	write_lock_bh(&ip_conntrack_lock);
++	__del_trigger(trig);
++	write_unlock_bh(&ip_conntrack_lock);
++}
++
++static unsigned int add_new_trigger(struct ipt_trigger *trig)
++{
++	struct ipt_trigger *new;
++
++	write_lock_bh(&ip_conntrack_lock);
++	new = kmalloc(sizeof(struct ipt_trigger), GFP_KERNEL);
++
++	if (!new) {
++		write_unlock_bh(&ip_conntrack_lock);
++		pr_err("%s: OOM allocating trigger list\n", __FUNCTION__);
++		return -ENOMEM;
++	}
++	memset(new, 0, sizeof(*trig));
++	INIT_LIST_HEAD(&new->list);
++	memcpy(new, trig, sizeof(*trig));
++
++	/* add to global table of trigger */
++	list_add(&new->list, &trigger_list);
++	/* add and start timer if required */
++	init_timer(&new->timeout);
++	new->timeout.data = (unsigned long)new;
++	new->timeout.function = trigger_timeout;
++	new->timeout.expires = jiffies + (TRIGGER_TIMEOUT * HZ);
++	add_timer(&new->timeout);
++
++	write_unlock_bh(&ip_conntrack_lock);
++	return 0;
++}
++
++static inline int trigger_out_matched(const struct ipt_trigger *i, const u_int16_t proto, const u_int16_t dport)
++{
++	return ((i->mproto == proto) && (i->ports.mport[0] <= dport)
++		&& (i->ports.mport[1] >= dport));
++}
++
++static unsigned int trigger_out(struct sk_buff **pskb, const struct xt_action_param *par)
++{
++	const struct ipt_trigger_info *info = par->targinfo;
++	struct ipt_trigger trig, *found;
++	const struct iphdr *iph = ip_hdr(*pskb);	//(*pskb)->nh.iph; 
++	struct tcphdr *tcph = (void *)iph + iph->ihl * 4;	/* Might be TCP, UDP */
++
++	/* Check if the trigger range has already existed in 'trigger_list'. */
++	list_for_each_entry(found, &trigger_list, list) {
++		if (trigger_out_matched(found, iph->protocol, ntohs(tcph->dest))) {
++			/* Yeah, it exists. We need to update(delay) the destroying timer. */
++			trigger_refresh(found, TRIGGER_TIMEOUT * HZ);
++			/* In order to allow multiple hosts use the same port range, we update 
++			   the 'saddr' after previous trigger has a reply connection. */
++			if (found->reply)
++				found->srcip = iph->saddr;
++			return XT_CONTINUE;	/* We don't block any packet. */
++		}
++	}
++	/* Create new trigger */
++	memset(&trig, 0, sizeof(trig));
++	trig.srcip = iph->saddr;
++	trig.mproto = iph->protocol;
++	trig.rproto = info->proto;
++	memcpy(&trig.ports, &info->ports, sizeof(struct ipt_trigger_ports));
++	add_new_trigger(&trig);	/* Add the new 'trig' to list 'trigger_list'. */
++	return XT_CONTINUE;	/* We don't block any packet. */
++}
++
++static inline int trigger_in_matched(const struct ipt_trigger *i, const u_int16_t proto, const u_int16_t dport)
++{
++	u_int16_t rproto = i->rproto;
++
++	if (!rproto)
++		rproto = proto;
++
++	return ((rproto == proto) && (i->ports.rport[0] <= dport)
++		&& (i->ports.rport[1] >= dport));
++}
++
++static unsigned int trigger_in(struct sk_buff **pskb, const struct xt_action_param *par)
++{
++	struct ipt_trigger *found;
++	const struct iphdr *iph = ip_hdr(*pskb);	//(*pskb)->nh.iph; 
++	struct tcphdr *tcph = (void *)iph + iph->ihl * 4;	/* Might be TCP, UDP */
++	/* Check if the trigger-ed range has already existed in 'trigger_list'. */
++	list_for_each_entry(found, &trigger_list, list) {
++		if (trigger_in_matched(found, iph->protocol, ntohs(tcph->dest))) {
++			/* Yeah, it exists. We need to update(delay) the destroying timer. */
++			trigger_refresh(found, TRIGGER_TIMEOUT * HZ);
++			return NF_ACCEPT;	/* Accept it, or the imcoming packet could be  
++						   dropped in the FORWARD chain */
++		}
++	}
++	return XT_CONTINUE;	/* Our job is the interception. */
++}
++
++static unsigned int trigger_dnat(struct sk_buff **pskb, const struct xt_action_param *par)
++{
++	struct ipt_trigger *found;
++	const struct iphdr *iph = ip_hdr(*pskb);	//(*pskb)->nh.iph; 
++	struct tcphdr *tcph = (void *)iph + iph->ihl * 4;	/* Might be TCP, UDP */
++	struct nf_conn *ct;
++	enum ip_conntrack_info ctinfo;
++	const struct nf_nat_ipv4_multi_range_compat *mr = par->targinfo;
++	struct nf_nat_range newrange;
++
++	NF_CT_ASSERT(par->hooknum == NF_INET_PRE_ROUTING);
++	/* Check if the trigger-ed range has already existed in 'trigger_list'. */
++	list_for_each_entry(found, &trigger_list, list) {
++		if (trigger_in_matched(found, iph->protocol, ntohs(tcph->dest))) {
++			if (!found->srcip)
++				return XT_CONTINUE;
++			found->reply = 1;	/* Confirm there has been a reply connection. */
++			ct = nf_ct_get(*pskb, &ctinfo);
++			NF_CT_ASSERT(ct && (ctinfo == IP_CT_NEW));
++
++			/* Alter the destination of incoming packet. */
++			newrange.flags = mr->range[0].flags | NF_NAT_RANGE_MAP_IPS;
++			newrange.min_addr.ip = found->srcip;
++			newrange.max_addr.ip = found->srcip;
++			newrange.min_proto = mr->range[0].min;
++			newrange.max_proto = mr->range[0].max;
++
++			/* Hand modified range to generic setup. */
++			return nf_nat_setup_info(ct, &newrange, NF_NAT_MANIP_DST);
++		}
++	}
++
++	return XT_CONTINUE;	/* We don't block any packet. */
++}
++
++static unsigned int target_trigger(struct sk_buff *skb, const struct xt_action_param *par)
++{
++
++	const struct ipt_trigger_info *info = par->targinfo;
++	const struct iphdr *iph = ip_hdr(skb);	//(*pskb)->nh.iph; 
++	struct sk_buff *pskb;
++	pskb = (struct sk_buff *)skb;
++
++	pr_debug("%s: type = %s\n", __FUNCTION__, (info->type == IPT_TRIGGER_DNAT) ? "dnat" : (info->type == IPT_TRIGGER_IN) ? "in" : "out");
++
++	/* The Port-trigger only supports TCP and UDP. */
++	if ((iph->protocol != IPPROTO_TCP) && (iph->protocol != IPPROTO_UDP))
++		return XT_CONTINUE;
++
++	if (info->type == IPT_TRIGGER_OUT)
++		return trigger_out(&pskb, par);
++	else if (info->type == IPT_TRIGGER_IN)
++		return trigger_in(&pskb, par);
++	else if (info->type == IPT_TRIGGER_DNAT)
++		return trigger_dnat(&pskb, par);
++	return XT_CONTINUE;
++
++}
++
++static int checkentry_trigger(const struct xt_tgchk_param *par)
++{
++	const struct ipt_trigger_info *info = par->targinfo;
++	struct list_head *cur_item, *tmp_item;
++
++	if ((strcmp(par->table, "mangle") == 0)) {
++		pr_err("trigger_check: bad table `%s'.\n", par->table);
++		return 0;
++	}
++	if (par->hook_mask & ~((1 << NF_INET_PRE_ROUTING) | (1 << NF_INET_FORWARD))) {
++		pr_err("trigger_check: bad hooks %x.\n", par->hook_mask);
++		return 0;
++	}
++	if (info->proto) {
++		if (info->proto != IPPROTO_TCP && info->proto != IPPROTO_UDP) {
++			pr_err("trigger_check: bad proto %d.\n", info->proto);
++			return 0;
++		}
++	}
++	if (info->type == IPT_TRIGGER_OUT) {
++		if (!info->ports.mport[0] || !info->ports.rport[0]) {
++			pr_err("trigger_check: Try 'iptbles -j TRIGGER -h' for help.\n");
++			return 0;
++		}
++	}
++
++	/* Empty the 'trigger_list' */
++	list_for_each_safe(cur_item, tmp_item, &trigger_list) {
++		struct ipt_trigger *trig = (void *)cur_item;
++
++		pr_debug("%s: list_for_each_safe(): %p.\n", __FUNCTION__, trig);
++		del_timer(&trig->timeout);
++		__del_trigger(trig);
++	}
++
++	return 0;
++}
++
++static struct xt_target ipt_trigger_reg = {
++	.name = "TRIGGER",
++	.family = NFPROTO_IPV4,
++	.target = target_trigger,
++	.targetsize = sizeof(struct ipt_trigger_info),
++	.checkentry = checkentry_trigger,
++	.me = THIS_MODULE,
++};
++
++static int __init init(void)
++{
++	return xt_register_target(&ipt_trigger_reg);
++}
++
++static void __exit fini(void)
++{
++	xt_unregister_target(&ipt_trigger_reg);
++}
++
++module_init(init);
++module_exit(fini);
++MODULE_LICENSE("GPL");
+diff --git a/net/ipv4/tcp_output.c b/net/ipv4/tcp_output.c
+index b7909160692e..fb527a1c6293 100644
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@ -42,6 +42,9 @@
+ #include <linux/gfp.h>
+ #include <linux/module.h>
+ 
++#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
++extern int32_t (*ppa_sw_litepath_tcp_send_hook)(struct sk_buff *skb);
++#endif
+ /* People can turn this off for buggy TCP's found in printers etc. */
+ int sysctl_tcp_retrans_collapse __read_mostly = 1;
+ 
+@@ -1040,9 +1043,20 @@ static int __tcp_transmit_skb(struct sock *sk, struct sk_buff *skb,
+ 	/* Cleanup our debris for IP stacks */
+ 	memset(skb->cb, 0, max(sizeof(struct inet_skb_parm),
+ 			       sizeof(struct inet6_skb_parm)));
+-
++#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
++	if (sk->sk_state == TCP_ESTABLISHED) {
++		if (ppa_sw_litepath_tcp_send_hook) {
++			err = ppa_sw_litepath_tcp_send_hook(skb);
++			if (!err)
++				goto xmit_done;
++		}
++	}
++#endif
+ 	err = icsk->icsk_af_ops->queue_xmit(sk, skb, &inet->cork.fl);
+ 
++#if IS_ENABLED(CONFIG_PPA_TCP_LITEPATH)
++xmit_done:
++#endif
+ 	if (unlikely(err > 0)) {
+ 		tcp_enter_cwr(sk);
+ 		err = net_xmit_eval(err);
+@@ -3009,7 +3023,13 @@ void tcp_send_fin(struct sock *sk)
+ 	 * Note: in the latter case, FIN packet will be sent after a timeout,
+ 	 * as TCP stack thinks it has already been transmitted.
+ 	 */
++#ifdef CONFIG_LTQ_TOE_DRIVER
++	/* don't piggyback the FIN for large packets (TSO)
++	   bug in HW will add FIN flag for all the segmented packets */
++	if (tskb && (tcp_send_head(sk) || tcp_under_memory_pressure(sk)) && (tskb->len < tcp_current_mss(sk))) {
++#else
+ 	if (tskb && (tcp_send_head(sk) || tcp_under_memory_pressure(sk))) {
++#endif
+ coalesce:
+ 		TCP_SKB_CB(tskb)->tcp_flags |= TCPHDR_FIN;
+ 		TCP_SKB_CB(tskb)->end_seq++;
+diff --git a/net/ipv4/udp_redirect_symb.c b/net/ipv4/udp_redirect_symb.c
+new file mode 100644
+index 000000000000..4951c4a61ae3
+--- /dev/null
++++ b/net/ipv4/udp_redirect_symb.c
+@@ -0,0 +1,21 @@
++/* udp_redirect_symb.c: Hook to receive packets directly from the network stack.
++ * Copyright (C) 2011-2016  Lantiq Deutschland GmbH (www.lantiq.com)
++ * Copyright (c) 2017 Intel Corporation
++ */
++
++/* ============================= */
++/* Includes                      */
++/* ============================= */
++#include <linux/module.h>
++#include <linux/udp_redirect.h>
++
++/* ============================= */
++/* Global variable definition    */
++/* ============================= */
++int (*udp_do_redirect_fn)(struct sock *sk, struct sk_buff *skb) = NULL;
++
++/* ============================= */
++/* Global function definition    */
++/* ============================= */
++
++EXPORT_SYMBOL(udp_do_redirect_fn);

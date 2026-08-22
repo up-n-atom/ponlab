@@ -1,0 +1,236 @@
+From 53f67381dfc9a06e44fad206f31bc2fe1071a0d9 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Fri, 6 Jul 2018 16:21:19 +0800
+Subject: [PATCH] DRVLIB_SW-797: DP & GSWIP changes for PON fcs,crc,spl tag
+ handling
+
+---
+ .../lantiq/datapath/gswip31/datapath_misc.c        | 55 ++++++++++++++++-
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.c   | 68 ++++++++++++++++++++++
+ include/net/datapath_api.h                         |  1 +
+ include/net/switch_api/mac_ops.h                   | 27 ++++++++-
+ 4 files changed, 149 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c
+index 1d325c32129a..ab319734902c 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c
+@@ -99,7 +99,7 @@ static void init_dma_pmac_template(int portid, u32 flags)
+ 			dp_info->dma0_mask_template[i].field.redir = 0;
+ 		}
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+-		dp_info->pmac_template[TEMPL_PTP].ptp= 1;
++		dp_info->pmac_template[TEMPL_PTP].ptp = 1;
+ #endif
+ 	} else if (flags & DP_F_DIRECTLINK) { /*always with pmac*/
+ 		/*normal dirctpath without checksum support
+@@ -767,6 +767,58 @@ static int dp_platform_set(int inst, u32 flag)
+ 	return 0;
+ }
+ 
++#define DP_GSWIP_CRC_DISABLE 1
++#define DP_GSWIP_FCS_DISABLE 0
++#define DP_GSWIP_FLOW_CTL_DISABLE 4
++static int pon_config(int inst, int ep, struct dp_port_data *data, u32 flags)
++{
++	struct core_ops *gsw_handle;
++	GSW_return_t ret;
++	struct mac_ops *mac_ops;
++	GSW_CPU_PortCfg_t cpu_port_cfg;
++
++	mac_ops = dp_port_prop[inst].mac_ops[ep];
++	gsw_handle = dp_port_prop[inst].ops[GSWIP_L];
++	memset((void *)&cpu_port_cfg, 0x00, sizeof(cpu_port_cfg));
++	ret = gsw_core_api((dp_gsw_cb)gsw_handle->gsw_common_ops.CPU_PortCfgGet,
++			   gsw_handle, &cpu_port_cfg);
++	if (ret != GSW_statusOk) {
++		PR_ERR("fail in getting CPU port config\r\n");
++		return -1;
++	}
++	/* Enable the Egress and Ingress Special Tag */
++	cpu_port_cfg.nPortId = ep;
++	cpu_port_cfg.bSpecialTagIngress = 1;
++	cpu_port_cfg.bSpecialTagEgress = 1;
++	ret = gsw_core_api((dp_gsw_cb)gsw_handle->gsw_common_ops.CPU_PortCfgSet,
++			   gsw_handle, &cpu_port_cfg);
++	if (ret != GSW_statusOk) {
++		PR_ERR("Fail in configuring CPU port\n");
++		return -1;
++	}
++
++	/* Disable Rx CRC check. Value '0'-enable, '1'-disable */
++	mac_ops->set_rx_crccheck(mac_ops, DP_GSWIP_CRC_DISABLE);
++
++	/* TX FCS generation disable. Value '1'-enable, '0'-disable */
++	if (data->flag_ops & DP_F_DATA_FCS_DISABLE)
++		mac_ops->set_fcsgen(mac_ops, DP_GSWIP_FCS_DISABLE);
++
++	/* Disables RX/TX Flow control */
++	mac_ops->set_flow_ctl(mac_ops, DP_GSWIP_FLOW_CTL_DISABLE);
++	mac_ops->set_sptag(mac_ops, SPTAG_MODE_REPLACE);
++
++	return 0;
++}
++
++static int dp_port_spl_cfg(int inst, int ep, struct dp_port_data *data,
++			   u32 flags)
++{
++	if (flags & (DP_F_GPON | DP_F_EPON))
++		pon_config(inst, ep, data, flags);
++	return 0;
++}
++
+ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 			     u32 flags)
+ {
+@@ -811,6 +863,7 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 			   CBM_QUEUE_MAP_F_MPE1_DONTCARE |
+ 			   CBM_QUEUE_MAP_F_MPE2_DONTCARE);
+ 	dp_node_reserve(inst, ep, data, flags);
++	dp_port_spl_cfg(inst, ep, data, flags);
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_DBG)
+ 	if (DP_DBG_FLAG_QOS & dp_dbg_flag) {
+ 		for (i = 0; i < port_info->deq_port_num; i++) {
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+index 608a932bec0f..3271ac90a5cd 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+@@ -613,6 +613,69 @@ int mac_get_mtu(void *pdev)
+ 	return mtu;
+ }
+ 
++static int mac_set_rxcrccheck(void *pdev, u8 disable)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++
++#ifdef __KERNEL__
++	spin_lock_bh(&pdata->mac_lock);
++#endif
++
++	xgmac_set_rxcrc(pdev, disable);
++
++	if (disable) {
++		/* Packet dont have FCS and FCS is not removed */
++		gswss_set_mac_rxfcs_op(pdev, MODE0);
++	} else {
++		/* Packet have FCS and FCS is removed */
++		gswss_set_mac_rxfcs_op(pdev, MODE2);
++	}
++
++#ifdef __KERNEL__
++	spin_unlock_bh(&pdata->mac_lock);
++#endif
++
++	return 0;
++}
++
++static int mac_set_sptag(void *pdev, u8 mode)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++
++#ifdef __KERNEL__
++	spin_lock_bh(&pdata->mac_lock);
++#endif
++
++	gswss_set_mac_txsptag_op(pdev, mode);
++
++#ifdef __KERNEL__
++	spin_unlock_bh(&pdata->mac_lock);
++#endif
++
++	return 0;
++}
++
++static int mac_set_macaddr(void *pdev, u8 *mac_addr)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++
++#ifdef __KERNEL__
++	spin_lock_bh(&pdata->mac_lock);
++#endif
++
++	lmac_set_pauseframe_addr(pdev, mac_addr);
++
++	/* Program MAC Address */
++	xgmac_set_mac_address(pdev, mac_addr);
++
++#ifdef __KERNEL__
++	spin_unlock_bh(&pdata->mac_lock);
++#endif
++
++	return 0;
++}
++
++
+ int mac_set_pfsa(void *pdev, u8 *mac_addr, u32 mode)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+@@ -1264,6 +1327,11 @@ void mac_init_fn_ptrs(struct mac_ops *mac_op)
+ 	mac_op->do_tx_hwts = xgmac_tx_hwts;
+ 	mac_op->mac_get_ts_info = xgmac_get_ts_info;
+ #endif
++
++	mac_op->set_macaddr = mac_set_macaddr;
++	mac_op->set_rx_crccheck = mac_set_rxcrccheck;
++	mac_op->set_sptag = mac_set_sptag;
++
+ 	mac_op->mac_int_en = mac_int_enable;
+ 	mac_op->mac_int_dis = mac_int_disable;
+ 
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index fd6ba8d678b5..6ee9556d6096 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -619,6 +619,7 @@ enum dp_port_data_flag {
+ 	DP_F_DATA_EVEN_FIRST = BIT(2), /*!< reserve dp_port in even number*/
+ 	DP_F_DATA_RESV_Q = BIT(3), /*!< reserve QOS queue */
+ 	DP_F_DATA_RESV_SCH = BIT(4), /*!< reserve QOS scheduler */
++	DP_F_DATA_FCS_DISABLE = BIT(5), /*!< Disable FCS for PON port on SOC */
+ };
+ 
+ /*! @brief typedef struct dp_port_data */
+diff --git a/include/net/switch_api/mac_ops.h b/include/net/switch_api/mac_ops.h
+index 51d014c78008..d685a66b8ff3 100644
+--- a/include/net/switch_api/mac_ops.h
++++ b/include/net/switch_api/mac_ops.h
+@@ -28,6 +28,31 @@ struct mac_ops {
+ 	 * return	OUT  !0:Flow Ctrl operation Set Error
+ 	 */
+ 	int(*set_flow_ctl)(void *, u32);
++	/* This function Sets the Mac Adress in xgmac.
++	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
++	 * param[in/out]IN:	*mac_addr MAC source address to Set
++	 * return	OUT	-1:	Source Address Set Error
++	 */
++	int(*set_macaddr)(void *, u8 *);
++	/* This function Enables/Disables Rx CRC check.
++	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
++	 * param[in/out]IN:	disable	Disable=1, Enable=0
++	 * return	OUT	-1:	Set Failed
++	 */
++	int(*set_rx_crccheck)(void *, u8);
++	/* This function configure treatment of special tag
++	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
++	 * param[in/out]IN:	mode	0 - packet does not have special tag
++	 *				1 - packet has special tag and special tag is replaced
++	 *				2 - packet has special tag and no modification
++	 *				3 - packet has special tag and special tag is removed
++	 * return	OUT	-1:	Set Failed
++	 */
++#define SPTAG_MODE_NOTAG	0
++#define SPTAG_MODE_REPLACE	1
++#define SPTAG_MODE_KEEP		2
++#define SPTAG_MODE_REMOVE	3
++	int(*set_sptag)(void *, u8);
+ 	/* This function Gets the Flow Ctrl operation in Both XGMAC and LMAC.
+ 	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
+ 	 * return	OUT:	mode	0 - Auto Mode based on GPHY/XPCS link.
+@@ -176,7 +201,7 @@ struct mac_ops {
+ 	int(*get_mtu)(void *);
+ 	/* This function Sets the Pause frame Source Address
+ 	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
+-	 * param[in/out]IN:	*mac_addrMAC source address to Set
++	 * param[in/out]IN:	*mac_addr MAC source address to Set
+ 	 * param[in/out]IN:	mode
+ 	 *			1 - PORT specific MAC source address
+ 	 *			0 - COMMON MAC source address

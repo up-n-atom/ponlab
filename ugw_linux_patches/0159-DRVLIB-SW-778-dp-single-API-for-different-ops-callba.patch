@@ -1,0 +1,634 @@
+From 226884073ac721f228ce891024318ff9fee239f5 Mon Sep 17 00:00:00 2001
+From: anishkhx <anishx.khurana@intel.com>
+Date: Fri, 13 Jul 2018 14:54:36 +0800
+Subject: [PATCH] DRVLIB_SW-778 : dp single API for different ops callback
+ registration updated as per review comments
+
+---
+ drivers/net/ethernet/lantiq/datapath/Makefile      |   3 +-
+ .../ethernet/lantiq/datapath/datapath_instance.c   |  51 ++----
+ .../ethernet/lantiq/datapath/datapath_instance.h   |   2 +
+ .../net/ethernet/lantiq/datapath/datapath_ioctl.c  | 159 ++++++++++++++-----
+ .../net/ethernet/lantiq/datapath/datapath_ioctl.h  |  11 +-
+ .../net/ethernet/lantiq/datapath/datapath_swdev.c  | 176 +++++++++++++--------
+ .../ethernet/lantiq/datapath/datapath_swdev_api.h  |   2 -
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c   |  10 +-
+ 8 files changed, 255 insertions(+), 159 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/Makefile b/drivers/net/ethernet/lantiq/datapath/Makefile
+index 281c794c5dbb..44ed059a5c04 100644
+--- a/drivers/net/ethernet/lantiq/datapath/Makefile
++++ b/drivers/net/ethernet/lantiq/datapath/Makefile
+@@ -11,6 +11,5 @@ ifneq ($(CONFIG_LTQ_DATAPATH_SWITCHDEV),)
+ obj-$(CONFIG_LTQ_DATAPATH) += datapath_swdev.o
+ endif
+ 
+-ifneq ($(CONFIG_LTQ_DATAPATH_PTP1588),)
+ obj-$(CONFIG_LTQ_DATAPATH) += datapath_ioctl.o
+-endif
++
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_instance.c b/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
+index 62ee978374a9..f320c3370cbc 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
+@@ -29,9 +29,7 @@
+ #include "datapath.h"
+ #include "datapath_instance.h"
+ #include "datapath_swdev_api.h"
+-#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ #include "datapath_ioctl.h"
+-#endif
+ int dp_cap_num;
+ struct dp_hw_cap hw_cap_list[DP_MAX_HW_CAP];
+ 
+@@ -193,7 +191,7 @@ struct dp_dev *dp_dev_lookup(struct hlist_head *head,
+ }
+ 
+ static int dp_ndo_setup_tc(struct net_device *dev, u32 handle,
+-		    __be16 protocol, struct tc_to_netdev *tc)
++			   __be16 protocol, struct tc_to_netdev *tc)
+ {
+ #if IS_ENABLED(CONFIG_PPA)
+ 	if (qos_mgr_hook_setup_tc)
+@@ -218,6 +216,7 @@ int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
+ 	u8 new_f = 0;
+ 	u32 idx;
+ 	struct subif_basic *subif;
++	int err = DP_SUCCESS;
+ 
+ 	if (!dev && !subif_name) {
+ 		PR_ERR("Why dev/subif_name both NULL?\n");
+@@ -273,27 +272,15 @@ int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
+ 		/*backup ops*/
+ 		if (dev) {
+ 			dev->features |= NETIF_F_HW_TC;
+-			if (!dev->netdev_ops) {
+-				PR_ERR("netdev_ops not defined\n");
+-				return -1;
+-			}
+-			if (!dp_dev->old_dev_ops) {
+-				dp_dev->old_dev_ops = NULL;
+-				dp_dev->old_dev_ops = dev->netdev_ops;
+-				dp_dev->new_dev_ops = *dev->netdev_ops;
+-				dp_dev->new_dev_ops.ndo_setup_tc =
+-							dp_ndo_setup_tc;
+-				dev->netdev_ops =
+-					(const struct net_device_ops *)
+-							&dp_dev->new_dev_ops;
+-			} else if (dev->netdev_ops ==
+-					(const struct net_device_ops *)
+-					&dp_dev->new_dev_ops) {
+-				dp_dev->new_dev_ops.ndo_setup_tc =
+-							dp_ndo_setup_tc;
+-			} else {
+-				PR_ERR("error in old dev ops assignment\n");
+-			}
++			err = dp_ops_set((void **)&dev->netdev_ops,
++					 offsetof(const struct net_device_ops,
++						  ndo_setup_tc),
++					 sizeof(*dev->netdev_ops),
++					 (void **)&dp_dev->old_dev_ops,
++					 &dp_dev->new_dev_ops,
++					 (unsigned long)&dp_ndo_setup_tc);
++			if (err)
++				return DP_FAILURE;
+ 		}
+ #endif
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_SWITCHDEV)
+@@ -346,22 +333,10 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst, int ep,
+ 
+ 			if (!dp_dev->count) { /*move to free list */
+ 				hlist_del(&dp_dev->hlist);
+-#if IS_ENABLED(CONFIG_PPA)
+-	if (dp_dev->old_dev_ops) {
+-		if (dev->netdev_ops != dp_dev->old_dev_ops) {
+-			dev->netdev_ops = dp_dev->old_dev_ops;
+-			dp_dev->old_dev_ops = NULL;
+-		}
+-	}
+-#endif
+-#if IS_ENABLED(CONFIG_LTQ_DATAPATH_SWITCHDEV)
+-				dp_port_deregister_switchdev(dp_dev, dev);
+-#endif				/*do't really free now
++				/*do't really free now
+ 				 *in case network stack is holding the callback
+ 				 */
+-#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+-				dp_deregister_ptp_ioctl(dp_dev,dev,inst);
+-#endif
++				dp_ops_reset(dp_dev, dev);
+ 				hlist_add_head(&dp_dev->hlist,
+ 					       &dp_dev_list_free[idx]);
+ 			}
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_instance.h b/drivers/net/ethernet/lantiq/datapath/datapath_instance.h
+index 9b75e1e10b49..5e70633818c0 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_instance.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_instance.h
+@@ -57,6 +57,8 @@ struct dp_dev {
+ 	struct list_head ctp_list;
+ 	const struct net_device_ops *old_dev_ops;
+ 	struct net_device_ops new_dev_ops;
++	const struct ethtool_ops *old_ethtool_ops;
++	struct ethtool_ops new_ethtool_ops;
+ #ifdef CONFIG_NET_SWITCHDEV
+ 	struct switchdev_ops *old_swdev_ops;
+ 	struct switchdev_ops new_swdev_ops;
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.c b/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.c
+index 5e5b8f1d940b..e383c7673147 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.c
+@@ -1,81 +1,162 @@
+ #include "datapath_ioctl.h"
+ 
++#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ static int dp_ndo_ptp_ioctl(struct net_device *dev,
+-                 struct ifreq *ifr, int cmd);
++			    struct ifreq *ifr,
++			    int cmd);
++#endif
+ 
++static int get_tsinfo(struct net_device *dev,
++		      struct ethtool_ts_info *ts_info)
++{
++	struct mac_ops *ops;
++	struct pmac_port_info *port = get_port_info_via_dp_name(dev);
++	int inst = 0;
++	int err = 0;
++
++	if (!port)
++		return -EFAULT;
++	ops = dp_port_prop[inst].mac_ops[port->port_id];
++	if (!ops)
++		return -EFAULT;
++	err = ops->mac_get_ts_info(ops, ts_info);
++	if (err < 0)
++		return -EFAULT;
++	DP_DEBUG(DP_DBG_FLAG_INST,
++		 "get_tsinfo done:%s\n",
++		 dev->name);
++	return 0;
++}
++
++int dp_ops_set(void **dev_ops, int ops_cb_offset,
++	       size_t ops_size, void **dp_orig_ops_cb,
++	       void *dp_new_ops, void *new_ops_cb)
++{
++	void **dev_ops_cb = NULL;
++	int i;
++
++	if (!dev_ops) {
++		PR_ERR("dev_ops NULL\n");
++		return DP_FAILURE;
++	}
++	if (!dp_new_ops) {
++		PR_ERR("dp_new_ops NULL\n");
++		return DP_FAILURE;
++	}
++	if (*dev_ops != dp_new_ops) {
++		if (*dev_ops) {
++			*dp_orig_ops_cb = *dev_ops; /* save * old * ops * */
++			for (i = 0; i < ops_size / sizeof(unsigned long *); i++)
++				*((unsigned long *)(dp_new_ops) + i) =
++					*((unsigned long *)(*dev_ops) + i);
++		} else {
++			*dp_orig_ops_cb = NULL;
++		}
++		*dev_ops = dp_new_ops;
++			}
++		/* callback for ops  */
++		dev_ops_cb = (void **)((char *)dp_new_ops + ops_cb_offset);
++		*dev_ops_cb = new_ops_cb;
++
++	return	DP_SUCCESS;
++}
+ 
++#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ static int dp_ndo_ptp_ioctl(struct net_device *dev,
+-                 struct ifreq *ifr, int cmd)
++			    struct ifreq *ifr, int cmd)
+ {
+ 	int err = 0;
+ 	struct mac_ops *ops;
+ 	int inst = 0;
+-	
+-	struct pmac_port_info *port = get_port_info_via_dp_name(dev);
+-	if(!port)
++	struct pmac_port_info *port;
++
++	port = get_port_info_via_dp_name(dev);
++	if (!port)
+ 		return -EFAULT;
+-	
++
+ 	ops = dp_port_prop[inst].mac_ops[port->port_id];
+-	if(!ops)
++	if (!ops)
+ 		return -EFAULT;
+-	
+-	switch(cmd) {
++
++	switch (cmd) {
+ 		case SIOCSHWTSTAMP: {
+-			port->f_ptp = ops->set_hwts(ops, ifr);
+-			if (port->f_ptp < 0) {
+-				err = -ERANGE;
++			err = ops->set_hwts(ops, ifr);
++			if (err < 0) {
++				port->f_ptp = 0;
+ 				break;
+ 			}
++			port->f_ptp = 1;
+ 			DP_DEBUG(DP_DBG_FLAG_DBG,
+-				"PTP in SIOCGHWTSTAMP done\n");
++				 "PTP in SIOCGHWTSTAMP done\n");
+ 			}
+ 			break;
+-		case SIOCGHWTSTAMP:
++		case SIOCGHWTSTAMP: {
+ 			ops->get_hwts(ops, ifr);
+ 			DP_DEBUG(DP_DBG_FLAG_DBG,
+-				"PTP in SIOCGHWTSTAMP done\n");
++				 "PTP in SIOCGHWTSTAMP done\n");
+ 			break;
+ 		}
++	}
+ 
+ 	return err;
+ }
+ 
+ int dp_register_ptp_ioctl(struct dp_dev *dp_dev,
+-			struct net_device *dev, int inst)
++			  struct net_device *dev, int inst)
+ {
+ 	struct dp_cap cap;
++	int err = DP_SUCCESS;
+ 
++	if (!dev)
++		return DP_FAILURE;
++	if (!dp_dev)
++		return DP_FAILURE;
+ 	cap.inst = inst;
+-	dp_get_cap(&cap,0);
++	dp_get_cap(&cap, 0);
+ 	if (!cap.hw_ptp)
+ 		return DP_FAILURE;
+-	if (!dp_dev->old_dev_ops)
+-		dp_dev->old_dev_ops = dev->netdev_ops;
+-	if (dev->netdev_ops)
+-		dp_dev->new_dev_ops = *dev->netdev_ops;
+-
+-	dp_dev->new_dev_ops.ndo_do_ioctl = dp_ndo_ptp_ioctl,
+-	dev->netdev_ops =
+-		(const struct net_device_ops *)&dp_dev->new_dev_ops;
+-	DP_DEBUG(DP_DBG_FLAG_INST,
+-		"dp_register_ptp_ioctl done:%s\n",
+-		dev->name);
+-	return DP_SUCCESS;
+-}
+ 
+-int dp_deregister_ptp_ioctl(struct dp_dev *dp_dev,
+-                  struct net_device *dev, int inst)
+-{
+-	struct dp_cap cap;
++	    /* netdev ops register */
++	err = dp_ops_set((void **)&dev->netdev_ops,
++			 offsetof(const struct net_device_ops, ndo_do_ioctl),
++			 sizeof(*dev->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &dp_ndo_ptp_ioctl);
++	if (err)
++		return DP_FAILURE;
+ 
+-	cap.inst = inst;
+-	dp_get_cap(&cap,0);
+-	if (!cap.hw_ptp)
++	/* ethtool ops register */
++	err = dp_ops_set((void **)&dev->ethtool_ops,
++			 offsetof(const struct ethtool_ops, get_ts_info),
++			 sizeof(*dev->ethtool_ops),
++			 (void **)&dp_dev->old_ethtool_ops,
++			 &dp_dev->new_ethtool_ops,
++			 &get_tsinfo);
++	if (err)
+ 		return DP_FAILURE;
+ 
+-	if (dp_dev->old_dev_ops)
++	DP_DEBUG(DP_DBG_FLAG_INST,
++		 "dp_register_ptp_ioctl done:%s\n",
++		 dev->name);
++	return DP_SUCCESS;
++}
++#endif
++int dp_ops_reset(struct dp_dev *dp_dev,
++		 struct net_device *dev)
++{
++	if (dev->netdev_ops == &dp_dev->new_dev_ops) {
+ 		dev->netdev_ops = dp_dev->old_dev_ops;
+-
++		dp_dev->old_dev_ops = NULL;
++	}
++	if (dev->ethtool_ops == &dp_dev->new_ethtool_ops) {
++		dev->ethtool_ops = dp_dev->old_ethtool_ops;
++		dp_dev->old_ethtool_ops = NULL;
++	}
++	if (dev->switchdev_ops == &dp_dev->new_swdev_ops) {
++		dev->switchdev_ops = dp_dev->old_swdev_ops;
++		dp_dev->old_swdev_ops = NULL;
++	}
+ 	return DP_SUCCESS;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.h b/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.h
+index 463d2c697113..14fa2165769d 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_ioctl.h
+@@ -6,10 +6,15 @@
+ #include "datapath.h"
+ #include "datapath_instance.h"
+ 
++#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ int dp_register_ptp_ioctl(struct dp_dev *dp_dev,
+-                  struct net_device *dp_port, int inst);
+-int dp_deregister_ptp_ioctl(struct dp_dev *dp_dev,
+-                  struct net_device *dev, int inst);
++			  struct net_device *dp_port, int inst);
++#endif
++int dp_ops_reset(struct dp_dev *dp_dev,
++		 struct net_device *dev);
++int dp_ops_set(void **dev_ops, int ops_cb_offset,
++	       size_t ops_size, void **dp_orig_ops_cb,
++		   void *dp_new_ops, void *new_ops_cb);
+ 
+ #endif
+ /*DATAPATH_IOCTL_H*/
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c b/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c
+index a8fadb8453ed..95679bbc7a29 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c
+@@ -30,6 +30,7 @@
+ #include "datapath_swdev.h"
+ #include "datapath.h"
+ #include "datapath_instance.h"
++#include "datapath_ioctl.h"
+ 
+ static void dp_swdev_insert_bridge_id_entry(struct br_info *);
+ static void dp_swdev_remove_bridge_id_entry(struct br_info *);
+@@ -1036,16 +1037,67 @@ int dp_notif_br_alloc(struct net_device *br_dev)
+ }
+ 
+ /*Register netdev_ops for switchdev*/
+-static int dp_set_netdev_ops(struct dp_dev *dp_dev)
++static int dp_set_netdev_ops(struct dp_dev *dp_dev,
++			     struct net_device *dp_port)
+ {
++	int err = DP_SUCCESS;
++
+ 	if (!dp_dev)
+ 		return -1;
+-	dp_dev->new_dev_ops.ndo_bridge_setlink = dp_ndo_bridge_setlink;
+-	dp_dev->new_dev_ops.ndo_bridge_getlink = dp_ndo_bridge_getlink;
+-	dp_dev->new_dev_ops.ndo_bridge_dellink = dp_ndo_bridge_dellink;
+-	dp_dev->new_dev_ops.ndo_fdb_add = switchdev_port_fdb_add;
+-	dp_dev->new_dev_ops.ndo_fdb_del = switchdev_port_fdb_del;
+-	dp_dev->new_dev_ops.ndo_fdb_dump = switchdev_port_fdb_dump;
++	err = dp_ops_set((void **)&dp_port->netdev_ops,
++			 offsetof(const struct net_device_ops,
++				  ndo_bridge_setlink),
++			 sizeof(*dp_port->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &dp_ndo_bridge_setlink);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->netdev_ops,
++			 offsetof(const struct net_device_ops,
++				  ndo_bridge_getlink),
++			 sizeof(*dp_port->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &dp_ndo_bridge_getlink);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->netdev_ops,
++			 offsetof(const struct net_device_ops,
++				  ndo_bridge_dellink),
++			 sizeof(*dp_port->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &dp_ndo_bridge_dellink);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->netdev_ops,
++			 offsetof(const struct net_device_ops,
++				  ndo_fdb_add),
++			 sizeof(*dp_port->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &switchdev_port_fdb_add);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->netdev_ops,
++			 offsetof(const struct net_device_ops,
++				  ndo_fdb_del),
++			 sizeof(*dp_port->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &switchdev_port_fdb_del);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->netdev_ops,
++			 offsetof(const struct net_device_ops,
++				  ndo_fdb_dump),
++			 sizeof(*dp_port->netdev_ops),
++			 (void **)&dp_dev->old_dev_ops,
++			 &dp_dev->new_dev_ops,
++			 &switchdev_port_fdb_dump);
++	if (err)
++		return DP_FAILURE;
+ 	return 0;
+ }
+ 
+@@ -1053,6 +1105,8 @@ static int dp_set_netdev_ops(struct dp_dev *dp_dev)
+ int dp_port_register_switchdev(struct dp_dev  *dp_dev,
+ 			       struct net_device *dp_port)
+ {
++	int err = DP_SUCCESS;
++
+ 	if (!dp_port) {
+ 		PR_ERR("cannot support switchdev if dev is NULL\n");
+ 		return -1;
+@@ -1062,71 +1116,57 @@ int dp_port_register_switchdev(struct dp_dev  *dp_dev,
+ 			PR_ERR("netdev_ops not defined\n");
+ 			return -1;
+ 		}
+-		/*backup ops*/
+-		if (!dp_dev->old_dev_ops) {
+-			dp_dev->old_dev_ops = NULL;
+-			dp_dev->old_dev_ops = dp_port->netdev_ops;
+-			dp_dev->new_dev_ops = *dp_port->netdev_ops;
+-			dp_set_netdev_ops(dp_dev);
+-			dp_port->netdev_ops = (const struct net_device_ops *)
+-						&dp_dev->new_dev_ops;
+-		} else if (dp_port->netdev_ops ==
+-				(const struct net_device_ops *)
+-				&dp_dev->new_dev_ops) {
+-			dp_set_netdev_ops(dp_dev);
+-		} else {
+-			PR_ERR("error in old dev ops assignment\n");
+-		}
+-		dp_dev->old_swdev_ops = NULL;
+-		if (dp_dev->old_swdev_ops)
+-			dp_dev->old_swdev_ops = (struct switchdev_ops *)
+-							dp_port->switchdev_ops;
+-		if (dp_port->switchdev_ops)
+-			dp_dev->new_swdev_ops = *dp_port->switchdev_ops;
+-		/*tune new ops */
+-		dp_dev->new_swdev_ops.switchdev_port_attr_get =
+-							dp_swdev_port_attr_get;
+-		dp_dev->new_swdev_ops.switchdev_port_attr_set =
+-							dp_swdev_port_attr_set;
+-		dp_dev->new_swdev_ops.switchdev_port_obj_add =
+-							dp_swdev_port_obj_add;
+-		dp_dev->new_swdev_ops.switchdev_port_obj_del =
+-							dp_swdev_port_obj_del;
+-		dp_dev->new_swdev_ops.switchdev_port_obj_dump =
+-							dp_swdev_port_obj_dump;
+-#ifdef CONFIG_LTQ_DATAPATH_SWDEV_TEST
+-		dp_dev->new_dev_ops.ndo_vlan_rx_add_vid =
+-				dp_swdev_vlan_rx_add,
+-		dp_dev->new_dev_ops.ndo_vlan_rx_kill_vid =
+-				dp_swdev_vlan_rx_kill,
+-		dp_dev->new_dev_ops.ndo_change_proto_down =
+-				dp_swdev_port_change_proto_down,
+-		dp_dev->new_dev_ops.ndo_neigh_destroy =
+-				dp_swdev_port_neigh_destroy,
+-#endif
+-		/*change to new ops */
+-		dp_port->switchdev_ops =
+-			(const struct switchdev_ops *)&dp_dev->new_swdev_ops;
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "dp_port_register_switchdev done:%s\n",
+-			 dp_port->name);
++	/* switchdev ops register */
++	err = dp_ops_set((void **)&dp_port->switchdev_ops,
++			 offsetof(const struct switchdev_ops,
++				  switchdev_port_attr_get),
++			 sizeof(*dp_port->switchdev_ops),
++			 (void **)&dp_dev->old_swdev_ops,
++			 &dp_dev->new_swdev_ops,
++			 &dp_swdev_port_attr_get);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->switchdev_ops,
++			 offsetof(const struct switchdev_ops,
++				  switchdev_port_attr_set),
++			 sizeof(*dp_port->switchdev_ops),
++			 (void **)&dp_dev->old_swdev_ops,
++			 &dp_dev->new_swdev_ops,
++			 &dp_swdev_port_attr_set);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->switchdev_ops,
++			 offsetof(const struct switchdev_ops,
++				  switchdev_port_obj_add),
++			 sizeof(*dp_port->switchdev_ops),
++			 (void **)&dp_dev->old_swdev_ops,
++			 &dp_dev->new_swdev_ops,
++			 &dp_swdev_port_obj_add);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->switchdev_ops,
++			 offsetof(const struct switchdev_ops,
++				  switchdev_port_obj_del),
++			 sizeof(*dp_port->switchdev_ops),
++			 (void **)&dp_dev->old_swdev_ops,
++			 &dp_dev->new_swdev_ops,
++			 &dp_swdev_port_obj_del);
++	if (err)
++		return DP_FAILURE;
++	err = dp_ops_set((void **)&dp_port->switchdev_ops,
++			 offsetof(const struct switchdev_ops,
++				  switchdev_port_obj_dump),
++			 sizeof(*dp_port->switchdev_ops),
++			 (void **)&dp_dev->old_swdev_ops,
++			 &dp_dev->new_swdev_ops,
++			 &dp_swdev_port_obj_dump);
++	if (err)
++		return DP_FAILURE;
++	dp_set_netdev_ops(dp_dev, dp_port);
+ 	}
+ 	return 0;
+ }
+ 
+-void dp_port_deregister_switchdev(struct dp_dev *dp_dev,
+-				  struct net_device *dev)
+-{
+-	if (dp_dev->old_swdev_ops)
+-		dev->switchdev_ops = dp_dev->old_swdev_ops;
+-	if (dp_dev->old_dev_ops) {
+-		if (dev->netdev_ops != dp_dev->old_dev_ops) {
+-			dev->netdev_ops = dp_dev->old_dev_ops;
+-			dp_dev->old_dev_ops = NULL;
+-		}
+-	}
+-}
+-
+ void dp_switchdev_exit(void)
+ {
+ 	int i;
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_swdev_api.h b/drivers/net/ethernet/lantiq/datapath/datapath_swdev_api.h
+index 6fbcc0ceb3d6..4e5c31de460f 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_swdev_api.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_swdev_api.h
+@@ -12,8 +12,6 @@
+ int dp_switchdev_init(void);
+ int dp_port_register_switchdev(struct dp_dev *dp_dev,
+ 			       struct net_device *dp_port);
+-void dp_port_deregister_switchdev(struct dp_dev *dp_dev,
+-				  struct net_device *dp_port);
+ int dp_del_br_if(struct net_device *dev, struct net_device *br_dev,
+ 		 int inst, int bport);
+ int dp_notif_br_alloc(struct net_device *br_dev);
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index dad37e292a92..f9010ec3c8d6 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -198,6 +198,7 @@ static int set_settings(struct net_device *dev, struct ethtool_cmd *cmd)
+ 	return -ENODEV;
+ }
+ 
++<<<<<<< HEAD
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ static int get_tsinfo(struct net_device *dev, struct ethtool_ts_info *ts_info)
+ {
+@@ -214,6 +215,8 @@ static int get_tsinfo(struct net_device *dev, struct ethtool_ts_info *ts_info)
+ }
+ #endif
+ 
++=======
++>>>>>>> DRVLIB_SW-778 : dp single API for different ops callback registration (netdev_ops,ethtool_ops,switchdev_ops
+ /* Reset the device */
+ static int nway_reset(struct net_device *dev)
+ {
+@@ -230,9 +233,6 @@ static const struct ethtool_ops ethtool_ops = {
+ 	.get_link		= ethtool_op_get_link,
+ 	.get_link_ksettings	= phy_ethtool_get_link_ksettings,
+ 	.set_link_ksettings	= phy_ethtool_set_link_ksettings,
+-#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+-	.get_ts_info		= get_tsinfo,
+-#endif
+ };
+ 
+ /* open the network device interface*/
+@@ -662,10 +662,6 @@ static int ltq_eth_init(struct net_device *dev)
+ 		dev->ethtool_ops = &ethtool_ops;
+ 	}
+ 
+-#if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+-	dev->ethtool_ops = &ethtool_ops;
+-#endif
+-
+ 	priv->dp_subif.subif = 0;
+ 	priv->dp_subif.port_id = priv->dp_port_id;
+ 

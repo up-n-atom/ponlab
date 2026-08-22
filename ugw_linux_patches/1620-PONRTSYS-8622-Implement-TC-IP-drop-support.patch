@@ -1,0 +1,494 @@
+From 014e974f1f5299a71472c4c58778c8b170c6d035 Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <kamil.rywacki@intel.com>
+Date: Thu, 25 Feb 2021 01:06:56 +0100
+Subject: [PATCH] PONRTSYS-8622: Implement TC IP drop support
+
+---
+ drivers/net/datapath/pon_qos/Makefile             |   3 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.c  |  40 +++-
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.h  |   2 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.c | 224 ++++++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.h |  28 +++
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.c     |  11 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.h     |  14 +-
+ 7 files changed, 311 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index db86f33ee4ef..59560e52a162 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -22,4 +22,5 @@ pon_qos-objs := \
+ 	pon_qos_tc_ds_tc_remap.o \
+ 	pon_qos_tc_police.o \
+ 	pon_qos_tc_tbf.o \
+-	pon_qos_tc_trap.o
++	pon_qos_tc_trap.o \
++	pon_qos_tc_ip_drop.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+index 5216361fbe04..78738d91e552 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /******************************************************************************
+  *
++ * Copyright (c) 2021 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -17,6 +18,7 @@
+ #include "pon_qos_tc_mirred.h"
+ #include "pon_qos_tc_police.h"
+ #include "pon_qos_tc_trap.h"
++#include "pon_qos_tc_ip_drop.h"
+ 
+ struct pon_qos_storage_node {
+ 	/** Unique key for TC flower - flower cookie */
+@@ -50,6 +52,8 @@ static char *flower_type_str_get(enum pon_qos_tc_flower_type type)
+ 		return "TC_TYPE_COLMARK";
+ 	case TC_TYPE_TRAP:
+ 		return "TC_TYPE_TRAP";
++	case TC_TYPE_IP_DROP:
++		return "TC_TYPE_DROP";
+ 	default:
+ 		return "TC_TYPE_UNKNOWN";
+ 	}
+@@ -94,6 +98,8 @@ static int flower_remove(struct net_device *dev,
+ 		return pon_qos_tc_unmap(dev, arg1);
+ 	case TC_TYPE_MIRRED:
+ 		return pon_qos_mirred_unoffload(dev, f, handle);
++	case TC_TYPE_IP_DROP:
++		return pon_qos_ip_drop_unoffload(dev, f, handle);
+ 	case TC_TYPE_POLICE:
+ 	case TC_TYPE_COLMARK:
+ 		return pon_qos_police_unoffload(dev, arg1, arg2);
+@@ -145,10 +151,35 @@ static bool is_type_mirred(struct net_device *dev,
+ 	return false;
+ }
+ 
++static bool is_type_ip_drop(struct net_device *dev,
++			    struct tc_cls_flower_offload *f)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++
++	if (!dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC) ||
++	    !dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_CONTROL))
++		return false;
++
++	if (!dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS) &&
++	    !dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_IPV6_ADDRS))
++		return false;
++
++	if (tc_no_actions(f->exts))
++		return false;
++
++	tcf_exts_to_list(f->exts, &actions);
++	list_for_each_entry(a, &actions, list)
++		if (is_tcf_gact_shot(a))
++			return true;
++
++	return false;
++}
++
+ static bool is_type_colmark(struct net_device *dev,
+ 			    struct tc_cls_flower_offload *f)
+ {
+-	/* This driver supports only signle actions for now */
++	/* This driver supports only single actions for now */
+ 	if (tc_no_actions(f->exts))
+ 		return false;
+ 
+@@ -158,7 +189,7 @@ static bool is_type_colmark(struct net_device *dev,
+ static bool is_type_police(struct net_device *dev,
+ 			    struct tc_cls_flower_offload *f)
+ {
+-	/* This driver supports only signle actions for now */
++	/* This driver supports only single actions for now */
+ 	if (tc_no_actions(f->exts))
+ 		return false;
+ 
+@@ -227,6 +258,9 @@ flower_type_get(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 	if (is_type_trap(dev, f))
+ 		return TC_TYPE_TRAP;
+ 
++	if (is_type_ip_drop(dev, f))
++		return TC_TYPE_IP_DROP;
++
+ 	if (is_type_mirred(dev, f))
+ 		return TC_TYPE_MIRRED;
+ 
+@@ -264,6 +298,8 @@ static int pon_qos_tc_flower_replace(struct net_device *dev,
+ 		return pon_qos_tc_vlan_filter_add(dev, f);
+ 	case TC_TYPE_QUEUE:
+ 		return pon_qos_tc_map(dev, f);
++	case TC_TYPE_IP_DROP:
++		return pon_qos_ip_drop_offload(dev, f, handle);
+ 	case TC_TYPE_MIRRED:
+ 		return pon_qos_mirred_offload(dev, f, handle);
+ 	case TC_TYPE_POLICE:
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+index 2b7be3d9296c..31274670e7cf 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /******************************************************************************
+  *
++ * Copyright (c) 2021 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -17,6 +18,7 @@ enum pon_qos_tc_flower_type {
+ 	TC_TYPE_COLMARK = 5,
+ 	TC_TYPE_TRAP = 6,
+ 	TC_TYPE_POLICE = 7,
++	TC_TYPE_IP_DROP = 8,
+ };
+ 
+ int pon_qos_tc_flower_storage_add(struct net_device *dev,
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.c
+new file mode 100644
+index 000000000000..af761a32b8d8
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.c
+@@ -0,0 +1,224 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright 2021 MaxLinear, Inc.
++ *
++ *****************************************************************************/
++
++#include <net/switch_api/gsw_types.h>
++#include <net/switch_api/lantiq_gsw.h>
++#include <net/switch_api/gsw_dev.h>
++#include <net/switch_api/lantiq_gsw_flow.h>
++#include <net/datapath_api.h>
++#include <net/flow_dissector.h>
++#include <net/pkt_cls.h>
++#include <net/ipv6.h>
++#include "pon_qos_tc_flower.h"
++#include "pon_qos_tc_pce.h"
++#include "pon_qos_tc_ip_drop.h"
++
++static int parse_mask(struct net_device *dev,
++		      GSW_PCE_rule_t *rule,
++		      u32 *mask,
++		      int mask_size)
++{
++	int m, i, idx = 0;
++	u32 mask_cpy;
++
++	if (!mask)
++		return -EIO;
++
++	if (mask_size != 1 && mask_size != 4)
++		return -EIO;
++
++	/* Convert mask to nimble */
++	for (m = 0; m < mask_size; m++) {
++		mask_cpy = mask[m];
++		for (i = 0; i < 4; i++, idx += 2) {
++			if (!(mask_cpy & 0x0f))
++				rule->pattern.nDstIP_Mask |= 1 << idx;
++			if (!(mask_cpy & 0xf0))
++				rule->pattern.nDstIP_Mask |= 1 << (idx + 1);
++			mask_cpy >>= 8;
++		}
++	}
++
++	netdev_dbg(dev, "%s: nDstIP_Mask: %u\n",
++		   __func__, rule->pattern.nDstIP_Mask);
++
++	return 0;
++}
++
++static int parse_ipv4(struct net_device *dev,
++		      struct tc_cls_flower_offload *f,
++		      GSW_PCE_rule_t *rule)
++{
++	struct flow_dissector_key_ipv4_addrs *key;
++	struct flow_dissector_key_ipv4_addrs *mask;
++
++	if (!dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS))
++		return -EIO;
++
++	key = skb_flow_dissector_target(f->dissector,
++					FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++					f->key);
++	mask = skb_flow_dissector_target(f->dissector,
++					 FLOW_DISSECTOR_KEY_IPV4_ADDRS,
++					 f->mask);
++
++	memcpy(&rule->pattern.nDstIP.nIPv4, &key->dst, sizeof(key->dst));
++	if (ipv4_is_multicast(key->dst))
++		rule->action.ePortFilterType_Action =
++			GSW_PCE_PORT_FILTER_ACTION_6;
++
++	return parse_mask(dev, rule, &mask->dst, 1);
++}
++
++static int parse_ipv6(struct net_device *dev,
++		      struct tc_cls_flower_offload *f,
++		      GSW_PCE_rule_t *rule)
++{
++	struct flow_dissector_key_ipv6_addrs *key;
++	struct flow_dissector_key_ipv6_addrs *mask;
++
++	if (!dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_IPV6_ADDRS))
++		return -EIO;
++
++	key = skb_flow_dissector_target(f->dissector,
++					FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++					f->key);
++	mask = skb_flow_dissector_target(f->dissector,
++					 FLOW_DISSECTOR_KEY_IPV6_ADDRS,
++					 f->mask);
++
++	memcpy(rule->pattern.nDstIP.nIPv6, &key->dst, sizeof(key->dst));
++	if (ipv6_addr_is_multicast(&key->dst))
++		rule->action.ePortFilterType_Action =
++			GSW_PCE_PORT_FILTER_ACTION_6;
++
++	return parse_mask(dev, rule, key->dst.in6_u.u6_addr32, 4);
++}
++
++static int parse_ip(struct net_device *dev,
++		    struct tc_cls_flower_offload *f,
++		    GSW_PCE_rule_t *pce_rule)
++{
++	u16 addr_type;
++	struct flow_dissector_key_control *key;
++
++	if (!dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_CONTROL))
++		return -EIO;
++
++	key = skb_flow_dissector_target(f->dissector,
++					FLOW_DISSECTOR_KEY_CONTROL,
++					f->key);
++	addr_type = key->addr_type;
++
++	pce_rule->pattern.eDstIP_Select = 1;
++	pce_rule->action.ePortFilterType_Action = GSW_PCE_PORT_FILTER_ACTION_1;
++
++	switch (addr_type) {
++	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
++		return parse_ipv4(dev, f, pce_rule);
++	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
++		return parse_ipv6(dev, f, pce_rule);
++	default:
++		return -EIO;
++	}
++
++	return -EIO;
++}
++
++static int pon_qos_tc_to_pce(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     GSW_PCE_rule_t *pce_rule)
++{
++	dp_subif_t dp_subif;
++	int ret = 0;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "%s: dp_get_netif_subifid failed\n",
++			   __func__);
++		return -ENODEV;
++	}
++
++	netdev_dbg(dev, "%s: using port: %d subif: %d\n",
++		   __func__, dp_subif.port_id, dp_subif.subif_groupid);
++
++	pce_rule->pattern.bEnable = 1;
++	pce_rule->pattern.bPortIdEnable = 1;
++	pce_rule->pattern.nPortId = dp_subif.port_id;
++	pce_rule->pattern.bSubIfIdEnable = 1;
++	pce_rule->pattern.nSubIfId = dp_subif.subif_groupid;
++	pce_rule->pattern.bSLAN_Vid = 1;
++	pce_rule->pattern.nSLAN_Vid = 0;
++	pce_rule->pattern.nOuterVidRange = 4095;
++	pce_rule->pattern.bSVidRange_Select = 1;
++	pce_rule->pattern.bInsertionFlag_Enable = 1;
++	pce_rule->pattern.nInsertionFlag = 0;
++
++	if (!eth_type_vlan(f->common.protocol))
++		pce_rule->pattern.bSLANVid_Exclude = 1;
++
++	ret = parse_ip(dev, f, pce_rule);
++	if (ret < 0)
++		return ret;
++
++	pce_rule->action.nForwardPortMap[0] = 0x0000;
++
++	netdev_dbg(dev, "%s: PCE rule prepared\n", __func__);
++	return ret;
++}
++
++int pon_qos_ip_drop_offload(struct net_device *dev,
++			    struct tc_cls_flower_offload *f,
++			    uint32_t tc_handle)
++{
++	GSW_PCE_rule_t *pce_rule = NULL;
++	int pref = f->common.prio >> 16;
++	int ret = 0;
++
++	pce_rule = kzalloc(sizeof(*pce_rule), GFP_KERNEL);
++	if (!pce_rule) {
++		ret = -ENOMEM;
++		goto err;
++	}
++
++	ret = pon_qos_tc_to_pce(dev, f, pce_rule);
++	if (ret != 0) {
++		kfree(pce_rule);
++		goto err;
++	}
++
++	ret = pon_qos_pce_rule_create(dev, tc_handle, pref,
++				      PCE_UNCOMMON, pce_rule);
++	if (ret != 0) {
++		kfree(pce_rule);
++		goto err;
++	}
++
++	kfree(pce_rule);
++
++	ret = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_IP_DROP,
++					    NULL, NULL);
++	if (ret < 0) {
++		(void)pon_qos_pce_rule_delete(tc_handle, pref);
++		goto err;
++	}
++
++err:
++	return ret;
++}
++
++int pon_qos_ip_drop_unoffload(struct net_device *dev,
++			      struct tc_cls_flower_offload *f,
++			      uint32_t tc_handle)
++{
++	int pref = f->common.prio >> 16;
++	int ret = 0;
++
++	ret = pon_qos_pce_rule_delete(tc_handle, pref);
++	return ret;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.h b/drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.h
+new file mode 100644
+index 000000000000..a24298435258
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ip_drop.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2021 MaxLinear, Inc.
++ *
++ *****************************************************************************/
++
++/**
++ *  Drop packets based on IP address using PCE rules.
++ *
++ *  \param[in]	dev		Network device
++ *  \param[in]	f		Flower offload
++ *  \param[in]	tc_handle	TC command identifier
++ */
++int pon_qos_ip_drop_offload(struct net_device *dev,
++			    struct tc_cls_flower_offload *f,
++			    uint32_t tc_handle);
++
++/**
++ *  Remove packets drop by removing PCE rule.
++ *
++ *  \param[in]	dev		Network device
++ *  \param[in]	f		Flower offload
++ *  \param[in]	tc_handle	TC command identifier
++ */
++int pon_qos_ip_drop_unoffload(struct net_device *dev,
++			      struct tc_cls_flower_offload *f,
++			      uint32_t tc_handle);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+index 87fe2082347a..e8ad1d61b2e3 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /******************************************************************************
+  *
+- * Copyright (c) 2020 MaxLinear, Inc.
++ * Copyright (c) 2020 - 2021 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -23,6 +23,8 @@
+ #define PON_QOS_PCE_BLOCK_ENTRIES_MAX 64
+ /** Special value used for common block */
+ #define PON_QOS_PCE_BLOCK_COMMON -1
++/** PCE sub-block size */
++#define TC_PCE_SUBBLK_SIZE 32
+ 
+ /** This structure represent list element storing relation between
+  *  TC command and PCE rule.
+@@ -64,6 +66,7 @@ static int get_subif_data(struct net_device *dev,
+ 		pr_debug("%s: portid: %u, subif: %u\n", __func__,
+ 			 PON_QOS_PCE_BLOCK_COMMON, PON_QOS_PCE_BLOCK_COMMON);
+ 		break;
++	case PCE_UNCOMMON:
+ 	case PCE_MIRR_VLAN_FWD:
+ 	case PCE_MIRR_VLAN_DROP:
+ 	case PCE_MIRR_VLAN_WILD:
+@@ -124,6 +127,10 @@ static int pce_index_range_get(enum pce_type type,
+ 		*start = 0;
+ 		*stop = PON_QOS_PCE_BLOCK_ENTRIES_MAX;
+ 		break;
++	case PCE_UNCOMMON:
++		*start = 0;
++		*stop = TC_PCE_SUBBLK_SIZE;
++		break;
+ 	case PCE_MIRR_VLAN_FWD:
+ 		*start = 0;
+ 		*stop = 16;
+@@ -154,8 +161,6 @@ static int pce_index_range_get(enum pce_type type,
+ 	return 0;
+ }
+ 
+-#define TC_PCE_SUBBLK_SIZE 32
+-
+ int pon_qos_pce_rule_create(struct net_device *dev,
+ 			    u32 tc_handle, int pref,
+ 			    enum pce_type type,
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h
+index 4e05d407f11e..ddd4f9f5b4d8 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h
+@@ -1,17 +1,21 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /******************************************************************************
+  *
++ * Copyright (c) 2021 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+ 
+ enum pce_type {
++	/* PCE rule will be placed in common block */
+ 	PCE_COMMON = 0,
+-	PCE_MIRR_VLAN_FWD = 1,
+-	PCE_MIRR_VLAN_DROP = 2,
+-	PCE_MIRR_VLAN_WILD = 3,
+-	PCE_MIRR_UNTAG_FWD = 4,
+-	PCE_MIRR_UNTAG_DROP = 5,
++	/* PCE rule will be placed in CTP block */
++	PCE_UNCOMMON = 1,
++	PCE_MIRR_VLAN_FWD = 2,
++	PCE_MIRR_VLAN_DROP = 3,
++	PCE_MIRR_VLAN_WILD = 4,
++	PCE_MIRR_UNTAG_FWD = 5,
++	PCE_MIRR_UNTAG_DROP = 6,
+ };
+ 
+ /**

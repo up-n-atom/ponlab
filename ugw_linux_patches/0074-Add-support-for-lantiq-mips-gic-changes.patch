@@ -1,0 +1,574 @@
+From b24799debe2814e8858a5f36e70e10e4991fa6d2 Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:22 +0800
+Subject: [PATCH] Add support for lantiq mips gic changes
+
+---
+ drivers/clocksource/mips-gic-timer.c |   8 +
+ drivers/irqchip/irq-mips-gic.c       | 343 ++++++++++++++++++++++++++++++-----
+ include/linux/irqchip/mips-gic.h     |  10 +
+ 3 files changed, 320 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/clocksource/mips-gic-timer.c b/drivers/clocksource/mips-gic-timer.c
+old mode 100644
+new mode 100755
+index 7a960cd01104..53249a254ad9
+--- a/drivers/clocksource/mips-gic-timer.c
++++ b/drivers/clocksource/mips-gic-timer.c
+@@ -16,6 +16,7 @@
+ #include <linux/percpu.h>
+ #include <linux/smp.h>
+ #include <linux/time.h>
++#include <linux/sched_clock.h>
+ 
+ static DEFINE_PER_CPU(struct clock_event_device, gic_clockevent_device);
+ static int gic_timer_irq;
+@@ -137,6 +138,11 @@ static struct clocksource gic_clocksource = {
+ 	.archdata	= { .vdso_clock_mode = VDSO_CLOCK_GIC },
+ };
+ 
++static u64 notrace gic_read_sched_clock(void)
++{
++	return gic_read_count();
++}
++
+ static int __init __gic_clocksource_init(void)
+ {
+ 	int ret;
+@@ -150,6 +156,8 @@ static int __init __gic_clocksource_init(void)
+ 	ret = clocksource_register_hz(&gic_clocksource, gic_frequency);
+ 	if (ret < 0)
+ 		pr_warn("GIC: Unable to register clocksource\n");
++	sched_clock_register(gic_read_sched_clock, gic_get_count_width(),
++		gic_frequency);
+ 
+ 	return ret;
+ }
+diff --git a/drivers/irqchip/irq-mips-gic.c b/drivers/irqchip/irq-mips-gic.c
+old mode 100644
+new mode 100755
+index abf696b49dd7..1785ab1ecebc
+--- a/drivers/irqchip/irq-mips-gic.c
++++ b/drivers/irqchip/irq-mips-gic.c
+@@ -23,6 +23,37 @@
+ 
+ #include <dt-bindings/interrupt-controller/mips-gic.h>
+ 
++/* The following defintions must match the static interrupt routing table */
++#define GIC_VI2_NUM_INTRS	64
++#define GIC_VI3_NUM_INTRS	64
++#define GIC_VI4_NUM_INTRS	32
++#define GIC_VI5_NUM_INTRS	32
++#define GIC_VI6_NUM_INTRS	64
++
++#define GIC_VI2_INTRS_BASE	0
++#define GIC_VI3_INTRS_BASE	GIC_VI2_NUM_INTRS
++#define GIC_VI4_INTRS_BASE	(GIC_VI2_NUM_INTRS + GIC_VI3_NUM_INTRS)
++#define GIC_VI5_INTRS_BASE	(GIC_VI2_NUM_INTRS + GIC_VI3_NUM_INTRS \
++					+ GIC_VI4_NUM_INTRS)
++#define GIC_VI6_INTRS_BASE	(GIC_VI2_NUM_INTRS + GIC_VI3_NUM_INTRS \
++					+ GIC_VI4_NUM_INTRS + GIC_VI5_NUM_INTRS)
++
++/* offset = (irq_base /32) *4 = irq_base >> 3 */
++#define GIC_VI2_SH_PEND		(GIC_SH_PEND_OFS + (GIC_VI2_INTRS_BASE >> 3))
++#define GIC_VI2_SH_MASK		(GIC_SH_MASK_OFS + (GIC_VI2_INTRS_BASE >> 3))
++
++#define GIC_VI3_SH_PEND		(GIC_SH_PEND_OFS + (GIC_VI3_INTRS_BASE >> 3))
++#define GIC_VI3_SH_MASK		(GIC_SH_MASK_OFS + (GIC_VI3_INTRS_BASE >> 3))
++
++#define GIC_VI4_SH_PEND		(GIC_SH_PEND_OFS + (GIC_VI4_INTRS_BASE >> 3))
++#define GIC_VI4_SH_MASK		(GIC_SH_MASK_OFS + (GIC_VI4_INTRS_BASE >> 3))
++
++#define GIC_VI5_SH_PEND		(GIC_SH_PEND_OFS + (GIC_VI5_INTRS_BASE >> 3))
++#define GIC_VI5_SH_MASK		(GIC_SH_MASK_OFS + (GIC_VI5_INTRS_BASE >> 3))
++
++#define GIC_VI6_SH_PEND		(GIC_SH_PEND_OFS + (GIC_VI6_INTRS_BASE >> 3))
++#define GIC_VI6_SH_MASK		(GIC_SH_MASK_OFS + (GIC_VI6_INTRS_BASE >> 3))
++
+ unsigned int gic_present;
+ 
+ struct gic_pcpu_mask {
+@@ -56,9 +87,25 @@ static unsigned int timer_cpu_pin;
+ static struct irq_chip gic_level_irq_controller, gic_edge_irq_controller;
+ DECLARE_BITMAP(ipi_resrv, GIC_MAX_INTRS);
+ DECLARE_BITMAP(ipi_available, GIC_MAX_INTRS);
++static unsigned int gic_reserved_list[GIC_MAX_INTRS];
++static unsigned int gic_reserved_list_count;
+ 
+ static void __gic_irq_dispatch(void);
+ 
++static u32 gic_irq_to_pin(unsigned int irq)
++{
++	if (irq < GIC_VI3_INTRS_BASE)
++		return GIC_CPU_INT0;
++	else if (irq < GIC_VI4_INTRS_BASE)
++		return GIC_CPU_INT1;
++	else if (irq < GIC_VI5_INTRS_BASE)
++		return GIC_CPU_INT2;
++	else if (irq < GIC_VI6_INTRS_BASE)
++		return GIC_CPU_INT3;
++	else 
++		return GIC_CPU_INT4;
++}
++
+ static inline u32 gic_read32(unsigned int reg)
+ {
+ 	return __raw_readl(gic_base + reg);
+@@ -145,6 +192,12 @@ static inline void gic_map_to_pin(unsigned int intr, unsigned int pin)
+ 		    GIC_SH_MAP_TO_PIN(intr), GIC_MAP_TO_PIN_MSK | pin);
+ }
+ 
++static inline void gic_yield_map_to_pin(unsigned int intr, unsigned int pin)
++{
++	gic_write32(GIC_REG(SHARED, GIC_SH_INTR_MAP_TO_PIN_BASE) +
++		    GIC_SH_MAP_TO_PIN(intr), GIC_MAP_TO_YQ_MSK | pin);
++}
++
+ static inline void gic_map_to_vpe(unsigned int intr, unsigned int vpe)
+ {
+ 	gic_write(GIC_REG(SHARED, GIC_SH_INTR_MAP_TO_VPE_BASE) +
+@@ -382,6 +435,52 @@ static void gic_handle_shared_int(bool chained)
+ 	}
+ }
+ 
++#define GIC_SHARED_IRQ_DISPATCH(X)					\
++do {									\
++	unsigned int i, intr, virq, gic_reg_step = mips_cm_is64 ? 8 : 4;\
++	unsigned long *pcpu_mask;					\
++	unsigned long pending_reg, intrmask_reg;			\
++	DECLARE_BITMAP(pending, GIC_VI##X##_NUM_INTRS);			\
++	DECLARE_BITMAP(intrmask, GIC_VI##X##_NUM_INTRS);		\
++									\
++	/* Get per-cpu bitmaps */					\
++	pcpu_mask = pcpu_masks[smp_processor_id()].pcpu_mask;		\
++	pending_reg =  GIC_REG_ADDR(SHARED, GIC_VI##X##_SH_PEND);	\
++	intrmask_reg =  GIC_REG_ADDR(SHARED,GIC_VI##X##_SH_MASK);	\
++	for (i = 0; i < BITS_TO_LONGS(GIC_VI##X##_NUM_INTRS); i++) {	\
++		pending[i] = gic_read(pending_reg);			\
++		intrmask[i] = gic_read(intrmask_reg);			\
++		pending_reg += gic_reg_step;				\
++		intrmask_reg += gic_reg_step;				\
++		if (!IS_ENABLED(CONFIG_64BIT) || mips_cm_is64)		\
++			continue;					\
++		pending[i] |= (u64)gic_read(pending_reg) << 32;		\
++		intrmask[i] |= (u64)gic_read(intrmask_reg) << 32;	\
++		pending_reg += gic_reg_step;				\
++		intrmask_reg += gic_reg_step;				\
++	}								\
++	bitmap_and(pending, pending, intrmask, GIC_VI##X##_NUM_INTRS);	\
++	bitmap_and(pending, pending, pcpu_mask				\
++		+ (GIC_VI##X##_INTRS_BASE >> 5), GIC_VI##X##_NUM_INTRS);\
++	for_each_set_bit(intr, pending, GIC_VI##X##_NUM_INTRS) {	\
++		virq = irq_linear_revmap(gic_irq_domain,		\
++			GIC_SHARED_TO_HWIRQ(intr + GIC_VI##X##_INTRS_BASE));\
++		do_IRQ(virq);						\
++	}								\
++} while (0)
++
++#define GIC_VIx_IRQ_DISPATCH(x)						\
++static void gic_shared_irq_vi ## x ##_dispatch(void)			\
++{									\
++	GIC_SHARED_IRQ_DISPATCH(x);					\
++}
++
++GIC_VIx_IRQ_DISPATCH(2)
++GIC_VIx_IRQ_DISPATCH(3)
++GIC_VIx_IRQ_DISPATCH(4)
++GIC_VIx_IRQ_DISPATCH(5)
++GIC_VIx_IRQ_DISPATCH(6)
++
+ static void gic_mask_irq(struct irq_data *d)
+ {
+ 	gic_reset_mask(GIC_HWIRQ_TO_SHARED(d->hwirq));
+@@ -460,7 +559,7 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *cpumask,
+ 	unsigned long	flags;
+ 	int		i;
+ 
+-	cpumask_and(&tmp, cpumask, cpu_online_mask);
++	cpumask_and(&tmp, cpumask, cpu_possible_mask);
+ 	if (cpumask_empty(&tmp))
+ 		return -EINVAL;
+ 
+@@ -480,10 +579,34 @@ static int gic_set_affinity(struct irq_data *d, const struct cpumask *cpumask,
+ 
+ 	return IRQ_SET_MASK_OK_NOCOPY;
+ }
++
++void gic_send_ipi_simple(unsigned int hwirq, unsigned int cpu)
++{
++	gic_write(GIC_REG(SHARED, GIC_SH_WEDGE), GIC_SH_WEDGE_SET(hwirq));
++}
++EXPORT_SYMBOL_GPL(gic_send_ipi_simple);
++
++int gic_clear_edge(unsigned int irq)
++{
++	irq_hw_number_t hwirq;
++	struct irq_data *d = irq_get_irq_data(irq);
++
++	if (unlikely(!d))
++		return -EINVAL;
++
++	hwirq = GIC_HWIRQ_TO_SHARED(irqd_to_hwirq(d));
++
++	gic_write(GIC_REG(SHARED, GIC_SH_WEDGE), hwirq);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gic_clear_edge);
++
+ #endif
+ 
+ static struct irq_chip gic_level_irq_controller = {
+ 	.name			=	"MIPS GIC",
++	.irq_enable		=	gic_unmask_irq,
++	.irq_disable		=	gic_mask_irq,
+ 	.irq_mask		=	gic_mask_irq,
+ 	.irq_unmask		=	gic_unmask_irq,
+ 	.irq_set_type		=	gic_set_type,
+@@ -494,6 +617,8 @@ static struct irq_chip gic_level_irq_controller = {
+ 
+ static struct irq_chip gic_edge_irq_controller = {
+ 	.name			=	"MIPS GIC",
++	.irq_enable		=	gic_unmask_irq,
++	.irq_disable		=	gic_mask_irq,
+ 	.irq_ack		=	gic_ack_irq,
+ 	.irq_mask		=	gic_mask_irq,
+ 	.irq_unmask		=	gic_unmask_irq,
+@@ -524,6 +649,11 @@ static void gic_handle_local_int(bool chained)
+ 	}
+ }
+ 
++static void gic_local_irq_dispatch(void)
++{
++	gic_handle_local_int(false);
++}
++
+ static void gic_mask_local_irq(struct irq_data *d)
+ {
+ 	int intr = GIC_HWIRQ_TO_LOCAL(d->hwirq);
+@@ -592,6 +722,17 @@ static void gic_irq_dispatch(struct irq_desc *desc)
+ 	gic_handle_shared_int(true);
+ }
+ 
++static bool gic_reserved_list_pins(unsigned int pin)
++{
++	unsigned int i;
++
++	for (i = 0; i < gic_reserved_list_count; i++) {
++		if (gic_reserved_list[i] == pin)
++			return true;
++	}
++	return false;
++}
++
+ static void __init gic_basic_init(void)
+ {
+ 	unsigned int i;
+@@ -600,9 +741,11 @@ static void __init gic_basic_init(void)
+ 
+ 	/* Setup defaults */
+ 	for (i = 0; i < gic_shared_intrs; i++) {
+-		gic_set_polarity(i, GIC_POL_POS);
+-		gic_set_trigger(i, GIC_TRIG_LEVEL);
+-		gic_reset_mask(i);
++		if (!gic_reserved_list_pins(i)) {
++			gic_set_polarity(i, GIC_POL_POS);
++			gic_set_trigger(i, GIC_TRIG_LEVEL);
++			gic_reset_mask(i);
++		}
+ 	}
+ 
+ 	for (i = 0; i < gic_vpes; i++) {
+@@ -618,17 +761,12 @@ static void __init gic_basic_init(void)
+ 	}
+ }
+ 
+-static int gic_local_irq_domain_map(struct irq_domain *d, unsigned int virq,
+-				    irq_hw_number_t hw)
++static int gic_local_int_pin_init(int intr)
+ {
+-	int intr = GIC_HWIRQ_TO_LOCAL(hw);
+-	int ret = 0;
+ 	int i;
++	int ret = 0;
+ 	unsigned long flags;
+ 
+-	if (!gic_local_irq_is_routable(intr))
+-		return -EPERM;
+-
+ 	spin_lock_irqsave(&gic_lock, flags);
+ 	for (i = 0; i < gic_vpes; i++) {
+ 		u32 val = GIC_MAP_TO_PIN_MSK | gic_cpu_pin;
+@@ -676,6 +814,17 @@ static int gic_local_irq_domain_map(struct irq_domain *d, unsigned int virq,
+ 	return ret;
+ }
+ 
++static int gic_local_irq_domain_map(struct irq_domain *d, unsigned int virq,
++				    irq_hw_number_t hw)
++{
++	int intr = GIC_HWIRQ_TO_LOCAL(hw);
++
++	if (!gic_local_irq_is_routable(intr))
++		return -EPERM;
++
++	return gic_local_int_pin_init(intr);
++}
++
+ static int gic_shared_irq_domain_map(struct irq_domain *d, unsigned int virq,
+ 				     irq_hw_number_t hw, unsigned int vpe)
+ {
+@@ -684,7 +833,10 @@ static int gic_shared_irq_domain_map(struct irq_domain *d, unsigned int virq,
+ 	int i;
+ 
+ 	spin_lock_irqsave(&gic_lock, flags);
+-	gic_map_to_pin(intr, gic_cpu_pin);
++	if (cpu_has_vint)
++		gic_map_to_pin(intr, gic_irq_to_pin(intr));
++	else
++		gic_map_to_pin(intr, gic_cpu_pin);
+ 	gic_map_to_vpe(intr, mips_cm_vp_id(vpe));
+ 	for (i = 0; i < min(gic_vpes, NR_CPUS); i++)
+ 		clear_bit(intr, pcpu_masks[i].pcpu_mask);
+@@ -969,6 +1121,33 @@ static struct irq_domain_ops gic_ipi_domain_ops = {
+ 	.match = gic_ipi_domain_match,
+ };
+ 
++static void __init gic_map_single_int(struct device_node *node,
++				     unsigned int irq)
++{
++	unsigned int linux_irq;
++	struct irq_fwspec local_int_fwspec = {
++		.fwnode	       = &node->fwnode,
++		.param_count    = 3,
++		.param	       = {
++			[0]     = GIC_LOCAL,
++			[1]     = irq,
++			[2]     = IRQ_TYPE_NONE,
++		},
++	};
++
++	if (!gic_local_irq_is_routable(irq))
++		return;
++
++	linux_irq = irq_create_fwspec_mapping(&local_int_fwspec);
++	WARN_ON(!linux_irq);
++}
++
++static void __init gic_map_interrupts(struct device_node *node)
++{
++	gic_map_single_int(node, GIC_LOCAL_INT_TIMER);
++	gic_map_single_int(node, GIC_LOCAL_INT_PERFCTR);
++}
++
+ static void __init __gic_init(unsigned long gic_base_addr,
+ 			      unsigned long gic_addrspace_size,
+ 			      unsigned int cpu_vec, unsigned int irqbase,
+@@ -1005,31 +1184,57 @@ static void __init __gic_init(unsigned long gic_base_addr,
+ 		set_vi_handler(gic_cpu_pin + GIC_PIN_TO_VEC_OFFSET,
+ 			       __gic_irq_dispatch);
+ 	} else {
+-		gic_cpu_pin = cpu_vec - GIC_CPU_PIN_OFFSET;
+-		irq_set_chained_handler(MIPS_CPU_IRQ_BASE + cpu_vec,
+-					gic_irq_dispatch);
+-		/*
+-		 * With the CMP implementation of SMP (deprecated), other CPUs
+-		 * are started by the bootloader and put into a timer based
+-		 * waiting poll loop. We must not re-route those CPU's local
+-		 * timer interrupts as the wait instruction will never finish,
+-		 * so just handle whatever CPU interrupt it is routed to by
+-		 * default.
+-		 *
+-		 * This workaround should be removed when CMP support is
+-		 * dropped.
+-		 */
+-		if (IS_ENABLED(CONFIG_MIPS_CMP) &&
+-		    gic_local_irq_is_routable(GIC_LOCAL_INT_TIMER)) {
+-			timer_cpu_pin = gic_read32(GIC_REG(VPE_LOCAL,
+-							 GIC_VPE_TIMER_MAP)) &
+-					GIC_MAP_MSK;
+-			irq_set_chained_handler(MIPS_CPU_IRQ_BASE +
+-						GIC_CPU_PIN_OFFSET +
+-						timer_cpu_pin,
+-						gic_irq_dispatch);
+-		} else {
++		if (cpu_has_vint) {
++			/* install generic handler */
++			/* 2 - Normal
++			 * 3 - Normal
++			 * 4 - Normal
++			 * 5 - Normal
++			 * 6 - Normal
++			 * 7 - Local
++			 */
++			set_vi_handler(2, gic_shared_irq_vi2_dispatch);
++			set_vi_handler(3, gic_shared_irq_vi3_dispatch);
++			set_vi_handler(4, gic_shared_irq_vi4_dispatch);
++			set_vi_handler(5, gic_shared_irq_vi5_dispatch);
++			set_vi_handler(6, gic_shared_irq_vi6_dispatch);
++			set_vi_handler(7, gic_local_irq_dispatch);
++			gic_cpu_pin = 7 - GIC_CPU_PIN_OFFSET;
+ 			timer_cpu_pin = gic_cpu_pin;
++			gic_local_int_pin_init(GIC_LOCAL_INT_WD);
++			gic_local_int_pin_init(GIC_LOCAL_INT_COMPARE);
++			gic_local_int_pin_init(GIC_LOCAL_INT_PERFCTR);
++			change_c0_status(ST0_IM, STATUSF_IP2 | STATUSF_IP3
++				| STATUSF_IP4 | STATUSF_IP5 |
++				STATUSF_IP6 | STATUSF_IP7);
++			back_to_back_c0_hazard();
++		} else {
++			gic_cpu_pin = cpu_vec - GIC_CPU_PIN_OFFSET;
++			irq_set_chained_handler(MIPS_CPU_IRQ_BASE + cpu_vec,
++						gic_irq_dispatch);
++			/*
++			 * With the CMP implementation of SMP (deprecated),
++			 * other CPUs are started by the bootloader and put
++			 * into a timer based waiting poll loop. We must not
++			 * re-route those CPU's local timer interrupts as the
++			 * wait instruction will never finish, so just handle
++			 * whatever CPU interrupt it is routed to by default.
++			 *
++			 * This workaround should be removed when CMP support
++			 * is dropped.
++			 */
++			if (IS_ENABLED(CONFIG_MIPS_CMP) &&
++			    gic_local_irq_is_routable(GIC_LOCAL_INT_TIMER)) {
++				timer_cpu_pin = gic_read32(GIC_REG(VPE_LOCAL,
++							GIC_VPE_TIMER_MAP)) &
++						GIC_MAP_MSK;
++				irq_set_chained_handler(MIPS_CPU_IRQ_BASE +
++							GIC_CPU_PIN_OFFSET +
++							timer_cpu_pin,
++							gic_irq_dispatch);
++			} else {
++				timer_cpu_pin = gic_cpu_pin;
++			}
+ 		}
+ 	}
+ 
+@@ -1041,16 +1246,16 @@ static void __init __gic_init(unsigned long gic_base_addr,
+ 	gic_irq_domain->name = "mips-gic-irq";
+ 
+ 	gic_dev_domain = irq_domain_add_hierarchy(gic_irq_domain, 0,
+-						  GIC_NUM_LOCAL_INTRS + gic_shared_intrs,
+-						  node, &gic_dev_domain_ops, NULL);
++					GIC_NUM_LOCAL_INTRS + gic_shared_intrs,
++					node, &gic_dev_domain_ops, NULL);
+ 	if (!gic_dev_domain)
+ 		panic("Failed to add GIC DEV domain");
+ 	gic_dev_domain->name = "mips-gic-dev";
+ 
+ 	gic_ipi_domain = irq_domain_add_hierarchy(gic_irq_domain,
+-						  IRQ_DOMAIN_FLAG_IPI_PER_CPU,
+-						  GIC_NUM_LOCAL_INTRS + gic_shared_intrs,
+-						  node, &gic_ipi_domain_ops, NULL);
++					IRQ_DOMAIN_FLAG_IPI_PER_CPU,
++					GIC_NUM_LOCAL_INTRS + gic_shared_intrs,
++					node, &gic_ipi_domain_ops, NULL);
+ 	if (!gic_ipi_domain)
+ 		panic("Failed to add GIC IPI domain");
+ 
+@@ -1068,7 +1273,25 @@ static void __init __gic_init(unsigned long gic_base_addr,
+ 	}
+ 
+ 	bitmap_copy(ipi_available, ipi_resrv, GIC_MAX_INTRS);
++	if (node) {
++		int t = 0;
++
++		t = of_property_count_u32_elems(node, "mti,reserved-list");
++		if (t < 0 || t > GIC_MAX_INTRS)
++			gic_reserved_list_count = 0;
++		else
++			gic_reserved_list_count = t;
++	}
++
++	if (node &&
++	    gic_reserved_list_count &&
++	    of_property_read_u32_array(node, "mti,reserved-list",
++				       gic_reserved_list,
++				       gic_reserved_list_count))
++		gic_reserved_list_count = 0;
++
+ 	gic_basic_init();
++	gic_map_interrupts(node);
+ }
+ 
+ void __init gic_init(unsigned long gic_base_addr,
+@@ -1078,6 +1301,44 @@ void __init gic_init(unsigned long gic_base_addr,
+ 	__gic_init(gic_base_addr, gic_addrspace_size, cpu_vec, irqbase, NULL);
+ }
+ 
++int gic_yield_setup(unsigned int cpu, unsigned int pin, unsigned int irq)
++{
++	int cpux;
++	unsigned long flags;
++	irq_hw_number_t hwirq;
++	struct irq_data *d = irq_get_irq_data(irq);
++
++	if (unlikely(!d))
++		return -EINVAL;
++
++	/* Sanity check */
++	if ((cpu >= nr_cpu_ids) || (pin > 0xF))
++		return -EINVAL;
++	hwirq = GIC_HWIRQ_TO_SHARED(irqd_to_hwirq(d));
++
++	spin_lock_irqsave(&gic_lock, flags);
++	gic_yield_map_to_pin(hwirq, pin);
++	gic_map_to_vpe(hwirq, cpu);
++	/* Clear all yield related percpu mask */
++	for_each_possible_cpu(cpux)
++		clear_bit(hwirq, pcpu_masks[cpux].pcpu_mask);
++	spin_unlock_irqrestore(&gic_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gic_yield_setup);
++
++unsigned long gic_read_reg(unsigned int reg)
++{
++	return gic_read(reg);
++}
++EXPORT_SYMBOL_GPL(gic_read_reg);
++
++void gic_write_reg(unsigned int reg, unsigned long val)
++{
++	return gic_write(reg, val);
++}
++EXPORT_SYMBOL_GPL(gic_write_reg);
++
+ static int __init gic_of_init(struct device_node *node,
+ 			      struct device_node *parent)
+ {
+diff --git a/include/linux/irqchip/mips-gic.h b/include/linux/irqchip/mips-gic.h
+old mode 100644
+new mode 100755
+index 81f930b0bca9..32becd06fd3d
+--- a/include/linux/irqchip/mips-gic.h
++++ b/include/linux/irqchip/mips-gic.h
+@@ -26,6 +26,9 @@
+ /* Accessors */
+ #define GIC_REG(segment, offset) (segment##_##SECTION_OFS + offset##_##OFS)
+ 
++#define GIC_REG_ADDR(segment, offset) \
++	(segment##_##SECTION_OFS + offset)
++
+ /* GIC Address Space */
+ #define SHARED_SECTION_OFS		0x0000
+ #define SHARED_SECTION_SIZE		0x8000
+@@ -270,6 +273,11 @@ extern int gic_get_c0_compare_int(void);
+ extern int gic_get_c0_perfcount_int(void);
+ extern int gic_get_c0_fdc_int(void);
+ extern int gic_get_usm_range(struct resource *gic_usm_res);
++extern unsigned long gic_read_reg(unsigned int reg);
++extern void gic_write_reg(unsigned int reg, unsigned long val);
++extern int gic_yield_setup(unsigned int cpu,
++			   unsigned int pin, unsigned int irq);
++extern int gic_clear_edge(unsigned int irq);
+ 
+ #else /* CONFIG_MIPS_GIC */
+ 
+@@ -295,4 +303,6 @@ static inline int gic_get_usm_range(struct resource *gic_usm_res)
+  */
+ extern unsigned gic_read_local_vp_id(void);
+ 
++extern void gic_send_ipi_simple(unsigned int hwirq, unsigned int cpu);
++
+ #endif /* __LINUX_IRQCHIP_MIPS_GIC_H */

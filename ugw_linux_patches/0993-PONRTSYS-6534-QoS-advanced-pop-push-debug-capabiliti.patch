@@ -1,0 +1,1341 @@
+From f3330d3c7d6073a208599d9f9a4e40ff7f910d73 Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Tue, 21 Jan 2020 10:04:07 +0200
+Subject: [PATCH] PONRTSYS-6534: QoS advanced pop/push debug capabilities
+
+---
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c  | 264 +--------------------
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h  |  32 ---
+ .../pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c   |  63 ++---
+ .../pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h  |   2 -
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h |   4 +-
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c    | 112 +++++++--
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c     |  58 ++++-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h     |   8 +-
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h    |  23 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  |  78 ++++++
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h  |  33 +++
+ drivers/net/ppv4/pp-dev/pp_dts.c                   |   5 +
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.c        | 102 ++++++++
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.h        |  29 +++
+ .../net/ppv4/pp-hal/buffer-manager/bm_internal.h   |   1 +
+ drivers/net/ppv4/pp-hal/descriptor/pp_desc.c       |  51 ++++
+ drivers/net/ppv4/pp-hal/descriptor/pp_desc.h       |  47 ++++
+ 17 files changed, 565 insertions(+), 347 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+index 073d7469e0f0..4bb73982dc72 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+@@ -21,7 +21,7 @@
+ #include <linux/bitfield.h>
+ 
+ #include "pp_common.h"
+-/* @TODO Remove once mcdma code goes out */
++#include "pp_qos_utils.h"
+ #include "pp_regs.h"
+ #include "pp_buffer_mgr.h"
+ #include "bm.h"
+@@ -35,12 +35,6 @@ static u64 qos_uc_base_addr;
+ #define MCDMA_CONTROL_OFFSET (0x8)
+ #define MCDMA_ACTIVE_MASK    (BIT(30))
+ 
+-#if (defined(CONFIG_PPV4) || defined(CONFIG_PPV4_MODULE))
+-#define BM_DATAPATH_BASE      (0xF00C0000ULL)
+-#else
+-#error "BM base is missing"
+-#endif
+-
+ static void __bmgr_work_handler(struct work_struct *w);
+ 
+ static struct bmgr_driver_db *db;
+@@ -95,33 +89,6 @@ static inline bool __bmgr_is_ready(void)
+ 	return false;
+ }
+ 
+-/**
+- * @TODO Move to QoS Driver
+- */
+-static void __copy_dma(u32 src, u32 dst, u32 flags)
+-{
+-	ulong qos_uc_mcdm0_base = (qos_uc_base_addr + QOS_UC_MCDM0_OFF);
+-	ulong mcdm0_ctrl = qos_uc_mcdm0_base + MCDMA_CONTROL_OFFSET;
+-
+-	/* source address */
+-	PP_REG_WR32(qos_uc_mcdm0_base + MCDMA_SRC_OFFSET, src);
+-	/* destination address */
+-	PP_REG_WR32(qos_uc_mcdm0_base + MCDMA_DST_OFFSET, dst);
+-
+-	pr_info("Copying from ADDR 0x%x to ADDR 0x%x\n", src, dst);
+-
+-	/* 8 bytes burst, total size is 8 byte which is 64 bits */
+-	PP_REG_WR32(mcdm0_ctrl, flags);
+-
+-	/* wait for Active bit will be 0 */
+-	if (pp_reg_poll(mcdm0_ctrl, MCDMA_ACTIVE_MASK, 0)) {
+-		pr_err("pp_reg_poll failed - dma timeout\n");
+-		return;
+-	}
+-
+-	pr_info("Copying DONE (control 0x%x)\n", PP_REG_RD32(mcdm0_ctrl));
+-}
+-
+ /**
+  * @brief Check wheather pool parameters are valid
+  * @param pool_params: Pool param from user
+@@ -516,235 +483,6 @@ static s32 __bmgr_pool_enable(u8 pool_id, bool enable)
+ 	return ret;
+ }
+ 
+-/**
+- * @TODO Move to QoS Driver
+- */
+-s32 bmgr_test_dma(u32 num_bytes)
+-{
+-	void          *addr = NULL;
+-	void          *addr1 = NULL;
+-	dma_addr_t    dma;
+-	dma_addr_t    dma1;
+-
+-#ifdef CONFIG_PPV4_FPGA
+-	addr = (void *)DDR_PP_DEBUG_BM_COPY_DMA_TEST_ADDR;
+-	dma = (u32)addr;
+-	addr1 = (void *)(DDR_PP_DEBUG_BM_COPY_DMA_TEST_ADDR + 8);
+-	dma1 = (u32)addr1;
+-	DDR_WR32((u32)addr, 0);
+-	DDR_WR32((u32)(addr + 4), 0);
+-	DDR_WR32((u32)addr1, 0xcafecafe);
+-	DDR_WR32((u32)(addr1 + 4), 0x12345678);
+-#else
+-	addr = dma_alloc_coherent(NULL, 2 * sizeof(u32), &dma,
+-				  GFP_KERNEL | GFP_DMA);
+-	if (!addr) {
+-		pr_err("Could not allocate addr using dma_alloc_coherent\n");
+-		return -ENOMEM;
+-	}
+-
+-	addr1 = dma_alloc_coherent(NULL, 2 * sizeof(u32), &dma1,
+-				   GFP_KERNEL | GFP_DMA);
+-	if (!addr1) {
+-		pr_err("Could not allocate addr1 using dma_alloc_coherent\n");
+-		dma_free_coherent(NULL, 2 * sizeof(u32), addr, dma);
+-		return -ENOMEM;
+-	}
+-	PP_REG_WR32(addr, 0);
+-	PP_REG_WR32((addr + 4), 0);
+-	PP_REG_WR32(addr1, 0xcafecafe);
+-	PP_REG_WR32((addr1 + 4), 0x12345678);
+-#endif
+-
+-	pr_info("ADDRESSES ======> %#lx[%#lx] ; %#lx[%#lx] ; %#lx[%#lx] ; %#lx[%#lx]\n",
+-		(ulong)addr, (ulong)dma, (ulong)addr + 4, (ulong)dma + 4,
+-		(ulong)addr1, (ulong)dma1, (ulong)addr1 + 4, (ulong)dma1 + 4);
+-
+-#ifdef CONFIG_PPV4_FPGA
+-	pr_info("Before TEST ======> 0x%x ; 0x%x ; 0x%x ; 0x%x\n",
+-		DDR_RD32((u32)addr), DDR_RD32((u32)addr + 4),
+-		DDR_RD32((u32)addr1), DDR_RD32((u32)addr1 + 4));
+-	/* BIT(31): kick, 4<<18: 8 byte burst */
+-	__copy_dma((u32)dma1, (u32)dma, (BIT(31) | 4 << 18 | num_bytes));
+-	pr_info("After TEST ======> 0x%x ; 0x%x ; 0x%x ; 0x%x\n",
+-		DDR_RD32((u32)addr), DDR_RD32((u32)(addr + 4)),
+-		DDR_RD32((u32)addr1), DDR_RD32((u32)(addr1 + 4)));
+-
+-	if ((DDR_RD32((u32)addr) == DDR_RD32((u32)addr1)) &&
+-	    (DDR_RD32((u32)(addr + 4)) == DDR_RD32((u32)(addr1 + 4)))) {
+-		pr_info("\nDMA Test OK\n");
+-	} else {
+-		pr_info("\nDMA Test Failed\n");
+-	}
+-#else
+-	pr_info("Before TEST ======> 0x%x ; 0x%x ; 0x%x ; 0x%x\n",
+-		PP_REG_RD32(addr), PP_REG_RD32(addr + 4),
+-		PP_REG_RD32(addr1), PP_REG_RD32(addr1 + 4));
+-	__copy_dma((u32)dma1, (u32)dma, (BIT(31) | 4 << 18 | num_bytes));
+-	pr_info("After TEST ======> 0x%x ; 0x%x ; 0x%x ; 0x%x\n",
+-		PP_REG_RD32(addr), PP_REG_RD32(addr + 4),
+-		PP_REG_RD32(addr1), PP_REG_RD32(addr1 + 4));
+-
+-	if ((PP_REG_RD32(addr) == PP_REG_RD32(addr1)) &&
+-	    (PP_REG_RD32(addr + 4) == PP_REG_RD32(addr1 + 4))) {
+-		pr_info("\nDMA Test OK\n");
+-	} else {
+-		pr_info("\nDMA Test Failed\n");
+-	}
+-
+-	dma_free_coherent(NULL, 2 * sizeof(u32), addr1, dma1);
+-	dma_free_coherent(NULL, 2 * sizeof(u32), addr, dma);
+-#endif
+-	return 0;
+-}
+-
+-s32 bmgr_pop_buffer(struct pp_bmgr_buff_info * const buff_info)
+-{
+-	dma_addr_t dma;
+-	u32        address = BM_DATAPATH_BASE;
+-	u32        idx = 0;
+-	u32        low = 0;
+-	u32        high = 0;
+-	void       *addr;
+-	u16        offset = 0;
+-	struct     bmgr_policy_db_entry *policy;
+-
+-	if (unlikely(!__bmgr_is_ready()))
+-		return -EPERM;
+-
+-	if (!buff_info) {
+-		pr_err("buff_info is NULL\n");
+-		return -EINVAL;
+-	}
+-
+-	if (buff_info->num_allocs > PP_BM_MAX_BURST_IN_POP) {
+-		pr_err("num_allocs %d is limited with %d\n",
+-		       buff_info->num_allocs, PP_BM_MAX_BURST_IN_POP);
+-		return -EINVAL;
+-	}
+-
+-	/* Write the Single/Burst bit */
+-	if (buff_info->num_allocs > 1)
+-		address |= BIT(16);
+-
+-	policy = &db->policies[buff_info->policy_id];
+-
+-	/* Write the Policy */
+-	address |= (buff_info->policy_id << 8);
+-
+-#ifdef CONFIG_PPV4_FPGA
+-	addr = (void *)DDR_PP_DEBUG_BM_POP_TEST_ADDR;
+-	dma = (u32)addr;
+-#else
+-	addr = dma_alloc_coherent(NULL,
+-				  2 * sizeof(u32) * buff_info->num_allocs,
+-				  &dma, GFP_KERNEL | GFP_DMA);
+-	if (!addr) {
+-		pr_err("Could not allocate using dma_alloc_coherent\n");
+-		return -ENOMEM;
+-	}
+-#endif
+-
+-	__copy_dma(address, (u32)dma,
+-		   (0x80100000 | (8 * buff_info->num_allocs)));
+-
+-	for (idx = 0; idx < buff_info->num_allocs; idx++) {
+-#ifdef CONFIG_PPV4_FPGA
+-		low = DDR_RD32((u32)(addr + offset));
+-		high = DDR_RD32((u32)(addr + offset + 4));
+-#else
+-		low = PP_REG_RD32(addr + offset);
+-		high = PP_REG_RD32(addr + offset + 4);
+-#endif
+-		offset += 8;
+-
+-		pr_info("POP ======> 0x%x ; 0x%x\n", low, high);
+-
+-		buff_info->addr_low[idx] = low;
+-		buff_info->addr_high[idx] = high & 0xF;
+-		buff_info->pool_id[idx] = (high & 0xFF000000) >> 24;
+-
+-		pr_info("---> pop buffer from address 0x%x (pool %u, addr low 0x%x, addr high 0x%x)\n",
+-			address, buff_info->pool_id[idx],
+-			buff_info->addr_low[idx],
+-			buff_info->addr_high[idx]);
+-
+-		if (buff_info->pool_id[idx] >=
+-		    db->cfg.max_pools) {
+-			policy->num_allocated_buffers += idx;
+-			pr_info("Can't pop from policy %d\n",
+-				buff_info->policy_id);
+-			return -ENOSPC;
+-		}
+-
+-		db->pools[buff_info->pool_id[idx]].
+-			num_allocated_buffers++;
+-	}
+-
+-	policy->num_allocated_buffers += buff_info->num_allocs;
+-
+-	return 0;
+-}
+-
+-s32 bmgr_push_buffer(struct pp_bmgr_buff_info * const buff_info)
+-{
+-	u32 address = BM_DATAPATH_BASE;
+-	u32 value = 0;
+-	u32 idx = 0;
+-	u32 ptr2push[2 * PP_BM_MAX_BURST_IN_POP]; /* 64 bit per allocation */
+-	struct bmgr_policy_db_entry *policy;
+-
+-	if (unlikely(!__bmgr_is_ready()))
+-		return -EPERM;
+-
+-	if (unlikely(!buff_info)) {
+-		pr_err("buff_info is NULL\n");
+-		return -EINVAL;
+-	}
+-
+-	if (unlikely(!buff_info->num_allocs)) {
+-		pr_err("num_allocs cannnot be 0\n");
+-		return -EINVAL;
+-	}
+-
+-	if (unlikely(buff_info->num_allocs > PP_BM_MAX_BURST_IN_POP)) {
+-		pr_err("num_allocs %d is limited with %d\n",
+-		       buff_info->num_allocs, PP_BM_MAX_BURST_IN_POP);
+-		return -EINVAL;
+-	}
+-
+-	/* Write the Single/Burst bit */
+-	if (buff_info->num_allocs > 1)
+-		address |= BIT(16);
+-
+-	/* Write the Policy */
+-	address |= (buff_info->policy_id << 8);
+-
+-	/* write to ddr */
+-	for (idx = 0; idx < buff_info->num_allocs; idx++) {
+-		ptr2push[2 * idx] = buff_info->addr_low[idx];
+-		value = (buff_info->addr_high[idx] & 0xF) |
+-			 ((buff_info->pool_id[idx] & U8_MAX) << 24);
+-		ptr2push[2 * idx + 1] = value;
+-
+-		pr_info("<--- push buffer to address 0x%x (pool %d, addr low 0x%x, addr high 0x%x, value %u)\n",
+-			address, buff_info->pool_id[idx],
+-			buff_info->addr_low[idx],
+-			buff_info->addr_high[idx], value);
+-
+-		db->pools[buff_info->pool_id[idx]].
+-			num_deallocated_buffers++;
+-	}
+-
+-	__copy_dma(ptr2push[0], address,
+-		   (0x80100000 | (8 * buff_info->num_allocs))/*0x80100008*/);
+-
+-	policy = &db->policies[buff_info->policy_id];
+-	policy->num_deallocated_buffers += buff_info->num_allocs;
+-
+-	return 0;
+-}
+-
+ static s32
+ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		      u8 *pool_id, bool lock)
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h
+index 0d31a955f009..9fa5d18943cf 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h
+@@ -45,24 +45,6 @@ struct pp_bmgr_init_param {
+ 	struct dentry *dbgfs;
+ };
+ 
+-/**
+- * \brief This structure is used for allocate and deallocate
+- *      buffer
+- * @addr_low [Out] buffer ptr low
+- * @addr_high [Out]buffer ptr high
+- * @policy_id policy to allocate from
+- * @pool_id pool for deallocate buffer back
+- * @num_allocs num ptrs to allocate (32 max)
+- */
+-struct pp_bmgr_buff_info {
+-	u32 addr_low[PP_BM_MAX_BURST_IN_POP];
+-	u32 addr_high[PP_BM_MAX_BURST_IN_POP];
+-	u16 policy_id;
+-	u8  pool_id[PP_BM_MAX_BURST_IN_POP];
+-	u8  num_allocs;
+-	u8  reserved;
+-};
+-
+ /**
+  * @brief Buffer Manager stats
+  */
+@@ -105,18 +87,4 @@ s32 bmgr_config_set(const struct pp_bmgr_init_param * const cfg);
+  */
+ s32 pp_bmgr_config_get(struct pp_bmgr_init_param * const cfg);
+ 
+-/**
+- * @brief Pop buffer
+- * @param buff_info buffer descriptor
+- * @return 0 on success, other error code on failure
+- */
+-s32 bmgr_pop_buffer(struct pp_bmgr_buff_info * const buff_info);
+-
+-/**
+- * @brief Push buffer
+- * @param buff_info buffer descriptor
+- * @return 0 on success, other error code on failure
+- */
+-s32 bmgr_push_buffer(struct pp_bmgr_buff_info * const buff_info);
+-
+ #endif /* _PP_BUFFER_MGR_H_ */
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
+index 04f3e94e46e1..2debef8d1f47 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
+@@ -19,9 +19,6 @@
+ 
+ static struct dentry *dbgfs;
+ 
+-static u16 policy_pop_test;
+-static struct pp_bmgr_buff_info buff_info;
+-
+ void __dbg_conf_set_help(struct seq_file *f)
+ {
+ 	seq_puts(f, "\"<max_policies> <max_pools>\"\n");
+@@ -512,52 +509,64 @@ void __dbg_dump_sw_stats(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(sw_stats, __dbg_dump_sw_stats, NULL);
+ 
+-void __dbg_test_dma(struct seq_file *f)
++void pop_help(struct seq_file *f)
+ {
+-	bmgr_test_dma(8);
++	seq_puts(f, "\"<policy id> <buff count (0 for all)>\"\n");
+ }
+ 
+-PP_DEFINE_DEBUGFS(test_dma, __dbg_test_dma, NULL);
++#define BM_MAX_BUFFER_POPS 1000
+ 
+-/* Currently pop one buffer from policies 0-3 in increament order */
+-void __dbg_pop(struct seq_file *f)
++void pop(char *cmd_buf, void *data)
+ {
+-	memset(&buff_info, 0x0, sizeof(buff_info));
++	struct bmgr_buff_info buff_info;
++	u32 policy, num_buff, buff_idx;
++
++	if (sscanf(cmd_buf, "%u %u", &policy, &num_buff) != 2)
++		return;
+ 
+-	buff_info.num_allocs = 1;
+-	buff_info.policy_id = policy_pop_test;
++	buff_info.policy_id = policy;
+ 
+-	bmgr_pop_buffer(&buff_info);
++	if (!num_buff)
++		num_buff = BM_MAX_BUFFER_POPS;
+ 
+-	policy_pop_test++;
+-	if (policy_pop_test == 4)
+-		policy_pop_test = 0;
++	for (buff_idx = 0; buff_idx < num_buff; buff_idx++) {
++		if (bm_pop_buffer(&buff_info))
++			break;
+ 
+-	seq_printf(f, "pop buffer address 0x%x (high 0x%x) from policy %d pool %d\n",
+-		   buff_info.addr_low[0], buff_info.addr_high[0],
+-		   buff_info.policy_id, buff_info.pool_id[0]);
++		pr_info("POP ==> %#llx (pool %u)\n", buff_info.address,
++			buff_info.pool_id);
++	}
+ }
+ 
+-PP_DEFINE_DEBUGFS(pop, __dbg_pop, NULL);
++PP_DEFINE_DEBUGFS(pop, pop_help, pop);
+ 
+-/* Currently push only last pop-ed buffer */
+-void __dbg_push(struct seq_file *f)
++void push_help(struct seq_file *f)
+ {
+-	bmgr_push_buffer(&buff_info);
++	seq_puts(f, "\"<buff addr> <pool id> <policy id>\"\n");
++}
++
++void push(char *cmd_buf, void *data)
++{
++	struct bmgr_buff_info buff_info;
++
++	if (sscanf(cmd_buf, "%llx %hhu %hu", &buff_info.address,
++		   &buff_info.pool_id, &buff_info.policy_id) != 3) {
++		return;
++	}
++
++	pr_info("<== PUSH %#llx (pool %u, policy %u)\n", buff_info.address,
++		buff_info.pool_id, buff_info.policy_id);
+ 
+-	seq_printf(f, "push buffer address 0x%x (high 0x%x) from policy %d pool %d\n",
+-		   buff_info.addr_low[0], buff_info.addr_high[0],
+-		   buff_info.policy_id, buff_info.pool_id[0]);
++	bm_push_buffer(&buff_info);
+ }
+ 
+-PP_DEFINE_DEBUGFS(push, __dbg_push, NULL);
++PP_DEFINE_DEBUGFS(push, push_help, push);
+ 
+ static struct debugfs_file bm_debugfs_files[] = {
+ 	{"hw_stats", &PP_DEBUGFS_FOPS(hw_stats)},
+ 	{"sw_stats", &PP_DEBUGFS_FOPS(sw_stats)},
+ 	{"pop", &PP_DEBUGFS_FOPS(pop)},
+ 	{"push", &PP_DEBUGFS_FOPS(push)},
+-	{"test_dma", &PP_DEBUGFS_FOPS(test_dma)},
+ 	{"conf_get", &PP_DEBUGFS_FOPS(conf_get)},
+ 	{"conf_set", &PP_DEBUGFS_FOPS(conf_set)},
+ 	{"pool_add", &PP_DEBUGFS_FOPS(pool_add)},
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
+index b51d9f6dbc5a..e2c2665e8d80 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
+@@ -135,8 +135,6 @@ struct bmgr_driver_db {
+ 	u32         num_policies;
+ };
+ 
+-s32 bmgr_test_dma(u32 num_bytes);
+-
+ /**
+  * @brief Get buffer manager config registers
+  * @param config struct
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
+index 19e01d7c25da..ec8763785706 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
+@@ -56,8 +56,10 @@
+ #define PPV4_QOS_CMD_BUF_GUARD_OFFSET                     \
+ 	(PPV4_QOS_CMD_BUF_OFFSET + PPV4_QOS_CMD_BUF_SIZE)
+ 
+-/* DCCM free memory: 0x1004 - 0x7FC0 */
++/* DCCM free memory: 0x1004 - 0x7F00 */
+ 
++#define PPV4_QOS_UC_INTERNALS_OFFSET   (0x7F00)
++#define PPV4_QOS_UC_INTERNALS_SIZE     (0xC0)
+ #define PPV4_QOS_AQM_BUF_OFFSET        (0x7FC0)
+ #define PPV4_QOS_AQM_BUF_SIZE          (0x40)
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+index 8f9054670826..850c3568e182 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+@@ -20,6 +20,7 @@
+ #include "pp_qos_fw.h"
+ #include "pp_regs.h"
+ #include "infra.h"
++#include "pp_desc.h"
+ 
+ #define PP_QOS_DEBUGFS_DIR "ppv4_qos"
+ 
+@@ -1559,10 +1560,8 @@ PP_DEFINE_DEBUGFS(table_entry, read_table_entry_help, read_table_entry);
+ void queue_push(char *cmd_buf, void *data)
+ {
+ 	struct pp_qos_dev *qdev;
+-	struct qos_node *node;
+ 	unsigned long addr;
+-	u32 logical_id, size, color, phy;
+-	s32 ret;
++	u32 logical_id, size, color, policy, pool, port, data_off;
+ 
+ 	qdev = pp_qos_dev_open((unsigned long)data);
+ 	if (unlikely(!qdev)) {
+@@ -1570,38 +1569,119 @@ void queue_push(char *cmd_buf, void *data)
+ 		return;
+ 	}
+ 
+-	if (sscanf(cmd_buf, "%u %u %u %lx",
++	if (sscanf(cmd_buf, "%u %u %u %u %u %u %u %lx",
+ 		   &logical_id,
+ 		   &size,
++		   &pool,
++		   &policy,
+ 		   &color,
+-		   &addr) != 4) {
++		   &port,
++		   &data_off,
++		   &addr) != 8) {
+ 		QOS_LOG_ERR("sscanf err\n");
+ 		goto queue_push_done;
+ 	}
+ 
+-	phy = get_phy_from_id(qdev->mapping, logical_id);
+-	node = get_node_from_phy(qdev->nodes, phy);
+-	if (!node) {
+-		QOS_LOG_ERR("No node for id %u\n", logical_id);
+-		goto queue_push_done;
++	qos_descriptor_push(qdev, logical_id, size, pool, policy, color, port,
++			    data_off, addr);
++
++queue_push_done:
++	return;
++}
++
++void queue_push_help(struct seq_file *f)
++{
++	seq_puts(f, "<q logic id> <size> <pool> <policy>"
++		    " <color> <tx port> <data off> <addr>\n");
++}
++
++PP_DEFINE_DEBUGFS(queue_push, queue_push_help, queue_push);
++
++/**
++ * @brief pop descriptor from qos queue
++ */
++void queue_pop(char *cmd_buf, void *data)
++{
++	struct pp_qos_dev *qdev;
++	struct pp_qos_desc desc;
++	struct pp_qos_hw_desc hw_desc;
++	u32 descriptor[4];
++	u32 logical_id;
++
++	qdev = pp_qos_dev_open((unsigned long)data);
++	if (unlikely(!qdev)) {
++		QOS_LOG_ERR("Error: qdev NULL\n");
++		return;
++	}
++
++	if (sscanf(cmd_buf, "%u",
++		   &logical_id) != 1) {
++		QOS_LOG_ERR("sscanf err\n");
++		return;
+ 	}
+ 
+-	create_push_desc_cmd(qdev, node->data.queue.rlm, size, color, addr);
++	qos_descriptor_pop(qdev, logical_id, descriptor);
++
++	QOS_LOG_INFO("descriptor[0]: %#x\n", descriptor[0]);
++	QOS_LOG_INFO("descriptor[1]: %#x\n", descriptor[1]);
++	QOS_LOG_INFO("descriptor[2]: %#x\n", descriptor[2]);
++	QOS_LOG_INFO("descriptor[3]: %#x\n", descriptor[3]);
++
++	if (IS_ENABLED(CONFIG_PPV4_LGM)) {
++		hw_desc.word[0] = descriptor[0];
++		hw_desc.word[1] = descriptor[1];
++		hw_desc.word[2] = descriptor[2];
++		hw_desc.word[3] = descriptor[3];
++		pp_qos_desc_decode(&desc, &hw_desc);
++		pp_qos_desc_dump(&desc);
++	}
++}
++
++void queue_pop_help(struct seq_file *f)
++{
++	seq_puts(f, "<queue logical id>\n");
++}
++
++PP_DEFINE_DEBUGFS(queue_pop, queue_pop_help, queue_pop);
++
++/**
++ * @brief mcmda copy
++ */
++void mcdma_copy(char *cmd_buf, void *data)
++{
++	struct pp_qos_dev *qdev;
++	u32 src, dst, size;
++	s32 ret;
++
++	qdev = pp_qos_dev_open((unsigned long)data);
++	if (unlikely(!qdev)) {
++		QOS_LOG_ERR("Error: qdev NULL\n");
++		return;
++	}
++
++	if (sscanf(cmd_buf, "%x %x %u",
++		   &src, &dst, &size) != 3) {
++		QOS_LOG_ERR("sscanf err\n");
++		goto mcdma_copy_done;
++	}
++
++	create_mcdma_copy_cmd(qdev, src, dst, size);
+ 	update_cmd_id(&qdev->drvcmds);
+ 	ret = transmit_cmds(qdev);
+ 	if (unlikely(ret))
+ 		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
+ 
+-queue_push_done:
++mcdma_copy_done:
+ 	return;
+ }
+ 
+-void queue_push_help(struct seq_file *f)
++void mcdma_copy_help(struct seq_file *f)
+ {
+-	seq_puts(f, "<id> <size> <color> <address>\n");
++	seq_puts(f, "<src address> <dst address> <size>"
++		    "(addresses should be ddr contiguous)\n");
+ }
+ 
+-PP_DEFINE_DEBUGFS(queue_push, queue_push_help, queue_push);
++PP_DEFINE_DEBUGFS(mcdma_copy, mcdma_copy_help, mcdma_copy);
+ 
+ /**
+  * @brief add sf
+@@ -2002,6 +2082,7 @@ static struct debugfs_file qos_debugfs_files[] = {
+ 	{"sf_del", &PP_DEBUGFS_FOPS(sf_del)},
+ 	{"codel_cfg", &PP_DEBUGFS_FOPS(codel_cfg)},
+ 	{"codel_stats", &PP_DEBUGFS_FOPS(codel_stats)},
++	{"mcdma_copy", &PP_DEBUGFS_FOPS(mcdma_copy)},
+ 	{"queue", &PP_DEBUGFS_FOPS(queue_set)},
+ 	{"syncq", &PP_DEBUGFS_FOPS(syncq_add)},
+ 	{"sched", &PP_DEBUGFS_FOPS(sched_set)},
+@@ -2009,6 +2090,7 @@ static struct debugfs_file qos_debugfs_files[] = {
+ 	{"shared_grp_rem", &PP_DEBUGFS_FOPS(shared_grp_del)},
+ 	{"port", &PP_DEBUGFS_FOPS(port_set)},
+ 	{"push_desc", &PP_DEBUGFS_FOPS(queue_push)},
++	{"pop_desc", &PP_DEBUGFS_FOPS(queue_pop)},
+ 	{"allocate", &PP_DEBUGFS_FOPS(allocate)},
+ 	{"remove", &PP_DEBUGFS_FOPS(remove)},
+ 	{"flush", &PP_DEBUGFS_FOPS(flush)},
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+index a3259ab5bc78..9d8e7e893865 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+@@ -410,6 +410,8 @@ enum cmd_type {
+ 	CMD_TYPE_GET_CODEL_STATS,
+ 	CMD_TYPE_GET_PORT_STATS,
+ 	CMD_TYPE_PUSH_DESC,
++	CMD_TYPE_POP_DESC,
++	CMD_TYPE_MCDMA_COPY,
+ 	CMD_TYPE_GET_NODE_INFO,
+ 	CMD_TYPE_READ_TABLE_ENTRY,
+ 	CMD_TYPE_REM_SHARED_GROUP,
+@@ -446,6 +448,8 @@ static const char *const cmd_str[] = {
+ 	[CMD_TYPE_GET_CODEL_STATS] = "CMD_TYPE_GET_CODEL_STATS",
+ 	[CMD_TYPE_GET_PORT_STATS] = "CMD_TYPE_GET_PORT_STATS",
+ 	[CMD_TYPE_PUSH_DESC] = "CMD_TYPE_PUSH_DESC",
++	[CMD_TYPE_POP_DESC] = "CMD_TYPE_POP_DESC",
++	[CMD_TYPE_MCDMA_COPY] = "CMD_TYPE_MCDMA_COPY",
+ 	[CMD_TYPE_GET_NODE_INFO] = "CMD_TYPE_GET_NODE_INFO",
+ 	[CMD_TYPE_READ_TABLE_ENTRY] = "CMD_TYPE_READ_TABLE_ENTRY",
+ 	[CMD_TYPE_REM_SHARED_GROUP] = "CMD_TYPE_REM_SHARED_GROUP",
+@@ -571,6 +575,16 @@ struct cmd_push_desc {
+ 	struct fw_cmd_push_desc fw;
+ } __attribute__((packed));
+ 
++struct cmd_pop_desc {
++	struct cmd base;
++	struct fw_cmd_pop_desc fw;
++} __attribute__((packed));
++
++struct cmd_mcdma_copy {
++	struct cmd base;
++	struct fw_cmd_mcdma_copy fw;
++} __attribute__((packed));
++
+ struct cmd_read_table_entry {
+ 	struct cmd base;
+ 	struct fw_cmd_read_table_entry fw;
+@@ -2364,8 +2378,9 @@ void create_remove_shared_group_cmd(struct pp_qos_dev *qdev, u32 id)
+ 	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ }
+ 
+-void create_push_desc_cmd(struct pp_qos_dev *qdev, u32 queue,
+-			  u32 size, u32 color, u32 addr)
++void create_push_desc_cmd(struct pp_qos_dev *qdev, u32 queue, u32 size,
++			  u32 pool, u32 policy, u32 color, u32 gpid,
++			  u32 data_off, u32 addr)
+ {
+ 	struct cmd_push_desc cmd;
+ 
+@@ -2378,12 +2393,51 @@ void create_push_desc_cmd(struct pp_qos_dev *qdev, u32 queue,
+ 	cmd.fw.base.type = UC_QOS_CMD_DEBUG_PUSH_DESC;
+ 	cmd.fw.rlm = queue;
+ 	cmd.fw.size = size;
++	cmd.fw.pool = pool;
++	cmd.fw.policy = policy;
+ 	cmd.fw.color = color;
++	cmd.fw.gpid = gpid;
++	cmd.fw.data_offset = data_off;
++	cmd.fw.addr = addr;
++
++	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
++}
++
++void create_pop_desc_cmd(struct pp_qos_dev *qdev, u32 queue, u32 addr)
++{
++	struct cmd_pop_desc cmd;
++
++	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
++		return;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd_init(qdev, &cmd.base, CMD_TYPE_POP_DESC,
++		 sizeof(cmd), 0, NULL, 0, 0);
++	cmd.fw.base.type = UC_QOS_CMD_DEBUG_POP_DESC;
++	cmd.fw.rlm = queue;
+ 	cmd.fw.addr = addr;
+ 
+ 	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ }
+ 
++void create_mcdma_copy_cmd(struct pp_qos_dev *qdev, u32 src, u32 dst, u32 sz)
++{
++	struct cmd_mcdma_copy cmd;
++
++	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
++		return;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd_init(qdev, &cmd.base, CMD_TYPE_MCDMA_COPY,
++		 sizeof(cmd), 0, NULL, 0, 0);
++	cmd.fw.base.type = UC_QOS_CMD_DEBUG_MCDMA_COPY;
++	cmd.fw.src_addr = src;
++	cmd.fw.dst_addr = dst;
++	cmd.fw.size = sz;
++
++	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
++}
++
+ /******************************************************************************/
+ /*                         FW write functions                                 */
+ /******************************************************************************/
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h
+index 408eea2298bc..3edccc9cb19a 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h
+@@ -96,9 +96,11 @@ void create_init_logger_cmd(struct pp_qos_dev *qdev,
+ void create_add_shared_group_cmd(struct pp_qos_dev *qdev, u32 id, u32 limit);
+ void create_remove_shared_group_cmd(struct pp_qos_dev *qdev, u32 id);
+ void create_set_shared_group_cmd(struct pp_qos_dev *qdev, u32 id, u32 limit);
+-void create_push_desc_cmd(struct pp_qos_dev *qdev, u32 queue,
+-			  u32 size, u32 color, u32 addr);
+-
++void create_push_desc_cmd(struct pp_qos_dev *qdev, u32 queue, u32 size,
++			  u32 pool, u32 policy, u32 color, u32 gpid,
++			  u32 data_off, u32 addr);
++void create_pop_desc_cmd(struct pp_qos_dev *qdev, u32 queue, u32 addr);
++void create_mcdma_copy_cmd(struct pp_qos_dev *qdev, u32 src, u32 dst, u32 sz);
+ void create_get_node_info_cmd(struct pp_qos_dev *qdev, u32 phy, u32 addr,
+ 			      struct pp_qos_node_info *info);
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
+index 097acea5c1b4..546903c504f2 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
+@@ -11,8 +11,8 @@
+ 
+ /* UC version */
+ #define UC_VERSION_MAJOR (1)
+-#define UC_VERSION_MINOR (9)
+-#define UC_VERSION_BUILD (1)
++#define UC_VERSION_MINOR (10)
++#define UC_VERSION_BUILD (0)
+ 
+ #define QOS_MAX_PREDECESSORS       (6)
+ #define QOS_AQM_CONTEXT_MAX_QUEUES (8)
+@@ -621,6 +621,8 @@ enum uc_qos_command {
+ 	UC_QOS_CMD_GET_NODE_INFO,
+ 	UC_QOS_CMD_DEBUG_READ_NODE,
+ 	UC_QOS_CMD_DEBUG_PUSH_DESC,
++	UC_QOS_CMD_DEBUG_POP_DESC,
++	UC_QOS_CMD_DEBUG_MCDMA_COPY,
+ 	UC_QOS_CMD_DEBUG_ADD_CREDIT_TO_PORT,
+ 	UC_QOS_CMD_GET_ACTIVE_QUEUES_STATS,
+ 	UC_QOS_CMD_UPDATE_PORT_TREE,
+@@ -922,6 +924,14 @@ struct fw_cmd_push_desc {
+ 	u32 addr; /*! Packet address */
+ 	u32 policy; /*! Policy */
+ 	u32 pool; /*! Pool */
++	u32 gpid; /*! Tx port ID */
++	u32 data_offset; /*! Data offset */
++} __attribute__((packed));
++
++struct fw_cmd_pop_desc {
++	struct uc_qos_cmd_base base;
++	u32 rlm; /*! Queue ID */
++	u32 addr; /*! Descriptor address */
+ } __attribute__((packed));
+ 
+ struct fw_cmd_read_table_entry {
+@@ -1004,6 +1014,13 @@ struct fw_cmd_get_quanta {
+ 	u32 quanta;   /*! [OUT]: the quanta in KB */
+ } __attribute__((packed));
+ 
++struct fw_cmd_mcdma_copy {
++	struct uc_qos_cmd_base base;
++	u32 src_addr; /*! Source address */
++	u32 dst_addr; /*! Destination address */
++	u32 size; /*! Size in bytes */
++} __attribute__((packed));
++
+ union uc_qos_cmd_s {
+ 	struct uc_qos_cmd_base           base;
+ 	struct fw_cmd_multiple_cmds      multiple_cmds;
+@@ -1031,6 +1048,8 @@ union uc_qos_cmd_s {
+ 	struct fw_cmd_rem_bwl_group      rem_bwl_group;
+ 	struct fw_cmd_set_codel          set_codel;
+ 	struct fw_cmd_push_desc          push_desc;
++	struct fw_cmd_pop_desc           pop_desc;
++	struct fw_cmd_mcdma_copy         mcdma_copy;
+ 	struct fw_cmd_read_table_entry   read_tbl_entry;
+ 	struct fw_cmd_flush_queue        flush_queue;
+ 	struct fw_cmd_get_queue_stats    get_queue_stats;
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index 8a056e4fdfb0..40cd97ebb4d9 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -16,6 +16,7 @@
+ #include "pp_qos_common.h"
+ #include "pp_qos_fw.h"
+ #include "pp_regs.h"
++#include "pp_desc.h"
+ #include "pp_qos_utils.h"
+ #include "infra.h"
+ 
+@@ -4027,3 +4028,80 @@ s32 qos_drv_stats_get(struct pp_qos_dev *qdev, struct qos_drv_stats *stats)
+ 
+ 	return 0;
+ }
++
++void qos_uc_mcdma_copy(struct pp_qos_dev *qdev, u32 src_phy, u32 dst_phy,
++		       u32 size)
++{
++	s32 ret;
++
++	if (!qos_device_ready(qdev))
++		return;
++
++	create_mcdma_copy_cmd(qdev, src_phy, dst_phy, size);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret))
++		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++}
++
++void qos_descriptor_push(struct pp_qos_dev *qdev, u32 queue_id, u32 size,
++			 u32 pool, u32 policy, u32 color, u32 gpid,
++			 u32 data_off, u32 addr)
++{
++	struct qos_node *node;
++	u32 phy;
++	s32 ret;
++
++	phy = get_phy_from_id(qdev->mapping, queue_id);
++	node = get_node_from_phy(qdev->nodes, phy);
++	if (!node) {
++		QOS_LOG_ERR("No node for id %u\n", queue_id);
++		return;
++	}
++
++	create_push_desc_cmd(qdev, node->data.queue.rlm, size, pool, policy,
++			     color, gpid, data_off, addr >> 7);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret))
++		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++}
++
++void qos_descriptor_pop(struct pp_qos_dev *qdev, u32 queue_id, u32 *descriptor)
++{
++	dma_addr_t desc_addr_phys;
++	struct qos_node *node;
++	void   *desc_addr = NULL;
++	u32    phy, sz;
++	s32 ret;
++
++	memset(descriptor, 0, 16);
++	sz = PAGE_ALIGN(QOS_DESC_WORDS_CNT * sizeof(u32));
++	desc_addr = dmam_alloc_coherent(pp_dev_get(), sz, &desc_addr_phys,
++					GFP_KERNEL);
++	if (!desc_addr)
++		return;
++
++	phy = get_phy_from_id(qdev->mapping, queue_id);
++	node = get_node_from_phy(qdev->nodes, phy);
++	if (!node) {
++		QOS_LOG_ERR("No node for id %u\n", queue_id);
++		goto free_mem;
++	}
++
++	create_pop_desc_cmd(qdev, node->data.queue.rlm, (u32)desc_addr_phys);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret)) {
++		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++		goto free_mem;
++	}
++
++	*descriptor = DDR_RD32(desc_addr);
++	*(descriptor + 1) = DDR_RD32((u32 *)desc_addr + 1);
++	*(descriptor + 2) = DDR_RD32((u32 *)desc_addr + 2);
++	*(descriptor + 3) = DDR_RD32((u32 *)desc_addr + 3);
++
++free_mem:
++	dma_free_coherent(NULL, sz, desc_addr, desc_addr_phys);
++}
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+index c0a6b78c8bee..b92e3af94052 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+@@ -1110,6 +1110,39 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev);
+ void __qos_ddr_free(struct pp_qos_dev *qdev);
+ s32 allocate_ddr_for_qm_on_platform(struct pp_qos_dev *qdev);
+ 
++/**
++ * @brief Copy using qos uC mcdma (8 bytes transaction)
++ * @param qdev
++ * @param src_phy physical source address
++ * @param dst_phy physical destination address
++ * @param size number of bytes to copy
++ */
++void qos_uc_mcdma_copy(struct pp_qos_dev *qdev, u32 src_phy, u32 dst_phy,
++		       u32 size);
++
++/**
++ * @brief Push qos descriptor to queue
++ * @param qdev
++ * @param queue_id Logical queue id
++ * @param size packet size
++ * @param pool buffer pool
++ * @param policy buffer policy
++ * @param color packet color
++ * @param gpid tx port if
++ * @param data_off data start offset
++ * @param addr packet address
++ */
++void qos_descriptor_push(struct pp_qos_dev *qdev, u32 queue_id, u32 size,
++			 u32 pool, u32 policy, u32 color, u32 gpid,
++			 u32 data_off, u32 addr);
++
++/**
++ * @brief Pop qos descriptor from queue
++ * @param qdev
++ * @param queue_id Logical queue id
++ */
++void qos_descriptor_pop(struct pp_qos_dev *qdev, u32 queue_id, u32 *descriptor);
++
+ /**
+  * @brief Set a new clock for the QoS driver and FW
+  *        This update all necessary SW/FW/HW configuration which
+diff --git a/drivers/net/ppv4/pp-dev/pp_dts.c b/drivers/net/ppv4/pp-dev/pp_dts.c
+index 793b4622e7c8..364bac2b2fcc 100644
+--- a/drivers/net/ppv4/pp-dev/pp_dts.c
++++ b/drivers/net/ppv4/pp-dev/pp_dts.c
+@@ -513,6 +513,11 @@ static s32 __dts_bmgr_cfg(struct pp_dts_cfg *dts_cfg)
+ 		return -ENODEV;
+ 	}
+ 
++	ret = __dts_phys_addr_get(pdev, "bmgr-pop-push",
++				  &dts_cfg->bm_params.bm_pop_push_addr);
++	if (unlikely(ret))
++		return ret;
++
+ 	/* Fetch bm base address */
+ 	ret = __dts_virt_addr_remap(pdev, "reg-config",
+ 				    &dts_cfg->bm_params.bm_base);
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+index 7488d4b6ae47..91febcebba81 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+@@ -23,6 +23,7 @@
+ #include "pp_common.h"
+ #include "bm.h"
+ #include "bm_internal.h"
++#include "pp_qos_utils.h"
+ 
+ /* Each cache row contains 4 pointers which are 16 bytes */
+ #define BM_BURST_BYTES_TO_CACHE_ROWS(sz, num) (((sz) * (num)) >> 4)
+@@ -103,6 +104,7 @@ s32 bm_init(const struct pp_bm_init_param * const cfg)
+ 		return -ENOMEM;
+ 
+ 	/* Get config */
++	db->bm_pop_push_addr = cfg->bm_pop_push_addr;
+ 	db->max_pools = cfg->max_pools;
+ 	db->max_groups = cfg->max_groups;
+ 	db->max_policies = cfg->max_policies;
+@@ -629,3 +631,103 @@ s32 bm_pool_configure(u8 pool_id, const struct bmgr_pool_cfg * const cfg)
+ 
+ 	return 0;
+ }
++
++#define BM_POP_NULL_ADDRESS 0xFFFFFFFFF
++#define BM_POP_ADDR_OFFSET(policy) (policy << 8)
++
++s32 bm_pop_buffer(struct bmgr_buff_info *buff_info)
++{
++	u32         low, high, sz;
++	void        *dst_addr;
++	struct      pp_qos_dev *qdev;
++	dma_addr_t  dst_addr_phys;
++	phys_addr_t bm_addr_phys = db->bm_pop_push_addr;
++	s32 ret = 0;
++
++	if (!buff_info) {
++		pr_err("buff_info is NULL\n");
++		return -EINVAL;
++	}
++
++	qdev = pp_qos_dev_open(PP_QOS_INSTANCE_ID);
++	if (unlikely(ptr_is_null(qdev)))
++		return -EINVAL;
++
++	/* Write the Policy */
++	bm_addr_phys |= BM_POP_ADDR_OFFSET(buff_info->policy_id);
++
++	sz = PAGE_ALIGN(2 * sizeof(u32));
++	dst_addr = dma_alloc_coherent(NULL, sz, &dst_addr_phys,
++				      GFP_KERNEL | GFP_DMA);
++	if (!dst_addr) {
++		pr_err("Could not allocate using dma_alloc_coherent\n");
++		return -ENOMEM;
++	}
++
++	qos_uc_mcdma_copy(qdev, bm_addr_phys, (u32)dst_addr_phys, 8);
++
++	low = PP_REG_RD32(dst_addr);
++	high = PP_REG_RD32(dst_addr + 4);
++
++	buff_info->address = PP_BUILD_64BIT_WORD(low, high & 0xF);
++	if (buff_info->address == BM_POP_NULL_ADDRESS) {
++		ret = -EAGAIN;
++		goto free_mem;
++	}
++
++	buff_info->address = buff_info->address;
++	buff_info->pool_id = (high & 0xFF000000) >> 24;
++
++free_mem:
++	dma_free_coherent(NULL, sz, dst_addr, dst_addr_phys);
++
++	return ret;
++}
++
++s32 bm_push_buffer(struct bmgr_buff_info *buff_info)
++{
++	u32         value, addr_low, sz;
++	s32         ret = 0;
++	u8          addr_high;
++	void        *src_addr;
++	struct      pp_qos_dev *qdev;
++	dma_addr_t  src_addr_phys;
++	phys_addr_t bm_addr_phys = db->bm_pop_push_addr;
++
++	if (unlikely(!buff_info)) {
++		pr_err("buff_info is NULL\n");
++		return -EINVAL;
++	}
++
++	qdev = pp_qos_dev_open(PP_QOS_INSTANCE_ID);
++	if (unlikely(ptr_is_null(qdev)))
++		return -EINVAL;
++
++	sz = PAGE_ALIGN(2 * sizeof(u32));
++	src_addr = dma_alloc_coherent(NULL, sz, &src_addr_phys,
++				      GFP_KERNEL | GFP_DMA);
++	if (!src_addr) {
++		pr_err("Could not allocate using dma_alloc_coherent\n");
++		ret = -ENOMEM;
++		goto free_mem;
++	}
++
++	/* Write the Policy */
++	bm_addr_phys |= BM_POP_ADDR_OFFSET(buff_info->policy_id);
++
++	/* write to ddr */
++	buff_info->address = buff_info->address;
++	addr_high = buff_info->address >> 32;
++	addr_low = (u32)buff_info->address;
++	value = addr_high | ((buff_info->pool_id & U8_MAX) << 24);
++
++	DDR_WR32(src_addr, addr_low);
++	DDR_WR32(src_addr + 4, value);
++
++	qos_uc_mcdma_copy(qdev, src_addr_phys, bm_addr_phys, 8);
++
++free_mem:
++	dma_free_coherent(NULL, sz, src_addr, src_addr_phys);
++
++	return 0;
++}
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.h b/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
+index dede729391d3..33dba1c52560 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
+@@ -25,6 +25,20 @@
+  */
+ #define BM_MAX_ISOLATED_GROUPS                        (BM_MAX_GROUPS - 1)
+ 
++/**
++ * \brief This structure is used for allocate and deallocate
++ *      buffer
++ * @address buffer ptr
++ * @policy_id policy to allocate from
++ * @pool_id pool for deallocate buffer back
++ */
++struct bmgr_buff_info {
++	u64 address;
++	u16 policy_id;
++	u8  pool_id;
++	u8  reserved;
++};
++
+ /**
+  * @brief bmgr group statistics
+  * @grp_avail_buff A counter of the number of currently
+@@ -95,6 +109,7 @@ struct pp_bm_init_param {
+ 	u32  max_groups;
+ 	u32  max_policies;
+ 	u32  pcu_fifo_sz;
++	phys_addr_t bm_pop_push_addr;
+ };
+ 
+ /**
+@@ -217,6 +232,20 @@ s32 bm_group_reserved_set(u8 group_id, u32 reserved_buffers);
+  */
+ s32 bm_group_stats_get(u8 group_id, struct bmgr_group_stats * const stats);
+ 
++/**
++ * @brief Pop buffer
++ * @param buff_info buffer descriptor
++ * @return 0 on success, other error code on failure
++ */
++s32 bm_pop_buffer(struct bmgr_buff_info *buff_info);
++
++/**
++ * @brief Push buffer
++ * @param buff_info buffer descriptor
++ * @return 0 on success, other error code on failure
++ */
++s32 bm_push_buffer(struct bmgr_buff_info *buff_info);
++
+ /**
+  * @brief Set default configuration
+  * @param base_addr module's base address
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h b/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h
+index 77d0a0106d59..3b21df0a8bd2 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h
+@@ -83,6 +83,7 @@ struct bmgr_db {
+ 	u32 total_free_pcu_fifo_sz;
+ 	u32 pcu_pool_fifo_sz;
+ 	u32 pcu_fifo_sz_alignment;
++	phys_addr_t bm_pop_push_addr;
+ };
+ 
+ #define BM_OFFSET_OF_PLCY(policy)                     (policy<<2)
+diff --git a/drivers/net/ppv4/pp-hal/descriptor/pp_desc.c b/drivers/net/ppv4/pp-hal/descriptor/pp_desc.c
+index 3590e1aee531..0d315287e1ee 100644
+--- a/drivers/net/ppv4/pp-hal/descriptor/pp_desc.c
++++ b/drivers/net/ppv4/pp-hal/descriptor/pp_desc.c
+@@ -95,6 +95,34 @@ static s32 __desc_ud_decode(struct pp_pkt_ud *ud,
+ 	return 0;
+ }
+ 
++s32 pp_qos_desc_decode(struct pp_qos_desc *desc,
++		       const struct pp_qos_hw_desc *qos_hw_desc)
++{
++	const struct pp_hw_desc *hw_desc =
++		(const struct pp_hw_desc *)qos_hw_desc;
++
++	if (unlikely(!(!ptr_is_null(desc) &&
++		       !ptr_is_null(hw_desc))))
++		return -EINVAL;
++
++	desc->ps         = (u64)__desc_fld_get(hw_desc, DESC_FLD_PS_B) << 32 |
++			   (u32)__desc_fld_get(hw_desc, DESC_FLD_PS_A);
++	desc->data_off   = __desc_fld_get(hw_desc, DESC_FLD_DATA_OFF);
++	desc->src_pool   = __desc_fld_get(hw_desc, DESC_FLD_SRC_POOL);
++	desc->buff_ptr   = (u64)__desc_fld_get(hw_desc, DESC_FLD_BUFF_PTR) << 7;
++	desc->tx_port    = __desc_fld_get(hw_desc, DESC_FLD_TX_PORT);
++	desc->bm_policy  = __desc_fld_get(hw_desc, DESC_FLD_BM_POLICY);
++	desc->pkt_len    = __desc_fld_get(hw_desc, DESC_FLD_PKT_LEN);
++	desc->lsp_pkt    = __desc_fld_get(hw_desc, DESC_FLD_LSP_PKT);
++	desc->pmac       = __desc_fld_get(hw_desc, DESC_FLD_PMAC);
++	desc->color      = __desc_fld_get(hw_desc, DESC_FLD_COLOR);
++	desc->pre_l2_sz  = __desc_fld_get(hw_desc, DESC_FLD_PRE_L2) << 4;
++	desc->ts         = __desc_fld_get(hw_desc, DESC_FLD_TS);
++	desc->own        = __desc_fld_get(hw_desc, DESC_FLD_OWN);
++
++	return 0;
++}
++
+ s32 pp_desc_top_decode(struct pp_desc *desc, const struct pp_hw_desc *hw_desc)
+ {
+ 	if (unlikely(!(!ptr_is_null(desc) &&
+@@ -133,6 +161,29 @@ s32 pp_desc_decode(struct pp_desc *desc, const struct pp_hw_desc *hw_desc)
+ 	return __desc_ud_decode(&desc->ud, hw_desc);
+ }
+ 
++s32 pp_qos_desc_dump(struct pp_qos_desc *desc)
++{
++	if (unlikely(ptr_is_null(desc)))
++		return -EINVAL;
++
++	pr_info("\n");
++	pr_info("DESCRIPTOR:\n");
++	pr_info(" tx port           : %hhu\n", (u8)desc->tx_port);
++	pr_info(" packet len        : %hu\n", (u16)desc->pkt_len);
++	pr_info(" buff addr         : %#llx\n", (u64)desc->buff_ptr);
++	pr_info(" data offset       : %hu\n", (u16)desc->data_off);
++	pr_info(" PS                : %#llx\n", (u64)desc->ps);
++	pr_info(" src pool          : %llu\n", (u64)desc->src_pool);
++	pr_info(" bm policy         : %hhu\n", (u8)desc->bm_policy);
++	pr_info(" color             : %s\n", PP_COLOR_TO_STR(desc->color));
++	pr_info(" pmac              : %s\n", BOOL2STR(desc->pmac));
++	pr_info(" pre L2 size       : %llu\n", (u64)desc->pre_l2_sz);
++	pr_info(" ts                : %s\n", BOOL2STR(desc->ts));
++	pr_info(" ownership         : %s\n", BOOL2STR(desc->own));
++
++	return 0;
++}
++
+ s32 pp_desc_top_dump(struct pp_desc *desc)
+ {
+ 	if (unlikely(ptr_is_null(desc)))
+diff --git a/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h b/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h
+index 2137d81d0043..2c71bdcc0b2d 100644
+--- a/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h
++++ b/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h
+@@ -212,6 +212,16 @@ enum pp_desc_fld {
+  */
+ #define DESC_WORDS_CNT                 (QOS_DESC_WORDS_CNT + UD_DESC_WORDS_CNT)
+ 
++/**
++ * @struct pp_qos_hw_desc
++ * @brief  PP QoS HW descriptor definition it is impossible to map
++ *         the descriptor hw structure exactly so we just define
++ *         an array of 12 32bit registers
++ */
++struct pp_qos_hw_desc {
++	u32 word[QOS_DESC_WORDS_CNT];
++};
++
+ /**
+  * @struct pp_hw_desc
+  * @brief  PP HW descriptor definition it is impossible to map
+@@ -222,6 +232,36 @@ struct pp_hw_desc {
+ 	u32 word[DESC_WORDS_CNT];
+ };
+ 
++/**
++ * @struct pp_qos_desc
++ * @brief qos pp decriptor host structure
++ */
++struct pp_qos_desc {
++	u64 ps:48,           /*! protocol specific, up to 48bits         */
++	    data_off:9,      /*! data_pointer = buff_ptr + data_off      */
++	    src_pool:4;      /*! from which pool the buffer was taken    */
++	u64 buff_ptr:36;     /*! buffer pointer                          */
++	u8  tx_port;         /*! Egress Port @ RXDMA output              */
++	u8  bm_policy;       /*! from which policy the buffer was taken  */
++	u16 pkt_len:14,      /*! packet length. Defaults incl preL2 & ts */
++	    lsp_pkt:1;       /*! last slow path packet, used for syncq   */
++	u8  pmac:1,           /*! 16B of PMAC header Part of Pre L2       */
++	    color:2;          /*! color at egress                         */
++	u8  pre_l2_sz:6,      /*! preL2 size incl PMAC hdr                */
++	    ts:1,             /*! indicate timestemp existence            */
++	    own:1;            /*! descriptor ownership                    */
++};
++
++/**
++ * @brief Decode qos descriptor hw buffer to host descriptor
++ *        form
++ * @param desc host descriptor to store the host form
++ * @param hw_desc hw descriptor to decode
++ * @return s32 0 on success, error code otherwise
++ */
++s32 pp_qos_desc_decode(struct pp_qos_desc *desc,
++		       const struct pp_qos_hw_desc *qos_hw_desc);
++
+ /**
+  * @brief Decode descriptor top hw buffer to host descriptor
+  *        form
+@@ -239,6 +279,13 @@ s32 pp_desc_top_decode(struct pp_desc *desc, const struct pp_hw_desc *hw_desc);
+  */
+ s32 pp_desc_decode(struct pp_desc *desc, const struct pp_hw_desc *hw_desc);
+ 
++/**
++ * @brief Dump dbg QoS descriptor in host format
++ * @param desc host descriptor
++ * @return s32 0 on success, error code otherwise
++ */
++s32 pp_qos_desc_dump(struct pp_qos_desc *desc);
++
+ /**
+  * @brief Dump dbg descriptor in host format
+  * @param desc host descriptor

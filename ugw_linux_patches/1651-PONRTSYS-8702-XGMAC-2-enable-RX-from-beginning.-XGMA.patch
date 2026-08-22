@@ -1,0 +1,373 @@
+From 072a9d5b26c8081b7d26042e8adda70e00ace9ac Mon Sep 17 00:00:00 2001
+From: Xu Liang <lxu@maxlinear.com>
+Date: Thu, 15 Apr 2021 10:46:36 +0800
+Subject: [PATCH] PONRTSYS-8702: XGMAC 2 enable RX from beginning. XGMAC 3
+ onwards enable RX at GSWSS when ETH interface up and disable when ETH
+ interface down
+
+---
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c   | 37 +++++++++-
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h   |  1 +
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.c   | 49 ++++++++++---
+ drivers/net/ethernet/lantiq/switch-api/mac/xgmac.h |  1 +
+ .../ethernet/lantiq/switch-api/mac/xgmac_mac_api.c | 81 ++++++++++++++++------
+ include/net/switch_api/mac_ops.h                   |  9 ++-
+ 6 files changed, 144 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index 53aec1fb6927..ab6f364b6111 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -22,6 +22,7 @@
+ #include <linux/of_irq.h>
+ #include <linux/of_device.h>
+ #include <linux/thermal.h>
++#include <linux/delay.h>
+ #include <net/switchdev.h>
+ 
+ #ifdef CONFIG_USERSPACE_LINK_NOTIFICATION
+@@ -629,6 +630,34 @@ static int eth_serdes_power(struct net_device *dev, bool up)
+ 	return ret;
+ }
+ 
++static int xgmac_rx(struct ltq_eth_priv *priv, bool on)
++{
++	struct mac_ops *ops;
++
++	if (priv->master)
++		priv = priv->master;
++
++	if (priv->xgmac_id <= 2)
++		return -EINVAL;
++
++	if ((!on || atomic_inc_return(&priv->xgmac_rx) != 1)
++	    && (on || atomic_dec_if_positive(&priv->xgmac_rx) != 0))
++		return 0;
++
++	ops = gsw_get_mac_ops(0, priv->xgmac_id);
++	if (!ops) {
++		pr_err("Failed in get ops from XGMAC %u\n", priv->xgmac_id);
++		return -ENOTSUPP;
++	}
++	if (!ops->rx_enable) {
++		pr_err("No XGMAC RX enable/disable support on XGMAC %u\n",
++			priv->xgmac_id);
++		return -ENOTSUPP;
++	}
++
++	return ops->rx_enable(ops, on);
++}
++
+ /* open the network device interface*/
+ static int ltq_eth_open(struct net_device *dev)
+ {
+@@ -652,8 +681,12 @@ static int ltq_eth_open(struct net_device *dev)
+ 		return -1;
+ 	}
+ 
+-	if (of_device_is_available(priv->xpcs_node))
++	if (of_device_is_available(priv->xpcs_node)) {
+ 		eth_serdes_power(dev, true);
++		usleep_range(20, 30);
++	}
++
++	xgmac_rx(priv, true);
+ 
+ 	return 0;
+ }
+@@ -666,6 +699,8 @@ static int ltq_eth_stop(struct net_device *dev)
+ 
+ 	pr_debug("%s called for device %s\n", __func__, dev->name);
+ 
++	xgmac_rx(priv, false);
++
+ 	if (of_device_is_available(priv->xpcs_node))
+ 		eth_serdes_power(dev, false);
+ 
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+index 9b2bd657211b..d0a635ec4411 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+@@ -92,6 +92,7 @@ struct ltq_eth_priv {
+ 	int end;
+ 	struct ltq_eth_priv *master;
+ 	atomic_t powerup;
++	atomic_t xgmac_rx;
+ 	struct ethtool_cmd bkup_cmd;
+ 	bool needs_recovery;
+ 	#define FLAG_PAUSE_AUTO         0x00000001
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+index 98b0b64d7ee3..52e753eb89c5 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+@@ -1055,6 +1055,40 @@ int mac_get_int_sts(void *pdev)
+ 	return val;
+ }
+ 
++static int xgmac_rx_enable(void *pdev, int enable)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++	u32 addr, val;
++
++	if (pdata->mac_idx < MAC_2 || pdata->mac_idx > MAC_LAST)
++		return -EINVAL;
++
++	addr = 0x1080 | (pdata->mac_idx << 8);
++	val = GSWSS_MAC_RGRD(pdata, addr);
++	if (enable)
++		val &= ~BIT(2);
++	else
++		val |= BIT(2);
++	GSWSS_MAC_RGWR(pdata, addr, val);
++
++	return 0;
++}
++
++static int xgmac_powerup_tx(void *pdev)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++	int ret;
++
++	if (pdata->mac_idx < MAC_2 || pdata->mac_idx > MAC_LAST)
++		return -EINVAL;
++
++	ret = xgmac_powerup(pdev);
++	if (ret)
++		return ret;
++
++	return xgmac_rx_enable(pdev, 0);
++}
++
+ int mac_init(void *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+@@ -1131,7 +1165,10 @@ int mac_init(void *pdev)
+ 		mac_set_physpeed(pdev, SPEED_MAC_AUTO);
+ 
+ 	/* POWER ON MAC Tx/Rx */
+-	xgmac_powerup(pdev);
++	if (pdata->mac_idx > MAC_2)
++		xgmac_powerup_tx(pdev);
++	else
++		xgmac_powerup(pdev);
+ 
+ #ifdef __KERNEL__
+ 	/* Filter pause frames from XGMAC */
+@@ -1567,13 +1604,6 @@ int mac_e160_unprepare(void *pdev)
+ 	return 0;
+ }
+ 
+-static void mac_soft_restart(void *pdev)
+-{
+-	/* Bring Down and up Xgmac Tx and Rx, Not all register reset */
+-	xgmac_powerdown(pdev);
+-	xgmac_powerup(pdev);
+-}
+-
+ static int __rmon_get(void *pdev, struct mac_rmon *prmon)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+@@ -1722,7 +1752,8 @@ void mac_init_fn_ptrs(struct mac_ops *mac_op)
+ 	mac_op->do_tx_hwts = xgmac_tx_hwts;
+ 	mac_op->mac_get_ts_info = xgmac_get_ts_info;
+ #endif
+-	mac_op->soft_restart = mac_soft_restart;
++	mac_op->soft_restart = xgmac_soft_restart;
++	mac_op->rx_enable = xgmac_rx_enable;
+ 
+ 	mac_op->set_macaddr = mac_set_macaddr;
+ 	mac_op->set_rx_crccheck = mac_set_rxcrccheck;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac.h
+index d439f5c196c6..400f43fbf4b3 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac.h
+@@ -1001,6 +1001,7 @@ int xgmac_set_hwtstamp_settings(void *pdev, u32 tx_type,
+ 				u32 rx_filter);
+ int xgmac_config_jumbo_pkt(void *pdev, u32 mtu);
+ int xgmac_config_std_pkt(void *pdev);
++void xgmac_soft_restart(void *pdev);
+ int xgmac_powerup(void *pdev);
+ int xgmac_powerdown(void *pdev);
+ int xgmac_config_subsec_inc(void *pdev, u32 ptp_clk);
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+index d59af3d08a29..cc464befd9b7 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+@@ -325,8 +325,6 @@ int xgmac_set_gmii_speed(void *pdev)
+ 
+ 	XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr);
+ 
+-	xgmac_powerup(pdev);
+-
+ 	return 0;
+ }
+ 
+@@ -348,8 +346,6 @@ int xgmac_set_gmii_2500_speed(void *pdev)
+ 
+ 	XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr);
+ 
+-	xgmac_powerup(pdev);
+-
+ 	return 0;
+ }
+ 
+@@ -371,8 +367,6 @@ int xgmac_set_xgmii_2500_speed(void *pdev)
+ 
+ 	XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr);
+ 
+-	xgmac_powerup(pdev);
+-
+ 	return 0;
+ }
+ 
+@@ -394,8 +388,6 @@ int xgmac_set_xgmii_speed(void *pdev)
+ 
+ 	XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr);
+ 
+-	xgmac_powerup(pdev);
+-
+ 	return 0;
+ }
+ 
+@@ -627,6 +619,54 @@ int xgmac_set_rxcrc(void *pdev, u32 val)
+ 	return 0;
+ }
+ 
++void xgmac_soft_restart(void *pdev)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++	u32 mac_tcr = XGMAC_RGRD(pdata, MAC_TX_CFG);
++	u32 mac_tcr_org = mac_tcr;
++	u32 mac_rcr = XGMAC_RGRD(pdata, MAC_RX_CFG);
++	u32 mac_rcr_org = mac_rcr;
++	u32 mac_pfr = XGMAC_RGRD(pdata, MAC_PKT_FR);
++	u32 mac_pfr_org = mac_pfr;
++
++	/* Disable MAC Tx */
++	if (MAC_GET_VAL(mac_tcr, MAC_TX_CFG, TE) != 0) {
++		mac_dbg("XGMAC %d: MAC TX: DISABLED\n", pdata->mac_idx);
++		MAC_SET_VAL(mac_tcr, MAC_TX_CFG, TE, 0);
++		XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr);
++	}
++
++	/* Disable MAC Rx */
++	if (MAC_GET_VAL(mac_rcr, MAC_RX_CFG, RE) != 0) {
++		mac_dbg("XGMAC %d: MAC RX: DISABLED\n", pdata->mac_idx);
++		MAC_SET_VAL(mac_rcr, MAC_RX_CFG, RE, 0);
++		XGMAC_RGWR(pdata, MAC_RX_CFG, mac_rcr);
++	}
++
++	/* Re-enable MAC Tx */
++	if (mac_tcr_org != mac_tcr) {
++		mac_dbg("XGMAC %d: MAC TX: ENABLED\n", pdata->mac_idx);
++		XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr_org);
++	}
++
++	/* Re-enable MAC Rx */
++	if (mac_rcr_org != mac_rcr) {
++		/* Enable MAC Filter Rx All */
++		if (MAC_GET_VAL(mac_pfr, MAC_PKT_FR, RA) != 1) {
++			mac_dbg("XGMAC %d: MAC Filter Receive All: ENABLED\n",
++				pdata->mac_idx);
++			MAC_SET_VAL(mac_pfr, MAC_PKT_FR, RA, 1);
++			XGMAC_RGWR(pdata, MAC_PKT_FR, mac_pfr);
++		}
++
++		mac_dbg("XGMAC %d: MAC RX: ENABLED\n", pdata->mac_idx);
++		XGMAC_RGWR(pdata, MAC_RX_CFG, mac_rcr_org);
++
++		if (mac_pfr_org != mac_pfr)
++			XGMAC_RGWR(pdata, MAC_PKT_FR, mac_pfr);
++	}
++}
++
+ /* RE:
+  * When this bit is set, the Rx state machine of the MAC is enabled for
+  * receiving packets from the GMII or XGMII interface
+@@ -652,6 +692,7 @@ int xgmac_powerup(void *pdev)
+ 	u32 mac_tcr = XGMAC_RGRD(pdata, MAC_TX_CFG);
+ 	u32 mac_rcr = XGMAC_RGRD(pdata, MAC_RX_CFG);
+ 	u32 mac_pfr = XGMAC_RGRD(pdata, MAC_PKT_FR);
++	u32 mac_pfr_org = mac_pfr;
+ 
+ 	/* Enable MAC Tx */
+ 	if (MAC_GET_VAL(mac_tcr, MAC_TX_CFG, TE) != 1) {
+@@ -660,6 +701,14 @@ int xgmac_powerup(void *pdev)
+ 		XGMAC_RGWR(pdata, MAC_TX_CFG, mac_tcr);
+ 	}
+ 
++	/* Enable MAC Filter Rx All */
++	if (MAC_GET_VAL(mac_pfr, MAC_PKT_FR, RA) != 1) {
++		mac_dbg("XGMAC %d: MAC Filter Receive All: ENABLED\n",
++			pdata->mac_idx);
++		MAC_SET_VAL(mac_pfr, MAC_PKT_FR, RA, 1);
++		XGMAC_RGWR(pdata, MAC_PKT_FR, mac_pfr);
++	}
++
+ 	/* Enable MAC Rx */
+ 	if (MAC_GET_VAL(mac_rcr, MAC_RX_CFG, RE) != 1) {
+ 		mac_dbg("XGMAC %d: MAC RX: ENABLED\n", pdata->mac_idx);
+@@ -667,13 +716,8 @@ int xgmac_powerup(void *pdev)
+ 		XGMAC_RGWR(pdata, MAC_RX_CFG, mac_rcr);
+ 	}
+ 
+-	/* Enable MAC Filter Rx All */
+-	if (MAC_GET_VAL(mac_pfr, MAC_PKT_FR, RA) != 1) {
+-		mac_dbg("XGMAC %d: MAC Filter Receive All: ENABLED\n",
+-			pdata->mac_idx);
+-		MAC_SET_VAL(mac_pfr, MAC_PKT_FR, RA, 1);
++	if (mac_pfr_org != mac_pfr)
+ 		XGMAC_RGWR(pdata, MAC_PKT_FR, mac_pfr);
+-	}
+ 
+ 	return 0;
+ }
+@@ -683,7 +727,6 @@ int xgmac_powerdown(void *pdev)
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 	u32 mac_tcr = XGMAC_RGRD(pdata, MAC_TX_CFG);
+ 	u32 mac_rcr = XGMAC_RGRD(pdata, MAC_RX_CFG);
+-	u32 mac_pfr = XGMAC_RGRD(pdata, MAC_PKT_FR);
+ 
+ 	/* Disable MAC Tx */
+ 	if (MAC_GET_VAL(mac_tcr, MAC_TX_CFG, TE) != 0) {
+@@ -699,14 +742,6 @@ int xgmac_powerdown(void *pdev)
+ 		XGMAC_RGWR(pdata, MAC_RX_CFG, mac_rcr);
+ 	}
+ 
+-	/* Disable MAC Filter Rx All */
+-	if (MAC_GET_VAL(mac_pfr, MAC_PKT_FR, RA) != 0) {
+-		mac_dbg("XGMAC %d: MAC Filter Receive All: DISABLED\n",
+-			pdata->mac_idx);
+-		MAC_SET_VAL(mac_pfr, MAC_PKT_FR, RA, 0);
+-		XGMAC_RGWR(pdata, MAC_PKT_FR, mac_pfr);
+-	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/include/net/switch_api/mac_ops.h b/include/net/switch_api/mac_ops.h
+index d047c72cda57..fe3bc5c90cb6 100644
+--- a/include/net/switch_api/mac_ops.h
++++ b/include/net/switch_api/mac_ops.h
+@@ -766,13 +766,20 @@ struct mac_ops {
+ 	 * return	OUT	-1: Initialize MAC Error
+ 	 */
+ 	int (*mac_get_ts_info)(void *ops, struct ethtool_ts_info *ts_info);
++#endif
+ 
+ 	/* This sequence is to do soft restart of Xgmac
+ 	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
+ 	 * return	OUT	-1:	Initialize MAC Error
+ 	 */
+ 	void (*soft_restart)(void *ops);
+-#endif
++
++	/* This sequence is to enable/disable RX
++	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
++	 * param[in/out]IN:	enable	0: disable, 1: enable
++	 * return	OUT	-1:	Initialize MAC Error
++	 */
++	int (*rx_enable)(void *ops, int enable);
+ 
+ 	/* This sequence is used to retrieve XG/L-MAC counter
+ 	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.

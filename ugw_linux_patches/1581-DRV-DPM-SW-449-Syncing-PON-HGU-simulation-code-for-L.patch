@@ -1,0 +1,241 @@
+From 8284354cbec13c8532a330e55164e3f5e00a985a Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Mon, 18 Jan 2021 16:51:52 +0800
+Subject: [PATCH] DRV_DPM_SW-449: Syncing PON HGU simulation code for LGM to
+ PRX
+
+---
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 155 +++++++++++++++++------
+ include/net/datapath_api.h                       |  10 +-
+ 2 files changed, 123 insertions(+), 42 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 9df8d14fdb10..0c458eaf2369 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -29,14 +29,32 @@
+ 
+ static struct pon_spl_cfg pon_cfg[] = {
+ 	{
+-		DP_F_DEREGISTER, 0, 1, DP_GSWIP_CRC_ENABLE, GSW_CRC_PAD_INS_EN,
+-		GSW_FLOW_RXTX, TX_SPTAG_REMOVE, RX_TIME_NOTS, RX_SPTAG_INSERT,
+-		RX_FCS_REMOVE, PMAC_2, 2
++		.flag = DP_F_DEREGISTER,
++		.ingress = 0,
++		.egress = 1,
++		.crc_check = DP_GSWIP_CRC_ENABLE,
++		.fcs_gen = GSW_CRC_PAD_INS_EN,
++		.flow_ctrl = GSW_FLOW_RXTX,
++		.tx_spl_tag = TX_SPTAG_REMOVE,
++		.rx_time_stamp = RX_TIME_NOTS,
++		.rx_spl_tag = RX_SPTAG_INSERT,
++		.rx_fcs = RX_FCS_REMOVE,
++		.pmac = PMAC_2,
++		.qid = 2
+ 	},
+ 	{
+-		DP_F_GPON | DP_F_EPON, 1, 1, DP_GSWIP_CRC_DISABLE,
+-		GSW_CRC_PAD_INS_DIS, GSW_FLOW_OFF, TX_SPTAG_REPLACE,
+-		RX_TIME_NO_INSERT, RX_SPTAG_NO_INSERT, 0, PMAC_1, 28
++		.flag = DP_F_FAST_ETH_WAN | DP_F_GPON | DP_F_EPON,
++		.ingress = 1,
++		.egress = 1,
++		.crc_check = DP_GSWIP_CRC_DISABLE,
++		.fcs_gen = GSW_CRC_PAD_INS_DIS,
++		.flow_ctrl = GSW_FLOW_OFF,
++		.tx_spl_tag = TX_SPTAG_REPLACE,
++		.rx_time_stamp = RX_TIME_NO_INSERT,
++		.rx_spl_tag = RX_SPTAG_NO_INSERT,
++		.rx_fcs = 0,
++		.pmac = PMAC_1,
++		.qid = 28
+ 	},
+ };
+ 
+@@ -1496,7 +1514,81 @@ static int dp_platform_set(int inst, u32 flag)
+ 	return DP_SUCCESS;
+ }
+ 
+-static int pon_config(int inst, int ep, struct dp_port_data *data, u32 flags)
++/* API to enable GSWIP PCE processing */
++static int dp_gsw_pce_enable(int inst, int ep, u32 flags)
++{
++	struct qos_ops *gsw_qos;
++	GSW_QoS_queuePort_t q_map = {0};
++	int i = 0;
++	struct core_ops *gsw_ops = dp_port_prop[inst].ops[0];
++
++	gsw_qos = &gsw_ops->gsw_qos_ops;
++
++	/* Disable Ingress PCE Bypass for Port (PON/Eth) TC 0 .. 3 */
++	for (i = 0; i <= 3; i++) {
++		q_map.nPortId = ep;
++		q_map.nTrafficClassId = i;
++		if (gsw_qos->QoS_QueuePortGet(gsw_ops, &q_map)) {
++			pr_err("%s: Fail in QoS_QueuePortGet\n", __func__);
++			return DP_FAILURE;
++		}
++		q_map.bEnableIngressPceBypass = 0;
++		if (gsw_qos->QoS_QueuePortSet(gsw_ops, &q_map)) {
++			pr_err("%s: Fail in QoS_QueuePortSet\n", __func__);
++			return DP_FAILURE;
++		}
++	}
++
++	return DP_SUCCESS;
++}
++
++/* API to redirect packet to PMAC 1 in gswip second loop for PON HGU */
++static int dp_gsw_secloop_cfg(int inst, int ep, u32 flags)
++{
++	struct qos_ops *gsw_qos;
++	GSW_QoS_queuePort_t q_map = {0};
++	int i = 0;
++	struct core_ops *gsw_ops = dp_port_prop[inst].ops[0];
++	struct pon_spl_cfg *cfg = &pon_cfg[0];
++
++	for (i = 0; i < ARRAY_SIZE(pon_cfg); i++) {
++		if ((pon_cfg[i].flag & flags) == flags) {
++			cfg = &pon_cfg[i];
++			break;
++		}
++	}
++
++	gsw_qos = &gsw_ops->gsw_qos_ops;
++
++	/* EP=2 remapped to Q 28 .. Q 31 and redirect to Pmac 1 */
++	for (i = 0; i <= 3; i++) {
++		q_map.nPortId = ep;
++		q_map.nTrafficClassId = i;
++		if (gsw_qos->QoS_QueuePortGet(gsw_ops, &q_map)) {
++			pr_err("%s: Fail in QoS_QueuePortGet\n", __func__);
++			return DP_FAILURE;
++		}
++
++		/* Currently QID is hardcoded, later when
++		 * GSWIP default config is ready QID can get from GSWIP
++		 * Qos Queue port Get API
++		 */
++		q_map.nQueueId = cfg->qid + i;
++		if (flags & DP_F_DEREGISTER)
++			q_map.nQueueId = cfg->qid;
++
++		q_map.nRedirectPortId = cfg->pmac;
++		if (gsw_qos->QoS_QueuePortSet(gsw_ops, &q_map)) {
++			pr_err("%s: Fail in QoS_QueuePortSet\n", __func__);
++			return DP_FAILURE;
++		}
++	}
++
++	return DP_SUCCESS;
++}
++
++static int pon_config(int inst, int ep, struct dp_port_data *data,
++		      u32 flags)
+ {
+ 	struct core_ops *gsw_ops;
+ 	struct common_ops *gsw_com;
+@@ -1504,9 +1596,6 @@ static int pon_config(int inst, int ep, struct dp_port_data *data, u32 flags)
+ 	GSW_CPU_PortCfg_t cpu_port_cfg = {0};
+ 	struct pon_spl_cfg *cfg = &pon_cfg[0];
+ 	int i;
+-	struct qos_ops *gsw_qos;
+-	GSW_QoS_queuePort_t q_map = {0};
+-	int j = 0;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(pon_cfg); i++) {
+ 		if ((pon_cfg[i].flag & flags) == flags) {
+@@ -1533,36 +1622,10 @@ static int pon_config(int inst, int ep, struct dp_port_data *data, u32 flags)
+ 	}
+ 
+ 	if (is_soc_lgm(inst)) {
+-		gsw_qos = &gsw_ops->gsw_qos_ops;
+-
+-		/* Disable Ingress PCE Bypass for PON TC 0 .. 3
+-		 * EP=2 remapped to Q 28 .. Q 31 and redirect to Pmac 1
+-		 */
+-		for (j = 0; j <= 3; j++) {
+-			q_map.nPortId = ep;
+-			q_map.nTrafficClassId = j;
+-			if (gsw_qos->QoS_QueuePortGet(gsw_ops, &q_map)) {
+-				pr_err("%s: Fail in QoS_QueuePortGet\n",
+-				       __func__);
+-				return DP_FAILURE;
+-			}
+-
+-			/* Currently QID is hardcoded, later when
+-			 * GSWIP default config is ready QID can get from GSWIP
+-			 * Qos Queue port Get API
+-			 */
+-			q_map.nQueueId = cfg->qid + j;
+-			if (flags & DP_F_DEREGISTER)
+-				q_map.nQueueId = cfg->qid;
+-
+-			q_map.bEnableIngressPceBypass = 0;
+-			q_map.nRedirectPortId = cfg->pmac;
+-			if (gsw_qos->QoS_QueuePortSet(gsw_ops, &q_map)) {
+-				pr_err("%s: Fail in QoS_QueuePortSet\n",
+-				       __func__);
+-				return DP_FAILURE;
+-			}
+-		}
++		if (dp_gsw_pce_enable(inst, ep, flags))
++			return DP_FAILURE;
++		if (dp_gsw_secloop_cfg(inst, ep, flags))
++			return DP_FAILURE;
+ 	}
+ 
+ 	/* Rx CRC check. Value '0'-enable, '1'-disable */
+@@ -1639,7 +1702,7 @@ static int vuni_cfg(int inst, int ep, struct dp_port_data *data, u32 flags)
+ 		}
+ 	}
+ 
+-	return 0;
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_port_spl_cfg(int inst, int ep, struct dp_port_data *data,
+@@ -1652,6 +1715,16 @@ static int dp_port_spl_cfg(int inst, int ep, struct dp_port_data *data,
+ 	else if (is_soc_lgm(inst) && port_info->alloc_flags & DP_F_VUNI)
+ 		vuni_cfg(inst, ep, data, flags);
+ 
++	if (is_soc_lgm(inst) && (data->flag_ops & DP_F_DATA_PCE_PATH_EN)) {
++		if (dp_gsw_pce_enable(inst, ep, flags))
++			return DP_FAILURE;
++	}
++
++	if (is_soc_lgm(inst) && (data->flag_ops & DP_F_DATA_PON_HGU_SEC_LOOP)) {
++		if (dp_gsw_secloop_cfg(inst, ep, flags))
++			return DP_FAILURE;
++	}
++
+ 	return DP_SUCCESS;
+ }
+ 
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index 1c4b4ac55bee..e981a8ceca86 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -981,13 +981,21 @@ enum dp_port_data_flag {
+ 	DP_F_DATA_CONTINUOUS_Q_RESV = BIT(7), /*!< reserve continuous physical
+ 					       *   queue ID
+ 					       */
+-	DP_F_DATA_NO_LOOP = BIT(8)	/*!< Once this flag is set,Bridge
++	DP_F_DATA_NO_LOOP = BIT(8),	/*!< Once this flag is set,Bridge
+ 					 * forwarding among subif which belongs
+ 					 * to same DP port/llid is disabled.
+ 					 * It can be used for PON application,
+ 					 * but may not for others like WIFI
+ 					 * bridging between diff subif/vap
+ 					 */
++	DP_F_DATA_PCE_PATH_EN = BIT(9), /*!< Once this flag is set,
++					 * PCE path will be enabled for the
++					 * corresponding LPID
++					 */
++	DP_F_DATA_PON_HGU_SEC_LOOP = BIT(10), /*!< Once this flag is set,
++					       * GSWIP second loop redirect to
++					       * PMAC 1 will be configured
++					       */
+ };
+ 
+ /*! @brief typedef struct dp_port_data */

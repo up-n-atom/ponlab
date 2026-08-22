@@ -1,0 +1,164 @@
+From 32560ec4647c93ba49570af0e51cddded8e9479b Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Thu, 14 Nov 2019 17:22:50 +0800
+Subject: [PATCH] DRVLIB_SW-3183: ptp timestamping fails after lan port
+ re-linking
+
+    - PONRTSYS-5397: Original Jira
+    - Mac Tx Fifo need a timeout value to clear contents, Current timeout value was 100 sec which created a delay,
+      For 1-Step Changed to 1 sec solved the issue, For 2-Step need to change 1 sec and need to clear the stored skb.
+    - Klockwork fix in datapath_stats.c
+---
+ drivers/net/datapath/dpm/datapath_stats.c                |  2 +-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c         |  3 ++-
+ drivers/net/ethernet/lantiq/switch-api/mac/mac_cli.c     |  2 +-
+ drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.c | 11 ++++++++---
+ drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.h |  4 ++--
+ drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c   |  5 +++--
+ include/net/switch_api/mac_ops.h                         |  1 +
+ 7 files changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_stats.c b/drivers/net/datapath/dpm/datapath_stats.c
+index cea5f4aea1e9..2901177148ee 100644
+--- a/drivers/net/datapath/dpm/datapath_stats.c
++++ b/drivers/net/datapath/dpm/datapath_stats.c
+@@ -24,5 +24,5 @@ int dp_net_dev_get_ss_stat_strings_count_3X(struct net_device *dev)
+ 
+ void dp_net_dev_get_ss_stat_strings_3X(struct net_device *dev, u8 *data)
+ {
+-	memcpy(data, *dp_ethtool_gstrings, sizeof(dp_ethtool_gstrings));
++	memcpy(data, dp_ethtool_gstrings, sizeof(dp_ethtool_gstrings));
+ }
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index da7c800192cb..19271b03bc39 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -2198,12 +2198,13 @@ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 				     struct ethtool_stats *stats, u64 *data)
+ {
+ 	GSW_RMON_Port_cnt_t g_counters = { 0 };
+-	struct core_ops *ops = gsw_get_swcore_ops(0);
++	struct core_ops *ops;
+ 	dp_subif_t s_subif;
+ 	uint32_t flags = 0;
+ 	u64 *data_dst;
+ 	int ret = 0;
+ 
++	ops = dp_port_prop[0].ops[0];
+ 	/* get subif information from net device */
+ 	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &s_subif,
+ 				   flags);
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cli.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cli.c
+index b052fe5ff632..e408e43cba86 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cli.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cli.c
+@@ -122,7 +122,7 @@ static int cli_add_fifo(void *pdev)
+ 
+ 	fifo_entry_add(pdev, pdata->val[0], pdata->val[1],
+ 		       pdata->val[2], pdata->val[3], pdata->val[4],
+-		       pdata->val[5]);
++		       pdata->val[5], NULL);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.c
+index 390a8042a436..02e86d7d70e6 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.c
+@@ -34,7 +34,7 @@ u32 fifo_init(void *pdev)
+ }
+ 
+ int fifo_entry_add(void *pdev, u8 ttse, u8 ostc, u8 ostpa, u8 cic,
+-		   u32 ttsl, u32 ttsh)
++		   u32 ttsl, u32 ttsh, struct sk_buff **ptp_tx_skb_loc)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 	int id;
+@@ -63,6 +63,7 @@ int fifo_entry_add(void *pdev, u8 ttse, u8 ostc, u8 ostpa, u8 cic,
+ 	f_entry->ttsh = ttsh;
+ 	f_entry->timeout = FIFO_TIMEOUT_IN_SEC;
+ 	f_entry->is_used = 1;
++	f_entry->ptp_tx_skb_loc = ptp_tx_skb_loc;
+ 
+ #ifdef __KERNEL__
+ 	setup_timer(&f_entry->timer, fifo_entry_timeout,
+@@ -94,6 +95,8 @@ int fifo_entry_del(void *pdev, u32 rec_id)
+ 	f_entry->ttsl = 0;
+ 	f_entry->ttsh = 0;
+ 
++	f_entry->ptp_tx_skb_loc = NULL;
++
+ 	/* Fifo available for the next packet */
+ 	f_entry->is_used = 0;
+ 
+@@ -199,9 +202,11 @@ void fifo_entry_timeout(unsigned long data)
+ {
+ 	struct mac_fifo_entry *f_entry  = (struct mac_fifo_entry *)data;
+ 
+-	//mac_printf("RecordID in timeout %d \n", f_entry->rec_id);
+-
+ 	/* Mark this Fifo entry can be used again */
++	if (f_entry->ptp_tx_skb_loc) {
++		kfree_skb(*(f_entry->ptp_tx_skb_loc));
++		*(f_entry->ptp_tx_skb_loc) = (struct sk_buff *)NULL;
++	}
+ 	f_entry->is_used = 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.h b/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.h
+index a0d0ba7b42ae..2279a25bf9d3 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_tx_fifo.h
+@@ -10,7 +10,7 @@
+ #ifndef _MAC_TXFIFO_H
+ #define _MAC_TXFIFO_H
+ 
+-#define FIFO_TIMEOUT_IN_SEC         	100     /* 100 Sec */
++#define FIFO_TIMEOUT_IN_SEC		1	/* 1 sec */
+ #define MAX_FIFO_ENTRY			64	/* Max Hw Fifo available */
+ #define START_FIFO			1	/* */
+ 
+@@ -22,7 +22,7 @@ enum {
+ 
+ u32 fifo_init(void *pdev);
+ int fifo_entry_add(void *pdev, u8 ttse, u8 ostc, u8 ostpa, u8 cic,
+-		   u32 ttsl, u32 ttsh);
++		   u32 ttsl, u32 ttsh, struct sk_buff **ptp_tx_skb_loc);
+ int fifo_entry_del(void *pdev, u32 rec_id);
+ void fifo_isr_handler(void *pdev);
+ int print_fifo(void *pdev);
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+index 64f8b730af8e..43f94b6a0dc5 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+@@ -371,7 +371,8 @@ int xgmac_tx_hwts(void *pdev, struct sk_buff *skb)
+ 			pdata->ptp_tx_skb = skb_get(skb);
+ 
+ 			/* PTP Sync if we are Master TTSE=1 OSTC=0, OSTPA=0 */
+-			rec_id = fifo_entry_add(pdev, 1, 0, 0, 0, 0, 0);
++			rec_id = fifo_entry_add(pdev, 1, 0, 0, 0, 0, 0,
++						&pdata->ptp_tx_skb);
+ 		}
+ 
+ 		if (IS_1STEP(pdata)) {
+@@ -384,7 +385,7 @@ int xgmac_tx_hwts(void *pdev, struct sk_buff *skb)
+ 			}
+ 
+ 			/* PTP Sync if we are Master TTSE=0 OSTC=1, OSTPA=0 */
+-			rec_id = fifo_entry_add(pdev, 0, 1, 0, 0, 0, 0);
++			rec_id = fifo_entry_add(pdev, 0, 1, 0, 0, 0, 0, NULL);
+ 			/* SNAPTYPESEL=0 TSMSTREN=1 TSEVNTEN = 1 */
+ 			xgmac_ptp_txtstamp_mode(pdev, 0, 1, 1);
+ 		}
+diff --git a/include/net/switch_api/mac_ops.h b/include/net/switch_api/mac_ops.h
+index 61e2568111a5..afe1ad345b62 100644
+--- a/include/net/switch_api/mac_ops.h
++++ b/include/net/switch_api/mac_ops.h
+@@ -146,6 +146,7 @@ struct mac_fifo_entry {
+ #ifdef __KERNEL__
+ 	struct timer_list timer;
+ #endif
++	struct sk_buff **ptp_tx_skb_loc;
+ };
+ 
+ 

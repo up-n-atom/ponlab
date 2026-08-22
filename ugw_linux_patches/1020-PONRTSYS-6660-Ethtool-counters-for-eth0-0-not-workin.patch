@@ -1,0 +1,306 @@
+From 22f9d23b8354bcc8857dbf25cec55f53c04cb53d Mon Sep 17 00:00:00 2001
+From: Robert Dabrowski <robertx.dabrowski@intel.com>
+Date: Thu, 13 Feb 2020 08:30:34 +0100
+Subject: [PATCH] PONRTSYS-6660: Ethtool counters for eth0_0 not working in tx
+ direction in short-cut mode
+
+---
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 119 +++++++++++----------
+ 1 file changed, 62 insertions(+), 57 deletions(-)
+
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+index 9226ee514069..e82718899f8e 100644
+--- a/drivers/net/datapath/mib_counters/dp_mib_counters.c
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0
+-/*  Copyright (C) 2020 Intel Corporation.
++/* Copyright (C) 2020 Intel Corporation.
+  */
+ 
+ #include <linux/module.h> /* Needed by all modules */
+@@ -8,6 +8,7 @@
+ #include <linux/timer.h>
+ #include <linux/spinlock.h>
+ #include <linux/list.h>
++#include <linux/string.h>
+ 
+ #include <net/datapath_api.h>
+ #include "../dpm/datapath.h"
+@@ -52,8 +53,12 @@ static struct list_head registered_devices_list;
+ /* Devices list lock */
+ static rwlock_t dev_list_lock;
+ 
+-/* Notify callback registration ID - used for deregister CB */
+-static s32 g_notify_cb_id;
++/* Notify callback registration ID (pointer) - used for deregister CB */
++static void *g_notify_cb_id;
++
++/* GSWIP "shortcut" mode flag - based on device tree */
++static u8 shortcut_mode;
++
+ /* Wraparound counter handle */
+ static u64 wraparound(u64 curr, u64 last, u32 size)
+ {
+@@ -69,6 +74,8 @@ static void update_dev_counters(struct mib_counters *cnt)
+ {
+ 	GSW_RMON_Port_cnt_t *tmp_counters;
+ 	struct core_ops *ops;
++	/* net device is a bridge port on UNI side */
++	u8 dev_is_uni = 0;
+ 	s32 ret = 0;
+ 	u8 i = 0;
+ 
+@@ -80,13 +87,10 @@ static void update_dev_counters(struct mib_counters *cnt)
+ 		return;
+ 	}
+ 
+-	/* TODO: check whether these zeros can be replaced by consts/variables
+-	 * (e.g. "inst")
+-	 */
+-	ops = dp_port_prop[0].ops[0];
++	ops = dp_port_prop[cnt->inst].ops[0];
+ 
+-	DP_DEBUG(DP_DBG_FLAG_REG,
+-		 "MIB CNT - update_dev_counters for dev: %s, port_id: %d, sub_if_id_grp: %d\n",
++	DP_DEBUG(DP_DBG_FLAG_MIB,
++		 "MIB CNT - update counters for dev: %s, port_id: %d, sub_if_id_grp: %d\n",
+ 		 cnt->dev->name, cnt->port_id, cnt->sub_if_id_grp);
+ 
+ 	/* read current counters' values */
+@@ -111,11 +115,19 @@ static void update_dev_counters(struct mib_counters *cnt)
+ 	 * record packets dropped by QoS modules too.
+ 	 * CTP Tx PCE-Bypass counters are placed after QoS modules,
+ 	 * and they record the packets actually transmitted.
++	 *
++	 * Do not overwrite CTP Tx counters for an UNI interface
++	 * in "shortcut" mode
+ 	 */
++
++	/* TODO: find out better way to check given dev is UNI bridge port */
++	dev_is_uni = cnt->dev->name[0] == 'e';
++
++	if (!(dev_is_uni && shortcut_mode)) {
+ #define _DP_ETHTOOL_TX(r)	tmp_counters[0].r = tmp_counters[1].r;
+-	DP_ETHTOOL_STAT_REG_TX_DECLARE
++		DP_ETHTOOL_STAT_REG_TX_DECLARE
+ #undef _DP_ETHTOOL_TX
+-
++	}
+ 	/* update 64 bits wide counters based on last read values */
+ 	write_lock(&cnt->cnt_lock);
+ #define _DP_ETHTOOL(x, y) cnt->wide_cntrs.y += wraparound(tmp_counters[0].y, cnt->last_read_rmon.y, sizeof(cnt->last_read_rmon.y));
+@@ -135,8 +147,6 @@ static void update_all_devs_counters(void)
+ 	struct mib_counters *mib_cnt;
+ 	struct list_head *p;
+ 
+-	DP_DEBUG(DP_DBG_FLAG_REG, "MIB CNT - update all counters\n");
+-
+ 	read_lock(&dev_list_lock);
+ 	list_for_each(p, &registered_devices_list)
+ 	{
+@@ -155,16 +165,11 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	dev_cnt = devm_kzalloc(&g_dp_dev->dev,
+ 			       sizeof(struct mib_counters),
+ 			       GFP_KERNEL);
+-	if (!dev_cnt) {
+-		/* TODO: use appropriate errno */
+-		return -1;
+-	}
++	if (!dev_cnt)
++		return -ENOMEM;
+ 
+ 	port_info = get_dp_port_info(inst, port_id);
+ 
+-	/* TODO: check if there is a need to pass also sub_if to mib_counters
+-	 *       structure to be able to match DE REGISTERED SUBIF
+-	 */
+ 	dev_cnt->inst = inst;
+ 	dev_cnt->dev = dev;
+ 	dev_cnt->port_id = port_id;
+@@ -178,8 +183,9 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	list_add_tail(&dev_cnt->dev_list, &registered_devices_list);
+ 	write_unlock(&dev_list_lock);
+ 
+-	DP_DEBUG(DP_DBG_FLAG_REG, "MIB CNT - added device: %s port_id = %d, sub_if_id_grp = %d <- from sub_if: %d\n",
+-		 dev->name, port_id, dev_cnt->sub_if_id_grp, sub_if);
++	DP_DEBUG(DP_DBG_FLAG_MIB,
++		 "MIB CNT - added device: %s port_id = %d, sub_if_id_grp = %d\n",
++		 dev->name, port_id, dev_cnt->sub_if_id_grp);
+ 
+ 	return 0;
+ }
+@@ -189,49 +195,43 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ {
+ 	struct pmac_port_info *port_info;
+ 	struct mib_counters *mib_cnt;
+-	struct list_head *p,*q;
++	struct list_head *p, *q;
+ 	s32 sub_if_id_grp;
+ 
+-	/* TODO: tune the range check */
+-	if ((!dev) || (port_id < 0) || (port_id > 16) || (sub_if < 0) || (sub_if > 512)) {
+-		DP_DEBUG(DP_DBG_FLAG_REG,
+-			 "MIB CNT -- item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d  - POSSIBLY WRONG DATA !\n",
++	if ((!dev) || (port_id < 0) || (port_id > 12) || (sub_if < 0) || (sub_if > 512)) {
++		DP_DEBUG(DP_DBG_FLAG_MIB,
++			 "MIB CNT - item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d  - POSSIBLY WRONG DATA !\n",
+ 			 dev->name, port_id, sub_if, inst);
+-		return -1;
++		return -EINVAL;
+ 	}
+ 
+ 	port_info = get_dp_port_info(inst, port_id);
+ 
+-	DP_DEBUG(DP_DBG_FLAG_REG, "MIB CNT - inside rm_dev_from_list\n");
+-	DP_DEBUG(DP_DBG_FLAG_REG,
++	DP_DEBUG(DP_DBG_FLAG_MIB,
+ 		 "MIB CNT -- looking for item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d\n",
+ 		 dev->name, port_id, sub_if, inst);
+ 
+ 	sub_if_id_grp = GET_VAP(sub_if, port_info->vap_offset,
+ 				port_info->vap_mask);
+ 
+-	DP_DEBUG(DP_DBG_FLAG_REG,
+-		 "MIB CNT --- sub_if_id_grp taken from VAP = %d\n",
+-		 sub_if_id_grp);
+-
+ 	write_lock(&dev_list_lock);
+-	list_for_each_safe(p, q, &registered_devices_list)
+-	{
++	list_for_each_safe(p, q, &registered_devices_list) {
+ 		mib_cnt = list_entry(p, struct mib_counters, dev_list);
+ 
+-		DP_DEBUG(DP_DBG_FLAG_REG,
+-			 "MIB CNT - list item: name = %s, port_id = %d, sub_if_id_grp = %d, inst = %d\n",
++		DP_DEBUG(DP_DBG_FLAG_MIB,
++			 "MIB CNT --- list item: name = %s, port_id = %d, sub_if_id_grp = %d, inst = %d ",
+ 			 mib_cnt->dev->name, mib_cnt->port_id, mib_cnt->sub_if_id_grp, mib_cnt->inst);
+ 
+ 		if ((mib_cnt->port_id == port_id) &&
+ 		    (mib_cnt->sub_if_id_grp == sub_if_id_grp) &&
+-		    (mib_cnt->inst == inst)) {
+-			DP_DEBUG(DP_DBG_FLAG_REG, "MIB CNT - removing device: %s port_id = %d, sub_if_id_grp = %d\n",
++		    (mib_cnt->inst == inst) &&
++		    (!strcmp(mib_cnt->dev->name, dev->name))) {
++			DP_DEBUG(DP_DBG_FLAG_MIB, "REMOVED\n",
+ 				 dev->name, port_id, sub_if_id_grp);
+ 			list_del(p);
+ 			devm_kfree(&g_dp_dev->dev, mib_cnt);
+ 		} else {
+-			DP_DEBUG(DP_DBG_FLAG_REG, "MIB CNT  -  item DOES NOT MATCH\n");
++			DP_DEBUG(DP_DBG_FLAG_MIB, "doesn't match\n");
+ 		}
+ 	}
+ 	write_unlock(&dev_list_lock);
+@@ -240,11 +240,8 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ }
+ 
+ /* Function needed for ethtool to find on list appropriate wide counters set */
+-/* TODO: check why sometimes gem(s) and pmapper(s) has the same port_id and
+- *       sub_if_id_grp
+- */
+ struct mib_counters *find_registered_dev(s32 port_id, s32 sub_if_id_grp,
+-					 s32 inst)
++					 s32 inst, struct net_device *dev)
+ {
+ 	struct mib_counters *mib_cnt;
+ 	struct list_head *p;
+@@ -254,7 +251,8 @@ struct mib_counters *find_registered_dev(s32 port_id, s32 sub_if_id_grp,
+ 		mib_cnt = list_entry(p, struct mib_counters, dev_list);
+ 		if ((mib_cnt->port_id == port_id) &&
+ 		    (mib_cnt->sub_if_id_grp == sub_if_id_grp) &&
+-		    (mib_cnt->inst == inst)) {
++		    (mib_cnt->inst == inst) &&
++		    (!strcmp(mib_cnt->dev->name, dev->name))) {
+ 			return mib_cnt;
+ 		}
+ 	}
+@@ -265,21 +263,21 @@ struct mib_counters *find_registered_dev(s32 port_id, s32 sub_if_id_grp,
+ /* Callback function to register new net device (subif) reported by DP API */
+ s32 subif_register_cb(struct dp_event_info *info)
+ {
+-	DP_DEBUG(DP_DBG_FLAG_REG,
++	DP_DEBUG(DP_DBG_FLAG_MIB,
+ 		 "MIB CNT - EVENT - SUBIF REGISTER CB called\n - event info type = %d\n",
+ 		 info->type);
+ 
+ 	switch (info->type) {
+ 	case DP_EVENT_REGISTER_SUBIF:
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - event type: DP_EVENT_REGISTER_SUBIF\n");
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - info->reg_subif_info.dpid = %d\n",
+ 			 info->reg_subif_info.dpid);
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - info->reg_subif_info.subif = %d\n",
+ 			 info->reg_subif_info.subif);
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - info->reg_subif_info.dev->name = %s\n",
+ 			 info->reg_subif_info.dev->name);
+ 
+@@ -291,15 +289,15 @@ s32 subif_register_cb(struct dp_event_info *info)
+ 		break;
+ 	case DP_EVENT_DE_REGISTER_SUBIF:
+ 
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - event type: DP_EVENT_DE_REGISTER_SUBIF\n");
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - info->de_reg_subif_info.dpid = %d\n",
+ 			 info->de_reg_subif_info.dpid);
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - info->de_reg_subif_info.subif = %d\n",
+ 			 info->de_reg_subif_info.subif);
+-		DP_DEBUG(DP_DBG_FLAG_REG,
++		DP_DEBUG(DP_DBG_FLAG_MIB,
+ 			 "MIB CNT - info->de_reg_subif_info.dev->name = %s\n",
+ 			 info->de_reg_subif_info.dev->name);
+ 
+@@ -353,7 +351,7 @@ void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
+ 	/* Find required registered device on list */
+ 	read_lock(&dev_list_lock);
+ 	mib_cnt = find_registered_dev(ps_subif->port_id, sub_if_id_grp,
+-				      ps_subif->inst);
++				      ps_subif->inst, dev);
+ 	if (!mib_cnt) {
+ 		devm_kfree(&g_dp_dev->dev, ps_subif);
+ 		read_unlock(&dev_list_lock);
+@@ -396,7 +394,6 @@ void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
+ #define _DP_ETHTOOL(x, y)	*data_dst++ = wide_cnt_mod.y;
+ 	DP_ETHTOOL_STAT_REG_DECLARE
+ #undef _DP_ETHTOOL
+-
+ }
+ 
+ /********************* TIMER **************************************/
+@@ -414,6 +411,8 @@ void cnt_upd_timer_handler(unsigned long data)
+ static int __init mib_counters_mod_init(void)
+ {
+ 	struct dp_event event_info = {0};
++	struct device_node *np;
++	u32 gsw_mode = 0;
+ 	int ret;
+ 
+ 	/* Initialize empty list of registered net devices */
+@@ -438,8 +437,14 @@ static int __init mib_counters_mod_init(void)
+ 		return ret;
+ 	}
+ 
++	/* Save callback ID for deregistration purpose */
+ 	g_notify_cb_id = event_info.id;
+ 
++	/* Get info from device tree about "shortcut" mode */
++	np = of_find_node_by_name(NULL, "gsw_core");
++	of_property_read_u32(np, "gsw_mode", &gsw_mode);
++	shortcut_mode = ((gsw_mode & BIT(0)) == GSW_SHORTCUT_MODE);
++
+ 	return 0;
+ }
+ 

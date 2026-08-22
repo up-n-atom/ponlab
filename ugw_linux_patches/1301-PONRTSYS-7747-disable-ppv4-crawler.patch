@@ -1,0 +1,184 @@
+From 11f391db809f1757d32991b097f3121fc54efa3d Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Thu, 19 Mar 2020 21:01:31 +0200
+Subject: [PATCH] PONRTSYS-7747: disable ppv4 crawler
+
+Disable inactive sessions scan by default
+add debugfs to enable/disable it
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 50 +++++++++++++++++++++-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c | 18 +++++++-
+ .../pp-session-mgr/pp_session_mgr_internal.h       | 13 ++++++
+ 3 files changed, 78 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 3d11ba338e23..cdf48e914660 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -172,6 +172,7 @@ union work_args {
+  * @brief Inactive sessions scan states
+  */
+ enum inact_scan_state {
++	INACT_SCAN_DISABLE,
+ 	INACT_SCAN_IDLE,
+ 	INACT_SCAN_BUSY,
+ };
+@@ -1671,6 +1672,32 @@ enum smgr_state smgr_state_get(void)
+ 	return db->state;
+ }
+ 
++s32 smgr_sessions_scan_state_set(bool en)
++{
++	if (unlikely(!pp_is_ready()))
++		return -EPERM;
++
++	__smgr_lock();
++	if (en) {
++		if (db->scan_state == INACT_SCAN_DISABLE)
++			db->scan_state = INACT_SCAN_IDLE;
++	} else {
++		db->scan_state = INACT_SCAN_DISABLE;
++	}
++	__smgr_unlock();
++	pr_debug("PP Session Manager Inactive Scan %s\n", BOOL2EN(en));
++
++	return 0;
++}
++
++bool smgr_sessions_scan_state_get(void)
++{
++	if (unlikely(!pp_is_ready()))
++		return false;
++
++	return db->scan_state == INACT_SCAN_DISABLE ? false : true;
++}
++
+ /* ========================================================================== */
+ /*                               Session Create                               */
+ /* ========================================================================== */
+@@ -3692,7 +3719,8 @@ static void __smgr_inactive_work(struct work_struct *work)
+ 	/* free memory and restore scan state back to idle */
+ 	kmem_cache_free(db->work_args_cache, w);
+ 	__smgr_lock();
+-	db->scan_state = INACT_SCAN_IDLE;
++	if (db->scan_state != INACT_SCAN_DISABLE)
++		db->scan_state = INACT_SCAN_IDLE;
+ 	__smgr_unlock();
+ }
+ 
+@@ -3740,6 +3768,7 @@ __smgr_inactive_args_prepare(struct pp_request *req, u32 *inact, u32 inact_sz)
+ s32 pp_inactive_sessions_get(struct pp_request *req, u32 *inact, u32 n)
+ {
+ 	struct inactive_work_args *wargs;
++	struct pp_inactive_list_cb_args cb_args = { 0 };
+ 	s32 ret = 0;
+ 
+ 	if (unlikely(__smgr_is_disable())) {
+@@ -3754,7 +3783,9 @@ s32 pp_inactive_sessions_get(struct pp_request *req, u32 *inact, u32 n)
+ 		__smgr_stats_invalid_args();
+ 		ret = -EINVAL;
+ 		goto done;
++
+ 	}
++
+ 	if (unlikely(n == 0)) {
+ 		pr_err("zero array size\n");
+ 		__smgr_stats_invalid_args();
+@@ -3763,6 +3794,21 @@ s32 pp_inactive_sessions_get(struct pp_request *req, u32 *inact, u32 n)
+ 	}
+ 
+ 	__smgr_lock();
++	if (db->scan_state == INACT_SCAN_DISABLE) {
++		__smgr_unlock();
++		pr_debug("PP inactive sessions scan is disabled\n");
++		/* when the scan is disabled, just call the user callback
++		 * with an empty array of inactive sessions
++		 */
++		cb_args.inact_sess  = inact;
++		cb_args.n_sessions  = 0;
++		cb_args.base.ret    = 0;
++		cb_args.base.req_id = req->req_id;
++		cb_args.base.ev     = PP_INACTIVE_LIST;
++		req->cb(&cb_args.base);
++		return 0;
++	}
++
+ 	if (db->scan_state == INACT_SCAN_BUSY) {
+ 		pr_err("scan in progress, cannot start new one\n");
+ 		__smgr_stats_resource_busy();
+@@ -4235,6 +4281,8 @@ static s32 __smgr_db_init(struct pp_smgr_init_param *init_param)
+ 	/* enable by default */
+ 	db->state = SMGR_ENABLE;
+ 	db->frag_mode = init_param->frag_mode;
++	/* disable inactive scan */
++	db->scan_state = INACT_SCAN_DISABLE;
+ 	/* init lock */
+ 	spin_lock_init(&db->lock);
+ 	/* allocate bitmap for HW crawler */
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 437bdb4930b9..bd1d0e99c1fc 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -171,6 +171,19 @@ void __smgr_dbg_sessions_dump(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(sessions, __smgr_dbg_sessions_dump, NULL);
+ 
++/**
++ * @brief Set session ID to use for dumping the session info
++ */
++void __smgr_dbg_sessions_scan_state_set(char *cmd_buf, void *data)
++{
++	bool en;
++
++	if (kstrtobool(cmd_buf, &en))
++		pr_info("failed to parse '%s'\n", cmd_buf);
++
++	smgr_sessions_scan_state_set(en);
++}
++
+ /**
+  * @brief Dump all PP inactive sessions
+  */
+@@ -190,7 +203,8 @@ void __smgr_dbg_inact_sessions_dump(struct seq_file *f)
+ 	ret = pp_inactive_sessions_get(&req, sessions, n_sessions);
+ }
+ 
+-PP_DEFINE_DEBUGFS(inact_sess_dump, __smgr_dbg_inact_sessions_dump, NULL);
++PP_DEFINE_DEBUGFS(inact_sessions, __smgr_dbg_inact_sessions_dump,
++		  __smgr_dbg_sessions_scan_state_set);
+ 
+ /**
+  * @brief Set session ID to use for dumping the session info
+@@ -2502,7 +2516,7 @@ PP_DEFINE_DEBUGFS(sess_update, sess_update_help, sess_update_set);
+ 
+ static struct debugfs_file debugfs_files[] = {
+ 	{ "sessions", &PP_DEBUGFS_FOPS(sessions) },
+-	{ "inact_sessions", &PP_DEBUGFS_FOPS(inact_sess_dump) },
++	{ "inact_sessions", &PP_DEBUGFS_FOPS(inact_sessions) },
+ 	{ "xsession", &PP_DEBUGFS_FOPS(session) },
+ 	{ "xsi", &PP_DEBUGFS_FOPS(session_si) },
+ 	{ "exception_xsi", &PP_DEBUGFS_FOPS(exception_session_si) },
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 75aa334eeaf7..442780cf089f 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -404,6 +404,19 @@ static inline bool smgr_is_sess_mcast_dst(const struct sess_db_info *s)
+  */
+ bool smgr_is_sess_id_valid(u32 id);
+ 
++/**
++ * @brief Get inactive sessions scan state (enable/disable)
++ * @return bool true in case it is enabled, false otherwise
++ */
++bool smgr_sessions_scan_state_get(void);
++
++/**
++ * @brief Set the inactive sessions scan state
++ * @param en enable/disable scan
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_sessions_scan_state_set(bool en);
++
+ /**
+  * @brief Get session SI
+  * @param id session id

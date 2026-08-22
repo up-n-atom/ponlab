@@ -1,0 +1,352 @@
+From b3f8f96427bc04e3b3becbb365d91361909a7897 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <przemyslawx.czarnota@intel.com>
+Date: Wed, 22 Jul 2020 10:52:47 +0200
+Subject: [PATCH] PONRTSYS-5444: Mapping of multiple tc-flower VLAN rules to
+ single hw rule using tc-action cookie
+
+- Merge rules with the TPID 0
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c | 121 +++++++++++++++------
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c |  23 +++-
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.h |  42 +++++++
+ include/net/datapath_api_vlan.h                    |   6 +
+ 4 files changed, 153 insertions(+), 39 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+index c48951194b8e..16bbf29afcc6 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+@@ -25,7 +25,7 @@ static LIST_HEAD(tc_ext_vlan_storage);
+ 
+ static bool has_cookie(struct dp_act_vlan *act)
+ {
+-	return act->sort_key != 0;
++	return act->merge_key.hi != 0 && act->merge_key.lo != 0;
+ }
+ 
+ static bool is_dscp(struct dp_act_vlan *act)
+@@ -42,11 +42,64 @@ static bool is_dscp(struct dp_act_vlan *act)
+ 	return true;
+ }
+ 
+-static void dp_pattern_vlan_from_cookie(struct dp_pattern_vlan *patt,
+-					u64 cookie)
++static void dp_pattern_vlan_from_cookie_us(struct dp_pattern_vlan *outer,
++					   struct dp_pattern_vlan *inner,
++					   struct dp_act_vlan *act)
+ {
+-	if (FILTER_ETHERTYPE(cookie) == FILTER_ETHERTYPE_ANY)
+-		patt->proto = DP_VLAN_PATTERN_NOT_CARE;
++	if (outer && inner) {
++		if (FILTER_OUTER_TPID(act->merge_key.hi) == FILTER_TPID_ANY)
++			outer->tpid = DP_VLAN_PATTERN_NOT_CARE;
++
++		if (FILTER_INNER_TPID(act->merge_key.hi) == FILTER_TPID_ANY)
++			inner->tpid = DP_VLAN_PATTERN_NOT_CARE;
++
++		if (FILTER_ETHERTYPE(act->merge_key.hi) == FILTER_ETHERTYPE_ANY)
++			inner->proto = DP_VLAN_PATTERN_NOT_CARE;
++
++		return;
++	}
++
++	if (outer) {
++		if (FILTER_INNER_TPID(act->merge_key.hi) == FILTER_TPID_ANY)
++			outer->tpid = DP_VLAN_PATTERN_NOT_CARE;
++		if (FILTER_ETHERTYPE(act->merge_key.hi) == FILTER_ETHERTYPE_ANY)
++			outer->proto = DP_VLAN_PATTERN_NOT_CARE;
++	}
++}
++
++static void dp_pattern_vlan_from_cookie_ds(struct dp_pattern_vlan *outer,
++					   struct dp_pattern_vlan *inner,
++					   struct dp_act_vlan *act)
++{
++	if (outer && inner) {
++		if (FILTER_DS_OUTER_TPID(act->merge_key.hi) == FILTER_TPID_ANY)
++			outer->tpid = DP_VLAN_PATTERN_NOT_CARE;
++
++		if (FILTER_DS_INNER_TPID(act->merge_key.hi) == FILTER_TPID_ANY)
++			inner->tpid = DP_VLAN_PATTERN_NOT_CARE;
++
++		if (FILTER_ETHERTYPE(act->merge_key.hi) == FILTER_ETHERTYPE_ANY)
++			inner->proto = DP_VLAN_PATTERN_NOT_CARE;
++
++		return;
++	}
++
++	if (outer) {
++		if (FILTER_DS_INNER_TPID(act->merge_key.hi) == FILTER_TPID_ANY)
++			outer->tpid = DP_VLAN_PATTERN_NOT_CARE;
++		if (FILTER_ETHERTYPE(act->merge_key.hi) == FILTER_ETHERTYPE_ANY)
++			outer->proto = DP_VLAN_PATTERN_NOT_CARE;
++	}
++}
++
++static void dp_pattern_vlan_from_cookie(struct dp_pattern_vlan *outer,
++					struct dp_pattern_vlan *inner,
++					struct dp_act_vlan *act)
++{
++	if (TREATMENT_DS_EN(act->merge_key.lo))
++		dp_pattern_vlan_from_cookie_ds(outer, inner, act);
++	else
++		dp_pattern_vlan_from_cookie_us(outer, inner, act);
+ }
+ 
+ static int dp_pattern_vlan_eq(const struct dp_pattern_vlan *a,
+@@ -59,15 +112,20 @@ static int dp_pattern_vlan_eq(const struct dp_pattern_vlan *a,
+ 	       a->proto == b->proto;
+ }
+ 
+-static int dscp_merge(struct dp_pattern_vlan *old_outer,
+-		      struct dp_pattern_vlan *old_inner,
+-		      struct dp_act_vlan *old,
+-		      struct dp_pattern_vlan *new_outer,
+-		      struct dp_pattern_vlan *new_inner,
+-		      struct dp_act_vlan *new)
++static int merge(int old_def,
++		 struct dp_pattern_vlan *old_outer,
++		 struct dp_pattern_vlan *old_inner,
++		 struct dp_act_vlan *old,
++		 int new_def,
++		 struct dp_pattern_vlan *new_outer,
++		 struct dp_pattern_vlan *new_inner,
++		 struct dp_act_vlan *new)
+ {
+ 	int i;
+ 
++	if (old_def != new_def)
++		return -1;
++
+ 	if (old_outer && new_outer)
+ 		if (!dp_pattern_vlan_eq(old_outer, new_outer))
+ 			return -1;
+@@ -79,9 +137,6 @@ static int dscp_merge(struct dp_pattern_vlan *old_outer,
+ 	if (old->act != new->act)
+ 		return -1;
+ 
+-	if (!old->push_n || !new->push_n)
+-		return -1;
+-
+ 	if (old->push_n != new->push_n)
+ 		return -1;
+ 
+@@ -89,9 +144,6 @@ static int dscp_merge(struct dp_pattern_vlan *old_outer,
+ 		return -1;
+ 
+ 	for (i = 0; i < old->push_n; i++) {
+-		if (old->prio[i] != DERIVE_FROM_DSCP ||
+-		    new->prio[i] != DERIVE_FROM_DSCP)
+-			return -1;
+ 		if (old->prio[i] != new->prio[i])
+ 			return -1;
+ 		if (old->tpid[i] != new->tpid[i])
+@@ -100,10 +152,12 @@ static int dscp_merge(struct dp_pattern_vlan *old_outer,
+ 			return -1;
+ 	}
+ 
+-	for (i = 0; i < DP_DSCP_MAP; i++) {
+-		if (new->dscp_pcp_map_valid[i]) {
+-			old->dscp_pcp_map[i] = new->dscp_pcp_map[i];
+-			old->dscp_pcp_map_valid[i] = true;
++	if (is_dscp(new) && is_dscp(old)) {
++		for (i = 0; i < DP_DSCP_MAP; i++) {
++			if (new->dscp_pcp_map_valid[i]) {
++				old->dscp_pcp_map[i] = new->dscp_pcp_map[i];
++				old->dscp_pcp_map_valid[i] = true;
++			}
+ 		}
+ 	}
+ 
+@@ -128,13 +182,13 @@ static int untagged_add(struct net_device *dev,
+ 		return err;
+ 	}
+ 
+-	if (has_cookie(&rule->act) && is_dscp(&rule->act))
+-		dp_pattern_vlan_from_cookie(&rule->outer, rule->act.sort_key);
++	if (has_cookie(&rule->act))
++		dp_pattern_vlan_from_cookie(&rule->outer, NULL, &rule->act);
+ 
+ 	/* Attempt to merge new rule into existing one */
+ 	list_for_each_entry(p, &node->rules, list) {
+-		if (!dscp_merge(&p->outer, NULL, &p->act, &rule->outer, NULL,
+-				&rule->act)) {
++		if (!merge(p->def, &p->outer, NULL, &p->act, rule->def,
++			   &rule->outer, NULL, &rule->act)) {
+ 			kfree(rule);
+ 			return 0;
+ 		}
+@@ -173,13 +227,13 @@ static int single_tagged_add(struct net_device *dev,
+ 		return err;
+ 	}
+ 
+-	if (has_cookie(&rule->act) && is_dscp(&rule->act))
+-		dp_pattern_vlan_from_cookie(&rule->outer, rule->act.sort_key);
++	if (has_cookie(&rule->act))
++		dp_pattern_vlan_from_cookie(&rule->outer, NULL, &rule->act);
+ 
+ 	/* Attempt to merge new rule into existing one */
+ 	list_for_each_entry(p, &node->rules, list) {
+-		if (!dscp_merge(&p->outer, NULL, &p->act, &rule->outer, NULL,
+-				&rule->act)) {
++		if (!merge(p->def, &p->outer, NULL, &p->act, rule->def,
++			   &rule->outer, NULL, &rule->act)) {
+ 			kfree(rule);
+ 			return 0;
+ 		}
+@@ -218,13 +272,14 @@ static int double_tagged_add(struct net_device *dev,
+ 		return err;
+ 	}
+ 
+-	if (has_cookie(&rule->act) && is_dscp(&rule->act))
+-		dp_pattern_vlan_from_cookie(&rule->inner, rule->act.sort_key);
++	if (has_cookie(&rule->act))
++		dp_pattern_vlan_from_cookie(&rule->outer, &rule->inner,
++					    &rule->act);
+ 
+ 	/* Attempt to merge new rule into existing one */
+ 	list_for_each_entry(p, &node->rules, list) {
+-		if (!dscp_merge(&p->outer, &p->inner, &p->act, &rule->outer,
+-				&rule->inner, &rule->act)) {
++		if (!merge(p->def, &p->outer, &p->inner, &p->act, rule->def,
++			   &rule->outer, &rule->inner, &rule->act)) {
+ 			kfree(rule);
+ 			return 0;
+ 		}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c
+index ac09cc988678..aa030eeb5231 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c
+@@ -11,6 +11,7 @@
+ #include <net/tc_act/tc_mirred.h>
+ #include <net/datapath_api_vlan.h>
+ #include <uapi/linux/tc_act/tc_vlan.h>
++#include "pon_qos_tc_vlan_storage.h"
+ #include "pon_qos_tc_vlan_prepare.h"
+ #include "pon_qos_tc_lct.h"
+ 
+@@ -201,24 +202,34 @@ static void cookie_parse(struct net_device *dev,
+ 	list_for_each_entry(a, &actions, list) {
+ 		if (a->act_cookie) {
+ 			u8 *p = a->act_cookie->data;
++			u64 hi = 0;
++			u64 lo = 0;
+ 			int i;
+ 
+-			if (a->act_cookie->len < 8) {
++			if (a->act_cookie->len < 16) {
+ 				netdev_warn(dev, "%s: cookie is too short!\n",
+ 					    __func__);
+ 				continue;
+ 			}
+ 
+-			/* Save first two words (64 bits) from cookie
+-			 * data as cookie priority
+-			 */
+ 			for (i = 7; i > -1; i--) {
+ 				u64 cookie_byte = *p;
+ 
+-				act->sort_key |=
+-					(cookie_byte << i * 8);
++				hi |= (cookie_byte << i * 8);
+ 				p++;
+ 			}
++
++			for (i = 7; i > -1; i--) {
++				u64 cookie_byte = *p;
++
++				lo |= (cookie_byte << i * 8);
++				p++;
++			}
++
++			act->sort_key = hi & FILTER_SORT_MASK;
++			act->merge_key.hi = hi;
++			act->merge_key.lo = lo;
++
+ 			netdev_dbg(dev, "Cookie parsed: %llx\n",
+ 				   act->sort_key);
+ 			return;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+index 162cb9d4dc69..30c625427e58 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+@@ -10,13 +10,55 @@
+ 
+ #include "pon_qos_tc_vlan_prepare.h"
+ 
++/* Received frame EVLAN tagging operation layout (encoded in the cookie)
++ *    3                   2                   1
++ *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |  FOP  |         FIV             | FOT |  FOP* | FOT*|    r    |\merge
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ key
++ * |  FIP  |         FIV             | FIT |  FIP* | FIT*|r| ETYPE |/.hi
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |x|      PAD          |  TOP  |           TOV             | TOT |\merge
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+ key
++ * |  TIP* | TIT*| PAD |y|  TIP  |           TIV             | TIT |/.lo
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ *
++ * * - Downstram
++ * r - Reserved
++ * x - Treatment, tags to remove
++ * y - Enable downstream, this will cause the driver to use * fields
++ *     when merging.
++ *
++ * The * fields and y are ignored when sorting
++ * (sort_key is merge_key.hi & FILTER_SORT_MASK)
++ *
++ * sort_key, merge_key.hi and merge_key.lo are 64 bit values
++ */
++
++#define FILTER_SORT_MASK 0xFFFFF000FFFFF00F
++
++/* Macros valid for sort_key or merge_key.hi */
+ #define FILTER_OUTER_PRIO(x) (((x) >> 60) & 0xF)
+ #define FILTER_OUTER_VID(x) (((x) >> 47) & 0x1FFF)
+ #define FILTER_OUTER_TPID(x) (((x) >> 44) & 0x7)
++
++#define FILTER_DS_OUTER_PRIO(x) (((x) >> 40) & 0xF)
++#define FILTER_DS_OUTER_TPID(x) (((x) >> 37) & 0x7)
++
+ #define FILTER_INNER_PRIO(x) (((x) >> 28) & 0xF)
+ #define FILTER_INNER_VID(x) (((x) >> 15) & 0x1FFF)
+ #define FILTER_INNER_TPID(x) (((x) >> 12) & 0x7)
++
++#define FILTER_DS_INNER_PRIO(x) (((x) >> 8) & 0xF)
++#define FILTER_DS_INNER_TPID(x) (((x) >> 5) & 0x7)
++
+ #define FILTER_ETHERTYPE(x) (((x) >> 0) & 0xF)
++
++/* Macros valid for merge_key.lo */
++#define TREATMENT_DS_INNER_PRIO(x) (((x) >> 28) & 0xF)
++#define TREATMENT_DS_INNER_TPID(x) (((x) >> 25) & 0x7)
++#define TREATMENT_DS_EN(x) (((x) >> 20) & 0x1)
++
+ #define FILTER_PRIO_IGNORE 15
+ #define FILTER_PRIO_DEFAULT 14
+ #define FILTER_ETHERTYPE_ANY 0
+diff --git a/include/net/datapath_api_vlan.h b/include/net/datapath_api_vlan.h
+index e5df2de65ec1..3deaf17ad1d4 100644
+--- a/include/net/datapath_api_vlan.h
++++ b/include/net/datapath_api_vlan.h
+@@ -51,6 +51,11 @@ struct dp_act_reassign {
+ 	struct net_device *bp_dev;  /* BP network device where to reassign*/
+ };
+ 
++struct dp_merge_key {
++	u64 hi;
++	u64 lo;
++};
++
+ struct dp_act_vlan {
+ #define DP_VLAN_ACT_FWD    BIT(0)  /*forward packet without editing */
+ #define DP_VLAN_ACT_DROP   BIT(1)  /*drop packet */
+@@ -105,6 +110,7 @@ struct dp_act_vlan {
+ 					       */
+ 	struct dp_act_reassign ract; /* VLAN reassignment action */
+ 	u64 sort_key; /*! Special user key used to sort rules */
++	struct dp_merge_key merge_key; /*! Special user key used to merge rules */
+ };
+ 
+ #define DP_VLAN_DEF_RULE 1

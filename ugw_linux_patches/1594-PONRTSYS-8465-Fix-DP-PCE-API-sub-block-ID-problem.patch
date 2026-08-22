@@ -1,0 +1,212 @@
+From e8b583eebd6a0cf0ca98b98e09856e1537776a7e Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <kamil.rywacki@intel.com>
+Date: Tue, 19 Jan 2021 17:20:18 +0100
+Subject: [PATCH] PONRTSYS-8465: Fix DP PCE API sub-block ID problem
+
+- Sub-block ID generation is now correctly using free entries
+- Add user option to chose ID in sub-block manually
+---
+ drivers/net/datapath/dpm/datapath_pce.c | 84 ++++++++++++++++++++++++++-------
+ drivers/net/datapath/dpm/datapath_pce.h |  8 +++-
+ 2 files changed, 74 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_pce.c b/drivers/net/datapath/dpm/datapath_pce.c
+index 4e9d2c5ba13a..db45ca8acc9e 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.c
++++ b/drivers/net/datapath/dpm/datapath_pce.c
+@@ -572,14 +572,16 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+ 			struct dp_subblk_entry *subblk_entry)
+ {
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
++	int index = pce->nIndex;
+ 
+ 	if (!ops)
+ 		return -1;
+ 
+ 	if (pce->nIndex > subblk_entry->subblk_rules_max) {
+-		pr_err("%s: PCE Index for Block %d should be within 0 to %d\n",
++		pr_err("%s: PCE Index for Block %d should be within 0 to %d, nIndex: %u\n",
+ 		       __func__, subblk_entry->subblk_id,
+-		       subblk_entry->subblk_rules_max);
++		       subblk_entry->subblk_rules_max,
++		       pce->nIndex);
+ 		return -1;
+ 	}
+ 
+@@ -601,11 +603,14 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+ 		pce->nIndex;
+ 
+ 	if (ops->gsw_tflow_ops.TFLOW_PceRuleDelete(ops, pce)) {
+-		pr_err("%s: TFLOW_PceRule Delete failed, nIndex: %u\n",
++		pr_err("%s: TFLOW_PceRule Delete failed, nIndex: %d\n",
+ 		       __func__, pce->nIndex);
+ 		return -1;
+ 	}
+ 
++	/* update sub-block bitmask control */
++	clear_bit(index, subblk_entry->_used);
++
+ 	if (subblk_entry->subblk_rules_used)
+ 		subblk_entry->subblk_rules_used--;
+ 
+@@ -620,38 +625,81 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+ /* Pce Rule Operations
+  * pce_rule     : Pce rule Entry to add
+  * subblk_entry : Sub-Block on which rule need to be added
++ * ret : Sub-Block relative index on which rule was added
+  */
+ static int pce_rule_add(GSW_PCE_rule_t *pce,
+ 			struct dp_blk_entry *blk_entry,
+ 			struct dp_subblk_entry *subblk_entry)
+ {
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
++	int index = 0, i;
+ 
+ 	if (!ops)
+ 		return -1;
+ 
+-	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: %s %d %s %d %s %d\n",
++	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: %s %d %s %d %s %d %s %d\n",
+ 		 __func__,
+ 		 "subblk_firstindex", subblk_entry->subblk_firstindex,
+ 		 "blk_firstindex", blk_entry->blk_firstindex,
+-		 "subblk_rules_used", subblk_entry->subblk_rules_used);
++		 "subblk_rules_used", subblk_entry->subblk_rules_used,
++		 "subblk_rules_max", subblk_entry->subblk_rules_max);
+ 
+ 	pce->pattern.bEnable = 1;
+ 	pce->pattern.nIndex =
+-		(subblk_entry->subblk_firstindex - blk_entry->blk_firstindex) +
+-		subblk_entry->subblk_rules_used;
++		subblk_entry->subblk_firstindex - blk_entry->blk_firstindex;
++
++	/* prevent bitmask overflow */
++	if (subblk_entry->subblk_rules_max > PCE_SUBBLK_SIZE_MAX) {
++		pr_err("%s: Sub-block max rules(%u) > max default(%d)\n",
++		       __func__, subblk_entry->subblk_rules_max,
++		       PCE_SUBBLK_SIZE_MAX);
++		return -1;
++	}
++
++	if (!subblk_entry->manual_index_en) {
++		for (i = 0; i < subblk_entry->subblk_rules_max; i++) {
++			if (test_bit(i, subblk_entry->_used))
++				continue;
++			index = i;
++			break;
++		}
++	} else {
++		if (subblk_entry->manual_index >
++		    subblk_entry->subblk_rules_max) {
++			pr_err("%s: Manual user index out of range: %u\n",
++			       __func__, subblk_entry->manual_index);
++			return -1;
++		}
++		index = subblk_entry->manual_index;
++	}
++
++	pce->pattern.nIndex += index;
++	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: Index %d\n",
++		 __func__, pce->pattern.nIndex);
++
++	/* check if index is already occupied */
++	if (test_bit(index, subblk_entry->_used)) {
++		pr_err("%s: Index already in use, subblk_index: %d, nIndex: %d\n",
++		       __func__, index, pce->pattern.nIndex);
++		return -1;
++	}
+ 
+ 	if (ops->gsw_tflow_ops.TFLOW_PceRuleWrite(ops, pce)) {
+-		pr_err("%s: TFLOW_PceRuleWite failed, nIndex: %u\n",
++		pr_err("%s: TFLOW_PceRuleWite failed, nIndex: %d\n",
+ 		       __func__, pce->pattern.nIndex);
+ 		return -1;
+ 	}
+ 
++	/* update sub-block bitmask control */
++	set_bit(index, subblk_entry->_used);
++
+ 	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: Success Pce Rule Added to HW Idx %d\n",
+-		 __func__,
+-		 (blk_entry->blk_firstindex + pce->pattern.nIndex));
++		 __func__, pce->pattern.nIndex);
+ 
+-	return DP_SUCCESS;
++	/* save sub-block relative index for user inside PCE structure */
++	pce->pattern.nIndex = index;
++
++	return index;
+ }
+ 
+ /* Pce Rule Operations
+@@ -668,9 +716,10 @@ static int pce_rule_get(GSW_PCE_rule_t *pce,
+ 		return -1;
+ 
+ 	if (pce->pattern.nIndex > subblk_entry->subblk_rules_max) {
+-		pr_err("%s: PCE Index for Block %d should be within 0 to %d\n",
++		pr_err("%s: PCE Index for Block %d should be within 0 to %d, nIndex: %u\n",
+ 		       __func__, subblk_entry->subblk_id,
+-		       subblk_entry->subblk_rules_max);
++		       subblk_entry->subblk_rules_max,
++		       pce->pattern.nIndex);
+ 		return -1;
+ 	}
+ 
+@@ -718,9 +767,10 @@ static int pce_rule_update(GSW_PCE_rule_t *pce,
+ 	}
+ 
+ 	if (pce->pattern.nIndex > subblk_entry->subblk_rules_max) {
+-		pr_err("%s: PCE Index for Block %d should be within 0 to %d\n",
++		pr_err("%s: PCE Index for Block %d should be within 0 to %d, nIndex: %u\n",
+ 		       __func__, subblk_entry->subblk_id,
+-		       subblk_entry->subblk_rules_max);
++		       subblk_entry->subblk_rules_max,
++		       pce->pattern.nIndex);
+ 		return -1;
+ 	}
+ 
+@@ -1007,14 +1057,14 @@ int dp_pce_rule_add_priv(struct dp_pce_blk_info *pce_blk_info,
+ 	}
+ 
+ 	/* Add PCE rule inside sub-block entry */
+-	if (pce_rule_add(pce, blk_entry, subblk_entry)) {
++	ret = pce_rule_add(pce, blk_entry, subblk_entry);
++	if (ret < 0) {
+ 		pr_err("%s: pce_rule_add failed\n", __func__);
+ 		subblk_del(blk_entry, subblk_entry);
+ 		blk_del(blk_entry);
+ 		goto EXIT;
+ 	}
+ 
+-	ret = subblk_entry->subblk_rules_used;
+ 	subblk_entry->subblk_rules_used++;
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_PCE,
+diff --git a/drivers/net/datapath/dpm/datapath_pce.h b/drivers/net/datapath/dpm/datapath_pce.h
+index e0cd9319e559..dfe24afe5dab 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.h
++++ b/drivers/net/datapath/dpm/datapath_pce.h
+@@ -15,6 +15,9 @@
+ /* CTP flow entry index used during reset in GSWIP CTP_PortCfgSet */
+ #define CTP_FLOW_ENTRY_IDX_RESET 0xFFFFFFFF
+ 
++/* Max default Sub-Block Size */
++#define PCE_SUBBLK_SIZE_MAX	64
++
+ /* Main PCE rule entry struct */
+ struct dp_pce_rule {
+ 	u32 hw_rules_max;
+@@ -39,9 +42,12 @@ struct dp_subblk_entry {
+ 	struct list_head list;
+ 	char subblk_name[32];	/* Sub-Block app name like vlan_aware */
+ 	int subblk_id;		/* Sub-Block ID */
+-	int subblk_firstindex;	/* Sub-Block Starting Pce Index */
++	u32 subblk_firstindex;	/* Sub-Block Starting Pce Index */
+ 	u32 subblk_rules_max;	/* num of rules in this Sub-Block */
+ 	u32 subblk_rules_used;	/* num of rules used for this Sub-Block */
++	bool manual_index_en;	/* Enable use of manual index from user */
++	u32 manual_index;	/* User provided manual index */
++	DECLARE_BITMAP(_used, PCE_SUBBLK_SIZE_MAX);	/* Used rules */
+ 	bool subblk_protected;  /* Indicates this sub-blk is protected or not */
+ };
+ 

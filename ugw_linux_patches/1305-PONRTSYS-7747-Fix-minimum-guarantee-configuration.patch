@@ -1,0 +1,3404 @@
+From 23b3822fa424ae6d0444dafeea8adec412504528 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Sun, 19 Apr 2020 18:19:04 +0300
+Subject: [PATCH] PONRTSYS-7747: Fix minimum guarantee configuration
+
+Use different groups for policies who use the same
+set of pools
+Disable minimum guarantee hw logic for pools which
+are used by 1 policy only
+Add unit-tests for buffer manager
+Fix Falcon compatibility issues
+
+Signed-off-by: Emergi Idan <idan.emergi@intel.com>
+---
+ drivers/net/ppv4/Makefile                          |    1 +
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c  | 1066 +++++++++++++-------
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h  |   50 +-
+ .../pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c   |  125 +--
+ .../pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h  |   40 +-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |   16 +-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c  |    2 +-
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.c        |  110 +-
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.h        |   46 +-
+ drivers/net/ppv4/pp-tools/unit-test/pput_drv.c     |    1 +
+ .../ppv4/pp-tools/unit-test/tests/pp_bm_tests.c    |  907 +++++++++--------
+ include/linux/pp_buffer_mgr_api.h                  |   11 +-
+ 12 files changed, 1491 insertions(+), 884 deletions(-)
+
+diff --git a/drivers/net/ppv4/Makefile b/drivers/net/ppv4/Makefile
+index 7ee09f1b8551..446ccf5b061e 100644
+--- a/drivers/net/ppv4/Makefile
++++ b/drivers/net/ppv4/Makefile
+@@ -155,6 +155,7 @@ $(TARGET)-y += pp-tools/unit-test/tests/pp_parser_tests.o
+ endif
+ 
+ $(TARGET)-y += pp-tools/unit-test/tests/pp_qos_tests.o
++$(TARGET)-y += pp-tools/unit-test/tests/pp_bm_tests.o
+ endif
+ endif
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+index d5bfc7dc0d78..5b7e496c8ea2 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+@@ -5,6 +5,9 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  * Copyright (C) 2017-2020 Intel Corporation
+  */
++
++#define pr_fmt(fmt) "[PP_BMGR]:%s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/platform_device.h>
+ #include <linux/device.h>
+ #include <linux/kernel.h>
+@@ -51,17 +54,6 @@ struct policy_reset_action {
+ 	void   (*cb)(s32 ret);
+ };
+ 
+-/**
+- * @brief This structure is used to pause/resume a group
+- * @pause if set group is paused else it is resumed
+- * @validate_resources if set pool resource validation will
+- *        occur
+- */
+-struct group_pause_config {
+-	bool pause;
+-	bool validate_resources;
+-};
+-
+ /**
+  * @brief This function locks the DB in a recursion-save manner
+  * @return void
+@@ -89,6 +81,11 @@ static inline bool __bmgr_is_ready(void)
+ 	return false;
+ }
+ 
++static inline bool bmgr_is_group_id_valid(u32 id)
++{
++	return (id < db->cfg.max_groups);
++}
++
+ static inline bool bmgr_is_pool_id_valid(u32 id)
+ {
+ 	if (likely(id < db->cfg.max_pools))
+@@ -157,54 +154,257 @@ __bmgr_is_pool_params_valid(const struct pp_bmgr_pool_params *const pool_params)
+ }
+ 
+ /**
+- * @brief Check wheather policy parameters are valid
+- * @param policy_params: Policy param from user
+- * @return 0 on success, other error code on failure
++ * @brief Free buffer pool
++ * @param pool the pool id
++ * @return s32
+  */
+-static s32
+-__bmgr_is_policy_params_valid(const struct pp_bmgr_policy_params
+-				*const policy_params)
++static void free_pool(u32 pool)
+ {
+-	if (unlikely(!policy_params)) {
+-		pr_err("policy_params is NULL\n");
+-		return -EINVAL;
++	clear_bit(pool, db->pools_bmap);
++	db->num_pools--;
++}
++
++/**
++ * @brief Test whether pool is used or not
++ * @param pool the pool id
++ * @return bool true if the pool is used, false otherwise
++ */
++static bool is_pool_busy(u32 pool)
++{
++	return test_bit(pool, db->pools_bmap);
++}
++
++/**
++ * @brief Allocate free pool
++ *        If a valid pool is specified, try to allocate it
++ *        otherwise, try to allocate a free pool
++ * @param pool the allocated pool id
++ * @return s32 0 on succesfull allocation, error code otherwise
++ */
++static s32 alloc_pool(u8 *pool)
++{
++	if (db->num_pools == db->cfg.max_pools) {
++		pr_err("no free pool available\n");
++		return -ENOENT;
+ 	}
+ 
+-	if (unlikely(policy_params->num_pools_in_policy >
+-		     db->cfg.max_pools_in_policy)) {
+-		pr_err("num_pools_in_policy %d should be up to %d\n",
+-		       policy_params->num_pools_in_policy,
+-		       db->cfg.max_pools_in_policy);
++	if (*pool == PP_BM_INVALID_POOL_ID)
++		*pool = find_first_zero_bit(db->pools_bmap, PP_BM_MAX_POOLS);
++	if (!bmgr_is_pool_id_valid(*pool))
+ 		return -EINVAL;
++	if (is_pool_busy(*pool)) {
++		pr_err("Pool %d id active\n", *pool);
++		return -EBUSY;
+ 	}
+ 
++	set_bit(*pool, db->pools_bmap);
++	db->num_pools++;
++
+ 	return 0;
+ }
+ 
+ /**
+- * @brief Allocate group
+- * @note This function should be called under db lock
+- * @param group_id allocated groop id
+-  @return 0 on success, other error code on failure
++ * @brief Test whether 2 policies params are equal
++ *        Policies params are considered to be equal if the following apply:
++ *        1. The share the exact same pools
++ * @param a policy a params
++ * @param b policy b params
++ * @return bool true if both are equal, false otherwise
+  */
+-static s32 __bmgr_allocate_group(u8 *group_id)
++static bool policy_params_cmp(const struct pp_bmgr_policy_params *a,
++			      const struct pp_bmgr_policy_params *b)
+ {
+-	u8 idx;
++	u32 i;
++	bool ret = true;
+ 
+-	BM_FOR_EACH_ISOLATED_GROUP(db, idx) {
+-		if (!db->groups[idx].is_busy) {
+-			*group_id = idx;
+-			db->groups[idx].is_busy = 1;
+-			break;
++	if (a->num_pools_in_policy != b->num_pools_in_policy) {
++		pr_err("num_pools_in_policy mismatch\n");
++		return false;
++	}
++
++	for (i = 0; i < a->num_pools_in_policy; i++) {
++		if (a->pools_in_policy[i].pool_id !=
++		    b->pools_in_policy[i].pool_id) {
++			pr_err("a->pools[%u] = %u != b->pools[%u] = %u\n", i,
++			       a->pools_in_policy[i].pool_id, i,
++			       b->pools_in_policy[i].pool_id);
++			ret = false;
+ 		}
+ 	}
+ 
+-	if (idx == db->cfg.max_groups)
+-		return -ENOMEM;
++	return ret;
++}
++
++/**
++ * @brief Check wheather policy parameters are valid
++ * @param prms Policy params from user
++ * @param is_isolated specify if the policy is isolated or not
++ * @return 0 on success, other error code on failure
++ */
++static s32 bmgr_is_policy_params_valid(const struct pp_bmgr_policy_params *prms,
++				       bool *is_isolated)
++{
++	ulong policies[BITS_TO_LONGS(PP_BM_MAX_POLICIES)] = { 0 };
++	ulong pools[BITS_TO_LONGS(PP_BM_MAX_POOLS)] = { 0 };
++	struct pp_bmgr_policy_params *other;
++	struct bmgr_pool_db_entry *pool;
++	u32 i, pool_id, other_id, isolated_pools;
++	u32 total_buff, total_max_allowed, total_min_guarantee;
++	s32 ret = 0;
++
++	if (unlikely(ptr_is_null(prms)))
++		return -EINVAL;
++
++	if (unlikely(!prms->num_pools_in_policy)) {
++		pr_err("policy must have at least 1 pool\n");
++		return -EINVAL;
++	}
++	if (unlikely(prms->num_pools_in_policy > db->cfg.max_pools_in_policy)) {
++		pr_err("num_pools_in_policy %d should be up to %d\n",
++		       prms->num_pools_in_policy,
++		       db->cfg.max_pools_in_policy);
++		ret = -EINVAL;
++	}
++
++	isolated_pools = 0;
++	total_buff = 0;
++	total_max_allowed = 0;
++	for (i = 0; i < prms->num_pools_in_policy; i++) {
++		pool_id = prms->pools_in_policy[i].pool_id;
++		set_bit(pool_id, pools);
++
++		/* Verify pool in policy is valid */
++		if (unlikely(!bmgr_is_pool_id_valid(pool_id))) {
++			ret = -EINVAL;
++			continue;
++		}
++
++		/* Verify pool in policy is active */
++		if (unlikely(!is_pool_busy(pool_id))) {
++			pr_err("pool_id %d is not active\n", pool_id);
++			ret = -EINVAL;
++			continue;
++		}
++
++		pool = &db->pools[pool_id];
++		/* Verify isolated pool is not used by any policy */
++		if (pool->params.flags & POOL_ISOLATED) {
++			if (pool->policy_ref_cnt) {
++				pr_err("Isolated Pool %d already used by other policy\n",
++				       pool_id);
++				ret = -EINVAL;
++				continue;
++			}
++			isolated_pools++;
++		}
++
++		total_max_allowed += prms->pools_in_policy[i].max_allowed;
++		total_buff += pool->params.num_buffers;
++		/* verify the policy max allowed from the current pool
++		 * isn't bigger then the pool size
++		 */
++		if (prms->pools_in_policy[i].max_allowed >
++		    pool->params.num_buffers) {
++			pr_err("max allowed(%u) cannot be bigger than the pool%u size(%u)\n",
++			       prms->pools_in_policy[i].max_allowed,
++			       pool->pool_id, pool->params.num_buffers);
++			// ret = -EINVAL;
++		}
++
++		if (pool->policy_ref_cnt) {
++			/* gather all the policies that uses the same
++			 * set of pools into 1 bitmap
++			 */
++			bitmap_or(policies, policies,
++				  pool->policies_bmap, PP_BM_MAX_POLICIES);
++
++			/* verify the policy uses the same pools of a policy
++			 * that already use the current pool
++			 */
++			other_id = find_first_bit(pool->policies_bmap,
++						  PP_BM_MAX_POLICIES);
++			other = &db->policies[other_id].params;
++			if (!policy_params_cmp(other, prms)) {
++				pr_err("pools mismatch with policy %u\n",
++				       other_id);
++				ret = -EINVAL;
++			}
++		}
++	}
++
++	/* sum the total minimum guerantee of all policies
++	 * that uses the same set of pools
++	 */
++	total_min_guarantee = prms->min_guaranteed;
++	for_each_set_bit(i, policies, PP_BM_MAX_POLICIES)
++		total_min_guarantee += db->policies[i].params.min_guaranteed;
++
++	/* verify the policy max allowed from all pools isn't bigger then
++	 * total number of buffers of the pools
++	 */
++	if (total_max_allowed > total_buff) {
++		pr_err("total max allowed of %u is bigger then %u buffers available in pools %*pbl\n",
++		       total_max_allowed, total_buff, PP_BM_MAX_POOLS, pools);
++		// ret = -EINVAL;
++	}
++
++	/* verify the policy minimum guarantee isn't bigger then the
++	 * max allowed
++	 */
++	if (total_max_allowed < prms->min_guaranteed) {
++		pr_err("total max allowed of %u cannot be less then the minimum guarantee of %u\n",
++		       total_max_allowed, prms->min_guaranteed);
++		ret = -EINVAL;
++	}
++
++	if (total_buff < total_min_guarantee) {
++		pr_err("min guarantee of %u is causing overbooked on pools %*pbl\n",
++		       total_min_guarantee, PP_BM_MAX_POOLS, pools);
++		ret = -EINVAL;
++	}
++
++	/* If there is an isolated pool, all pools should be isolated */
++	if (isolated_pools) {
++		if (isolated_pools != prms->num_pools_in_policy) {
++			pr_err("cannot mix isolated and non-isolated pools\n");
++			ret = -EINVAL;
++		}
++
++		if (is_isolated)
++			*is_isolated = true;
++	} else {
++		if (is_isolated)
++			*is_isolated = false;
++	}
++
++	return ret;
++}
++
++static s32 alloc_group(u8 *group)
++{
++	if (db->num_groups == db->cfg.max_groups)
++		return -ENOENT;
++
++	*group = find_first_zero_bit(db->groups_bmap, BM_MAX_GROUPS);
++	set_bit(*group, db->groups_bmap);
++	db->num_groups++;
++
++	return 0;
++}
++
++static s32 free_group(u32 group)
++{
++	clear_bit(group, db->groups_bmap);
++	db->num_groups--;
+ 
+ 	return 0;
+ }
+ 
++static bool is_group_busy(u32 group)
++{
++	return test_bit(group, db->groups_bmap);
++}
++
+ /**
+  * @brief Enable pool pop
+  * @param pool_id: Pool ID
+@@ -252,7 +452,7 @@ static s32 pool_pause(struct bmgr_pool_db_entry *pool, bool pause,
+ 	s32 ret = 0;
+ 
+ 	/* pausing pool means to disable popping from it, so, pause
+-	 * means disable pop (false), continue means enable pop (true)
++	 * means disable pop (false), resume means enable pop (true)
+ 	 */
+ 	pop_enable = pause ? false : true;
+ 
+@@ -294,6 +494,10 @@ static s32 pool_pause(struct bmgr_pool_db_entry *pool, bool pause,
+ 	return ret;
+ }
+ 
++#define group_pause(id) group_pause_set(id, true, false)
++#define group_pause_validate(id) group_pause_set(id, true, true)
++#define group_resume(id) group_pause_set(id, false, false)
++
+ /**
+  * @brief Pause/Unpause buffer allocation in pools associated
+  *        with a group
+@@ -302,27 +506,76 @@ static s32 pool_pause(struct bmgr_pool_db_entry *pool, bool pause,
+  * @param cfg pause config
+  * @return 0 on success, other error code on failure
+  */
+-static s32 __group_pause(u8 group_id, struct group_pause_config *cfg)
++static s32 group_pause_set(u8 group_id, bool pause, bool validate)
+ {
+ 	struct bmgr_group_db_entry *group;
+ 	struct bmgr_pool_db_entry *pool;
++	u32 id;
+ 	s32 ret = 0;
+ 
++	/* silently ignore */
++	if (!bmgr_is_group_id_valid(group_id))
++		return 0;
++
+ 	/* Group entry in db */
+ 	group = &db->groups[group_id];
+ 
+ 	/* pause/continue all pools in group */
+-	list_for_each_entry(pool, &group->pools_head, group_link) {
+-		if (!pool->is_busy) {
++	for_each_set_bit(id, group->pools_bmap, PP_BM_MAX_POOLS) {
++		pool = &db->pools[id];
++		if (!is_pool_busy(pool->pool_id)) {
+ 			pr_err("Pool %d in Group %d is not active\n",
+ 			       pool->pool_id, group_id);
+ 			continue;
+ 		}
+ 
+-		ret = pool_pause(pool, cfg->pause, cfg->validate_resources);
++		ret = pool_pause(pool, pause, validate);
+ 		if (unlikely(ret)) {
+ 			pr_err("failed to %s pool %u, ret %d\n",
+-			       BOOL2EN(cfg->pause), pool->pool_id, ret);
++			       pause ? "pause" : "resume", pool->pool_id, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++#define policy_pause(id) policy_pause_set(id, true, false)
++#define policy_pause_validate(id) policy_pause_set(id, true, true)
++#define policy_resume(id) policy_pause_set(id, false, false)
++
++/**
++ * @brief Pause/resume buffer allocation all pools used by the
++ *        specified policy
++ * @note This function should be called under db lock
++ * @param policy_id
++ * @param pause whether to pause or resume
++ * @param validate whether to validate if all resources are back
++ * @return 0 on success, other error code on failure
++ */
++static s32 policy_pause_set(u8 policy_id, bool pause, bool validate)
++{
++	struct bmgr_policy_db_entry *policy;
++	struct bmgr_pool_db_entry *pool;
++	u32 i;
++	s32 ret = 0;
++
++	/* Group entry in db */
++	policy = &db->policies[policy_id];
++
++	/* pause/continue all pools in group */
++	for (i = 0; i < policy->params.num_pools_in_policy; i++) {
++		pool = &db->pools[policy->params.pools_in_policy[i].pool_id];
++		if (!is_pool_busy(pool->pool_id)) {
++			pr_err("Pool %u in policy %u is not active\n",
++			       pool->pool_id, policy_id);
++			continue;
++		}
++
++		ret = pool_pause(pool, pause, validate);
++		if (unlikely(ret)) {
++			pr_err("failed to %s pool %u, ret %d\n",
++			       pause ? "pause" : "resume", pool->pool_id, ret);
+ 			return ret;
+ 		}
+ 	}
+@@ -333,25 +586,31 @@ static s32 __group_pause(u8 group_id, struct group_pause_config *cfg)
+ /**
+  * @brief Add pool to group
+  * @note This function should be called under db lock
+- * @param group_id groop id to add pool to
++ * @param group_id group id to add pool to
+  * @param pool_id pool id to add
+  * @return 0 on success, other error code on failure
+  */
+-static s32 __add_pool_to_group(u8 group_id, u8 pool_id)
++static s32 add_pool_to_group(u8 group_id, u8 pool_id)
+ {
+ 	struct bmgr_group_db_entry *grp;
+ 	struct bmgr_pool_db_entry *pool;
+ 
+-	if (!db->groups[group_id].is_busy)
++	if (!is_group_busy(group_id))
+ 		return -EINVAL;
+ 
+ 	grp = &db->groups[group_id];
+ 	pool = &db->pools[pool_id];
+ 
+-	list_add_tail(&pool->group_link, &grp->pools_head);
+-	grp->available_buffers += pool->params.num_buffers;
++	if (test_bit(pool_id, grp->pools_bmap)) {
++		pr_err("pool %u is already part of a group\n", pool_id);
++		return -EINVAL;
++	}
++
++
++	grp->available += pool->params.num_buffers;
++	set_bit(pool_id, grp->pools_bmap);
+ 
+-	return bm_group_available_set(group_id, grp->available_buffers);
++	return bm_group_available_set(group_id, grp->available);
+ }
+ 
+ /**
+@@ -359,89 +618,123 @@ static s32 __add_pool_to_group(u8 group_id, u8 pool_id)
+  * @note This function should be called under db lock and assume
+  *       group is not active
+  * @param policy_id policy id to add pool to
+- * @param group_id groop id to add pool to
+- * @param policy_params pools in policy info
+  * @return 0 on success, other error code on failure
+  */
+-static s32
+-__add_pools_to_policy(u16 policy_id,
+-		      u8 group_id,
+-		      const struct pp_bmgr_policy_params * const policy_params)
++static s32 add_pools_to_policy(u16 policy_id)
+ {
+-	struct bmgr_group_db_entry *group;
+-	u32    max = 0;
++	struct pp_bmgr_policy_params *prms;
++	u32 max = 0;
+ 	s32    ret = 0;
+ 	u8     pool_id;
+ 	u8     idx = 0;
+ 
+-	/* Group entry in db */
+-	group = &db->groups[group_id];
++	prms = &db->policies[policy_id].params;
+ 
+-	/* Traverse pools in policy */
+-	for (idx = 0; idx < policy_params->num_pools_in_policy; idx++) {
+-		pool_id = policy_params->pools_in_policy[idx].pool_id;
++	/* Group entry in db */
++	for (idx = 0; idx < prms->num_pools_in_policy; idx++) {
++		pool_id = prms->pools_in_policy[idx].pool_id;
+ 
+ 		/* Update pool/policy reference count */
+ 		db->pools[pool_id].policy_ref_cnt++;
+ 		set_bit(policy_id, db->pools[pool_id].policies_bmap);
+ 
+-		/* Update group if it's the first time this pool is in use */
+-		if (db->pools[pool_id].policy_ref_cnt == 1) {
+-			ret = __add_pool_to_group(group_id, pool_id);
+-			if (unlikely(ret)) {
+-				pr_err("__add_pool(%d)_to_group(%d) failed\n",
+-				       pool_id, group_id);
+-				goto add_pools_to_policy_done;
+-			}
+-		}
+-
+-		max = policy_params->pools_in_policy[idx].max_allowed;
++		max = prms->pools_in_policy[idx].max_allowed;
+ 		ret = bm_policy_pool_mapping_set(policy_id, pool_id,
+ 						 idx, max, true);
+ 		if (unlikely(ret)) {
+ 			pr_err("bm_policy(%d)_pool(%d)_mapping_set Failed\n",
+ 			       policy_id, pool_id);
+-			goto add_pools_to_policy_done;
++			return ret;
+ 		}
+ 	}
+ 
+-	/* Set the group's reserved buffers */
+-	group->reserved_buffers += policy_params->min_guaranteed;
++	return ret;
++}
+ 
+-	ret = bm_group_reserved_set(group_id,
+-				    group->reserved_buffers);
+-	if (unlikely(ret)) {
+-		pr_err("bm_group(%d)_reserved_set failed\n", group_id);
+-		goto add_pools_to_policy_done;
++/**
++ * @brief Add pools to policy
++ * @note This function should be called under db lock and assume
++ *       group is not active
++ * @param policy_id policy id to add pool to
++ * @param group_id groop id to add pool to
++ * @return 0 on success, other error code on failure
++ */
++static s32 add_policy_to_group(u16 policy_id, u8 group_id)
++{
++	struct bmgr_group_db_entry *group;
++	struct pp_bmgr_policy_params *prms;
++	s32 ret = 0;
++	u8  i, pool_id;
++
++	/* silently ignore */
++	if (!bmgr_is_group_id_valid(group_id))
++		goto done;
++
++	/* Group entry in db */
++	group = &db->groups[group_id];
++	prms = &db->policies[policy_id].params;
++
++	/* add all the policy's pool to the group */
++	for (i = 0; i < prms->num_pools_in_policy; i++) {
++		pool_id = prms->pools_in_policy[i].pool_id;
++
++		if (db->pools[pool_id].policy_ref_cnt > 1)
++			continue;
++		/* Update group if it's the first time this pool is in use */
++		ret = add_pool_to_group(group_id, pool_id);
++		if (unlikely(ret)) {
++			pr_err("__add_pool(%d)_to_group(%d) failed\n", pool_id,
++			       group_id);
++			return ret;
++		}
++	}
++
++	set_bit(policy_id, group->policies_bmap);
++	/* Set the group's reserved buffers */
++	group->reserved += prms->min_guaranteed;
++	if (bitmap_weight(group->policies_bmap, PP_BM_MAX_POLICIES) > 1) {
++		ret = bm_group_reserved_set(group_id, group->reserved);
++		if (unlikely(ret))
++			pr_err("bm_group(%d)_reserved_set(%d) failed\n",
++			       group_id, group->reserved);
+ 	}
+ 
+-add_pools_to_policy_done:
++done:
++	db->policies[policy_id].group_id = group_id;
++
+ 	return ret;
+ }
+ 
+-/**
++ /**
+  * @brief Remove a pool from a group
+  * @note This function should be called under db lock
+- * @param group_id groop id to remove pool from
++ * @param group_id group id to remove pool from
+  * @param pool_id pool id to remove from group
+  * @return 0 on success, other error code on failure
+  */
+-static s32 __remove_pool_from_group(u8 group_id, u8 pool_id)
++static s32 remove_pool_from_group(u8 group_id, u8 pool_id)
+ {
+ 	struct bmgr_group_db_entry *grp;
+ 	struct bmgr_pool_db_entry *pool;
++	u32 available = 0;
+ 
+-	if (!db->groups[group_id].is_busy)
++	if (!is_group_busy(group_id))
+ 		return -EINVAL;
+ 
+-	grp = &db->groups[group_id];
+ 	pool = &db->pools[pool_id];
++	grp = &db->groups[group_id];
+ 
+-	list_del(&pool->group_link);
+-	grp->available_buffers -= pool->params.num_buffers;
++	if (!test_bit(pool_id, grp->pools_bmap)) {
++		pr_err("pool %u isn't part of any group\n", pool_id);
++		return -EINVAL;
++	}
++
++	bm_group_available_get(group_id, &available);
++	available -= pool->params.num_buffers;
++	clear_bit(pool_id, grp->pools_bmap);
+ 
+ 	/* Group's rsrvd buffers will be updated when configuring the policy */
+-	return bm_group_available_set(group_id, grp->available_buffers);
++	return bm_group_available_set(group_id, available);
+ }
+ 
+ /**
+@@ -449,43 +742,67 @@ static s32 __remove_pool_from_group(u8 group_id, u8 pool_id)
+  * @note This function should be called under db lock and assume
+  *       group is not active
+  * @param policy_id policy id to remove pools from
+- * @param group_id groop id to remove pools from
+- * @param policy_params pools in policy info
+  * @return 0 on success, other error code on failure
+  */
+-static s32
+-__remove_pools_from_policy(u16 policy_id,
+-			   u8 group_id,
+-			   struct pp_bmgr_policy_params *policy_params)
++static s32 remove_pools_from_policy(u16 policy_id)
+ {
+-	struct bmgr_group_db_entry *group;
++	struct pp_bmgr_policy_params *prms;
+ 	s32    ret = 0;
+ 	u8     pool_id;
+ 	u8     idx = 0;
+ 
++	prms = &db->policies[policy_id].params;
+ 	/* Traverse pools in policy */
+-	for (idx = 0; idx < policy_params->num_pools_in_policy; idx++) {
+-		pool_id = policy_params->pools_in_policy[idx].pool_id;
++	for (idx = 0; idx < prms->num_pools_in_policy; idx++) {
++		pool_id = prms->pools_in_policy[idx].pool_id;
+ 		db->pools[pool_id].policy_ref_cnt--;
+ 		clear_bit(policy_id, db->pools[pool_id].policies_bmap);
+ 
+-		/* Update group only if pool is not used by any policy */
+-		if (db->pools[pool_id].policy_ref_cnt == 0) {
+-			ret = __remove_pool_from_group(group_id, pool_id);
+-			if (unlikely(ret)) {
+-				pr_err("__remove_pool(%d)_from_group(%d) failed\n",
+-				       pool_id, group_id);
+-				goto remove_pools_from_policy_done;
+-			}
+-		}
+-
+ 		ret = bm_policy_pool_mapping_set(policy_id,
+ 						 PP_BM_INVALID_POOL_ID,
+ 						 idx, 0, true);
+ 		if (unlikely(ret)) {
+ 			pr_err("bm_policy(%d)_pool(%d)_mapping_set Failed\n",
+ 			       policy_id, PP_BM_INVALID_POOL_ID);
+-			goto remove_pools_from_policy_done;
++			break;
++		}
++	}
++
++	return ret;
++}
++
++/**
++ * @brief Remove policy from a group
++ * @note This function should be called under db lock and assume
++ *       group is not active
++ * @param policy_id policy id to remove pools from
++ * @param group_id groop id to remove pools from
++ * @return 0 on success, other error code on failure
++ */
++static s32 remove_policy_from_group(u16 policy_id, u8 group_id)
++{
++	struct pp_bmgr_policy_params *prms;
++	struct bmgr_group_db_entry *group;
++	u32 reserved, pool_id, idx;
++	s32 ret = 0;
++
++	/* silently ignore */
++	if (!bmgr_is_group_id_valid(group_id))
++		return 0;
++
++	prms = &db->policies[policy_id].params;
++	/* Traverse pools in policy */
++	for (idx = 0; idx < prms->num_pools_in_policy; idx++) {
++		pool_id = prms->pools_in_policy[idx].pool_id;
++
++		/* Update group only if pool is not used by any policy */
++		if (db->pools[pool_id].policy_ref_cnt == 1) {
++			ret = remove_pool_from_group(group_id, pool_id);
++			if (unlikely(ret)) {
++				pr_err("__remove_pool(%d)_from_group(%d) failed\n",
++				       pool_id, group_id);
++				goto done;
++			}
+ 		}
+ 	}
+ 
+@@ -493,26 +810,27 @@ __remove_pools_from_policy(u16 policy_id,
+ 	group = &db->groups[group_id];
+ 
+ 	/* Reduce the group's reserved buffers */
+-	if (group->reserved_buffers < policy_params->min_guaranteed) {
++	bm_group_reserved_get(group_id, &reserved);
++	if (reserved < prms->min_guaranteed) {
+ 		/* Sanity check in order not to go below 0 */
+ 		pr_err("group %d rsrvd buffs (%d) < policy %d min guaranteed\n",
+ 		       group_id,
+-		       group->reserved_buffers,
+-		       policy_params->min_guaranteed);
+-		group->reserved_buffers = 0;
++		       reserved,
++		       prms->min_guaranteed);
++		reserved = 0;
+ 	} else {
+-		group->reserved_buffers -= policy_params->min_guaranteed;
++		reserved -= prms->min_guaranteed;
+ 	}
+ 
+-	ret = bm_group_reserved_set(group_id,
+-				    group->reserved_buffers);
+-	if (unlikely(ret)) {
+-		pr_err("bm_group(%d)_reserved_set(%d) failed\n",
+-		       group_id, group->reserved_buffers);
+-		goto remove_pools_from_policy_done;
+-	}
++	ret = bm_group_reserved_set(group_id, reserved);
++	if (unlikely(ret))
++		pr_err("bm_group(%d)_reserved_set(%d) failed\n", group_id,
++		       reserved);
+ 
+-remove_pools_from_policy_done:
++	db->policies[policy_id].group_id = PP_BM_INVALID_GROUP_ID;
++	clear_bit(policy_id, group->policies_bmap);
++
++done:
+ 	return ret;
+ }
+ 
+@@ -608,8 +926,6 @@ static s32 bmgr_policy_pool_pop_en(u32 policy_id, ulong bmap, bool en)
+ 			continue;
+ 
+ 		/* else, disable/enable the pool */
+-		pr_info("%s pool %u pop\n", BOOL2EN(en),
+-			pool_in_policy->pool_id);
+ 		ret = __bmgr_pool_pop_enable(pool_in_policy->pool_id, en);
+ 		if (!ret)
+ 			continue;
+@@ -748,13 +1064,13 @@ s32 pp_bmgr_pool_verification(u32 id)
+ 	__bmgr_db_lock();
+ 
+ 	pool = &db->pools[id];
+-	if (unlikely(!pool->is_busy)) {
++	if (unlikely(!is_pool_busy(id))) {
+ 		pr_err("pool %u isn't active\n", id);
+ 		__bmgr_db_unlock();
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Countes the maximum buffers can be popped from all policies
++	/* Sum the number of buffers can be popped from all policies
+ 	 * from the specified pool
+ 	 */
+ 	total = 0;
+@@ -864,41 +1180,13 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		__bmgr_db_lock();
+ 
+ 	/* Find next available slot in pools db */
+-	if (*pool_id == PP_BM_INVALID_POOL_ID) {
+-		BM_FOR_EACH_POOL(db, idx) {
+-			if (db->pools[idx].is_busy == 0) {
+-				*pool_id = idx;
+-				break;
+-			}
+-		}
+-
+-		/* If not found (Can be done also using num_pools) */
+-		if (!bmgr_is_pool_id_valid(idx)) {
+-			pr_err("bmgr_pool_configure: pools DB is full!\n");
+-			ret = -EIO;
+-			goto unlock;
+-		}
+-	}
+-
+-	/* Verify pool is valid */
+-	if (!bmgr_is_pool_id_valid(*pool_id)) {
+-		ret = -EINVAL;
++	ret = alloc_pool(pool_id);
++	if (ret)
+ 		goto unlock;
+-	}
+-
+-	/* Verify pool is not active */
+-	if (db->pools[*pool_id].is_busy == 1) {
+-		pr_err("Pool %d id active\n", *pool_id);
+-		ret = -EINVAL;
+-		goto unlock;
+-	}
+ 
+ 	pr_debug("Configuring pool %d\n", *pool_id);
+ 	pool = &db->pools[*pool_id];
+ 
+-	/* Mark pool as busy before sleepable memory allocations */
+-	pool->is_busy = 1;
+-
+ 	if (lock)
+ 		__bmgr_db_unlock();
+ 
+@@ -913,11 +1201,16 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 			pr_err("Could not allocate %u buffers of %u size\n",
+ 			       pool_params->num_buffers,
+ 			       pool_params->size_of_buffer);
+-			return -ENOMEM;
++			ret = -ENOMEM;
++			goto free_memory;
+ 		}
+ 		pr_info("allocate pool buffers @ %#llx\n", (u64)pool->phys);
+ 		low_addr = (u32)pool->phys;
++#ifdef CONFIG_ARCH_DMA_ADDR_T_64BIT
+ 		high_addr = pool->phys >> BITS_PER_U32;
++#else
++		high_addr = 0;
++#endif
+ 	} else {
+ 		low_addr = pool_params->base_addr_low;
+ 		high_addr = pool_params->base_addr_high;
+@@ -935,7 +1228,6 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		pr_err("Could not allocate %u bytes for pool %u pointers\n",
+ 		       (u32)pool->internal_ptrs_sz, *pool_id);
+ 		/* Mark pool as not used since pool allocation failed */
+-		pool->is_busy = 0;
+ 		ret = -ENOMEM;
+ 		goto free_memory;
+ 	}
+@@ -956,9 +1248,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	cfg.num_buffers = pool_params->num_buffers;
+ 	cfg.ptr_table_addr_low = (u32)pool->internal_ptrs_phys;
+ 	cfg.ptr_table_addr_high = (u32)((u64)pool->internal_ptrs_phys >> 32);
+-	cfg.min_guaranteed_enable =
+-		pool_params->flags & POOL_ENABLE_FOR_MIN_GRNT_POLICY_CALC;
+-
++	cfg.min_guaranteed_enable = false;
+ 	ret = bm_pool_configure(*pool_id, &cfg);
+ 	if (unlikely(ret)) {
+ 		pr_err("bm_pool_configure %d failed\n", *pool_id);
+@@ -969,14 +1259,12 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	ret = __bmgr_pool_enable(*pool_id, pool_enable);
+ 	if (unlikely(ret)) {
+ 		pr_err("__bmgr_pool_enable %d failed\n", *pool_id);
+-		ret = -EINVAL;
+ 		goto free_memory;
+ 	}
+ 
+ 	/* Update pool's DB */
+ 	memcpy(&pool->params, pool_params,
+ 	       sizeof(struct pp_bmgr_pool_params));
+-	db->num_pools++;
+ 
+ 	if (bm_ctrl_poll()) {
+ 		pr_err("bm_ctrl_poll failed\n");
+@@ -1002,7 +1290,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		pp_dma_free(pool->sz, pool->virt, &pool->phys);
+ 		pool->virt = 0;
+ 	}
+-	pool->is_busy = 0;
++	free_pool(*pool_id);
+ 	if (lock)
+ 		__bmgr_db_unlock();
+ 
+@@ -1035,7 +1323,7 @@ s32 pp_bmgr_pool_pop_disable(u8 pool_id)
+ 	__bmgr_db_lock();
+ 
+ 	/* Verify pool is active */
+-	if (db->pools[pool_id].is_busy == 0) {
++	if (!is_pool_busy(pool_id)) {
+ 		pr_err("Pool %d id not active\n", pool_id);
+ 		ret = -EINVAL;
+ 		goto unlock;
+@@ -1094,7 +1382,7 @@ static s32 __bmgr_pool_remove(u8 pool_id, bool lock, bool validate)
+ 		__bmgr_db_lock();
+ 
+ 	/* Verify pool is active */
+-	if (unlikely(db->pools[pool_id].is_busy == 0)) {
++	if (unlikely(!is_pool_busy(pool_id))) {
+ 		pr_err("Pool %d id not active\n", pool_id);
+ 		ret = -EINVAL;
+ 		goto unlock;
+@@ -1164,8 +1452,7 @@ static s32 __bmgr_pool_remove(u8 pool_id, bool lock, bool validate)
+ 	memset(&db->pools[pool_id], 0,
+ 	       sizeof(struct bmgr_pool_db_entry));
+ 	db->pools[pool_id].pool_id = pool_id;
+-
+-	db->num_pools--;
++	free_pool(pool_id);
+ 
+ 	if (bm_ctrl_poll()) {
+ 		pr_err("bm_ctrl_poll failed\n");
+@@ -1189,142 +1476,155 @@ s32 pp_bmgr_pool_remove(u8 pool_id)
+ }
+ EXPORT_SYMBOL(pp_bmgr_pool_remove);
+ 
+-static s32
+-__bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+-			u16 *policy_id, bool lock)
++static s32 free_policy(u32 policy)
+ {
+-	struct bmgr_policy_cfg cfg;
+-	struct group_pause_config pause_cfg;
+-	u8  isolated_pools_in_policy = 0;
+-	u8  group_id = 0;
+-	s32 ret = 0;
+-	u16 idx;
+-	u8  pool_id;
+-
+-	/* Validity check */
+-	ret = __bmgr_is_policy_params_valid(plcy_params);
+-	if (unlikely(ret))
+-		return ret;
++	clear_bit(policy, db->policies_bmap);
++	db->num_policies--;
+ 
+-	if (lock)
+-		__bmgr_db_lock();
++	return 0;
++}
+ 
+-	/* Find next available slot in policy db */
+-	if (*policy_id == PP_BM_INVALID_POLICY_ID) {
+-		BM_FOR_EACH_POLICY(db, idx) {
+-			if (db->policies[idx].is_busy == 0) {
+-				*policy_id = idx;
+-				break;
+-			}
+-		}
++static bool is_policy_busy(u32 policy)
++{
++	return test_bit(policy, db->policies_bmap);
++}
+ 
+-		/* If not found (Can be done also using num_policies) */
+-		if (!bmgr_is_policy_id_valid(idx)) {
+-			pr_err("No free policy!\n");
+-			ret = -EIO;
+-			goto unlock;
+-		}
++static s32 alloc_policy(u16 *policy)
++{
++	if (db->num_policies == db->cfg.max_policies) {
++		pr_err("No free policy available\n");
++		return -ENOENT;
+ 	}
+ 
+-	/* Verify policy id is valid */
+-	if (unlikely(!bmgr_is_policy_id_valid(*policy_id))) {
+-		ret = -EINVAL;
+-		goto unlock;
++	if (*policy == PP_BM_INVALID_POLICY_ID)
++		*policy = find_first_zero_bit(db->policies_bmap,
++					      PP_BM_MAX_POLICIES);
++	if (!bmgr_is_policy_id_valid(*policy))
++		return -EINVAL;
++	if (is_policy_busy(*policy)) {
++		pr_err("policy %d id active\n", *policy);
++		return -EBUSY;
+ 	}
+ 
+-	/* Verify policy is not active in db */
+-	if (unlikely(db->policies[*policy_id].is_busy == 1)) {
+-		pr_err("policy %d is active\n", *policy_id);
+-		ret = -EINVAL;
++	set_bit(*policy, db->policies_bmap);
++	db->num_policies++;
++
++	return 0;
++}
++
++static s32 bmgr_policy_configure(const struct pp_bmgr_policy_params *prms,
++				 u16 *policy_id, bool lock)
++{
++	struct bmgr_pool_db_entry *pool;
++	struct bmgr_policy_cfg cfg;
++	u8  group_id = PP_BM_INVALID_GROUP_ID;
++	u16 first_id = PP_BM_INVALID_POLICY_ID;
++	bool is_isolated = false;
++	s32 ret = 0;
++
++	if (lock)
++		__bmgr_db_lock();
++
++	/* Validity check */
++	ret = bmgr_is_policy_params_valid(prms, &is_isolated);
++	if (unlikely(ret))
+ 		goto unlock;
+-	}
+ 
+-	pr_debug("Configuring policy %d\n", *policy_id);
++	ret = alloc_policy(policy_id);
++	if (unlikely(ret))
++		goto unlock;
+ 
+-	/* Verify all pools in policy are active */
+-	for (idx = 0; idx < plcy_params->num_pools_in_policy; idx++) {
+-		pool_id = plcy_params->pools_in_policy[idx].pool_id;
++	pr_debug("Configuring policy %d, group_id %u\n", *policy_id, group_id);
+ 
+-		/* Verify pool in policy is valid */
+-		if (unlikely(!bmgr_is_pool_id_valid(pool_id))) {
+-			ret = -EINVAL;
+-			goto unlock;
+-		}
++	db->policies[*policy_id].is_isolated = is_isolated;
++	/* Groups logic:
++	 *   policies which use same set of pools will be associated to a group
++	 *   1st policy will not be associated to any group.
++	 *   2nd policy will create a group and both policies will be associated
++	 *   3rd policy and above will be associated to the group
++	 */
++	pool = &db->pools[prms->pools_in_policy[0].pool_id];
++	if (pool->policy_ref_cnt == 1) {
++		/* we add the second policy, create a group,
++		 * add the 1st policy and enable the pool's minimum guarantee
++		 */
++		ret = alloc_group(&group_id);
++		if (unlikely(ret))
++			goto free_policy;
+ 
+-		/* Verify pool in policy is active */
+-		if (unlikely(!db->pools[pool_id].is_busy)) {
+-			pr_err("pool_id %d is not allocated\n",
+-			       pool_id);
+-			ret = -EINVAL;
+-			goto unlock;
+-		}
++		ret = bm_pool_min_guarantee_set(pool->pool_id, true);
++		if (unlikely(ret))
++			goto free_policy;
+ 
+-		/* Verify isolated pool is not used by any policy */
+-		if (db->pools[pool_id].params.flags & POOL_ISOLATED) {
+-			if (db->pools[pool_id].policy_ref_cnt) {
+-				pr_err("Isolated Pool %d has a policy\n",
+-				       pool_id);
+-				ret = -EINVAL;
+-				goto unlock;
+-			}
++		/* get the first policy id */
++		first_id =
++			find_first_bit(pool->policies_bmap, PP_BM_MAX_POLICIES);
+ 
+-			isolated_pools_in_policy++;
+-		}
+-	}
++		/* pause the policy before adding it to the group */
++		ret = policy_pause_validate(first_id);
++		if (unlikely(ret))
++			goto free_policy;
+ 
+-	/* If there is an isolated pool, all pools should be isolated */
+-	if (isolated_pools_in_policy) {
+-		if (isolated_pools_in_policy !=
+-		    plcy_params->num_pools_in_policy) {
+-			pr_err("Policy %d has mix of isolated pools\n",
+-			       *policy_id);
+-			ret = -EINVAL;
+-			goto unlock;
++		/* add the first policy and all the pools to the group */
++		ret = add_policy_to_group(first_id, group_id);
++		if (unlikely(ret)) {
++			pr_err("Fail to add policy %u to group %u\n",
++			       first_id, group_id);
++			goto free_policy;
+ 		}
+-
+-		ret = __bmgr_allocate_group(&group_id);
++		cfg.group_id = group_id;
++		cfg.max_allowed = db->policies[first_id].params.max_allowed;
++		cfg.min_guaranteed =
++			db->policies[first_id].params.min_guaranteed;
++		ret = bm_policy_configure(first_id, &cfg);
+ 		if (unlikely(ret)) {
+-			pr_err("__bmgr_allocate_group failed\n");
+-			goto unlock;
++			pr_err("bm_policy(%d)_configure failed\n", first_id);
++			goto free_policy;
+ 		}
+-
+-		db->policies[*policy_id].is_isolated = true;
+-	} else {
+-		group_id = BM_DEFAULT_GROUP_ID;
++	} else if (pool->policy_ref_cnt > 1) {
++		/* third policy and above, take the group id from
++		 * one of the existing policies
++		 */
++		first_id =
++			find_first_bit(pool->policies_bmap, PP_BM_MAX_POLICIES);
++		group_id = db->policies[first_id].group_id;
+ 	}
+ 
+ 	/* Pause group before policy config */
+-	pause_cfg.pause = true;
+-	pause_cfg.validate_resources = true;
+-	ret = __group_pause(group_id, &pause_cfg);
++	ret = group_pause_validate(group_id);
+ 	if (unlikely(ret)) {
+ 		pr_err("Group %d pause failed\n", group_id);
+ 		goto group_resume;
+ 	}
+ 
++	/* Update Policy DB */
++	memcpy(&db->policies[*policy_id].params, prms,
++	       sizeof(*prms));
++
+ 	/* Add policy pools and update group */
+-	ret = __add_pools_to_policy(*policy_id, group_id, plcy_params);
++	ret = add_pools_to_policy(*policy_id);
++	if (unlikely(ret)) {
++		pr_err("Fail to add pools to policy %u\n", *policy_id);
++		goto group_resume;
++	}
++
++	/* add only the policy to the group, the pools were already added */
++	ret = add_policy_to_group(*policy_id, group_id);
+ 	if (unlikely(ret)) {
+-		pr_err("Policy %d pool set\n", *policy_id);
++		pr_err("Fail to add policy %u to group %u\n", *policy_id,
++		       group_id);
+ 		goto group_resume;
+ 	}
+ 
+ 	cfg.group_id = group_id;
+-	cfg.max_allowed = plcy_params->max_allowed;
+-	cfg.min_guaranteed = plcy_params->min_guaranteed;
++	cfg.max_allowed = prms->max_allowed;
++	cfg.min_guaranteed = prms->min_guaranteed;
+ 	ret = bm_policy_configure(*policy_id, &cfg);
+ 	if (unlikely(ret)) {
+ 		pr_err("bm_policy(%d)_configure failed\n", *policy_id);
+ 		goto group_resume;
+ 	}
+ 
+-	/* Update Policy DB */
+-	db->num_policies++;
+-	db->policies[*policy_id].is_busy = 1;
+-	db->policies[*policy_id].group_id = group_id;
+-	memcpy(&db->policies[*policy_id].params, plcy_params,
+-	       sizeof(*plcy_params));
+-
+ 	if (bm_ctrl_poll()) {
+ 		pr_err("bm_ctrl_poll failed\n");
+ 		ret = -EBUSY;
+@@ -1332,12 +1632,11 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 
+ group_resume:
+ 	/* Resume group */
+-	pause_cfg.pause = false;
+-	pause_cfg.validate_resources = false;
+-	ret = __group_pause(group_id, &pause_cfg);
+-	if (unlikely(ret))
+-		pr_err("Group %d resume failed\n", group_id);
++	group_resume(group_id);
+ 
++free_policy:
++	if (ret)
++		free_policy(*policy_id);
+ unlock:
+ 	if (lock)
+ 		__bmgr_db_unlock();
+@@ -1346,24 +1645,23 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 	return ret;
+ }
+ 
+-s32
+-pp_bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+-			 u16 *policy_id)
++s32 pp_bmgr_policy_configure(const struct pp_bmgr_policy_params *plcy_params,
++			     u16 *policy_id)
+ {
+ 	if (unlikely(!__bmgr_is_ready()))
+ 		return -EPERM;
+ 
+-	return __bmgr_policy_configure(plcy_params, policy_id, true);
++	return bmgr_policy_configure(plcy_params, policy_id, true);
+ }
+ EXPORT_SYMBOL(pp_bmgr_policy_configure);
+ 
+-static s32 __bmgr_policy_remove(u16 policy_id, bool lock)
++static s32 bmgr_policy_remove(u16 policy_id, bool lock)
+ {
+-	struct bmgr_group_db_entry *group;
+-	struct pp_bmgr_policy_params *plcy_params;
+-	struct group_pause_config pause_cfg;
++	struct pp_bmgr_policy_params *prms;
++	struct bmgr_pool_db_entry *pool;
+ 	struct bmgr_policy_cfg cfg;
+ 	s32 ret = 0;
++	u16 last_id;
+ 	u8 group_id;
+ 
+ 	pr_debug("Removing policy %d\n", policy_id);
+@@ -1376,7 +1674,7 @@ static s32 __bmgr_policy_remove(u16 policy_id, bool lock)
+ 		__bmgr_db_lock();
+ 
+ 	/* Verify policy is active in db */
+-	if (unlikely(db->policies[policy_id].is_busy == 0)) {
++	if (unlikely(!is_policy_busy(policy_id))) {
+ 		pr_err("policy %d is not active\n", policy_id);
+ 		ret = -EINVAL;
+ 		goto unlock;
+@@ -1385,68 +1683,81 @@ static s32 __bmgr_policy_remove(u16 policy_id, bool lock)
+ 	group_id = db->policies[policy_id].group_id;
+ 
+ 	/* Pause group before policy config */
+-	pause_cfg.pause = true;
+-	pause_cfg.validate_resources = true;
+-	ret = __group_pause(group_id, &pause_cfg);
+-	if (unlikely(ret)) {
+-		pr_err("Group %d pause failed\n", group_id);
++	ret = group_pause_validate(group_id);
++	if (unlikely(ret))
+ 		goto group_resume;
+-	}
+ 
+ 	/* Fetch policy params from db */
+-	plcy_params = &db->policies[policy_id].params;
++	prms = &db->policies[policy_id].params;
+ 
+-	/* Add policy pools and update group */
+-	ret = __remove_pools_from_policy(policy_id, group_id, plcy_params);
+-	if (unlikely(ret)) {
+-		pr_err("Policy %d pool remove\n", policy_id);
++	ret = remove_policy_from_group(policy_id, group_id);
++	if (unlikely(ret))
+ 		goto group_resume;
+-	}
+ 
+-	/* Reset policy */
+-	cfg.group_id = 0;
+-	cfg.max_allowed = 0;
+-	cfg.min_guaranteed = 0;
+-	ret = bm_policy_configure(policy_id, &cfg);
++	ret = remove_pools_from_policy(policy_id);
++	if (unlikely(ret))
++		goto group_resume;
++
++	/* Reset policy hw registers */
++	ret = bm_policy_configure(policy_id, NULL);
+ 	if (unlikely(ret)) {
+ 		pr_err("bm_policy_configure %d failed\n", policy_id);
+ 		goto group_resume;
+ 	}
+ 
+-	/* Handle Isolated Policy */
+-	if (db->policies[policy_id].is_isolated) {
+-		/* Group entry in db */
+-		group = &db->groups[group_id];
+-		group->is_busy = false;
+-
+-		if (group->available_buffers ||
+-		    group->reserved_buffers  ||
+-		    !list_empty(&group->pools_head)) {
+-			pr_err("Isolated group %d is not empty\n", group_id);
+-			group->available_buffers = 0;
+-			group->reserved_buffers = 0;
++	/* if there is only 1 policy left who uses the pools,
++	 * remove the last policy from the group and delete the group
++	 */
++	pool = &db->pools[prms->pools_in_policy[0].pool_id];
++	if (pool->policy_ref_cnt == 1) {
++		/* get the last policy that uses that set of pools */
++		last_id =
++			find_first_bit(pool->policies_bmap, PP_BM_MAX_POLICIES);
++		/* add the first policy and all the pools to the group */
++		ret = remove_policy_from_group(last_id, group_id);
++		if (unlikely(ret))
++			goto group_resume;
++
++		free_group(group_id);
++		group_id = PP_BM_INVALID_GROUP_ID;
++		cfg.group_id = db->policies[last_id].group_id;
++		cfg.max_allowed = db->policies[last_id].params.max_allowed;
++		cfg.min_guaranteed =
++			db->policies[last_id].params.min_guaranteed;
++		ret = bm_policy_configure(last_id, &cfg);
++		if (unlikely(ret)) {
++			pr_err("bm_policy(%d)_configure failed\n", last_id);
++			goto group_resume;
+ 		}
++
++		ret = bm_pool_min_guarantee_set(pool->pool_id, false);
++		if (unlikely(ret))
++			goto group_resume;
++
++		/* Resume all the pools in the policy, the group doesn't
++		 * exist any more so we need resume the policy
++		 */
++		ret = policy_resume(last_id);
++		if (unlikely(ret))
++			pr_err("policy %d resume failed\n", last_id);
+ 	}
+ 
+ 	/* Update Policy DB */
+-	db->num_policies--;
+-	memset(&db->policies[policy_id],
+-	       0, sizeof(struct bmgr_policy_db_entry));
++	free_policy(policy_id);
++	memset(&db->policies[policy_id], 0,
++	       sizeof(struct bmgr_policy_db_entry));
+ 
+ 	if (bm_ctrl_poll()) {
+ 		pr_err("bm_ctrl_poll failed\n");
+ 		ret = -EBUSY;
++		goto unlock;
+ 	}
+ 
+ group_resume:
+-	/* Resume group */
+-	pause_cfg.pause = false;
+-	pause_cfg.validate_resources = false;
+-	ret = __group_pause(group_id, &pause_cfg);
+-	if (unlikely(ret)) {
++	ret = group_resume(group_id);
++	if (unlikely(ret))
+ 		pr_err("Group %d resume failed\n", group_id);
+-		goto group_resume;
+-	}
++
+ unlock:
+ 	if (lock)
+ 		__bmgr_db_unlock();
+@@ -1460,7 +1771,7 @@ s32 pp_bmgr_policy_remove(u16 policy_id)
+ 	if (unlikely(!__bmgr_is_ready()))
+ 		return -EPERM;
+ 
+-	return __bmgr_policy_remove(policy_id, true);
++	return bmgr_policy_remove(policy_id, true);
+ }
+ EXPORT_SYMBOL(pp_bmgr_policy_remove);
+ 
+@@ -1535,7 +1846,7 @@ s32 pp_bmgr_policy_reset(u16 policy_id, void (*cb)(s32 ret))
+ 	__bmgr_db_lock();
+ 
+ 	/* Verify policy is active in db */
+-	if (unlikely(db->policies[policy_id].is_busy == 0)) {
++	if (unlikely(!is_policy_busy(policy_id))) {
+ 		pr_err("policy %d is not active\n", policy_id);
+ 		ret = -EINVAL;
+ 		goto unlock;
+@@ -1613,7 +1924,7 @@ s32 pp_bmgr_pool_conf_get(u8 pool_id,
+ 	__bmgr_db_lock();
+ 
+ 	/* Active check */
+-	if (unlikely(!db->pools[pool_id].is_busy)) {
++	if (unlikely(!is_pool_busy(pool_id))) {
+ 		pr_debug("pool_id %d is not active\n", pool_id);
+ 		ret = -EINVAL;
+ 		goto unlock;
+@@ -1646,7 +1957,7 @@ s32 pp_bmgr_pool_stats_get(struct pp_bmgr_pool_stats * const stats, u8 pool_id)
+ 		return -EINVAL;
+ 
+ 	/* Active check */
+-	if (unlikely(!db->pools[pool_id].is_busy)) {
++	if (unlikely(!is_pool_busy(pool_id))) {
+ 		pr_err("pool_id %d is not active\n", pool_id);
+ 		return -EINVAL;
+ 	}
+@@ -1679,7 +1990,7 @@ s32 pp_bmgr_policy_conf_get(u16 policy_id,
+ 	__bmgr_db_lock();
+ 
+ 	/* Active check */
+-	if (unlikely(!db->policies[policy_id].is_busy)) {
++	if (unlikely(!is_policy_busy(policy_id))) {
+ 		pr_debug("policy_id %d is not active\n", policy_id);
+ 		ret = -EINVAL;
+ 		goto unlock;
+@@ -1698,8 +2009,8 @@ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 			     u16 policy_id)
+ {
+ 	struct pp_bmgr_policy_params *param;
+-	u8 pool_idx;
+ 	s32 ret = 0;
++	u8 i;
+ 
+ 	if (unlikely(!__bmgr_is_ready()))
+ 		return -EPERM;
+@@ -1714,11 +2025,12 @@ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 		return -EINVAL;
+ 
+ 	/* Active check */
+-	if (unlikely(!db->policies[policy_id].is_busy)) {
++	if (unlikely(!is_policy_busy(policy_id))) {
+ 		pr_err("policy_id %d is not active\n", policy_id);
+ 		return -EINVAL;
+ 	}
+ 
++	memset(stats, 0, sizeof(*stats));
+ 	ret = bm_policy_stats_get(stats, policy_id);
+ 	if (unlikely(ret))
+ 		pr_err("bm_policy_stats_get %d failed\n", policy_id);
+@@ -1729,18 +2041,16 @@ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 	stats->policy_min_guaranteed = param->min_guaranteed;
+ 	stats->policy_grp_association = db->policies[policy_id].group_id;
+ 
+-	for (pool_idx = 0 ; pool_idx < PP_BM_MAX_POOLS_PER_PLCY ; pool_idx++) {
+-		if (param->num_pools_in_policy > pool_idx) {
+-			stats->policy_pools[pool_idx] =
+-				param->pools_in_policy[pool_idx].pool_id;
+-			stats->policy_max_allowed_per_pool[pool_idx] =
+-				param->pools_in_policy[pool_idx].max_allowed;
+-		} else {
+-			stats->policy_pools[pool_idx] = -1;
+-			stats->policy_max_allowed_per_pool[pool_idx] = 0;
+-		}
++	for (i = 0 ; i < param->num_pools_in_policy ; i++) {
++		set_bit(param->pools_in_policy[i].pool_id,
++			stats->pools_bmap);
++		stats->policy_max_allowed_per_pool[i] =
++			param->pools_in_policy[i].max_allowed;
+ 	}
+ 
++	if (db->policies[policy_id].group_id == PP_BM_INVALID_GROUP_ID)
++		stats->policy_grp_association = PP_BM_INVALID_GROUP_ID;
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(pp_bmgr_policy_stats_get);
+@@ -1775,11 +2085,68 @@ s32 pp_bmgr_stats_get(struct bmgr_stats *stats)
+ 	return 0;
+ }
+ 
++s32 pp_bmgr_group_db_info_get(u8 grp_id, struct bmgr_group_db_entry *info)
++{
++	if (ptr_is_null(info))
++		return -EINVAL;
++
++	if (!bmgr_is_group_id_valid(grp_id)) {
++		pr_err("Invalid group id %u\n", grp_id);
++		return -EINVAL;
++	}
++
++	if (!is_group_busy(grp_id))
++		return -EINVAL;
++
++	memcpy(info, &db->groups[grp_id], sizeof(*info));
++
++	return 0;
++}
++
++void bmgr_pools_per_policy_set(u32 pools_per_policy)
++{
++	if (unlikely(!__bmgr_is_ready()))
++		return;
++
++	__bmgr_db_lock();
++	db->cfg.max_pools_in_policy = pools_per_policy;
++	__bmgr_db_unlock();
++}
++
++s32 bmgr_get_active_policies(ulong *bmap, size_t size)
++{
++	if (unlikely(!__bmgr_is_ready()))
++		return -EPERM;
++
++	if (size < PP_BM_MAX_POLICIES)
++		return -ENOSPC;
++
++	__bmgr_db_lock();
++	memcpy(bmap, db->policies_bmap, sizeof(db->policies_bmap));
++	__bmgr_db_unlock();
++
++	return 0;
++}
++
++s32 bmgr_get_active_pools(ulong *bmap, size_t size)
++{
++	if (unlikely(!__bmgr_is_ready()))
++		return -EPERM;
++
++	if (size < PP_BM_MAX_POOLS)
++		return -ENOSPC;
++
++	__bmgr_db_lock();
++	memcpy(bmap, db->pools_bmap, sizeof(db->pools_bmap));
++	__bmgr_db_unlock();
++
++	return 0;
++}
++
+ s32 bmgr_config_set(const struct pp_bmgr_init_param * const cfg)
+ {
+ 	s32 ret = 0;
+ 	u32 policy_id;
+-	u8  group_id;
+ 	u8  pool_id;
+ 
+ 	if (unlikely(!__bmgr_is_ready()))
+@@ -1793,27 +2160,26 @@ s32 bmgr_config_set(const struct pp_bmgr_init_param * const cfg)
+ 	pr_debug("Ext-config: pools(%d), groups(%d), policies(%d)\n",
+ 		 cfg->max_pools, cfg->max_groups, cfg->max_policies);
+ 
+-	memcpy(&db->cfg, cfg, sizeof(struct pp_bmgr_init_param));
+ 
+-	if (unlikely(db->cfg.max_pools > PP_BM_MAX_POOLS)) {
++	if (unlikely(cfg->max_pools > PP_BM_MAX_POOLS)) {
+ 		pr_err("Max pools %d exceeds maximum of %d\n",
+-		       db->cfg.max_pools,
++		       cfg->max_pools,
+ 		       PP_BM_MAX_POOLS);
+ 		ret = -EINVAL;
+ 		goto reset_cfg_db;
+ 	}
+ 
+-	if (unlikely(db->cfg.max_groups > BM_MAX_GROUPS)) {
++	if (unlikely(cfg->max_groups > BM_MAX_GROUPS)) {
+ 		pr_err("Max groups %d exceeds maximum of %d\n",
+-		       db->cfg.max_groups,
++		       cfg->max_groups,
+ 		       BM_MAX_GROUPS);
+ 		ret = -EINVAL;
+ 		goto reset_cfg_db;
+ 	}
+ 
+-	if (unlikely(db->cfg.max_policies > PP_BM_MAX_POLICIES)) {
++	if (unlikely(cfg->max_policies > PP_BM_MAX_POLICIES)) {
+ 		pr_err("Max groups %d exceeds maximum of %d\n",
+-		       db->cfg.max_policies,
++		       cfg->max_policies,
+ 		       PP_BM_MAX_POLICIES);
+ 		ret = -EINVAL;
+ 		goto reset_cfg_db;
+@@ -1821,6 +2187,7 @@ s32 bmgr_config_set(const struct pp_bmgr_init_param * const cfg)
+ 
+ 	__bmgr_db_lock();
+ 
++	memcpy(&db->cfg, cfg, sizeof(*cfg));
+ 	/* Init RAM */
+ 	BM_FOR_EACH_POLICY(db, policy_id) {
+ 		ret = bm_policy_default_set(policy_id);
+@@ -1830,12 +2197,6 @@ s32 bmgr_config_set(const struct pp_bmgr_init_param * const cfg)
+ 		}
+ 	}
+ 
+-	BM_FOR_EACH_GROUP(db, group_id)
+-		INIT_LIST_HEAD(&db->groups[group_id].pools_head);
+-
+-	/* Set default group 0 active */
+-	db->groups[BM_DEFAULT_GROUP_ID].is_busy = 1;
+-
+ 	BM_FOR_EACH_POOL(db, pool_id)
+ 		db->pools[pool_id].pool_id = pool_id;
+ 
+@@ -1864,6 +2225,7 @@ s32 pp_bmgr_config_get(struct pp_bmgr_init_param * const cfg)
+ 	cfg->max_groups = db->cfg.max_groups;
+ 	cfg->max_policies = db->cfg.max_policies;
+ 	cfg->pool_pop_hw_en = db->cfg.pool_pop_hw_en;
++	cfg->max_pools_in_policy = db->cfg.max_pools_in_policy;
+ 
+ 	return 0;
+ }
+@@ -1879,7 +2241,7 @@ bool pp_bmgr_is_policy_active(u16 policy)
+ 		return false;
+ 
+ 	/* Check if policy is active in db */
+-	return !!db->policies[policy].is_busy;
++	return is_policy_busy(policy);
+ }
+ EXPORT_SYMBOL(pp_bmgr_is_policy_active);
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h
+index 9fa5d18943cf..21501bad9629 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.h
+@@ -13,12 +13,6 @@
+ #include <linux/pp_buffer_mgr_api.h>
+ #include <linux/debugfs.h> /* struct dentry */
+ 
+-/**
+- * @brief PP_BM_MAX_POOLS
+- *       Max supported pools. Real max defined in the DTS
+- */
+-#define PP_BM_MAX_POOLS                      (16)
+-
+ /**
+  * @brief PP_BM_MAX_POLICIES
+  *       Max supported policies. Real max defined in the DTS
+@@ -45,6 +39,18 @@ struct pp_bmgr_init_param {
+ 	struct dentry *dbgfs;
+ };
+ 
++/**
++ * @brief This structure is used for buffer manager database
++ * @pools Pools in policy
++ * @policies_bmap bitmap specifing which policies are member of the group
++ */
++struct bmgr_group_db_entry {
++	ulong  policies_bmap[BITS_TO_LONGS(PP_BM_MAX_POLICIES)];
++	ulong  pools_bmap[BITS_TO_LONGS(PP_BM_MAX_POOLS)];
++	u32 reserved;
++	u32 available;
++};
++
+ /**
+  * @brief Buffer Manager stats
+  */
+@@ -73,6 +79,30 @@ void pp_bmgr_exit(void);
+  */
+ s32 pp_bmgr_stats_get(struct bmgr_stats *stats);
+ 
++/**
++ * @brief Set maximum pools per policy
++ * @note this is for debug/testing purposes, do not use otherwise
++ * @param pools_per_policy
++ * @return s32
++ */
++void bmgr_pools_per_policy_set(u32 pools_per_policy);
++
++/**
++ * @brief Get active policies bitmap
++ * @param bmap policies bitmap buffer
++ * @param size num of bits in the bitmap
++ * @return s32 0 on success, error code otherwise
++ */
++s32 bmgr_get_active_policies(ulong *bmap, size_t size);
++
++/**
++ * @brief Get active pools bitmap
++ * @param bmap pools bitmap buffer
++ * @param size num of bits in the bitmap
++ * @return s32 0 on success, error code otherwise
++ */
++s32 bmgr_get_active_pools(ulong *bmap, size_t size);
++
+ /**
+  * @brief Set bmgr configuration
+  * @param cfg Buffer manager configuration
+@@ -87,4 +117,12 @@ s32 bmgr_config_set(const struct pp_bmgr_init_param * const cfg);
+  */
+ s32 pp_bmgr_config_get(struct pp_bmgr_init_param * const cfg);
+ 
++/**
++ * @brief Get group database info
++ * @param grp_id group id
++ * @param info
++ * @return 0 on success, other error code on failure
++ */
++s32 pp_bmgr_group_db_info_get(u8 grp_id, struct bmgr_group_db_entry *info);
++
+ #endif /* _PP_BUFFER_MGR_H_ */
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
+index 5e7db544095b..c45babbe4e85 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
+@@ -5,6 +5,9 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  * Copyright (C) 2018-2020 Intel Corporation
+  */
++
++#define pr_fmt(fmt) "[PP_BMGR_DBG]:%s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
+ #include <linux/debugfs.h>
+@@ -236,17 +239,20 @@ PP_DEFINE_DEBUGFS(conf_get, __dbg_conf_get, NULL);
+ 
+ static void dump_pools(struct seq_file *f)
+ {
+-	u8     idx;
++	u8     idx, flag;
+ 	struct bmgr_pool_db_entry *pool;
+ 	struct bmgr_driver_db *db = f->private;
++	ulong flags;
++	const char *flags_str[BMGR_NUM_FLAGS] = {
++		"MIN GUARANTEE",
++		"ISOLATED",
++	};
+ 
+ 	/* Dump all pools */
+ 	seq_puts(f, "============= POOLS =============\n");
+-	BM_FOR_EACH_POOL(db, idx) {
++	for_each_set_bit(idx, db->pools_bmap, db->cfg.max_pools) {
+ 		pool = &db->pools[idx];
+-
+-		if (!pool->is_busy)
+-			continue;
++		flags = pool->params.flags;
+ 
+ 		seq_printf(f, "Active pool %d:\n", idx);
+ 		seq_printf(f, "\t\tNum allocated buffers: %d\n",
+@@ -259,34 +265,42 @@ static void dump_pools(struct seq_file *f)
+ 			   pool->params.num_buffers);
+ 		seq_printf(f, "\t\tSize of buffer: %d\n",
+ 			   pool->params.size_of_buffer);
+-		seq_printf(f, "\t\tBase address low: 0x%x\n",
+-			   pool->params.base_addr_low);
+-		seq_printf(f, "\t\tBase address high: 0x%x\n",
+-			   pool->params.base_addr_high);
+-		seq_printf(f, "\t\tFlags: %d\n",
+-			   pool->params.flags);
++		seq_printf(f, "\t\tBase address : 0x%llx\n",
++			   PP_BUILD_64BIT_WORD(pool->params.base_addr_low,
++					       pool->params.base_addr_high));
++		seq_printf(f, "\t\tFlags: %#x ", pool->params.flags);
++		for_each_set_bit(flag, &flags, BMGR_NUM_FLAGS)
++			seq_printf(f, "[%s]", flags_str[flag]);
++		seq_puts(f, "\n");
++
++		seq_printf(f, "\t\t%u Policies: %*pbl\n",
++			   pool->policy_ref_cnt, PP_BM_MAX_POLICIES,
++			   pool->policies_bmap);
+ 	}
+ }
+ 
+ static void dump_groups(struct seq_file *f)
+ {
+-	struct bmgr_group_db_entry *group;
+ 	struct bmgr_driver_db *db = f->private;
+-	u8     idx;
++	struct bmgr_group_db_entry *group;
++	u32 idx, num_policies, num_pools;
+ 
+ 	/* Dump all groups */
+ 	seq_puts(f, "============= GROUPS ============\n");
+ 
+-	BM_FOR_EACH_GROUP(db, idx) {
+-		if (!db->groups[idx].is_busy)
+-			continue;
+-
++	for_each_set_bit(idx, db->groups_bmap, db->cfg.max_groups) {
+ 		group = &db->groups[idx];
++		num_policies =
++			bitmap_weight(group->policies_bmap, PP_BM_MAX_POLICIES);
++		num_pools =
++			bitmap_weight(group->pools_bmap, PP_BM_MAX_POOLS);
+ 		seq_printf(f, "Active group %d:\n", idx);
+-		seq_printf(f, "\t\tAvailable buffers: %d\n",
+-			   group->available_buffers);
+-		seq_printf(f, "\t\tReserved buffers: %d\n",
+-			   group->reserved_buffers);
++		seq_printf(f, "\t\tAvailable buffers: %d\n", group->available);
++		seq_printf(f, "\t\tReserved buffers: %d\n", group->reserved);
++		seq_printf(f, "\t\t%u Policies: %*pbl\n", num_policies,
++			   PP_BM_MAX_POLICIES, group->policies_bmap);
++		seq_printf(f, "\t\t%u Pools   : %*pbl\n", num_pools,
++			   PP_BM_MAX_POOLS, group->pools_bmap);
+ 		seq_puts(f, "\n");
+ 	}
+ }
+@@ -304,12 +318,9 @@ static void dump_policies(struct seq_file *f)
+ 
+ 	/* Dump all policies */
+ 	seq_puts(f, "============= POLICIES ==========\n");
+-	BM_FOR_EACH_POLICY(db, idx) {
++	for_each_set_bit(idx, db->policies_bmap, db->cfg.max_policies) {
+ 		policy = &db->policies[idx];
+ 
+-		if (!policy->is_busy)
+-			continue;
+-
+ 		seq_printf(f, "Active policy %d:\n", idx);
+ 		seq_printf(f, "\t\tNum allocated buffers: %d\n",
+ 			   policy->num_allocated_buffers);
+@@ -343,10 +354,12 @@ static void __dump_db(struct seq_file *f)
+ 
+ 	/* Dump all DB general counters */
+ 	seq_puts(f, "======= GENERAL COUNTERS ========\n");
+-	seq_printf(f, "Number of active pools:    %d\n",
+-		   db->num_pools);
+-	seq_printf(f, "Number of active policies: %d\n",
+-		   db->num_policies);
++	seq_printf(f, "%u Active pools   : %*pbl\n",
++		   db->num_pools, db->cfg.max_pools, db->pools_bmap);
++	seq_printf(f, "%u Active policies: %*pbl\n",
++		   db->num_policies, db->cfg.max_policies, db->policies_bmap);
++	seq_printf(f, "%u Active groups  : %*pbl\n",
++		   db->num_groups, db->cfg.max_groups, db->groups_bmap);
+ 
+ 	dump_pools(f);
+ 	dump_groups(f);
+@@ -366,7 +379,8 @@ void __dbg_dump_hw_stats(struct seq_file *f)
+ 	struct  bmgr_group_stats group_stats;
+ 	struct  pp_bmgr_policy_params *policy_params;
+ 	bool    pool_isolated;
+-	u16     i, j;
++	u16     i, j, n;
++	char    pools[64], group[32];
+ 
+ 	bmgr_get_cfg_regs(&cfg_regs);
+ 
+@@ -390,10 +404,7 @@ void __dbg_dump_hw_stats(struct seq_file *f)
+ 	seq_puts(f, "+======+======+================+===========+================+===============+====================+==========+\n");
+ 	seq_puts(f, "| Pool | Size | FIFO Base Addr | FIFO Size | Prog Empty Thr | Prog Full Thr | Ext FIFO Base Addr | Isolated |\n");
+ 	seq_puts(f, "+------+------+----------------+-----------+----------------+---------------+--------------------+----------+\n");
+-	BM_FOR_EACH_POOL(db, i) {
+-		if (!db->pools[i].is_busy)
+-			continue;
+-
++	for_each_set_bit(i, db->pools_bmap, db->cfg.max_pools) {
+ 		pool_isolated =
+ 			db->pools[i].params.flags &
+ 			POOL_ISOLATED;
+@@ -416,10 +427,7 @@ void __dbg_dump_hw_stats(struct seq_file *f)
+ 	seq_puts(f, "+======+==========+==============+=========+===========+============+==========+==========+=========+=========+\n");
+ 	seq_puts(f, "| Pool | FIFO Occ | Ext FIFO Occ |  Alloc  |    Pop    |    Push    | Burst wr | Burst rd | Wm lthr | Wm lctr |\n");
+ 	seq_puts(f, "+------+----------+--------------+---------+-----------+------------+----------+----------+---------+---------+\n");
+-	BM_FOR_EACH_POOL(db, i) {
+-		if (!db->pools[i].is_busy)
+-			continue;
+-
++	for_each_set_bit(i, db->pools_bmap, db->cfg.max_pools) {
+ 		pp_bmgr_pool_stats_get(&pool_stats, i);
+ 		seq_printf(f, "|%-6d|%-10d|%-14d|%-9d|%-11d|%-12d|%-10d|%-10d|%-9d|%-9d|\n",
+ 			   i,
+@@ -440,51 +448,50 @@ void __dbg_dump_hw_stats(struct seq_file *f)
+ 	seq_puts(f, "+=======+===================+==================+\n");
+ 	seq_puts(f, "| Group | Available Buffers | Reserved Buffers |\n");
+ 	seq_puts(f, "+-------+-------------------+------------------+\n");
+-	BM_FOR_EACH_GROUP(db, i) {
+-		if (!db->groups[i].is_busy)
+-			continue;
+-
++	for_each_set_bit(i, db->groups_bmap, db->cfg.max_groups) {
+ 		bmgr_group_stats_get(&group_stats, i);
+ 		seq_printf(f, "|%-7d|%-19d|%-18d|\n",
+ 			   i,
+ 			   group_stats.grp_avail_buff,
+ 			   group_stats.grp_rsrvd_buff);
+ 	}
+-	seq_puts(f, "+=======+===================+==================+\n");
++	seq_puts(f, "+=======+===================+==================+\n\n");
+ 
+-	seq_puts(f, "\n+==========================================================================================================+\n");
++	seq_puts(f, "+==========================================================================================================+\n");
+ 	seq_puts(f, "|------------------------------------------  Policy Statistics  -------------------------------------------+\n");
+ 	seq_puts(f, "+========+==========+=============+================+===================+===============+===================+\n");
+ 	seq_puts(f, "| Policy | Null ctr | Max Allowed | Min Guaranteed | Group Association | Pools Mapping | Allocated Buffers |\n");
+ 	seq_puts(f, "+--------+----------+-------------+----------------+-------------------+---------------+-------------------+\n");
+-	BM_FOR_EACH_POLICY(db, i) {
+-		if (!db->policies[i].is_busy)
+-			continue;
+-
++	for_each_set_bit(i, db->policies_bmap, db->cfg.max_policies) {
+ 		pp_bmgr_policy_stats_get(&policy_stats, i);
+-		seq_printf(f, "|%-8d|%-10d|%-13d|%-16d|%-19d|  %-2d %-2d %-2d %-2d  |%-19d|\n",
++
++		pr_buf(pools, sizeof(pools), n, "%*pbl", PP_BM_MAX_POOLS,
++		       policy_stats.pools_bmap);
++
++		if (policy_stats.policy_grp_association ==
++		    PP_BM_INVALID_GROUP_ID)
++			pr_buf(group, sizeof(group), n, "Invalid");
++		else
++			pr_buf(group, sizeof(group), n, "%u",
++			       policy_stats.policy_grp_association);
++
++		seq_printf(f, "|%-8d|%-10d|%-13d|%-16d|%-19s|%-15s|%-19u|\n",
+ 			   i,
+ 			   policy_stats.policy_null_ctr,
+ 			   policy_stats.policy_max_allowed,
+ 			   policy_stats.policy_min_guaranteed,
+-			   policy_stats.policy_grp_association,
+-			   policy_stats.policy_pools[0],
+-			   policy_stats.policy_pools[1],
+-			   policy_stats.policy_pools[2],
+-			   policy_stats.policy_pools[3],
++			   group,
++			   pools,
+ 			   policy_stats.policy_alloc_buff);
+ 	}
+-	seq_puts(f, "+========+==========+=============+================+===================+===============+===================+\n");
++	seq_puts(f, "+==========================================================================================================+\n");
+ 
+ 	seq_puts(f, "\n+=================================================+\n");
+ 	seq_puts(f, "|------------  Policy/Pool Statistics  -----------+\n");
+ 	seq_puts(f, "+========+======+=============+===================+\n");
+ 	seq_puts(f, "| Policy | Pool | Max Allowed | Allocated Buffers |\n");
+ 	seq_puts(f, "+--------+------+-------------+-------------------+\n");
+-	BM_FOR_EACH_POLICY(db, i) {
+-		if (!db->policies[i].is_busy)
+-			continue;
+-
++	for_each_set_bit(i, db->policies_bmap, db->cfg.max_policies) {
+ 		policy_params = &db->policies[i].params;
+ 
+ 		pp_bmgr_policy_stats_get(&policy_stats, i);
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
+index 94e96927468a..642f038b7657 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
+@@ -14,11 +14,6 @@
+ #include "pp_buffer_mgr.h"
+ #include "bm.h"
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_BM]:%s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ /**
+  * @brief Shortcut to iterate through BM pools
+  * @param p loop iterator
+@@ -40,55 +35,28 @@
+ #define BM_FOR_EACH_GROUP(_db, g) \
+ 	for (g = 0; g < (_db)->cfg.max_groups; g++)
+ 
+-/**
+- * @brief Shortcut to iterate through BM isolated groups
+- * @param g loop iterator
+- */
+-#define BM_FOR_EACH_ISOLATED_GROUP(_db, g) \
+-	for (g = 1; g < (_db)->cfg.max_groups; g++)
+-
+ /**
+  * @brief BM_MIN_POOL_BUFFER_SIZE Minimum buffer size in
+  *      configured pool
+  */
+ #define BM_MIN_POOL_BUFFER_SIZE                       (64)
+ 
+-/**
+- * @brief BM_DEFAULT_GROUP_ID Default group id
+- */
+-#define BM_DEFAULT_GROUP_ID                           (0)
+-
+ /**
+  * @brief BM_POLICY_RESET_DELAY_MS
+  */
+ #define BM_POLICY_RESET_DELAY_MS                      (10)
+ 
+-/**
+- * @brief This structure is used for buffer manager database
+- * @available_buffers available buffers in group
+- * @reserved_buffers reserved buffers in this group
+- * @pools Pools in policy
+- */
+-struct bmgr_group_db_entry {
+-	u32 available_buffers;
+-	u32 reserved_buffers;
+-	struct list_head pools_head;
+-	u8 is_busy;
+-};
+-
+ /**
+  * @brief This structure holds the pool database
+  */
+ struct bmgr_pool_db_entry {
+ 	struct pp_bmgr_pool_params params; /*! pools params */
+-	struct list_head group_link;
+ 	ulong  policies_bmap[BITS_TO_LONGS(PP_BM_MAX_POLICIES)];
+ 	u32    num_allocated_buffers;   /*! Num allocated buffers */
+ 	u32    num_deallocated_buffers; /*! Num deallocated buffers */
+ 	u32    policy_ref_cnt;
+ 	u8     pool_id;
+-	u8     is_busy;   /*! Is entry in used */
+-	void      *virt;  /*! pool virtual address, used when the pool is
++	void *virt; /*! pool virtual address, used when the pool is
+ 			   *  allocated internally by the buffer manager
+ 			   */
+ 	dma_addr_t phys;  /*! pool physical address */
+@@ -101,6 +69,7 @@ struct bmgr_pool_db_entry {
+ /**
+  * @brief This structure holds the policy database
+  * @policy_params Policy params
++ * @pools_bmap bit per pool specified which pools are used by the policy
+  * @num_allocated_buffers Num allocated buffers
+  * @num_deallocated_buffers Num deallocated buffers
+  * @is_busy Is entry in used
+@@ -111,7 +80,6 @@ struct bmgr_policy_db_entry {
+ 	u32    num_allocated_buffers;
+ 	u32    num_deallocated_buffers;
+ 	u8     group_id;
+-	u8     is_busy;
+ };
+ 
+ /**
+@@ -150,6 +118,10 @@ struct bmgr_driver_db {
+ 	spinlock_t  db_lock;
+ 	u32         num_pools;
+ 	u32         num_policies;
++	u32         num_groups;
++	ulong  policies_bmap[BITS_TO_LONGS(PP_BM_MAX_POLICIES)];
++	ulong  pools_bmap[BITS_TO_LONGS(PP_BM_MAX_POOLS)];
++	ulong  groups_bmap[BITS_TO_LONGS(BM_MAX_GROUPS)];
+ };
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 253228079eaa..caae900d4e30 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -383,8 +383,9 @@ s32 pp_resource_stats_show(char *buf, size_t sz, size_t *n)
+ 	struct pp_bmgr_pool_stats pool_stats;
+ 	struct rpb_hw_stats rpb_hw_stats;
+ 	struct pp_bmgr_init_param bmgr_cfg;
+-	u32 i, rpb_mem_sz;
++	u32 i, rpb_mem_sz, tmp;
+ 	s32 ret;
++	char pools[64];
+ 
+ 	if (unlikely(ptr_is_null(buf) || ptr_is_null(n)))
+ 		return -EINVAL;
+@@ -427,15 +428,14 @@ s32 pp_resource_stats_show(char *buf, size_t sz, size_t *n)
+ 			continue;
+ 
+ 		pp_bmgr_policy_stats_get(&policy_stats, i);
++		pr_buf(pools, sizeof(pools), tmp, "%*pbl", PP_BM_MAX_POOLS,
++		       policy_stats.pools_bmap);
++
+ 		pr_buf_cat(buf, sz, *n,
+-			   "| %-6d | %11d | %11d | %13d | %2d %2d %2d %2d   | %17d |\n",
+-			   i, policy_stats.policy_null_ctr,
++			   "| %-6d | %11d | %11d | %13d | %-13s | %17d |\n", i,
++			   policy_stats.policy_null_ctr,
+ 			   policy_stats.policy_max_allowed,
+-			   policy_stats.policy_min_guaranteed,
+-			   policy_stats.policy_pools[0],
+-			   policy_stats.policy_pools[1],
+-			   policy_stats.policy_pools[2],
+-			   policy_stats.policy_pools[3],
++			   policy_stats.policy_min_guaranteed, pools,
+ 			   policy_stats.policy_alloc_buff);
+ 	}
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
+index 845eb438fd28..e2e89ad3f365 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
+@@ -586,7 +586,6 @@ PP_DEFINE_DBGFS_ATT_FMT(mod_reg_log_en, mod_reg_log_en_get, mod_reg_log_en_set,
+ 
+ #endif /* CONFIG_PPV4_LGM */
+ 
+-#if IS_ENABLED(CONFIG_PPV4_LGM)
+ /**
+  * @brief files to create in the misc folder
+  */
+@@ -603,6 +602,7 @@ static struct debugfs_file files[] = {
+ #endif
+ };
+ 
++#if IS_ENABLED(CONFIG_PPV4_LGM)
+ /**
+  * @brief files to create in the root folder
+  */
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+index cfb46d98a866..7f918c00761a 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+@@ -346,9 +346,9 @@ void bm_get_cfg_regs(struct bmgr_cfg_regs * const regs)
+ 	regs->status_reg = PP_REG_RD32(PP_BM_STATUS_REG);
+ }
+ 
+-s32 bm_group_reserved_set(u8 group_id, u32 reserved_buffers)
++s32 bm_group_reserved_set(u8 group_id, u32 reserved)
+ {
+-	u32  reg_val = 0;
++	u32 val = 0;
+ 
+ 	if (group_id >= db->max_groups) {
+ 		pr_err("group id %d exceeds maximum of %d\n",
+@@ -356,15 +356,32 @@ s32 bm_group_reserved_set(u8 group_id, u32 reserved_buffers)
+ 		return -EINVAL;
+ 	}
+ 
+-	reg_val = PP_FIELD_MOD(PP_BM_GRP_RES_GRP_RESERVED_MSK,
+-			       reserved_buffers,
+-			       reg_val);
+-	PP_REG_WR32(PP_BM_GRP_RES_REG_IDX(group_id), reg_val);
++	val = PP_FIELD_MOD(PP_BM_GRP_RES_GRP_RESERVED_MSK, reserved, val);
++	PP_REG_WR32(PP_BM_GRP_RES_REG_IDX(group_id), val);
+ 
+ 	return 0;
+ }
+ 
+-s32 bm_group_available_set(u8 group_id, u32 available_buffers)
++s32 bm_group_reserved_get(u8 group_id, u32 *reserved)
++{
++	u32 reg_val;
++
++	if (ptr_is_null(reserved))
++		return -EINVAL;
++
++	if (group_id >= db->max_groups) {
++		pr_err("group id %d exceeds maximum of %d\n",
++		       group_id, db->max_groups);
++		return -EINVAL;
++	}
++
++	reg_val = PP_REG_RD32(PP_BM_GRP_RES_REG_IDX(group_id));
++	*reserved = FIELD_GET(PP_BM_GRP_RES_GRP_RESERVED_MSK, reg_val);
++
++	return 0;
++}
++
++s32 bm_group_available_set(u8 group_id, u32 available)
+ {
+ 	u32  reg_val = 0;
+ 
+@@ -374,13 +391,31 @@ s32 bm_group_available_set(u8 group_id, u32 available_buffers)
+ 		return -EINVAL;
+ 	}
+ 
+-	reg_val = FIELD_PREP(PP_BM_GRP_AVL_GRP_AVAILABLE_MSK,
+-			     available_buffers);
++	reg_val = FIELD_PREP(PP_BM_GRP_AVL_GRP_AVAILABLE_MSK, available);
+ 	PP_REG_WR32(PP_BM_GRP_AVL_REG_IDX(group_id), reg_val);
+ 
+ 	return 0;
+ }
+ 
++s32 bm_group_available_get(u8 group_id, u32 *available)
++{
++	u32 reg_val;
++
++	if (ptr_is_null(available))
++		return -EINVAL;
++
++	if (group_id >= db->max_groups) {
++		pr_err("group id %d exceeds maximum of %d\n",
++		       group_id, db->max_groups);
++		return -EINVAL;
++	}
++
++	reg_val = PP_REG_RD32(PP_BM_GRP_AVL_REG_IDX(group_id));
++	*available = FIELD_GET(PP_BM_GRP_AVL_GRP_AVAILABLE_MSK, reg_val);
++
++	return 0;
++}
++
+ s32 bm_pool_pop_enable(u8 pool_id, bool enable)
+ {
+ 	u32 reg_val;
+@@ -498,18 +533,31 @@ s32 bm_policy_pool_mapping_set(u16 policy_id,
+ }
+ 
+ s32 bm_policy_configure(u16 policy_id,
+-			const struct bmgr_policy_cfg * const cfg)
++			const struct bmgr_policy_cfg *cfg)
+ {
++	struct bmgr_policy_cfg tmp = { 0 };
++
+ 	if (policy_id >= db->max_policies) {
+ 		pr_err("policy_id %d exceeds maximum of %d\n",
+ 		       policy_id, db->max_policies);
+ 		return -EINVAL;
+ 	}
+ 
+-	/* Associate policy to group 0 */
+-	PP_REG_WR32(BM_PLCY_GRP_ASSOCIATED(policy_id), cfg->group_id);
+-	PP_REG_WR32(BM_PLCY_MAX_ALLOWED(policy_id), cfg->max_allowed);
+-	PP_REG_WR32(BM_PLCY_MIN_GUARANTEED(policy_id), cfg->min_guaranteed);
++	if (cfg) {
++		tmp.max_allowed = cfg->max_allowed;
++		/* there isn't an invalid value for a group in HW
++		 * so, for setting invalid group id, we set group id 0
++		 * and minimum guarantee to 0
++		 */
++		if (cfg->group_id != PP_BM_INVALID_GROUP_ID) {
++			tmp.group_id = cfg->group_id;
++			tmp.min_guaranteed = cfg->min_guaranteed;
++		}
++	}
++
++	PP_REG_WR32(BM_PLCY_GRP_ASSOCIATED(policy_id), tmp.group_id);
++	PP_REG_WR32(BM_PLCY_MIN_GUARANTEED(policy_id), tmp.min_guaranteed);
++	PP_REG_WR32(BM_PLCY_MAX_ALLOWED(policy_id), tmp.max_allowed);
+ 
+ 	return 0;
+ }
+@@ -524,6 +572,24 @@ s32 bm_ctrl_poll(void)
+ 	return 0;
+ }
+ 
++s32 bm_pool_min_guarantee_set(u8 pool_id, bool en)
++{
++	u32 reg_val = 0;
++
++	if (pool_id >= db->max_pools) {
++		pr_err("pool id %d exceeds maximum of %d\n",
++		       pool_id, db->max_pools);
++		return -EINVAL;
++	}
++
++	/* Set minimum guaranteed bit per pool */
++	reg_val = PP_REG_RD32(PP_BM_POOL_MIN_GRNT_MASK_REG);
++	reg_val = PP_FIELD_MOD(BM_POOL_MIN_GRNT_FIELD(pool_id), en, reg_val);
++	PP_REG_WR32(PP_BM_POOL_MIN_GRNT_MASK_REG, reg_val);
++
++	return 0;
++}
++
+ s32 bm_pool_configure(u8 pool_id, const struct bmgr_pool_cfg * const cfg)
+ {
+ 	u32 reg_val = 0;
+@@ -602,11 +668,7 @@ s32 bm_pool_configure(u8 pool_id, const struct bmgr_pool_cfg * const cfg)
+ 		    BM_DFLT_WATERMARK_LOW_THR(fifo_sz));
+ 
+ 	/* Set minimum guaranteed bit per pool */
+-	reg_val = PP_REG_RD32(PP_BM_POOL_MIN_GRNT_MASK_REG);
+-	reg_val = PP_FIELD_MOD(BM_POOL_MIN_GRNT_FIELD(pool_id),
+-			       !cfg->min_guaranteed_enable ? 1 : 0,
+-			       reg_val);
+-	PP_REG_WR32(PP_BM_POOL_MIN_GRNT_MASK_REG, reg_val);
++	bm_pool_min_guarantee_set(pool_id, cfg->min_guaranteed_enable);
+ 
+ 	/* Reset Pool FIFO - Set the reset bit to 0 */
+ 	reg_val = PP_REG_RD32(PP_BM_POOL_RESET_REG);
+@@ -624,6 +686,7 @@ s32 bm_pop_buffer(u32 policy, u32 *pool, u64 *buff)
+ 	phys_addr_t bm_addr_phys;
+ 	struct pp_qos_dev *qdev;
+ 	s32 ret;
++	u32 hi, low;
+ 
+ 	if (ptr_is_null(buff))
+ 		return -EINVAL;
+@@ -647,6 +710,10 @@ s32 bm_pop_buffer(u32 policy, u32 *pool, u64 *buff)
+ 	if (ret)
+ 		return ret;
+ 
++	hi = le32_to_cpu(*buff >> 32);
++	low = le32_to_cpu((u32)*buff);
++	*buff = le64_to_cpu(PP_BUILD_64BIT_WORD(low, hi));
++
+ 	if (pool)
+ 		*pool = (*buff & 0xFF00000000000000ULL) >> 56;
+ 
+@@ -661,6 +728,7 @@ s32 bm_push_buffer(u32 policy, u32 pool, u64 buff)
+ {
+ 	phys_addr_t bm_addr_phys;
+ 	struct pp_qos_dev *qdev;
++	u32 hi, low;
+ 
+ 	if (policy >= db->max_policies) {
+ 		pr_err("invalid policy id %u, maximum is %d\n",
+@@ -679,6 +747,8 @@ s32 bm_push_buffer(u32 policy, u32 pool, u64 buff)
+ 		return -EINVAL;
+ 
+ 	bm_addr_phys = db->bm_pop_push_addr + BM_POP_ADDR_OFFSET(policy);
+-	buff = buff | ((u64)pool << 56);
++	hi = cpu_to_le32((pool << 24) | (u32)(buff >> 32));
++	low = cpu_to_le32((u32)buff);
++	buff = cpu_to_le64(PP_BUILD_64BIT_WORD(low, hi));
+ 	return qos_uc_mcdma_copy_to_hw(qdev, &buff, bm_addr_phys, sizeof(buff));
+ }
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.h b/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
+index 132f5fd93d4d..72026a9f197a 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
+@@ -17,13 +17,18 @@
+  * @brief BM_MAX_GROUPS
+  *       Max supoorted groups. Real max defined in the DTS
+  */
+-#define BM_MAX_GROUPS                                 (16)
++#define BM_MAX_GROUPS          16
++
++/**
++ * @brief Invalid group id definition
++ */
++#define PP_BM_INVALID_GROUP_ID U8_MAX
+ 
+ /**
+  * @brief BM_MAX_ISOLATED_GROUPS
+- *       Max isolated groups is max groups minux 1 shared group
++ *       Max isolated groups is max groups
+  */
+-#define BM_MAX_ISOLATED_GROUPS                        (BM_MAX_GROUPS - 1)
++#define BM_MAX_ISOLATED_GROUPS BM_MAX_GROUPS
+ 
+ /**
+  * \brief This structure is used for allocate and deallocate
+@@ -130,6 +135,14 @@ void bm_get_cfg_regs(struct bmgr_cfg_regs * const regs);
+  */
+ s32 bm_ctrl_poll(void);
+ 
++/**
++ * @brief Enable/disable pool's minimum guarantee
++ * @param pool_id pool id
++ * @param en enable/disable
++ * @return 0 on success, other error code on failure
++ */
++s32 bm_pool_min_guarantee_set(u8 pool_id, bool en);
++
+ /**
+  * @brief Pool Configuration
+  * @param pool_id pool id
+@@ -173,8 +186,7 @@ s32 bm_pool_stats_get(struct pp_bmgr_pool_stats * const stats, u8 pool_id);
+  * @param cfg policy configuration
+  * @return 0 on success, other error code on failure
+  */
+-s32 bm_policy_configure(u16 policy_id,
+-			const struct bmgr_policy_cfg * const cfg);
++s32 bm_policy_configure(u16 policy_id, const struct bmgr_policy_cfg *cfg);
+ 
+ /**
+  * @brief Maps pool to policy (With priority)
+@@ -210,18 +222,34 @@ s32 bm_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ /**
+  * @brief Set group available buffers
+  * @param group_id group id
+- * @param available_buffers available buffers
++ * @param available available buffers
++ * @return 0 on success, other error code on failure
++ */
++s32 bm_group_available_set(u8 group_id, u32 available);
++
++/**
++ * @brief Get group available buffers
++ * @param group_id group id
++ * @param available available buffers
+  * @return 0 on success, other error code on failure
+  */
+-s32 bm_group_available_set(u8 group_id, u32 available_buffers);
++s32 bm_group_available_get(u8 group_id, u32 *available);
+ 
+ /**
+  * @brief Set group reserved buffers
+  * @param group_id group id
+- * @param available_buffers reserved buffers
++ * @param reserved reserved buffers
++ * @return 0 on success, other error code on failure
++ */
++s32 bm_group_reserved_set(u8 group_id, u32 reserved);
++
++/**
++ * @brief Get group reserved buffers
++ * @param group_id group id
++ * @param reserved reserved buffers
+  * @return 0 on success, other error code on failure
+  */
+-s32 bm_group_reserved_set(u8 group_id, u32 reserved_buffers);
++s32 bm_group_reserved_get(u8 group_id, u32 *reserved);
+ 
+ /**
+  * @brief Get group statistics
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c b/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c
+index 38873698c575..cb90ae342230 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c
+@@ -412,6 +412,7 @@ int pput_init(struct dentry *parent)
+ 	pp_prsr_tests_init();
+ #endif /* CONFIG_PPV4_LGM */
+ 	pp_qos_tests_init();
++	pp_bm_tests_init();
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c
+index 229bbbd677c6..dfe6074779c6 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c
+@@ -13,6 +13,7 @@
+ #include <linux/device.h>
+ #include <linux/module.h>
+ #include <linux/slab.h>
++#include <linux/bitops.h>
+ #include "../pput.h"
+ #include "bm.h"
+ #include "pp_buffer_mgr.h"
+@@ -22,86 +23,440 @@
+ #define pr_fmt(fmt) "[PP_BM_TEST] %s:%d: " fmt, __func__, __LINE__
+ #endif
+ 
+-#ifdef CONFIG_PPV4_LGM
+-#define BM_TEST_POOLS    (16)
+-#define BM_TEST_POLICIES (128)
+-#define BM_TEST_GROUPS   (16)
+-#else
+-#define BM_TEST_POOLS    (4)
+-#define BM_TEST_POLICIES (8)
+-#define BM_TEST_GROUPS   (2)
+-#endif
++struct pp_bmgr_init_param bmgr_cfg;
++ulong active_policies[BITS_TO_LONGS(PP_BM_MAX_POLICIES)];
++ulong active_pools[BITS_TO_LONGS(PP_BM_MAX_POOLS)];
++ulong isolated_pools[BITS_TO_LONGS(PP_BM_MAX_POOLS)];
+ 
+-#define BM_TEST_MAX_ALLOWED_PER_POOL (16)
++/**
++ * @brief Get information from the buffers manager driver
++ *        and set some stuff to enable the tests
++ * @param data not used
++ * @return s32
++ */
++static s32 pp_bm_pre_test(void *data)
++{
++	struct pp_bmgr_pool_params pool_prms;
++	u32 pool_id;
++	s32 ret;
+ 
+-#define BM_POOL_BUFFERS     (64)
+-#define BM_POOL_BUFFER_SIZE (2048)
+-#define BM_ALLOC_SZ         (BM_POOL_BUFFERS * BM_POOL_BUFFER_SIZE)
++	ret = pp_bmgr_config_get(&bmgr_cfg);
++	if (ret) {
++		pr_err("failed to get buffer manager config, ret %d\n", ret);
++		return PP_UT_FAIL;
++	}
+ 
+-static void       *bm_virt_ddr[BM_TEST_POOLS];
+-static dma_addr_t bm_phys_ddr[BM_TEST_POOLS];
++	/* get all active pools and policies */
++	bmgr_get_active_policies(active_policies, PP_BM_MAX_POLICIES);
++	bmgr_get_active_pools(active_pools, PP_BM_MAX_POOLS);
++	/* create 2 separate bitmaps for isolated and non-isolated pools */
++	for_each_set_bit(pool_id, active_pools, PP_BM_MAX_POOLS) {
++		ret = pp_bmgr_pool_conf_get(pool_id, &pool_prms);
++		if (ret) {
++			pr_err("failed to get pool %u params, ret %d\n",
++			       pool_id, ret);
++			return PP_UT_FAIL;
++		}
+ 
+-bool bm_restore_cfg;
+-struct pp_bmgr_init_param cfg;
++		if (pool_prms.flags & POOL_ISOLATED) {
++			set_bit(pool_id, isolated_pools);
++			clear_bit(pool_id, active_pools);
++		}
++	}
+ 
+-struct pool_config {
+-	bool is_active;
+-	struct pp_bmgr_pool_params params;
+-};
++	/* set number of pools per policy to more than 1
++	 * for testing the group creation logic that
++	 * prevent from 2 policies to share a subset of pools
++	 */
++	if (bmgr_cfg.max_pools_in_policy == 1)
++		bmgr_pools_per_policy_set(2);
+ 
+-struct policy_config {
+-	bool is_active;
+-	struct pp_bmgr_policy_params params;
+-};
++	return PP_UT_PASS;
++}
+ 
+-struct pool_config   *pool_cfg;
+-struct policy_config *policy_cfg;
++/**
++ * @brief Revert everything done in the pre test
++ * @param data not used
++ * @return s32
++ */
++static s32 pp_bm_post_test(void *data)
++{
++	/* revert max pools in policy back */
++	bmgr_pools_per_policy_set(bmgr_cfg.max_pools_in_policy);
+ 
+-static int pp_bm_pre_test(void *data);
+-static int pp_bm_configuration_test(void *data);
+-#ifdef PP_BM_ALLOCATION_TEST
+-static int pp_bm_allocation_test(void *data);
+-#endif
+-static int pp_bm_post_test(void *data);
+-
+-static struct pp_test_t pp_bm_tests[] = {
+-	{
+-		.component    = PP_BM_TESTS,
+-		.test_name    = "pp_bm_pre_test",
+-		.level_bitmap = PP_UT_LEVEL_FULL |
+-				PP_UT_LEVEL_MUST_PASS |
+-				PP_UT_LEVEL_MUST_RUN,
+-		.test_data    = NULL,
+-		.fn           = pp_bm_pre_test,
+-	},
+-	{
+-		.component    = PP_BM_TESTS,
+-		.test_name    = "pp_bm_configuration_test",
+-		.level_bitmap = PP_UT_LEVEL_FULL |
+-				PP_UT_LEVEL_MUST_PASS,
+-		.test_data    = NULL,
+-		.fn           = pp_bm_configuration_test,
+-	},
+-#ifdef PP_BM_ALLOCATION_TEST
+-	{
+-		.component    = PP_BM_TESTS,
+-		.test_name    = "pp_bm_allocation_test",
+-		.level_bitmap = PP_UT_LEVEL_FULL,
+-		.test_data    = NULL,
+-		.fn           = pp_bm_allocation_test,
+-	},
+-#endif
+-	{
+-		.component    = PP_BM_TESTS,
+-		.test_name    = "pp_bm_post_test",
+-		.level_bitmap = PP_UT_LEVEL_FULL |
+-				PP_UT_LEVEL_MUST_PASS |
+-				PP_UT_LEVEL_MUST_RUN,
+-		.test_data    = NULL,
+-		.fn           = pp_bm_post_test,
+-	},
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test if isolated pool can be used by more than 1 policy
++ * @param data
++ * @return s32 PP_UT_PASS in case it can't, PP_UT_FAIL otherwise
++ */
++static s32 pp_bm_isolated_pool_test(void *data)
++{
++	struct pp_bmgr_policy_params policy_cfg = { 0 };
++	u16 policy_id;
++	u8 pool_id;
++
++	if (bitmap_weight(isolated_pools, PP_BM_MAX_POOLS) == 0) {
++		pr_debug("failed to found isolated pool, skipping test\n");
++		return PP_UT_PASS;
++	}
++
++	/* get an isolated pool */
++	pool_id = find_first_bit(isolated_pools, PP_BM_MAX_POOLS);
++	/* Re-configure last policy as isolated */
++	policy_cfg.num_pools_in_policy = 1;
++	policy_cfg.pools_in_policy[0].pool_id = pool_id;
++	policy_cfg.max_allowed = 1;
++	policy_cfg.min_guaranteed = 0;
++	if (!pp_bmgr_policy_configure(&policy_cfg, &policy_id)) {
++		pr_err("Configured 2 policies to use an isolated pool %u, test fail\n",
++			pool_id);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Finds a policy which is part of a group with minimum guarantee
++ *        configured and, to reduce the test time, finds a policy with
++ *        the minimum number of buffers to pop for testing the
++ *        minimum guarantee
++ * @param n set to the number of buffers to pop to test the minimum
++ *          guarantee
++ * @return u32 group id if one exist, PP_BM_INVALID_GROUP_ID otherwise
++ */
++static u16 find_min_guarantee_policy(u32 *n)
++{
++	struct bmgr_group_db_entry grp_info;
++	struct pp_bmgr_policy_params policy_prms;
++	u32 grp_id, actual_allowed, min_policy_id, min_actual_allowed;
++	u32 policy_id, tmp;
++	s32 ret;
++
++	min_actual_allowed = U32_MAX;
++	min_policy_id = PP_BM_INVALID_POLICY_ID;
++	for (grp_id = 0; grp_id < bmgr_cfg.max_groups; grp_id++) {
++		ret = pp_bmgr_group_db_info_get(grp_id, &grp_info);
++		if (ret) /* skip if the group isn't active */
++			continue;
++
++		if (!grp_info.reserved)
++			continue;
++
++		/* calc maximum number of buffers available to pop
++		 * from the group
++		 */
++		tmp = grp_info.available - grp_info.reserved;
++		pr_debug("checking group %u, tmp %u\n", grp_id, tmp);
++
++		/* find the policy with the least amount of buffers
++		 * to pop to test the minimum guarantee
++		 */
++		for_each_set_bit(policy_id, grp_info.policies_bmap,
++				  PP_BM_MAX_POLICIES) {
++			pp_bmgr_policy_conf_get(policy_id, &policy_prms);
++
++			/* number of buffers needed to pop */
++			actual_allowed = tmp + policy_prms.min_guaranteed;
++			pr_debug("policy %u, actual_allowed %u, max_allowed %u, min guarantee %u\n",
++				 policy_id, actual_allowed,
++				 policy_prms.max_allowed,
++				 policy_prms.min_guaranteed);
++
++			/* check if the policy can pop enough buffers to
++			 * test the minimum guarantee
++			 */
++			if (actual_allowed >= policy_prms.max_allowed) {
++				pr_debug("not enough buffers to pop\n");
++				continue;
++			}
++
++			if (actual_allowed < min_actual_allowed) {
++				min_actual_allowed = actual_allowed;
++				min_policy_id = policy_id;
++			}
++		}
++	}
++
++	if (min_policy_id == PP_BM_INVALID_POLICY_ID) {
++		pr_info("Failed to find policy with minimum guarantee, skip test\n");
++		return PP_BM_INVALID_POLICY_ID;
++	}
++
++	if (n)
++		*n = min_actual_allowed;
++
++	return min_policy_id;
++}
++
++struct buff_info {
++	u32 pool;
++	u64 ptr;
+ };
+ 
++/**
++ * @brief Search for a group of policies with minimum guarantee
++ *        configured and try to allocate more than allowed
++ *        on one of the policies
++ * @param data no used
++ * @return s32 PP_UT_PASS if the minimum guarantee rules were
++ *             properly enforced, PP_UT_FAIL otherwise
++ */
++static s32 pp_bm_min_guarantee_test(void *data)
++{
++	struct buff_info *buffers_info;
++	u32 actual_allowed, i, popped_buffers;
++	u16 policy_id;
++
++	/* find a group of pools with minimum guarantee configured */
++	policy_id = find_min_guarantee_policy(&actual_allowed);
++	if (policy_id == PP_BM_INVALID_POLICY_ID)
++		return PP_UT_PASS;
++
++	pr_info("Try to pop %u buffers from policy %u\n", actual_allowed + 1,
++		 policy_id);
++
++	buffers_info =
++		kzalloc(sizeof(*buffers_info) * (actual_allowed + 1), GFP_KERNEL);
++	if (!buffers_info) {
++		pr_err("Failed to allocate memory for buffers pointers\n");
++		return PP_UT_FAIL;
++	}
++
++	/* try to pop more buffers then the actual allowed */
++	popped_buffers = 0;
++	for (i = 0; i < actual_allowed + 1; i++) {
++		bm_pop_buffer(policy_id, &buffers_info[i].pool,
++			      &buffers_info[i].ptr);
++		if (!buffers_info[i].ptr)
++			break;
++		pr_debug("popped buffer %#llx from policy %u, pool %u\n",
++			buffers_info[i].ptr, policy_id, buffers_info[i].pool);
++		popped_buffers++;
++	}
++	/* return all buffers back */
++	for (i = 0; i < popped_buffers; i++)
++		bm_push_buffer(policy_id, buffers_info[i].pool,
++			       buffers_info[i].ptr);
++
++	pr_info("%u buffers popped from policy %u\n", popped_buffers,
++		 policy_id);
++
++	kfree(buffers_info);
++	/* if we managed to popped all the buffers, minimum guarantee
++	 * don't work
++	 */
++	if (actual_allowed < popped_buffers) {
++		pr_info("popped %u buffers from policy %u, maximum expected is %u\n",
++			popped_buffers, policy_id, actual_allowed);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test whether 2 policies can be configured with same subset
++ *        of pools
++ * @param data no used
++ * @return s32 PP_UT_PASS if the configuration fails, PP_UT_FAIL otherwise
++ */
++static s32 pp_bm_pools_subset_test(void *data)
++{
++	struct pp_bmgr_policy_params policy_prms;
++	u8 pool_id, pool_id2;
++	u16 policy_id;
++	s32 ret;
++
++	/* there must be at least 2 non-isolated pools exist */
++	if (bitmap_weight(active_pools, PP_BM_MAX_POOLS) < 2) {
++		pr_info("test requires at least 2 non-isolated pools, skip\n");
++		return PP_UT_PASS;
++	}
++
++	pool_id  = find_first_bit(active_pools, PP_BM_MAX_POOLS);
++	pool_id2 = find_next_bit(active_pools, PP_BM_MAX_POOLS, pool_id + 1);
++	pr_info("pool_id %u, pool_id2 %u\n", pool_id, pool_id2);
++
++	/* try to create new policy with 1 more pool */
++	policy_prms.max_allowed = 2;
++	policy_prms.min_guaranteed = 0;
++	policy_prms.num_pools_in_policy = 2;
++	policy_prms.pools_in_policy[0].max_allowed = 1;
++	policy_prms.pools_in_policy[0].pool_id = pool_id;
++	policy_prms.pools_in_policy[1].max_allowed = 1;
++	policy_prms.pools_in_policy[1].pool_id = pool_id2;
++
++	policy_id = PP_BM_INVALID_POLICY_ID;
++	ret = pp_bmgr_policy_configure(&policy_prms, &policy_id);
++	if (!ret || ret != -EINVAL) {
++		pr_info("policy params valid failed with pools subset, test fail\n");
++		pp_bmgr_policy_remove(policy_id);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test whether a policy can be configured with an inactive pool
++ * @param data no used
++ * @return s32 PP_UT_PASS if the configuration fails, PP_UT_FAIL otherwise
++ */
++static s32 pp_bm_inactive_pool_test(void *data)
++{
++	ulong all_pools[BITS_TO_LONGS(PP_BM_MAX_POOLS)];
++	struct pp_bmgr_policy_params policy_prms;
++	u16 policy_id;
++	u8 pool_id;
++	s32 ret;
++
++	bitmap_or(all_pools, active_pools, isolated_pools, PP_BM_MAX_POOLS);
++	pool_id = find_first_zero_bit(all_pools, PP_BM_MAX_POOLS);
++	pr_info("inactive pool %u\n", pool_id);
++
++	policy_prms.max_allowed = 1;
++	policy_prms.min_guaranteed = 0;
++	policy_prms.num_pools_in_policy = 1;
++	policy_prms.pools_in_policy[0].max_allowed = 1;
++	policy_prms.pools_in_policy[0].pool_id = pool_id;
++
++	policy_id = PP_BM_INVALID_POLICY_ID;
++	ret = pp_bmgr_policy_configure(&policy_prms, &policy_id);
++	if (!ret || ret != -EINVAL) {
++		pr_info("policy params valid failed with inactive pool, test fail\n");
++		pp_bmgr_policy_remove(policy_id);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test whether a policy can be configured with a minimum
++ *        guarantee value which is greather than the pool size
++ * @param data no used
++ * @return s32 PP_UT_PASS if the configuration fails, PP_UT_FAIL otherwise
++ */
++static s32 pp_bm_min_guarantee_overbooked_test(void *data)
++{
++	struct pp_bmgr_policy_params policy_prms;
++	struct pp_bmgr_pool_params pool_prms;
++	u16 policy_id;
++	u8 pool_id;
++	s32 ret;
++
++	pool_id = find_first_bit(active_pools, PP_BM_MAX_POOLS);
++	ret = pp_bmgr_pool_conf_get(pool_id, &pool_prms);
++	if (ret) {
++		pr_err("failed to get pool %u params, ret %d\n", pool_id, ret);
++		return PP_UT_FAIL;
++	}
++
++	policy_prms.min_guaranteed = pool_prms.num_buffers + 1;
++	policy_prms.max_allowed = pool_prms.num_buffers + 1;
++	policy_prms.num_pools_in_policy = 1;
++	policy_prms.pools_in_policy[0].max_allowed = pool_prms.num_buffers + 1;
++	policy_prms.pools_in_policy[0].pool_id = pool_id;
++
++	policy_id = PP_BM_INVALID_POLICY_ID;
++	ret = pp_bmgr_policy_configure(&policy_prms, &policy_id);
++	if (!ret || ret != -EINVAL) {
++		pr_info("policy params valid failed with overbooked min guarantee, test fail\n");
++		pp_bmgr_policy_remove(policy_id);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test a whether a policy can be configured with
++ *        max allowed more than the pool size for every pool
++ * @param data not used
++ * @return s32
++ */
++static s32 pp_bm_max_allowed_overbooked_test(void *data)
++{
++	struct pp_bmgr_policy_params policy_prms;
++	struct pp_bmgr_pool_params pool_prms;
++	u16 policy_id;
++	u8 pool_id;
++	s32 ret;
++
++	pool_id = find_first_bit(active_pools, PP_BM_MAX_POOLS);
++	ret = pp_bmgr_pool_conf_get(pool_id, &pool_prms);
++	if (ret) {
++		pr_err("failed to get pool %u params, ret %d\n", pool_id, ret);
++		return PP_UT_FAIL;
++	}
++
++	policy_prms.pools_in_policy[0].max_allowed = pool_prms.num_buffers + 1;
++	policy_prms.pools_in_policy[0].pool_id = pool_id;
++	policy_prms.num_pools_in_policy = 1;
++	policy_prms.max_allowed = policy_prms.pools_in_policy[0].max_allowed;
++	policy_prms.min_guaranteed = 0;
++
++	policy_id = PP_BM_INVALID_POLICY_ID;
++	ret = pp_bmgr_policy_configure(&policy_prms, &policy_id);
++	/* we should also verify ret != -EINVAL to make sure
++	 * we failed due to a wrong configuration and not something else
++	 * but, due to cqm driver wrong configuration this specific checker
++	 * isn't enable.
++	 * @todo enable the checker in the driver and verify also ret != -EINVAL
++	 */
++	if (!ret) {
++		pr_info("policy params valid failed with overbooked max allowed, test fail\n");
++		pp_bmgr_policy_remove(policy_id);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test a whether a policy can be configured with
++ *        max allowed smaller than the minimum guarantee, such
++ *        configuration doesn't make any sense
++ * @param data not used
++ * @return s32
++ */
++static s32 pp_bm_max_allowed_min_guarantee_test(void *data)
++{
++	struct pp_bmgr_policy_params policy_prms;
++	struct pp_bmgr_pool_params pool_prms;
++	u16 policy_id;
++	u8 pool_id;
++	s32 ret;
++
++	pool_id = find_first_bit(active_pools, PP_BM_MAX_POOLS);
++	ret = pp_bmgr_pool_conf_get(pool_id, &pool_prms);
++	if (ret) {
++		pr_err("failed to get pool %u params, ret %d\n", pool_id, ret);
++		return PP_UT_FAIL;
++	}
++
++	/* assuming here minimum pool size if */
++	policy_prms.pools_in_policy[0].max_allowed = 1;
++	policy_prms.pools_in_policy[0].pool_id = pool_id;
++	policy_prms.num_pools_in_policy = 1;
++	policy_prms.max_allowed = policy_prms.pools_in_policy[0].max_allowed;
++	policy_prms.min_guaranteed = 2;
++
++	policy_id = PP_BM_INVALID_POLICY_ID;
++	ret = pp_bmgr_policy_configure(&policy_prms, &policy_id);
++	if (!ret || ret != -EINVAL) {
++		pr_info("policy params valid failed with overbooked max allowed, test fail\n");
++		pp_bmgr_policy_remove(policy_id);
++		return PP_UT_FAIL;
++	}
++
++	return PP_UT_PASS;
++}
++
+ #ifdef PP_BM_ALLOCATION_TEST
+ static bool __validate_allocation(u8 pool_id, u16 policy_id, u32 num_buffers)
+ {
+@@ -162,24 +517,8 @@ static s32 __bm_validate_buffer(struct pp_bmgr_buff_info *buff_info,
+ 
+ 	return 0;
+ }
+-#endif
+-
+-static s32 __bm_test_configure(void)
+-{
+-		cfg.max_pools = BM_TEST_POOLS;
+-		cfg.max_groups = BM_TEST_GROUPS;
+-		cfg.max_policies = BM_TEST_POLICIES;
+-		cfg.max_pools_in_policy = 2;
+-		if (IS_ENABLED(CONFIG_PPV4_LGM))
+-			cfg.pool_pop_hw_en = true;
+-		else
+-			cfg.pool_pop_hw_en = false;
+-
+-		return bmgr_config_set(&cfg);
+-}
+ 
+-#ifdef PP_BM_ALLOCATION_TEST
+-static int pp_bm_allocation_test(void *data)
++static s32 pp_bm_allocation_test(void *data)
+ {
+ 	struct pp_bmgr_buff_info *buff_info;
+ 	struct pp_bmgr_policy_params policy_params;
+@@ -266,318 +605,98 @@ static int pp_bm_allocation_test(void *data)
+ }
+ #endif
+ 
+-static int pp_bm_configuration_test(void *data)
+-{
+-	u8 pool_id;
+-	u16 policy_id;
+-	struct pp_bmgr_policy_params policy_params;
+-	struct pp_bmgr_pool_params pool_params;
+-
+-	/* Create Pools */
+-	for (pool_id = 0 ; pool_id < cfg.max_pools ; pool_id++) {
+-		pool_params.flags = POOL_ENABLE_FOR_MIN_GRNT_POLICY_CALC;
+-		bm_virt_ddr[pool_id] = pp_dma_alloc(BM_ALLOC_SZ,
+-						    GFP_KERNEL,
+-						    &bm_phys_ddr[pool_id]);
+-		if (!bm_virt_ddr[pool_id]) {
+-			pr_err("Could not allocate %u bytes for buffer manager\n",
+-			       BM_ALLOC_SZ);
+-			return -ENOMEM;
+-		}
+-
+-		pool_params.num_buffers = BM_POOL_BUFFERS;
+-		pool_params.base_addr_low = (u32)(bm_phys_ddr[pool_id]);
+-		pool_params.base_addr_high =
+-			(u32)((u64)bm_phys_ddr[pool_id] << 32);
+-		pool_params.size_of_buffer = BM_POOL_BUFFER_SIZE;
+-		if (pp_bmgr_pool_configure(&pool_params, &pool_id)) {
+-			pr_info("Configuring pool %d failed\n", pool_id);
+-			goto pp_bm_configuration_test_fail;
+-		}
+-	}
+-
+-	/* Try creating extra pool */
+-	if (unlikely(!pp_bmgr_pool_configure(&pool_params, &pool_id))) {
+-		pr_info("Error: Configuring extra pool %d succeeded\n",
+-			pool_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* Create Policies, leave last 2 pools not associated */
+-	for (policy_id = 0; policy_id < cfg.max_policies; policy_id++) {
+-		policy_params.max_allowed = 32;
+-		policy_params.min_guaranteed = 8;
+-		policy_params.num_pools_in_policy = 1;
+-		policy_params.pools_in_policy[0].pool_id =
+-			policy_id % (cfg.max_pools - 2);
+-		policy_params.pools_in_policy[0].max_allowed =
+-			BM_TEST_MAX_ALLOWED_PER_POOL;
+-		if (unlikely(pp_bmgr_policy_configure(&policy_params,
+-						      &policy_id))) {
+-			pr_info("Configuring policy %d failed\n", policy_id);
+-			goto pp_bm_configuration_test_fail;
+-		}
+-	}
+-
+-	/* Try creating extra policy */
+-	if (unlikely(!pp_bmgr_policy_configure(&policy_params, &policy_id))) {
+-		pr_info("Error: Configuring extra policy %d succeeded\n",
+-			 policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* Re-configure last pool as isolated */
+-	pool_id = cfg.max_pools - 1;
+-	pool_params.flags =
+-		POOL_ENABLE_FOR_MIN_GRNT_POLICY_CALC | POOL_ISOLATED;
+-
+-		pool_params.num_buffers = BM_POOL_BUFFERS;
+-		pool_params.base_addr_low = (u32)(bm_phys_ddr[pool_id]);
+-		pool_params.base_addr_high =
+-			(u32)(((u64)bm_phys_ddr[pool_id]) << 32);
+-		pool_params.size_of_buffer = BM_POOL_BUFFER_SIZE;
+-
+-	if (unlikely(pp_bmgr_pool_pop_disable(pool_id))) {
+-		pr_info("Error: Pop disable for pool %d failed\n", pool_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-	if (unlikely(pp_bmgr_pool_remove(pool_id))) {
+-		pr_info("Error: pool %d remove failed\n", pool_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-	if (pp_bmgr_pool_configure(&pool_params, &pool_id)) {
+-		pr_info("Configuring pool %d failed\n", pool_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* Try Reset non-isolated policy */
+-	if (unlikely(!pp_bmgr_policy_reset(cfg.max_policies - 1, NULL))) {
+-		pr_info("Error: non isolated policy %d reset succeeded\n",
+-			policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* Remove last 2 policies */
+-	if (unlikely(pp_bmgr_policy_remove(cfg.max_policies - 2))) {
+-		pr_info("policy %d remove failed\n", cfg.max_policies - 2);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	policy_id = cfg.max_policies - 1;
+-	if (unlikely(pp_bmgr_policy_remove(policy_id))) {
+-		pr_info("policy %d remove failed\n", policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	policy_params.max_allowed = 32;
+-	policy_params.min_guaranteed = 8;
+-
+-	/* Try Re-configure last policy as mixed isolated */
+-	policy_params.num_pools_in_policy = 2;
+-	policy_params.pools_in_policy[0].pool_id = cfg.max_pools - 1;
+-	policy_params.pools_in_policy[0].max_allowed =
+-		BM_TEST_MAX_ALLOWED_PER_POOL;
+-	policy_params.pools_in_policy[1].pool_id = cfg.max_pools - 2;
+-	policy_params.pools_in_policy[1].max_allowed =
+-		BM_TEST_MAX_ALLOWED_PER_POOL;
+-	if (unlikely(!pp_bmgr_policy_configure(&policy_params, &policy_id))) {
+-		pr_info("Error: Configuring policy %d as mixed isolated succeeded",
+-			policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* Re-configure last policy as isolated */
+-	policy_params.num_pools_in_policy = 1;
+-	policy_params.pools_in_policy[0].pool_id = cfg.max_pools - 1;
+-	policy_params.pools_in_policy[0].max_allowed =
+-		BM_TEST_MAX_ALLOWED_PER_POOL;
+-	if (unlikely(pp_bmgr_policy_configure(&policy_params, &policy_id))) {
+-		pr_info("Error: Configuring policy %d failed\n",
+-			policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* Try configure 2nd last policy with an isolated pool already used */
+-	policy_id = cfg.max_policies - 2;
+-	if (unlikely(!pp_bmgr_policy_configure(&policy_params, &policy_id))) {
+-		pr_info("Error: Configuring policy %d with a used isolated pool succeeded\n",
+-			policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	/* configure 2nd last policy properly */
+-	policy_id = cfg.max_policies - 2;
+-	policy_params.num_pools_in_policy = 1;
+-	policy_params.pools_in_policy[0].pool_id = cfg.max_pools - 2;
+-	policy_params.pools_in_policy[0].max_allowed =
+-		BM_TEST_MAX_ALLOWED_PER_POOL;
+-	if (unlikely(pp_bmgr_policy_configure(&policy_params, &policy_id))) {
+-		pr_info("Configuring policy %d wfailed\n",
+-			policy_id);
+-		goto pp_bm_configuration_test_fail;
+-	}
+-
+-	return PP_UT_PASS;
+-
+-pp_bm_configuration_test_fail:
+-	return PP_UT_FAIL;
+-}
+-
+-static int pp_bm_post_test(void *data)
+-{
+-	u8 pool_id;
+-	u16 policy_id;
+-	struct pp_bmgr_policy_params *policy_params;
+-
+-	/* Delete Test Policies */
+-	for (policy_id = 0; policy_id < cfg.max_policies; policy_id++) {
+-		if (unlikely(pp_bmgr_policy_remove(policy_id)))
+-			pr_info("Removing policy %d failed\n", policy_id);
+-	}
+-
+-	/* Delete Test Pools */
+-	for (pool_id = 0 ; pool_id < cfg.max_pools ; pool_id++) {
+-		if (unlikely(pp_bmgr_pool_pop_disable(pool_id)))
+-			pr_info("Disabling pool %d failed\n", pool_id);
+-		if (unlikely(pp_bmgr_pool_remove(pool_id)))
+-			pr_info("Removing pool %d failed\n", pool_id);
+-		/* Release pool memory */
+-		pp_dma_free(BM_ALLOC_SZ,
+-			    bm_virt_ddr[pool_id],
+-			    bm_phys_ddr[pool_id]);
+-	}
+-
+-	/* Reset bm config if no need to restore previous config */
+-	if (!bm_restore_cfg) {
+-		/* Reset test config */
+-		memset(&cfg, 0, sizeof(struct pp_bmgr_init_param));
+-		if (bmgr_config_set(&cfg)) {
+-			pr_info("bmgr_config_set failed\n");
+-			return PP_UT_FAIL;
+-		}
+-
+-		return PP_UT_PASS;
+-	}
+-
+-	/* Restore previous config */
+-	if (unlikely(bmgr_config_set(&cfg))) {
+-		pr_info("bmgr_config_set failed\n");
+-		goto pp_bm_post_test_config_restore_fail;
+-	}
+-
+-	/* Restore previous pool config */
+-	for (pool_id = 0 ; pool_id < cfg.max_pools ; pool_id++) {
+-		if (pool_cfg[pool_id].is_active) {
+-			if (pp_bmgr_pool_configure(&pool_cfg[pool_id].params,
+-						   &pool_id)) {
+-				pr_info("Configuring pool %d failed\n",
+-					pool_id);
+-				goto pp_bm_post_test_config_restore_fail;
+-			}
+-		}
+-	}
+-
+-	/* Restore policy config */
+-	for (policy_id = 0; policy_id < cfg.max_policies; policy_id++) {
+-		if (policy_cfg[policy_id].is_active) {
+-			policy_params = &policy_cfg[policy_id].params;
+-			if (pp_bmgr_policy_configure(policy_params,
+-						     &policy_id)) {
+-				pr_info("Removing policy %d failed\n",
+-					policy_id);
+-				goto pp_bm_post_test_config_restore_fail;
+-			}
+-		}
+-	}
+-
+-	kfree(pool_cfg);
+-	kfree(policy_cfg);
+-	return PP_UT_PASS;
+-
+-pp_bm_post_test_config_restore_fail:
+-	kfree(pool_cfg);
+-	kfree(policy_cfg);
+-	return PP_UT_FAIL;
+-}
+-
+-static int pp_bm_pre_test(void *data)
+-{
+-	u32 idx;
+-
+-	if (unlikely(pp_bmgr_config_get(&cfg))) {
+-		pr_info("pp_bmgr_config_get fail\n");
+-		goto pp_bm_pre_test_done;
+-	}
+-
+-	/* If max pools is not 0, need to restore bm configurations */
+-	bm_restore_cfg = cfg.max_pools ? true : false;
+-
+-	/* If no existing configuration go and load test config */
+-	if (!bm_restore_cfg)
+-		goto pp_bm_pre_test_configure;
+-
+-	/* Allocate pool cfg array in order to store pool config */
+-	pool_cfg = kcalloc(cfg.max_pools,
+-			   sizeof(struct pool_config),
+-			   GFP_KERNEL);
+-	if (unlikely(!pool_cfg))
+-		goto pp_bm_pre_test_config_store_fail;
+-
+-	/* Allocate policy cfg array in order to store policy config */
+-	policy_cfg = kcalloc(cfg.max_policies,
+-			     sizeof(struct policy_config),
+-			     GFP_KERNEL);
+-	if (unlikely(!policy_cfg))
+-		goto pp_bm_pre_test_config_store_fail;
+-
+-	/* Get existing policy config */
+-	for (idx = 0; idx < cfg.max_policies; idx++) {
+-		if (!pp_bmgr_policy_conf_get(idx, &policy_cfg[idx].params)) {
+-			policy_cfg[idx].is_active = true;
+-			if (pp_bmgr_policy_remove(idx)) {
+-				pr_info("Removing policy %d failed\n", idx);
+-				goto pp_bm_pre_test_config_store_fail;
+-			}
+-		}
+-	}
+-
+-	/* Get existing pool config */
+-	for (idx = 0 ; idx < cfg.max_pools ; idx++) {
+-		if (!pp_bmgr_pool_conf_get(idx, &pool_cfg[idx].params)) {
+-			pool_cfg[idx].is_active = true;
+-			if (unlikely(pp_bmgr_pool_pop_disable(idx))) {
+-				pr_info("Pool %d disable failed\n", idx);
+-				goto pp_bm_pre_test_config_store_fail;
+-			}
+-			if (unlikely(pp_bmgr_pool_remove(idx))) {
+-				pr_info("Removing pool %d failed\n", idx);
+-				goto pp_bm_pre_test_config_store_fail;
+-			}
+-		}
+-	}
+-
+-pp_bm_pre_test_configure:
+-	/* Configure bm for test */
+-	if (unlikely(__bm_test_configure())) {
+-		pr_info("__bm_test_configure fail\n");
+-		return PP_UT_FAIL;
+-	}
+-
+-pp_bm_pre_test_done:
+-	return PP_UT_PASS;
+-
+-pp_bm_pre_test_config_store_fail:
+-	kfree(pool_cfg);
+-	kfree(policy_cfg);
+-	return PP_UT_FAIL;
+-}
+-
+ /**
+  * Register all pp_bm tests to pput
+  */
+ void pp_bm_tests_init(void)
+ {
+-	int test_idx;
++	s32 test_idx;
++
++	struct pp_test_t pp_bm_tests[] = {
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "pre_test",
++			.level_bitmap = PP_UT_LEVEL_FULL |
++					PP_UT_LEVEL_MUST_PASS |
++					PP_UT_LEVEL_MUST_RUN,
++			.test_data = NULL,
++			.fn = pp_bm_pre_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "isolated_pool_test",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_isolated_pool_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "min_guarantee_test",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_min_guarantee_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "pools_subset_test",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_pools_subset_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "inactive_pool_test",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_inactive_pool_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "max_allowed_min_guarantee_test",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_max_allowed_min_guarantee_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "min_guarantee_overbooked_tes",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_min_guarantee_overbooked_test,
++		},
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "max_allowed_overbooked_test",
++			.level_bitmap =
++				PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++			.test_data = NULL,
++			.fn = pp_bm_max_allowed_overbooked_test,
++		},
++#ifdef PP_BM_ALLOCATION_TEST
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "pp_bm_allocation_test",
++			.level_bitmap = PP_UT_LEVEL_FULL,
++			.test_data = NULL,
++			.fn = pp_bm_allocation_test,
++		},
++#endif
++		{
++			.component = PP_BM_TESTS,
++			.test_name = "pp_bm_pre_test",
++			.level_bitmap = PP_UT_LEVEL_FULL |
++					PP_UT_LEVEL_MUST_PASS |
++					PP_UT_LEVEL_MUST_RUN,
++			.test_data = NULL,
++			.fn = pp_bm_post_test,
++		},
++	};
+ 
+ 	/* Add Tests */
+ 	for (test_idx = 0 ; test_idx < ARRAY_SIZE(pp_bm_tests); test_idx++)
+diff --git a/include/linux/pp_buffer_mgr_api.h b/include/linux/pp_buffer_mgr_api.h
+index cb3aecd45397..439eeeb17309 100644
+--- a/include/linux/pp_buffer_mgr_api.h
++++ b/include/linux/pp_buffer_mgr_api.h
+@@ -25,6 +25,12 @@
+  */
+ #define PP_BM_INVALID_POLICY_ID              (U16_MAX)
+ 
++/**
++ * @brief PP_BM_MAX_POOLS
++ *       Max supported pools. Real max defined in the DTS
++ */
++#define PP_BM_MAX_POOLS                      (16)
++
+ /**
+  * @define PP_BM_MAX_POOLS_PER_PLCY
+  * @brief Max pools per policy
+@@ -38,6 +44,7 @@
+  *        POOL_ENABLE_FOR_MIN_GRNT_POLICY_CALC When set pool
+  *        will take part in policy minimum guaranteed
+  *        calculation
++ * @note Deprecated, this will be determined by the pp internally
+  */
+ #define POOL_ENABLE_FOR_MIN_GRNT_POLICY_CALC BIT(0)
+ 
+@@ -48,6 +55,8 @@
+  */
+ #define POOL_ISOLATED                        BIT(1)
+ 
++#define BMGR_NUM_FLAGS 2
++
+ /**
+  * @struct pp_bmgr_pool_params
+  * @brief This structure is used in bmgr_pool_configure API in
+@@ -131,7 +140,7 @@ struct pp_bmgr_policy_stats {
+ 	u32 policy_grp_association;
+ 
+ 	/*! Mapped pools */
+-	s8  policy_pools[PP_BM_MAX_POOLS_PER_PLCY];
++	ulong pools_bmap[BITS_TO_LONGS(PP_BM_MAX_POOLS)];
+ 
+ 	/*! Total allocated buffers */
+ 	u32 policy_alloc_buff;

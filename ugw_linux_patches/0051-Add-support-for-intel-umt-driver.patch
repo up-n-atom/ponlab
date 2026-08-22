@@ -1,0 +1,2741 @@
+From b44601571c6837aff0154b00ce0b024c385e0aeb Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:08 +0800
+Subject: [PATCH] Add support for intel umt driver
+
+---
+ drivers/dma/ltq_umt_expand.c                       | 1000 ++++++++++++++++++++
+ drivers/net/ethernet/lantiq/umt/intel_umt_cqem.c   |  776 +++++++++++++++
+ .../net/ethernet/lantiq/umt/intel_umt_cqem_reg.h   |  877 +++++++++++++++++
+ include/linux/intel_umt_cqem.h                     |   52 +
+ 4 files changed, 2705 insertions(+)
+
+diff --git a/drivers/dma/ltq_umt_expand.c b/drivers/dma/ltq_umt_expand.c
+new file mode 100644
+index 000000000000..030617ef9a5b
+--- /dev/null
++++ b/drivers/dma/ltq_umt_expand.c
+@@ -0,0 +1,1000 @@
++/*
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ *
++ * Copyright (C) 2015 Zhu YiXin<yixin.zhu@lantiq.com>
++ * Copyright (C) 2016 Intel Corporation.
++ */
++#include <linux/init.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
++#include <linux/clk.h>
++#include <linux/slab.h>
++#include <linux/fs.h>
++#include <linux/errno.h>
++#include <linux/proc_fs.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/errno.h>
++#include <linux/dma-mapping.h>
++#include <linux/sched.h>
++#include <linux/wait.h>
++#include <linux/of.h>
++#include <linux/of_irq.h>
++#include <linux/seq_file.h>
++
++#include <linux/dma/lantiq_dmax.h>
++#include <linux/irqchip/mips-gic.h>
++#include <lantiq.h>
++#include <lantiq_soc.h>
++
++#include <net/datapath_proc_api.h>
++#include "ltq_hwmcpy_addr.h"
++#include <linux/ltq_hwmcpy.h>
++#include "ltq_hwmcpy.h"
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++#include <clocksource/intel-gptc-timer.h>
++#include "net/lantiq_cbm_api.h"
++
++/* the default interval is 40us */
++#define LTQ_UMT_SW_INTERVAL_DEFAULT 40
++/* the default yield pin is 8 */
++#define LTQ_UMT_SW_YIELD_PIN 8
++
++static u32 g_umt_interval = LTQ_UMT_SW_INTERVAL_DEFAULT;
++static u32 g_tot_dq_cnt[UMT_PORTS_NUM];
++#endif
++static u32 g_dma_ctrl = DMA1TX;
++
++/* 0x17AC == 20us according to register document*/
++#define UMT_US_TO_CNT_DEFAULT_VALUE (0x17AC / 20)
++
++static inline void umt_set_mode(u32 umt_id, enum umt_mode umt_mode)
++{
++	u32 val, off;
++
++	if (!umt_id) {
++		ltq_mcpy_w32_mask(0x2, ((u32)umt_mode) << 1, MCPY_GCTRL);
++	} else {
++		off = 16 + (umt_id - 1) * 3;
++		val = ltq_mcpy_r32(MCPY_GCTRL) & ~(BIT(off));
++		ltq_mcpy_w32(val | (((u32)umt_mode) << off), MCPY_GCTRL);
++	}
++}
++
++static inline void umt_set_msgmode(u32 umt_id, enum umt_msg_mode msg_mode)
++{
++	if (!umt_id)
++		ltq_mcpy_w32((u32)msg_mode, MCPY_UMT_SW_MODE);
++	else
++		ltq_mcpy_w32((u32)msg_mode,
++			     MCPY_UMT_X_ADDR(umt_id, MCPY_UMT_XSW_MODE));
++}
++
++/* input in term of microseconds */
++static inline u32 umt_us_to_cnt(int usec)
++{
++	unsigned long cpuclk;
++	struct clk *clk;
++	struct mcpy_umt *pumt = mcpy_get_umt();
++
++	clk = pumt->clk;
++	if (!clk)
++		return usec * UMT_US_TO_CNT_DEFAULT_VALUE;
++
++	cpuclk = clk_get_rate(clk);
++
++	return usec * (cpuclk / 1000000);
++}
++
++static inline void umt_set_period(u32 umt_id, u32 umt_period)
++{
++	umt_period = umt_us_to_cnt(umt_period);
++
++	if (!umt_id)
++		ltq_mcpy_w32(umt_period, MCPY_UMT_PERD);
++	else
++		ltq_mcpy_w32(umt_period,
++			     MCPY_UMT_X_ADDR(umt_id, MCPY_UMT_XPERIOD));
++}
++
++static inline void umt_set_dst(u32 umt_id, u32 umt_dst)
++{
++	if (!umt_id)
++		ltq_mcpy_w32(umt_dst, MCPY_UMT_DEST);
++	else
++		ltq_mcpy_w32(umt_dst,
++			     MCPY_UMT_X_ADDR(umt_id, MCPY_UMT_XDEST));
++}
++
++static inline void umt_set_mux(u32 umt_id, u32 cbm_pid, u32 dma_cid)
++{
++	u32 mux_sel;
++
++	cbm_pid = cbm_pid & 0xF;
++	dma_cid = dma_cid & 0xF;
++	mux_sel = ltq_mcpy_r32(MCPY_UMT_TRG_MUX) &
++			(~((0xF000F) << (umt_id * 4)));
++	mux_sel |= (dma_cid << (umt_id * 4)) |
++			(cbm_pid << (16 + (umt_id * 4)));
++	ltq_mcpy_w32(mux_sel, MCPY_UMT_TRG_MUX);
++}
++
++static inline void umt_set_endian(int dw_swp, int byte_swp)
++{
++	u32 val;
++
++	val = ltq_mcpy_r32(MCPY_GCTRL);
++	if (byte_swp)
++		val |= BIT(28);
++	else
++		val &= ~(BIT(28));
++
++	if (dw_swp)
++		val |= BIT(29);
++	else
++		val &= ~(BIT(29));
++
++	ltq_mcpy_w32(val, MCPY_GCTRL);
++}
++
++static inline void umt_en_expand_mode(void)
++{
++	u32 val;
++
++	val = ltq_mcpy_r32(MCPY_GCTRL) | BIT(31);
++	ltq_mcpy_w32(val, MCPY_GCTRL);
++
++	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
++		umt_set_endian(1, 0);
++	else
++		umt_set_endian(1, 1);
++}
++
++static inline void umt_enable(u32 umt_id, enum umt_status status)
++{
++	u32 val, off;
++
++	if (!umt_id) {
++		ltq_mcpy_w32_mask(0x4, ((u32)status) << 2, MCPY_GCTRL);
++	} else {
++		off = 17 + (umt_id - 1) * 3;
++		val = (ltq_mcpy_r32(MCPY_GCTRL) & ~BIT(off))
++				| (((u32)status) << off);
++		ltq_mcpy_w32(val, MCPY_GCTRL);
++	}
++}
++
++static inline void umt_suspend(u32 umt_id, enum umt_status status)
++{
++	u32 val;
++
++	if (status)
++		val = ltq_mcpy_r32(MCPY_UMT_CNT_CTRL) | BIT(umt_id);
++	else
++		val = ltq_mcpy_r32(MCPY_UMT_CNT_CTRL) & (~(BIT(umt_id)));
++
++	ltq_mcpy_w32(val, MCPY_UMT_CNT_CTRL);
++}
++
++/*This function will disable umt */
++static inline void umt_reset_umt(u32 umt_id)
++{
++	u32 mode;
++
++	umt_enable(umt_id, UMT_DISABLE);
++
++	/* Bit 1 for UMT0
++	 * Bit 16 for UMT1
++	 * Bit 19 for UMT2
++	 * Bit 23 for UMT3
++	 */
++	if (!umt_id)
++		mode = (ltq_mcpy_r32(MCPY_GCTRL) & BIT(1));
++	else
++		mode = (ltq_mcpy_r32(MCPY_GCTRL) & BIT(16 + 3 * (umt_id - 1)));
++
++	umt_set_mode(umt_id, !mode);
++	umt_set_mode(umt_id, mode);
++}
++
++/**
++ * intput:
++ * @umt_id: UMT port id, (0 - 3)
++ * @ep_id:  Aligned with datapath lib ep_id
++ * @period: measured in microseconds.
++ * ret:  Fail < 0 / Success: 0
++ */
++int ltq_umt_set_period(u32 umt_id, u32 ep_id, u32 period)
++{
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	struct umt_port *port;
++
++	if (period < MIN_UMT_PRD || umt_id >= UMT_PORTS_NUM)
++		goto period_err;
++
++	if (pumt->status != UMT_ENABLE) {
++		mcpy_dbg(MCPY_ERR, "UMT is not initialized!\n");
++		return -ENODEV;
++	}
++
++	port = &pumt->ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id) {
++		spin_unlock_bh(&port->umt_port_lock);
++		goto period_err;
++	}
++
++	if (port->umt_period != period) {
++		port->umt_period = period;
++		umt_set_period(umt_id, port->umt_period);
++	}
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++
++period_err:
++	mcpy_dbg(MCPY_ERR, "umt_id: %d, ep_id: %d, period: %d\n",
++		 umt_id, ep_id, period);
++
++	return -EINVAL;
++}
++EXPORT_SYMBOL(ltq_umt_set_period);
++
++/**
++ * API to configure the UMT port.
++ * input:
++ * @umt_id: (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ * @umt_mode:  0-self-counting mode, 1-user mode.
++ * @msg_mode:  0-No MSG, 1-MSG0 Only, 2-MSG1 Only, 3-MSG0 & MSG1.
++ * @dst:  Destination PHY address.
++ * @period(ms): only applicable when set to self-counting mode.
++ *              self-counting interval time. if 0, use the original setting.
++ * @enable: 1-Enable/0-Disable
++ * @ret:  Fail < 0 , SUCCESS:0
++ */
++int ltq_umt_set_mode(u32 umt_id, u32 ep_id, struct umt_set_mode *p_umt_mode)
++{
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	struct umt_port *port;
++	u32 msg_mode;
++	u32 umt_mode;
++	u32 phy_dst;
++	u32 period;
++	u32 enable;
++	u32 umt_ep_dst;
++
++	if (!p_umt_mode) {
++		mcpy_dbg(MCPY_ERR, "UMT mode is NULL!\n");
++		return -EINVAL;
++	}
++
++	umt_mode = p_umt_mode->umt_mode;
++	msg_mode = p_umt_mode->msg_mode;
++	phy_dst = p_umt_mode->phy_dst;
++	period = p_umt_mode->period;
++	enable = p_umt_mode->enable;
++	umt_ep_dst = p_umt_mode->umt_ep_dst;
++
++	if (pumt->status != UMT_ENABLE) {
++		mcpy_dbg(MCPY_ERR, "UMT is not initialized!!\n");
++		return -ENODEV;
++	}
++	if ((umt_mode >= (u32)UMT_MODE_MAX) || (msg_mode >= (u32)UMT_MSG_MAX) ||
++	    (enable >= (u32)UMT_STATUS_MAX) || (umt_ep_dst == 0) ||
++	    (phy_dst == 0) || (period == 0) || (umt_id >= UMT_PORTS_NUM)) {
++		mcpy_dbg(MCPY_ERR, "umt_id: %d, umt_mode: %d, msg_mode: %d.\n",
++			 umt_id, umt_mode, msg_mode);
++		mcpy_dbg(MCPY_ERR, "enable: %d, phy_dst: %d, umt_ep_dst: %d.\n",
++			 enable, phy_dst, umt_ep_dst);
++		return -EINVAL;
++	}
++
++	port = &pumt->ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id) {
++		mcpy_dbg(MCPY_ERR, "input ep_id: %d, port ep_id: %d\n",
++			 ep_id, port->ep_id);
++		spin_unlock_bh(&port->umt_port_lock);
++		return -EINVAL;
++	}
++
++	umt_reset_umt(umt_id);
++
++	port->umt_mode = (enum umt_mode)umt_mode;
++	port->msg_mode = (enum umt_msg_mode)msg_mode;
++	port->umt_dst = phy_dst;
++	port->umt_period = period;
++	port->status = (enum umt_status)enable;
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	if (IS_ENABLED(CONFIG_LTQ_UMT_SW_MODE))
++		port->umt_ep_dst = umt_ep_dst;
++#endif
++	umt_set_mode(umt_id, port->umt_mode);
++	umt_set_msgmode(umt_id, port->msg_mode);
++	umt_set_dst(umt_id, port->umt_dst);
++	umt_set_period(umt_id, port->umt_period);
++	umt_enable(umt_id, port->status);
++	/* setup the CBM/DMA mapping */
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(ltq_umt_set_mode);
++
++/**
++ * API to enable/disable umt port
++ * input:
++ * @umt_id (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ * @enable: Enable: 1 / Disable: 0
++ * ret:  Fail < 0, Success: 0
++ */
++int ltq_umt_enable(u32 umt_id, u32 ep_id, u32 enable)
++{
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	struct umt_port *port;
++
++	if (umt_id >= UMT_PORTS_NUM)
++		return -EINVAL;
++	if (enable >= (u32)UMT_STATUS_MAX || pumt->status != UMT_ENABLE)
++		return -ENODEV;
++
++	port = &pumt->ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id || port->umt_dst == 0 || port->ep_id == 0) {
++		mcpy_dbg(MCPY_ERR, "input ep_id: %d, umt port ep_id: %d, umt_dst: 0x%x\n",
++			 ep_id, port->ep_id, port->umt_dst);
++		goto en_err;
++	}
++
++	if (port->status != enable) {
++		port->status = (enum umt_status)enable;
++		umt_enable(umt_id, port->status);
++	}
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++
++en_err:
++	spin_unlock_bh(&port->umt_port_lock);
++	return -EINVAL;
++}
++EXPORT_SYMBOL(ltq_umt_enable);
++
++/**
++ * API to suspend/resume umt US/DS counter
++ * input:
++ * @umt_id (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ * @enable: suspend: 1 / resume: 0
++ * ret:  Fail < 0, Success: 0
++ */
++int ltq_umt_suspend(u32 umt_id, u32 ep_id, u32 enable)
++{
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	struct umt_port *port;
++
++	if (umt_id >= UMT_PORTS_NUM)
++		return -EINVAL;
++	if (enable >= (u32)UMT_STATUS_MAX || pumt->status != UMT_ENABLE)
++		return -ENODEV;
++
++	port = &pumt->ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id || port->umt_dst == 0 || port->ep_id == 0) {
++		mcpy_dbg(MCPY_ERR, "input ep_id: %d, umt port ep_id: %d, umt_dst: 0x%x\n",
++			 ep_id, port->ep_id, port->umt_dst);
++		goto en_err;
++	}
++
++	if (port->suspend != enable) {
++		port->suspend = (enum umt_status)enable;
++		umt_enable(umt_id, port->status);
++		umt_suspend(umt_id, port->suspend);
++	}
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++
++en_err:
++	spin_unlock_bh(&port->umt_port_lock);
++	return -EINVAL;
++}
++EXPORT_SYMBOL(ltq_umt_suspend);
++
++/**
++ * API to request and allocate UMT port
++ * input:
++ * @ep_id: aligned with datapath lib EP.
++ * @cbm_pid: CBM Port ID(0-3), 0 - CBM port 4, 1 - CBM port 24,
++ * 2 - CBM port 25, 3 - CBM port 26
++ * output:
++ * @dma_ctrlid: DMA controller ID. aligned with DMA driver DMA controller ID
++ * @dma_cid: DMA channel ID.
++ * @umt_id: (0 - 3)
++ * ret: Fail: < 0,  Success: 0
++ */
++int ltq_umt_request(u32 ep_id, u32 cbm_pid,
++		    u32 *dma_ctrlid, u32 *dma_cid, u32 *umt_id)
++{
++	int i, pid;
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	struct umt_port *port;
++
++	if (!dma_ctrlid || !dma_cid || !umt_id) {
++		mcpy_dbg(MCPY_ERR, "Output pointer is NULL!\n");
++		goto param_err;
++	}
++
++	if (pumt->status != UMT_ENABLE) {
++		mcpy_dbg(MCPY_ERR, "UMT not initialized!\n");
++		goto param_err;
++	}
++	if (!ep_id) {
++		mcpy_dbg(MCPY_ERR, "%s: ep_id cannot be zero!\n", __func__);
++		goto param_err;
++	}
++
++	if (cbm_pid >= UMT_PORTS_NUM) {
++		mcpy_dbg(MCPY_ERR, "%s: cbm pid must be in ranage(0 - %d)\n",
++			 __func__, UMT_PORTS_NUM);
++		goto param_err;
++	}
++
++	pid = -1;
++	spin_lock_bh(&pumt->umt_lock);
++	for (i = 0; i < UMT_PORTS_NUM; i++) {
++		port = &pumt->ports[i];
++		spin_lock_bh(&port->umt_port_lock);
++		if (port->ep_id == ep_id && port->cbm_pid == cbm_pid) {
++			pid = i;
++			spin_unlock_bh(&port->umt_port_lock);
++			break;
++		} else if (port->ep_id == 0 && pid == -1) {
++			pid = i;
++		}
++		spin_unlock_bh(&port->umt_port_lock);
++	}
++	spin_unlock_bh(&pumt->umt_lock);
++
++	if (pid < 0) {
++		mcpy_dbg(MCPY_ERR, "No free UMT port!\n");
++		return -ENODEV;
++	}
++
++	port = &pumt->ports[pid];
++	spin_lock_bh(&port->umt_port_lock);
++	port->ep_id = ep_id;
++	port->cbm_pid = cbm_pid;
++	umt_set_mux(port->umt_pid, port->cbm_pid, port->dma_cid);
++	*dma_ctrlid = pumt->dma_ctrlid;
++	*dma_cid = port->dma_cid;
++	*umt_id = port->umt_pid;
++	spin_unlock_bh(&port->umt_port_lock);
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	{
++	u32 flag = 0, cbm_pid_l = 0;
++	int ret = 0;
++	cbm_dq_port_res_t dqport;
++
++	ret = cbm_get_wlan_umt_pid(ep_id, &cbm_pid_l);
++	if (ret != 0) {
++		mcpy_dbg(MCPY_ERR, "Failed to get cbm port using ep id !\n");
++		goto param_err;
++	}
++
++	memset(&dqport, 0, sizeof(dqport));
++	ret = cbm_dequeue_port_resources_get(ep_id, &dqport, flag);
++
++	if (ret != 0) {
++		mcpy_dbg(MCPY_ERR, "Failed to get dp port using ep id !\n");
++		goto param_err;
++	}
++
++	if (dqport.deq_info->port_no == 4 ||
++	    dqport.deq_info->port_no == 24 ||
++	    dqport.deq_info->port_no == 25 ||
++	    dqport.deq_info->port_no == 26) {
++		spin_lock_bh(&port->umt_port_lock);
++		if (cbm_pid == cbm_pid_l)
++			port->umtid_map_cbmid = dqport.deq_info->port_no;
++		else
++			port->umtid_map_cbmid = 0;
++
++		spin_unlock_bh(&port->umt_port_lock);
++	} else {
++		kfree(dqport.deq_info);
++		mcpy_dbg(MCPY_ERR, "port no %d not valid !\n",
++			 dqport.deq_info->port_no);
++		goto param_err;
++	}
++
++	kfree(dqport.deq_info);
++	}
++#endif
++
++	return 0;
++
++param_err:
++	return -EINVAL;
++}
++EXPORT_SYMBOL(ltq_umt_request);
++
++/**
++ * API to release umt port
++ * input:
++ * @umt_id (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ *
++ * ret:  Fail < 0, Success: 0
++ */
++int ltq_umt_release(u32 umt_id, u32 ep_id)
++{
++	struct mcpy_umt *pumt;
++	struct umt_port *port;
++
++	if (umt_id >= UMT_PORTS_NUM)
++		return -ENODEV;
++
++	pumt = mcpy_get_umt();
++	if (pumt->status != UMT_ENABLE) {
++		mcpy_dbg(MCPY_ERR, "UMT is not initialized!\n");
++		return -ENODEV;
++	}
++
++	port = &pumt->ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id) {
++		mcpy_dbg(MCPY_ERR, "input ep_id: %d, UMT port ep_id: %d\n",
++			 ep_id, port->ep_id);
++		spin_unlock_bh(&port->umt_port_lock);
++
++		return -ENODEV;
++	}
++
++	port->ep_id = 0;
++	port->cbm_pid = 0;
++	port->umt_dst = 0;
++	port->umt_period = 0;
++	port->status = UMT_DISABLE;
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	port->umt_ep_dst = 0;
++	port->umtid_map_cbmid = 0;
++#endif
++	umt_enable(port->umt_pid, UMT_DISABLE);
++
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(ltq_umt_release);
++
++static void umt_port_init(struct mcpy_umt *pumt,
++			  struct device_node *node, int pid)
++{
++	char res_cid[32];
++	int cid;
++	struct umt_port *port;
++
++	port = &pumt->ports[pid];
++	sprintf(res_cid, "lantiq,umt%d-dmacid", pid);
++	if (of_property_read_u32(node, res_cid, &cid) < 0)
++		cid = UMT_DEF_DMACID + pid;
++
++	port->pctrl = pumt;
++	port->umt_pid = pid;
++	port->dma_cid = cid;
++	port->ep_id = 0;
++	port->status = UMT_DISABLE;
++	spin_lock_init(&port->umt_port_lock);
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	port->dq_idx = 0;
++	port->umt_ep_dst = 0;
++	port->umtid_map_cbmid = 0;
++#endif
++}
++
++static void *umt_port_seq_start(struct seq_file *s, loff_t *pos)
++{
++	struct mcpy_umt *pumt = s->private;
++	struct umt_port *port;
++
++	if (*pos >= UMT_PORTS_NUM)
++		return NULL;
++
++	port = &pumt->ports[*pos];
++
++	return port;
++}
++
++static void *umt_port_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	struct mcpy_umt *pumt = s->private;
++	struct umt_port *port;
++
++	if (++*pos >= UMT_PORTS_NUM)
++		return NULL;
++	port = &pumt->ports[*pos];
++	return port;
++}
++
++static void umt_port_seq_stop(struct seq_file *s, void *v)
++{
++}
++
++static int umt_port_seq_show(struct seq_file *s, void *v)
++{
++	struct umt_port *port = v;
++	int pid = port->umt_pid;
++	u32 val;
++
++	seq_printf(s, "\nUMT port %d configuration\n", pid);
++	seq_puts(s, "-----------------------------------------\n");
++	seq_printf(s, "UMT port ep_id: %d\n", port->ep_id);
++	seq_printf(s, "UMT Mode: \t%s\n",
++		   port->umt_mode == UMT_SELFCNT_MODE ?
++		   "UMT SelfCounting Mode" : "UMT User Mode");
++	switch (port->msg_mode) {
++	case UMT_NO_MSG:
++		seq_puts(s, "UMT MSG Mode: \tUMT NO MSG\n");
++		break;
++	case UMT_MSG0_ONLY:
++		seq_puts(s, "UMT MSG Mode: \tUMT MSG0 Only\n");
++		break;
++	case UMT_MSG1_ONLY:
++		seq_puts(s, "UMT MSG Mode: \tUMT MSG1 Only\n");
++		break;
++	case UMT_MSG0_MSG1:
++		seq_puts(s, "UMT MSG Mode: \tUMT_MSG0_And_MSG1\n");
++		break;
++	default:
++		seq_printf(s, "UMT MSG Mode Error! Msg_mode: %d\n",
++			   port->msg_mode);
++	}
++	seq_printf(s, "UMT DST: \t0x%x\n", port->umt_dst);
++	if (port->umt_mode == UMT_SELFCNT_MODE)
++		seq_printf(s, "UMT Period: \t%d(us)\n", port->umt_period);
++	seq_printf(s, "UMT Status: \t%s\n",
++		   port->status == UMT_ENABLE ? "Enable" :
++		   port->status == UMT_DISABLE ? "Disable" : "Init Fail");
++	seq_printf(s, "UMT DMA CID: \t%d\n", port->dma_cid);
++	seq_printf(s, "UMT CBM PID: \t%d\n", port->cbm_pid);
++
++	seq_printf(s, "++++Register dump of umt port: %d++++\n", pid);
++	if (pid == 0) {
++		seq_printf(s, "UMT Status: \t%s\n",
++			   (ltq_mcpy_r32(MCPY_GCTRL) & BIT(2)) != 0 ?
++			   "Enable" : "Disable");
++		seq_printf(s, "UMT Mode: \t%s\n",
++			   (ltq_mcpy_r32(MCPY_GCTRL) & BIT(1)) != 0 ?
++			   "UMT User MSG mode" : "UMT SelfCounting mode");
++		seq_printf(s, "UMT MSG Mode: \t%d\n",
++			   ltq_mcpy_r32(MCPY_UMT_SW_MODE));
++		seq_printf(s, "UMT Dst: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_DEST));
++		seq_printf(s, "UMT Period: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_PERD));
++		seq_printf(s, "UMT MSG0: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_MSG(0)));
++		seq_printf(s, "UMT MSG1: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_MSG(1)));
++	} else {
++		seq_printf(s, "UMT Status: \t%s\n",
++			   (ltq_mcpy_r32(MCPY_GCTRL) &
++			   BIT(17 + 3 * (pid - 1))) != 0 ?
++			   "Enable" : "Disable");
++		seq_printf(s, "UMT Mode: \t%s\n",
++			   (ltq_mcpy_r32(MCPY_GCTRL) &
++			   BIT(16 + 3 * (pid - 1))) != 0 ?
++			   "UMT User MSG mode" : "UMT SelfCounting mode");
++		seq_printf(s, "UMT MSG Mode: \t%d\n",
++			   ltq_mcpy_r32(MCPY_UMT_X_ADDR(pid, MCPY_UMT_XSW_MODE)));
++		seq_printf(s, "UMT Dst: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_X_ADDR(pid, MCPY_UMT_XDEST)));
++		seq_printf(s, "UMT Period: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_X_ADDR(pid, MCPY_UMT_XPERIOD)));
++		seq_printf(s, "UMT MSG0: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_X_ADDR(pid, MCPY_UMT_XMSG(0))));
++		seq_printf(s, "UMT MSG1: \t0x%x\n",
++			   ltq_mcpy_r32(MCPY_UMT_X_ADDR(pid, MCPY_UMT_XMSG(1))));
++	}
++
++	val = ltq_mcpy_r32(MCPY_UMT_TRG_MUX);
++	seq_printf(s, "DMA CID: \t%d\n",
++		   (val & ((0xF) << (pid * 4))) >> (pid * 4));
++	seq_printf(s, "CBM PID: \t%d\n",
++		   (val & ((0xF) << (16 + pid * 4))) >> (16 + pid * 4));
++
++	return 0;
++}
++
++static const struct seq_operations umt_port_seq_ops = {
++	.start = umt_port_seq_start,
++	.next = umt_port_seq_next,
++	.stop = umt_port_seq_stop,
++	.show = umt_port_seq_show,
++};
++
++static int umt_cfg_read_proc_open(struct inode *inode, struct file *file)
++{
++	int ret = seq_open(file, &umt_port_seq_ops);
++
++	if (ret == 0) {
++		struct seq_file *m = file->private_data;
++
++		m->private = PDE_DATA(inode);
++	}
++	return ret;
++}
++
++static const struct file_operations mcpy_umt_proc_fops = {
++	.open           = umt_cfg_read_proc_open,
++	.read           = seq_read,
++	.llseek         = seq_lseek,
++	.release        = seq_release,
++};
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++#define MICROSEC_TO_SEC(x) (1000000 / (x))
++static u32 jiffies1;
++
++static int umt_tc_info_read_proc(struct seq_file *s, void *v)
++{
++	u32 days, sec, min, hr;
++	struct umt_port *port = NULL;
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	int i = 0;
++
++	sec = jiffies1 / MICROSEC_TO_SEC(50);
++
++	if (sec >= 60) {
++		min = sec / 60;
++		sec = sec - (min * 60);
++	} else {
++		min = 0;
++	}
++
++	if (min >= 60) {
++		hr = min / 60;
++		min = min - (hr * 60);
++	} else {
++		hr = 0;
++	}
++
++	if (hr >= 24) {
++		days = hr / 24;
++		hr = hr - (days * 24);
++	} else {
++		days = 0;
++	}
++
++	seq_printf(s, "Jiffies1 : %08d\n", jiffies1);
++	seq_printf(s, "Uptime(d:h:m:s): %02d:%02d:%02d:%02d\n",
++		   days, hr, min, sec);
++
++	for (i = 0 ; i < UMT_PORTS_NUM; i++) {
++		port = &pumt->ports[i];
++		seq_printf(s, "Packets to be dequeued: %d  cbm id %d\n",
++			   g_tot_dq_cnt[i], port->umtid_map_cbmid);
++		seq_printf(s, "thread info: umt dst: 0x%x, interval: 0x%x, en: %d, dq_idx: %u, ep_dst:0x%x\n",
++			   port->umt_dst, g_umt_interval, port->status,
++			   port->dq_idx, port->umt_ep_dst);
++	}
++	return 0;
++}
++
++static int umt_tc_info_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, umt_tc_info_read_proc, PDE_DATA(inode));
++}
++
++static const struct file_operations umt_tc_info_proc_fops = {
++	.owner = THIS_MODULE,
++	.open = umt_tc_info_proc_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
++
++/* UMT interval related proc */
++static int umt_interval_read_proc(struct seq_file *s, void *v)
++{
++	seq_printf(s, "UMT interval: %d\n", g_umt_interval);
++	return 0;
++}
++
++static ssize_t proc_write_umt_interval(struct file *file,
++				       const char __user *buf, size_t count,
++				       loff_t *data)
++{
++	int len, tmp = 0;
++	char str[64];
++	char *p;
++
++	len = min(count, (size_t)(sizeof(str) - 1));
++	len -= copy_from_user(str, buf, len);
++	while (len && (str[len - 1] <= ' '))
++		len--;
++	str[len] = 0;
++	for (p = str; *p && (*p <= ' '); p++, len--)
++		;
++	if (!*p)
++		return count;
++
++	kstrtoul(p, 10, (long *)&tmp);
++	g_umt_interval = tmp;
++
++	pr_info("setting the umt interval to: %d\n",
++		(unsigned int)g_umt_interval);
++	if (g_umt_interval != LTQ_UMT_SW_INTERVAL_DEFAULT)
++		pr_info("warning... recommend value is : %d\n",
++			LTQ_UMT_SW_INTERVAL_DEFAULT);
++	gptc_ht_yield_interval(g_umt_interval);
++
++	return len;
++}
++
++static int umt_interval_proc_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, umt_interval_read_proc, PDE_DATA(inode));
++}
++
++static const struct file_operations umt_interval_proc_fops = {
++	.owner = THIS_MODULE,
++	.open = umt_interval_proc_open,
++	.read = seq_read,
++	.write = proc_write_umt_interval,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
++#endif
++
++static int umt_proc_init(struct mcpy_umt *pumt)
++{
++	struct proc_dir_entry *entry;
++
++	pumt->proc = proc_mkdir("umt", pumt->ctrl->proc);
++	if (!pumt->proc)
++		return -ENOMEM;
++
++	entry = proc_create_data("umt_info", 0x0, pumt->proc,
++				 &mcpy_umt_proc_fops, pumt);
++	if (!entry)
++		goto err1;
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	entry = proc_create_data("umt_tc_info", 0x0, pumt->proc,
++				 &umt_tc_info_proc_fops, pumt);
++	if (!entry)
++		goto err2;
++	entry = proc_create_data("umt_interval", 0x0, pumt->proc,
++				 &umt_interval_proc_fops, pumt);
++	if (!entry)
++		goto err3;
++#endif
++	return 0;
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++err3:
++	remove_proc_entry("umt_tc_info", pumt->ctrl->proc);
++err2:
++	remove_proc_entry("umt_info", pumt->ctrl->proc);
++#endif
++err1:
++	remove_proc_entry("umt", pumt->ctrl->proc);
++	mcpy_dbg(MCPY_ERR, "UMT proc create fail!\n");
++	return -1;
++}
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++void umt_callback_fn(void *param)
++{
++	u32 dq_cnt, dq_ptr;
++	int i, ret;
++	struct umt_port *port = NULL;
++	struct mcpy_umt *pumt = mcpy_get_umt();
++	u32 umt_ep_dst_local = 0x0;
++
++	jiffies1++;
++	if (pumt->status != UMT_ENABLE)
++		return;
++
++	for (i = 0; i < UMT_PORTS_NUM; i++) {
++		port = &pumt->ports[i];
++		umt_ep_dst_local = port->umt_ep_dst;
++		if (port->status == UMT_ENABLE &&
++		    umt_ep_dst_local && port->umtid_map_cbmid) {
++			ret = cbm_dequeue_dma_port_stats_get(port->umtid_map_cbmid, &dq_ptr, 0);
++			if (ret != 0)
++				continue;
++			if (dq_ptr >= port->dq_idx)
++				dq_cnt = dq_ptr - port->dq_idx;
++			else
++				dq_cnt = 0xFFFFFFFF - port->dq_idx + dq_ptr + 1;
++
++			if (dq_cnt) {
++				if (dq_cnt > 32)
++					dq_cnt = 32;
++				writel(dq_cnt, (void * __force)(umt_ep_dst_local + 0x4));
++				g_tot_dq_cnt[i] += dq_cnt;
++				port->dq_idx = port->dq_idx + dq_cnt;
++			}
++		}
++	}
++}
++
++int umt_reset_port_dq_idx(u32 cbm_id)
++{
++	struct mcpy_umt *pumt;
++	struct umt_port *port;
++	u32 umt_id = 0;
++
++	pumt = mcpy_get_umt();
++
++	if (pumt->status != UMT_ENABLE) {
++		mcpy_dbg(MCPY_ERR, "UMT is not initialized!\n");
++		return -ENODEV;
++	}
++
++	for (umt_id = 0; umt_id < UMT_PORTS_NUM; umt_id++) {
++		port = &pumt->ports[umt_id];
++		if (port->umtid_map_cbmid == cbm_id)
++			port->dq_idx = 0;
++	}
++
++	return 0;
++}
++#endif
++
++/* TODO: Register UMT error interrupt Handler */
++int umt_init(struct mcpy_ctrl *pctrl)
++{
++	struct device_node *node = pctrl->dev->of_node;
++	struct mcpy_umt *pumt;
++	int i;
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	struct gptc_ht_yield param;
++#endif
++
++	pumt = &pctrl->umt;
++	pumt->ctrl = pctrl;
++	pumt->dma_ctrlid = g_dma_ctrl;
++	pumt->clk = of_clk_get_by_name(node, "freq");
++
++	if (IS_ERR_VALUE(pumt->clk)) {
++		pr_err("the clock for umt is missing, error no %d.\n",
++		       (int)pumt->clk);
++		pumt->clk = NULL;
++	}
++	spin_lock_init(&pumt->umt_lock);
++	umt_en_expand_mode();
++
++	for (i = 0; i < UMT_PORTS_NUM; i++)
++		umt_port_init(pumt, node, i);
++
++	umt_proc_init(pumt);
++	pumt->status = UMT_ENABLE;
++
++#ifdef CONFIG_LTQ_UMT_SW_MODE
++	param.yield_pin = LTQ_UMT_SW_YIELD_PIN;
++	param.interval = g_umt_interval;
++	gptc_ht_yield_init(&param, umt_callback_fn, NULL);
++#endif
++
++	mcpy_dbg(MCPY_INFO, "UMT initialize success on processor: %d !\n",
++		 smp_processor_id());
++
++	return 0;
++}
++
+diff --git a/drivers/net/ethernet/lantiq/umt/intel_umt_cqem.c b/drivers/net/ethernet/lantiq/umt/intel_umt_cqem.c
+new file mode 100644
+index 000000000000..e9b221f8f2ee
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/umt/intel_umt_cqem.c
+@@ -0,0 +1,776 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2015 Zhu YiXin <yixin.zhu@lantiq.com>
++ * Copyright (C) 2016~2018 Intel Corporation.
++ */
++#include <linux/platform_device.h>
++#include <linux/module.h>
++#include <linux/clk.h>
++#include <linux/errno.h>
++#include <linux/debugfs.h>
++#include <linux/interrupt.h>
++#include <linux/of.h>
++#include <linux/seq_file.h>
++#include <linux/dma/lantiq_dmax.h>
++#include <linux/intel_umt_cqem.h>
++#include "intel_umt_cqem_reg.h"
++
++static const u32 g_dma_ctrl = DMA1TX;
++static void __iomem *g_umt_addr_base;
++
++/* 0x17AC == 20us default translation according to register document*/
++#define UMT_US_TO_CNT_DEFAULT_VALUE (0x17AC / 20)
++
++#define umt_r32(x)	readl(g_umt_addr_base + (x))
++#define umt_w32(x, y)	writel((x), g_umt_addr_base + (y))
++#define umt_w32_mask(x, y, z) \
++		do { \
++			void __iomem *z_ = g_umt_addr_base + (z); \
++			writel((readl(z_) & ~(x)) | (y), z_); \
++		} while (0)
++
++#define UMT_MSG(x)		(UMT_MSG0 + (x) * 4)
++
++#define UMT_X_SW_MODE		(UMT_SW_MODE_CH1 - UMT_MSG1_0)
++#define UMT_X_PERIOD		(UMT_PERIOD_CH1 - UMT_MSG1_0)
++#define UMT_X_DEST		(UMT_DEST_1 - UMT_MSG1_0)
++#define UMT_X_MSG(x)		((x) * 4)
++
++#define UMT_X_ADDR(x, off)	(UMT_MSG1_0 + \
++				((x) - 1) * (UMT_MSG2_0 - UMT_MSG1_0) + (off))
++
++#define UMT_PORTS_NUM		3
++#define MIN_UMT_PRD		20
++#define UMT_DEF_DMACID		13
++
++struct umt_port {
++	u32 umt_pid;
++	u32 ep_id;
++	enum umt_mode umt_mode;
++	enum umt_msg_mode msg_mode;
++	enum umt_status status;
++	u32 umt_period;
++	u32 umt_dst;
++	u32 cbm_pid; /* CBM WLAN ID (0 - 3) */
++	u32 dma_cid; /* DMA Chan ID */
++	enum umt_status suspend;
++	spinlock_t umt_port_lock; /* protect the umt per port resource */
++};
++
++struct umt_info {
++	struct umt_port ports[UMT_PORTS_NUM];
++	u32 dma_ctrlid;
++	enum umt_status status;
++	struct dentry *debugfs;
++	spinlock_t umt_lock; /* protect the umt global resource */
++	struct clk *clk;
++};
++
++static struct umt_info sg_umt;
++
++static inline void umt_set_mode(u32 umt_id, enum umt_mode umt_mode)
++{
++	u32 val, off;
++
++	if (!umt_id) {
++		umt_w32_mask(0x2, ((u32)umt_mode) << 1, UMT_GCTRL);
++	} else {
++		off = 16 + (umt_id - 1) * 3;
++		val = umt_r32(UMT_GCTRL) & ~(BIT(off));
++		umt_w32(val | (((u32)umt_mode) << off), UMT_GCTRL);
++	}
++}
++
++static inline void umt_set_msgmode(u32 umt_id, enum umt_msg_mode msg_mode)
++{
++	if (!umt_id)
++		umt_w32((u32)msg_mode, UMT_SW_MODE);
++	else
++		umt_w32((u32)msg_mode, UMT_X_ADDR(umt_id, UMT_X_SW_MODE));
++}
++
++/* input in term of microseconds */
++static inline u32 umt_us_to_cnt(u32 usec)
++{
++	unsigned long cpuclk;
++	struct clk *clk;
++	unsigned long long usec_tmp;
++
++	clk = sg_umt.clk;
++	if (!clk)
++		return usec * UMT_US_TO_CNT_DEFAULT_VALUE;
++
++	cpuclk = clk_get_rate(clk);
++
++	pr_debug("umt_us_to_cnt the cpuclk is %lu.\n", cpuclk);
++
++	usec_tmp = (unsigned long long)usec *
++			((unsigned long)cpuclk / 1000000ULL);
++	if (usec_tmp > 0xFFFFFFFFULL) {
++		pr_info("UMT period exceeds max value! set to 0xFFFFFFFF.\n");
++		return 0xFFFFFFFF;
++	}
++	return (u32)usec_tmp;
++}
++
++static inline void umt_set_period(u32 umt_id, u32 umt_period)
++{
++	umt_period = umt_us_to_cnt(umt_period);
++
++	if (!umt_id)
++		umt_w32(umt_period, UMT_PERD);
++	else
++		umt_w32(umt_period, UMT_X_ADDR(umt_id, UMT_X_PERIOD));
++}
++
++static inline void umt_set_dst(u32 umt_id, u32 umt_dst)
++{
++	if (!umt_id)
++		umt_w32(umt_dst, UMT_DEST);
++	else
++		umt_w32(umt_dst, UMT_X_ADDR(umt_id, UMT_X_DEST));
++}
++
++static inline void umt_set_mux(u32 umt_id, u32 cbm_pid, u32 dma_cid)
++{
++	u32 mux_sel;
++
++	cbm_pid = cbm_pid & 0xF;
++	dma_cid = dma_cid & 0xF;
++	mux_sel = umt_r32(UMT_TRG_MUX) &
++			(~((0xF000F) << (umt_id * 4)));
++	mux_sel |= (dma_cid << (umt_id * 4)) |
++			(cbm_pid << (16 + (umt_id * 4)));
++	umt_w32(mux_sel, UMT_TRG_MUX);
++}
++
++static inline void umt_set_endian(int dw_swp, int byte_swp)
++{
++	u32 val;
++
++	val = umt_r32(UMT_GCTRL);
++	if (byte_swp)
++		val |= UMT_GCTRL_OCP_UMT_ENDI_B_MASK;
++	else
++		val &= ~(UMT_GCTRL_OCP_UMT_ENDI_B_MASK);
++
++	if (dw_swp)
++		val |= UMT_GCTRL_OCP_UMT_ENDI_W_MASK;
++	else
++		val &= ~(UMT_GCTRL_OCP_UMT_ENDI_W_MASK);
++
++	umt_w32(val, UMT_GCTRL);
++}
++
++static inline void umt_en_endian_mode(void)
++{
++	if (IS_ENABLED(CONFIG_CPU_BIG_ENDIAN))
++		umt_set_endian(1, 0);
++	else
++		umt_set_endian(1, 1);
++}
++
++static inline void umt_enable(u32 umt_id, enum umt_status status)
++{
++	u32 val, off;
++
++	if (!umt_id) {
++		umt_w32_mask(0x4, ((u32)status) << 2, UMT_GCTRL);
++	} else {
++		off = 17 + (umt_id - 1) * 3;
++		val = (umt_r32(UMT_GCTRL) & ~BIT(off))
++				| (((u32)status) << off);
++		umt_w32(val, UMT_GCTRL);
++	}
++}
++
++static inline void umt_suspend(u32 umt_id, enum umt_status status)
++{
++	u32 val;
++
++	if (status)
++		val = umt_r32(UMT_COUNTER_CTRL) | BIT(umt_id);
++	else
++		val = umt_r32(UMT_COUNTER_CTRL) & (~(BIT(umt_id)));
++
++	umt_w32(val, UMT_COUNTER_CTRL);
++}
++
++/*This function will disable umt */
++static inline void umt_reset_umt(u32 umt_id)
++{
++	u32 mode;
++
++	umt_enable(umt_id, UMT_DISABLE);
++
++	/* Bit 1 for UMT0
++	 * Bit 16 for UMT1
++	 * Bit 19 for UMT2
++	 */
++	if (!umt_id)
++		mode = (umt_r32(UMT_GCTRL) & BIT(1));
++	else
++		mode = (umt_r32(UMT_GCTRL) & BIT(16 + 3 * (umt_id - 1)));
++
++	umt_set_mode(umt_id, !mode);
++	umt_set_mode(umt_id, mode);
++}
++
++/**
++ * intput:
++ * @umt_id: UMT port id, (0 - 3)
++ * @ep_id:  Aligned with datapath lib ep_id
++ * @period: measured in microseconds.
++ * ret:  Fail < 0 / Success: 0
++ */
++int intel_umt_cqem_set_period(u32 umt_id, u32 ep_id, u32 period)
++{
++	struct umt_port *port;
++
++	if (period < MIN_UMT_PRD) {
++		pr_err("Period (%d) is below min requirement!\n", period);
++		return -EINVAL;
++	}
++
++	if (umt_id >= UMT_PORTS_NUM) {
++		pr_err("umit id (%d) is out of range !\n", umt_id);
++		return -EINVAL;
++	}
++
++	if (sg_umt.status != UMT_ENABLE) {
++		pr_err("UMT is not initialized!\n");
++		return -EINVAL;
++	}
++
++	port = &sg_umt.ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id) {
++		spin_unlock_bh(&port->umt_port_lock);
++		pr_err("umt_id: %d, ep_id: %d, period: %d\n",
++		       umt_id, ep_id, period);
++		return -EINVAL;
++	}
++
++	if (port->umt_period != period) {
++		port->umt_period = period;
++		umt_set_period(umt_id, port->umt_period);
++	}
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_umt_cqem_set_period);
++
++/**
++ * API to configure the UMT port.
++ * input:
++ * @umt_id: (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ * @umt_mode:  0-self-counting mode, 1-user mode.
++ * @msg_mode:  0-No MSG, 1-MSG0 Only, 2-MSG1 Only, 3-MSG0 & MSG1.
++ * @dst:  Destination PHY address.
++ * @period(ms): only applicable when set to self-counting mode.
++ *              self-counting interval time. if 0, use the original setting.
++ * @enable: 1-Enable/0-Disable
++ * @ret:  Fail < 0 , SUCCESS:0
++ */
++int intel_umt_cqem_set_mode(u32 umt_id, u32 ep_id,
++			    struct umt_set_mode *p_umt_mode)
++{
++	struct umt_port *port;
++	u32 msg_mode;
++	u32 umt_mode;
++	u32 phy_dst;
++	u32 period;
++	u32 enable;
++	u32 umt_ep_dst;
++
++	if (!p_umt_mode) {
++		pr_err("UMT mode is NULL!\n");
++		return -EINVAL;
++	}
++
++	if (sg_umt.status != UMT_ENABLE) {
++		pr_err("UMT is not initialized!!\n");
++		return -ENODEV;
++	}
++
++	umt_mode = p_umt_mode->umt_mode;
++	msg_mode = p_umt_mode->msg_mode;
++	phy_dst = p_umt_mode->phy_dst;
++	period = p_umt_mode->period;
++	enable = p_umt_mode->enable;
++	umt_ep_dst = p_umt_mode->umt_ep_dst;
++
++	if ((umt_mode >= (u32)UMT_MODE_MAX) || (msg_mode >= (u32)UMT_MSG_MAX) ||
++	    (enable >= (u32)UMT_STATUS_MAX) || (umt_ep_dst == 0) ||
++	    (phy_dst == 0) || (period == 0) || (umt_id >= UMT_PORTS_NUM)) {
++		pr_err("umt_id: %d, umt_mode: %d, msg_mode: %d.\n",
++		       umt_id, umt_mode, msg_mode);
++		pr_err("enable: %d, phy_dst: %d, umt_ep_dst: %d.\n",
++		       enable, phy_dst, umt_ep_dst);
++		return -EINVAL;
++	}
++
++	port = &sg_umt.ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id) {
++		spin_unlock_bh(&port->umt_port_lock);
++		pr_err("input ep_id: %d, port ep_id: %d\n", ep_id, port->ep_id);
++		return -EINVAL;
++	}
++
++	umt_reset_umt(umt_id);
++
++	port->umt_mode = (enum umt_mode)umt_mode;
++	port->msg_mode = (enum umt_msg_mode)msg_mode;
++	port->umt_dst = phy_dst;
++	port->umt_period = period;
++	port->status = (enum umt_status)enable;
++
++	umt_set_mode(umt_id, port->umt_mode);
++	umt_set_msgmode(umt_id, port->msg_mode);
++	umt_set_dst(umt_id, port->umt_dst);
++	umt_set_period(umt_id, port->umt_period);
++	umt_enable(umt_id, port->status);
++	/* setup the CBM/DMA mapping */
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_umt_cqem_set_mode);
++
++/**
++ * API to enable/disable umt port
++ * input:
++ * @umt_id (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ * @enable: Enable: 1 / Disable: 0
++ * ret:  Fail < 0, Success: 0
++ */
++int intel_umt_cqem_enable(u32 umt_id, u32 ep_id, u32 enable)
++{
++	struct umt_port *port;
++
++	if (umt_id >= UMT_PORTS_NUM)
++		return -EINVAL;
++	if (enable >= (u32)UMT_STATUS_MAX || sg_umt.status != UMT_ENABLE)
++		return -ENODEV;
++
++	port = &sg_umt.ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id || port->umt_dst == 0 || port->ep_id == 0) {
++		spin_unlock_bh(&port->umt_port_lock);
++		pr_err("input ep_id: %d, umt port ep_id: %d, umt_dst: 0x%x\n",
++		       ep_id, port->ep_id, port->umt_dst);
++		return -EINVAL;
++	}
++
++	if (port->status != enable) {
++		port->status = (enum umt_status)enable;
++		umt_enable(umt_id, port->status);
++	}
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_umt_cqem_enable);
++
++/**
++ * API to suspend/resume umt US/DS counter
++ * input:
++ * @umt_id (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ * @enable: suspend: 1 / resume: 0
++ * ret:  Fail < 0, Success: 0
++ */
++int intel_umt_cqem_suspend(u32 umt_id, u32 ep_id, u32 enable)
++{
++	struct umt_port *port;
++
++	if (umt_id >= UMT_PORTS_NUM)
++		return -EINVAL;
++	if (enable >= (u32)UMT_STATUS_MAX || sg_umt.status != UMT_ENABLE)
++		return -ENODEV;
++
++	port = &sg_umt.ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id || port->umt_dst == 0 || port->ep_id == 0) {
++		spin_unlock_bh(&port->umt_port_lock);
++		pr_err("input ep_id: %d, umt port ep_id: %d, umt_dst: 0x%x\n",
++		       ep_id, port->ep_id, port->umt_dst);
++		return -EINVAL;
++	}
++
++	if (port->suspend != enable) {
++		port->suspend = (enum umt_status)enable;
++		umt_enable(umt_id, port->status);
++		umt_suspend(umt_id, port->suspend);
++	}
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_umt_cqem_suspend);
++
++/**
++ * API to request and allocate UMT port
++ * input:
++ * @ep_id: aligned with datapath lib EP.
++ * @cbm_pid: CBM Port ID(0-3), 0 - CBM port 4, 1 - CBM port 5,
++ * 2 - CBM port 6
++ * output:
++ * @dma_ctrlid: DMA controller ID. aligned with DMA driver DMA controller ID
++ * @dma_cid: DMA channel ID.
++ * @umt_id: (0 - 3)
++ * ret: Fail: < 0,  Success: 0
++ */
++int intel_umt_cqem_request(u32 ep_id, u32 cbm_pid,
++			   u32 *dma_ctrlid, u32 *dma_cid, u32 *umt_id)
++{
++	int i, pid;
++	struct umt_port *port;
++
++	if (!dma_ctrlid || !dma_cid || !umt_id) {
++		pr_err("Output pointer is NULL!\n");
++		return -EINVAL;
++	}
++
++	if (sg_umt.status != UMT_ENABLE) {
++		pr_err("UMT not initialized!\n");
++		return -EINVAL;
++	}
++	if (!ep_id) {
++		pr_err("%s: ep_id cannot be zero!\n", __func__);
++		return -EINVAL;
++	}
++
++	if (cbm_pid >= UMT_PORTS_NUM) {
++		pr_err("%s: cbm pid must be in ranage(0 - %d)\n",
++		       __func__, UMT_PORTS_NUM);
++		return -EINVAL;
++	}
++
++	pid = -1;
++	spin_lock_bh(&sg_umt.umt_lock);
++	for (i = 0; i < UMT_PORTS_NUM; i++) {
++		port = &sg_umt.ports[i];
++		spin_lock_bh(&port->umt_port_lock);
++		if (port->ep_id == ep_id && port->cbm_pid == cbm_pid) {
++			pid = i;
++			spin_unlock_bh(&port->umt_port_lock);
++			break;
++		} else if (port->ep_id == 0 && pid == -1) {
++			pid = i;
++		}
++		spin_unlock_bh(&port->umt_port_lock);
++	}
++	spin_unlock_bh(&sg_umt.umt_lock);
++
++	if (pid < 0) {
++		pr_err("No free UMT port!\n");
++		return -ENODEV;
++	}
++
++	port = &sg_umt.ports[pid];
++	spin_lock_bh(&port->umt_port_lock);
++	port->ep_id = ep_id;
++	port->cbm_pid = cbm_pid;
++	umt_set_mux(port->umt_pid, port->cbm_pid, port->dma_cid);
++	*dma_ctrlid = sg_umt.dma_ctrlid;
++	*dma_cid = port->dma_cid;
++	*umt_id = port->umt_pid;
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_umt_cqem_request);
++
++/**
++ * API to release umt port
++ * input:
++ * @umt_id (0 - 3)
++ * @ep_id: aligned with datapath lib EP
++ *
++ * ret:  Fail < 0, Success: 0
++ */
++int intel_umt_cqem_release(u32 umt_id, u32 ep_id)
++{
++	struct umt_port *port;
++
++	if (umt_id >= UMT_PORTS_NUM)
++		return -ENODEV;
++
++	if (sg_umt.status != UMT_ENABLE) {
++		pr_err("UMT is not initialized!\n");
++		return -ENODEV;
++	}
++
++	port = &sg_umt.ports[umt_id];
++
++	spin_lock_bh(&port->umt_port_lock);
++	if (port->ep_id != ep_id) {
++		spin_unlock_bh(&port->umt_port_lock);
++		pr_err("input ep_id: %d, UMT port ep_id: %d\n",
++		       ep_id, port->ep_id);
++		return -ENODEV;
++	}
++
++	port->ep_id = 0;
++	port->cbm_pid = 0;
++	port->umt_dst = 0;
++	port->umt_period = 0;
++	port->status = UMT_DISABLE;
++	umt_enable(port->umt_pid, UMT_DISABLE);
++
++	spin_unlock_bh(&port->umt_port_lock);
++
++	return 0;
++}
++EXPORT_SYMBOL(intel_umt_cqem_release);
++
++static void umt_port_init(struct device_node *node, int pid)
++{
++	char res_cid[32];
++	int cid;
++	struct umt_port *port;
++
++	port = &sg_umt.ports[pid];
++	snprintf(res_cid, sizeof(res_cid), "lantiq,umt%d-dmacid", pid);
++	if (of_property_read_u32(node, res_cid, &cid) < 0) {
++		cid = UMT_DEF_DMACID + pid;
++		pr_info("umt dma channel id not found in device tree!\n");
++		pr_info("umt dma channel id set to default %d!\n", cid);
++	}
++
++	port->umt_pid = pid;
++	port->dma_cid = cid;
++	port->ep_id = 0;
++	port->status = UMT_DISABLE;
++	spin_lock_init(&port->umt_port_lock);
++}
++
++#ifdef CONFIG_DEBUG_FS
++static void *umt_port_seq_start(struct seq_file *s, loff_t *pos)
++{
++	if (*pos >= UMT_PORTS_NUM)
++		return NULL;
++	return &sg_umt.ports[*pos];
++}
++
++static void *umt_port_seq_next(struct seq_file *s, void *v, loff_t *pos)
++{
++	if (++*pos >= UMT_PORTS_NUM)
++		return NULL;
++	return &sg_umt.ports[*pos];
++}
++
++static void umt_port_seq_stop(struct seq_file *s, void *v)
++{
++}
++
++static int umt_port_seq_show(struct seq_file *s, void *v)
++{
++	struct umt_port *port = v;
++	int pid = port->umt_pid;
++	u32 val;
++
++	seq_printf(s, "\nUMT port %d configuration\n", pid);
++	seq_puts(s, "-----------------------------------------\n");
++	seq_printf(s, "UMT port ep_id: %d\n", port->ep_id);
++	seq_printf(s, "UMT Mode: \t%s\n",
++		   port->umt_mode == UMT_SELFCNT_MODE ?
++		   "UMT SelfCounting Mode" : "UMT User Mode");
++	switch (port->msg_mode) {
++	case UMT_NO_MSG:
++		seq_puts(s, "UMT MSG Mode: \tUMT NO MSG\n");
++		break;
++	case UMT_MSG0_ONLY:
++		seq_puts(s, "UMT MSG Mode: \tUMT MSG0 Only\n");
++		break;
++	case UMT_MSG1_ONLY:
++		seq_puts(s, "UMT MSG Mode: \tUMT MSG1 Only\n");
++		break;
++	case UMT_MSG0_MSG1:
++		seq_puts(s, "UMT MSG Mode: \tUMT_MSG0_And_MSG1\n");
++		break;
++	default:
++		seq_printf(s, "UMT MSG Mode Error! Msg_mode: %d\n",
++			   port->msg_mode);
++	}
++	seq_printf(s, "UMT DST: \t0x%x\n", port->umt_dst);
++	if (port->umt_mode == UMT_SELFCNT_MODE)
++		seq_printf(s, "UMT Period: \t%d(us)\n", port->umt_period);
++	seq_printf(s, "UMT Status: \t%s\n",
++		   port->status == UMT_ENABLE ? "Enable" :
++		   port->status == UMT_DISABLE ? "Disable" : "Init Fail");
++	seq_printf(s, "UMT DMA CID: \t%d\n", port->dma_cid);
++	seq_printf(s, "UMT CBM PID: \t%d\n", port->cbm_pid);
++
++	seq_printf(s, "++++Register dump of umt port: %d++++\n", pid);
++	if (pid == 0) {
++		seq_printf(s, "UMT Status: \t%s\n",
++			   (umt_r32(UMT_GCTRL) & BIT(2)) != 0 ?
++			   "Enable" : "Disable");
++		seq_printf(s, "UMT Mode: \t%s\n",
++			   (umt_r32(UMT_GCTRL) & BIT(1)) != 0 ?
++			   "UMT User MSG mode" : "UMT SelfCounting mode");
++		seq_printf(s, "UMT MSG Mode: \t%d\n",
++			   umt_r32(UMT_SW_MODE));
++		seq_printf(s, "UMT Dst: \t0x%x\n",
++			   umt_r32(UMT_DEST));
++		seq_printf(s, "UMT Period: \t0x%x\n",
++			   umt_r32(UMT_PERD));
++		seq_printf(s, "UMT MSG0: \t0x%x\n",
++			   umt_r32(UMT_MSG(0)));
++		seq_printf(s, "UMT MSG1: \t0x%x\n",
++			   umt_r32(UMT_MSG(1)));
++	} else {
++		seq_printf(s, "UMT Status: \t%s\n",
++			   (umt_r32(UMT_GCTRL) &
++			   BIT(17 + 3 * (pid - 1))) != 0 ?
++			   "Enable" : "Disable");
++		seq_printf(s, "UMT Mode: \t%s\n",
++			   (umt_r32(UMT_GCTRL) &
++			   BIT(16 + 3 * (pid - 1))) != 0 ?
++			   "UMT User MSG mode" : "UMT SelfCounting mode");
++		seq_printf(s, "UMT MSG Mode: \t%d\n",
++			   umt_r32(UMT_X_ADDR(pid, UMT_X_SW_MODE)));
++		seq_printf(s, "UMT Dst: \t0x%x\n",
++			   umt_r32(UMT_X_ADDR(pid, UMT_X_DEST)));
++		seq_printf(s, "UMT Period: \t0x%x\n",
++			   umt_r32(UMT_X_ADDR(pid, UMT_X_PERIOD)));
++		seq_printf(s, "UMT MSG0: \t0x%x\n",
++			   umt_r32(UMT_X_ADDR(pid, UMT_X_MSG(0))));
++		seq_printf(s, "UMT MSG1: \t0x%x\n",
++			   umt_r32(UMT_X_ADDR(pid, UMT_X_MSG(1))));
++	}
++
++	val = umt_r32(UMT_TRG_MUX);
++	seq_printf(s, "DMA CID: \t%d\n",
++		   (val & ((0xF) << (pid * 4))) >> (pid * 4));
++	seq_printf(s, "CBM PID: \t%d\n",
++		   (val & ((0xF) << (16 + pid * 4))) >> (16 + pid * 4));
++
++	return 0;
++}
++
++static const struct seq_operations umt_port_seq_ops = {
++	.start = umt_port_seq_start,
++	.next = umt_port_seq_next,
++	.stop = umt_port_seq_stop,
++	.show = umt_port_seq_show,
++};
++
++static int umt_cfg_read_debugfs_open(struct inode *inode, struct file *file)
++{
++	return seq_open(file, &umt_port_seq_ops);
++}
++
++static const struct file_operations umt_debugfs_fops = {
++	.open		= umt_cfg_read_debugfs_open,
++	.read		= seq_read,
++	.llseek		= seq_lseek,
++	.release	= seq_release,
++};
++
++static int umt_debugfs_init(void)
++{
++	struct dentry *entry;
++
++	sg_umt.debugfs = debugfs_create_dir("umt", NULL);
++	if (!sg_umt.debugfs)
++		return -ENOMEM;
++
++	entry = debugfs_create_file("umt_info", 0644, sg_umt.debugfs,
++				    NULL, &umt_debugfs_fops);
++	if (!entry)
++		goto err1;
++
++	return 0;
++err1:
++	debugfs_remove_recursive(sg_umt.debugfs);
++	sg_umt.debugfs = NULL;
++	pr_err("UMT debugfs create fail!\n");
++	return -ENOMEM;
++}
++#endif
++
++static int intel_umt_drv_probe(struct platform_device *pdev)
++{
++	struct device_node *node = pdev->dev.of_node;
++	int i;
++	struct resource *res;
++
++	sg_umt.dma_ctrlid = g_dma_ctrl;
++	sg_umt.clk = of_clk_get_by_name(node, "freq");
++
++	if (IS_ERR_VALUE(sg_umt.clk)) {
++		pr_err("the clock for umt is missing, error no %d.\n",
++		       (int)sg_umt.clk);
++		sg_umt.clk = NULL;
++	}
++
++	spin_lock_init(&sg_umt.umt_lock);
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		pr_err("failed to get the umt resource!\n");
++		return -ENODEV;
++	}
++
++	g_umt_addr_base = devm_ioremap_resource(&pdev->dev, res);
++	if (!g_umt_addr_base) {
++		pr_err("failed to request amd map the umt io range!\n");
++		return -ENODEV;
++	}
++	pr_debug("the base addr of UMT is 0x%p\n", g_umt_addr_base);
++
++	umt_en_endian_mode();
++
++	for (i = 0; i < UMT_PORTS_NUM; i++)
++		umt_port_init(node, i);
++#ifdef CONFIG_DEBUG_FS
++	umt_debugfs_init();
++#endif
++	sg_umt.status = UMT_ENABLE;
++
++	pr_info("UMT initialize success on processor: %d!\n",
++		smp_processor_id());
++
++	return 0;
++}
++
++static int intel_umt_drv_remove(struct platform_device *pdev)
++{
++#ifdef CONFIG_DEBUG_FS
++	debugfs_remove_recursive(sg_umt.debugfs);
++	sg_umt.debugfs = NULL;
++#endif
++	sg_umt.status = UMT_DISABLE;
++	pr_info("Intel UMT CQEM driver remove!\n");
++	return 0;
++}
++
++static const struct of_device_id intel_umt_drv_match[] = {
++	{ .compatible = "intel,umt-cqem" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, intel_umt__drv_match);
++
++static struct platform_driver intel_umt_driver = {
++	.probe = intel_umt_drv_probe,
++	.remove = intel_umt_drv_remove,
++	.driver = {
++		.name = "intel,umt-cqem",
++		.of_match_table = intel_umt_drv_match,
++		.owner = THIS_MODULE,
++	},
++};
++
++module_platform_driver(intel_umt_driver);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/net/ethernet/lantiq/umt/intel_umt_cqem_reg.h b/drivers/net/ethernet/lantiq/umt/intel_umt_cqem_reg.h
+new file mode 100644
+index 000000000000..6225c309b6bf
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/umt/intel_umt_cqem_reg.h
+@@ -0,0 +1,877 @@
++//-----------------------------------------------------------------------------
++// LSD Generator
++//-----------------------------------------------------------------------------
++// Perl Package        : LSD::generator::targetC (v1.1)
++// LSD Source          : C:/Users/huchunfe/Perforce/huchunfe_huchunfe-MOBL1_dev.FalcONT/ipg_lsd/lsd_sys/source/xml/reg_files/umt.xml
++// Register File Name  : UMT_CTRL
++// Register File Title : UMT module Register Description
++// Register Width      : 32
++// Note                : Doxygen compliant comments
++//-----------------------------------------------------------------------------
++
++#ifndef _UMT_CTRL_H
++#define _UMT_CTRL_H
++
++//! \defgroup UMT_CTRL Register File UMT_CTRL - UMT module Register Description
++//! @{
++
++//! Base Address of CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_MODULE_BASE 0x19110000u
++
++//! \defgroup UMT_HW_INT_STAT Register UMT_HW_INT_STAT
++//! @{
++
++//! Register Offset (relative)
++#define UMT_HW_INT_STAT 0x9C
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_HW_INT_STAT 0x1911009Cu
++
++//! Register Reset Value
++#define UMT_HW_INT_STAT_RST 0x00000000u
++
++//! Field MUMT00_ERR - UMT HW Error
++#define UMT_HW_INT_STAT_MUMT00_ERR_POS 16
++//! Field MUMT00_ERR - UMT HW Error
++#define UMT_HW_INT_STAT_MUMT00_ERR_MASK 0x10000u
++
++//! Field MUMT01_ERR
++#define UMT_HW_INT_STAT_MUMT01_ERR_POS 17
++//! Field MUMT01_ERR
++#define UMT_HW_INT_STAT_MUMT01_ERR_MASK 0x20000u
++
++//! Field MUMT10_ERR - UMT HW Error
++#define UMT_HW_INT_STAT_MUMT10_ERR_POS 18
++//! Field MUMT10_ERR - UMT HW Error
++#define UMT_HW_INT_STAT_MUMT10_ERR_MASK 0x40000u
++
++//! Field MUMT11_ERR
++#define UMT_HW_INT_STAT_MUMT11_ERR_POS 19
++//! Field MUMT11_ERR
++#define UMT_HW_INT_STAT_MUMT11_ERR_MASK 0x80000u
++
++//! Field MUMT20_ERR - UMT HW Error
++#define UMT_HW_INT_STAT_MUMT20_ERR_POS 20
++//! Field MUMT20_ERR - UMT HW Error
++#define UMT_HW_INT_STAT_MUMT20_ERR_MASK 0x100000u
++
++//! Field MUMT21_ERR
++#define UMT_HW_INT_STAT_MUMT21_ERR_POS 21
++//! Field MUMT21_ERR
++#define UMT_HW_INT_STAT_MUMT21_ERR_MASK 0x200000u
++
++//! @}
++
++//! \defgroup UMT_SPARE_TIE0 Register UMT_SPARE_TIE0 - UMT Spare Register tie0
++//! @{
++
++//! Register Offset (relative)
++#define UMT_SPARE_TIE0 0xA4
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_SPARE_TIE0 0x191100A4u
++
++//! Register Reset Value
++#define UMT_SPARE_TIE0_RST 0x00000000u
++
++//! Field UMT_SPARE - SPARE register
++#define UMT_SPARE_TIE0_UMT_SPARE_POS 0
++//! Field UMT_SPARE - SPARE register
++#define UMT_SPARE_TIE0_UMT_SPARE_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DBG_D_TX0 Register UMT_DBG_D_TX0 - UMT Debug Descriptor TX0
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DBG_D_TX0 0xCC
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DBG_D_TX0 0x191100CCu
++
++//! Register Reset Value
++#define UMT_DBG_D_TX0_RST 0x00000000u
++
++//! Field DWORD - Debug Descriptor TX Register
++#define UMT_DBG_D_TX0_DWORD_POS 0
++//! Field DWORD - Debug Descriptor TX Register
++#define UMT_DBG_D_TX0_DWORD_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DBG_D_TX1 Register UMT_DBG_D_TX1 - UMT Debug Descriptor TX1
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DBG_D_TX1 0xD0
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DBG_D_TX1 0x191100D0u
++
++//! Register Reset Value
++#define UMT_DBG_D_TX1_RST 0x30000000u
++
++//! Field DWORD - Debug Descriptor TX Register
++#define UMT_DBG_D_TX1_DWORD_POS 0
++//! Field DWORD - Debug Descriptor TX Register
++#define UMT_DBG_D_TX1_DWORD_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DBG_D_RX0 Register UMT_DBG_D_RX0 - UMT Debug Descriptor RX
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DBG_D_RX0 0xD4
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DBG_D_RX0 0x191100D4u
++
++//! Register Reset Value
++#define UMT_DBG_D_RX0_RST 0x00000000u
++
++//! Field DWORD - Debug Descriptor RX Register
++#define UMT_DBG_D_RX0_DWORD_POS 0
++//! Field DWORD - Debug Descriptor RX Register
++#define UMT_DBG_D_RX0_DWORD_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DBG_D_RX1 Register UMT_DBG_D_RX1 - UMT Debug Descriptor RX
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DBG_D_RX1 0xD8
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DBG_D_RX1 0x191100D8u
++
++//! Register Reset Value
++#define UMT_DBG_D_RX1_RST 0x0000FFFFu
++
++//! Field DWORD - Debug Descriptor RX Register
++#define UMT_DBG_D_RX1_DWORD_POS 0
++//! Field DWORD - Debug Descriptor RX Register
++#define UMT_DBG_D_RX1_DWORD_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_PERD Register UMT_PERD - UMT SELF COUNTING MODE PERIOD
++//! @{
++
++//! Register Offset (relative)
++#define UMT_PERD 0xDC
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_PERD 0x191100DCu
++
++//! Register Reset Value
++#define UMT_PERD_RST 0x000017ACu
++
++//! Field UMT_P - PERIOD for UMT Self Counting MODE
++#define UMT_PERD_UMT_P_POS 0
++//! Field UMT_P - PERIOD for UMT Self Counting MODE
++#define UMT_PERD_UMT_P_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_TRG_MUX Register UMT_TRG_MUX - UMT Event Trigger Mux Selection
++//! @{
++
++//! Register Offset (relative)
++#define UMT_TRG_MUX 0xE0
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_TRG_MUX 0x191100E0u
++
++//! Register Reset Value
++#define UMT_TRG_MUX_RST 0x02100987u
++
++//! Field UMT_RX0_SEL - Select DMA1TX Event for UMT RX0 Counter
++#define UMT_TRG_MUX_UMT_RX0_SEL_POS 0
++//! Field UMT_RX0_SEL - Select DMA1TX Event for UMT RX0 Counter
++#define UMT_TRG_MUX_UMT_RX0_SEL_MASK 0xFu
++
++//! Field UMT_RX1_SEL - Select DMA1TX Event for UMT RX1 Counter
++#define UMT_TRG_MUX_UMT_RX1_SEL_POS 4
++//! Field UMT_RX1_SEL - Select DMA1TX Event for UMT RX1 Counter
++#define UMT_TRG_MUX_UMT_RX1_SEL_MASK 0xF0u
++
++//! Field UMT_RX2_SEL - Select DMA1TX Event for UMT RX2 Counter
++#define UMT_TRG_MUX_UMT_RX2_SEL_POS 8
++//! Field UMT_RX2_SEL - Select DMA1TX Event for UMT RX2 Counter
++#define UMT_TRG_MUX_UMT_RX2_SEL_MASK 0xF00u
++
++//! Field UMT_TX0_SEL - Select CBM Event for UMT TX0 Counter
++#define UMT_TRG_MUX_UMT_TX0_SEL_POS 16
++//! Field UMT_TX0_SEL - Select CBM Event for UMT TX0 Counter
++#define UMT_TRG_MUX_UMT_TX0_SEL_MASK 0xF0000u
++
++//! Field UMT_TX1_SEL - Select CBM Event for UMT TX1 Counter
++#define UMT_TRG_MUX_UMT_TX1_SEL_POS 20
++//! Field UMT_TX1_SEL - Select CBM Event for UMT TX1 Counter
++#define UMT_TRG_MUX_UMT_TX1_SEL_MASK 0xF00000u
++
++//! Field UMT_TX2_SEL - Select CBM Event for UMT TX2 Counter
++#define UMT_TRG_MUX_UMT_TX2_SEL_POS 24
++//! Field UMT_TX2_SEL - Select CBM Event for UMT TX2 Counter
++#define UMT_TRG_MUX_UMT_TX2_SEL_MASK 0xF000000u
++
++//! @}
++
++//! \defgroup UMT_COUNTER_CTRL Register UMT_COUNTER_CTRL - UMT Counter Control
++//! @{
++
++//! Register Offset (relative)
++#define UMT_COUNTER_CTRL 0xE4
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_COUNTER_CTRL 0x191100E4u
++
++//! Register Reset Value
++#define UMT_COUNTER_CTRL_RST 0x00000000u
++
++//! Field UMT_CH0_SND_DIS - Disable OCP Master from sending any UMT RX0/TX0 Counters
++#define UMT_COUNTER_CTRL_UMT_CH0_SND_DIS_POS 0
++//! Field UMT_CH0_SND_DIS - Disable OCP Master from sending any UMT RX0/TX0 Counters
++#define UMT_COUNTER_CTRL_UMT_CH0_SND_DIS_MASK 0x1u
++//! Constant SND - Enable Sending
++#define CONST_UMT_COUNTER_CTRL_UMT_CH0_SND_DIS_SND 0x0
++//! Constant DISND - Disable Sending
++#define CONST_UMT_COUNTER_CTRL_UMT_CH0_SND_DIS_DISND 0x1
++
++//! Field UMT_CH1_SND_DIS - Disable OCP Master from sending any UMT RX1/TX1 Counters
++#define UMT_COUNTER_CTRL_UMT_CH1_SND_DIS_POS 1
++//! Field UMT_CH1_SND_DIS - Disable OCP Master from sending any UMT RX1/TX1 Counters
++#define UMT_COUNTER_CTRL_UMT_CH1_SND_DIS_MASK 0x2u
++//! Constant SND - Enable Sending
++#define CONST_UMT_COUNTER_CTRL_UMT_CH1_SND_DIS_SND 0x0
++//! Constant DISND - Disable Sending
++#define CONST_UMT_COUNTER_CTRL_UMT_CH1_SND_DIS_DISND 0x1
++
++//! Field UMT_CH2_SND_DIS - Disable OCP Master from sending any UMT RX2/TX2 Counters
++#define UMT_COUNTER_CTRL_UMT_CH2_SND_DIS_POS 2
++//! Field UMT_CH2_SND_DIS - Disable OCP Master from sending any UMT RX2/TX2 Counters
++#define UMT_COUNTER_CTRL_UMT_CH2_SND_DIS_MASK 0x4u
++//! Constant SND - Enable Sending
++#define CONST_UMT_COUNTER_CTRL_UMT_CH2_SND_DIS_SND 0x0
++//! Constant DISND - Disable Sending
++#define CONST_UMT_COUNTER_CTRL_UMT_CH2_SND_DIS_DISND 0x1
++
++//! Field UMT_CH0_CNTR_CLR - Clear UMT RX0/TX0 Counters
++#define UMT_COUNTER_CTRL_UMT_CH0_CNTR_CLR_POS 4
++//! Field UMT_CH0_CNTR_CLR - Clear UMT RX0/TX0 Counters
++#define UMT_COUNTER_CTRL_UMT_CH0_CNTR_CLR_MASK 0x10u
++//! Constant NCLR - NOT CLEAR
++#define CONST_UMT_COUNTER_CTRL_UMT_CH0_CNTR_CLR_NCLR 0x0
++//! Constant CLR - CLEAR
++#define CONST_UMT_COUNTER_CTRL_UMT_CH0_CNTR_CLR_CLR 0x1
++
++//! Field UMT_CH1_CNTR_CLR - Clear UMT RX1/TX1 Counters
++#define UMT_COUNTER_CTRL_UMT_CH1_CNTR_CLR_POS 5
++//! Field UMT_CH1_CNTR_CLR - Clear UMT RX1/TX1 Counters
++#define UMT_COUNTER_CTRL_UMT_CH1_CNTR_CLR_MASK 0x20u
++//! Constant NCLR - NOT CLEAR
++#define CONST_UMT_COUNTER_CTRL_UMT_CH1_CNTR_CLR_NCLR 0x0
++//! Constant CLR - CLEAR
++#define CONST_UMT_COUNTER_CTRL_UMT_CH1_CNTR_CLR_CLR 0x1
++
++//! Field UMT_CH2_CNTR_CLR - Clear UMT RX2/TX2 Counters
++#define UMT_COUNTER_CTRL_UMT_CH2_CNTR_CLR_POS 6
++//! Field UMT_CH2_CNTR_CLR - Clear UMT RX2/TX2 Counters
++#define UMT_COUNTER_CTRL_UMT_CH2_CNTR_CLR_MASK 0x40u
++//! Constant NCLR - NOT CLEAR
++#define CONST_UMT_COUNTER_CTRL_UMT_CH2_CNTR_CLR_NCLR 0x0
++//! Constant CLR - CLEAR
++#define CONST_UMT_COUNTER_CTRL_UMT_CH2_CNTR_CLR_CLR 0x1
++
++//! @}
++
++//! \defgroup UMT_GCTRL Register UMT_GCTRL - Global Control Register
++//! @{
++
++//! Register Offset (relative)
++#define UMT_GCTRL 0x200
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_GCTRL 0x19110200u
++
++//! Register Reset Value
++#define UMT_GCTRL_RST 0x10000000u
++
++//! Field UMT_MD - UMT Mode
++#define UMT_GCTRL_UMT_MD_POS 1
++//! Field UMT_MD - UMT Mode
++#define UMT_GCTRL_UMT_MD_MASK 0x2u
++//! Constant CNT - Self Counting Mode
++#define CONST_UMT_GCTRL_UMT_MD_CNT 0x0
++//! Constant MSG - USER MSg MODE
++#define CONST_UMT_GCTRL_UMT_MD_MSG 0x1
++
++//! Field UMT_EN - ENABLE UMT
++#define UMT_GCTRL_UMT_EN_POS 2
++//! Field UMT_EN - ENABLE UMT
++#define UMT_GCTRL_UMT_EN_MASK 0x4u
++//! Constant DISU - DISABLE UMT PORT
++#define CONST_UMT_GCTRL_UMT_EN_DISU 0x0
++//! Constant ENU - ENABLE UMT PORT
++#define CONST_UMT_GCTRL_UMT_EN_ENU 0x1
++
++//! Field UMT_MSG_RRDY - UMT Message taken by Hardware Ready for SW Re-write
++#define UMT_GCTRL_UMT_MSG_RRDY_POS 3
++//! Field UMT_MSG_RRDY - UMT Message taken by Hardware Ready for SW Re-write
++#define UMT_GCTRL_UMT_MSG_RRDY_MASK 0x8u
++//! Constant NRDY - Not ready for re-write
++#define CONST_UMT_GCTRL_UMT_MSG_RRDY_NRDY 0x0
++//! Constant RDY - ready for re-write
++#define CONST_UMT_GCTRL_UMT_MSG_RRDY_RDY 0x1
++
++//! Field UMT_RST - Reset UMT
++#define UMT_GCTRL_UMT_RST_POS 4
++//! Field UMT_RST - Reset UMT
++#define UMT_GCTRL_UMT_RST_MASK 0x10u
++//! Constant MNRST - SW writes 0 to release of reset
++#define CONST_UMT_GCTRL_UMT_RST_MNRST 0x0
++//! Constant MRST - SW writes 1 to reset
++#define CONST_UMT_GCTRL_UMT_RST_MRST 0x1
++
++//! Field DEBUG_STEP - Freeze all running FSM for debugging
++#define UMT_GCTRL_DEBUG_STEP_POS 5
++//! Field DEBUG_STEP - Freeze all running FSM for debugging
++#define UMT_GCTRL_DEBUG_STEP_MASK 0x20u
++//! Constant OVER - step complete
++#define CONST_UMT_GCTRL_DEBUG_STEP_OVER 0x0
++//! Constant STEP - step ahead
++#define CONST_UMT_GCTRL_DEBUG_STEP_STEP 0x1
++
++//! Field DEBUG_PAUSE - PAUSE HW for Debug Access
++#define UMT_GCTRL_DEBUG_PAUSE_POS 6
++//! Field DEBUG_PAUSE - PAUSE HW for Debug Access
++#define UMT_GCTRL_DEBUG_PAUSE_MASK 0x40u
++//! Constant NORM - Normal operating
++#define CONST_UMT_GCTRL_DEBUG_PAUSE_NORM 0x0
++//! Constant PAUSE - force HW pause
++#define CONST_UMT_GCTRL_DEBUG_PAUSE_PAUSE 0x1
++
++//! Field PORT_EN - Enable UMT Ports
++#define UMT_GCTRL_PORT_EN_POS 8
++//! Field PORT_EN - Enable UMT Ports
++#define UMT_GCTRL_PORT_EN_MASK 0x700u
++
++//! Field UMT_MD1 - UMT Mode for ch1
++#define UMT_GCTRL_UMT_MD1_POS 16
++//! Field UMT_MD1 - UMT Mode for ch1
++#define UMT_GCTRL_UMT_MD1_MASK 0x10000u
++//! Constant CNT - Self Counting Mode
++#define CONST_UMT_GCTRL_UMT_MD1_CNT 0x0
++//! Constant MSG - USER MSg MODE
++#define CONST_UMT_GCTRL_UMT_MD1_MSG 0x1
++
++//! Field UMT_EN1 - ENABLE UMT for ch1
++#define UMT_GCTRL_UMT_EN1_POS 17
++//! Field UMT_EN1 - ENABLE UMT for ch1
++#define UMT_GCTRL_UMT_EN1_MASK 0x20000u
++//! Constant DISU - DISABLE UMT PORT
++#define CONST_UMT_GCTRL_UMT_EN1_DISU 0x0
++//! Constant ENU - ENABLE UMT PORT
++#define CONST_UMT_GCTRL_UMT_EN1_ENU 0x1
++
++//! Field UMT_MSG_RRDY1 - UMT ch 1 Message taken by Hardware Ready for SW Re-write
++#define UMT_GCTRL_UMT_MSG_RRDY1_POS 18
++//! Field UMT_MSG_RRDY1 - UMT ch 1 Message taken by Hardware Ready for SW Re-write
++#define UMT_GCTRL_UMT_MSG_RRDY1_MASK 0x40000u
++//! Constant NRDY - Not ready for re-write
++#define CONST_UMT_GCTRL_UMT_MSG_RRDY1_NRDY 0x0
++//! Constant RDY - ready for re-write
++#define CONST_UMT_GCTRL_UMT_MSG_RRDY1_RDY 0x1
++
++//! Field UMT_MD2 - UMT Mode for ch2
++#define UMT_GCTRL_UMT_MD2_POS 19
++//! Field UMT_MD2 - UMT Mode for ch2
++#define UMT_GCTRL_UMT_MD2_MASK 0x80000u
++//! Constant CNT - Self Counting Mode
++#define CONST_UMT_GCTRL_UMT_MD2_CNT 0x0
++//! Constant MSG - USER MSg MODE
++#define CONST_UMT_GCTRL_UMT_MD2_MSG 0x1
++
++//! Field UMT_EN2 - ENABLE UMT for ch2
++#define UMT_GCTRL_UMT_EN2_POS 20
++//! Field UMT_EN2 - ENABLE UMT for ch2
++#define UMT_GCTRL_UMT_EN2_MASK 0x100000u
++//! Constant DISU - DISABLE UMT PORT
++#define CONST_UMT_GCTRL_UMT_EN2_DISU 0x0
++//! Constant ENU - ENABLE UMT PORT
++#define CONST_UMT_GCTRL_UMT_EN2_ENU 0x1
++
++//! Field UMT_MSG_RRDY2 - UMT ch 2 Message taken by Hardware Ready for SW Re-write
++#define UMT_GCTRL_UMT_MSG_RRDY2_POS 21
++//! Field UMT_MSG_RRDY2 - UMT ch 2 Message taken by Hardware Ready for SW Re-write
++#define UMT_GCTRL_UMT_MSG_RRDY2_MASK 0x200000u
++//! Constant NRDY - Not ready for re-write
++#define CONST_UMT_GCTRL_UMT_MSG_RRDY2_NRDY 0x0
++//! Constant RDY - ready for re-write
++#define CONST_UMT_GCTRL_UMT_MSG_RRDY2_RDY 0x1
++
++//! Field OCP_UMT_ENDI_B - Control OCP SWAPPER byte for UMT
++#define UMT_GCTRL_OCP_UMT_ENDI_B_POS 28
++//! Field OCP_UMT_ENDI_B - Control OCP SWAPPER byte for UMT
++#define UMT_GCTRL_OCP_UMT_ENDI_B_MASK 0x10000000u
++//! Constant NO_SWP
++#define CONST_UMT_GCTRL_OCP_UMT_ENDI_B_NO_SWP 0x0
++//! Constant SWAP
++#define CONST_UMT_GCTRL_OCP_UMT_ENDI_B_SWAP 0x1
++
++//! Field OCP_UMT_ENDI_W - Control OCP SWAPPER WORD for UMT
++#define UMT_GCTRL_OCP_UMT_ENDI_W_POS 29
++//! Field OCP_UMT_ENDI_W - Control OCP SWAPPER WORD for UMT
++#define UMT_GCTRL_OCP_UMT_ENDI_W_MASK 0x20000000u
++//! Constant NO_SWP
++#define CONST_UMT_GCTRL_OCP_UMT_ENDI_W_NO_SWP 0x0
++//! Constant SWAP
++#define CONST_UMT_GCTRL_OCP_UMT_ENDI_W_SWAP 0x1
++
++//! @}
++
++//! \defgroup UMT_INT_MASK Register UMT_INT_MASK - Module Interrupt Mask register
++//! @{
++
++//! Register Offset (relative)
++#define UMT_INT_MASK 0x204
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_INT_MASK 0x19110204u
++
++//! Register Reset Value
++#define UMT_INT_MASK_RST 0x00000000u
++
++//! Field S18 - Interrupt Mask bit
++#define UMT_INT_MASK_S18_POS 18
++//! Field S18 - Interrupt Mask bit
++#define UMT_INT_MASK_S18_MASK 0x40000u
++//! Constant UM - Mask out this bit
++#define CONST_UMT_INT_MASK_S18_UM 0x0
++//! Constant M - Mask to Select this bit
++#define CONST_UMT_INT_MASK_S18_M 0x1
++
++//! @}
++
++//! \defgroup UMT_INTERNAL_INT_MASK Register UMT_INTERNAL_INT_MASK - Module Internal Interrupt Mask Register
++//! @{
++
++//! Register Offset (relative)
++#define UMT_INTERNAL_INT_MASK 0x208
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_INTERNAL_INT_MASK 0x19110208u
++
++//! Register Reset Value
++#define UMT_INTERNAL_INT_MASK_RST 0x00000000u
++
++//! Field S18 - Internal Interrupt Mask bit
++#define UMT_INTERNAL_INT_MASK_S18_POS 18
++//! Field S18 - Internal Interrupt Mask bit
++#define UMT_INTERNAL_INT_MASK_S18_MASK 0x40000u
++//! Constant UM - Mask out this bit
++#define CONST_UMT_INTERNAL_INT_MASK_S18_UM 0x0
++//! Constant M - Mask to select this bit
++#define CONST_UMT_INTERNAL_INT_MASK_S18_M 0x1
++
++//! @}
++
++//! \defgroup UMT_INT_EN Register UMT_INT_EN - Module Interrupt EN register
++//! @{
++
++//! Register Offset (relative)
++#define UMT_INT_EN 0x20C
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_INT_EN 0x1911020Cu
++
++//! Register Reset Value
++#define UMT_INT_EN_RST 0x00000000u
++
++//! Field S18 - Interrupt Enable bit
++#define UMT_INT_EN_S18_POS 18
++//! Field S18 - Interrupt Enable bit
++#define UMT_INT_EN_S18_MASK 0x40000u
++//! Constant UEN - Disable this bit
++#define CONST_UMT_INT_EN_S18_UEN 0x0
++//! Constant EN - Enable this bit
++#define CONST_UMT_INT_EN_S18_EN 0x1
++
++//! @}
++
++//! \defgroup UMT_INTERNAL_INT_EN Register UMT_INTERNAL_INT_EN - Module Internal Interrupt Enable Register
++//! @{
++
++//! Register Offset (relative)
++#define UMT_INTERNAL_INT_EN 0x210
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_INTERNAL_INT_EN 0x19110210u
++
++//! Register Reset Value
++#define UMT_INTERNAL_INT_EN_RST 0x00000000u
++
++//! Field P0Y - Internal Interrupt Enable Bit
++#define UMT_INTERNAL_INT_EN_P0Y_POS 0
++//! Field P0Y - Internal Interrupt Enable Bit
++#define UMT_INTERNAL_INT_EN_P0Y_MASK 0x1u
++//! Constant UEN - Disable this bit
++#define CONST_UMT_INTERNAL_INT_EN_P0Y_UEN 0x0
++//! Constant EN - Enable this bit
++#define CONST_UMT_INTERNAL_INT_EN_P0Y_EN 0x1
++
++//! Field S18 - Internal Interrupt Enable Bit
++#define UMT_INTERNAL_INT_EN_S18_POS 18
++//! Field S18 - Internal Interrupt Enable Bit
++#define UMT_INTERNAL_INT_EN_S18_MASK 0x40000u
++//! Constant UEN - Disable this bit
++#define CONST_UMT_INTERNAL_INT_EN_S18_UEN 0x0
++//! Constant EN - Enable this bit
++#define CONST_UMT_INTERNAL_INT_EN_S18_EN 0x1
++
++//! @}
++
++//! \defgroup UMT_INT_STAT Register UMT_INT_STAT - Module Interrupt States register
++//! @{
++
++//! Register Offset (relative)
++#define UMT_INT_STAT 0x214
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_INT_STAT 0x19110214u
++
++//! Register Reset Value
++#define UMT_INT_STAT_RST 0x00000000u
++
++//! Field S18 - Interrupt States bit
++#define UMT_INT_STAT_S18_POS 18
++//! Field S18 - Interrupt States bit
++#define UMT_INT_STAT_S18_MASK 0x40000u
++//! Constant UEN - Disabled this bit
++#define CONST_UMT_INT_STAT_S18_UEN 0x0
++//! Constant EN - UMT Error
++#define CONST_UMT_INT_STAT_S18_EN 0x1
++
++//! @}
++
++//! \defgroup UMT_SW_MODE Register UMT_SW_MODE - UMT Software Mode
++//! @{
++
++//! Register Offset (relative)
++#define UMT_SW_MODE 0x218
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_SW_MODE 0x19110218u
++
++//! Register Reset Value
++#define UMT_SW_MODE_RST 0x00000003u
++
++//! Field SW_MSG_MD - UMT software Msg mode
++#define UMT_SW_MODE_SW_MSG_MD_POS 0
++//! Field SW_MSG_MD - UMT software Msg mode
++#define UMT_SW_MODE_SW_MSG_MD_MASK 0x3u
++//! Constant NON - no msg
++#define CONST_UMT_SW_MODE_SW_MSG_MD_NON 0x0
++//! Constant MSG0 - MSG0 word to be programmed
++#define CONST_UMT_SW_MODE_SW_MSG_MD_MSG0 0x1
++//! Constant MSG1 - MSG1 to be programmed
++#define CONST_UMT_SW_MODE_SW_MSG_MD_MSG1 0x2
++//! Constant MSG11 - Both msg to be programmed
++#define CONST_UMT_SW_MODE_SW_MSG_MD_MSG11 0x3
++
++//! @}
++
++//! \defgroup UMT_MSG0 Register UMT_MSG0 - USER Message Contents
++//! @{
++
++//! Register Offset (relative)
++#define UMT_MSG0 0x220
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_MSG0 0x19110220u
++
++//! Register Reset Value
++#define UMT_MSG0_RST 0x00000000u
++
++//! Field MSG - USER MSG
++#define UMT_MSG0_MSG_POS 0
++//! Field MSG - USER MSG
++#define UMT_MSG0_MSG_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_MSG1 Register UMT_MSG1 - USER Message Contents
++//! @{
++
++//! Register Offset (relative)
++#define UMT_MSG1 0x224
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_MSG1 0x19110224u
++
++//! Register Reset Value
++#define UMT_MSG1_RST 0x00000000u
++
++//! Field MSG - USER MSG
++#define UMT_MSG1_MSG_POS 0
++//! Field MSG - USER MSG
++#define UMT_MSG1_MSG_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DEST Register UMT_DEST - UMT_DST
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DEST 0x230
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DEST 0x19110230u
++
++//! Register Reset Value
++#define UMT_DEST_RST 0x00000000u
++
++//! Field UMT_TA - Target address of UMT
++#define UMT_DEST_UMT_TA_POS 0
++//! Field UMT_TA - Target address of UMT
++#define UMT_DEST_UMT_TA_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup PORT_TO_CNT_0 Register PORT_TO_CNT_0 - Primary interrupt timeout counter
++//! @{
++
++//! Register Offset (relative)
++#define PORT_TO_CNT_0 0x300
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_PORT_TO_CNT_0 0x19110300u
++
++//! Register Reset Value
++#define PORT_TO_CNT_0_RST 0x00000000u
++
++//! Field TO_C - Timeout counter value for primary interrupt
++#define PORT_TO_CNT_0_TO_C_POS 0
++//! Field TO_C - Timeout counter value for primary interrupt
++#define PORT_TO_CNT_0_TO_C_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup PORT_TO_CNT_1 Register PORT_TO_CNT_1 - Primary interrupt timeout counter
++//! @{
++
++//! Register Offset (relative)
++#define PORT_TO_CNT_1 0x310
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_PORT_TO_CNT_1 0x19110310u
++
++//! Register Reset Value
++#define PORT_TO_CNT_1_RST 0x00000000u
++
++//! Field TO_C - Timeout counter value for primary interrupt
++#define PORT_TO_CNT_1_TO_C_POS 0
++//! Field TO_C - Timeout counter value for primary interrupt
++#define PORT_TO_CNT_1_TO_C_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup PORT_TO_CNT_2 Register PORT_TO_CNT_2 - Primary interrupt timeout counter
++//! @{
++
++//! Register Offset (relative)
++#define PORT_TO_CNT_2 0x320
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_PORT_TO_CNT_2 0x19110320u
++
++//! Register Reset Value
++#define PORT_TO_CNT_2_RST 0x00000000u
++
++//! Field TO_C - Timeout counter value for primary interrupt
++#define PORT_TO_CNT_2_TO_C_POS 0
++//! Field TO_C - Timeout counter value for primary interrupt
++#define PORT_TO_CNT_2_TO_C_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_MSG1_0 Register UMT_MSG1_0 - USER Message Contents
++//! @{
++
++//! Register Offset (relative)
++#define UMT_MSG1_0 0x400
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_MSG1_0 0x19110400u
++
++//! Register Reset Value
++#define UMT_MSG1_0_RST 0x00000000u
++
++//! Field MSG - USER MSG
++#define UMT_MSG1_0_MSG_POS 0
++//! Field MSG - USER MSG
++#define UMT_MSG1_0_MSG_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_MSG1_1 Register UMT_MSG1_1 - USER Message Contents
++//! @{
++
++//! Register Offset (relative)
++#define UMT_MSG1_1 0x404
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_MSG1_1 0x19110404u
++
++//! Register Reset Value
++#define UMT_MSG1_1_RST 0x00000000u
++
++//! Field MSG - USER MSG
++#define UMT_MSG1_1_MSG_POS 0
++//! Field MSG - USER MSG
++#define UMT_MSG1_1_MSG_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_PERIOD_CH1 Register UMT_PERIOD_CH1 - UMT SELF COUNTING MODE PERIOD
++//! @{
++
++//! Register Offset (relative)
++#define UMT_PERIOD_CH1 0x420
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_PERIOD_CH1 0x19110420u
++
++//! Register Reset Value
++#define UMT_PERIOD_CH1_RST 0x000017ACu
++
++//! Field UMT_P - PERIOD for UMT Self Counting MODE
++#define UMT_PERIOD_CH1_UMT_P_POS 0
++//! Field UMT_P - PERIOD for UMT Self Counting MODE
++#define UMT_PERIOD_CH1_UMT_P_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DEST_1 Register UMT_DEST_1 - UMT_DST
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DEST_1 0x430
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DEST_1 0x19110430u
++
++//! Register Reset Value
++#define UMT_DEST_1_RST 0x00000000u
++
++//! Field UMT_TA - Target address of UMT
++#define UMT_DEST_1_UMT_TA_POS 0
++//! Field UMT_TA - Target address of UMT
++#define UMT_DEST_1_UMT_TA_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_SW_MODE_CH1 Register UMT_SW_MODE_CH1 - UMT Software Mode
++//! @{
++
++//! Register Offset (relative)
++#define UMT_SW_MODE_CH1 0x434
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_SW_MODE_CH1 0x19110434u
++
++//! Register Reset Value
++#define UMT_SW_MODE_CH1_RST 0x00000003u
++
++//! Field SW_MSG_MD - UMT software Msg mode
++#define UMT_SW_MODE_CH1_SW_MSG_MD_POS 0
++//! Field SW_MSG_MD - UMT software Msg mode
++#define UMT_SW_MODE_CH1_SW_MSG_MD_MASK 0x3u
++//! Constant NON - no msg
++#define CONST_UMT_SW_MODE_CH1_SW_MSG_MD_NON 0x0
++//! Constant MSG0 - MSG0 word to be programmed
++#define CONST_UMT_SW_MODE_CH1_SW_MSG_MD_MSG0 0x1
++//! Constant MSG1 - MSG1 to be programmed
++#define CONST_UMT_SW_MODE_CH1_SW_MSG_MD_MSG1 0x2
++//! Constant MSG11 - Both msg to be programmed
++#define CONST_UMT_SW_MODE_CH1_SW_MSG_MD_MSG11 0x3
++
++//! @}
++
++//! \defgroup UMT_MSG2_0 Register UMT_MSG2_0 - USER Message Contents
++//! @{
++
++//! Register Offset (relative)
++#define UMT_MSG2_0 0x500
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_MSG2_0 0x19110500u
++
++//! Register Reset Value
++#define UMT_MSG2_0_RST 0x00000000u
++
++//! Field MSG - USER MSG
++#define UMT_MSG2_0_MSG_POS 0
++//! Field MSG - USER MSG
++#define UMT_MSG2_0_MSG_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_MSG2_1 Register UMT_MSG2_1 - USER Message Contents
++//! @{
++
++//! Register Offset (relative)
++#define UMT_MSG2_1 0x504
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_MSG2_1 0x19110504u
++
++//! Register Reset Value
++#define UMT_MSG2_1_RST 0x00000000u
++
++//! Field MSG - USER MSG
++#define UMT_MSG2_1_MSG_POS 0
++//! Field MSG - USER MSG
++#define UMT_MSG2_1_MSG_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_PERIOD_CH2 Register UMT_PERIOD_CH2 - UMT SELF COUNTING MODE PERIOD
++//! @{
++
++//! Register Offset (relative)
++#define UMT_PERIOD_CH2 0x520
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_PERIOD_CH2 0x19110520u
++
++//! Register Reset Value
++#define UMT_PERIOD_CH2_RST 0x000017ACu
++
++//! Field UMT_P - PERIOD for UMT Self Counting MODE
++#define UMT_PERIOD_CH2_UMT_P_POS 0
++//! Field UMT_P - PERIOD for UMT Self Counting MODE
++#define UMT_PERIOD_CH2_UMT_P_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_DEST_2 Register UMT_DEST_2 - UMT_DST
++//! @{
++
++//! Register Offset (relative)
++#define UMT_DEST_2 0x530
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_DEST_2 0x19110530u
++
++//! Register Reset Value
++#define UMT_DEST_2_RST 0x00000000u
++
++//! Field UMT_TA - Target address of UMT
++#define UMT_DEST_2_UMT_TA_POS 0
++//! Field UMT_TA - Target address of UMT
++#define UMT_DEST_2_UMT_TA_MASK 0xFFFFFFFFu
++
++//! @}
++
++//! \defgroup UMT_SW_MODE_CH2 Register UMT_SW_MODE_CH2 - UMT Software Mode
++//! @{
++
++//! Register Offset (relative)
++#define UMT_SW_MODE_CH2 0x534
++//! Register Offset (absolute) for 1st Instance CQEM_UMT_CTRL
++#define CQEM_UMT_CTRL_UMT_SW_MODE_CH2 0x19110534u
++
++//! Register Reset Value
++#define UMT_SW_MODE_CH2_RST 0x00000003u
++
++//! Field SW_MSG_MD - UMT software Msg mode
++#define UMT_SW_MODE_CH2_SW_MSG_MD_POS 0
++//! Field SW_MSG_MD - UMT software Msg mode
++#define UMT_SW_MODE_CH2_SW_MSG_MD_MASK 0x3u
++//! Constant NON - no msg
++#define CONST_UMT_SW_MODE_CH2_SW_MSG_MD_NON 0x0
++//! Constant MSG0 - MSG0 word to be programmed
++#define CONST_UMT_SW_MODE_CH2_SW_MSG_MD_MSG0 0x1
++//! Constant MSG1 - MSG1 to be programmed
++#define CONST_UMT_SW_MODE_CH2_SW_MSG_MD_MSG1 0x2
++//! Constant MSG11 - Both msg to be programmed
++#define CONST_UMT_SW_MODE_CH2_SW_MSG_MD_MSG11 0x3
++
++//! @}
++
++//! @}
++
++#endif
+diff --git a/include/linux/intel_umt_cqem.h b/include/linux/intel_umt_cqem.h
+new file mode 100644
+index 000000000000..4ba615930e0d
+--- /dev/null
++++ b/include/linux/intel_umt_cqem.h
+@@ -0,0 +1,52 @@
++/*
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms of the GNU General Public License version 2 as published
++ * by the Free Software Foundation.
++ *
++ * Copyright (C) 2015 Zhu YiXin<yixin.zhu@lantiq.com>
++ * Copyright (C) 2016~2017 Intel Corporation.
++ */
++
++#ifndef __INTEL_UMT_CQEM__
++#define __INTEL_UMT_CQEM__
++
++enum umt_mode {
++	UMT_SELFCNT_MODE = 0,
++	UMT_USER_MODE    = 1,
++	UMT_MODE_MAX,
++};
++
++enum umt_msg_mode {
++	UMT_NO_MSG    = 0,
++	UMT_MSG0_ONLY = 1,
++	UMT_MSG1_ONLY = 2,
++	UMT_MSG0_MSG1 = 3,
++	UMT_MSG_MAX,
++};
++
++enum umt_status {
++	UMT_DISABLE = 0,
++	UMT_ENABLE  = 1,
++	UMT_STATUS_MAX,
++	UMT_BROKEN,
++};
++
++struct umt_set_mode {
++	enum umt_mode umt_mode;
++	enum umt_msg_mode msg_mode;
++	u32 phy_dst;
++	u32 period;
++	enum umt_status enable;
++	u32 umt_ep_dst;
++};
++
++int intel_umt_cqem_set_period(u32 umt_id, u32 ep_id, u32 period);
++int intel_umt_cqem_set_mode(u32 umt_id, u32 ep_id,
++			    struct umt_set_mode *umt_mode);
++int intel_umt_cqem_enable(u32 umt_id, u32 ep_id, u32 enable);
++int intel_umt_cqem_request(u32 ep_id, u32 cbm_pid, u32 *dma_ctrlid,
++			   u32 *dma_cid, u32 *umt_id);
++int intel_umt_cqem_release(u32 umt_id, u32 ep_id);
++int intel_umt_cqem_suspend(u32 umt_id, u32 ep_id, u32 enable);
++
++#endif /* __INTEL_UMT_CQEM__ */

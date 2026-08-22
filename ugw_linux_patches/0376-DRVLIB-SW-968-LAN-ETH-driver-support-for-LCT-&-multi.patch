@@ -1,0 +1,467 @@
+From 6167b06179cd8763dc93071bd048a2e49516188f Mon Sep 17 00:00:00 2001
+From: Dinesh Sudham <dineshx.sudham@intel.com>
+Date: Fri, 16 Nov 2018 16:36:19 +0800
+Subject: [PATCH] DRVLIB_SW-968: LAN ETH driver support for LCT & multiple
+ subif
+
+---
+ .../net/ethernet/lantiq/datapath/datapath_api.c    |  14 +-
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c   | 219 +++++++++++++++++++--
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h   |   6 +
+ include/net/datapath_api.h                         |  18 ++
+ 4 files changed, 225 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+index 5955ec74945f..a2638e54ea2c 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -1870,8 +1870,6 @@ static void rx_dbg_zero_port(struct sk_buff *skb, struct dma_rx_desc_0 *desc0,
+ 			 "Recv Data");
+ }
+ 
+-/* This macro is for testing packet reception to LCT dev*/
+-#define TEST_LCT 1
+ /* clone skb to send one copy to lct dev for multicast/broadcast
+  * otherwise for unicast send only to lct device
+  * return 0 - Caller will not proceed handling i.e. for unicast do rx only for
+@@ -1896,25 +1894,17 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 		}
+ 		lct_skb->dev = dp_port->subif_info[vap].netif;
+ 		UP_STATS(dp_port->subif_info[vap].mib.rx_fn_rxif_pkt);
+-#if TEST_LCT
+-		skb_pull(lct_skb, sizeof(struct pmac_rx_hdr));
+-		ret = netif_rx(lct_skb);
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "pkt sent lct(%s) ret(%d)\n",
+ 			 lct_skb->dev->name ? lct_skb->dev->name : "NULL",
+ 			 ret);
+-#else
+ 		rx_fn(lct_skb->dev, NULL, lct_skb, lct_skb->len);
+-#endif
+ 		return 1;
+ 	} else if (memcmp(skb->data + PMAC_SIZE, skb->dev->dev_addr, 6) == 0) {
+ 		/* unicast */
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "LCT unicast\n");
+-#if TEST_LCT
+-		skb_pull(skb, sizeof(struct pmac_rx_hdr));
+-		ret = netif_rx(skb);
+-#else
++		DP_DEBUG(DP_DBG_FLAG_PAE, "unicast pkt sent lct(%s) ret(%d)\n",
++				 skb->dev->name ? skb->dev->name : "NULL", ret);
+ 		rx_fn(skb->dev, NULL, skb, skb->len);
+-#endif
+ 		UP_STATS(dp_port->subif_info[vap].mib.rx_fn_rxif_pkt);
+ 		return 0;
+ 	}
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index c26db75c5d8a..bf704db661d6 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -52,6 +52,8 @@
+ 
+ #define LTQ_ETH_NUM_INTERRUPTS 5
+ 
++#define NUM_IF 6
++
+ /* Init of the network device */
+ static int ltq_eth_init(struct net_device *dev);
+ /* Start the network device interface queue */
+@@ -95,11 +97,13 @@ static char wan_iface[IFNAMSIZ] = "eth1";
+ static char *macaddr0;
+ static char *macaddr1;
+ static int multimac = 1;
++static int dev_num;
+ 
+ static struct module g_ltq_eth_module[NUM_ETH_INF];
+ static u32 g_rx_csum_offload;
+ static u32 g_eth_switch_mode;
+ static struct ltq_net_soc_data g_soc_data;
++static struct net_device *eth_dev[NUM_IF];
+ 
+ static const struct net_device_ops ltq_eth_drv_ops = {
+ 	.ndo_init		= ltq_eth_init,
+@@ -313,25 +317,37 @@ static int ltq_eth_stop(struct net_device *dev)
+ static void ltq_eth_uninit(struct net_device *dev)
+ {
+ 	struct ltq_eth_priv *priv;
++	struct dp_subif_data data = {0};
+ 	int ret;
+ 
+ 	pr_debug("%s called for device %s\n", __func__, dev->name);
+ 	priv = netdev_priv(dev);
+-	priv->dp_subif.subif = 0;
+-	priv->dp_subif.port_id = priv->dp_port_id;
+ 
+ 	if (priv->dp_port_id == DP_FAILURE) {
+ 		pr_debug("dp port id (%d) is invalid. ignore the deregister.\n",
+ 			 priv->dp_port_id);
+ 		return;
+ 	}
+-	ret = dp_register_subif(priv->owner, dev, dev->name, &priv->dp_subif,
+-				DP_F_DEREGISTER);
+ 
+-	if (ret != DP_SUCCESS) {
++	if (priv->lct_en == 1) {
++		priv->dp_subif.subif = -1;
++		priv->dp_subif.port_id = priv->dp_port_id;
++		data.flag_ops = DP_F_DATA_LCT_SUBIF;
++		ret = dp_register_subif_ext(0, priv->owner,
++					    dev, dev->name,
++					    &priv->dp_subif,
++					    &data, DP_F_DEREGISTER);
++	} else {
++		priv->dp_subif.subif = -1;
++		priv->dp_subif.port_id = priv->dp_port_id;
++		ret = dp_register_subif_ext(0, priv->owner,
++					    dev, dev->name,
++					    &priv->dp_subif,
++					    NULL, DP_F_DEREGISTER);
++	}
++	if (ret != DP_SUCCESS)
+ 		pr_err("%s: failed to close for device: %s ret %d\n",
+ 		       __func__, dev->name, ret);
+-	}
+ }
+ 
+ /* Send the packet to netwrok rx queue */
+@@ -676,6 +692,7 @@ static int ltq_eth_init(struct net_device *dev)
+ {
+ 	int i;
+ 	struct ltq_eth_priv *priv;
++	struct dp_subif_data data = {0};
+ 	int ret;
+ 
+ 	priv = netdev_priv(dev);
+@@ -691,17 +708,28 @@ static int ltq_eth_init(struct net_device *dev)
+ 		dev->ethtool_ops = &ethtool_ops;
+ 	}
+ 
+-	priv->dp_subif.subif = 0;
+-	priv->dp_subif.port_id = priv->dp_port_id;
+-
+-	ret = dp_register_subif(priv->owner, dev, dev->name, &priv->dp_subif,
+-				0);
+-
++	if (priv->lct_en == 1) {
++		priv->dp_subif.subif = -1;
++		priv->dp_subif.port_id = priv->dp_port_id;
++		data.flag_ops = DP_F_DATA_LCT_SUBIF;
++		ret = dp_register_subif_ext(0, priv->owner,
++					    dev, dev->name, &priv->dp_subif,
++					    &data, 0);
++	} else {
++		priv->dp_subif.subif = -1;
++		priv->dp_subif.port_id = priv->dp_port_id;
++		ret = dp_register_subif_ext(0, priv->owner,
++					    dev, dev->name, &priv->dp_subif,
++					    NULL, 0);
++	}
+ 	if (ret != DP_SUCCESS) {
+ 		pr_err("%s: failed to open for device: %s ret %d\n",
+ 		       __func__, dev->name, ret);
+ 		return -1;
+ 	}
++	pr_debug("\n subif reg for owner = %s portid = %d subifid = %d dev= %s\n",
++		 priv->owner->name, priv->dp_port_id,
++		 priv->dp_subif.subif, dev->name);
+ 	return 0;
+ }
+ 
+@@ -1035,7 +1063,6 @@ ltq_eth_drv_eth_addr_setup(struct net_device *dev, int port, int wan)
+ 		if (ops)
+ 			ops->set_macaddr(ops, dev->dev_addr);
+ 	}
+-
+ }
+ 
+ #ifdef CONFIG_USERSPACE_LINK_NOTIFICATION
+@@ -1245,13 +1272,116 @@ xrx500_of_port(struct net_device *dev, struct device_node *port)
+ 	priv->hw->port_map[p->num] = priv->hw->num_devs;
+ }
+ 
++static int ltq_eth_dev_reg(struct xrx500_hw *hw, u32 xgmac_id_param,
++			   u32 lct_en, u32 dp_port, int start, int end)
++{
++	int i, err, num = 1;
++
++	for (i = start; i < end; i++) {
++		char name[16];
++		struct ltq_eth_priv *priv;
++
++		eth_dev[i] = alloc_etherdev_mq(sizeof(struct ltq_eth_priv),
++						g_soc_data.queue_num);
++		if (!eth_dev[i]) {
++			pr_debug("allocated failed for interface %d\n", i);
++			return -ENOMEM;
++		}
++		priv = netdev_priv(eth_dev[i]);
++		priv->dp_port_id = dp_port;
++		priv->xgmac_id = xgmac_id_param;
++		priv->hw = hw;
++		priv->id = hw->num_devs;
++		priv->owner = &g_ltq_eth_module[hw->num_devs];
++		sprintf(priv->owner->name, "module%02d", priv->id);
++		if (start == i && lct_en == 1) {
++			priv->lct_en = 1;
++			sprintf(name, "eth0_%d_%d_lct", hw->num_devs, num);
++		} else {
++				priv->lct_en = 0;
++				sprintf(name, "eth0_%d_%d",  hw->num_devs, num);
++		}
++		strcpy(eth_dev[i]->name, name);
++
++		eth_dev[i]->netdev_ops = &ltq_eth_drv_ops;
++		ltq_eth_drv_eth_addr_setup(eth_dev[i], priv->id, priv->wan);
++		err = register_netdev(eth_dev[i]);
++		if (err) {
++			pr_err("%s: failed to register netdevice: %s %d\n",
++			       __func__, eth_dev[i], err);
++				return -1;
++		}
++		num++;
++	}
++	return 0;
++}
++
++static int ltq_eth_dev_dereg_subif(int start, int end)
++{
++	int res, i;
++	struct ltq_eth_priv *priv;
++	struct dp_subif_data data = {0};
++
++	for (i = start; i < end; i++) {
++		struct net_device *dev = eth_dev[i];
++
++		priv = netdev_priv(dev);
++		priv->dp_subif.subif = priv->dp_subif.subif;
++		priv->dp_subif.port_id = priv->dp_subif.port_id;
++		if (priv->lct_en == 1) {
++			pr_debug("owner = %s portid = %d subifid = %d dev= %s\n",
++				 priv->owner->name, priv->dp_port_id,
++				 priv->dp_subif.subif, dev->name);
++			res = dp_register_subif_ext(0, priv->owner,
++						    dev, dev->name,
++						    &priv->dp_subif,
++						    &data, DP_F_DEREGISTER);
++		}
++		if (priv->lct_en == 0) {
++			pr_debug("owner = %s portid = %d subifid = %d dev= %s\n",
++				 priv->owner->name, priv->dp_port_id,
++				 priv->dp_subif.subif, dev->name);
++			res = dp_register_subif_ext(0, priv->owner,
++						    dev, dev->name,
++						    &priv->dp_subif, NULL,
++						    DP_F_DEREGISTER);
++		}
++		if (res != DP_SUCCESS) {
++			pr_err("%s: failed to deregister subif for device: %s ret %d\n",
++			       __func__, dev->name, res);
++			return -1;
++		}
++	}
++	return 0;
++}
++
++static int ltq_eth_dev_dereg(int start, int end)
++{
++	int i;
++
++	for (i = start; i < end; i++) {
++		struct ltq_eth_priv *priv;
++		struct net_device *dev = eth_dev[i];
++
++		netif_stop_queue(dev);
++		priv = netdev_priv(dev);
++		priv->dp_port_id = DP_FAILURE;
++		unregister_netdev(dev);
++		free_netdev(dev);
++	}
++	return 0;
++}
++
+ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 			   struct platform_device *pdev)
+ {
+ 	struct ltq_eth_priv *priv;
++	struct dp_dev_data dev_data = {0};
+ 	struct device_node *port;
+ 	const __be32 *wan;
+ 	u32 dp_dev_port_param, dp_port_id_param, xgmac_id_param;
++	u32 lct_en_param = 0, extra_subif_param = 0;
++	int net_start = 0, net_end = 0;
+ 	dp_cb_t cb = {0};
+ 	u32 dp_port_id = 0;
+ 	char name[16];
+@@ -1309,6 +1439,30 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 		priv->xgmac_id = xgmac_id_param;
+ 	}
+ 
++	ret = of_property_read_u32(iface, "intel,lct-en",
++				   &lct_en_param);
++	if (ret < 0) {
++		pr_debug("Property intel,lct-en not exist for if %s\n",
++			 name);
++		priv->lct_en = -1;
++	}
++			pr_debug("Property intel,lct-en for if %s %d\n",
++				 name, lct_en_param);
++	ret = of_property_read_u32(iface, "intel,extra-subif",
++				   &extra_subif_param);
++	if (ret < 0) {
++		pr_info("Property intel,extra-subif not exist for if %s %d\n",
++			name, extra_subif_param);
++		priv->extra_subif = -1;
++	}	else {
++			pr_info("Property intel,extra-subif for if %s %d\n",
++				name, extra_subif_param);
++			priv->extra_subif = extra_subif_param;
++			priv->start = dev_num;
++			priv->end = dev_num + priv->extra_subif;
++			dev_num = priv->extra_subif;
++	}
++
+ 	strcpy(hw->devs[hw->num_devs]->name, name);
+ 	hw->devs[hw->num_devs]->netdev_ops = &ltq_eth_drv_ops;
+ 	hw->devs[hw->num_devs]->watchdog_timeo = LTQ_TX_TIMEOUT;
+@@ -1340,11 +1494,14 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 	}
+ 
+ 	priv->dp_port_id = dp_port_id;
++	dev_data.max_ctp = 4;
+ 	cb.stop_fn = (dp_stop_tx_fn_t)dp_fp_stop_tx;
+ 	cb.restart_fn  = (dp_restart_tx_fn_t)dp_fp_restart_tx;
+ 	cb.rx_fn = (dp_rx_fn_t)dp_fp_rx;
+ 
+-	if (dp_register_dev(priv->owner, dp_port_id, &cb, 0) != DP_SUCCESS) {
++	if (dp_register_dev_ext(0, priv->owner,
++				dp_port_id, &cb,
++				&dev_data, 0) != DP_SUCCESS) {
+ 		pr_err("dp_register_dev failed for %s\n and port_id %d",
+ 		       hw->devs[hw->num_devs]->name, dp_port_id);
+ 		dp_alloc_port(priv->owner, hw->devs[hw->num_devs],
+@@ -1390,7 +1547,16 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 
+ 	/* register the actual device */
+ 	if (!register_netdev(hw->devs[hw->num_devs]))
+-		hw->num_devs++;
++		pr_debug("%s: priv->extra_subif = %d interface %s !\n",
++			 __func__, priv->extra_subif, name);
++	if (extra_subif_param >= 1) {
++		net_start = priv->start;
++		net_end = priv->end;
++		ltq_eth_dev_reg(&xrx500_hw, xgmac_id_param, lct_en_param,
++				dp_port_id_param, net_start, net_end);
++	}
++
++	hw->num_devs++;
+ 
+ 	return 0;
+ }
+@@ -1741,7 +1907,6 @@ static int ltq_eth_drv_init(struct platform_device *pdev)
+ 		if (mdio_np)
+ 			if (xrx500_of_mdio_pae(&xrx500_hw, mdio_np))
+ 				dev_err(&pdev->dev, "mdio probe of PAE failed\n");
+-
+ 	}
+ 
+ 	bus = xrx500_hw.mii_bus;
+@@ -1787,7 +1952,9 @@ static void ltq_eth_drv_exit(struct platform_device *pdev)
+ 	int i, ret, j;
+ 
+ 	for (i = 0; i < xrx500_hw.num_devs; i++) {
++		int net_start = 0, net_end = 0;
+ 		struct ltq_eth_priv *priv;
++		struct dp_dev_data dev_data = {0};
+ 		struct net_device *dev = xrx500_hw.devs[i];
+ 
+ 		if (!dev)
+@@ -1815,18 +1982,27 @@ static void ltq_eth_drv_exit(struct platform_device *pdev)
+ 
+ 		pr_debug("ltq_eth_drv_exit i %d dev_id %d port_id %d for device %s\n",
+ 			 i, priv->dev_port, priv->dp_port_id, dev->name);
++		net_start = priv->start;
++		net_end = priv->end;
+ 		priv->dp_subif.subif = 0;
+ 		priv->dp_subif.port_id = priv->dp_port_id;
+ 
+-		ret = dp_register_subif(priv->owner, dev, dev->name,
+-					&priv->dp_subif, DP_F_DEREGISTER);
++		ret = dp_register_subif(priv->owner, dev,
++					dev->name, &priv->dp_subif,
++					DP_F_DEREGISTER);
+ 
+ 		if (ret != DP_SUCCESS) {
+ 			pr_err("%s: failed to call deregister subif: %s\n",
+ 			       __func__, dev->name);
+ 		}
+-		ret = dp_register_dev(priv->owner, priv->dp_port_id, NULL,
+-				      DP_F_DEREGISTER);
++
++		if (priv->extra_subif >= 1)
++			ltq_eth_dev_dereg_subif(net_start, net_end);
++
++		ret = dp_register_dev_ext(0, priv->owner,
++					  priv->dp_port_id, NULL,
++					  &dev_data,
++					  DP_F_DEREGISTER);
+ 		if (ret != DP_SUCCESS) {
+ 			pr_err("%s: failed to call deregister device: %s\n",
+ 			       __func__, dev->name);
+@@ -1837,9 +2013,12 @@ static void ltq_eth_drv_exit(struct platform_device *pdev)
+ 			pr_err("%s: failed to call dealloc for device : %s\n",
+ 			       __func__, dev->name);
+ 		}
++
+ 		priv->dp_port_id = DP_FAILURE;
+ 		unregister_netdev(dev);
+ 		free_netdev(dev);
++		if (priv->extra_subif >= 1)
++			ltq_eth_dev_dereg(net_start, net_end);
+ 	}
+ 
+ 	if (xrx500_hw.mii_bus) {
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+index 518693c9edf2..60646e649cc9 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+@@ -73,6 +73,12 @@ struct ltq_eth_priv {
+ 	int id;
+ 	int wan;
+ 	int jumbo_enabled;
++	int lct_en;
++	int extra_subif;
++	/*! min netdevices for extra subif/lct */
++	int start;
++	/*! max netdevices for extra subif/lct */
++	int end;
+ 	#define FLAG_PAUSE_AUTO         0x00000001
+ 	#define FLAG_FULL_DUPLEX        0x00000002
+ 	#define FLAG_10_BASE_T          0x00000010
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index 795bbdaadfa9..6bbac3049065 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -846,6 +846,24 @@ struct dp_dev_data {
+ 	int txout_poolid; /*!< [out] For legacy ACA to free BM buffer in
+ 			   *   in falcon_mx
+ 			   */
++	u16 max_ctp;    /*!< [in] maximum subif required which will be mapped to
++			 * GSWIP continuous CTP block.
++			 * Since very limited CTP in GSWIP and it is already
++			 * out of range, some drivers have to specify this
++			 * parameter to save the system resource, for example
++			 * of G.INIT in falcon_mx:
++			 * 1) single LAN port only: it is value should be 16
++			 * 2) two Lan Ports:
++			 *      a) 1st lan port: 8 CPT with 8 subif only
++			 *      b) 2nd lan port: 16 CTP with 16 subif
++			 *         Note: first 8 subif/CTP will not be used
++			 *         at all for the HW back-pressure design based
++			 *         subif ID.
++			 * Currently DP just add this parameter, but not really
++			 * implemented yet since DP need to change the flow, ie,
++			 * move the CTP allocation from dp_alloc_port to
++			 * dp_register_dev
++			 */
+ };
+ 
+ /*! @addtogroup Datapath_Driver_API */

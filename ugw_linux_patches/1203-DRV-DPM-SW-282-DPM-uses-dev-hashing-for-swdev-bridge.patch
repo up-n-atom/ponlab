@@ -1,0 +1,1598 @@
+From b5063e19db81c905bbb9fe2d347c81385e0cf816 Mon Sep 17 00:00:00 2001
+From: Jack Ping CHNG <jack.ping.chng@linux.intel.com>
+Date: Thu, 4 Jun 2020 14:47:16 +0800
+Subject: [PATCH] DRV_DPM_SW-282: DPM uses dev hashing for swdev bridge list
+ instead of name
+
+- Replaced device name with dev pointer to save memory and
+  speed during hashing
+- Code cleanup
+---
+ drivers/net/datapath/dpm/datapath_misc.c     |   6 +-
+ drivers/net/datapath/dpm/datapath_notifier.c |   5 +-
+ drivers/net/datapath/dpm/datapath_swdev.c    | 846 ++++++++++++++-------------
+ drivers/net/datapath/dpm/datapath_swdev.h    |  24 +-
+ include/net/datapath_api.h                   |   9 +-
+ 5 files changed, 461 insertions(+), 429 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_misc.c b/drivers/net/datapath/dpm/datapath_misc.c
+index 88c9deb8e713..eb9e3f12e1a3 100644
+--- a/drivers/net/datapath/dpm/datapath_misc.c
++++ b/drivers/net/datapath/dpm/datapath_misc.c
+@@ -799,7 +799,7 @@ int dp_meter_add(struct net_device *dev, struct dp_meter_cfg *meter, int flag)
+ 		}
+ 		mtr_subif.inst =  mtr_subif.subif.inst;
+ 	} else if (flag & DP_METER_ATTACH_BRIDGE) {
+-		mtr_subif.fid = dp_get_fid_by_brname(dev, &mtr_subif.inst);
++		mtr_subif.fid = dp_get_fid_by_dev(dev, &mtr_subif.inst);
+ 		if (mtr_subif.fid < 0) {
+ 			pr_err("fid less then 0\n");
+ 			return DP_FAILURE;
+@@ -844,7 +844,7 @@ int dp_meter_del(struct net_device *dev, struct dp_meter_cfg *meter, int flag)
+ 		}
+ 		mtr_subif.inst = mtr_subif.subif.inst;
+ 	} else if (flag & DP_METER_ATTACH_BRIDGE) {
+-		mtr_subif.fid = dp_get_fid_by_brname(dev, &mtr_subif.inst);
++		mtr_subif.fid = dp_get_fid_by_dev(dev, &mtr_subif.inst);
+ 		if (mtr_subif.fid < 0) {
+ 			pr_err("fid less then 0\n");
+ 			return DP_FAILURE;
+@@ -862,7 +862,7 @@ int dp_meter_del(struct net_device *dev, struct dp_meter_cfg *meter, int flag)
+ EXPORT_SYMBOL(dp_meter_del);
+ 
+ #if (!IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV))
+-int dp_get_fid_by_brname(struct net_device *dev, int *inst)
++int dp_get_fid_by_dev(struct net_device *dev, int *inst)
+ {
+ 	pr_err("API not support when SWDEV disabled\n");
+ 	return -1;
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index 494f67f8b40e..5d8f19e2c882 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -185,7 +185,7 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 		 */
+ 		DP_DEBUG(DP_DBG_FLAG_NOTIFY, "Bridge name:%s\n",
+ 			 br_dev ? br_dev->name : "NULL");
+-		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
++		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 		if (sif->swdev_en == 1) {
+ 			if (br_info) {
+ 				dp_dev->fid = br_info->fid;
+@@ -280,7 +280,8 @@ static int dp_notifier_cb(struct notifier_block *self, unsigned long action,
+ 	evt_notif = container_of(self, struct dp_evt_notif_info, nb);
+ 	if (!evt_notif->evt_info.dp_event_cb) {
+ 		pr_err("skipping event 0x%lx, callback not registerd: owner[%d] type[0x%x]\n",
+-			action, evt_notif->evt_info.owner, evt_notif->evt_info.type);
++		       action, evt_notif->evt_info.owner,
++		       evt_notif->evt_info.type);
+ 		goto end;
+ 	}
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index 06f581a74211..923ff35cfc82 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -2,176 +2,179 @@
+ /* Copyright (C) Intel Corporation
+  * Author: Shao Guohua <guohua.shao@intel.com>
+  */
+-
+-#include <linux/types.h>
+ #include <linux/if_bridge.h>
+ #include <linux/if_vlan.h>
+ #include <linux/ethtool.h>
++#include <linux/types.h>
+ #include <net/rtnetlink.h>
+-#include <generated/utsrelease.h>
++
+ #include <net/datapath_api.h>
+-#include "datapath_swdev.h"
+ #include "datapath.h"
+ #include "datapath_instance.h"
+ #include "datapath_ioctl.h"
++#include "datapath_swdev.h"
+ 
+ static void dp_swdev_insert_bridge_id_entry(struct br_info *);
+ static void dp_swdev_remove_bridge_id_entry(struct br_info *);
+ static int dp_swdev_add_bport_to_list(struct br_info *br_item,
+ 				      struct bridge_id_entry_item *brid_item);
+-static int dp_swdev_del_bport_from_list(struct br_info *br_item,
+-					int bport);
++static int dp_swdev_del_bport_from_list(struct br_info *br_item, int bport);
+ 
+ struct hlist_head
+ 	g_bridge_id_entry_hash_table[DP_MAX_INST][BR_ID_ENTRY_HASH_TABLE_SIZE];
+ 
+-u16 dp_swdev_cal_hash(unsigned char *name)
++static inline u32 dp_swdev_cal_hash(const void *ptr)
+ {
+-	unsigned long hash = init_name_hash(0);
+-
+-	if (name) {
+-		while (*name)
+-			hash = partial_name_hash(*name++, hash);
+-	}
+-	return hash_long(hash, BRIDGE_ID_ENTRY_HASH_LENGTH);
++	return hash_long((unsigned long)ptr, BRIDGE_ID_ENTRY_HASH_LENGTH);
+ }
+ 
+ /* dp_kfree - used as destructor for
+  * switchdev_trans_item_enqueue() API
+  */
+-void dp_kfree(void const *data)
++void dp_kfree(void const *ptr)
+ {
+-	devm_kfree(&g_dp_dev->dev, (void *)data);
++	devm_kfree(&g_dp_dev->dev, (void *)ptr);
+ }
+ 
+-struct hlist_head *get_dp_g_bridge_id_entry_hash_table_info(int instance,
+-							    int index)
++struct hlist_head *get_dp_g_bridge_id_entry_hash_table_info(int inst, int idx)
+ {
+-	return &g_bridge_id_entry_hash_table[instance][index];
++	return &g_bridge_id_entry_hash_table[inst][idx];
+ }
+ EXPORT_SYMBOL(get_dp_g_bridge_id_entry_hash_table_info);
+ 
+-int dp_get_fid_by_brname(struct net_device *dev, int *inst)
++int dp_get_fid_by_dev(struct net_device *dev, int *inst)
+ {
+ 	struct br_info *br_info;
+-	u32 fid;
++	int fid = -1;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("%s failed: datapath not initialized yet\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+ 
+-	if (!dev) {
+-		pr_err("%s failed: dev can not be NULL\n", __func__);
++	if (!dev || !inst) {
++		pr_err("%s failed: dev or inst is NULL\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+ 
+ 	rcu_read_lock();
+-	br_info = dp_swdev_bridge_entry_lookup_rcu(dev->name);
+-	if (!br_info) {
+-		rcu_read_unlock();
+-		return -1;
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(dev);
++	if (br_info) {
++		*inst = br_info->inst;
++		fid = br_info->fid;
+ 	}
+-	*inst = br_info->inst;
+-	fid = br_info->fid;
++
+ 	rcu_read_unlock();
+ 
+ 	return fid;
+ }
+-EXPORT_SYMBOL(dp_get_fid_by_brname);
++EXPORT_SYMBOL(dp_get_fid_by_dev);
+ 
+-int dp_swdev_chk_bport_in_br(struct net_device *bp_dev, int bport, int inst)
++int dp_swdev_chk_bport_in_br(struct net_device *dev, int bport, int inst)
+ {
++	struct bridge_member_port *bmp;
+ 	struct net_device *br_dev;
+-	struct bridge_member_port *temp_list = NULL;
+ 	struct br_info *br_info;
+-	int found = 0;
+ 
+-	br_dev = netdev_master_upper_dev_get(bp_dev);
++	br_dev = netdev_master_upper_dev_get(dev);
+ 	if (!br_dev)
+-		return -1;
++		return DP_FAILURE;
++
+ 	rcu_read_lock();
+-	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 	if (!br_info)
+ 		goto ERR;
+-	list_for_each_entry(temp_list, &br_info->bp_list, list) {
+-		if (temp_list->bportid == bport) {
+-			found = 1;
++
++	list_for_each_entry(bmp, &br_info->bp_list, list) {
++		if (bmp->bportid == bport) {
+ 			DP_DEBUG(DP_DBG_FLAG_SWDEV, "bport(%s) in bridge\n",
+-				 bp_dev->name ? bp_dev->name : "NULL");
++				 dev->name ? dev->name : "NULL");
++
+ 			rcu_read_unlock();
+-			return 0;
++
++			return DP_SUCCESS;
+ 		}
+ 	}
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "bport(%s) not in bridge\n",
+-		 bp_dev->name ? bp_dev->name : "NULL");
++
+ ERR:
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "bport(%s) not in bridge\n",
++		 dev->name ? dev->name : "NULL");
++
+ 	rcu_read_unlock();
+-	return -1;
++
++	return DP_FAILURE;
+ }
+ 
+-struct br_info *dp_swdev_bridge_entry_lookup_rcu(char *br_name)
++struct br_info *dp_swdev_bridge_entry_lookup_rcu(struct net_device *dev)
+ {
+-	u16 idx;
+-	struct br_info *br_item = NULL;
+-	struct hlist_head *tmp;
+-	int i = 0;
+ 
+-	idx = dp_swdev_cal_hash(br_name);
++	struct br_info *br_item;
++	struct hlist_head *head;
++	u32 idx;
++	int i;
++
++	idx = dp_swdev_cal_hash(dev);
++
+ 	for (i = 0; i < DP_MAX_INST; i++) {
+-		tmp = (&g_bridge_id_entry_hash_table[i][idx]);
+-		hlist_for_each_entry_rcu(br_item, tmp, br_hlist) {
+-			if (br_item) {
+-				if (strcmp(br_name,
+-					   br_item->br_device_name) == 0) {
+-					DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-						 "hash entry found(%s)\n",
+-						 br_name);
+-					return br_item;
+-				}
+-			} else {
+-				break;
++		head = (&g_bridge_id_entry_hash_table[i][idx]);
++		hlist_for_each_entry_rcu(br_item, head, br_hlist) {
++			if (br_item->dev == dev) {
++				DP_DEBUG(DP_DBG_FLAG_SWDEV,
++					 "Hash entry found(%s)\n",
++					 dev->name);
++				return br_item;
+ 			}
+ 		}
+ 	}
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "Hash entry not found(%s)\n", dev->name);
++
+ 	return NULL;
+ }
+ 
+ static void dp_swdev_remove_bridge_id_entry(struct br_info *br_item)
+ {
+-	/*reset switch bridge configurations*/
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "hash del\n");
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "Hash del(%s)\n", br_item->dev->name);
++
+ 	hlist_del_rcu(&br_item->br_hlist);
++
+ 	synchronize_rcu();
++
+ 	devm_kfree(&g_dp_dev->dev, br_item);
+ }
+ 
+ static void dp_swdev_insert_bridge_id_entry(struct br_info *br_item)
+ {
+-	u16 idx;
+-	struct hlist_head *tmp;
+-
+-	idx = dp_swdev_cal_hash(br_item->br_device_name);
+-	tmp = (&g_bridge_id_entry_hash_table[br_item->inst][idx]);
+-	hlist_add_head_rcu(&br_item->br_hlist, tmp);
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "hash added idx:%d bridge(%s)\n",
+-		 idx, br_item->br_device_name);
++	struct hlist_head *head;
++	u32 idx;
++
++	idx = dp_swdev_cal_hash(br_item->dev);
++
++	head = &g_bridge_id_entry_hash_table[br_item->inst][idx];
++
++	hlist_add_head_rcu(&br_item->br_hlist, head);
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "Hash added idx:%d bridge(%s)\n",
++		 idx, br_item->dev->name);
+ }
+ 
+ int dp_swdev_bridge_id_entry_free(int instance)
+ {
+-	u32 index;
+-	struct hlist_node *tmp;
++	struct hlist_node *node;
+ 	struct hlist_head *head;
+ 	struct br_info *br_item;
++	u32 idx;
+ 
+-	for (index = 0; index < BR_ID_ENTRY_HASH_TABLE_SIZE; index++) {
+-		head = &g_bridge_id_entry_hash_table[instance][index];
+-		hlist_for_each_entry_safe(br_item, tmp, head, br_hlist) {
++	for (idx = 0; idx < BR_ID_ENTRY_HASH_TABLE_SIZE; idx++) {
++		head = &g_bridge_id_entry_hash_table[instance][idx];
++		hlist_for_each_entry_safe(br_item, node, head, br_hlist) {
+ 			dp_swdev_remove_bridge_id_entry(br_item);
+ 		}
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ int dp_swdev_bridge_id_entry_init(void)
+@@ -182,141 +185,158 @@ int dp_swdev_bridge_id_entry_init(void)
+ 		for (j = 0; j < BR_ID_ENTRY_HASH_TABLE_SIZE; j++)
+ 			INIT_HLIST_HEAD(&g_bridge_id_entry_hash_table[i][j]);
+ 
+-	return 0;/*<success>*/
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_swdev_del_bport_from_list(struct br_info *br_item,
+ 					int bport)
+ {
++	struct bridge_member_port *bmp;
+ 	int found = 0;
+-	struct bridge_member_port *temp_list = NULL;
+ 
+-	list_for_each_entry(temp_list, &br_item->bp_list, list) {
+-		if (temp_list->bportid == bport) {
++	list_for_each_entry(bmp, &br_item->bp_list, list) {
++		if (bmp->bportid == bport) {
+ 			found = 1;
+ 			break;
+ 		}
+ 	}
++
+ 	if (found) {
+-		list_del(&temp_list->list);
+-		devm_kfree(&g_dp_dev->dev, temp_list);
+-		return 1;
++		list_del(&bmp->list);
++
++		devm_kfree(&g_dp_dev->dev, bmp);
++
++		return DP_SUCCESS;
+ 	}
+-	return 0;
++
++	return DP_FAILURE;
+ }
+ 
+ static int dp_swdev_add_bport_to_list(struct br_info *br_item,
+ 				      struct bridge_id_entry_item *brid_item)
+ {
++	struct bridge_member_port *bmp;
+ 	int found = 0;
+-	struct bridge_member_port *bport_list = NULL;
+-	struct bridge_member_port *temp_list = NULL;
+ 
+-	list_for_each_entry(temp_list, &br_item->bp_list, list) {
+-		if (temp_list->bportid == brid_item->bportid) {
++	list_for_each_entry(bmp, &br_item->bp_list, list) {
++		if (bmp->bportid == brid_item->bportid) {
+ 			found = 1;
+ 			break;
+ 		}
+ 	}
+-	if (found == 0) {
+-		bport_list = (struct bridge_member_port *)
+-			     devm_kzalloc(&g_dp_dev->dev,
+-					  sizeof(struct bridge_member_port),
+-					  GFP_ATOMIC);
+-		if (!bport_list) {
+-			pr_err("\n Node creation failed\n");
+-			return -1;
+-		}
+-		bport_list->dev_reg_flag = br_item->flag;
+-		bport_list->bportid = brid_item->bportid;
+-		bport_list->dev_priv_flag = brid_item->priv_flag;
+-		bport_list->dp_port = br_item->dp_port;
++
++	if (!found) {
++		bmp = devm_kzalloc(&g_dp_dev->dev, sizeof(*bmp),
++				   GFP_ATOMIC);
++		if (!bmp)
++			return DP_FAILURE;
++
++		bmp->dev_priv_flag = brid_item->priv_flag;
++		bmp->dev_reg_flag = br_item->flag;
++		bmp->bportid = brid_item->bportid;
++		bmp->dp_port = br_item->dp_port;
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 			 "bport:%d reg_flag:%d priv_flag:0x%x\n",
+-			 bport_list->bportid, bport_list->dev_reg_flag,
+-			 bport_list->dev_priv_flag);
+-		list_add(&bport_list->list, &br_item->bp_list);
++			 bmp->bportid, bmp->dev_reg_flag, bmp->dev_priv_flag);
++
++		list_add(&bmp->list, &br_item->bp_list);
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+ 				  u8 *addr)
+ {
+-	struct br_info *br_info;
++	struct pmac_port_info *p_info;
+ 	struct inst_info *i_info;
++	struct br_info *br_info;
+ 	int ret;
+-	struct pmac_port_info *p_info;
+-
+-	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
+ 
+ 	if (br_item->flags == BRIDGE_NO_ACTION) {
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 			 "bport not added so no action required\n");
+-		return 0;
++
++		return DP_SUCCESS;
+ 	}
++
+ 	rcu_read_lock();
+-	br_info = dp_swdev_bridge_entry_lookup_rcu(br_item->br_device_name);
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_item->dev);
+ 	if (!br_info)
+ 		goto EXIT;
+-	if (!dp_swdev_del_bport_from_list(br_info, br_item->bportid))
++
++	if (dp_swdev_del_bport_from_list(br_info, br_item->bportid))
+ 		goto EXIT;
++
++	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
+ 	i_info = &dp_port_prop[br_item->inst].info;
+ 	ret = i_info->swdev_bridge_port_cfg_reset(br_info, br_item->inst,
+ 						  br_item->bportid,
+ 						  p_info->bp_hairpin_cap);
+ 	if (ret == DEL_BRENTRY) {
+ 		i_info->swdev_free_brcfg(br_item->inst, br_item->fid);
++
+ 		dp_swdev_remove_bridge_id_entry(br_info);
++
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 			 "last bport(%d) to remove from bridge(%s)\n",
+-			 br_item->bportid, br_item->br_device_name);
++			 br_item->bportid, br_item->dev->name);
+ 	}
++
+ EXIT:
+ 	rcu_read_unlock();
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "rem bport(%d)\n", br_item->bportid);
+-	return 0;
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "remove bport(%d)\n", br_item->bportid);
++
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_swdev_cfg_vlan(struct bridge_id_entry_item *br_item,
+ 			     struct net_device *dev)
+ {
++	struct pmac_port_info *p_info;
++	struct dp_bp_attr conf = {0};
++	struct inst_info *i_info;
+ 	struct dp_dev *dp_dev;
+-	u32 inst;
+ 	int vap;
+-	struct inst_info *i_info;
+-	struct pmac_port_info *p_info;
+-	struct dp_bp_attr conf;
+ 
+ 	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
+-	if (p_info->swdev_en != 1)
+-		return 0;
++	if (!p_info->swdev_en)
++		return DP_SUCCESS;
++
+ 	if (br_item->flags & LOGIC_DEV_REGISTER) {
+ 		dp_dev = dp_dev_lookup(dev);
+ 		if (!dp_dev) {
+-			pr_err("\n dp_dev NULL\n");
++			pr_err("%s dp_dev is NULL\n", __func__);
+ 			/* Cannot return -1 from here as this fn is
+ 			 * called by swdev commit phase
+ 			 */
+-			return 0;
++			return DP_SUCCESS;
+ 		}
+-		inst = br_item->inst;
+-		i_info = get_dp_prop_info(inst);
+-		vap = GET_VAP(dp_dev->ctp,
+-			      get_dp_port_info(inst, dp_dev->ep)->vap_offset,
+-			      get_dp_port_info(inst, dp_dev->ep)->vap_mask);
++
++		p_info = get_dp_port_info(br_item->inst, dp_dev->ep);
++		vap = GET_VAP(dp_dev->ctp, p_info->vap_offset,
++			      p_info->vap_mask);
++
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV, "vap=%d ep=%d bp=%d\n",
+ 			 vap, dp_dev->ep, dp_dev->bp);
++
++		i_info = get_dp_prop_info(br_item->inst);
++
+ 		if (br_item->flags & CPU_PORT_DISABLE) {
+-		/* For vUNI vlan dev need to remove CPU from bp member list */
+-			conf.inst = inst;
++			/* For vUNI vlan dev need to remove CPU
++			 * from bp member list
++			 */
++			conf.inst = br_item->inst;
+ 			conf.dev = dev;
+-			conf.en = 0;
+ 			i_info->dp_set_bp_attr(&conf, br_item->bportid, 0);
+ 		}
+-		i_info->dp_cfg_vlan(inst, vap, dp_dev->ep);
++
++		i_info->dp_cfg_vlan(br_item->inst, vap, dp_dev->ep);
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_swdev_filter_vlan(struct net_device *dev,
+@@ -324,69 +344,84 @@ static int dp_swdev_filter_vlan(struct net_device *dev,
+ 				struct switchdev_trans *trans,
+ 				struct net_device *br_dev)
+ {
+-	struct br_info *br_info;
+ 	struct bridge_id_entry_item *br_item;
+-	dp_subif_t subif = {0};
++	struct br_info *br_info;
++	int ret = -EOPNOTSUPP;
++	dp_subif_t subif;
+ 
+ 	if (switchdev_trans_ph_prepare(trans)) {
+-		/*Get current BPORT ID,instance from DP*/
+ 		if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+-			pr_err("%s dp_get_netif_subifid failed for %s\n",
++			pr_err("%s get subif fail for %s\n",
+ 			       __func__, dev->name);
+-			return -EOPNOTSUPP;
++			return ret;
+ 		}
++
+ 		br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item),
+ 				       GFP_ATOMIC);
+ 		if (!br_item)
+-			return -ENOMEM;
+-		br_item->inst = subif.inst;
+-		/* current bridge member port*/
++			return ret;
++
+ 		br_item->bportid = subif.bport;
++		br_item->inst = subif.inst;
++
+ 		rcu_read_lock();
+-		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
++
++		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 		if (br_info) {
+-			strcpy(br_item->br_device_name,
+-			       br_info->br_device_name);
++			br_item->dev = br_info->dev;
+ 			br_item->fid = br_info->fid;
+ 		} else {
+ 			rcu_read_unlock();
++
+ 			devm_kfree(&g_dp_dev->dev, br_item);
+-			return -EOPNOTSUPP;
++
++			return ret;
+ 		}
++
+ 		switchdev_trans_item_enqueue(trans, br_item,
+ 					     dp_kfree, &br_item->tritem);
++
+ 		rcu_read_unlock();
+-		return 0;
++
++		return DP_SUCCESS;
+ 	}
++
+ 	br_item = switchdev_trans_item_dequeue(trans);
++
+ 	DP_LIB_LOCK(&dp_lock);
+-	if (br_item)
++
++	if (br_item) {
+ 		dp_swdev_cfg_vlan(br_item, dev);
++		dp_kfree(br_item);
++	}
++
+ 	DP_LIB_UNLOCK(&dp_lock);
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 			      struct net_device *dev)
+ {
+-	struct br_info *br_info;
+ 	struct inst_info *i_info;
++	struct br_info *br_info;
+ 	int ret;
+ 
+ 	i_info = get_dp_prop_info(br_item->inst);
+ 	DP_DEBUG(DP_DBG_FLAG_SWDEV, "britem flags:%x\n", br_item->flags);
+ 
+ 	if (br_item->flags & ADD_BRENTRY) {
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "Add br entry %s\n",
+-			 br_item->br_device_name);
++		DP_DEBUG(DP_DBG_FLAG_SWDEV, "Add bridge entry %s\n",
++			 br_item->dev->name);
+ 
+ 		ret = i_info->swdev_bridge_cfg_set(br_item->inst, br_item->fid);
+ 		if (ret == 0) {
+ 			br_info = devm_kzalloc(&g_dp_dev->dev,
+ 					       sizeof(*br_info), GFP_ATOMIC);
+ 			if (!br_info)
+-				/* cannot return failure in switchdev commit */
+-				return 0;
++				/* Cannot return failure in switchdev commit */
++				return DP_SUCCESS;
++
+ 			br_info->fid = br_item->fid;
+ 			br_info->inst = br_item->inst;
+ 			br_info->dp_port = br_item->dp_port;
+@@ -398,8 +433,7 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 			if (br_item->flags & LOGIC_DEV_REGISTER)
+ 				br_info->flag = LOGIC_DEV_REGISTER;
+ 
+-			strcpy(br_info->br_device_name,
+-			       br_item->br_device_name);
++			br_info->dev = br_item->dev;
+ 			INIT_LIST_HEAD(&br_info->bp_list);
+ 			dp_swdev_insert_bridge_id_entry(br_info);
+ 			dp_swdev_add_bport_to_list(br_info, br_item);
+@@ -410,16 +444,17 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 			br_item->flags &= ~ADD_BRENTRY;
+ 			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 				 "added bport(%d),bridge(%s)\n",
+-				 br_item->bportid,
+-				 br_info->br_device_name);
+-			return 0;
++				 br_item->bportid, br_item->dev->name);
++
++			return DP_SUCCESS;
+ 		}
+ 	} else {
+ 		rcu_read_lock();
+-		br_info =
+-		      dp_swdev_bridge_entry_lookup_rcu(br_item->br_device_name);
++
++		br_info = dp_swdev_bridge_entry_lookup_rcu(br_item->dev);
+ 		if (!br_info)
+ 			goto EXIT;
++
+ 		br_info->flag = 0;
+ 		br_info->dp_port = br_item->dp_port;
+ 
+@@ -434,41 +469,45 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 		rcu_read_unlock();
+ 		return 0;
+ 	}
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "No configuration,Pls check!!\n");
+-	return 0;
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "No configuration, please check!\n");
++
++	return DP_SUCCESS;
+ }
+ 
+-/* this API handles de-registration of vlan device created during add_if */
++/* Handles de-registration of vlan device created during add_if */
+ static int dp_del_swdev_reg_vlan(struct bridge_id_entry_item *br_item,
+ 				 struct net_device *dev, u8 *addr)
+ {
+-	struct net_device *base;
+-	dp_subif_t subif = {0};
+ 	struct pmac_port_info *p_info;
++	struct net_device *base;
++	dp_subif_t subif;
+ 
+ 	if (br_item) {
+ 		dp_swdev_clr_gswip_cfg(br_item, addr);
+-		/* De-Register Logical Dev i.e. VLAN DEV
++
++		/* De-register logical dev i.e. VLAN DEV
+ 		 * if it is registered
+ 		 */
+ 		if (!(br_item->flags & LOGIC_DEV_REGISTER))
+-			return 0;
++			return DP_SUCCESS;
++
+ 		base = get_base_dev(dev, -1);
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "base dev name:%s\n",
+-			 base ? base->name : "NULL");
+ 		if (!base)
+ 			base = dev;
++		DP_DEBUG(DP_DBG_FLAG_SWDEV, "base dev name:%s\n", base->name);
++
+ 		dp_swdev_cfg_vlan(br_item, dev);
+-		if (dp_get_netif_subifid(base, NULL, NULL,
+-					 NULL, &subif, 0)) {
+-			pr_err("dp_get_netif_subifid fail:%s(%s)\n",
+-			       base->name, __func__);
+-			/*Cannot Return -EOPNOTSUPP
+-			 * in swdev commit stage
+-			 */
+-			return 0;
++
++		if (dp_get_netif_subifid(base, NULL, NULL, NULL, &subif, 0)) {
++			pr_err("%s get subif fail for %s\n",
++			       __func__, base->name);
++			/* Cannot return -EOPNOTSUPP in swdev commit stage */
++			return DP_SUCCESS;
+ 		}
++
+ 		p_info = get_dp_port_info(subif.inst, subif.port_id);
++
+ 		DP_LIB_UNLOCK(&dp_lock);
+ 		/* Release dp_lock here since dp_register_subif will be
+ 		   acquiring the dp_lock. Need to set DP_F_SUBIF_LOGICAL
+@@ -477,15 +516,14 @@ static int dp_del_swdev_reg_vlan(struct bridge_id_entry_item *br_item,
+ 		if (dp_register_subif(p_info->owner, dev, dev->name,
+ 				      &subif,
+ 				      DP_F_DEREGISTER | DP_F_SUBIF_LOGICAL)) {
+-			pr_err("dp_register_subif fail: %s(%s)\n",
+-			       dev->name, __func__);
+-			/* Cannot Return -EOPNOTSUPP
+-			 * in swdev commit stage
+-			 */
++			pr_err("%s de-register subif-%s fail\n",
++			       __func__, dev->name);
+ 		}
++
+ 		DP_LIB_LOCK(&dp_lock);
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ static int dp_swdev_add_if(struct net_device *dev,
+@@ -493,60 +531,60 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 			   struct switchdev_trans *trans,
+ 			   struct net_device *br_dev)
+ {
+-	struct br_info *br_info;
++	struct bridge_id_entry_item *br_item;
+ 	struct pmac_port_info *p_info;
++	struct dp_subif_info *sif;
+ 	struct inst_info *i_info;
+-	struct bridge_id_entry_item *br_item;
+-	int br_id = 0;
++	struct br_info *br_info;
+ 	struct net_device *base;
+-	dp_subif_t subif = {0};
+ 	u32 flag = 0, vap;
+-	int port, inst;
+-	s32 res;
+-	struct dp_subif_info *sif;
++	dp_subif_t subif;
++	int br_id;
+ 
+-	/*Get current BPORT ID,instance from DP*/
+-	res = dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0);
+-	if (res) {
++	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "get subifid failed for %s, chk if vlan dev\n",
++				 "Get subifid failed for %s, check if vlan dev\n",
+ 			 dev->name);
+-		/*Check bridge port exists otherwise register
+-		 *device with datapath  i.e. only in case of new
+-		 *VLAN interface
++
++		/* Check bridge port exists otherwise register
++		 * device with datapath  i.e. only in case of new
++		 * VLAN interface
+ 		 */
+-		/*Check if dev is a VLAN device */
+ 		if (!is_vlan_dev(dev))
+ 			return -EOPNOTSUPP;
++
+ 		base = get_base_dev(dev, -1);
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "base dev name:%s\n",
+-			 base ? base->name : "NULL");
+ 		if (!base)
+ 			base = dev;
+-		res = dp_get_netif_subifid(base, NULL, NULL, NULL,
+-					   &subif, 0);
+-		if (res) {
+-			pr_err("dp_get_netif_subifid fail:%s\n", base->name);
++		DP_DEBUG(DP_DBG_FLAG_SWDEV, "base dev name:%s\n", base->name);
++
++		if (dp_get_netif_subifid(base, NULL, NULL, NULL, &subif, 0)) {
++			pr_err("%s get subif fail for %s\n",
++			       __func__, base->name);
+ 			return -EOPNOTSUPP;
+ 		}
+-		port = subif.port_id;
+-		inst = subif.inst;
++
+ 		subif.subif = -1;
+-		p_info = get_dp_port_info(inst, port);
++		p_info = get_dp_port_info(subif.inst, subif.port_id);
++
+ 		if (dp_register_subif(p_info->owner, dev, dev->name,
+ 				      &subif, DP_F_SUBIF_LOGICAL)) {
+-			pr_err("dp_register_subif fail: %s\n", dev->name);
++			pr_err("%s register subif-%s fail\n",
++			       __func__, dev->name);
+ 			return -EOPNOTSUPP;
+ 		}
++
+ 		flag = LOGIC_DEV_REGISTER;
++
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV, "registered subif,bp=%d port=%d\n",
+ 			 subif.bport, subif.port_id);
+ 	}
++
+ 	p_info = get_dp_port_info(subif.inst, subif.port_id);
+ 	i_info = &dp_port_prop[subif.inst].info;
+-	vap = GET_VAP(subif.subif, p_info->vap_offset,
+-		      p_info->vap_mask);
++	vap = GET_VAP(subif.subif, p_info->vap_offset, p_info->vap_mask);
+ 	sif = get_dp_port_subif(p_info, vap);
++
+ 	/* SWITCHDEV_TRANS_PREPARE phase */
+ 	if (switchdev_trans_ph_prepare(trans)) {
+ 		br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item),
+@@ -554,65 +592,75 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 		if (!br_item)
+ 			/*need to check dequeue if no memory*/
+ 			return -ENOMEM;
+-		br_item->inst = subif.inst;
+-		/* current bridge member port*/
+-		br_item->bportid = subif.bport;
++
+ 		br_item->dp_port = subif.port_id;
++		br_item->bportid = subif.bport;
++		br_item->inst = subif.inst;
++
+ 		/* dev->priv_flags should be set only for base dev */
+ 		if (!(flag & LOGIC_DEV_REGISTER))
+ 			br_item->priv_flag = dev->priv_flags;
+ 
+-		rcu_read_lock();
+-		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
+ 		if (!sif->cpu_port_en)
+ 			br_item->flags |= CPU_PORT_DISABLE;
++
++		rcu_read_lock();
++
++		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 		if (br_info) {
+-			strcpy(br_item->br_device_name,
+-			       br_info->br_device_name);
++			br_item->dev = br_info->dev;
+ 			br_item->fid = br_info->fid;
+ 			br_item->flags |= flag;
+ 		} else {
+ 			br_item->flags |= ADD_BRENTRY | flag;
+ 			if (sif->swdev_en == 1) {
+-				br_id = i_info->swdev_alloc_bridge_id(
+-							br_item->inst);
++				br_id =
++				  i_info->swdev_alloc_bridge_id(br_item->inst);
+ 				if (br_id) {
+-					/* Store bridge information
+-					 * to add in the table.
+-					 * This info is used during
++					/* Store bridge information to add in
++					 * the table. This info is used during
+ 					 * switchdev commit phase
+ 					 */
+-					strcpy(br_item->br_device_name,
+-					       br_dev->name);
++					br_item->dev = br_dev;
+ 					br_item->fid = br_id;
+ 				} else {
+-					pr_err("Switch config failed\r\n");
++					pr_err("Switch config failed\n");
++
+ 					devm_kfree(&g_dp_dev->dev, br_item);
++
+ 					rcu_read_unlock();
++
+ 					return -EOPNOTSUPP;
+ 				}
+ 			} else {
+-				strcpy(br_item->br_device_name, br_dev->name);
+-				br_item->fid = br_id;
++				br_item->dev = br_dev;
+ 			}
+ 		}
++
+ 		rcu_read_unlock();
+-		switchdev_trans_item_enqueue(trans, br_item,
+-					     dp_kfree, &br_item->tritem);
+-		return 0;
++
++		switchdev_trans_item_enqueue(trans, br_item, dp_kfree,
++					     &br_item->tritem);
++
++		return DP_SUCCESS;
+ 	}
+-	/*configure switch in commit phase and it cannot return failure*/
++
++	/* Configure switch in commit phase and it cannot return failure*/
+ 	br_item = switchdev_trans_item_dequeue(trans);
+ 	if (br_item) {
+ 		DP_LIB_LOCK(&dp_lock);
+-		if (sif->swdev_en == 1)
++
++		if (sif->swdev_en)
+ 			dp_swdev_cfg_gswip(br_item, dev);
++
+ 		if (br_item->flags & LOGIC_DEV_REGISTER)
+-			/*do only for vlan flag*/
+ 			dp_swdev_cfg_vlan(br_item, dev);
++
+ 		DP_LIB_UNLOCK(&dp_lock);
++		dp_kfree(br_item);
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ /* flags = DP_SWDEV_BRIDGE_ITEM - britem pointer is valid
+@@ -624,50 +672,41 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 			   struct bridge_id_entry_item *britem,
+ 			   int flags)
+ {
+-	struct br_info *br_info;
+-	struct pmac_port_info *p_info;
+ 	struct bridge_id_entry_item *br_item;
+-	struct bridge_member_port *temp_list = NULL;
+-	dp_subif_t subif = {0};
+-	int vap = 0;
+-	u8 *addr = (u8 *)dev->dev_addr;
++	struct bridge_member_port *bmp;
++	struct pmac_port_info *p_info;
+ 	struct dp_subif_info *sif;
++	struct br_info *br_info;
++	dp_subif_t subif;
++	u8 *addr;
++	int vap;
+ 
+-	/*Get current BR_PORT ID from DP*/
++	/* Get current BR_PORT ID from DP */
+ 	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "dp_get_netif_subifid failed for %s\n",
+-			 dev->name);
+-		return -EINVAL;
++		pr_err("%s get subif failed for %s\n", __func__, dev->name);
++		return DP_FAILURE;
+ 	}
+-	p_info = get_dp_port_info(subif.inst, subif.port_id);
+-	vap = GET_VAP(subif.subif, p_info->vap_offset,
+-		      p_info->vap_mask);
+-	sif = get_dp_port_subif(p_info, vap);
+-	/* SWITCHDEV_TRANS_PREPARE phase */
++
+ 	if (switchdev_trans_ph_prepare(trans)) {
+-		br_item = devm_kzalloc(&g_dp_dev->dev,
+-				       sizeof(*br_item), GFP_ATOMIC);
++		br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item),
++				       GFP_ATOMIC);
+ 		if (!br_item)
+-			/*TODO need to check dequeue if no memory*/
++			/* TODO need to check dequeue if no memory */
+ 			return -ENOMEM;
++
+ 		rcu_read_lock();
+-		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
++
++		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 		if (br_info) {
++			br_item->flags = BRIDGE_NO_ACTION;
++			br_item->dp_port = subif.port_id;
++			br_item->bportid = subif.bport;
++			br_item->dev = br_info->dev;
+ 			br_item->fid = br_info->fid;
+ 			br_item->inst = subif.inst;
+-			/* current bridge member port*/
+-			br_item->bportid = subif.bport;
+-			br_item->dp_port = subif.port_id;
+-			br_item->flags = BRIDGE_NO_ACTION;
+-			strcpy(br_item->br_device_name,
+-			       br_info->br_device_name);
+-
+-			list_for_each_entry(temp_list, &br_info->bp_list,
+-					    list) {
+-				if (temp_list->bportid == br_item->bportid) {
+-					br_item->flags =
+-						temp_list->dev_reg_flag;
++			list_for_each_entry(bmp, &br_info->bp_list, list) {
++				if (bmp->bportid == br_item->bportid) {
++					br_item->flags = bmp->dev_reg_flag;
+ 					break;
+ 				}
+ 			}
+@@ -676,10 +715,10 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 			 * de-register vlan device with datapath
+ 			 */
+ 			if (is_vlan_dev(dev)) {
+-				br_item->inst = subif.inst;
+-				br_item->dp_port = subif.port_id;
+ 				br_item->flags = LOGIC_DEV_REGISTER |
+-							BRIDGE_NO_ACTION;
++						 BRIDGE_NO_ACTION;
++				br_item->dp_port = subif.port_id;
++				br_item->inst = subif.inst;
+ 			} else {
+ 				DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 					 "No bridge entry or bp to delete\r\n");
+@@ -687,73 +726,84 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 			}
+ 		}
+ 		rcu_read_unlock();
++
+ 		/*check return value & enqueue*/
+ 		switchdev_trans_item_enqueue(trans, br_item, dp_kfree,
+ 					     &br_item->tritem);
+-		return 0;
++		return DP_SUCCESS;
+ 	}
++
++	p_info = get_dp_port_info(subif.inst, subif.port_id);
++	vap = GET_VAP(subif.subif, p_info->vap_offset,
++		      p_info->vap_mask);
++	sif = get_dp_port_subif(p_info, vap);
++	addr = (u8 *)dev->dev_addr;
++
+ 	if (flags == DP_SWDEV_BRIDGE_ITEM)
+ 		br_item = britem;
+ 	else
+-		/*configure switch in commit phase & it cannot return failure*/
++		/* Configure switch in commit phase &
++		 * it cannot return failure
++		 */
+ 		br_item = switchdev_trans_item_dequeue(trans);
++
+ 	if (sif->swdev_en)
+ 		dp_del_swdev_reg_vlan(br_item, dev, addr);
+-	return 0;
++
++	if (flags != DP_SWDEV_BRIDGE_ITEM)
++		dp_kfree(br_item);
++
++	return DP_SUCCESS;
+ }
+ 
+ int dp_del_br_if(struct net_device *dev, struct net_device *br_dev,
+ 		 int inst, int bport)
+ {
++	struct bridge_id_entry_item br_item;
++	struct bridge_member_port *bmp;
+ 	struct br_info *br_info;
+-	struct bridge_id_entry_item *br_item;
+-	struct bridge_member_port *temp_list = NULL;
+ 
+-	br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item), GFP_ATOMIC);
+-	if (!br_item)
+-		return -1;
+ 	rcu_read_lock();
+-	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
++
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 	if (br_info) {
+-		br_item->fid = br_info->fid;
+-		br_item->inst = inst;
+-		br_item->bportid = bport;
+-		strcpy(br_item->br_device_name, br_info->br_device_name);
+-
+-		list_for_each_entry(temp_list, &br_info->bp_list, list) {
+-			if (temp_list->bportid == br_item->bportid) {
+-				br_item->flags =
+-					temp_list->dev_reg_flag;
++		br_item.dev = br_info->dev;
++		br_item.fid = br_info->fid;
++		br_item.bportid = bport;
++		br_item.inst = inst;
++		list_for_each_entry(bmp, &br_info->bp_list, list) {
++			if (bmp->bportid == br_item.bportid) {
++				br_item.flags = bmp->dev_reg_flag;
+ 				break;
+ 			}
+ 		}
+ 	} else {
+ 		if (is_vlan_dev(dev)) {
+-			br_item->inst = inst;
+-			br_item->flags = LOGIC_DEV_REGISTER |
++			br_item.inst = inst;
++			br_item.flags = LOGIC_DEV_REGISTER |
+ 				BRIDGE_NO_ACTION;
+ 		} else {
+ 			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 				 "No bridge entry or bport to delete\r\n");
+-			br_item->flags = BRIDGE_NO_ACTION;
++			br_item.flags = BRIDGE_NO_ACTION;
+ 		}
+ 	}
++
+ 	rcu_read_unlock();
+-	dp_swdev_del_if(dev, NULL, br_dev, br_item, DP_SWDEV_BRIDGE_ITEM);
+-	devm_kfree(&g_dp_dev->dev, br_item);
+-	return 0;
++
++	return dp_swdev_del_if(dev, NULL, br_dev, &br_item,
++			DP_SWDEV_BRIDGE_ITEM);
+ }
+ 
+ static int dp_swdev_port_attr_bridge_flags_set(struct net_device *dev,
+ 					       unsigned long flags,
+ 					       struct switchdev_trans *trans)
+ {
+-	dp_subif_t subif = {0};
+ 	struct inst_info *i_info;
+-	int err = 0;
++	dp_subif_t subif;
+ 
+ 	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
++		return DP_SUCCESS;
+ 
+ 	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+@@ -763,50 +813,46 @@ static int dp_swdev_port_attr_bridge_flags_set(struct net_device *dev,
+ 	}
+ 
+ 	i_info = &dp_port_prop[subif.inst].info;
+-	if (!i_info->swdev_bridge_port_flags_set)
+-		return -EOPNOTSUPP;
++	if (i_info->swdev_bridge_port_flags_set)
++		return i_info->swdev_bridge_port_flags_set(subif.inst,
++						  subif.bport, flags);
+ 
+-	err = i_info->swdev_bridge_port_flags_set(subif.inst,
+-						  subif.bport,
+-						  flags);
+-	return err;
++	return -EOPNOTSUPP;
+ }
+ 
+ static int dp_swdev_port_attr_bridge_flags_get(struct net_device *dev,
+ 					       unsigned long *flags)
+ {
+-	dp_subif_t subif = {0};
+ 	struct inst_info *i_info;
+-	int err = 0;
++	dp_subif_t subif;
+ 
+ 	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "dp_get_netif_subifid failed for %s\n",
+-			 dev->name);
++		pr_err("%s get subif failed for %s\n", __func__, dev->name);
+ 		return -EINVAL;
+ 	}
+ 
+ 	i_info = &dp_port_prop[subif.inst].info;
+-	if (!i_info->swdev_bridge_port_flags_get)
+-		return -EOPNOTSUPP;
++	if (i_info->swdev_bridge_port_flags_get)
++		return i_info->swdev_bridge_port_flags_get(subif.inst,
++							   subif.bport, flags);
+ 
+-	err = i_info->swdev_bridge_port_flags_get(subif.inst,
+-						  subif.bport,
+-						  flags);
+-	return err;
++	return -EOPNOTSUPP;
+ }
+ 
+ static int dp_swdev_port_attr_learning_limit_set(struct net_device *dev,
+ 						 int learning_limit,
+ 						 struct switchdev_trans *trans)
+ {
+-	dp_subif_t subif = {0};
+ 	struct inst_info *i_info;
+-	int err = 0;
++	dp_subif_t subif;
++
++	/* If we are in preperation do not execute the command */
++	if (switchdev_trans_ph_prepare(trans))
++		return DP_SUCCESS;
+ 
+ 	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "dp_get_netif_subifid failed for %s\n",
++			 "Get subif failed for %s\n",
+ 			 dev->name);
+ 			return -EINVAL;
+ 	}
+@@ -823,73 +869,66 @@ static int dp_swdev_port_attr_learning_limit_set(struct net_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
+-	/* If we are in preperation do not execute the command */
+-	if (switchdev_trans_ph_prepare(trans))
+-		return 0;
+-
+-	err = i_info->swdev_port_learning_limit_set(subif.inst,
+-						    subif.bport,
+-						    learning_limit);
+-	return err;
++	return i_info->swdev_port_learning_limit_set(subif.inst,
++						     subif.bport,
++						     learning_limit);
+ }
+ 
+ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 				  const struct switchdev_attr *attr,
+ 				  struct switchdev_trans *trans)
+ {
+-	int err = -EOPNOTSUPP;
+ 	struct net_device *br_dev;
++	int ret = -EOPNOTSUPP;
++
+ 	/* switchdev attr orig dev -> bridge port dev pointer
+ 	 * then get the bridge dev from switchdev attr's orig dev
+ 	 */
+ 
+ 	br_dev = netdev_master_upper_dev_get(attr->orig_dev);
+ 	if (!br_dev)
+-		return -EOPNOTSUPP;
++		return ret;
++
+ 	switch (attr->id) {
+ 	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+-		/* STP STATE forwading or ifconfig UP - add bridge*/
+ 		if (attr->u.stp_state == BR_STATE_FORWARDING) {
+-			err = dp_swdev_add_if(attr->orig_dev,
+-					      attr, trans, br_dev);
+-		}
+-		/* STP STATE disabled or ifconfig DOWN - del bridge*/
+-		else if (attr->u.stp_state == BR_STATE_DISABLED) {
++			/* STP STATE forwading or ifconfig UP - add bridge*/
++			ret = dp_swdev_add_if(attr->orig_dev, attr, trans,
++					      br_dev);
++		} else if (attr->u.stp_state == BR_STATE_DISABLED) {
++			/* STP STATE disabled or ifconfig DOWN - del bridge*/
+ 			DP_LIB_LOCK(&dp_lock);
+-			err = dp_swdev_del_if(attr->orig_dev,
+-					      trans, br_dev, NULL, 0);
+-			if (err != 0)
+-				err = -EOPNOTSUPP;
++			ret = dp_swdev_del_if(attr->orig_dev, trans, br_dev,
++					      NULL, 0);
+ 			DP_LIB_UNLOCK(&dp_lock);
+-		} else {
+-			return -EOPNOTSUPP;
+ 		}
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+-		err = dp_swdev_port_attr_bridge_flags_set(dev,
++		ret = dp_swdev_port_attr_bridge_flags_set(dev,
+ 							  attr->u.brport_flags,
+ 							  trans);
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME:
+-	/* err = dp_swdev_port_attr_bridge_ageing_time_set(dp_swdev_port,
+-	 * attr->u.ageing_time,
+-	 * trans);
+-	 */
++		/* ret = dp_swdev_port_attr_bridge_ageing_time_set(
++		 * dp_swdev_port,
++		 * attr->u.ageing_time,
++		 * trans);
++		 */
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING:
+-		/* err = dp_swdev_port_attr_bridge_br_vlan_set(dev,
++		/* ret = dp_swdev_port_attr_bridge_br_vlan_set(dev,
+ 		 * attr->orig_dev,trans);
+ 		 */
+ 	case SWITCHDEV_ATTR_ID_PORT_LEARNING_LIMIT:
+-		err =
+-		dp_swdev_port_attr_learning_limit_set(dev,
+-						      attr->u.learning_limit,
+-						      trans);
++		ret =
++		  dp_swdev_port_attr_learning_limit_set(dev,
++							attr->u.learning_limit,
++							trans);
+ 	default:
+-		err = -EOPNOTSUPP;
+ 		break;
+ 	}
+-	return err;
++
++	return ret;
+ }
+ 
+ static int dp_swdev_port_attr_get(struct net_device *dev,
+@@ -897,133 +936,127 @@ static int dp_swdev_port_attr_get(struct net_device *dev,
+ {
+ 	struct net_device *br_dev;
+ 	struct br_info *br_info;
+-	dp_subif_t subif = {0};
+-	int err = 0;
+-	/*For this api default err return value "-EOPNOTSUPP"
+-	 * cannot be set as this blocks bridgeport offload_fwd_mark
+-	 * setting at linux bridge level("nbp_switchdev_mark_set")
+-	 */
++	int ret = DP_SUCCESS;
+ 
+ 	br_dev = netdev_master_upper_dev_get(attr->orig_dev);
+ 	if (!br_dev)
+-		return 0;
+-
+-	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "%s dp_get_netif_subifid failed for %s\n",
+-			 __func__, dev->name);
+-		return 0;
+-	}
++		return -EOPNOTSUPP;
+ 
+ 	switch (attr->id) {
+ 	case SWITCHDEV_ATTR_ID_PORT_PARENT_ID:
++		/* Default err return value "-EOPNOTSUPP"cannot be set as
++		 * this blocks bridgeport offload_fwd_mark setting at
++		 * linux bridge level("nbp_switchdev_mark_set")
++		 */
+ 		rcu_read_lock();
+-		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev->name);
++
++		br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 		if (!br_info) {
+ 			rcu_read_unlock();
+-			return 0;
++			return ret;
+ 		}
+ 		attr->u.ppid.id_len = sizeof(br_info->fid);
+ 		memcpy(&attr->u.ppid.id, &br_info->fid, attr->u.ppid.id_len);
++
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 			 "SWITCHDEV_ATTR_ID_PORT_PARENT_ID:%s fid=%d\n",
+ 			 attr->orig_dev ? attr->orig_dev->name : "NULL",
+ 			 br_info->fid);
++
+ 		rcu_read_unlock();
+ 		break;
+ 	case SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS:
+-		err =
+-		dp_swdev_port_attr_bridge_flags_get(dev,
+-						    &attr->u.brport_flags);
++		ret =
++		    dp_swdev_port_attr_bridge_flags_get(dev,
++							&attr->u.brport_flags);
+ 		break;
+ 	default:
+-		return 0;
++		break;
+ 	}
+-	return err;
++
++	return ret;
+ }
+ 
+ static int dp_swdev_port_obj_add(struct net_device *dev,
+ 				 const struct switchdev_obj *obj,
+ 				 struct switchdev_trans *trans)
+ {
+-	int err = -EOPNOTSUPP;
+ 	struct net_device *br_dev;
++	int ret = -EOPNOTSUPP;
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s id:%d flags:%d dev name:%s\r\n",
+ 		 __func__, obj->id, obj->flags, dev->name);
++
+ 	br_dev = netdev_master_upper_dev_get(obj->orig_dev);
+ 	if (!br_dev)
+-		return err;
++		return ret;
++
+ 	switch (obj->id) {
+ 	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+-		err = dp_swdev_filter_vlan(obj->orig_dev, obj, trans, br_dev);
++		ret = dp_swdev_filter_vlan(obj->orig_dev, obj, trans, br_dev);
+ 		break;
+ 	default:
+-		err = -EOPNOTSUPP;
+ 		break;
+ 	}
+-	return err;
++
++	return ret;
+ }
+ 
+ static int dp_swdev_port_obj_del(struct net_device *dev,
+ 				 const struct switchdev_obj *obj)
+ {
+-	int err = -EOPNOTSUPP;
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
+ 
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\r\n", __func__);
+-	switch (obj->id) {
+-	case SWITCHDEV_OBJ_ID_PORT_VLAN:
+-		break;
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-	return err;
++	return -EOPNOTSUPP;
+ }
+ 
+ int dp_notif_br_alloc(struct net_device *br_dev)
+ {
+-	int br_id = 0;
+-	struct br_info *br_info;
+ 	struct inst_info *dp_info = get_dp_prop_info(0);
++	struct br_info *br_info;
++	int br_id;
+ 
+ 	br_id = dp_info->swdev_alloc_bridge_id(0);
+-	if (br_id == -1) {
+-		pr_err("Switch bridge alloc failed\r\n");
+-		return br_id;
++	if (br_id == DP_FAILURE) {
++		pr_err("Switch bridge alloc failed\n");
++		return DP_FAILURE;
+ 	}
+-	if (dp_info->swdev_bridge_cfg_set(0, br_id) == 0) {
++
++	if (!dp_info->swdev_bridge_cfg_set(0, br_id)) {
+ 		br_info = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_info),
+ 				       GFP_ATOMIC);
+ 		if (!br_info) {
+-			return -1;
++			dp_info->swdev_free_brcfg(0, br_id);
++			return DP_FAILURE;
+ 		}
+-		br_info->fid = br_id;
+-		br_info->inst = 0;
+-		br_info->flag = 0;
+-		strcpy(br_info->br_device_name, br_dev->name);
++
+ 		INIT_LIST_HEAD(&br_info->bp_list);
++		br_info->dev = br_dev;
++		br_info->fid = br_id;
++
+ 		dp_swdev_insert_bridge_id_entry(br_info);
+ 	} else {
+-		pr_err("Switch configuration failed\r\n");
+-		return -1;
++		pr_err("Switch configuration failed\n");
++		return DP_FAILURE;
+ 	}
++
+ 	return br_id;
+ }
+ 
+ /* This function registers the created port in datapath to switchdev */
+ int dp_register_switchdev_ops(struct dp_dev *dp_dev, int reset)
+ {
+-	int i;
+-	u32 vap, flag = DP_OPS_SWITCHDEV;
+-	struct inst_info *inst_info = get_dp_prop_info(dp_dev->inst);
+-	void *cb[] = {&dp_swdev_port_attr_get, &dp_swdev_port_attr_set,
+-		      &dp_swdev_port_obj_add, &dp_swdev_port_obj_del};
+ 	int offset[] = {offsetof(struct switchdev_ops, switchdev_port_attr_get),
+ 			offsetof(struct switchdev_ops, switchdev_port_attr_set),
+ 			offsetof(struct switchdev_ops, switchdev_port_obj_add),
+ 			offsetof(struct switchdev_ops, switchdev_port_obj_del)};
++	void *cb[] = {&dp_swdev_port_attr_get, &dp_swdev_port_attr_set,
++		      &dp_swdev_port_obj_add, &dp_swdev_port_obj_del};
++	struct inst_info *inst_info = get_dp_prop_info(dp_dev->inst);
++	u32 vap, flag = DP_OPS_SWITCHDEV;
+ 	struct pmac_port_info *port_info;
+ 	struct dp_subif_info *sif;
++	int i;
+ 
+ 	port_info = get_dp_port_info(dp_dev->inst, dp_dev->ep);
+ 	vap = GET_VAP(dp_dev->ctp, port_info->vap_offset, port_info->vap_mask);
+@@ -1057,6 +1090,5 @@ void dp_switchdev_exit(void)
+ 
+ int dp_switchdev_init(void)
+ {
+-	dp_swdev_bridge_id_entry_init();
+-	return 0;
++	return dp_swdev_bridge_id_entry_init();
+ }
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.h b/drivers/net/datapath/dpm/datapath_swdev.h
+index 1381d810f396..db9c912ca915 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.h
++++ b/drivers/net/datapath/dpm/datapath_swdev.h
+@@ -12,21 +12,19 @@
+ #include <net/switch_api/lantiq_gsw_api.h> /*Switch related structures */
+ #include <net/switch_api/lantiq_gsw.h>
+ 
+-#define ENABLE 1
+-#define DISABLE 0
+-
+ #define BRIDGE_ID_ENTRY_HASH_LENGTH 6
+ #define BR_ID_ENTRY_HASH_TABLE_SIZE BIT(BRIDGE_ID_ENTRY_HASH_LENGTH)
+ 
+-#define ADD_BRENTRY	0x00000001
+-#define DEL_BRENTRY	0x00000002
+-#define BRIDGE_NO_ACTION 0x00000004
+-#define LOGIC_DEV_REGISTER 0x00000008
+-#define CPU_PORT_DISABLE   0x00000010
++#define ADD_BRENTRY		BIT(0)
++#define DEL_BRENTRY		BIT(1)
++#define BRIDGE_NO_ACTION	BIT(2)
++#define LOGIC_DEV_REGISTER	BIT(3)
++#define CPU_PORT_DISABLE	BIT(4)
+ 
+ #define DP_SWDEV_BRIDGE_ITEM 1
++
+ struct bridge_id_entry_item {
+-	u8 br_device_name[IFNAMSIZ];
++	struct net_device *dev;
+ 	u16 fid;
+ 	u32 flags;
+ 	u32 bportid; /*Bridge port*/
+@@ -38,7 +36,7 @@ struct bridge_id_entry_item {
+ 
+ struct br_info {
+ 	struct hlist_node br_hlist;
+-	u8 br_device_name[IFNAMSIZ];
++	struct net_device *dev;
+ 	u16 fid;
+ 	u32 flag;
+ 	u32 inst;
+@@ -63,14 +61,10 @@ struct fdb_tbl {
+ };
+ 
+ extern struct list_head fdb_tbl_list;
+-extern struct hlist_head
+-	g_bridge_id_entry_hash_table[DP_MAX_INST][BR_ID_ENTRY_HASH_TABLE_SIZE];
+ int dp_swdev_bridge_id_entry_free(int instance);
+ int dp_swdev_bridge_id_entry_init(void);
+-struct br_info *dp_swdev_bridge_entry_lookup_rcu(char *br_name);
++struct br_info *dp_swdev_bridge_entry_lookup_rcu(struct net_device *dev);
+ int dp_swdev_chk_bport_in_br(struct net_device *bp_dev, int bport, int inst);
+-u16 crc_cal(const u8 *data, u16 len);
+-u16 dp_swdev_cal_hash(u8 *dev_name);
+ void dp_switchdev_exit(void);
+ 
+ #endif /*DATAPATH_SWDEV_H*/
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index fb3f80b75257..bd5cb311f522 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -1796,12 +1796,17 @@ int dp_get_pmapper(struct net_device *dev, struct dp_pmapper *mapper, u32 flag);
+ int dp_dma_chan_irq_rx_enable(int inst, struct dp_dma_ch *ch, int flag);
+ 
+ /*!
+- *@brief Datapath Swdev API to get FID from bridge name
++ *@brief Datapath Swdev API to get FID from device
+  *@param[in] dev: network device pointer
+  *@param[out] inst: DP instance ID
+  *@return Returns GSWIP bridge id i.e. FID
+  */
+-int dp_get_fid_by_brname(struct net_device *dev, int *inst);
++int dp_get_fid_by_dev(struct net_device *dev, int *inst);
++/*!
++ *@note dp_get_fid_by_brname will be remove after all other drivers change
++ *      to dp_get_fid_by_dev
++ */
++#define dp_get_fid_by_brname(dev, inst) dp_get_fid_by_dev(dev, inst)
+ 
+ struct dp_spl_conn {
+ 	enum DP_SPL_TYPE type; /*!< [in] Special Connectity Type */

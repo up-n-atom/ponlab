@@ -1,0 +1,405 @@
+From 99889c019b0bb392616e55ca874a1cc4d427e304 Mon Sep 17 00:00:00 2001
+From: kavitha3 <k.subramanian@intel.com>
+Date: Fri, 4 Jan 2019 14:41:37 +0800
+Subject: [PATCH] Optimise the FSQM threshold levels, fsqm check, support ofr
+ LL debug
+
+---
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c       | 223 ++++++++++++++++++++-
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.h       |   7 +-
+ .../net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c   |  22 ++
+ 3 files changed, 241 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index e462ab83f70e..6332af3d6711 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -15,6 +15,7 @@
+ 			   (TYPE == DP_F_DEQ_CPU1) ||\
+ 			   (TYPE == DP_F_DEQ_MPE) ||\
+ 			   (TYPE == DP_F_DEQ_DL))
++#define FSQM_FRM_NUM (CQM_SRAM_SIZE / CQM_SRAM_FRM_SIZE)
+ static const char cqm_name[] = "cqm";
+ static void __iomem *bufreq[CQM_PRX300_NUM_POOLS];
+ static void __iomem *eqmdesc[4];
+@@ -22,7 +23,7 @@ static struct cbm_cntr_mode cbm_cntr_func[2];
+ static struct cqm_dqm_port_info dqm_port_info[CQM_PORT_MAX] = { {0} };
+ static struct cqm_eqm_port_info eqm_port_info[CQM_ENQ_PORT_MAX] = { {0} };
+ static struct cbm_desc_list g_cqm_dlist[4][CQM_DEQ_BUF_SIZE];
+-
++static bool touched[FSQM_FRM_NUM];
+ /*Maintain a shadow queue lookup table for fast
+  *processing of queue map get API
+  */
+@@ -42,6 +43,11 @@ static s32 cqm_dq_dma_chan_init(s32 cqm_port_id, u32 flags);
+ static void init_cqm_deq_cpu_port(int idx);
+ static s32 cqm_dequeue_dma_port_uninit(s32 cqm_port_id, u32 flags);
+ 
++#ifdef ENABLE_LL_DEBUG
++static void do_cbm_debug_tasklet(unsigned long cpu);
++static struct tasklet_struct cbm_debug_tasklet;
++#endif
++
+ #define FLAG_WAN (DP_F_FAST_ETH_WAN | DP_F_GPON | DP_F_EPON)
+ #define FLAG_LAN (DP_F_FAST_ETH_LAN | DP_F_GINT)
+ #define FLAG_ACA (DP_F_FAST_WLAN | DP_F_FAST_DSL)
+@@ -2424,6 +2430,48 @@ static inline int is_bm(u32 desc2)
+ 	return 0;
+ }
+ 
++#ifdef ENABLE_LL_DEBUG
++/** Trigger when taklet schedule calls*/
++static void do_cbm_debug_tasklet(unsigned long cpu)
++{
++	u32 err_port = 0;
++	u32 err_egpid = 0;
++	u32 err_igpid = 0;
++	u32 err_lsa = 0;
++	void *c_base = cqm_ctrl->cqm;
++
++	err_port = get_val(cbm_r32(c_base + CBM_LL_DBG),
++			   CBM_LL_DBG_ERR_PORT_MASK,
++			   CBM_LL_DBG_ERR_PORT_POS);
++
++	err_egpid = get_val(cbm_r32(c_base + CBM_LL_DBG),
++			    CBM_LL_DBG_ERR_EGPID_MASK,
++			    CBM_LL_DBG_ERR_EGPID_POS);
++
++	err_igpid = get_val(cbm_r32(c_base + CBM_LL_DBG),
++			    CBM_LL_DBG_ERR_IGPID_MASK,
++			    CBM_LL_DBG_ERR_IGPID_POS);
++
++	err_lsa = get_val(cbm_r32(c_base + CBM_LL_DBG),
++			  CBM_LL_DBG_ERR_LSA_MASK,
++			  CBM_LL_DBG_ERR_LSA_POS);
++	if (err_port)
++		pr_err("***Double free egp %u %u\n", err_egpid, err_lsa);
++	else
++		pr_err("***Double free igp %u %u\n", err_igpid, err_lsa);
++
++	cbm_w32(c_base + CQM_INT_LINE(5, cbm_irncr), 1 << 16);
++	cbm_r32(c_base + CQM_INT_LINE(5, cbm_irnicr));
++	/*Dummy read for write flush*/
++	cbm_r32(c_base + CQM_INT_LINE(5, cbm_irncr));
++	/*finish read*/
++	rmb();
++	/* Enable all interrupts */
++	cbm_w32((c_base + CQM_INT_LINE(5, cbm_irnen)), (1) << 16);
++}
++
++#endif
++
+ /** Trigger when taklet schedule calls*/
+ static void do_cqm_tasklet(unsigned long cpu)
+ {
+@@ -2570,6 +2618,16 @@ static irqreturn_t cqm_isr(int irq, void *dev_id)
+ 		set_val((c_base + CQM_INT_LINE(line, cbm_irnen)), 0,
+ 			CBM_IRNCR_0_CPUPI_MASK, CBM_IRNCR_0_CPUPI_POS);
+ 		tasklet_schedule(&cqm_ctrl->cqm_cpu_free_tasklet);
++#endif
++#ifdef ENABLE_LL_DEBUG
++	} else if (cbm_intr_status & CBM_IRNCR_0_LLI_MASK) {
++		/* Disable all interrupts */
++		set_val((c_base + CQM_INT_LINE(line, cbm_irnen)), 0,
++			CBM_IRNCR_0_LLI_MASK, CBM_IRNCR_0_LLI_POS);
++		/*Dummy Read, for write flush*/
++		cbm_r32((c_base + CQM_INT_LINE(line, cbm_irnen)));
++		/* Schedule the tasklet */
++		tasklet_schedule(&cbm_debug_tasklet);
+ #endif
+ 	} else {
+ 		/*spurious intr is also considered handled, to avoid
+@@ -2625,11 +2683,7 @@ static int cqm_interrupt_init(void)
+ 			return ret;
+ 		}
+ 		/* Set the Affinity to VPE1 */
+-		#ifdef ENABLE_LL_DEBUG
+-		cpumask.bits[0] = 0x4;
+-		#else
+ 		cpumask.bits[0] = 0x2;
+-		#endif
+ 		ret = irq_set_affinity(cqm_ctrl->cbm_irq[2], &cpumask);
+ 		if (ret) {
+ 			dev_err(cqm_ctrl->dev, "Can not set affinity for IRQ - %d",
+@@ -2682,14 +2736,17 @@ static int cqm_interrupt_init(void)
+ static void cqm_intr_mapping_init(void)
+ {
+ 	void *c_base = cqm_ctrl->cqm;
++	u32 reg_val = (0x1 << 8);
+ 	/*map LS, PIB intr to line 4 and CPU pool Interrupt*/
+ #ifdef CPU_POOL_ALLOWED
+-	cbm_w32((c_base + CQM_INT_LINE(4, cbm_irnen)), (0x1 << 8) | BIT(20));
+-#else
+-	cbm_w32((c_base + CQM_INT_LINE(4, cbm_irnen)), (0x1 << 8));
++	reg_val |= BIT(20);
++#endif
++#ifdef ENABLE_LL_DEBUG
++	reg_val |= BIT(16);
+ #endif
++	cbm_w32((c_base + CQM_INT_LINE(4, cbm_irnen)), reg_val);
+ 	/*map LS */
+-	cbm_w32((c_base + CQM_INT_LINE(5, cbm_irnen)), (0x2 << 8));
++	cbm_w32((c_base + CQM_INT_LINE(5, cbm_irnen)), 0x2 << 8);
+ 	cbm_w32((c_base + CQM_INT_LINE(6, cbm_irnen)), 0x4 << 8);
+ #ifdef CONFIG_CBM_LS_ENABLE
+ 	cbm_w32((c_base + CQM_INT_LINE(6, egp_irnen)), 0x4);
+@@ -2770,12 +2827,16 @@ static void dump_cqem_basic_regs(u32 flag)
+ static int init_cqm_basic(struct platform_device *pdev)
+ {
+ 	int tmp_v;
+-	u32 addr, version;
++	u32 version;
+ 	int frm_size_bit = (CQM_SRAM_FRM_SIZE == 128) ? 0 : 1;
+ 	int size;
+ 	void *c_base = cqm_ctrl->cqm;
+ 
+ 	dev_dbg(cqm_ctrl->dev, "[%s]Line %d\n", __func__, __LINE__);
++	#ifdef ENABLE_LL_DEBUG
++	set_val((c_base + CBM_CTRL), 1, CBM_CTRL_LL_DBG_MASK,
++		CBM_CTRL_LL_DBG_POS);
++	#endif
+ 	/* base address of internal packet buffer managed by the FSQM */
+ 	cbm_w32(c_base + CBM_PB_BASE, CQM_SRAM_BASE);
+ 
+@@ -2816,6 +2877,7 @@ static int init_cqm_basic(struct platform_device *pdev)
+ 	WARN_ON(cqm_ctrl->max_mem_alloc >=
+ 		CONFIG_CMA_SIZE_MBYTES * 1024 * 1024);
+ 	tmp_v = TOT_DMA_HNDL - 1;
++#ifdef CPU_POOL_ALLOWED
+ 	cqm_ctrl->cpu_rtn_ptr = dma_alloc_attrs(&pdev->dev, size,
+ 						&cqm_ctrl->dma_hndl_p[tmp_v],
+ 						GFP_KERNEL,
+@@ -2841,6 +2903,7 @@ static int init_cqm_basic(struct platform_device *pdev)
+ 		addr);
+ 	cbm_w32((c_base + CBM_CPU_POOL_BUF_ALW_NUM),
+ 		CQM_CPU_POOL_BUF_ALW_NUM);
++#endif
+ 	version = cbm_r32(c_base + CBM_VERSION_REG);
+ 	dev_dbg(cqm_ctrl->dev,
+ 		"Basic init of CQM successful ver Major: %u Minor: %u\n",
+@@ -3604,6 +3667,142 @@ static int conf_bm(struct cqm_data *pdata)
+ 	return CBM_SUCCESS;
+ }
+ 
++void fsqm_ofsq_read(struct fsq *fsq)
++{
++	u32 reg;
++
++	reg = cbm_r32(cqm_ctrl->fsqm + OFSQ);
++	fsq->head = (reg & OFSQ_HEAD_MASK) >> OFSQ_HEAD_POS;
++	fsq->tail = (reg & OFSQ_TAIL_MASK) >> OFSQ_TAIL_POS;
++#ifdef HEAD_TAIL_SUPERVISION
++	if (fsq->head > initial_tail) {
++		pr_err("%s %x %s %x\n",
++		       "fsqm_ofsq_read: head", fsq->head,
++			   "exceeds initial head", initial_tail);
++	}
++	if (fsq->tail < initial_head) {
++		pr_err("%s %x %s %x\n",
++		       "fsqm_ofsq_read: tail", fsq->tail,
++			   "underrun initial tail", initial_head);
++	}
++#endif
++}
++
++bool fsqm_check(uint16_t len)
++{
++	bool pass;
++	u16 reg;
++	u16 cnt;
++	struct fsq fsq;
++	u16 head, tail, next;
++	void *fsqm = cqm_ctrl->fsqm;
++
++	pass = true;
++
++	memset(&touched[0], 0x00, sizeof(touched));
++
++	/* freeze fsqm */
++	set_val(fsqm + FSQM_CTRL, 1, FSQM_CTRL_ALLOC_DIS_MASK,
++		FSQM_CTRL_ALLOC_DIS_POS);
++
++	/* check: free segment queue is back at its original length */
++	reg = cbm_r32(fsqm + OFSC);
++	if (len) {
++		if (reg == len) {
++			dev_info(cqm_ctrl->dev,
++				 "pass: OFSC is back at its expected value");
++		} else {
++			dev_info(cqm_ctrl->dev, "%s %s %d\n",
++				 "error: OFSC is NOT back ",
++				 "at its original length =", reg);
++			pass = false;
++		}
++	} else {
++		len = reg;
++	}
++	/* check: free segment queue is not corrupt
++	 * step through the free segment queue, starting from the head LSA,
++	 * and follow the next pointers until the tail LSA is reached.
++	 * In an array, mark all LSAs which were touched while stepping through.
++	 * If the FSQ touches the same LSA twice, the FSQ is corrupt.
++	 */
++	for (cnt = 0; cnt < FSQM_FRM_NUM; cnt++)
++		touched[cnt] = false;
++
++	fsqm_ofsq_read(&fsq);	/* get head LSA */
++	head = fsq.head;
++	tail = fsq.tail;
++	dev_info(cqm_ctrl->dev, "start with head: 0x%x tail: 0x%x", head, tail);
++	touched[head] = true;
++
++	for (cnt = 0; cnt < (len - 1); cnt++) {
++		next =  cbm_r32(FSQM_LLT_RAM(fsqm, head));
++		dev_info(cqm_ctrl->dev, "[%5d] %s 0x%04x %s 0x%04x\n", cnt,
++			 "llt addr:", head, "llt data:", next);
++
++		if (next == 0x7fff) {
++			dev_info(cqm_ctrl->dev, "[%5d] %s %s\n", cnt,
++				 "error: Unexpected end of FSQ NIL value",
++				 "detected before reaching TAIL segment");
++			head = next;
++			pass = false;
++			cnt++;
++			break;
++		}
++
++		if (next == tail && cnt != (len - 2)) {
++			dev_info(cqm_ctrl->dev, "[%5d] %s %s 0x04%x\n", cnt,
++				 "error: Correct TAIL segment reached",
++				 "but too early (list shortened)",
++				  next);
++			head = next;
++			pass = false;
++			cnt++;
++			break;
++		}
++
++		if (next >= FSQM_FRM_NUM) {
++			dev_info(cqm_ctrl->dev, "[%5d] %s 0x04%x\n", cnt,
++				 "error: LLT next pointer out ofrange: ",
++				 next);
++			head = next;
++			pass = false;
++			cnt++;
++			break;
++		}
++
++		if (!touched[next]) {
++			touched[next] = true;
++		} else {
++			dev_info(cqm_ctrl->dev, "%s %s\n",
++				 "error: FSQ touches the same LSA",
++				 " twice the FSQ is corrupt\n");
++			pass = false;
++		}
++
++		head = next;
++	}
++
++	next =  cbm_r32(FSQM_LLT_RAM(fsqm, head));
++	dev_info(cqm_ctrl->dev, "[%5d] llt addr: 0x%04x llt data: 0x%04x", cnt,
++		 head, next);
++
++	tail = fsq.tail;
++	if (tail == head) {
++		dev_info(cqm_ctrl->dev, "Arrived at FSQ tail LSA");
++	} else {
++		dev_info(cqm_ctrl->dev, "[%5d] %s 0x%x %s %s0x%x\n",
++			 cnt, "error: FSQ tail LSA:", tail, "does not match",
++			 "last next LSA: ", head);
++		pass = false;
++	}
++
++	/* unfreeze fsqm */
++	set_val(fsqm + FSQM_CTRL, 0, FSQM_CTRL_ALLOC_DIS_MASK,
++		FSQM_CTRL_ALLOC_DIS_POS);
++	return pass;
++}
++
+ static int cqm_prx300_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res[PRX300_MAX_RESOURCE] = {NULL};
+@@ -3762,6 +3961,10 @@ static int cqm_prx300_probe(struct platform_device *pdev)
+ 	tasklet_init(&cqm_ctrl->cqm_cpu_free_tasklet,
+ 		     cqm_cpu_free_tasklet, (unsigned long)i);
+ #endif
++#ifdef ENABLE_LL_DEBUG
++	tasklet_init(&cbm_debug_tasklet,
++		     do_cbm_debug_tasklet, (unsigned long)i);
++#endif
+ #ifdef CONFIG_CBM_LS_ENABLE
+ 	init_dummy_netdev(&g_cbm_ctrl.dummy_dev);
+ 	netif_napi_add(&g_cbm_ctrl.dummy_dev, &g_cbm_ctrl.napi,
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+index b6f2c9cdc429..e3a508209531 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+@@ -28,7 +28,6 @@
+ #include "reg/cqem_pon_ip_if.h"
+ #include "cqm_config.h"
+ 
+-#define CPU_POOL_ALLOWED 0
+ #define FREE_BUDGET 30
+ /*#define CBM_DEBUG 1*/
+ /*#define CBM_DEBUG_LVL_1 1*/
+@@ -608,6 +607,11 @@ struct cqm_buf_dbg_cnt {
+ 	atomic_t isr_free_cnt;
+ };
+ 
++struct fsq {
++	u16 head;
++	u16 tail;
++};
++
+ extern
+ struct cqm_buf_dbg_cnt cqm_dbg_cntrs[CQM_MAX_POLICY_NUM][CQM_MAX_POOL_NUM];
+ 
+@@ -617,6 +621,7 @@ struct cqm_buf_dbg_cnt cqm_dbg_cntrs[CQM_MAX_POLICY_NUM][CQM_MAX_POOL_NUM];
+ void cqm_read_dma_desc_prep(int port, void **base_addr, int *num_desc);
+ void cqm_read_dma_desc_end(int port);
+ int get_fsqm_ofsc(void);
++bool fsqm_check(uint16_t len);
+ void *cqm_get_enq_base(void);
+ void *cqm_get_deq_base(void);
+ void *cqm_get_dma_desc_base(void);
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c
+index 9dfcdb7bf2ea..2b68f6129382 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm_debugfs.c
+@@ -1655,6 +1655,24 @@ static const struct file_operations cqm_ofsc_fops = {
+ 	.release = single_release,
+ };
+ 
++static int cqm_ofsq_read(struct seq_file *s, void *v)
++{
++	seq_printf(s, "0x%08x\n", fsqm_check(0));
++	return 0;
++}
++
++static int cqm_ofsq_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, cqm_ofsq_read, inode->i_private);
++}
++
++static const struct file_operations cqm_ofsq_fops = {
++	.open = cqm_ofsq_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = single_release,
++};
++
+ int cqm_debugfs_init(struct cqm_ctrl *pctrl)
+ {
+ 	char cqm_dir[64] = {0};
+@@ -1702,6 +1720,10 @@ int cqm_debugfs_init(struct cqm_ctrl *pctrl)
+ 				   pctrl, &cqm_ofsc_fops);
+ 	if (!file)
+ 		goto err;
++	file = debugfs_create_file("check_fsqm", 0644, pctrl->debugfs,
++				   pctrl, &cqm_ofsq_fops);
++	if (!file)
++		goto err;
+ 	file = debugfs_create_file("pkt_count", 0644, pctrl->debugfs,
+ 				   pctrl, &cqm_dbg_cntrs_fops);
+ 	if (!file)

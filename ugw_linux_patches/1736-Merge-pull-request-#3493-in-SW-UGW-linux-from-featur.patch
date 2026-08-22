@@ -1,0 +1,481 @@
+From d3fb466507f5887e5b39204bd06d9db6a4964e85 Mon Sep 17 00:00:00 2001
+From: chdugw_auto <jkulkarni@maxlinear.com>
+Date: Thu, 26 Aug 2021 18:13:56 +0300
+Subject: [PATCH] Merge pull request #3493 in SW_UGW/linux from
+ feature/PONRTSYS-9198-support-bridging-domains-in-pon-and-lan-ethernet-driver-prx
+ to master
+
+* commit 'd3389c08b51a71a69e86ac271034ee79f703dda0':
+  PONRTSYS-9198: Fix PON QOS TC multicast control
+  PONRTSYS-9198: Support for bridging domains in pon hgu vuni driver
+  PONRTSYS-9198: Bridging domains LAN support
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c |   5 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_parser.c |  12 ++-
+ drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.c |  76 +++++++++++++++--
+ drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.h |   1 +
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c | 101 +++++++++++++++++++++--
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h |   2 +
+ include/dt-bindings/net/lantiq,prx300-eth.h      |  19 +++++
+ include/dt-bindings/net/mxl,vuni.h               |  19 +++++
+ include/net/datapath_api.h                       |   1 +
+ include/net/datapath_br_domain.h                 |  19 +++++
+ 10 files changed, 238 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+index 6df4fddcfc73..bdc6e7ece592 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+@@ -235,10 +235,9 @@ static int pon_qos_tc_to_pce(struct net_device *dev,
+ 	if (ret != 0)
+ 		return ret;
+ 
+-	/* TODO: Use portmap instead of portfilter */
+ 	if (pon_qos_tc_parse_is_mcc(dev, f))
+-		pce_rule->action.ePortFilterType_Action =
+-			GSW_PCE_PORT_FILTER_ACTION_6;
++		pce_rule->action.ePortMapAction =
++			GSW_PCE_ACTION_PORTMAP_ALTERNATIVE;
+ 	else
+ 		pce_rule->action.ePortFilterType_Action =
+ 			GSW_PCE_PORT_FILTER_ACTION_1;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c b/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c
+index ddadaefc7bfa..46c9418831ac 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_parser.c
+@@ -15,6 +15,8 @@
+ #include <uapi/linux/icmpv6.h>
+ #include "pon_qos_tc_parser.h"
+ 
++#define PON_PORT_ID 2
++
+ void pon_qos_tc2pce_subif_parse(struct net_device *dev,
+ 				GSW_PCE_rule_t *pce_rule,
+ 				int ifindex)
+@@ -38,8 +40,16 @@ void pon_qos_tc2pce_subif_parse(struct net_device *dev,
+ 	 * configured for all sub interfaces. This is for example the case
+ 	 * for pon0.
+ 	 */
+-	if (ret != DP_SUCCESS)
++	if (ret != DP_SUCCESS) {
++		if (dev != indev)
++			return;
++		/* If dev is equal indev assume that this rule should be
++		 * configured only for PON sub interface.
++		 */
++		pce_rule->pattern.bPortIdEnable = 1;
++		pce_rule->pattern.nPortId = PON_PORT_ID;
+ 		return;
++	}
+ 
+ 	pce_rule->logicalportid = dp_subif.port_id;
+ 	pce_rule->pattern.bPortIdEnable = 1;
+diff --git a/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.c b/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.c
+index 55e3d5bc4fab..bd49cb496095 100644
+--- a/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.c
++++ b/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.c
+@@ -19,8 +19,11 @@
+ #include <linux/of_device.h>
+ 
+ #include <net/datapath_api.h>
++#include <net/datapath_br_domain.h>
+ #include "intel_pon_hgu_vuni.h"
+ 
++#include <dt-bindings/net/mxl,vuni.h>
++
+ #define MAX_SUB_IF 5
+ 
+ #define DRV_MODULE_NAME		"intel_pon_hgu_vuni"
+@@ -61,6 +64,7 @@ static int32_t dp_fp_rx(struct net_device *, struct net_device *,
+ 			struct sk_buff *, int32_t);
+ 
+ const char *string_array[MAX_SUB_IF]={NULL};
++static u32 eth_subif_domain[MAX_SUB_IF];
+ static struct vuni_hw vuni_hw;
+ 
+ static struct module g_intel_vuni_module[NUM_IF];
+@@ -380,6 +384,44 @@ static int vuni_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 	return -EOPNOTSUPP;
+ }
+ 
++static void vuni_domain_set(struct net_device *dev,
++			    struct dp_subif_data *data)
++{
++	struct intel_vuni_priv *priv;
++
++	priv = netdev_priv(dev);
++	if (priv->extra_subif_domain != VUNI_BR_DOMAIN_NO) {
++		data->flag_ops |= DP_SUBIF_BR_DOMAIN;
++
++		switch (priv->extra_subif_domain) {
++		case VUNI_BR_DOMAIN_UC:
++			data->domain_id = DP_BR_DM_UC;
++			break;
++		case VUNI_BR_DOMAIN_MC:
++			data->domain_id = DP_BR_DM_MC;
++			break;
++		case VUNI_BR_DOMAIN_BC:
++			data->domain_id = DP_BR_DM_BC1;
++			break;
++		case VUNI_BR_DOMAIN_US:
++			data->domain_id = DP_BR_DM_US;
++			break;
++		default:
++			data->domain_id = DP_BR_DM_UC;
++			break;
++		}
++
++		if (priv->extra_subif_domain == VUNI_BR_DOMAIN_UC)
++			data->domain_members = DP_BR_DM_MEMBER(DP_BR_DM_UC) |
++					       DP_BR_DM_MEMBER(DP_BR_DM_BC1);
++		else if (priv->extra_subif_domain == VUNI_BR_DOMAIN_US)
++			data->domain_members = DP_BR_DM_MEMBER(DP_BR_DM_UC);
++
++		pr_info("domain set for dev %s id %d member 0x%x\n",
++			dev->name, data->domain_id, data->domain_members);
++	}
++}
++
+ /* init of the network device */
+ static int vuni_init(struct net_device *dev)
+ {
+@@ -405,6 +447,7 @@ static int vuni_init(struct net_device *dev)
+ 	} else {
+ 		priv->dp_subif.subif = -1;
+ 		priv->dp_subif.port_id = priv->dp_port_id;
++		vuni_domain_set(dev, &data);
+ 		ret = dp_register_subif_ext(0, priv->owner,
+ 					    dev, dev->name, &priv->dp_subif,
+ 					    NULL, 0);
+@@ -490,6 +533,7 @@ static int intel_vuni_dev_reg(struct net_device *dev_0, struct vuni_hw *hw,
+ 			snprintf(eth_dev[hw->num_devs][i]->name,
+ 				 IFNAMSIZ, string_array[i],
+ 				 hw->num_devs);
++			priv->extra_subif_domain = eth_subif_domain[i];
+ 		}
+ 		eth_dev[hw->num_devs][i]->netdev_ops = &intel_vuni_drv_ops;
+ 		ltq_eth_drv_eth_addr_setup(eth_dev[hw->num_devs][i],
+@@ -571,6 +615,7 @@ static int vuni_of_iface(struct vuni_hw *hw, struct device_node *iface,
+ 	struct dp_port_data data = {0};
+ 	dp_pmac_cfg_t pmac_cfg;
+ 	u32 extra_subif_param;
++	int extra_subif_domain_num = 0;
+ 	int net_start = 0, net_end = 0;
+ 	dp_cb_t cb = {0};
+ 	u32 dp_port_id = 0;
+@@ -601,19 +646,33 @@ static int vuni_of_iface(struct vuni_hw *hw, struct device_node *iface,
+ 	}
+ 	ret = of_property_read_string_array(iface, "intel,extra-subif",
+ 				   string_array, extra_subif_param);
++	extra_subif_domain_num =
++		of_property_read_variable_u32_array(iface,
++						    "intel,extra-subif-domain",
++						    eth_subif_domain,
++						    MAX_SUB_IF, MAX_SUB_IF);
+ 	if (ret < 0) {
+ 		pr_info("Property intel,extra-subif not exist for if %s %d\n",
+ 			name, extra_subif_param);
+ 		priv->extra_subif = 0;
++	} else if ((extra_subif_domain_num < 0 &&
++		    extra_subif_domain_num != -EINVAL) ||
++		   (extra_subif_domain_num > 0 &&
++		    extra_subif_domain_num != extra_subif_param)) {
++		/* no error if property is not existing */
++		pr_info("Property intel,extra-subif-domain not correct: %d\n",
++			extra_subif_domain_num);
++		priv->extra_subif = 0;
+ 	} else {
+-			for (i = 0; i < extra_subif_param ; i++) {
+-				pr_info("Property intel,extra-subif for if %s %d\n",
+-				string_array[i], i);
+-			}
+-			priv->extra_subif = extra_subif_param;
+-			/* Traffic between diff subif */
+-			if (!of_property_read_bool(iface, "intel,allow_subif_data_loop"))
+-				data.flag_ops = DP_F_DATA_NO_LOOP;
++		for (i = 0; i < extra_subif_param ; i++) {
++			pr_info("Property intel,extra-subif for if %s %d %d\n",
++				string_array[i], i, eth_subif_domain[i]);
++		}
++		priv->extra_subif = extra_subif_param;
++		/* Traffic between diff subif */
++		if (!of_property_read_bool(iface,
++					   "intel,allow_subif_data_loop"))
++			data.flag_ops = DP_F_DATA_NO_LOOP;
+ 	}
+ 	priv->start = 0;
+ 	priv->end = priv->extra_subif - 1;
+@@ -705,6 +764,7 @@ static int intel_vuni_drv_init(struct platform_device *pdev)
+ 	struct device_node *iface_np;
+ 
+ 	memset(g_intel_vuni_module, 0, sizeof(g_intel_vuni_module));
++	memset(eth_subif_domain, VUNI_BR_DOMAIN_NO, sizeof(eth_subif_domain));
+ 
+ 	/* load the interfaces */
+ 	/* add a dummy interface */
+diff --git a/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.h b/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.h
+index 51e0a8b6484a..b19d221b2304 100644
+--- a/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.h
++++ b/drivers/net/ethernet/lantiq/intel_pon_hgu_vuni.h
+@@ -38,6 +38,7 @@ struct intel_vuni_priv {
+ 	int id;
+ 	int vani;
+ 	int extra_subif;
++	u32 extra_subif_domain;
+ 	/*! min netdevices for extra subif/lct */
+ 	int start;
+ 	/*! max netdevices for extra subif/lct */
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index 658fbf0e5b81..eeef0b6546a7 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -23,6 +23,7 @@
+ #include <linux/of_device.h>
+ #include <linux/thermal.h>
+ #include <linux/delay.h>
++#include <dt-bindings/net/lantiq,prx300-eth.h>
+ #include <net/switchdev.h>
+ 
+ #ifdef CONFIG_USERSPACE_LINK_NOTIFICATION
+@@ -31,6 +32,7 @@
+ 
+ #include <lantiq.h>
+ #include <net/datapath_api.h>
++#include <net/datapath_br_domain.h>
+ #include <net/lantiq_cbm_api.h>
+ #include <net/switch_api/lantiq_gsw_api.h>
+ #include <net/switch_api/gsw_dev.h>
+@@ -1188,6 +1190,28 @@ static int ltq_eth_init(struct net_device *dev)
+ 	data.flag_ops |= DP_SUBIF_RX_FLAG;
+ 	data.rx_en_flag = netif_running(dev);
+ 
++#ifndef CONFIG_INTEL_DATAPATH_HAL_GSWIP30
++	data.flag_ops |= DP_SUBIF_BR_DOMAIN;
++	data.domain_id = priv->bridge_domain;
++	if (data.domain_id == DP_BR_DM_UC) {
++		data.domain_members |= DP_BR_DM_MEMBER(data.domain_id);
++		/* As broadcast GEM traffic should go to LAN[0] make it a
++		 * member of broadcast domain 1. LAN[x] gets also broadcast
++		 * GEM traffic but as member of broadcast domain 2.
++		 * Both LAN ports have to use different domains to avoid
++		 * loops e.g. from main port subif=0 of the first port to
++		 * the additional broadcast subif of the second port when
++		 * the broadcast GEM is shared.
++		 */
++		if (!priv->lan_id)
++			data.domain_members |= DP_BR_DM_MEMBER(DP_BR_DM_BC1);
++		else
++			data.domain_members |= DP_BR_DM_MEMBER(DP_BR_DM_BC2);
++	}
++	if (data.domain_id == DP_BR_DM_US)
++		data.domain_members |= DP_BR_DM_MEMBER(DP_BR_DM_UC);
++#endif
++
+ 	if (priv->lct_en == 1)
+ 		data.flag_ops |= DP_F_DATA_LCT_SUBIF;
+ 
+@@ -2079,8 +2103,69 @@ static void ltq_eth_iphost_cpu_disconnect(struct net_device *dev)
+ 	dp_set_bp_attr(&conf, 0);
+ }
+ 
+-static int ltq_eth_dev_reg(struct xrx500_hw *hw, u32 xgmac_id_param,
+-			   u32 lct_en, u32 dp_port, int start, int end,
++static int ltq_eth_dev_bridge_domain_set(struct ltq_eth_priv *priv,
++					 struct device_node *iface,
++					 int index)
++{
++	int err;
++	u32 bridge_domain, lan_id;
++
++	err = of_property_read_u32(iface, "reg", &lan_id);
++	if (err != 0) {
++		pr_err("%s: property [%s] read error(%d)\n",
++		       __func__, "reg", err);
++		return err;
++	}
++	priv->lan_id = lan_id;
++
++	err = of_property_read_u32_index(iface, "mxl,bridge-domain",
++					 index, &bridge_domain);
++	if (err != 0) {
++		if (err == -EINVAL) {
++			pr_debug("%s: property [%s:%d] does not exist, using default value [%d]\n",
++				 __func__, "mxl,bridge-domain", index,
++				 DP_BR_DM_UC);
++			/* Use default value */
++			priv->bridge_domain = DP_BR_DM_UC;
++			return 0;
++		}
++		pr_err("%s: property [%s:%d] read error(%d)\n",
++		       __func__, "mxl,bridge-domain", index, err);
++		return err;
++	}
++
++	pr_debug("%s: Parsed bridge-domain [%u] for index [%d]\n", __func__,
++		 bridge_domain, index);
++
++	switch (bridge_domain) {
++	case UNI_BR_DOMAIN_UC:
++		priv->bridge_domain = DP_BR_DM_UC;
++		break;
++	case UNI_BR_DOMAIN_MC:
++		priv->bridge_domain = DP_BR_DM_MC;
++		break;
++	case UNI_BR_DOMAIN_BC1:
++		priv->bridge_domain = DP_BR_DM_BC1;
++		break;
++	case UNI_BR_DOMAIN_BC2:
++		priv->bridge_domain = DP_BR_DM_BC2;
++		break;
++	case UNI_BR_DOMAIN_US:
++		priv->bridge_domain = DP_BR_DM_US;
++		break;
++	default:
++		priv->bridge_domain = DP_BR_DM_UC;
++		break;
++	}
++
++	pr_debug("%s: Assigned bridge-domain [%u] for index [%d]\n", __func__,
++		 priv->bridge_domain, index);
++	return 0;
++}
++
++static int ltq_eth_dev_reg(struct xrx500_hw *hw, struct device_node *iface,
++			   u32 xgmac_id_param, u32 lct_en, u32 dp_port,
++			   int start, int end,
+ 			   struct ltq_eth_priv *master)
+ {
+ 	int i, err, num = 1;
+@@ -2101,6 +2186,9 @@ static int ltq_eth_dev_reg(struct xrx500_hw *hw, u32 xgmac_id_param,
+ 		priv->id = hw->num_devs;
+ 		priv->owner = &g_ltq_eth_module[hw->num_devs];
+ 		sprintf(priv->owner->name, "module%02d", priv->id);
++		err = ltq_eth_dev_bridge_domain_set(priv, iface, i + 1);
++		if (err != 0)
++			return err;
+ 		if (start == i && lct_en == 1) {
+ 			priv->lct_en = 1;
+ 			snprintf(eth_dev[hw->num_devs][i]->name, IFNAMSIZ,
+@@ -2318,6 +2406,9 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 
+ 	priv->owner = &g_ltq_eth_module[hw->num_devs];
+ 	sprintf(priv->owner->name, "module%02d", priv->id);
++	ret = ltq_eth_dev_bridge_domain_set(priv, iface, 0);
++	if (ret != 0)
++		return ret;
+ 
+ 	dp_port_id = dp_alloc_port_ext(0, priv->owner, hw->devs[hw->num_devs],
+ 				       dp_dev_port_param, dp_port_id_param,
+@@ -2394,9 +2485,9 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 	if (extra_subif_param >= 1) {
+ 		net_start = priv->start;
+ 		net_end = priv->end;
+-		ltq_eth_dev_reg(&xrx500_hw, priv->xgmac_id, lct_en_param,
+-				dp_port_id_param, net_start, net_end,
+-				priv);
++		ltq_eth_dev_reg(&xrx500_hw, iface, priv->xgmac_id,
++				lct_en_param, dp_port_id_param,
++				net_start, net_end, priv);
+ 	}
+ 
+ 	hw->num_devs++;
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+index d0a635ec4411..7d5ed0bf206f 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+@@ -86,6 +86,8 @@ struct ltq_eth_priv {
+ 	int jumbo_enabled;
+ 	int lct_en;
+ 	int extra_subif;
++	u8 bridge_domain;
++	u8 lan_id;
+ 	/*! min netdevices for extra subif/lct */
+ 	int start;
+ 	/*! max netdevices for extra subif/lct */
+diff --git a/include/dt-bindings/net/lantiq,prx300-eth.h b/include/dt-bindings/net/lantiq,prx300-eth.h
+new file mode 100644
+index 000000000000..d7c377def204
+--- /dev/null
++++ b/include/dt-bindings/net/lantiq,prx300-eth.h
+@@ -0,0 +1,19 @@
++ /* SPDX-License-Identifier: GPL-2.0 */
++ /*
++  *  Copyright (C) 2021 MAXLINEAR Corporation.
++  */
++#ifndef __LTQ_PRX300_ETH_H
++#define __LTQ_PRX300_ETH_H
++
++/* Bridge domain: unicast */
++#define UNI_BR_DOMAIN_UC 0
++/* Bridge domain: multicast */
++#define UNI_BR_DOMAIN_MC 1
++/* Bridge domain: broadcast one */
++#define UNI_BR_DOMAIN_BC1 2
++/* Bridge domain: broadcast two */
++#define UNI_BR_DOMAIN_BC2 3
++/* Bridge domain: upstream */
++#define UNI_BR_DOMAIN_US 4
++
++#endif
+diff --git a/include/dt-bindings/net/mxl,vuni.h b/include/dt-bindings/net/mxl,vuni.h
+new file mode 100644
+index 000000000000..7ba08dbe65b6
+--- /dev/null
++++ b/include/dt-bindings/net/mxl,vuni.h
+@@ -0,0 +1,19 @@
++ /* SPDX-License-Identifier: GPL-2.0 */
++ /*
++  *  Copyright (C) 2021 MAXLINEAR Corporation.
++  */
++#ifndef __MXL_VUNI_H
++#define __MXL_VUNI_H
++
++/* Bridge domain: none */
++#define VUNI_BR_DOMAIN_NO 0
++/* Bridge domain: unicast */
++#define VUNI_BR_DOMAIN_UC 1
++/* Bridge domain: multicast */
++#define VUNI_BR_DOMAIN_MC 2
++/* Bridge domain: broadcast */
++#define VUNI_BR_DOMAIN_BC 3
++/* Bridge domain: upstream */
++#define VUNI_BR_DOMAIN_US 4
++
++#endif
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index ec32c8c66fa9..5bdf1a1ff02d 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -967,6 +967,7 @@ struct dp_subif_data {
+ 	u8 domain_id:5;	/*!< [in] we support 32 domain per bridge only
+ 			 * valid only DP_SUBIF_BR_DOMAIN is set in flag_ops
+ 			 */
++	#define DP_BR_DM_MEMBER(domain) (1 << (domain))
+ 	u32 domain_members; /*!< [in] one bit for one domain_id:
+ 			     * bit 0 for domain_id 0, bit 1 for domain 1 and so on.
+ 			     * If one bit is set to 1, the traffic received
+diff --git a/include/net/datapath_br_domain.h b/include/net/datapath_br_domain.h
+new file mode 100644
+index 000000000000..459dd2ac1b29
+--- /dev/null
++++ b/include/net/datapath_br_domain.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++  *  Copyright (C) 2021 MAXLINEAR Corporation.
++  */
++#ifndef __DATAPATH_BR_DOMAIN_H
++#define __DATAPATH_BR_DOMAIN_H
++
++/*! @brief enum DP_SUBIF_BR_DM_TT
++ *  Specific domains for traffic types.
++ */
++enum DP_SUBIF_BR_DM_TT {
++	DP_BR_DM_UC = 0, /*!< Unicast domain */
++	DP_BR_DM_MC = 1, /*!< Multicast domain */
++	DP_BR_DM_BC1 = 2, /*!< Broadcast domain one */
++	DP_BR_DM_BC2 = 3, /*!< Broadcast domain two */
++	DP_BR_DM_US = 4, /*!< Upstream domain */
++};
++
++#endif

@@ -1,0 +1,230 @@
+From 8af56439f2e04d8d9cc4261fb04d58a22f06688b Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Fri, 7 Jun 2019 11:10:11 +0800
+Subject: [PATCH] DRVLIB_SW-2329/DRVLIB_SW-2358: shift register freq to high &
+ remove clock source and freq setting in LED driver
+
+---
+ drivers/clocksource/intel-gptc-timer.c | 12 ++++-----
+ drivers/gpio/gpio-intel-sso.c          | 33 +++++++++++++++++++++++
+ drivers/leds/leds-intel-sso.c          | 48 +++-------------------------------
+ 3 files changed, 42 insertions(+), 51 deletions(-)
+
+diff --git a/drivers/clocksource/intel-gptc-timer.c b/drivers/clocksource/intel-gptc-timer.c
+index 178f0e3220fb..dd06016d5831 100644
+--- a/drivers/clocksource/intel-gptc-timer.c
++++ b/drivers/clocksource/intel-gptc-timer.c
+@@ -118,6 +118,7 @@ struct gptc_timer {
+ 	u32 irq;
+ 	u32 type;
+ 	u32 frequency;
++	unsigned long cycles;
+ 	enum gptc_cnt_dir dir;
+ 	bool used;
+ 	bool irq_registered;
+@@ -383,7 +384,7 @@ static void gptc_per_timer_init(struct gptc_timer *timer)
+ 	gptc_count_dir(timer);
+ 	gptc_enable_32bit_timer(timer);
+ 	if (timer->type == TIMER_TYPE_HEARTBEAT)
+-		gptc_reload_counter(timer, 1); /* TODO for interval */
++		gptc_reload_counter(timer, timer->cycles);
+ 	else
+ 		gptc_reset_counter(timer);
+ 	if (timer->type == TIMER_TYPE_CLK_SRC ||
+@@ -546,11 +547,6 @@ static int gptc_of_parse_timer(struct gptc *gptc)
+ 			 __func__, clkspec.args_count, clkspec.args[0],
+ 			 clkspec.args[1], clkspec.args[2]);
+ 
+-		if (clkspec.args_count != 3) {
+-			pr_err("%s: invalid gptc clk property\n", __func__);
+-			return -EINVAL;
+-		}
+-
+ 		type = clkspec.args[0];
+ 		tid = clkspec.args[1];
+ 		cpuid = clkspec.args[2];
+@@ -591,6 +587,8 @@ static int gptc_of_parse_timer(struct gptc *gptc)
+ 			timer->irq = 0;
+ 			timer->dir = GPTC_COUNT_DOWN;
+ 			timer->cpuid = 0;
++			timer->cycles = ((clkspec.args_count > 3)
++					 ? clkspec.args[3] : 1);
+ 			list_add_tail(&timer->heartbeat, &gptc_heartbeat_list);
+ 			break;
+ 		case TIMER_TYPE_CLK_EVT:
+@@ -1224,7 +1222,7 @@ static int gptc_remove(struct platform_device *pdev)
+  * GPTC might not be used as clock source in PRX300.
+  * GPTC driver for prx300 has same function scopes as other soc,
+  * but it uses platform device instead of clock source init API
+- * to better support senarios that it is not used as clock source.
++ * to better support scenarios that it is not used as clock source.
+  */
+ static struct platform_driver gptc_drv = {
+ 	.probe = gptc_probe,
+diff --git a/drivers/gpio/gpio-intel-sso.c b/drivers/gpio/gpio-intel-sso.c
+index 310d9302f4bc..581ebf9418fa 100644
+--- a/drivers/gpio/gpio-intel-sso.c
++++ b/drivers/gpio/gpio-intel-sso.c
+@@ -38,7 +38,11 @@
+ #define SSO_CON1_FPID_MASK	3
+ #define SSO_CON1_GPTD		25
+ #define SSO_CON1_GPTD_MASK	3
++/* Shift clock */
++#define FCDSC 20
++#define FCDSC_MASK 3
+ 
++static const int shift_clk_freq_tbl[] = {25000000, 12500000, 6250000, 3125000};
+ static const int freq_tbl[] = {2, 4, 8, 10, 50000, 100000, 200000, 250000};
+ static const char * const sso_gpio_drv_name = "intel-sso-gpio";
+ 
+@@ -70,6 +74,7 @@ struct sso_gpio_priv {
+ 	int gpio_base;
+ 	int edge;
+ 	int freq;
++	int shift_clk_freq;
+ 	u32 alloc_bitmap;
+ };
+ 
+@@ -192,6 +197,26 @@ static int sso_gpio_freq_set(struct sso_gpio_priv *priv)
+ 	return 0;
+ }
+ 
++static void sso_register_shift_clk(struct sso_gpio_priv *priv)
++{
++	u32 val = 0;
++	int idx, size = ARRAY_SIZE(shift_clk_freq_tbl);
++
++	for (idx = 0; idx < size; idx++) {
++		if (shift_clk_freq_tbl[idx] <= priv->shift_clk_freq) {
++			val = idx;
++			break;
++		}
++	}
++
++	if (idx == size)
++		dev_warn(priv->dev, "%s: Invalid freq %d\n",
++			 __func__, priv->shift_clk_freq);
++
++	sso_gpio_write_mask(priv->mmap, SSO_CON1, FCDSC,
++			    FCDSC_MASK, val);
++}
++
+ static int sso_gpio_gc_init(struct sso_gpio_priv *priv,
+ 			    struct device *dev, const char *name)
+ {
+@@ -259,6 +284,9 @@ static int sso_gpio_hw_init(struct sso_gpio_priv *priv)
+ 	/* Set GPIO update rate */
+ 	sso_gpio_freq_set(priv);
+ 
++	/* Register shift clock */
++	sso_register_shift_clk(priv);
++
+ 	return 0;
+ }
+ 
+@@ -321,6 +349,11 @@ static int intel_sso_gpio_probe(struct platform_device *pdev)
+ 	else
+ 		priv->freq = prop;
+ 
++	/* update shift clock frequency */
++	if (device_property_read_u32(dev, "intel,sso-shift-clk-freq",
++				     &priv->shift_clk_freq))
++		priv->shift_clk_freq = -1;
++
+ 	/* gpio mem */
+ 	priv->mmap = syscon_node_to_regmap(dev->of_node);
+ 	if (IS_ERR(priv->mmap)) {
+diff --git a/drivers/leds/leds-intel-sso.c b/drivers/leds/leds-intel-sso.c
+index add8078cfda3..81db83ee9f1a 100644
+--- a/drivers/leds/leds-intel-sso.c
++++ b/drivers/leds/leds-intel-sso.c
+@@ -36,10 +36,6 @@
+ #define BLINK_SRC_OFF(pin, src)		(((pin) * 6) + 4)
+ #define BLINK_SRC_MASK	0x3
+ 
+-/* CON1 */
+-#define US		30
+-#define US_MASK		0x3
+-
+ /* Driver MACRO */
+ #define MAX_FREQ_RANK		10
+ #define GPTC_PRE_DIV		200
+@@ -77,13 +73,6 @@ enum {
+ 	SSO_MAX_BRIGHTNESS = 0xFF
+ };
+ 
+-enum {
+-	SSO_SW_UPDATE = 0,
+-	SSO_GPTC_UPDATE,
+-	SSO_FPID_UPDATE,
+-	SSO_UPDATE_MAX
+-};
+-
+ static const u32 freq_div_tbl[] = {4000, 2000, 1000, 800};
+ 
+ struct sso_led_priv;
+@@ -152,7 +141,6 @@ struct sso_cfg {
+ 	u32 gptc_clkrate;
+ 	u32 brightness;
+ 	int blink_rate_idx;
+-	u32 update_src;
+ };
+ 
+ /**
+@@ -204,22 +192,6 @@ sso_led_write_mask(struct regmap *map, u32 reg, u32 off, u32 mask, u32 val)
+ 	return sso_led_writel(map, reg, reg_val);
+ }
+ 
+-static int sso_led_hw_init(struct sso_led_priv *priv)
+-{
+-	struct sso_cfg *cfg = &priv->cfg;
+-
+-	if (sso_led_write_mask(priv->mmap, SSO_CON1, US,
+-			       US_MASK, cfg->update_src))
+-		return -EINVAL;
+-
+-	if (cfg->update_src != SSO_GPTC_UPDATE)
+-		sso_led_update_bit(priv->mmap, SSO_CON0, BLINK_R, 0);
+-	else
+-		sso_led_update_bit(priv->mmap, SSO_CON0, BLINK_R, 1);
+-
+-	return 0;
+-}
+-
+ static u32 sso_rectify_brightness(u32 brightness)
+ {
+ 	if (brightness > BRIGHTNESS_MAX)
+@@ -299,7 +271,10 @@ static void sso_led_freq_set(struct sso_led_priv *priv, u32 pin, int freq_idx)
+ 	group = sso_led_pin_to_group(pin);
+ 	freq_src = sso_led_get_freq_src(freq_idx);
+ 	off = sso_led_pin_blink_off(pin, group);
+-	if (group == LED_GRP1_24_28)
++
++	if (group == LED_GRP0_0_23)
++		return;
++	else if (group == LED_GRP1_24_28)
+ 		reg = LED_BLINK_H8_0;
+ 	else
+ 		reg = LED_BLINK_H8_1;
+@@ -595,21 +570,6 @@ static int sso_dt_parse(struct sso_led_priv *priv)
+ 	else
+ 		cfg->blink_rate_idx = sso_rectify_blink_rate(priv, prop);
+ 
+-	if (device_property_read_u32(dev, "intel,sso-def-updatesrc", &prop))
+-		cfg->update_src = SSO_GPTC_UPDATE;
+-	else
+-		cfg->update_src = prop;
+-
+-	if (cfg->update_src >= SSO_UPDATE_MAX) {
+-		dev_err(dev, "led update src error!\n");
+-		return -EINVAL;
+-	}
+-
+-	if (sso_led_hw_init(priv)) {
+-		dev_err(dev, "led HW init fail!\n");
+-		return -EINVAL;
+-	}
+-
+ 	if (sso_led_dt_parse(priv))
+ 		return -EINVAL;
+ 

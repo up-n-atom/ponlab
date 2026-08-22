@@ -1,0 +1,129 @@
+From 26813556cd57a52288fe68bc115f76202255831c Mon Sep 17 00:00:00 2001
+From: Dinesh Sudham <dineshx.sudham@intel.com>
+Date: Thu, 15 Oct 2020 18:16:56 +0800
+Subject: [PATCH] PONRTSYS-8097:NET: Support to enable or disable EEE using
+ ethtool
+
+Modified Ethernet driver EEE feature can enabled or disabled using
+Ethtool
+
+Signed-off-by: Dinesh Sudham <dineshx.sudham@intel.com>
+---
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c | 53 ++++++++++++------------
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h |  8 ++++
+ 2 files changed, 35 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index 38c0fa2eb287..a85b8e755e1a 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -343,25 +343,14 @@ static int nway_reset(struct net_device *dev)
+ static int  ethtool_eee_get(struct net_device *dev,
+ 			    struct ethtool_eee *eee_data)
+ {
+-	struct core_ops *ops = gsw_get_swcore_ops(0);
+-	GSW_portLinkCfg_t	port_link_cfg = {0};
+-	int retval = -EOPNOTSUPP;
+-
+-	if (!ops)
+-		return -ENODEV;
+-	port_link_cfg.nPortId = dev->dev_id;
+-	retval = ops->gsw_common_ops.PortLinkCfgGet(ops, &port_link_cfg);
+-
+-	if (retval != 0) {
+-		pr_err("%s: gsw PortLinkCfgGet failed\n", __func__);
+-		return retval;
+-	}
++	struct ltq_eth_priv *priv = netdev_priv(dev);
+ 
+-	if (port_link_cfg.bLPI) {
+-		eee_data->eee_active = port_link_cfg.bLPI;
+-		eee_data->eee_enabled = port_link_cfg.bLPI;
+-		eee_data->tx_lpi_enabled = port_link_cfg.bLPI;
+-	}
++	eee_data->eee_enabled = priv->eee_enabled;
++	eee_data->tx_lpi_enabled = priv->tx_lpi_enabled;
++	eee_data->eee_active = priv->eee_active;
++	/* Check for XGMAC capability */
++	if (priv->xgmac_id >= 2)
++		eee_data->tx_lpi_timer = priv->tx_lpi_timer;
+ 
+ 	return phy_ethtool_get_eee(dev->phydev, eee_data);
+ }
+@@ -369,6 +358,7 @@ static int  ethtool_eee_get(struct net_device *dev,
+ static int  ethtool_eee_set(struct net_device *dev,
+ 			    struct ethtool_eee *eee_data)
+ {
++	struct ltq_eth_priv *priv = netdev_priv(dev);
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
+ 	GSW_portLinkCfg_t	port_link_cfg = {0};
+ 	int retval = -EOPNOTSUPP;
+@@ -383,8 +373,12 @@ static int  ethtool_eee_set(struct net_device *dev,
+ 		return retval;
+ 	}
+ 
+-	/* xmac */
+-	port_link_cfg.bLPI ^= 1;
++	priv->eee_enabled = eee_data->eee_enabled;
++	priv->tx_lpi_enabled = eee_data->tx_lpi_enabled;
++	priv->tx_lpi_timer = eee_data->tx_lpi_timer;
++	/* xgmac */
++	port_link_cfg.bLPI = eee_data->tx_lpi_enabled && eee_data->eee_enabled;
++
+ 	retval =  ops->gsw_common_ops.PortLinkCfgSet(ops, &port_link_cfg);
+ 
+ 	if (retval != 0) {
+@@ -392,14 +386,19 @@ static int  ethtool_eee_set(struct net_device *dev,
+ 		return retval;
+ 	}
+ 
+-	/* phy */
+-	if (!eee_data->eee_active) {
+-		if (phy_init_eee(dev->phydev, 0)) {
+-			pr_err("%s: phy_init_eee failed\n", __func__);
+-			return retval;
+-		}
++	/* Check for XGMAC capability */
++	if (priv->xgmac_id >= 2) {
++		struct mac_ops *ops;
++
++		ops = gsw_get_mac_ops(0, priv->xgmac_id);
++		if (ops)
++			ops->xgmac_reg_wr(ops, 0x00D4, priv->tx_lpi_timer);
+ 	}
+ 
++	/* phy */
++	if (eee_data->eee_enabled)
++		priv->eee_active = phy_init_eee(dev->phydev, 0) >= 0;
++
+ 	return retval;
+ }
+ 
+@@ -2246,6 +2245,8 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 	priv->hw = hw;
+ 	priv->id = hw->num_devs;
+ 	spin_lock_init(&priv->lock);
++	if (priv->xgmac_id >= 1)
++		priv->tx_lpi_timer = DEFAULT_LPI_TIMER;
+ 
+ 	priv->owner = &g_ltq_eth_module[hw->num_devs];
+ 	sprintf(priv->owner->name, "module%02d", priv->id);
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+index 6ace35096fd6..9b2bd657211b 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+@@ -111,6 +111,14 @@ struct ltq_eth_priv {
+ 	#define FLAG_INTERNAL_PHY       0x00100000
+ 	u32 ethtool_flags;
+ 	#define ETHTOOL_FLAG_BP_CPU_ENABLE	BIT(0)
++	bool eee_enabled;
++	bool eee_active;
++	bool tx_lpi_enabled;
++	u32 tx_lpi_timer;
++	/* The default timer value as per the
++	 * XGMAC spec 1 sec(1000 ms)
++	 */
++	#define DEFAULT_LPI_TIMER 1000
+ };
+ 
+ /**

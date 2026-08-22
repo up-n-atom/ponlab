@@ -1,0 +1,334 @@
+From bc479078f59ad4ea8f09d3c765d5aa8189835129 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Mon, 9 Nov 2020 09:20:12 +0200
+Subject: [PATCH] LMTSYS-3823: [PPV4 LGM] Fragment packets are sent to the UC
+ without template UD
+
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          | 23 +++++++-----
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 43 ++++++++++------------
+ drivers/net/ppv4/pp-hal/checker/checker.c          |  8 +++-
+ drivers/net/ppv4/pp-hal/checker/checker.h          |  1 -
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      | 10 +++++
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   |  2 +-
+ .../net/ppv4/pp-hal/micro-controller/uc_internal.h |  8 +++-
+ drivers/net/ppv4/pp-hal/session-info/pp_si.h       | 12 ++++++
+ .../pp-tools/unit-test/tests/pp_session_tests.c    |  2 -
+ include/linux/pp_api.h                             | 30 +++++----------
+ 10 files changed, 78 insertions(+), 61 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index f4add1bd0936..bdec70c279b2 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -210,7 +210,8 @@ s32 pp_nf_set(enum pp_nf_type type, struct pp_nf_info *nf)
+ 	struct pp_qos_queue_info q_info;
+ 	struct pp_qos_dev *qdev;
+ 	s32 ret = 0;
+-	u16 qos_port;
++	u16 uc_qos_port;
++	u16 uc_q;
+ 
+ 	if (unlikely(!pp_is_ready()))
+ 		return -EPERM;
+@@ -245,28 +246,30 @@ s32 pp_nf_set(enum pp_nf_type type, struct pp_nf_info *nf)
+ 		goto out;
+ 	}
+ 
+-	/* update checker */
+-	ret = chk_nf_set(q_info.physical_id, type);
+-	if (unlikely(ret)) {
+-		pr_err("Failed Setting queue %hu for nf %d\n",
+-		       q_info.physical_id, type);
+-		goto out;
+-	}
++	uc_qos_port = q_info.port_id;
++	uc_q = q_info.physical_id;
+ 
+-	qos_port = q_info.port_id;
+ 	ret = pp_qos_queue_info_get(qdev, nf->cycl2_q, &q_info);
+ 	if (unlikely(ret)) {
+ 		pr_err("Failed getting queue %u info\n", nf->cycl2_q);
+ 		goto out;
+ 	}
+ 
+-	ret = uc_nf_set(type, nf->pid, qos_port, q_info.physical_id,
++	ret = uc_nf_set(type, nf->pid, uc_qos_port, q_info.physical_id,
+ 			PMGR_HIF_DFLT_DP_IDX);
+ 	if (unlikely(ret)) {
+ 		pr_err("Failed Setting NF %d in uc\n", type);
+ 		goto out;
+ 	}
+ 
++	/* update checker */
++	ret = chk_nf_set(uc_q, type);
++	if (unlikely(ret)) {
++		pr_err("Failed Setting queue %hu for nf %d\n",
++		       uc_q, type);
++		goto out;
++	}
++
+ 	/* store nf info */
+ 	set_bit(type, &db->nf_en);
+ 	memcpy(&db->nf[type], nf, sizeof(*nf));
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 5748f51cc60f..e37370188094 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -1825,21 +1825,9 @@ static bool __smgr_is_ud_info_valid(struct pp_sess_create_args *args)
+ 	if (test_bit(PP_SESS_FLAG_MCAST_GRP_BIT, &args->flags))
+ 		return true;
+ 
+-	if (unlikely((args->ps_sz + args->ud_sz) > PP_UD_REGION_SZ)) {
+-		pr_err("ps_sz (%u) + ud_sz (%u) must be less than %u\n",
+-		       args->ps_sz, args->ud_sz, PP_UD_REGION_SZ);
+-		return false;
+-	}
+-
+-	if (unlikely(args->ps_sz && (args->ps_off == PP_INVALID_PS_OFF))) {
+-		pr_err("ps_sz (%u) cannot be set if ps_off not chosen\n",
+-		       args->ps_sz);
+-		return false;
+-	}
+-
+-	if (unlikely((args->ps_off + args->ps_sz) != PP_PS_REGION_SZ)) {
+-		pr_err("ps_sz (%u) + ps_off (%u) must equal %u\n",
+-		       args->ps_sz, args->ps_off, PP_PS_REGION_SZ);
++	if (unlikely((args->ud_sz) > PP_UD_REGION_SZ - PP_PS_REGION_SZ)) {
++		pr_err("ud_sz (%u) must be less than %u\n",
++		       args->ud_sz, PP_UD_REGION_SZ - PP_PS_REGION_SZ);
+ 		return false;
+ 	}
+ 
+@@ -2727,15 +2715,16 @@ static s32 __smgr_si_ud_set(struct sess_info *s)
+ 	struct pp_port_cfg cfg;
+ 	s32 ret = 0;
+ 
+-	if (s->args->ps_off < PP_INVALID_PS_OFF)
+-		s->si.ps_off = s->args->ps_off;
+-	else
++	if (test_bit(PP_SESS_FLAG_PS_VALID_BIT, &s->args->flags)) {
++		s->si.si_ps_sz = PP_PS_REGION_SZ;
++		s->si.ps_off = 0;
++	} else {
++		s->si.si_ps_sz = 0;
+ 		s->si.ps_off = PP_INVALID_PS_OFF;
+-
+-	s->si.si_ps_sz = s->args->ps_sz;
++	}
+ 
+ 	if (s->args->ud_sz)
+-		s->si.si_ud_sz = s->args->ps_sz + s->args->ud_sz;
++		s->si.si_ud_sz = s->si.si_ps_sz + s->args->ud_sz;
+ 
+ 	/* if this is a session for fragments, make sure UD will be copied
+ 	 * for the egress UC, otherwise, use the user arguments
+@@ -2771,17 +2760,20 @@ static s32 __smgr_si_ud_set(struct sess_info *s)
+ 		       &reass_info,
+ 		       sizeof(reass_info));
+ 		s->si.si_ud_sz = PP_PS_REGION_SZ + sizeof(reass_info);
++
++		s->si.si_ps_sz = 6;
++		s->si.ps_off = 0;
+ 	} else {
+ 		s->si.tmpl_ud_sz = s->args->tmp_ud_sz;
+ 		s->si.ps_copy =
+ 			test_bit(PP_SESS_FLAG_PS_COPY_BIT, &s->args->flags);
+ 	}
+ 
+-	if (s->args->ps_sz)
+-		memcpy(s->si.ud, s->args->ps, s->args->ps_sz);
++	if (s->si.si_ps_sz)
++		memcpy(s->si.ud, &s->args->ps, sizeof(s->args->ps));
+ 
+ 	if (s->args->ud_sz)
+-		memcpy(s->si.ud + s->args->ps_sz, s->args->ud, s->args->ud_sz);
++		memcpy(s->si.ud + s->si.si_ps_sz, s->args->ud, s->args->ud_sz);
+ 
+ 	return 0;
+ }
+@@ -2795,6 +2787,9 @@ static void __smgr_si_flags_set(struct sess_info *s)
+ 	ulong chck_flags = SESS_CHCK_DFLT_FLAGS;
+ 	u8 ext_proto, int_proto;
+ 
++	if (pp_misc_is_nf_en(PP_NF_REASSEMBLY))
++		chck_flags |= BIT(SI_CHCK_FLAG_DVRT_FRAG);
++
+ 	if (test_bit(PP_SESS_FLAG_MTU_CHCK_BIT, &s->args->flags))
+ 		pr_info("Session mtu check flag is not supported\n");
+ //		set_bit(SI_CHCK_FLAG_DVRT_MTU_OVFL, &chck_flags);
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.c b/drivers/net/ppv4/pp-hal/checker/checker.c
+index 4fdfd525318b..29ebcccac8c1 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.c
++++ b/drivers/net/ppv4/pp-hal/checker/checker.c
+@@ -1268,8 +1268,12 @@ s32 chk_init(struct pp_chk_init_param *init_param)
+ 	reg = PP_REG_RD32(PP_CHK_STAGE2_MATCH_FALLBACK_REG);
+ 	reg = PP_FIELD_MOD(PP_CHK_STAGE2_MATCH_FALLBACK_DIS_SW_ERR_ALT_SI_MSK,
+ 			   1, reg);
+-	if (pp_silicon_step_get() == PP_SSTEP_A)
+-		reg = PP_FIELD_MOD(BIT(SI_CHCK_FLAG_DVRT_FRAG), 1, reg);
++	/* Divert all frags to ingress uc for 2 purposes:
++	 * 1. a-step only - fix the egress nf queue
++	 * 2. Other steps - if no ud, divert to host.
++	 *    This is done to handle frag packets received on non frag session
++	 */
++	reg = PP_FIELD_MOD(BIT(SI_CHCK_FLAG_DVRT_FRAG), 1, reg);
+ 	PP_REG_WR32(PP_CHK_STAGE2_MATCH_FALLBACK_REG, reg);
+ 
+ 	/* DSI BASE ADDR */
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.h b/drivers/net/ppv4/pp-hal/checker/checker.h
+index 3ad50aab7186..fb385ac320df 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.h
++++ b/drivers/net/ppv4/pp-hal/checker/checker.h
+@@ -77,7 +77,6 @@
+ 	 BIT(SI_CHCK_FLAG_DVRT_TTL_EXP)  | \
+ 	 BIT(SI_CHCK_FLAG_DVRT_TCP_CTRL) | \
+ 	 BIT(SI_CHCK_FLAG_UPDT_SESS_CNT) | \
+-	 BIT(SI_CHCK_FLAG_DVRT_FRAG)     | \
+ 	 BIT(SI_CHCK_FLAG_DYN_SESS))
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 51e3a5986f8b..c4b9450c5614 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -1489,6 +1489,16 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 	for (idx = 0 ; idx < RX_DMA_MAX_POOLS ; idx++)
+ 		info.buffer_size[idx] = cfg.buffer_size[idx];
+ 
++	/* Write host info to SRAM to be used by ingress uc */
++	PP_REG_WR32(UC_SSRAM(INGRESS, INGRESS_HOST_INFO_PORT_SSRAM_OFF),
++		    dflt_si.eg_port);
++	PP_REG_WR32(UC_SSRAM(INGRESS, INGRESS_HOST_INFO_QUEUE_SSRAM_OFF),
++		    dflt_si.dst_q);
++	PP_REG_WR32(UC_SSRAM(INGRESS, INGRESS_HOST_INFO_BASE_POLICY_SSRAM_OFF),
++		    dflt_si.base_policy);
++	PP_REG_WR32(UC_SSRAM(INGRESS, INGRESS_HOST_INFO_POLICY_BMAP_SSRAM_OFF),
++		    dflt_si.policies_map);
++
+ 	return uc_egr_mbox_cmd_send(UC_CMD_REASSEMBLY_INFO, 0,
+ 				    (const void *)&info, sizeof(info), NULL, 0);
+ }
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index 2fabffe08943..5854b130f483 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -16,7 +16,7 @@
+ #define EGRESS_VER_MINOR  19
+ 
+ #define INGRESS_VER_MAJOR 1
+-#define INGRESS_VER_MINOR 2
++#define INGRESS_VER_MINOR 3
+ 
+ /**
+  * @define CMD_DONE_REG_IDX
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+index a4f928b0c167..37825a76ef38 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+@@ -14,7 +14,13 @@
+ #define UC_VER_MAJOR(t)               (t ## _VER_MAJOR)
+ #define UC_VER_MINOR(t)               (t ## _VER_MINOR)
+ 
+-#define INGRESS_VER_SSRAM_OFF         (0x4000)
++/* Ingress configuration. Must be aligned with the gdb structure in uc */
++#define INGRESS_GDB_SSRAM_OFF                    (0x4000)
++#define INGRESS_VER_SSRAM_OFF                    (INGRESS_GDB_SSRAM_OFF)
++#define INGRESS_HOST_INFO_PORT_SSRAM_OFF         (INGRESS_GDB_SSRAM_OFF + 0x4)
++#define INGRESS_HOST_INFO_QUEUE_SSRAM_OFF        (INGRESS_GDB_SSRAM_OFF + 0x8)
++#define INGRESS_HOST_INFO_BASE_POLICY_SSRAM_OFF  (INGRESS_GDB_SSRAM_OFF + 0xc)
++#define INGRESS_HOST_INFO_POLICY_BMAP_SSRAM_OFF  (INGRESS_GDB_SSRAM_OFF + 0x10)
+ 
+ /* UC Egress SW implementation for A-STEP */
+ /* CPU 3 DCCM address for the port credit inc address */
+diff --git a/drivers/net/ppv4/pp-hal/session-info/pp_si.h b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+index f482d556cb64..0bacf7937171 100644
+--- a/drivers/net/ppv4/pp-hal/session-info/pp_si.h
++++ b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+@@ -80,6 +80,18 @@
+  */
+ #define SI_NO_TRIM_VALUE                (0x7)
+ 
++/**
++ * @brief SI protocol specific region size in bytes
++ */
++#define PP_PS_REGION_SZ                 (6)
++
++/**
++ * @brief Value defines an invalid value to specify the PP not
++ *        to copy the UD from SI to the STW PS (protocol
++ *        specific) region
++ */
++#define PP_INVALID_PS_OFF               (6)
++
+ /**
+  * @brief SI fields enumeration
+  */
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c
+index 8ee522b29ace..b565e726b3e1 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c
+@@ -703,8 +703,6 @@ static void __sess_args_default_set(struct pp_sess_create_args *args,
+ 	args->tx = tx;
+ 	args->dst_q = qos_queue;
+ 	args->dst_q_high = qos_queue;
+-	args->ps_sz = 0;
+-	args->ps_off  = PP_INVALID_PS_OFF;
+ 	args->eg_port = pp_port;
+ 	args->in_port = pp_port;
+ 
+diff --git a/include/linux/pp_api.h b/include/linux/pp_api.h
+index 59a916df53e1..61e0b574102b 100755
+--- a/include/linux/pp_api.h
++++ b/include/linux/pp_api.h
+@@ -113,18 +113,6 @@ enum {
+  */
+ #define PP_UD_REGION_SZ            (48)
+ 
+-/**
+- * @define Value defines an invalid value to specify the PP not
+- *        to copy the UD from SI to the STW PS (protocol
+- *        specific) region
+- */
+-#define PP_INVALID_PS_OFF          (6)
+-
+-/**
+- * @brief SI protocol specific region size in bytes
+- */
+-#define PP_PS_REGION_SZ            (6)
+-
+ /**
+  * @define Max Status word port classification field bit
+  * @brief defines the last bit that can be extracted from the stw for
+@@ -624,6 +612,14 @@ struct pp_mcast_grp_info {
+ #define PP_SESS_FLAG_INTERNAL_HASH_CALC_MSK \
+ 	BIT(PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT)
+ 
++/**
++ * @define Specify if PS is valid
++ * @note to use with (struct pp_sess_create_args).flags
++ */
++#define PP_SESS_FLAG_PS_VALID_BIT                (11)
++#define PP_SESS_FLAG_PS_VALID_MSK \
++	BIT(PP_SESS_FLAG_PS_VALID_BIT)
++
+ /**
+  * @struct pp_session_args
+  * @brief PP session arguments required for creating a new
+@@ -675,14 +671,8 @@ struct pp_sess_create_args {
+ 	u8  ud_sz;
+ 
+ 	/*! protocol specific data to copy to STW PS */
+-	u8  ps[PP_PS_REGION_SZ];
+-
+-	/*! specify number of bytes to copy from SI PS to STW PS */
+-	u8  ps_sz;
+-
+-	/*! STW PS destination offset (ps_off + ps_sz must equal  6) */
+-	/*! set to 'PP_INVALID_PS_OFF' if not needed                 */
+-	u8  ps_off;
++	/*! Set PP_SESS_FLAG_PS_VALID_BIT to indicate the ps is valid */
++	u32 ps;
+ 
+ 	/*! specify number of bytes to copy from STW template to packet UD */
+ 	u8  tmp_ud_sz;

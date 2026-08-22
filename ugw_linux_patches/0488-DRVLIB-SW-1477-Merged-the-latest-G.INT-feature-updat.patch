@@ -1,0 +1,243 @@
+From 63958d71d51770b38f4ac39e4857bf592910939c Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Mon, 18 Feb 2019 15:48:04 +0800
+Subject: [PATCH] DRVLIB_SW-1477: Merged the latest G.INT feature updates
+
+---
+ drivers/net/ethernet/lantiq/cqm/cqm_dev.c          |  4 +
+ drivers/net/ethernet/lantiq/cqm/cqm_dev.h          |  1 +
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c       | 95 ++++++++++++++--------
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.h       |  1 +
+ .../net/ethernet/lantiq/cqm/prx300/cqm_config.c    |  4 +-
+ 5 files changed, 70 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_dev.c b/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
+index 95478f225c19..65f9174a13db 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
+@@ -105,6 +105,10 @@ struct device_node *parse_dts(int j, void **pdata, struct resource **res,
+ 	}
+ 	cqm_pdata->num_dq_port = count;
+ 
++	if (of_property_read_s32(node, "intel,gint-mode",
++				 &cqm_pdata->gint_mode))
++		cqm_pdata->gint_mode = -1;
++
+ 	ret_node = node;
+ 	gsw_node = of_find_node_by_name(NULL, "gsw_core");
+ 	if (!gsw_node) {
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_dev.h b/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
+index f1017587fe1c..2f4febbe3247 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
+@@ -46,5 +46,6 @@ struct cqm_data {
+ 	u32  dq_port[MAX_CPU_DQ_PORT_N_TYPE];
+ 	u32 num_dq_port;
+ 	u32 gsw_mode;
++	int gint_mode;
+ };
+ #endif
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index b77afdd14930..b0496c8524a6 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -5,6 +5,11 @@
+ #include <net/switch_api/gsw_flow_ops.h>
+ #include <net/switch_api/gsw_dev.h>
+ 
++#define LAN_0_PORT 7
++#define LAN_1_PORT 15
++#define LAN_PORT_NUM ((cqm_ctrl->gint_mode <  0) ? 1 : \
++		      ((LAN_1_PORT - LAN_0_PORT) << cqm_ctrl->gint_mode))
++#define MAX_PORT(FLAG) (((FLAG) & FLAG_LAN) ? LAN_PORT_NUM : 1)
+ #define OWN_BIT  BIT(31)
+ #define COMPLETE_BIT  BIT(30)
+ #define PRX300_CQM_DROP_INIT ((PRX300_CQM_DROP_Q << 24) | \
+@@ -56,8 +61,8 @@ static struct tasklet_struct cbm_debug_tasklet;
+ struct cqm_egp_map epg_lookup_table[] = {
+ 	{0,	0,			0},
+ 	{26,	2,			FLAG_WAN},
+-	{7,	3,			FLAG_LAN},
+-	{15,	4,			FLAG_LAN},
++	{LAN_0_PORT,	3,			FLAG_LAN},
++	{LAN_1_PORT,	4,			FLAG_LAN},
+ 	{4,	CBM_PMAC_DYNAMIC,	FLAG_ACA},
+ 	{5,	CBM_PMAC_DYNAMIC,	FLAG_ACA},
+ 	{6,	CBM_PMAC_DYNAMIC,	FLAG_ACA},
+@@ -115,9 +120,18 @@ static inline void cqm_populate_entry(struct cqm_pmac_port_map *local_entry,
+ 				      int *phys_port, u32 cbm_port,
+ 				      u32 flags, int *found)
+ {
+-	int index = cbm_port / BITS_PER_LONG;
++	int index, idx;
+ 	*phys_port = cbm_port;
+-	local_entry->egp_port_map[index] |= BIT(cbm_port % BITS_PER_LONG);
++	u32 port_bit;
++
++	for (idx = 0; idx < MAX_PORT(flags); idx++) {
++		index = ((cbm_port + idx) / BITS_PER_LONG);
++		port_bit = (cbm_port + idx) % BITS_PER_LONG;
++		local_entry->egp_port_map[index] |= BIT(port_bit);
++		dev_dbg(cqm_ctrl->dev, "egp_port_map[%d]->%u idx %d\n",
++			index, local_entry->egp_port_map[index], idx);
++	}
++
+ 	local_entry->egp_type = flags;
+ 	*found = 1;
+ }
+@@ -1816,46 +1830,50 @@ void print_reg(char *name, void *addr)
+ }
+ 
+ static void fill_dp_alloc_data(struct cbm_dp_alloc_data *data, int dp,
+-			       int port)
++			       int port, u32 flags)
+ {
+ 	struct cqm_dqm_port_info *p_info;
+-	int dma_controller, chan;
++	int dma_controller, chan, idx;
+ 	unsigned char dma_ctrl[DMA_CH_STR_LEN];
+ 
+ 	/*Write only valid, else skip*/
+ 	data->flags |= CBM_PORT_DP_SET | CBM_PORT_DQ_SET;
+ 	data->dp_port = dp;
+ 	data->deq_port = port;
+-	data->deq_port_num = (data->deq_port == DQM_PON_TYPE) ? 64 : 1;
+-	data->num_dma_chan = 1;
+-	p_info = &dqm_port_info[port];
+-	if (p_info->dma_dt_init_type == DEQ_DMA_CHNL) {
+-		data->flags |= CBM_PORT_DMA_CHAN_SET | CBM_PORT_PKT_CRDT_SET;
+-		dev_dbg(cqm_ctrl->dev, "%d %d %d\n", port,
+-			p_info->dma_dt_ctrl,  p_info->dma_dt_ch);
+-		if (p_info->dma_dt_ctrl == 3)
+-			snprintf(dma_ctrl, sizeof(dma_ctrl), "DMA%d"
+-			, p_info->dma_dt_ctrl);
+-		else
+-			snprintf(dma_ctrl, sizeof(dma_ctrl), "DMA%dTX"
+-			, p_info->dma_dt_ctrl);
+-		dma_controller = cqm_dma_get_controller(dma_ctrl);
+-		dev_dbg(cqm_ctrl->dev, "dma %d \r\n", dma_controller);
+-		chan = _DMA_C(dma_controller, 0, p_info->dma_dt_ch);
+-		dev_dbg(cqm_ctrl->dev, "chan %d \r\n", chan);
+-		p_info->dma_ch = chan;
+-		snprintf(p_info->dma_chan_str, DMA_CH_STR_LEN, "port%d", port);
+-		data->dma_chan = p_info->dma_ch;
+-		data->tx_pkt_credit = p_info->dq_txpush_num;
+-	} else {
+-		data->flags |= CBM_PORT_PKT_CRDT_SET;
+-		data->tx_pkt_credit = p_info->dq_txpush_num;
++	for (idx = 0; idx < MAX_PORT(flags); idx++) {
++		p_info = &dqm_port_info[port + idx];
++		if (p_info->dma_dt_init_type == DEQ_DMA_CHNL) {
++			data->flags |= CBM_PORT_DMA_CHAN_SET |
++					CBM_PORT_PKT_CRDT_SET;
++			dev_dbg(cqm_ctrl->dev, "%d %d %d\n", (port + idx),
++				p_info->dma_dt_ctrl,  p_info->dma_dt_ch);
++			if (p_info->dma_dt_ctrl == 3)
++				snprintf(dma_ctrl, sizeof(dma_ctrl), "DMA%d"
++				, p_info->dma_dt_ctrl);
++			else
++				snprintf(dma_ctrl, sizeof(dma_ctrl), "DMA%dTX"
++				, p_info->dma_dt_ctrl);
++			dma_controller = cqm_dma_get_controller(dma_ctrl);
++			dev_dbg(cqm_ctrl->dev, "dma %d \r\n", dma_controller);
++			chan = _DMA_C(dma_controller, 0, p_info->dma_dt_ch);
++			dev_dbg(cqm_ctrl->dev, "chan %d \r\n", chan);
++			p_info->dma_ch = chan;
++			snprintf(p_info->dma_chan_str, DMA_CH_STR_LEN, "port%d",
++				 (port + idx));
++			data->dma_chan = p_info->dma_ch;
++			data->tx_pkt_credit = p_info->dq_txpush_num;
++		} else {
++			data->flags |= CBM_PORT_PKT_CRDT_SET;
++			data->tx_pkt_credit = p_info->dq_txpush_num;
++		}
+ 	}
+ 	data->flags |= CBM_PORT_RING_ADDR_SET |
+ 		       CBM_PORT_RING_SIZE_SET |
+ 		       CBM_PORT_RING_OFFSET_SET;
+ 	data->tx_ring_size = 1;
+ 	data->tx_b_credit = 0;
++	data->num_dma_chan = idx;
++	data->deq_port_num = (data->deq_port == DQM_PON_TYPE) ? 64 : idx;
+ 	/*Lower 22 bits*/
+ 	data->tx_ring_addr = (u32)(cqm_ctrl->txpush +
+ 	(TXPUSH_CMD_RX_EGP_1 * port)) & 0x7FFFFF;
+@@ -1997,6 +2015,13 @@ dp_port_alloc(struct module *owner, struct net_device *dev, u32 dev_port,
+ 	if (flags & DP_F_FAST_ETH_LAN) {
+ 		port_start = PMAC_ETH_LAN_START_ID;
+ 		port_end = PMAC_ETH_LAN_END_ID;
++		if ((cqm_ctrl->gint_mode > 0) &&
++		    (port_id == PMAC_ETH_LAN_END_ID)) {
++			dev_err(cqm_ctrl->dev,
++				"Use ginit mode flag to alloc LAN port %d\n",
++				port_id);
++			return DP_FAILURE;
++		}
+ 	} else if (flags & (DP_F_FAST_ETH_WAN | DP_F_GPON | DP_F_EPON)) {
+ 		port_start = PMAC_ETH_WAN_ID;
+ 		port_end = PMAC_ETH_WAN_ID;
+@@ -2068,7 +2093,7 @@ dp_port_alloc(struct module *owner, struct net_device *dev, u32 dev_port,
+ 			return DP_FAILURE;
+ 	}
+ 	cqm_add_to_list(&local_entry);
+-	fill_dp_alloc_data(data, port_id, cbm_port[0]);
++	fill_dp_alloc_data(data, port_id, cbm_port[0], flags);
+ 	return CBM_SUCCESS;
+ }
+ 
+@@ -2117,8 +2142,11 @@ static s32 dp_enable(struct module *owner, u32 port_id,
+ 		dev_err(cqm_ctrl->dev, "Invalid port number\n");
+ 		return CBM_FAILURE;
+ 	}
+-	if (data->dma_chnl_init)
+-		handle_dma_chnl_init(port, flags);
++
++	if (data->dma_chnl_init) {
++		for (i = 0; i < data->num_dma_chan; i++)
++			handle_dma_chnl_init((port + i), flags);
++	}
+ 	type = find_dqm_port_type(port);
+ 	switch (type) {
+ 	case DQM_CPU_TYPE:
+@@ -3886,6 +3914,7 @@ static int cqm_prx300_probe(struct platform_device *pdev)
+ #endif
+ 	cqm_ctrl->syscfg = pdata->syscfg;
+ 	cqm_ctrl->force_xpcs = pdata->force_xpcs;
++	cqm_ctrl->gint_mode = pdata->gint_mode;
+ 
+ 	/* check prx300 pool and policy */
+ 	if (pdata->num_pools > CQM_PRX300_NUM_BM_POOLS) {
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+index e3a508209531..d84a83882628 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+@@ -597,6 +597,7 @@ struct cqm_ctrl {
+ 	const char *name;
+ 	u32 prx300_pool_ptrs[CQM_PRX300_NUM_BM_POOLS];
+ 	u32 prx300_pool_size[CQM_PRX300_NUM_BM_POOLS];
++	int gint_mode;
+ };
+ 
+ struct cqm_buf_dbg_cnt {
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm_config.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm_config.c
+index b8d3800a7673..3ac2e9bfe4c3 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm_config.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm_config.c
+@@ -100,7 +100,7 @@ const struct cqm_config prx300_cqm_config[] = {
+ 	{
+ 	.type = DQM_DMA_TYPE,
+ 	.data.dqm_dma.port = 7,
+-	.data.dqm_dma.port_range = 0,
++	.data.dqm_dma.port_range = 7,
+ 	.data.dqm_dma.dma_ctrl = 1,
+ 	.data.dqm_dma.dma_chan = 0,
+ 	.data.dqm_dma.port_enable = 1,
+@@ -110,7 +110,7 @@ const struct cqm_config prx300_cqm_config[] = {
+ 	{
+ 	.type = DQM_DMA_TYPE,
+ 	.data.dqm_dma.port = 15,
+-	.data.dqm_dma.port_range = 0,
++	.data.dqm_dma.port_range = 7,
+ 	.data.dqm_dma.dma_ctrl = 1,
+ 	.data.dqm_dma.dma_chan = 8,
+ 	.data.dqm_dma.port_enable = 1,

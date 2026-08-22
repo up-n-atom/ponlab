@@ -1,0 +1,161 @@
+From 4eea77ceda0e80dcc5e1874159916b91d6351ddd Mon Sep 17 00:00:00 2001
+From: Robert Dabrowski <robertx.dabrowski@intel.com>
+Date: Sun, 15 Dec 2019 22:33:08 +0100
+Subject: [PATCH] PONRTSYS-6164: PON GEM counters are not matching pontop
+ counters - for gem connected to pmapper get Rx from CTP and Tx from
+ PCE-Bypass
+
+---
+ drivers/net/datapath/dpm/datapath.h              | 18 +++++
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 92 ++++++++++++++++++------
+ 2 files changed, 89 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index fae53de5cb9c..21325ca20927 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -397,6 +397,24 @@ DP_ETHTOOL_STAT_REG_DECLARE
+ #undef _DP_ETHTOOL
+ };
+ 
++/* Tx counters serviced by CTP bypass registers */
++#define DP_ETHTOOL_STAT_REG_TX_DECLARE \
++	_DP_ETHTOOL_TX(nTxUnderSizeGoodPkts) \
++	_DP_ETHTOOL_TX(nTxOversizeGoodPkts) \
++	_DP_ETHTOOL_TX(nTxGoodPkts) \
++	_DP_ETHTOOL_TX(nTxUnicastPkts) \
++	_DP_ETHTOOL_TX(nTxBroadcastPkts) \
++	_DP_ETHTOOL_TX(nTxMulticastPkts) \
++	_DP_ETHTOOL_TX(nTx64BytePkts) \
++	_DP_ETHTOOL_TX(nTx127BytePkts) \
++	_DP_ETHTOOL_TX(nTx255BytePkts) \
++	_DP_ETHTOOL_TX(nTx511BytePkts) \
++	_DP_ETHTOOL_TX(nTx1023BytePkts) \
++	_DP_ETHTOOL_TX(nTxMaxBytePkts) \
++	_DP_ETHTOOL_TX(nTxDroppedPkts) \
++	_DP_ETHTOOL_TX(nTxAcmDroppedPkts) \
++	_DP_ETHTOOL_TX(nTxGoodBytes)
++
+ struct dev_mib {
+ 	atomic_t rx_fn_rxif_pkt; /*! received packet counter */
+ 	atomic_t rx_fn_txif_pkt; /*! transmitted packet counter */
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index aaa08e1503c5..abea6df331e1 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -2200,44 +2200,94 @@ int register_dp_cap_gswip31(int flag)
+ void dp_net_dev_get_ethtool_stats_31(struct net_device *dev,
+ 				     struct ethtool_stats *stats, u64 *data)
+ {
+-	GSW_RMON_Port_cnt_t g_counters = { 0 };
++	GSW_RMON_Port_cnt_t *g_counters;
++	struct pmac_port_info *port_info;
+ 	struct core_ops *ops;
+-	dp_subif_t s_subif;
+-	uint32_t flags = 0;
++	dp_subif_t *ps_subif;
++	u32 flags = 0;
+ 	u64 *data_dst;
+-	int ret = 0;
++	s32 ret = 0;
++	u8 i = 0;
+ 
+ 	ops = dp_port_prop[0].ops[0];
++
++	ps_subif = kzalloc(sizeof(dp_subif_t), GFP_KERNEL);
++	if (!ps_subif)
++		return;
++
++	/* two counters structures are used
++	 * one set for BP or regular CTP
++	 * second set for CTP PCE-Bypass
++	 */
++	g_counters = kzalloc(2 * sizeof(GSW_RMON_Port_cnt_t), GFP_KERNEL);
++	if (!g_counters)
++		return;
++
+ 	/* get subif information from net device */
+-	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &s_subif,
+-				   flags);
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, ps_subif, flags);
+ 	if (ret != DP_SUCCESS) {
+ 		netdev_err(dev, "dp_get_netif_subifid returned %d\n", ret);
+ 		/* dev_put(dev); */
+ 		return;
+ 	}
+ 
+-	/* dp_subif_t::flag_bp is set for BP */
+-	if (s_subif.flag_bp) {
+-		/* BP - Bridge Port */
+-		g_counters.ePortType = GSW_BRIDGE_PORT;
+-		g_counters.nPortId = s_subif.bport;
++	/* dp_subif_t::flag_bp is true for BP */
++	if (ps_subif->flag_bp) {
++		/* Bridge Port */
++		g_counters[0].ePortType = GSW_BRIDGE_PORT;
++		g_counters[0].nPortId = ps_subif->bport;
++		g_counters[0].nSubIfIdGroup = 0;
++		g_counters[0].bPceBypass = 0;
++
++		/* read BP counters */
++		ret = ops->gsw_rmon_ops.RMON_Port_Get(ops, &g_counters[0]);
++		if (ret != DP_SUCCESS) {
++			netdev_err(dev, "RMON_Port_Get returned %d\n", ret);
++			return;
++		}
++
+ 	} else {
+-		/* CTP - Connection Termination Point */
+-		g_counters.ePortType = GSW_CTP_PORT;
+-		g_counters.nPortId = s_subif.subif;
+-	}
++		/* Connection Termination Point */
++		port_info = get_dp_port_info(0, ps_subif->port_id);
++		/* first pass reads CTP counters,
++		 * second pass reads CTP-Bypass counters
++		 */
++		for (i = 0; i < 2; i++) {
++			g_counters[i].ePortType = GSW_CTP_PORT;
++			g_counters[i].nPortId = ps_subif->port_id;
++			g_counters[i].nSubIfIdGroup =
++				GET_VAP(ps_subif->subif, port_info->vap_offset,
++					port_info->vap_mask);
++			g_counters[i].bPceBypass = i;
++
++			/* read CTP counters */
++			ret = ops->gsw_rmon_ops.RMON_Port_Get(ops,
++							      &g_counters[i]);
++			if (ret != DP_SUCCESS) {
++				netdev_err(dev, "RMON_Port_Get returned %d\n",
++					   ret);
++				return;
++			}
++		}
+ 
+-	/* read hw counters */
+-	ret = ops->gsw_rmon_ops.RMON_Port_Get(ops, &g_counters);
+-	if (ret != DP_SUCCESS) {
+-		netdev_err(dev, "RMON_Port_Get returned %d\n", ret);
+-		return;
++		/* CTP TX counters are placed before QoS modules, and they
++		 * record packets dropped by QoS modules too.
++		 * CTP TX Bypass counters are placed after QoS modules,
++		 * and they record the packets actually transmitted.
++		 */
++#define _DP_ETHTOOL_TX(r)	g_counters[0].r = g_counters[1].r;
++		DP_ETHTOOL_STAT_REG_TX_DECLARE
++#undef _DP_ETHTOOL_TX
+ 	}
+ 
++	/* copy counters' values to ethtool buffer */
+ 	data_dst = data;
+-#define _DP_ETHTOOL(x, y)	*data_dst++ = g_counters.y;
++
++#define _DP_ETHTOOL(x, y)	*data_dst++ = g_counters[0].y;
+ 	DP_ETHTOOL_STAT_REG_DECLARE
+ #undef _DP_ETHTOOL
++
++	kfree(g_counters);
++	kfree(ps_subif);
+ }
+ 

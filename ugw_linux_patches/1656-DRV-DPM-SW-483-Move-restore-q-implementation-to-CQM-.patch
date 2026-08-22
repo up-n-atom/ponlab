@@ -1,0 +1,171 @@
+From 3ee216652cde4eb9b16645c42ed5b2445093d15e Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Thu, 29 Apr 2021 14:53:28 +0800
+Subject: [PATCH] DRV_DPM_SW-483: Move restore q implementation to CQM to avoid
+ multiple spin_lock
+
+---
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c     | 14 --------------
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h     |  1 -
+ drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c | 17 ++++-------------
+ drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c        |  7 +++++++
+ drivers/net/ethernet/lantiq/cqm/cqm_common.h         |  1 +
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c         | 14 ++++++++++++++
+ include/net/lantiq_cbm_api.h                         |  1 +
+ 7 files changed, 27 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 68f5d55eeeeb..ee89c2607615 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -843,20 +843,6 @@ int dp_get_lookup_qid_via_index(struct cbm_lookup *info)
+ 	return qid;
+ }
+ 
+-void dp_set_lookup_qid_via_index(struct cbm_lookup *info)
+-{
+-	if (!info)
+-		return;
+-	if (info->index & BIT(EGFLAG_BIT))
+-		info->egflag = 1;
+-	else
+-		info->egflag = 0;
+-	info->index &= BIT(EGFLAG_BIT) - 1;
+-	set_lookup_qid_via_index(info);
+-	DP_DEBUG(DP_DBG_FLAG_LOOKUP, "set egflag=%d index=0x%x qid=%d\n",
+-		 info->egflag, info->index, info->qid);
+-}
+-
+ /** @brief map traffic from one specific subif to 1st cpu queue via egflag 0,
+  *         currently used for DOCSIS, MMM, and MPEG.
+  *         it maps to drop queue on deregistration.
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 2e8eaaf25e05..10644ad8f54e 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -455,7 +455,6 @@ int dp_queue_block_flush(struct dp_qos_blk_flush_queue *cfg, int flag);
+ int dp_port_block_flush(struct dp_qos_blk_flush_port *cfg, int flag);
+ int dp_get_queue_qocc(struct dp_qos_queue_info *info, int flag);
+ int dp_get_lookup_qid_via_index(struct cbm_lookup *info);
+-void dp_set_lookup_qid_via_index(struct cbm_lookup *info);
+ 
+ /* Bridge port */
+ int dp_gsw_alloc_bp(int inst, int ep, int subif, int fid, int bp_member, int flags);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index aaed5df740c0..e0152536bf75 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -282,7 +282,6 @@ void dp_map_to_drop_q(int inst, int qid, struct cbm_lookup_entry *lu)
+ {
+ 	struct hal_priv *priv = HAL(inst);
+ 
+-	lu->num = 0;
+ 	lu->ppv4_drop_q = priv->ppv4_drop_q;
+ 	lu->qid = qid;
+ 
+@@ -310,10 +309,9 @@ static void cqm_queue_flush(int cqm_inst, int drop_port, int qid, u32 node_id)
+  */
+ static int queue_flush(int inst, int node_id, int flag)
+ {
+-	int qid, blocked, pid, cbm_inst, i, res = DP_FAILURE;
++	int qid, blocked, pid, cbm_inst, res = DP_FAILURE;
+ 	struct pp_qos_queue_conf q_cfg = {0}, q_cfg_tmp = {0};
+ 	struct hal_priv *priv = HAL(inst);
+-	struct cbm_lookup cbm_lu = {0};
+ 	struct cbm_lookup_entry *lu;
+ 
+ 	qid = get_qid_by_node(inst, node_id);
+@@ -394,16 +392,9 @@ static int queue_flush(int inst, int node_id, int flag)
+ 	}
+ 
+ 	/* Restore lookup entry mapping for this qid if needed */
+-	if (flag & FLUSH_RESTORE_LOOKUP && lu->num) {
+-		DP_DEBUG(DP_DBG_FLAG_QOS,
+-			 "Try to restore qid:%d lookup entry:%d\n",
+-			 qid, lu->num);
+-
+-		for (i = 0; i < lu->num; i++) {
+-			cbm_lu.qid = qid;
+-			cbm_lu.index = lu->entry[i];
+-			dp_set_lookup_qid_via_index(&cbm_lu);
+-		}
++	if (flag & FLUSH_RESTORE_LOOKUP) {
++		lu->qid = qid;
++		cqm_restore_orig_q(lu);
+ 	}
+ 
+ 	res = DP_SUCCESS;
+diff --git a/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c b/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c
+index 17cafcaa4499..4ffd6177ac13 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c
++++ b/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c
+@@ -434,6 +434,13 @@ void cqm_map_to_drop_q(struct cbm_lookup_entry *lu_info)
+ }
+ EXPORT_SYMBOL(cqm_map_to_drop_q);
+ 
++void cqm_restore_orig_q(const struct cbm_lookup_entry *lu)
++{
++	if (g_cbm_ops && g_cbm_ops->cqm_restore_orig_q)
++		g_cbm_ops->cqm_restore_orig_q(lu);
++}
++EXPORT_SYMBOL(cqm_restore_orig_q);
++
+ int cbm_q_thres_get(u32 *length)
+ {
+ 	if (g_cbm_ops && g_cbm_ops->cbm_q_thres_get)
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_common.h b/drivers/net/ethernet/lantiq/cqm/cqm_common.h
+index 1684492aa52a..c4e4f2f03caa 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_common.h
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_common.h
+@@ -178,6 +178,7 @@ struct cbm_ops {
+ 	void (*set_lookup_qid_via_index)(struct cbm_lookup *info);
+ 	uint8_t (*get_lookup_qid_via_index)(u32 index);
+ 	void (*cqm_map_to_drop_q)(struct cbm_lookup_entry *lu_info);
++	void (*cqm_restore_orig_q)(const struct cbm_lookup_entry *lu);	
+ 	u8 (*get_lookup_qid_via_bits)(
+ 	u32 ep,
+ 	u32 classid,
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index 2a95eb836a89..6259e48eeb64 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -797,6 +797,19 @@ static void map_to_drop_q(struct cbm_lookup_entry *lu_entry)
+ 	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
+ }
+ 
++static void restore_orig_q(const struct cbm_lookup_entry *lu_entry)
++{
++	unsigned long sys_flag;
++	int i = 0;
++
++	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
++
++	for (i = 0; i < lu_entry->num; i++)
++		cqm_qid_program(lu_entry->qid, lu_entry->entry[i]);
++
++	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
++}
++
+ static inline void find_next_sub_if_id(u32 *idx_p, u32 mask, u32 mask_all,
+ 				       u32 limit_v, u32 start_v)
+ {
+@@ -4651,6 +4664,7 @@ static const struct cbm_ops cqm_ops = {
+ 	.set_lookup_qid_via_index = set_lookup_qid_via_index_prx300,
+ 	.get_lookup_qid_via_index = get_lookup_qid_via_idx_prx300,
+ 	.cqm_map_to_drop_q = map_to_drop_q,
++	.cqm_restore_orig_q = restore_orig_q,
+ 	.cbm_enable_backpressure = enable_backpressure,
+ 	.cbm_get_mtu_size = cqm_get_mtu_size,
+ 	.cbm_dp_get_dc_config = cqm_get_dc_config,
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index 75db3037d839..182dea6f0229 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -1249,6 +1249,7 @@ uint32_t cbm_get_std_free_count(void);
+ void set_lookup_qid_via_index(struct cbm_lookup *info);
+ uint8_t get_lookup_qid_via_index(uint32_t index);
+ void cqm_map_to_drop_q(struct cbm_lookup_entry *lu_info);
++void cqm_restore_orig_q(const struct cbm_lookup_entry *lu);
+ int check_ptr_validation(uint32_t buf);
+ void cbm_setup_DMA_p2p(void);
+ int cbm_turn_on_DMA_p2p(void);

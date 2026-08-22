@@ -1,0 +1,112 @@
+From 28cb08d5b3714ccdd0c99b2054b6da9a3fedf3a8 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <pczarnota@maxlinear.com>
+Date: Fri, 16 Jul 2021 15:40:10 +0200
+Subject: [PATCH] PONRTSYS-9221: Traffic on eth0_0 fails if omcid is stopped
+
+- Separate us and ds
+
+The removal of queue mapping was not working in case of "replicated"
+UNI queue mappings because of this check:
+
+	/* Do not overwrite lookup table for active downstream QID */
+	if (sch->ds && (atomic_read(&qid->ref_cnt) > 0))
+	       return 0;
+
+This check was introduced to prevent creation of subif -> queue mappings
+for GEMs in downstream. Such mapping can only exist in upstream and
+this check was introduced to avoid creating them.
+
+This change removes this check and separates US and DS queue mapping
+configuration. In DS, we will create (subif, tc) -> queue mappings for
+UNIs and force TC mapping for GEMs. In US we will create subif -> queue
+mappings for GEM ports.
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c | 41 ++++++++++++++++-----------
+ 1 file changed, 25 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 45dcc1514c17..ae5bb2a531aa 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -952,10 +952,6 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ {
+ 	int ret;
+ 
+-	/* Do not overwrite lookup table for active downstream QID */
+-	if (sch->ds && (atomic_read(&qid->ref_cnt) > 0))
+-		return 0;
+-
+ 	ret = pon_qos_set_qmap(qid, sch->port, subif, tc_cookie, en);
+ 	if (ret != 0)
+ 		return -EFAULT;
+@@ -982,6 +978,7 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+  *
+  * would trigger mappings for each subif:
+  *
++ *    subif=0 tc=tc
+  *    subif=1 tc=tc
+  *    subif=2 tc=tc
+  *    subif=3 tc=tc
+@@ -1007,7 +1004,7 @@ static int pon_qos_replicate_mappings_for_subifs(struct net_device *dev,
+ 		return -EINVAL;
+ 
+ 	/* Perform (subif, tc) -> (queue) mappings for each sub interface */
+-	for (i = 1; i < prop.num_subif; ++i) {
++	for (i = 0; i < prop.num_subif; ++i) {
+ 		int subif_id = subif.subif + i * SUBIF_INCREMENT;
+ 
+ 		ret = pon_qos_set_qmap(qid, sch->port, subif_id, tc, en);
+@@ -1080,6 +1077,21 @@ int pon_qos_update_ds_qmap(struct net_device *dev,
+ 	return 0;
+ }
+ 
++int pon_qos_update_us_qmap(struct net_device *dev, struct pon_qos_qdisc *sch,
++			   struct pon_qos_q_data *qid,
++			   struct pon_qos_qmap_tc *q_tc, bool en)
++{
++	int ret;
++
++	ret = pon_qos_map_qid(qid, sch, q_tc->tc, q_tc->tc_cookie, en);
++	if (ret) {
++		netdev_err(dev, "%s: qid map err\n", __func__);
++		return ret;
++	}
++
++	return 0;
++}
++
+ /*
+  * If mapping is egress and it has indev specified as cpu port,
+  * then it is an extraction mapping
+@@ -1175,23 +1187,20 @@ static int pon_qos_update_qmap_default(struct net_device *dev,
+ 	trace_pon_qos_update_qmap_enter(dev, sch, qid, q_tc, en);
+ 
+ 	/* TODO: DPM uses port zero currently as the CPU port */
+-	if (pon_qos_is_cpu_port(sch->port))
+-		return pon_qos_config_cpu_port(qid, sch->port, 0,
+-					       q_tc->tc_cookie, en);
+-
+-	ret = pon_qos_map_qid(qid, sch, q_tc->tc,
+-			      q_tc->tc_cookie, en);
+-	if (ret != 0) {
+-		netdev_err(dev, "%s: qid map err\n", __func__);
+-		return -EFAULT;
++	if (pon_qos_is_cpu_port(sch->port)) {
++		ret = pon_qos_config_cpu_port(qid, sch->port, 0,
++					      q_tc->tc_cookie, en);
++		trace_pon_qos_update_qmap_exit(dev, sch, qid, q_tc, en);
++		return ret;
+ 	}
+ 
+ 	if (sch->ds) {
+ 		ret = pon_qos_update_ds_qmap(dev, sch, qid, q_tc, en);
+-		if (ret)
+-			return ret;
++		trace_pon_qos_update_qmap_exit(dev, sch, qid, q_tc, en);
++		return ret;
+ 	}
+ 
++	ret = pon_qos_update_us_qmap(dev, sch, qid, q_tc, en);
+ 	trace_pon_qos_update_qmap_exit(dev, sch, qid, q_tc, en);
+ 
+ 	return ret;

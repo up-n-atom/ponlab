@@ -1,0 +1,293 @@
+From 4ceef71c2724bbb2d0b1e694940ff6bbcad0a668 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Wed, 12 Sep 2018 15:12:32 +0300
+Subject: [PATCH] Disable pop when configuring a pool/policy
+
+---
+ drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c | 134 ++++++++++++++----------
+ 1 file changed, 80 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c b/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c
+index 6dcfa2b6341c..393ea10afc61 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c
++++ b/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c
+@@ -565,26 +565,29 @@ static s32 bmgr_is_policy_params_valid(
+ 	return RC_SUCCESS;
+ }
+ 
+-/**************************************************************************
+- *! \fn	bmgr_set_control
+- **************************************************************************
+- *
+- *  \brief	Sets the control register
+- *
+- *  \return	RC_SUCCESS on success, other error code on failure
+- *
+- **************************************************************************/
+-static s32 bmgr_set_control(void)
++static u32 bmgr_get_control(void)
+ {
+-	// Buffer manager client enable
+-	WR_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE), 0x1);
++	return RD_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE));
++}
++
++static u32 enable_pop(void)
++{
++	u32 reg = RD_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE));
++
++	reg &= (~0x2);
++	WR_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE), reg);
+ 
+ 	return RC_SUCCESS;
+ }
+ 
+-static u32 bmgr_get_control(void)
++static u32 disable_pop(void)
+ {
+-	return RD_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE));
++	u32 reg = RD_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE));
++
++	reg |= 0x2;
++	WR_REG_32(BMGR_CTRL_REG_ADDR(BM_BASE), reg);
++
++	return RC_SUCCESS;
+ }
+ 
+ /**************************************************************************
+@@ -810,42 +813,43 @@ static u32 bmgr_get_pool_size(u8 pool_id)
+ }
+ 
+ /**************************************************************************
+- *! \fn	bmgr_set_group_available_buffers
++ *! \fn	bmgr_get_group_available_buffers
+  **************************************************************************
+  *
+- *  \brief  Sets the available buffers in group.
+- *          This is used to for better HW performance
++ *  \brief	Returns the available buffers in group
+  *
+- *  \param	group_id:		Group ID
+- *  \param	available_buffers:	Available buffres in group
++ *  \param	group_id:	Group ID
+  *
+- *  \return	RC_SUCCESS on success, other error code on failure
++ *  \return	Available buffers in group
+  *
+  **************************************************************************/
+-static s32 bmgr_set_group_available_buffers(u8 group_id,
+-					    u32 available_buffers)
++static u32 bmgr_get_group_available_buffers(u8 group_id)
+ {
+-	WR_REG_32(BMGR_GROUP_AVAILABLE_BUFF_REG_ADDR(BM_BASE, group_id),
+-		  available_buffers);
+-
+-	return RC_SUCCESS;
++	return RD_REG_32(BMGR_GROUP_AVAILABLE_BUFF_REG_ADDR(BM_BASE,
++			 group_id));
+ }
+ 
+ /**************************************************************************
+- *! \fn	bmgr_get_group_available_buffers
++ *! \fn	bmgr_add_group_available_buffers
+  **************************************************************************
+  *
+- *  \brief	Returns the available buffers in group
++ *  \brief  Adds the available buffers in group.
+  *
+  *  \param	group_id:	Group ID
++ *  \param	num_buffers:	Available buffres to add
+  *
+- *  \return	Available buffers in group
++ *  \return	RC_SUCCESS on success, other error code on failure
+  *
+  **************************************************************************/
+-static u32 bmgr_get_group_available_buffers(u8 group_id)
++static s32 bmgr_add_group_available_buffers(u8 group_id,
++					    u32 num_buffers)
+ {
+-	return RD_REG_32(BMGR_GROUP_AVAILABLE_BUFF_REG_ADDR(BM_BASE,
+-			 group_id));
++	u32 reg = bmgr_get_group_available_buffers(group_id);
++
++	reg += num_buffers;
++	WR_REG_32(BMGR_GROUP_AVAILABLE_BUFF_REG_ADDR(BM_BASE, group_id), reg);
++
++	return RC_SUCCESS;
+ }
+ 
+ /**************************************************************************
+@@ -1722,7 +1726,9 @@ s32 bmgr_push_buffer(struct bmgr_buff_info * const buff_info)
+ 	u32	address = BMGR_DATAPATH_BASE;
+ 	u32	value = 0;
+ 	u32	index = 0;
+-	u32	ptr2push[2 * PP_BMGR_MAX_BURST_IN_POP]; // 64 bit per allocation
++	dma_addr_t	dma;
++	void	*addr;
++	u32	*ptr2push; // 64 bit per allocation
+ 
+ 	if (!buff_info) {
+ 		pr_err("bmgr_push_buffer: buff_info is NULL\n");
+@@ -1742,6 +1748,16 @@ s32 bmgr_push_buffer(struct bmgr_buff_info * const buff_info)
+ 	// Write the Policy
+ 	address |= (buff_info->policy_id << 8);
+ 
++	addr = dmam_alloc_coherent(&this->pdev->dev,
++                                    2 * PP_BMGR_MAX_BURST_IN_POP,
++                                    &dma,
++                                    GFP_KERNEL | GFP_DMA);
++	if (!addr) {
++		dev_err(&this->pdev->dev, "Could not allocate using dmam_alloc_coherent\n");
++		return -ENOMEM;
++	}
++	ptr2push = (u32 *)addr;
++
+ 	// write to ddr
+ 	for (index = 0; index < buff_info->num_allocs; index++) {
+ 		ptr2push[2*index] = buff_info->addr_low[index];
+@@ -1749,6 +1765,7 @@ s32 bmgr_push_buffer(struct bmgr_buff_info * const buff_info)
+ 			 ((buff_info->pool_id[index] & 0xFF) << 24);
+ 		ptr2push[2*index + 1] = value;
+ 
++		pr_info("addr 0x%x addr1 0x%x %p %p\n", ptr2push[2*index], ptr2push[2*index+1], &ptr2push[2*index], &ptr2push[2*index+1]);
+ 		pr_info("bmgr_push_buffer: <--- push buffer to address %p (pool %d, addr low %p, addr high %p, value %d)\n",
+ 			(void *)address, buff_info->pool_id[index],
+ 			(void *)buff_info->addr_low[index],
+@@ -1758,8 +1775,8 @@ s32 bmgr_push_buffer(struct bmgr_buff_info * const buff_info)
+ 			num_deallocated_buffers++;
+ 	}
+ 
+-	copy_dma((u32)&ptr2push[0], address,
+-		 (0x80100000 | (8 * buff_info->num_allocs))/*0x80100008*/);
++	copy_dma((u32)dma, address,
++		 (0x80040000 | (8 * buff_info->num_allocs))/*0x80100008*/);
+ 
+ 	this->driver_db.policies[buff_info->policy_id].
+ 		num_deallocated_buffers += buff_info->num_allocs;
+@@ -1788,7 +1805,8 @@ s32 bmgr_driver_init(void)
+ 	// @lock
+ 	bmgr_db_lock();
+ 
+-	bmgr_set_control();
++	disable_pop();
++
+ 	bmgr_configure_ocp_master();
+ 
+ 	// Reset group reserved buffers
+@@ -1835,19 +1853,21 @@ EXPORT_SYMBOL(bmgr_driver_init);
+ s32 bmgr_pool_configure(const struct bmgr_pool_params * const pool_params,
+ 			u8 * const pool_id)
+ {
+-	s32	status = RC_SUCCESS;
+-	void	*pointers_table = NULL;
+-	u32	index = 0;
+-	u32	*temp_pointers_table_ptr = NULL;
+-	u64	user_array_ptr;
+-	u32	phy_ll_base;
+-	u32	val = 0;
++	s32		status = RC_SUCCESS;
++	void		*pointers_table = NULL;
++	u32		index = 0;
++	u32		*temp_pointers_table_ptr = NULL;
++	u64		user_array_ptr;
++	u32		val = 0;
++	dma_addr_t	dma;
+ 
+ 	pr_info("Configuring buffer manager pool...");
+ 
+ 	// @lock
+ 	bmgr_db_lock();
+ 
++	disable_pop();
++
+ 	// Validity check
+ 	status = bmgr_is_pool_params_valid(pool_params);
+ 	if (status != RC_SUCCESS)
+@@ -1872,9 +1892,10 @@ s32 bmgr_pool_configure(const struct bmgr_pool_params * const pool_params,
+ 	}
+ 
+ 	// Allocate pool_param->pool_num_of_buff * POINTER_SIZE bytes array
+-	pointers_table = devm_kzalloc(&this->pdev->dev,
+-				      sizeof(u32) * pool_params->num_buffers,
+-				      GFP_KERNEL);
++	pointers_table = dmam_alloc_coherent(&this->pdev->dev,
++				sizeof(u32) * pool_params->num_buffers,
++				&dma,
++				GFP_KERNEL | GFP_DMA);
+ 	if (!pointers_table) {
+ 		pr_err("bmgr_pool_configure: Failed to allocate pointers_table, num_buffers %d",
+ 		       pool_params->num_buffers);
+@@ -1899,16 +1920,11 @@ s32 bmgr_pool_configure(const struct bmgr_pool_params * const pool_params,
+ 		user_array_ptr += pool_params->size_of_buffer;
+ 	}
+ 
+-	phy_ll_base = dma_map_single(&this->pdev->dev,
+-				     (void *)pointers_table,
+-				     (pool_params->num_buffers * 4),
+-				     DMA_TO_DEVICE);
+-
+ 	status = bmgr_set_pool_size(*pool_id, pool_params->num_buffers);
+ 	if (status != RC_SUCCESS)
+ 		goto free_memory;
+ 
+-	status = bmgr_set_ext_fifo_base_addr_low(*pool_id, phy_ll_base);
++	status = bmgr_set_ext_fifo_base_addr_low(*pool_id, (u32)dma);
+ 	if (status != RC_SUCCESS)
+ 		goto free_memory;
+ 
+@@ -1942,8 +1958,8 @@ s32 bmgr_pool_configure(const struct bmgr_pool_params * const pool_params,
+ 	this->driver_db.groups[pool_params->group_id].num_pools_in_group++;
+ 	// Group's reserved buffers will be updated when configuring the policy
+ 
+-	val = this->driver_db.groups[pool_params->group_id].available_buffers;
+-	status = bmgr_set_group_available_buffers(pool_params->group_id, val);
++	status = bmgr_add_group_available_buffers(pool_params->group_id,
++						  pool_params->num_buffers);
+ 	if (status != RC_SUCCESS)
+ 		goto free_memory;
+ 
+@@ -2001,6 +2017,8 @@ s32 bmgr_pool_configure(const struct bmgr_pool_params * const pool_params,
+ 
+ 	bmgr_wait_for_init_completion();
+ 
++	enable_pop();
++
+ 	// @unlock
+ 	bmgr_db_unlock();
+ 
+@@ -2013,6 +2031,8 @@ s32 bmgr_pool_configure(const struct bmgr_pool_params * const pool_params,
+ 	// free pointers_table
+ 		kfree(pointers_table);
+ unlock:
++	enable_pop();
++
+ 	// @unlock
+ 	bmgr_db_unlock();
+ 
+@@ -2046,6 +2066,8 @@ s32 bmgr_policy_configure(const struct bmgr_policy_params * const policy_params,
+ 	// @lock
+ 	bmgr_db_lock();
+ 
++	disable_pop();
++
+ 	// Validity check
+ 	status = bmgr_is_policy_params_valid(policy_params);
+ 	if (status != RC_SUCCESS)
+@@ -2122,6 +2144,8 @@ s32 bmgr_policy_configure(const struct bmgr_policy_params * const policy_params,
+ 
+ 	bmgr_wait_for_init_completion();
+ 
++	enable_pop();
++
+ 	// @unlock
+ 	bmgr_db_unlock();
+ 
+@@ -2131,6 +2155,8 @@ s32 bmgr_policy_configure(const struct bmgr_policy_params * const policy_params,
+ 	return status;
+ 
+ unlock:
++	enable_pop();
++
+ 	// @unlock
+ 	bmgr_db_unlock();
+ 

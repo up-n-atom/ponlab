@@ -1,0 +1,325 @@
+From 83d32d6784065a1c993f6893e7bb422e4756be3e Mon Sep 17 00:00:00 2001
+From: Jan Dominiak <janx.dominiak@intel.com>
+Date: Tue, 24 Nov 2020 14:36:49 +0100
+Subject: [PATCH] PONRTSYS-8114: PON QOS - Support for mapping of US queues
+ based on GEM port and traffic class
+
+PON QOS extended to support mapping of US queues
+based on subif and class indexes. For backward
+compatibility, if cookie is empty, class is
+assumed to be same as subif.
+---
+ .../net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c  | 20 +++++++----
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c     | 27 ++++++++++++---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c      | 39 ++++++++++++++--------
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h      |  9 +++--
+ 4 files changed, 69 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c
+index 39831fde964e..1c411ee7cdac 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ds_tc_remap.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /******************************************************************************
+  *
++ * Copyright (c) 2020 MaxLinear, Inc.
+  * Copyright (c) 2019-2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -353,6 +354,8 @@ int pon_qos_tc_mappings_init(void)
+ {
+ 	struct core_ops *gsw_handle = NULL;
+ 	GSW_return_t ret = 0;
++	int i = 0;
++
+ 	GSW_QoS_DSCP_ClassCfg_t dscp2tc = {
+ 		.nTrafficClass = {
+ 			0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
+@@ -364,8 +367,6 @@ int pon_qos_tc_mappings_init(void)
+ 		.nTrafficClass = { 0, 1, 2, 3, 4, 5, 6, 7 },
+ 	};
+ 	GSW_QoS_portCfg_t qosPortCfg = {
+-		/* FIXME: hardcode the PON port number for now */
+-		.nPortId = 2,
+ 		.eClassMode = GSW_QOS_CLASS_SELECT_SPCP_DSCP,
+ 	};
+ 
+@@ -388,10 +389,17 @@ int pon_qos_tc_mappings_init(void)
+ 		return ret;
+ 	}
+ 
+-	ret = gsw_handle->gsw_qos_ops.QoS_PortCfgSet(gsw_handle, &qosPortCfg);
+-	if (ret != GSW_statusOk) {
+-		pr_err("%s: QoS_PortCfgSet failed: %d\n", __func__, ret);
+-		return ret;
++	/* FIXME: hardcoded port numbers for now */
++	for (i = 2; i <= 4; i++) {
++		qosPortCfg.nPortId = i;
++
++		ret = gsw_handle->gsw_qos_ops.QoS_PortCfgSet(gsw_handle,
++							     &qosPortCfg);
++		if (ret != GSW_statusOk) {
++			pr_err("%s: QoS_PortCfgSet failed for port %d: %d\n",
++			       __func__, i, ret);
++			return ret;
++		}
+ 	}
+ 
+ 	return ret;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index caed1b0b9e26..6747c3ad00a8 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /******************************************************************************
+  *
++ * Copyright (c) 2020 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -27,12 +28,14 @@ struct flower_cls_map {
+ 
+ static LIST_HEAD(tc_class_list);
+ 
+-static int pon_qos_tc_flower_action_valid(struct tcf_exts *exts)
++static int pon_qos_tc_parse_flower_action(struct tcf_exts *exts,
++					  char *tc_cookie)
+ {
+ 	const struct tc_action *a;
+ 	LIST_HEAD(actions);
+ 	int act_nr = 0;
+ 	int act_ok_nr = 0;
++	int offset;
+ 
+ 	if (tc_no_actions(exts))
+ 		return -EINVAL;
+@@ -43,6 +46,19 @@ static int pon_qos_tc_flower_action_valid(struct tcf_exts *exts)
+ 		    to_gact(a)->tcf_action == TC_ACT_OK)
+ 			act_ok_nr++;
+ 		act_nr++;
++
++		if (a->act_cookie) {
++			/* Maximum supported value is 15, so there is not need
++			 * to store whole act_cookie->data. Copying whole
++			 * unsigned char to signed char with such low values
++			 * won't cause any conversion problem, and in addition
++			 * will reset sign bit, which later will be used to
++			 * check if cookie was set or not.
++			 */
++			offset = a->act_cookie->len - sizeof(*tc_cookie);
++			memcpy(tc_cookie, a->act_cookie->data + offset,
++			       sizeof(*tc_cookie));
++		}
+ 	}
+ 
+ 	if (act_nr != 1 && act_ok_nr != 1)
+@@ -111,6 +127,7 @@ int pon_qos_tc_map(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 	struct flower_cls_map *map = NULL;
+ 	struct net_device *indev = NULL;
+ 	struct pon_qos_qmap_tc qmap = { 0 };
++	char tc_cookie = PON_QOS_TC_COOKIE_EMPTY;
+ 	int ifi = (int)*(int *)f->key;
+ 	int ret = 0;
+ 
+@@ -120,7 +137,7 @@ int pon_qos_tc_map(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 			return -ENODEV;
+ 	}
+ 
+-	ret = pon_qos_tc_flower_action_valid(f->exts);
++	ret = pon_qos_tc_parse_flower_action(f->exts, &tc_cookie);
+ 	if (ret < 0)
+ 		goto err_put_indev;
+ 
+@@ -131,8 +148,10 @@ int pon_qos_tc_map(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 	map->dev = dev;
+ 	map->indev = indev;
+ 	qmap.indev = map->indev;
+-	qmap.tc = map->key.vlan_priority;
++	qmap.subif = map->key.vlan_priority;
+ 	qmap.handle = map->classid;
++	qmap.tc_cookie = tc_cookie;
++
+ 	ret = pon_qos_update_qmap(dev, &qmap, 1);
+ 	if (ret < 0) {
+ 		netdev_err(dev, "%s: queue map fail\n", __func__);
+@@ -169,7 +188,7 @@ int pon_qos_tc_unmap(struct net_device *dev, void *list_node)
+ 	map = list_node;
+ 
+ 	qmap.indev = map->indev;
+-	qmap.tc = map->key.vlan_priority;
++	qmap.subif = map->key.vlan_priority;
+ 	qmap.handle = map->classid;
+ 	ret = pon_qos_update_qmap(dev, &qmap, 0);
+ 	if (ret < 0) {
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 8923dfde4a2c..43b65f9d312b 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0
+ /******************************************************************************
+  *
++ * Copyright (c) 2020 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -817,7 +818,7 @@ int pon_qos_tc_sched_status(struct pon_qos_port *p, struct pon_qos_qdisc *root)
+ }
+ 
+ static int pon_qos_set_qmap(struct pon_qos_q_data *qid,
+-			    int port, int tc, bool en)
++			    int port, int subif, int tc_cookie, bool en)
+ {
+ 	struct dp_queue_map_set qmap_set = {0};
+ 	int ret;
+@@ -826,10 +827,15 @@ static int pon_qos_set_qmap(struct pon_qos_q_data *qid,
+ 	qmap_set.q_id = en ? qid->qid : 0;
+ 
+ 	qmap_set.map.dp_port = port;
+-	qmap_set.map.subif = tc;
+-	qmap_set.map.class = tc;
++	qmap_set.map.subif = subif;
+ 	qmap_set.mask.flowid = 1;
+ 
++	/* If tc cookie is not set, assume class is same as subif */
++	if (tc_cookie == PON_QOS_TC_COOKIE_EMPTY)
++		qmap_set.map.class = subif;
++	else
++		qmap_set.map.class = tc_cookie;
++
+ 	/* Do not set the flags below for the CPU port otherwise the lookup
+ 	 * table entry for the re-insert queue is overwritten. The re-inserted
+ 	 * packets carry enc = 1,dec = 0, mpe1 = 0 and mpe = 0 in the DMA
+@@ -852,14 +858,14 @@ static int pon_qos_set_qmap(struct pon_qos_q_data *qid,
+ }
+ 
+ static int pon_qos_config_cpu_port(struct pon_qos_q_data *qid,
+-				   int port, int tc, bool en)
++				   int port, int subif, char tc_cookie, bool en)
+ {
+ 	int ret, i;
+ 
+ 	/* only 8 classes for CPU, starting from TC=8 */
+-	tc += 8;
++	subif += 8;
+ 
+-	ret = pon_qos_set_qmap(qid, port, tc, en);
++	ret = pon_qos_set_qmap(qid, port, subif, tc_cookie, en);
+ 	if (ret != 0)
+ 		return ret;
+ 
+@@ -868,12 +874,12 @@ static int pon_qos_config_cpu_port(struct pon_qos_q_data *qid,
+ 	else
+ 		atomic_inc(&qid->ref_cnt);
+ 
+-	if (tc != 15)
++	if (subif != 15)
+ 		return 0;
+ 
+ 	/* map class [0..7] and 15 to low prio queue */
+ 	for (i = 0; i < 7; i++) {
+-		ret = pon_qos_set_qmap(qid, port, i, en);
++		ret = pon_qos_set_qmap(qid, port, i, tc_cookie, en);
+ 		if (ret != 0)
+ 			pr_err("%s: cpu port config failed\n", __func__);
+ 	}
+@@ -920,7 +926,9 @@ static int pon_qos_reassign_tc(struct pon_qos_qdisc *sch, int tc, bool en)
+ 
+ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 			   struct pon_qos_qdisc *sch,
+-			   int tc, bool en)
++			   int subif,
++			   char tc_cookie,
++			   bool en)
+ {
+ 	int ret;
+ 
+@@ -928,7 +936,7 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 	if (sch->ds && (atomic_read(&qid->ref_cnt) > 0))
+ 		return 0;
+ 
+-	ret = pon_qos_set_qmap(qid, sch->port, tc, en);
++	ret = pon_qos_set_qmap(qid, sch->port, subif, tc_cookie, en);
+ 	if (ret != 0)
+ 		return -EFAULT;
+ 
+@@ -940,7 +948,8 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 	return ret;
+ }
+ int pon_qos_update_qmap(struct net_device *dev,
+-			struct pon_qos_qmap_tc *q_tc, bool en)
++			struct pon_qos_qmap_tc *q_tc,
++			bool en)
+ {
+ 	struct pon_qos_port *port = NULL;
+ 	struct pon_qos_qdisc *sch = NULL;
+@@ -970,7 +979,7 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 		if (ret < 0)
+ 			return -ENODEV;
+ 	} else {
+-		tc = q_tc->tc;
++		tc = q_tc->subif;
+ 	}
+ 
+ 	netdev_dbg(dev, "port: %d deq_i: %d qid: %d handle: %#x tc: %d ds:%s\n",
+@@ -983,13 +992,15 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 		 * queue with classid X:Y is mapped tc = (Y-1) + 8.
+ 		 * Later this can be improved by using tc-cookie.
+ 		 */
++
+ 		tc = TC_H_MIN(q_tc->handle) - 1;
+ 		if (tc < 0 || tc > PON_QOS_8021P_HIGHEST_PRIO)
+ 			return -EINVAL;
+ 
+-		ret = pon_qos_config_cpu_port(qid, sch->port, tc, en);
++		ret = pon_qos_config_cpu_port(qid, sch->port, tc,
++					      q_tc->tc_cookie, en);
+ 	} else {
+-		ret = pon_qos_map_qid(qid, sch, tc, en);
++		ret = pon_qos_map_qid(qid, sch, tc, q_tc->tc_cookie, en);
+ 		if (ret != 0) {
+ 			netdev_err(dev, "%s: qid map err\n", __func__);
+ 			return -EFAULT;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index 4bdac6400c57..743712fd9b37 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -1,6 +1,7 @@
+ /* SPDX-License-Identifier: GPL-2.0 */
+ /******************************************************************************
+  *
++ * Copyright (c) 2020 MaxLinear, Inc.
+  * Copyright (c) 2020 Intel Corporation
+  *
+  *****************************************************************************/
+@@ -19,6 +20,8 @@
+ #define PON_QOS_UNUSED -1
+ #define PON_QOS_CPU_PORT 0
+ 
++#define PON_QOS_TC_COOKIE_EMPTY -1
++
+ enum pon_qos_qdisc_type {
+ 	PON_QOS_QDISC_NONE,
+ 	PON_QOS_QDISC_PRIO,
+@@ -120,7 +123,8 @@ struct pon_qos_qmap_tc {
+ 	int flags;
+ 	u32 handle;
+ 	struct net_device *indev;
+-	int tc;
++	int subif;
++	char tc_cookie;
+ };
+ 
+ int pon_qos_get_queue_by_handle(struct net_device *dev,
+@@ -159,7 +163,8 @@ int pon_qos_qdisc_tree_del(struct pon_qos_port *p, struct pon_qos_qdisc *root);
+ int pon_qos_tc_sched_status(struct pon_qos_port *p, struct pon_qos_qdisc *root);
+ 
+ int pon_qos_update_qmap(struct net_device *dev,
+-			struct pon_qos_qmap_tc *q_tc, bool en);
++			struct pon_qos_qmap_tc *q_tc,
++			bool en);
+ int pon_qos_ev_tc_assign(struct pon_qos_qdisc *sch, u8 tc);
+ int pon_qos_ev_tc_unassign(struct pon_qos_qdisc *sch, u8 tc);
+ int pon_qos_tc_mappings_init(void);

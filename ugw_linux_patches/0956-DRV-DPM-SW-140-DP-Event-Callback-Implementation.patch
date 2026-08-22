@@ -1,0 +1,644 @@
+From c4561f9a5712ab0d1732f38caeb4b9a8b1595d87 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Fri, 17 Jan 2020 16:10:08 +0800
+Subject: [PATCH] DRV_DPM_SW-140: DP Event Callback Implementation
+
+    - PONRTSYS-6351: HW counter overflow handling - dp event callback API
+---
+ drivers/net/datapath/dpm/datapath.h          |  21 ++++
+ drivers/net/datapath/dpm/datapath_api.c      | 103 ++++++++++++++++
+ drivers/net/datapath/dpm/datapath_instance.c |   3 +
+ drivers/net/datapath/dpm/datapath_notifier.c | 148 ++++++++++++++++++++++
+ include/net/datapath_api.h                   | 178 ++++++++++++++++++++++++++-
+ 5 files changed, 447 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 90121a6682b6..fe05ec071cf6 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -1010,5 +1010,26 @@ int32_t dp_get_netif_subifid_priv(struct net_device *netif,
+ 				  dp_subif_t *subif, uint32_t flags);
+ struct hlist_head *get_dp_g_bridge_id_entry_hash_table_info(int instance,
+ 							    int index);
++struct dp_evt_notif_info {
++	struct notifier_block *nb;
++	struct dp_event evt_info;
++	struct list_head list;
++};
++
++struct dp_evt_notif_data {
++	enum DP_DATA_PORT_TYPE type;
++	enum DP_EVENT_OWNER owner;
++	struct net_device *dev;
++	struct module *mod;
++	u32 dev_port;
++	s32 subif;
++	int dpid;
++	int inst;
++};
++
++extern struct atomic_notifier_head dp_evt_notif_list;
++extern struct list_head evt_notif_list[DP_MAX_INST];
++int register_dp_event_notifier(struct dp_event *info);
++int unregister_dp_event_notifier(struct dp_event *info);
+ #endif /*DATAPATH_H */
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 55a2dba70513..5e7f2c476f35 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -109,6 +109,8 @@ struct cqm_port_info dp_deq_port_tbl[DP_MAX_INST][DP_MAX_CQM_DEQ];
+ /* DMA TX CH info*/
+ struct dma_chan_info *dp_dma_chan_tbl[DP_MAX_INST];
+ 
++struct list_head evt_notif_list[DP_MAX_INST];
++
+ struct parser_info pinfo[4];
+ int dp_print_len;
+ 
+@@ -120,6 +122,12 @@ int aca_portid = -1;
+ 
+ static void *dp_ops[DP_MAX_INST][DP_OPS_CNT];
+ 
++void (*dp_dev_get_ethtool_stats_fn)(struct net_device *dev,
++				    struct ethtool_stats *stats,
++				    u64 *data) = NULL;
++EXPORT_SYMBOL(dp_dev_get_ethtool_stats_fn);
++
++
+ int dp_register_ops(int inst, enum DP_OPS_TYPE type, void *ops)
+ {
+ 	if (inst < 0 || inst >= DP_MAX_INST || type >= DP_OPS_CNT) {
+@@ -362,6 +370,7 @@ static int32_t dp_alloc_port_private(int inst,
+ 	int i;
+ 	struct cbm_dp_alloc_data cbm_data = {0};
+ 	struct pmac_port_info *port;
++	struct dp_evt_notif_data notif_data;
+ 
+ 	if (!owner) {
+ 		pr_err("Allocate port failed for owner NULL\n");
+@@ -386,6 +395,10 @@ static int32_t dp_alloc_port_private(int inst,
+ 		DP_DEBUG(DP_DBG_FLAG_REG, "\n");
+ 	}
+ #endif
++	notif_data.inst = inst;
++	notif_data.dev = dev;
++	notif_data.mod = owner;
++	notif_data.dev_port = dev_port;
+ 	cbm_data.dp_inst = inst;
+ 	cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+ 	port = get_dp_port_info(inst, port_id);
+@@ -396,6 +409,10 @@ static int32_t dp_alloc_port_private(int inst,
+ 			       owner->name);
+ 			return DP_FAILURE;
+ 		}
++
++		atomic_notifier_call_chain(&dp_evt_notif_list,
++					   DP_EVENT_DE_ALLOC_PORT,
++					   &notif_data);
+ 		cbm_data.deq_port = port->deq_port_base;
+ 		cbm_data.dma_chan = port->dma_chan;
+ 		cbm_dp_port_dealloc(owner, dev_port, port_id,
+@@ -520,6 +537,11 @@ static int32_t dp_alloc_port_private(int inst,
+ 	DP_DEBUG(DP_DBG_FLAG_REG,
+ 		 "Port %d allocation succeed for module %s with dev_port %d\n",
+ 		 port_id, owner->name, dev_port);
++
++	atomic_notifier_call_chain(&dp_evt_notif_list,
++				   DP_EVENT_ALLOC_PORT,
++				   &notif_data);
++
+ 	return port_id;
+ }
+ 
+@@ -536,6 +558,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 	struct cbm_dp_en_data cbm_data = {0};
+ 	struct subif_platform_data platfrm_data = {0};
+ 	struct dp_subif_info *sif;
++	struct dp_evt_notif_data notif_data;
+ 	u32 cqm_deq_port;
+ 	u32 dma_ch_offset;
+ 	u32 dma_ch_ref, dma_ch_ref_curr;
+@@ -710,6 +733,25 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 
+ 	if (i < end) {
+ 		res = DP_SUCCESS;
++
++		notif_data.inst = inst;
++		notif_data.dpid = subif_id->port_id;
++		notif_data.subif = subif_id->subif;
++
++		if (dp_bp_dev_tbl[inst][sif->bp].ref_cnt <= 1) {
++			notif_data.dev = dev;
++			atomic_notifier_call_chain(&dp_evt_notif_list,
++						   DP_EVENT_REGISTER_SUBIF,
++						   &notif_data);
++		}
++
++		if (data->ctp_dev) {
++			notif_data.dev = data->ctp_dev;
++			atomic_notifier_call_chain(&dp_evt_notif_list,
++						   DP_EVENT_REGISTER_SUBIF,
++						   &notif_data);
++		}
++
+ 		if (dp_bp_dev_tbl[inst][sif->bp].ref_cnt > 1)
+ 			return res;
+ 		dp_inst_add_dev(dev, subif_name,
+@@ -721,6 +763,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 			 "register subif failed for no matched vap\n");
+ 	}
+ EXIT:
++
+ 	return res;
+ }
+ 
+@@ -737,6 +780,7 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	struct cbm_dp_en_data cbm_data = {0};
+ 	struct subif_platform_data platfrm_data = {0};
+ 	struct dp_subif_info *sif;
++	struct dp_evt_notif_data notif_data;
+ 	u32 dma_ch_offset, dma_ch_ref;
+ 
+ 	port_id = subif_id->port_id;
+@@ -788,6 +832,19 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 		return res;
+ 	}
+ 	bp = sif->bp;
++
++	if (sif->ctp_dev) {
++		notif_data.inst = inst;
++		notif_data.dev = sif->ctp_dev;
++		notif_data.dpid = subif_id->port_id;
++		notif_data.subif = subif_id->subif;
++
++		atomic_notifier_call_chain(&dp_evt_notif_list,
++					   DP_EVENT_DE_REGISTER_SUBIF,
++					   &notif_data);
++	}
++
++
+ 	/* reset mib, flag, and others */
+ 	memset(&sif->mib, 0, sizeof(sif->mib));
+ 	sif->flags = 0;
+@@ -849,6 +906,15 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 			 dev->name, inst, bp);
+ 		dp_inst_del_dev(dev, subif_name, inst, port_id,
+ 				subif_id->subif, 0);
++
++		notif_data.inst = inst;
++		notif_data.dev = dev;
++		notif_data.dpid = subif_id->port_id;
++		notif_data.subif = subif_id->subif;
++
++		atomic_notifier_call_chain(&dp_evt_notif_list,
++					   DP_EVENT_DE_REGISTER_SUBIF,
++					   &notif_data);
+ 	}
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_REG, "  dp_port=%d subif=%d cqm_port=%d\n",
+@@ -984,6 +1050,7 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 	struct pmac_port_info *port_info;
+ 	struct dp_dev_data tmp_data = {0};
+ 	struct cbm_dp_alloc_complete_data *cbm_data = NULL;
++	struct dp_evt_notif_data notif_data;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("dp_register_dev failed for datapath not init yet\n");
+@@ -1004,6 +1071,11 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 	}
+ 	port_info = get_dp_port_info(inst, port_id);
+ 
++	notif_data.inst = inst;
++	notif_data.dev = port_info->dev;
++	notif_data.dpid = port_info->port_id;
++	notif_data.mod = port_info->owner;
++
+ 	DP_LIB_LOCK(&dp_lock);
+ 	if (flags & DP_F_DEREGISTER) {	/*de-register */
+ 		if (port_info->status != PORT_DEV_REGISTERED) {
+@@ -1011,6 +1083,9 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 				 "No or %s to de-register for num_subif=%d\n",
+ 				 owner->name, port_info->num_subif);
+ 		} else if (port_info->status == PORT_DEV_REGISTERED) {
++			atomic_notifier_call_chain(&dp_evt_notif_list,
++						   DP_EVENT_DE_REGISTER_DEV,
++						   &notif_data);
+ 			port_info->status = PORT_ALLOCATED;
+ 			DP_CB(inst, dev_platform_set)(inst, port_id, data,
+ 						      flags);
+@@ -1088,6 +1163,10 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 	port_info->status = PORT_DEV_REGISTERED;
+ 	if (dp_cb)
+ 		port_info->cb = *dp_cb;
++
++	atomic_notifier_call_chain(&dp_evt_notif_list, DP_EVENT_REGISTER_DEV,
++				   &notif_data);
++
+ 	DP_LIB_UNLOCK(&dp_lock);
+ 	devm_kfree(&g_dp_dev->dev, cbm_data);
+ 
+@@ -2318,6 +2397,10 @@ void dp_net_dev_get_ethtool_stats(struct net_device *dev,
+ 	dp_subif_t subif = {0};
+ 	struct inst_info *pinfo = &dp_port_prop[subif.inst].info;
+ 
++	/* This is for the Mib counter wraparound module */
++	if (dp_dev_get_ethtool_stats_fn)
++		return dp_dev_get_ethtool_stats_fn(dev, stats, data);
++
+ 	if (!pinfo->dp_net_dev_get_ethtool_stats)
+ 		return;
+ 
+@@ -2325,6 +2408,26 @@ void dp_net_dev_get_ethtool_stats(struct net_device *dev,
+ }
+ EXPORT_SYMBOL(dp_net_dev_get_ethtool_stats);
+ 
++int dp_register_event_cb(struct dp_event *info, u32 flag)
++{
++	int ret;
++
++	if ((info->inst < 0) || (info->inst >= DP_MAX_INST)) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "register subif failed for wrong inst=%d\n",
++			 info->inst);
++		return DP_FAILURE;
++	}
++
++	if (flag & DP_F_DEREGISTER)
++		ret = unregister_dp_event_notifier(info);
++	else
++		ret = register_dp_event_notifier(info);
++
++	return ret;
++}
++EXPORT_SYMBOL(dp_register_event_cb);
++
+ #ifdef DP_TEST_EXAMPLE
+ void test(void)
+ {
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index d95f0716976f..df0e6276eff2 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -680,6 +680,9 @@ int dp_inst_init(u32 flag)
+ 		INIT_HLIST_HEAD(&dp_dev_list_free[i]);
+ 	}
+ 
++	for (i = 0; i < DP_MAX_INST; i++)
++		INIT_LIST_HEAD(&evt_notif_list[i]);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index a2bae47590d4..fb0b34f95152 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -216,3 +216,151 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ #endif
+ 	return 0;
+ }
++
++ATOMIC_NOTIFIER_HEAD(dp_evt_notif_list);
++static int dp_notifier(struct notifier_block *self, unsigned long action,
++		       void *data)
++{
++	struct dp_evt_notif_data *notif_data = data;
++	struct dp_evt_notif_info *evt_notif = NULL;
++	struct dp_event_info info;
++	struct list_head *pos;
++
++	if (!data) {
++		pr_err("invalid notifier data\n");
++		return -EINVAL;
++	}
++
++	rcu_read_lock();
++	list_for_each(pos, &evt_notif_list[notif_data->inst]) {
++		evt_notif = list_entry(pos, struct dp_evt_notif_info, list);
++		if (evt_notif->nb == self)
++			break;
++	}
++
++	if (!evt_notif || !evt_notif->evt_info.dp_event_cb)
++		goto end;
++
++	switch (evt_notif->evt_info.type & action) {
++	case DP_EVENT_INIT:
++		info.init_info.dev = notif_data->dev;
++		info.init_info.owner = notif_data->mod;
++		info.init_info.dev_port = notif_data->dev_port;
++		break;
++	case DP_EVENT_ALLOC_PORT:
++		info.alloc_info.dev = notif_data->dev;
++		info.alloc_info.owner = notif_data->mod;
++		info.alloc_info.dev_port = notif_data->dev_port;
++		break;
++	case DP_EVENT_DE_ALLOC_PORT:
++		info.de_alloc_info.dev = notif_data->dev;
++		info.de_alloc_info.owner = notif_data->mod;
++		info.de_alloc_info.dev_port = notif_data->dev_port;
++		break;
++	case DP_EVENT_REGISTER_DEV:
++		info.reg_dev_info.dev = notif_data->dev;
++		info.reg_dev_info.dpid = notif_data->dpid;
++		info.reg_dev_info.owner = notif_data->mod;
++		break;
++	case DP_EVENT_DE_REGISTER_DEV:
++		info.dereg_dev_info.dev = notif_data->dev;
++		info.dereg_dev_info.dpid = notif_data->dpid;
++		info.dereg_dev_info.owner = notif_data->mod;
++		break;
++	case DP_EVENT_REGISTER_SUBIF:
++		info.reg_subif_info.dev = notif_data->dev;
++		info.reg_subif_info.dpid = notif_data->dpid;
++		info.reg_subif_info.subif = notif_data->subif;
++		break;
++	case DP_EVENT_DE_REGISTER_SUBIF:
++		info.de_reg_subif_info.dev = notif_data->dev;
++		info.de_reg_subif_info.dpid = notif_data->dpid;
++		info.de_reg_subif_info.subif = notif_data->subif;
++
++		break;
++	case DP_EVENT_OWNER_SWITCH:
++		info.owner_info.dpid = notif_data->dpid;
++		info.owner_info.new_owner = notif_data->type;
++		break;
++	default:
++		goto end;
++	}
++
++	info.inst = notif_data->inst;
++	info.type = action;
++	info.data = evt_notif->evt_info.data;
++
++	evt_notif->evt_info.dp_event_cb(&info);
++end:
++	rcu_read_unlock();
++
++	return NOTIFY_DONE;
++}
++
++int register_dp_event_notifier(struct dp_event *info)
++{
++	struct dp_evt_notif_info *evt_notif;
++	struct notifier_block *nb = NULL;
++
++	if (!info->id) {
++		evt_notif = kzalloc(sizeof(*evt_notif), GFP_ATOMIC);
++		if (!evt_notif)
++			return DP_FAILURE;
++
++		nb = kzalloc(sizeof(*nb), GFP_ATOMIC);
++		if (!nb)
++			return DP_FAILURE;
++
++		nb->notifier_call = dp_notifier;
++	} else {
++		list_for_each_entry(evt_notif, &evt_notif_list[info->inst],
++				    list) {
++			if (evt_notif->nb == info->id)
++				break;
++		}
++
++		if (!evt_notif) {
++			pr_err("invalid handle\n");
++			return DP_FAILURE;
++		}
++	}
++
++	evt_notif->evt_info.f_owner_only = info->f_owner_only;
++	evt_notif->evt_info.dp_event_cb = info->dp_event_cb;
++	evt_notif->evt_info.type = info->type;
++	evt_notif->evt_info.data = info->data;
++
++	if (nb) {
++		evt_notif->nb = nb;
++		info->id = nb;
++
++		list_add(&evt_notif->list, &evt_notif_list[info->inst]);
++
++		atomic_notifier_chain_register(&dp_evt_notif_list, nb);
++	}
++
++	return 0;
++}
++
++int unregister_dp_event_notifier(struct dp_event *info)
++{
++	struct dp_evt_notif_info *evt_notif;
++
++	list_for_each_entry(evt_notif, &evt_notif_list[info->inst], list) {
++		if (evt_notif->nb == info->id) {
++			list_del_rcu(&evt_notif->list);
++			synchronize_rcu();
++			break;
++		}
++	}
++
++	if (!evt_notif->nb) {
++		pr_err("invalid handle\n");
++		return DP_FAILURE;
++	}
++
++	atomic_notifier_chain_unregister(&dp_evt_notif_list, evt_notif->nb);
++	kfree(evt_notif->nb);
++
++	return 0;
++}
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index f365538e0694..0f505dd70faa 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -1800,6 +1800,178 @@ struct dp_spl_conn {
+  */
+ int dp_connect_spl_path(int inst, struct dp_spl_conn *conn);
+ 
++enum DP_DATA_PORT_TYPE {
++	DP_DATA_PORT_LINUX = 0, /*!< data port owned by Linux */
++	DP_DATA_PORT_DPDK, /*!< data port owned by DPDK */
++	DP_DATA_PORT_MPE, /*!< data port owned by MPE */
++};
++
++/*! @brief enum DP_EVENT_TYPE to define the different kind of event type
++ */
++enum DP_EVENT_TYPE {
++	DP_EVENT_INIT = 0, /*!< event callback for initiazation when first
++				 *   network driver register to dp via calling
++				 *   API dp_alloc_port_ext
++				 *   DP will call event callback before
++				 *   allocate port for this request
++				 */
++	DP_EVENT_ALLOC_PORT, /*!< event callback for alloc port */
++	DP_EVENT_DE_ALLOC_PORT, /*!< event callback for de_alloc port
++					  */
++	DP_EVENT_REGISTER_DEV, /*!< event callback for register dev */
++	DP_EVENT_DE_REGISTER_DEV, /*!< event callback for de_register
++					    *   dev
++					    */
++	DP_EVENT_REGISTER_SUBIF, /*!< event callback for register subif
++					  */
++	DP_EVENT_DE_REGISTER_SUBIF, /*!< event callback for de_register
++					     *   subif
++					     */
++	DP_EVENT_OWNER_SWITCH  /*!< event callback when data port owner
++					 *   switching between linux and
++					 *   DPDK
++					 */
++};
++
++/*! @brief struct dp_event_init_info, init event specific information
++ */
++struct dp_event_init_info {
++	struct module *owner; /*!< Kernel module pointer which owns the port */
++	struct net_device *dev; /*!< network device pointer. it can be NULL for
++				 *   some device
++				 */
++	u32 dev_port; /*!< Physical Port Number of this device managed by the
++		       *   driver
++		       */
++};
++
++/*! @brief struct dp_event_alloc_info, alloc port event specific information
++ */
++struct dp_event_alloc_info {
++	struct module *owner; /*!< Kernel module pointer which owns the port */
++	struct net_device *dev; /*!< network device pointer. it can be NULL for
++				 *   some device
++				 */
++	u32 dev_port; /*!< Physical Port Number of this device managed by the
++		       *   driver
++		       */
++};
++
++/*! @brief struct dp_event_reg_dev_info, register dev event specific
++ *  information
++ */
++struct dp_event_reg_dev_info {
++	struct module *owner; /*!< Kernel module pointer which owns the port */
++	struct net_device *dev; /*!< network device pointer. it can be NULL for
++				 *   some device
++				 */
++	int dpid;  /*!< dp port ID */
++};
++
++/*! @brief struct dp_event_reg_subif_info, register subif event specific
++ *   information
++ */
++struct dp_event_reg_subif_info {
++	int dpid;  /*!< dp port ID */
++	s32 subif; /*!< device subif */
++	struct net_device *dev; /*!< subif network device pointer.
++				 *   It can be NULL for some case, like ATM DSL
++				 */
++};
++
++/*! @brief struct dp_event_owner_info, data port owner change event specific
++ *   information
++ */
++struct dp_event_dataport_owner_info {
++	int dpid;  /*!< dp port ID */
++	enum DP_DATA_PORT_TYPE new_owner; /*!<  owner dpid will switch to */
++};
++
++
++/*! @brief struct dp_dev_event, which is used for dp_register_event
++ */
++struct dp_event_info {
++	int inst; /*!< [out] dp instance id */
++	enum DP_EVENT_TYPE type; /*!< [out] event type */
++	union {
++		struct dp_event_init_info init_info; /*!< initialization info */
++		struct dp_event_alloc_info alloc_info; /*!< alloc port info */
++		struct dp_event_alloc_info de_alloc_info; /*!< de_alloc port
++							   * info */
++		struct dp_event_reg_dev_info reg_dev_info; /*!< register
++							    *   dev info
++							    */
++		struct dp_event_reg_dev_info dereg_dev_info; /*!< de_register
++							      *   dev info
++							      */
++		struct dp_event_reg_subif_info reg_subif_info;/*!< register
++							       *   subif
++							       *   info
++							       */
++		struct dp_event_reg_subif_info de_reg_subif_info;/*!< register
++								  *   subif
++								  *   info
++								  */
++		struct dp_event_dataport_owner_info owner_info;/*!< data port
++								*   owner info
++								*/
++	};
++	void *data; /*!< [out] pass back the data to caller which was provied by
++		     *   caller when calling dp_register_event_cb API
++		     */
++
++};
++
++enum DP_EVENT_OWNER {
++	DP_EVENT_OWNER_DPDK = 0, /*!< Event owner type DPDK */
++	DP_EVENT_OWNER_PPA, /*!< Event owner type PPA */
++	DP_EVENT_OWNER_MIB, /*!< Event owner type MIB */
++	DP_EVENT_OWNER_OTHERS /*!< Event owner type OTHERS */
++};
++
++/* Note:this callback should should support tasklet/softtimer related context */
++struct dp_event {
++	int inst; /*!< [in] dp instance id */
++	enum DP_EVENT_OWNER owner; /*!< [in] owner who register to DP
++				    *   for event status monitoring.
++				    *   For debugging purpose only
++				    */
++	enum DP_EVENT_TYPE type; /*!< [in] type of event */
++	int f_owner_only; /*!< [in] flag to indicate whether only limited event
++			   *   will be trigger. It is mainly for DPDK if
++			   *   DPDK only interted in those data port which owned
++			   *   by DPDK only
++			   */
++	int32_t(*dp_event_cb)(struct dp_event_info *info);  /*!< [in] event
++							     *   callback
++							     *   function
++							     *   callback contex
++							     *   can be tasklet
++							     *   or soft-timer
++							     */
++	void *data; /*!< [in] optinal data which will be passed backed to
++		     *   callback function when event triggered
++		     */
++	void *id; /*!< [in/out] handle for dp_register_event_cb.
++		   *   When set as NULL, it will be treated as [out] parameter.
++		   *   Upon sucessful registration of the callback function, a
++		   *   valid handle will be return.
++		   *   The handle can be used for subsequent update by
++		   *   registered apps. It will be used as [in] parameter.
++		   *   All existing values will be overwritten by the new
++		   *   values in dp_event_info.
++		   */
++};
++
++/*!
++ *@brief dp_register_event_cb API to register event callback functions
++ *@param[in/out] info: registration event info
++ *@param[in] flag: DP_F_DEREGISTER is for de-registration,
++ *                 otherwise it is for registration
++ *@return DP_SUCCESS on succeed and DP_FAILURE on failure
++ */
++int dp_register_event_cb(struct dp_event *info, uint32_t flag);
++
+ /*! @brief Enumerator DP_OPS_TYPE */
+ enum DP_OPS_TYPE {
+ 	DP_OPS_BM, /*!< BM ops type */
+@@ -1847,12 +2019,6 @@ static inline struct umt_ops *dp_get_umt_ops(int inst)
+ 	return (struct umt_ops *)dp_get_ops(inst, DP_OPS_UMT);
+ }
+ 
+-enum DP_DATA_PORT_TYPE {
+-	DP_DATA_PORT_LINUX = 0, /*!< data port owned by Linux */
+-	DP_DATA_PORT_DPDK, /*!< data port owned by DKDP */
+-	DP_DATA_PORT_MPE, /*!< data port owned by MPE */
+-};
+-
+ /*!
+  *@brief parse dma ID
+  *@param[in] inst     : DMA ID

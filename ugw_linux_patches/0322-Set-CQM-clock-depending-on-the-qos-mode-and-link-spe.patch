@@ -1,0 +1,148 @@
+From 46553f9c6b2ba07f95a38c6e7567b2869e61296e Mon Sep 17 00:00:00 2001
+From: kavitha3 <k.subramanian@intel.com>
+Date: Thu, 11 Oct 2018 11:30:17 +0800
+Subject: [PATCH] Set CQM clock depending on the qos mode and link speed
+
+---
+ drivers/net/ethernet/lantiq/cqm/cqm_dev.c      | 19 ++++++++---------
+ drivers/net/ethernet/lantiq/cqm/cqm_dev.h      |  1 +
+ drivers/net/ethernet/lantiq/cqm/falconmx/cqm.c | 29 +++++++++++++++++++++++---
+ drivers/net/ethernet/lantiq/cqm/falconmx/cqm.h |  7 +++++++
+ 4 files changed, 43 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_dev.c b/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
+index 39e2e7a84786..0faf028670e4 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_dev.c
+@@ -17,7 +17,7 @@ struct device_node *parse_dts(int j, void **pdata, struct resource **res,
+ 			      int *num_res)
+ {
+ 	struct device_node *node = NULL, *cpu_deq_port = NULL;
+-	struct device_node *ret_node = NULL;
++	struct device_node *ret_node = NULL, *gsw_node = NULL;
+ 	int idx = 0;
+ 	struct cqm_data *cqm_pdata = NULL;
+ 	unsigned int intr[MAX_NUM_INTR];
+@@ -67,17 +67,9 @@ struct device_node *parse_dts(int j, void **pdata, struct resource **res,
+ 						   GFP_KERNEL);
+ 	memcpy(cqm_pdata->intrs, intr, (sizeof(unsigned int) * idx));
+ 	cqm_pdata->rcu_reset = of_reset_control_get(node, "cqm");
+-	if (IS_ERR(cqm_pdata->rcu_reset)) {
++	if (IS_ERR(cqm_pdata->rcu_reset))
+ 		pr_err("No rcu reset for %s\n", dev_node_name[j].node_name);
+-		/*return PTR_ERR(cqm_pdata->rcu_reset)*/;
+-	}
+ 
+-	cqm_pdata->cqm_clk[0] = (void *)of_clk_get_by_name(node, "freq");
+-	if (IS_ERR(cqm_pdata->cqm_clk[0]))
+-		pr_err("Error getting freq clk\n");
+-	cqm_pdata->cqm_clk[1] = (void *)of_clk_get_by_name(node, "cbm");
+-	if (IS_ERR(cqm_pdata->cqm_clk[1]))
+-		pr_err("Error getting cqm clk\n");
+ 	cqm_pdata->syscfg = syscon_regmap_lookup_by_phandle(node,
+ 							    "intel,syscon");
+ 	if (IS_ERR(cqm_pdata->syscfg)) {
+@@ -114,6 +106,13 @@ struct device_node *parse_dts(int j, void **pdata, struct resource **res,
+ 	cqm_pdata->num_dq_port = count;
+ 
+ 	ret_node = node;
++	gsw_node = of_find_node_by_name(NULL, "gsw_core");
++	if (!gsw_node) {
++		pr_err("Unable to get node gsw_core\n");
++		return NULL;
++	}
++	cqm_pdata->gsw_mode = 0;
++	of_property_read_u32(gsw_node, "gsw_mode", &cqm_pdata->gsw_mode);
+ 	return ret_node;
+ 
+ err_free_pdata:
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_dev.h b/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
+index 42d05c707b82..e702aaf1896d 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_dev.h
+@@ -45,5 +45,6 @@ struct cqm_data {
+ 	unsigned int pool_size[MAX_NUM_POOLS];
+ 	u32  dq_port[MAX_CPU_DQ_PORT_N_TYPE];
+ 	u32 num_dq_port;
++	u32 gsw_mode;
+ };
+ #endif
+diff --git a/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.c b/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.c
+index 586533aae1ec..567fc765677d 100644
+--- a/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.c
+@@ -3,6 +3,7 @@
+ #include "../cqm_dev.h"
+ #include <net/datapath_proc_api.h>
+ #include <net/switch_api/gsw_flow_ops.h>
++#include <net/switch_api/gsw_dev.h>
+ 
+ #define OWN_BIT  BIT(31)
+ #define COMPLETE_BIT  BIT(30)
+@@ -3612,7 +3613,8 @@ static int cqm_falconmx_probe(struct platform_device *pdev)
+ 	struct cqm_data *pdata = NULL;
+ 	const struct of_device_id *match;
+ 	u32 port_no, port_type;
+-	int result;
++	int result, ret;
++	struct clk *cqm_clk;
+ 
+ 	memset(&cqm_dbg_cntrs, 0, sizeof(cqm_dbg_cntrs));
+ 	pdata = platform_get_drvdata(pdev);
+@@ -3670,8 +3672,20 @@ static int cqm_falconmx_probe(struct platform_device *pdev)
+ 			cqm_ctrl->cbm_irq[i + 1] = 0;
+ 	}
+ #ifndef CONFIG_USE_EMULATOR
+-	cqm_ctrl->cbm_clk = pdata->cqm_clk[0];
+-	clk_prepare_enable(pdata->cqm_clk[1]);
++	cqm_ctrl->cbm_clk = devm_clk_get(cqm_ctrl->dev, "freq");
++	if (IS_ERR(cqm_ctrl->cbm_clk)) {
++		ret = PTR_ERR(cqm_ctrl->cbm_clk);
++		dev_err(cqm_ctrl->dev, "failed to get cqm_ctrl->cqm:%d\n", ret);
++		return ret;
++	}
++	cqm_clk = devm_clk_get(cqm_ctrl->dev, "cbm");
++	if (IS_ERR(cqm_clk)) {
++		ret = PTR_ERR(cqm_clk);
++		dev_err(cqm_ctrl->dev, "failed to get cqm_clk:%d\n", ret);
++		return ret;
++	}
++	clk_prepare_enable(cqm_clk);
++	clk_prepare_enable(cqm_ctrl->cbm_clk);
+ #endif
+ 	cqm_ctrl->syscfg = pdata->syscfg;
+ 	cqm_ctrl->force_xpcs = pdata->force_xpcs;
+@@ -3765,6 +3779,15 @@ static int cqm_falconmx_probe(struct platform_device *pdev)
+ 	/* Enable all the LS interrupts */
+ 	ls_intr_ctrl(0xFF0000, cqm_ctrl->ls);
+ 	/*set the Ingress port delay before enqueue*/
++	switch (pdata->gsw_mode) {
++	case SHORT_QOS_10G:
++		clk_set_rate(cqm_ctrl->cbm_clk, 400000000);
++	break;
++	case FULL_QOS_1G:
++	case SHORT_QOS_1G:
++		clk_set_rate(cqm_ctrl->cbm_clk, 250000000);
++	break;
++	};
+ 	dev_info(cqm_ctrl->dev, "CBM Clock: %ldHz\n",
+ 		 clk_get_rate(cqm_ctrl->cbm_clk));
+ 
+diff --git a/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.h b/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.h
+index d73482010ab3..9688ca9be82e 100644
+--- a/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/falconmx/cqm.h
+@@ -162,6 +162,13 @@ enum CQM_BUFF_SIZE {
+ 	CQM_SIZE3_BUF_SIZE,
+ };
+ 
++enum CQM_QOS_LINK_MODE {
++	FULL_QOS_10G = 0,
++	SHORT_QOS_10G,
++	FULL_QOS_1G,
++	SHORT_QOS_1G,
++};
++
+ /**************************************************
+  *
+  * Macros

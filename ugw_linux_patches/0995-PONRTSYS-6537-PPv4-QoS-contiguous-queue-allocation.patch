@@ -1,0 +1,1049 @@
+From f665295405e44390f78954cf90b391db49d456fe Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Sun, 26 Jan 2020 16:56:27 +0200
+Subject: [PATCH] PONRTSYS-6537: PPv4 QoS contiguous queue allocation
+
+---
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c    |  92 +++++---
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c   | 240 +++++++++++++++++----
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  | 120 +++++++++--
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h  |  28 ++-
+ drivers/net/ppv4/pp-dev/pp_dts.c                   |  12 +-
+ drivers/net/ppv4/pp-hal/descriptor/pp_desc.h       |  12 +-
+ .../ppv4/pp-tools/unit-test/tests/pp_qos_tests.c   |   9 +-
+ include/linux/pp_qos_api.h                         |  35 +++
+ 8 files changed, 451 insertions(+), 97 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+index 850c3568e182..0588a198e9b2 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+@@ -35,8 +35,8 @@ static u8  g_raw_config;
+ void remove_node(char *cmd_buf, void *data)
+ {
+ 	struct pp_qos_dev *qdev;
+-	u32 id = 0;
+-	char node_type[10];
++	char node_type[16];
++	u32 count, id = 0;
+ 
+ 	qdev = pp_qos_dev_open((unsigned long)data);
+ 	if (sscanf(cmd_buf, "%10s %u", node_type, &id) != 2) {
+@@ -44,19 +44,28 @@ void remove_node(char *cmd_buf, void *data)
+ 		return;
+ 	}
+ 
+-	if (!strncmp(node_type, "port", 6))
++	if (!strncmp(node_type, "port", strlen("port"))) {
+ 		pp_qos_port_remove(qdev, id);
+-	else if (!strncmp(node_type, "sched", 6))
++	} else if (!strncmp(node_type, "sched", strlen("sched"))) {
+ 		pp_qos_sched_remove(qdev, id);
+-	else if (!strncmp(node_type, "queue", 6))
++	} else if (!strncmp(node_type, "queue", strlen("queue"))) {
+ 		pp_qos_queue_remove(qdev, id);
+-	else
++	} else if (!strncmp(node_type, "cont_queue", strlen("cont_queue"))) {
++		if (sscanf(cmd_buf, "%16s %u %u", node_type, &id,
++			   &count) != 3) {
++			QOS_LOG_ERR("sscanf err\n");
++			return;
++		}
++		pp_qos_contiguous_queue_remove(qdev, id, count);
++	} else {
+ 		QOS_LOG_ERR("Type %s not supported\n", node_type);
++	}
+ }
+ 
+ void remove_node_help(struct seq_file *f)
+ {
+ 	seq_puts(f, "<port/sched/queue> <node id>\n");
++	seq_puts(f, "<cont_queue> <start id> <count>\n");
+ }
+ 
+ PP_DEFINE_DEBUGFS(remove, remove_node_help, remove_node);
+@@ -64,25 +73,50 @@ PP_DEFINE_DEBUGFS(remove, remove_node_help, remove_node);
+ void allocate_node(char *cmd_buf, void *data)
+ {
+ 	struct pp_qos_dev *qdev;
+-	u32 phy = 0, id;
+-	char node_type[10];
++	u32 phy = 0, id, count;
++	char node_type[16];
++	u32 *ids, *rlms;
++	s32 rc;
+ 
+ 	qdev = pp_qos_dev_open((unsigned long)data);
+-	if (sscanf(cmd_buf, "%10s", node_type) != 1) {
++	if (sscanf(cmd_buf, "%16s", node_type) != 1) {
+ 		QOS_LOG_ERR("sscanf err\n");
+ 		return;
+ 	}
+ 
+ 	if (!strncmp(node_type, "port", 6)) {
+-		if (sscanf(cmd_buf, "%10s %u", node_type, &phy) != 2) {
++		if (sscanf(cmd_buf, "%16s %u", node_type, &phy) != 2) {
+ 			QOS_LOG_ERR("sscanf err\n");
+ 			return;
+ 		}
+ 		pp_qos_port_allocate(qdev, phy, &id);
+-	} else if (!strncmp(node_type, "sched", 6)) {
++	} else if (!strncmp(node_type, "sched", strlen("sched"))) {
+ 		pp_qos_sched_allocate(qdev, &id);
+-	} else if (!strncmp(node_type, "queue", 6)) {
++	} else if (!strncmp(node_type, "queue_id_phy",
++			    strlen("queue_id_phy"))) {
++		pp_qos_queue_allocate_id_phy(qdev, &id, &phy);
++		QOS_LOG_INFO("Allocated id %u rlm %u\n", id, phy);
++		return;
++	} else if (!strncmp(node_type, "queue", strlen("queue"))) {
+ 		pp_qos_queue_allocate(qdev, &id);
++	} else if (!strncmp(node_type, "cont_queue", strlen("cont_queue"))) {
++		if (sscanf(cmd_buf, "%16s %u", node_type, &count) != 2) {
++			QOS_LOG_ERR("sscanf err\n");
++			return;
++		}
++		ids = kzalloc(qdev->init_params.reserved_queues * sizeof(u32),
++			      GFP_KERNEL);
++		rlms = kzalloc(qdev->init_params.reserved_queues * sizeof(u32),
++			       GFP_KERNEL);
++		rc = pp_qos_contiguous_queue_allocate(qdev, ids, rlms, count);
++		if (!rc) {
++			QOS_LOG_INFO("Alloc %u contq start @ id %u rlm %u\n",
++				     count, *ids, *rlms);
++		}
++
++		kfree(ids);
++		kfree(rlms);
++		return;
+ 	} else {
+ 		QOS_LOG_ERR("Type %s not supported\n", node_type);
+ 		return;
+@@ -95,6 +129,8 @@ void allocate_node_help(struct seq_file *f)
+ {
+ 	seq_printf(f, "<port/sched/queue> <port phy (%#x for automatic phy)>\n",
+ 		   ALLOC_PORT_ID);
++	seq_puts(f, "<cont_queue> <count>\n");
++	seq_puts(f, "<queue_id_phy>\n");
+ }
+ 
+ PP_DEFINE_DEBUGFS(allocate, allocate_node_help, allocate_node);
+@@ -1216,7 +1252,8 @@ void pp_qos_dbg_tree_remove(struct seq_file *s)
+ 	qos_pools_clean(qdev);
+ 	qos_pools_init(qdev,
+ 		       qdev->init_params.max_ports,
+-		       qdev->init_params.max_queues);
++		       qdev->init_params.max_queues,
++		       qdev->init_params.reserved_queues);
+ }
+ 
+ PP_DEFINE_DEBUGFS(destroy_tree, pp_qos_dbg_tree_remove, NULL);
+@@ -1276,13 +1313,18 @@ void pp_qos_dbg_gen_show(struct seq_file *s)
+ 		seq_puts(s, "Could not obtain FW version\n");
+ 	}
+ 
+-	seq_printf(s, "Used nodes:\t%u\nPorts:\t\t%u\nScheds:\t\t%u\nQueues:\t\t%u\nInternals:\t%u\n",
+-		   stats.active_nodes, stats.active_ports, stats.active_sched,
+-		   stats.active_queues, stats.active_internals);
++	seq_printf(s, "Used nodes:\t%u\n", stats.active_nodes);
++	seq_printf(s, "Ports:\t\t%u\n", stats.active_ports);
++	seq_printf(s, "Scheds:\t\t%u\n", stats.active_sched);
++	seq_printf(s, "Queues:\t\t%u\n", stats.active_queues);
++	seq_printf(s, "Reserved Queues:\t%u\n", stats.active_reserved_queues);
++	seq_printf(s, "Internals:\t%u\n", stats.active_internals);
+ 
+ 	seq_printf(s, "Command queue watermark:\n\tcmd_q: %u\n\tpend_q: %u\n",
+ 		   (u32)cmd_queue_watermark_get(qdev->drvcmds.cmdq),
+ 		   (u32)cmd_queue_watermark_get(qdev->drvcmds.pendq));
++	seq_printf(s, "WRED resources:\t%u\n",
++		   qdev->init_params.wred_total_avail_resources);
+ }
+ 
+ PP_DEFINE_DEBUGFS(gen_show, pp_qos_dbg_gen_show, NULL);
+@@ -1603,8 +1645,10 @@ PP_DEFINE_DEBUGFS(queue_push, queue_push_help, queue_push);
+ void queue_pop(char *cmd_buf, void *data)
+ {
+ 	struct pp_qos_dev *qdev;
++#ifdef CONFIG_PPV4_LGM
+ 	struct pp_qos_desc desc;
+ 	struct pp_qos_hw_desc hw_desc;
++#endif
+ 	u32 descriptor[4];
+ 	u32 logical_id;
+ 
+@@ -1627,14 +1671,14 @@ void queue_pop(char *cmd_buf, void *data)
+ 	QOS_LOG_INFO("descriptor[2]: %#x\n", descriptor[2]);
+ 	QOS_LOG_INFO("descriptor[3]: %#x\n", descriptor[3]);
+ 
+-	if (IS_ENABLED(CONFIG_PPV4_LGM)) {
+-		hw_desc.word[0] = descriptor[0];
+-		hw_desc.word[1] = descriptor[1];
+-		hw_desc.word[2] = descriptor[2];
+-		hw_desc.word[3] = descriptor[3];
+-		pp_qos_desc_decode(&desc, &hw_desc);
+-		pp_qos_desc_dump(&desc);
+-	}
++#ifdef CONFIG_PPV4_LGM
++	hw_desc.word[0] = descriptor[0];
++	hw_desc.word[1] = descriptor[1];
++	hw_desc.word[2] = descriptor[2];
++	hw_desc.word[3] = descriptor[3];
++	pp_qos_desc_decode(&desc, &hw_desc);
++	pp_qos_desc_dump(&desc);
++#endif
+ }
+ 
+ void queue_pop_help(struct seq_file *f)
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+index 44e09bafd1af..f104ee124314 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+@@ -137,7 +137,6 @@ static s32 is_node_configured(const struct pp_qos_dev *qdev,
+ 
+ 	phy = get_phy_from_id(qdev->mapping, id);
+ 	if (QOS_PHY_UNMAPPED(phy)) {
+-		pr_info("Id %u is not configured\n", id);
+ 		*configured = false;
+ 	} else if (QOS_PHY_VALID(phy)) {
+ 		*configured = true;
+@@ -1115,7 +1114,7 @@ static s32 check_queue_conf_validity(struct pp_qos_dev *qdev, u32 id,
+ 				     struct qos_node *node, u32 *modified,
+ 				     bool syncq, u16 rlm)
+ {
+-	u32 phy;
++	u32 phy, mapped_rlm;
+ 	s32 rc;
+ 	struct qos_node *nodep;
+ 
+@@ -1151,7 +1150,13 @@ static s32 check_queue_conf_validity(struct pp_qos_dev *qdev, u32 id,
+ 		}
+ 
+ 		if (rlm == QOS_INVALID_RLM) {
+-			node->data.queue.rlm = allocate_rlm(qdev, id);
++			mapped_rlm = get_phy_from_id(qdev->rlm_mapping, id);
++			if (!QOS_PHY_VALID(mapped_rlm)) {
++				mapped_rlm = allocate_rlm(qdev, id,
++							  RLM_RANGES_NORMAL);
++			}
++
++			node->data.queue.rlm = mapped_rlm;
+ 		} else {
+ 			node->data.queue.rlm = rlm;
+ 			node->data.queue.is_alias = 1;
+@@ -1251,10 +1256,52 @@ void pp_qos_queue_conf_set_default(struct pp_qos_queue_conf *conf)
+ }
+ EXPORT_SYMBOL(pp_qos_queue_conf_set_default);
+ 
++static void qos_queue_allocate(struct pp_qos_dev *qdev, u32 *id, u32 *rlm,
++			       enum rlm_range range)
++{
++	u16 _id;
++
++	_id = pp_pool_get(qdev->ids);
++	QOS_ASSERT(QOS_ID_VALID(_id), "got illegal id %u\n", _id);
++	*id = _id;
++	map_id_reserved(qdev->mapping, _id);
++	map_id_reserved(qdev->rlm_mapping, _id);
++
++	if (!rlm)
++		return;
++
++	switch (range) {
++	case RLM_RANGES_NORMAL:
++	case RLM_RANGES_RESERVED:
++		*rlm = allocate_rlm(qdev, _id, range);
++	break;
++	default:
++		*rlm = QOS_INVALID_RLM;
++	}
++}
++
++s32 pp_qos_queue_allocate_id_phy(struct pp_qos_dev *qdev, u32 *id, u32 *phy)
++{
++	s32 rc = 0;
++
++	QOS_LOG_API_DEBUG("queue_id_phy > allocate\n");
++
++	QOS_LOCK(qdev);
++	PP_QOS_ENTER_FUNC();
++	if (!qos_device_ready(qdev)) {
++		rc = -EINVAL;
++		goto out;
++	}
++	qos_queue_allocate(qdev, id, phy, RLM_RANGES_NORMAL);
++out:
++	QOS_UNLOCK(qdev);
++	return rc;
++}
++EXPORT_SYMBOL(pp_qos_queue_allocate_id_phy);
++
+ s32 pp_qos_queue_allocate(struct pp_qos_dev *qdev, u32 *id)
+ {
+ 	s32 rc = 0;
+-	u16 _id;
+ 
+ 	QOS_LOG_API_DEBUG("queue > allocate\n");
+ 
+@@ -1264,17 +1311,60 @@ s32 pp_qos_queue_allocate(struct pp_qos_dev *qdev, u32 *id)
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
+-	_id = pp_pool_get(qdev->ids);
+-	QOS_ASSERT(QOS_ID_VALID(_id), "got illegal id %u\n", _id);
+-	*id = _id;
+-	map_id_reserved(qdev->mapping, _id);
+-	map_id_reserved(qdev->rlm_mapping, _id);
++	qos_queue_allocate(qdev, id, NULL, RLM_RANGES_MAX);
+ out:
+ 	QOS_UNLOCK(qdev);
+ 	return rc;
+ }
+ EXPORT_SYMBOL(pp_qos_queue_allocate);
+ 
++s32 pp_qos_contiguous_queue_allocate(struct pp_qos_dev *qdev, u32 *ids,
++				     u32 *phy_ids, u32 count)
++{
++	u32 id_capacity, rlm_capacity, queue_idx;
++	s32 rc = 0;
++
++	QOS_LOG_API_DEBUG("cont_queue %u > allocate\n", count);
++
++	PP_QOS_ENTER_FUNC();
++	if (!qos_device_ready(qdev))
++		return -EINVAL;
++
++	if (!count || count != qdev->init_params.reserved_queues) {
++		QOS_LOG_ERR("Cannot allocate %u contiguous queues (only %u)\n",
++			    count, qdev->init_params.reserved_queues);
++		return -EINVAL;
++	}
++
++	QOS_LOCK(qdev);
++	id_capacity = pp_pool_capacity_get(qdev->ids);
++	rlm_capacity = pp_pool_capacity_get(qdev->reserved_rlms);
++
++	if (id_capacity < count) {
++		QOS_LOG_ERR("Not enough nodes (requested %u. free %u)\n", count,
++			    id_capacity);
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	if (rlm_capacity < count) {
++		QOS_LOG_ERR("Not enough reserved queues (reques %u. free %u)\n",
++			    count, rlm_capacity);
++		rc = -ENOMEM;
++		goto out;
++	}
++
++	for (queue_idx = 0; queue_idx < count; queue_idx++) {
++		qos_queue_allocate(qdev, &ids[queue_idx], &phy_ids[queue_idx],
++				   RLM_RANGES_RESERVED);
++	}
++
++out:
++	QOS_UNLOCK(qdev);
++	return rc;
++}
++EXPORT_SYMBOL(pp_qos_contiguous_queue_allocate);
++
+ /**
+  * @brief __qos_sync_queue_add() - Add sync queue
+  * @param qdev handle to qos device instance obtained previously
+@@ -1318,7 +1408,6 @@ static s32 __qos_sync_queue_add(struct pp_qos_dev *qdev, u32 id, u32 *rlm,
+ 				  modified);
+ 
+ 	*rlm = node.data.queue.rlm;
+-
+ out:
+ 	return rc;
+ }
+@@ -1739,7 +1828,7 @@ s32 pp_qos_queue_conf_get(struct pp_qos_dev *qdev, u32 id,
+ }
+ EXPORT_SYMBOL(pp_qos_queue_conf_get);
+ 
+-static s32 _pp_qos_queue_remove(struct pp_qos_dev *qdev, s32 id)
++static s32 qos_queue_remove(struct pp_qos_dev *qdev, s32 id)
+ {
+ 	struct qos_node *node;
+ 	struct qos_node *parent;
+@@ -1779,65 +1868,87 @@ static s32 _pp_qos_queue_remove(struct pp_qos_dev *qdev, s32 id)
+ 	return rc;
+ }
+ 
+-/**
+- * pp_qos_queue_remove() - Remove a queue
+- * @qos_dev: handle to qos device instance obtained previously from qos_dev_init
+- * @id:   queue's id obtained from queue_allocate
+- *
+- * Note: client should make sure that queue is empty and
+- * that new packets are not enqueued, by calling
+- *       pp_qos_queue_disable
+- *
+- * Return: 0 on success
+- */
+-s32 pp_qos_queue_remove(struct pp_qos_dev *qdev, u32 id)
++static s32 _pp_qos_queue_remove(struct pp_qos_dev *qdev, u32 id)
+ {
++	u32 rep_id, rlm;
++	s32 rc = 0;
+ 	bool node_configured;
+-	s32 rc;
+-	u32 rep_id;
+ 	struct qos_node *node;
+ 
+-	QOS_LOCK(qdev);
+-	PP_QOS_ENTER_FUNC();
+-	if (!qos_device_ready(qdev)) {
+-		rc = -EINVAL;
+-		goto out;
+-	}
+-
+ 	rc = is_node_configured(qdev, id, &node_configured);
+ 	if (unlikely(rc))
+-		goto out;
++		return rc;
+ 
+-	/* If node is not configured just release id */
++	/* If node is not configured just release id & rlm */
+ 	if (!node_configured) {
++		rlm = get_phy_from_id(qdev->rlm_mapping, id);
++		if (QOS_PHY_VALID(rlm))
++			release_rlm(qdev, rlm);
++
+ 		release_id(qdev, id);
+-		goto out;
++		return rc;
+ 	}
+ 
+ 	node = get_conform_node(qdev, id, node_queue);
+ 	if (!node) {
+ 		QOS_LOG_ERR("node NULL id %u\n", id);
+-		rc = -EINVAL;
+-		goto out;
++		return -EINVAL;
+ 	}
+ 
+ 	rep_id = get_rep_id_from_id(qdev->mapping, id);
+ 
+ 	if (QOS_ID_VALID(rep_id)) {
+-		rc = _pp_qos_queue_remove(qdev, rep_id);
++		rc = qos_queue_remove(qdev, rep_id);
+ 		update_cmd_id(&qdev->drvcmds);
+ 		rc = transmit_cmds(qdev);
+ 		if (rc)
+-			goto out;
++			return rc;
+ 	}
+ 
+-	rc = _pp_qos_queue_remove(qdev, id);
++	rc = qos_queue_remove(qdev, id);
+ 	if (rc)
+-		goto out;
++		return rc;
+ 
+ 	update_cmd_id(&qdev->drvcmds);
+ 	rc = transmit_cmds(qdev);
+ 
++	return rc;
++}
++
++/**
++ * pp_qos_queue_remove() - Remove a queue
++ * @qos_dev: handle to qos device instance obtained previously from qos_dev_init
++ * @id:   queue's id obtained from queue_allocate
++ *
++ * Note: client should make sure that queue is empty and
++ * that new packets are not enqueued, by calling
++ *       pp_qos_queue_disable
++ *
++ * Return: 0 on success
++ */
++s32 pp_qos_queue_remove(struct pp_qos_dev *qdev, u32 id)
++{
++	u32 rlm;
++	s32 rc;
++
++	QOS_LOCK(qdev);
++	PP_QOS_ENTER_FUNC();
++	if (!qos_device_ready(qdev)) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	rlm = get_phy_from_id(qdev->rlm_mapping, id);
++	if (QOS_PHY_VALID(rlm)) {
++		if (rlm_get_range_type(qdev, rlm) == RLM_RANGES_RESERVED) {
++			QOS_LOG_ERR("Cannot remove cont queue id %u\n", id);
++			rc = -EINVAL;
++			goto out;
++		}
++	}
++
++	rc = _pp_qos_queue_remove(qdev, id);
++
+ 	QOS_LOG_API_DEBUG("queue %u > remove\n", id);
+ out:
+ 	QOS_UNLOCK(qdev);
+@@ -1848,6 +1959,49 @@ s32 pp_qos_queue_remove(struct pp_qos_dev *qdev, u32 id)
+ }
+ EXPORT_SYMBOL(pp_qos_queue_remove);
+ 
++s32 pp_qos_contiguous_queue_remove(struct pp_qos_dev *qdev, u32 id, u32 count)
++{
++	u32 rlm_idx, _id;
++	u32 first_rlm, last_rlm;
++	s32 rc = 0;
++
++	QOS_LOG_API_DEBUG("cont_queue %u %u > remove\n", id, count);
++
++	PP_QOS_ENTER_FUNC();
++	if (!qos_device_ready(qdev))
++		return -EINVAL;
++
++	if (!count || count != qdev->init_params.reserved_queues) {
++		QOS_LOG_ERR("Cannot remove %u contiguous queues (only %u)\n",
++			    count, qdev->init_params.reserved_queues);
++		return -EINVAL;
++	}
++
++	first_rlm = get_phy_from_id(qdev->rlm_mapping, id);
++	if (rlm_get_range_type(qdev, first_rlm) != RLM_RANGES_RESERVED) {
++		QOS_LOG_ERR("Physical Queue ID %u is not contiguous\n",
++			    first_rlm);
++		return -EINVAL;
++	}
++
++	last_rlm = first_rlm + count - 1;
++	if (rlm_get_range_type(qdev, last_rlm) != RLM_RANGES_RESERVED) {
++		QOS_LOG_ERR("Physical Queue ID %u is not contiguous\n",
++			    last_rlm);
++		return -EINVAL;
++	}
++
++	QOS_LOCK(qdev);
++	for (rlm_idx = last_rlm + 1; rlm_idx > first_rlm; rlm_idx--) {
++		_id = get_id_from_phy(qdev->rlm_mapping, rlm_idx - 1);
++		rc |= _pp_qos_queue_remove(qdev, _id);
++	}
++	QOS_UNLOCK(qdev);
++
++	return rc;
++}
++EXPORT_SYMBOL(pp_qos_contiguous_queue_remove);
++
+ static u32 get_phy_by_priority(const struct pp_qos_dev *qdev,
+ 			       u32 parent_id, u32 priority)
+ {
+@@ -2258,7 +2412,7 @@ s32 pp_qos_queue_set(struct pp_qos_dev *qdev, u32 id,
+ 			if (prev_eir > 0) {
+ 				rep_id = get_rep_id_from_id(qdev->mapping, id);
+ 				if (QOS_ID_VALID(rep_id))
+-					_pp_qos_queue_remove(qdev, rep_id);
++					qos_queue_remove(qdev, rep_id);
+ 				else
+ 					QOS_LOG_ERR("%u has no rep_id\n", id);
+ 			}
+@@ -4042,7 +4196,7 @@ s32 qos_dev_init(struct pp_qos_dev *qdev,
+ 	u32 num_reserved_ports = 0;
+ 
+ 	rc = qos_dev_init_db(qdev, conf->max_ports, conf->max_queues,
+-			     conf->num_syncqs);
++			     conf->reserved_queues, conf->num_syncqs);
+ 	if (unlikely(rc))
+ 		goto err;
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index 40cd97ebb4d9..3cd70688401c 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -258,6 +258,11 @@ static struct pp_pool *pp_pool_init(u32 capacity, u16 invalid)
+ 	return tmp;
+ }
+ 
++u32 pp_pool_capacity_get(struct pp_pool *pool)
++{
++	return pool->top;
++}
++
+ u16 pp_pool_get(struct pp_pool *pool)
+ {
+ 	u16 tmp;
+@@ -305,14 +310,15 @@ static struct pp_pool *free_id_init(void)
+ 	return tmp;
+ }
+ 
+-static struct pp_pool *free_rlm_init(u32 max_queues)
++static struct pp_pool *free_rlm_init(u32 max_queue_id, u32 queue_cnt)
+ {
+ 	u32 i;
++	u32 last_queue_id = max_queue_id + 1 - queue_cnt;
+ 	struct pp_pool *tmp;
+ 
+-	tmp  = pp_pool_init(max_queues, PP_QOS_INVALID_ID);
++	tmp  = pp_pool_init(queue_cnt, PP_QOS_INVALID_ID);
+ 	if (tmp) {
+-		for (i = max_queues; i > 0; --i)
++		for (i = max_queue_id + 1; i > last_queue_id; --i)
+ 			pp_pool_put(tmp, i - 1);
+ 	}
+ 
+@@ -1506,11 +1512,28 @@ void node_phy_delete(struct pp_qos_dev *qdev, u32 phy)
+ 	}
+ }
+ 
+-u16 allocate_rlm(struct pp_qos_dev *qdev, u32 id)
++u16 allocate_rlm(struct pp_qos_dev *qdev, u32 id, enum rlm_range range)
+ {
+ 	u16 rlm;
+ 
+-	rlm = pp_pool_get(qdev->rlms);
++	switch (range) {
++	case RLM_RANGES_RESERVED:
++		if (qdev->reserved_rlms) {
++			rlm = pp_pool_get(qdev->reserved_rlms);
++		} else {
++			QOS_LOG_ERR("Cannot allocate reserve\n");
++			rlm = pp_pool_get(qdev->rlms);
++		}
++
++	break;
++	case RLM_RANGES_NORMAL:
++		rlm = pp_pool_get(qdev->rlms);
++	break;
++	default:
++		QOS_LOG_ERR("Unknown RLM range\n");
++		rlm = pp_pool_get(qdev->rlms);
++	}
++
+ 	if (rlm == QOS_INVALID_RLM) {
+ 		QOS_LOG_ERR("Can't get free rlm\n");
+ 		return QOS_INVALID_RLM;
+@@ -1522,14 +1545,49 @@ u16 allocate_rlm(struct pp_qos_dev *qdev, u32 id)
+ 	return rlm;
+ }
+ 
++/**
++ * @brief Get the range type to which this rlm id belongs
++ */
++enum rlm_range rlm_get_range_type(struct pp_qos_dev *qdev, u32 rlm)
++{
++	u32 range_idx;
++	struct range *rng;
++
++	for (range_idx = 0; range_idx < RLM_RANGES_MAX; range_idx++) {
++		rng = &qdev->rlm_ranges[range_idx];
++		if (rlm >= rng->start && rlm <= rng->end)
++			return range_idx;
++	}
++
++	return RLM_RANGES_MAX;
++}
++
+ void release_rlm(struct pp_qos_dev *qdev, u32 rlm)
+ {
+ 	u32 id;
++	enum rlm_range range;
+ 
+ 	id = get_id_from_phy(qdev->rlm_mapping, rlm);
+ 	QOS_ASSERT(QOS_ID_VALID(id), "Invalid id for rlm %u\n", rlm);
+ 	map_invalidate_id_phy(qdev->rlm_mapping, id);
+-	pp_pool_put(qdev->rlms, rlm);
++
++	range = rlm_get_range_type(qdev, rlm);
++	switch (range) {
++	case RLM_RANGES_RESERVED:
++		if (qdev->reserved_rlms) {
++			pp_pool_put(qdev->reserved_rlms, rlm);
++		} else {
++			QOS_LOG_ERR("Cannot push to reserved\n");
++			pp_pool_put(qdev->rlms, rlm);
++		}
++	break;
++	case RLM_RANGES_NORMAL:
++		pp_pool_put(qdev->rlms, rlm);
++	break;
++	default:
++		QOS_LOG_ERR("Unknown RLM range\n");
++		pp_pool_put(qdev->rlms, rlm);
++	}
+ }
+ 
+ void release_id(struct pp_qos_dev *qdev, u32 id)
+@@ -1892,7 +1950,8 @@ static void link_with_parent(struct pp_qos_dev *qdev,
+ 	update_parent(qdev, parent_phy);
+ }
+ 
+-s32 qos_pools_init(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues)
++s32 qos_pools_init(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues,
++		   u32 reserved_queues)
+ {
+ 	qdev->octets = octets_init(octet_of_phy(max_ports - 1));
+ 	if (!qdev->octets)
+@@ -1906,7 +1965,30 @@ s32 qos_pools_init(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues)
+ 	if (!qdev->ids)
+ 		goto fail;
+ 
+-	qdev->rlms = free_rlm_init(max_queues);
++	if (reserved_queues) {
++		qdev->reserved_rlms =
++			free_rlm_init(max_queues - 1, reserved_queues);
++		qdev->rlm_ranges[RLM_RANGES_RESERVED].start =
++			max_queues - reserved_queues;
++		qdev->rlm_ranges[RLM_RANGES_RESERVED].end = max_queues - 1;
++
++		if (!qdev->reserved_rlms)
++			goto fail;
++	} else {
++		qdev->reserved_rlms = NULL;
++		qdev->rlm_ranges[RLM_RANGES_RESERVED].start = max_queues;
++		qdev->rlm_ranges[RLM_RANGES_RESERVED].end = max_queues;
++	}
++
++	qdev->rlms = free_rlm_init(max_queues - 1 - reserved_queues,
++				   max_queues - reserved_queues);
++	qdev->rlm_ranges[RLM_RANGES_NORMAL].start = 0;
++	qdev->rlm_ranges[RLM_RANGES_NORMAL].end =
++		max_queues - 1 - reserved_queues;
++
++	if (!qdev->rlms)
++		goto fail;
++
+ 	if (!qdev->rlms)
+ 		goto fail;
+ 
+@@ -1939,6 +2021,9 @@ void qos_pools_clean(struct pp_qos_dev *qdev)
+ 	pp_pool_clean(qdev->rlms);
+ 	qdev->rlms = NULL;
+ 
++	pp_pool_clean(qdev->reserved_rlms);
++	qdev->rlms = NULL;
++
+ 	octets_clean(qdev->octets);
+ 	qdev->octets = NULL;
+ 
+@@ -1953,7 +2038,7 @@ void qos_pools_clean(struct pp_qos_dev *qdev)
+ }
+ 
+ s32 qos_dev_init_db(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues,
+-		    u32 num_syncqs)
++		    u32 reserved_queues, u32 num_syncqs)
+ {
+ 	u32 i;
+ 
+@@ -1962,7 +2047,7 @@ s32 qos_dev_init_db(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues,
+ 	memset(qdev, 0, sizeof(struct pp_qos_dev));
+ 	qdev->init_params.max_ports = max_ports;
+ 
+-	if (qos_pools_init(qdev, max_ports, max_queues))
++	if (qos_pools_init(qdev, max_ports, max_queues, reserved_queues))
+ 		goto fail;
+ 
+ 	qdev->syncq = syncq_init(num_syncqs);
+@@ -4016,14 +4101,19 @@ s32 qos_drv_stats_get(struct pp_qos_dev *qdev, struct qos_drv_stats *stats)
+ 
+ 	for_each_qos_used_node(qdev, node) {
+ 		stats->active_nodes++;
+-		if (node_port(node))
++		if (node_port(node)) {
+ 			stats->active_ports++;
+-		else if (node_queue(node))
+-			stats->active_queues++;
+-		else if (node_internal(node))
++		} else if (node_queue(node)) {
++			if (RLM_RANGES_RESERVED ==
++			    rlm_get_range_type(qdev, node->data.queue.rlm))
++				stats->active_reserved_queues++;
++			else
++				stats->active_queues++;
++		} else if (node_internal(node)) {
+ 			stats->active_internals++;
+-		else if (node_sched(node))
++		} else if (node_sched(node)) {
+ 			stats->active_sched++;
++		}
+ 	}
+ 
+ 	return 0;
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+index b92e3af94052..861b65c6ff8b 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+@@ -10,6 +10,7 @@
+ 
+ #include <linux/pp_qos_api.h>
+ #include <linux/debugfs.h>      /* struct dentry */
++#include <linux/range.h>
+ #include "pp_qos_uc_defs.h"
+ #include "pp_qos_common.h"
+ 
+@@ -42,8 +43,8 @@
+ /******************************************************************************/
+ 
+ #define QOS_INVALID_OCTET   0xFFFFU
+-#define QOS_INVALID_RLM     0xFFFFU
+ #define QOS_INVALID_PHY     0xFFFFU
++#define QOS_INVALID_RLM     (QOS_INVALID_PHY)
+ #define QOS_UNMAPPED_PHY    0xFFFEU
+ 
+ #define QOS_CHILD_UNLIMITED_WEIGHT 127
+@@ -130,7 +131,7 @@ struct fw_sec_info {
+  * @fw_com                FW Communication configuration
+  * @fw_sec_data_stack     Describes FW internal data and stack
+  *                        location
+- * @reserved_ports:       These ports are reserved for client to explicity
++ * @reserved_ports        These ports are reserved for client to explicity
+  *                        select the physical_port ithat will be used when
+  *                        adding a new port. All other non reserved ports are
+  *                        managed by the system, i.e. when client adds a new
+@@ -138,6 +139,8 @@ struct fw_sec_info {
+  *                        unreserved ports.
+  *                        To reserve a port its value on the array should be
+  *                        not 0
++ * @reserved_queues       These queues are reserved for contiguous queue
++ *                        allocation
+  * @bm_base               bm base address
+  * @dbgfs                 debugfs parent folder
+  * @sysfs                 sysfs parent folder
+@@ -157,6 +160,7 @@ struct pp_qos_init_param {
+ 	struct fw_com      fwcom;
+ 	struct fw_sec_info fw_sec_data_stack;
+ 	u32                reserved_ports[PP_QOS_MAX_PORTS];
++	u32                reserved_queues;
+ 	phys_addr_t        bm_base;
+ 	struct dentry     *dbgfs;
+ 	struct kobject    *sysfs;
+@@ -388,20 +392,29 @@ struct qos_aqm_sf_entry {
+ struct qos_drv_stats {
+ 	u32 active_nodes;
+ 	u32 active_queues;
++	u32 active_reserved_queues;
+ 	u32 active_ports;
+ 	u32 active_sched;
+ 	u32 active_internals;
+ };
+ 
++enum rlm_range {
++	RLM_RANGES_RESERVED,
++	RLM_RANGES_NORMAL,
++	RLM_RANGES_MAX,
++};
++
+ struct pp_qos_dev {
+ 	LOCK                           lock;
+ 	u32                            id;
+ 	bool                           initialized;
+-	struct pp_qos_init_param       init_params;
+ 	struct qos_aqm_sf_entry        sf_entry[PP_QOS_AQM_MAX_SERVICE_FLOWS];
++	struct pp_qos_init_param       init_params;
+ 	struct shared_bw_group         groups[QOS_MAX_SHARED_BW_GRP + 1];
+ 	struct pp_pool                 *ids;
+ 	struct pp_pool                 *rlms;
++	struct pp_pool                 *reserved_rlms;
++	struct range                   rlm_ranges[RLM_RANGES_MAX];
+ 	struct pp_pool                 *portsphys;
+ 	struct pp_nodes                *nodes;
+ 	struct pp_mapping              *mapping;
+@@ -799,8 +812,10 @@ void pp_queue_reset(struct pp_queue *queue);
+ 
+ /* Pool (stack) of u16 data */
+ u16 pp_pool_get(struct pp_pool *pool);
++u32 pp_pool_capacity_get(struct pp_pool *pool);
+ s32 pp_pool_put(struct pp_pool *pool, u16 data);
+-s32 qos_pools_init(struct pp_qos_dev *qdev, u32 max_port, u32 max_queues);
++s32 qos_pools_init(struct pp_qos_dev *qdev, u32 max_port, u32 max_queues,
++		   u32 reserved_queues);
+ void qos_pools_clean(struct pp_qos_dev *qdev);
+ 
+ /* Cyclic buffer
+@@ -852,7 +867,7 @@ u32 octet_get_least_free_entries(struct pp_octets *octets);
+ 
+ /* Initialize qos dev, max port designates phy of highest port */
+ s32 qos_dev_init_db(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues,
+-		    u32 num_syncqs);
++		    u32 reserved_queues, u32 num_syncqs);
+ void qos_dev_clear_db(struct pp_qos_dev *qdev);
+ 
+ /**
+@@ -898,7 +913,8 @@ s32 node_remove(struct pp_qos_dev *qdev, struct qos_node *node);
+  */
+ void node_phy_delete(struct pp_qos_dev *qdev, u32 phy);
+ 
+-u16 allocate_rlm(struct pp_qos_dev *qdev, u32 id);
++u16 allocate_rlm(struct pp_qos_dev *qdev, u32 id, enum rlm_range range);
++enum rlm_range rlm_get_range_type(struct pp_qos_dev *qdev, u32 rlm);
+ void release_rlm(struct pp_qos_dev *qdev, u32 rlm);
+ 
+ /* Return id to pool */
+diff --git a/drivers/net/ppv4/pp-dev/pp_dts.c b/drivers/net/ppv4/pp-dev/pp_dts.c
+index 364bac2b2fcc..689bbe8941f9 100644
+--- a/drivers/net/ppv4/pp-dev/pp_dts.c
++++ b/drivers/net/ppv4/pp-dev/pp_dts.c
+@@ -559,6 +559,8 @@ static s32 __dts_qos_cfg(struct pp_dts_cfg *dts_cfg)
+ 				   &p->wred_max_q_size);
+ 	ret |= __dts_u32_param_get(pdev, np, "num-reserved-ports",
+ 				   &num_reserved_ports);
++	ret |= __dts_u32_param_get(pdev, np, "num-reserved-queues",
++				   &p->reserved_queues);
+ 	ret |= __dts_u32_param_get(pdev, np, "fw-sec-data-stack-dccm",
+ 				   &p->fw_sec_data_stack.is_in_dccm);
+ 	ret |= __dts_u32_param_get(pdev, np, "fw-sec-data-stack-dccm-offset",
+@@ -570,11 +572,19 @@ static s32 __dts_qos_cfg(struct pp_dts_cfg *dts_cfg)
+ 		return ret;
+ 
+ 	if (num_reserved_ports > PP_QOS_MAX_PORTS) {
+-		dev_err(&pdev->dev, "Num reserved ports %d exceeds maxmimum of %d\n",
++		dev_err(&pdev->dev,
++			"Num reserved ports %d exceeds maxmimum of %d\n",
+ 			num_reserved_ports, PP_QOS_MAX_PORTS);
+ 		return -EINVAL;
+ 	}
+ 
++	if (p->reserved_queues > p->max_queues) {
++		dev_err(&pdev->dev,
++			"Num reserved queues %d exceeds maxmimum of %d\n",
++			p->reserved_queues, p->max_queues);
++		return -EINVAL;
++	}
++
+ 	for (idx = 0 ; idx < num_reserved_ports ; idx++)
+ 		dts_cfg->qos_params.reserved_ports[idx] = 1;
+ 
+diff --git a/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h b/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h
+index 2c71bdcc0b2d..5ef749d20986 100644
+--- a/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h
++++ b/drivers/net/ppv4/pp-hal/descriptor/pp_desc.h
+@@ -13,6 +13,12 @@
+ #include <linux/bitops.h>
+ #include <linux/pp_api.h>
+ 
++/**
++ * @define QOS_DESC_WORDS_CNT
++ * @brief qos descriptor size in 32bit words granularity
++ */
++#define QOS_DESC_WORDS_CNT             (4)
++
+ #ifdef CONFIG_PPV4_LGM
+ /**
+  * @enum pp_desc_fld
+@@ -194,12 +200,6 @@ enum pp_desc_fld {
+ #define DESC_FLD_PRV_PS_B_LSB          (0  + 13 * BITS_PER_U32)
+ #define DESC_FLD_PRV_PS_B_MSB          (15 + 13 * BITS_PER_U32)
+ 
+-/**
+- * @define QOS_DESC_WORDS_CNT
+- * @brief qos descriptor size in 32bit words granularity
+- */
+-#define QOS_DESC_WORDS_CNT             (4)
+-
+ /**
+  * @define UD_DESC_WORDS_CNT
+  * @brief ud size in descriptor in 32bit words granularity
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
+index 7c1b238aa709..fa2825be7901 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
+@@ -96,7 +96,7 @@ static int four_ports_four_queues_test(void *data);
+ static int block_unblock_test(void *data);
+ 
+ #ifndef PP_QOS_DISABLE_CMDQ
+-static int stat_test(void *data);
++/* static int stat_test(void *data); */
+ static int info_test(void *data);
+ #endif
+ static int reposition_test(void *data);
+@@ -195,6 +195,7 @@ static struct pp_test_t pp_qos_tests[] = {
+ 		.test_data    = NULL,
+ 		.fn           = info_test,
+ 	},
++/*
+ 	{
+ 		.component    = PP_QOS_TESTS,
+ 		.test_name    = "stat_test",
+@@ -203,6 +204,7 @@ static struct pp_test_t pp_qos_tests[] = {
+ 		.test_data    = NULL,
+ 		.fn           = stat_test,
+ 	},
++*/
+ #endif
+ 	{
+ 		.component    = PP_QOS_TESTS,
+@@ -657,6 +659,8 @@ static struct pp_qos_dev * __must_check qos_restart(u32 instance_id)
+ 	new_conf.reserved_ports[97] = 1;
+ 	new_conf.reserved_ports[105] = 1;
+ 
++	new_conf.reserved_queues = 0;
++
+ 	ret = qos_dev_init(qdev, &new_conf, false);
+ 	if (ret) {
+ 		pr_err("qos_dev_init failed\n");
+@@ -4432,6 +4436,7 @@ static int wsp_test(void *data)
+ }
+ 
+ #ifndef PP_QOS_DISABLE_CMDQ
++/*
+ static int stat_test(void *data)
+ {
+ 	struct pp_qos_dev *qdev;
+@@ -4698,7 +4703,7 @@ static int stat_test(void *data)
+ 
+ 	return test_ret;
+ }
+-
++*/
+ static int info_test(void *data)
+ {
+ 	struct pp_qos_queue_conf confq;
+diff --git a/include/linux/pp_qos_api.h b/include/linux/pp_qos_api.h
+index fb154d3e4e57..b0803dd8bbc7 100644
+--- a/include/linux/pp_qos_api.h
++++ b/include/linux/pp_qos_api.h
+@@ -593,6 +593,16 @@ void pp_qos_queue_conf_set_default(struct pp_qos_queue_conf *conf);
+  */
+ s32 pp_qos_queue_allocate(struct pp_qos_dev *qos_dev, u32 *id);
+ 
++/**
++ * @brief Allocate resources for a new queue
++ * @param qos_dev handle to qos device instance obtained from
++ *        pp_qos_dev_open
++ * @param id upon success hold's new queue id
++ * @param phy upon success hold's new physical queue id
++ * @return 0 on success
++ */
++s32 pp_qos_queue_allocate_id_phy(struct pp_qos_dev *qdev, u32 *id, u32 *phy);
++
+ /**
+  * @brief Remove a queue
+  * @param qos_dev handle to qos device instance obtained from
+@@ -606,6 +616,31 @@ s32 pp_qos_queue_allocate(struct pp_qos_dev *qos_dev, u32 *id);
+  */
+ s32 pp_qos_queue_remove(struct pp_qos_dev *qos_dev, u32 id);
+ 
++/**
++ * @brief Allocate resources for new contiguous queues
++ * @param qos_dev handle to qos device instance obtained from
++ *        pp_qos_dev_open
++ * @param ids upon success hold's new queue id's list
++ * @param phy_ids upon success hold's new physical queue id's list
++ * @param count Amount of contiguous queues to allocate
++ * @note Amount of queues must be as defined in dts
++ * @return 0 on success
++ */
++s32 pp_qos_contiguous_queue_allocate(struct pp_qos_dev *qos_dev, u32 *ids,
++				     u32 *phy_ids, u32 count);
++
++/**
++ * @brief Remove all contiguous queues
++ * @param qos_dev handle to qos device instance obtained from
++ *        pp_qos_dev_open
++ * @param id holds the first queue id obtained by alloc function
++ * @param count Amount of contiguous queues to remove
++ * @note Amount of queues must be as defined in dts
++ * @return 0 on success
++ */
++s32 pp_qos_contiguous_queue_remove(struct pp_qos_dev *qos_dev, u32 id,
++				   u32 count);
++
+ /**
+  * @brief Set queue configuration
+  * @param qos_dev handle to qos device instance obtained from

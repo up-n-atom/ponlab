@@ -1,0 +1,224 @@
+From 320eac976017cc3e64b0b00a5a876440b20b6cad Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Thu, 27 Jun 2019 18:34:12 +0300
+Subject: [PATCH] PONRTSYS-4424: added alignment check
+
+---
+ drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c    |  7 +++-
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_common.h   |  2 -
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c    | 24 ++++-------
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c | 49 +++++++++++++++-------
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h    |  3 ++
+ 5 files changed, 51 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c b/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c
+index ea514be6c687..af73346b5cb4 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c
++++ b/drivers/net/ethernet/lantiq/ppv4/bm/pp_bm_drv.c
+@@ -559,7 +559,12 @@ static s32 bmgr_is_pool_params_valid(
+ 		return -EINVAL;
+ 	}
+ 
+-	// Num_buffers can be up to 2^24
++	if (!IS_ALIGNED(pool_params->num_buffers, 64)) {
++		pr_err("Number of buffers must be aligned to 64\n");
++		return -EINVAL;
++	}
++
++	/* Num_buffers can be up to 2^24 */
+ 	if (pool_params->num_buffers >= 0x1000000) {
+ 		pr_err("Number of buffers can be up to 0x1000000\n");
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_common.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_common.h
+index fee127d41ae7..eeb058b4be9c 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_common.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_common.h
+@@ -121,8 +121,6 @@ do { \
+ #define QOS_FREE(p)		free(p)
+ #endif
+ 
+-#define ALLOCATE_DDR_FOR_QM(qdev) allocate_ddr_for_qm(qdev)
+-
+ /* Locking */
+ #ifdef __KERNEL__
+ #define LOCK spinlock_t
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
+index 6eae19c12e5f..3c578172e4cf 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
+@@ -253,7 +253,6 @@ static int pp_qos_get_resources(
+ 	return 0;
+ }
+ 
+-#ifdef CONFIG_OF
+ int allocate_ddr_for_qm(struct pp_qos_dev *qdev)
+ {
+ 	void *addr;
+@@ -272,33 +271,25 @@ int allocate_ddr_for_qm(struct pp_qos_dev *qdev)
+ 		return -ENOMEM;
+ 	}
+ 
++	qdev->hwconf.qm_ddr_start_virt = addr;
+ 	qdev->hwconf.qm_ddr_start = (unsigned int)(dma);
+ 	qdev->hwconf.qm_num_pages =
+ 		qdev->hwconf.wred_total_avail_resources / PPV4_QOS_DESC_IN_PAGE;
+ 
+ 	return 0;
+ }
+-#else
+-int allocate_ddr_for_qm(struct pp_qos_dev *qdev)
++
++void free_ddr_for_qm(struct pp_qos_dev *qdev)
+ {
+-	struct ppv4_qos_platform_data *psrc;
+ 	struct device *dev;
++	unsigned int size;
+ 
+ 	dev = &((struct platform_device *)qdev->pdev)->dev;
+-	psrc = (struct ppv4_qos_platform_data *)dev_get_platdata(dev);
+-	if (!psrc) {
+-		dev_err(dev, "Device contain no platform data\n");
+-		return -ENODEV;
+-	}
+-
+-	qdev->hwconf.qm_num_pages =
+-		qdev->hwconf.wred_total_avail_resources / PPV4_QOS_DESC_IN_PAGE;
++	size = qdev->hwconf.wred_total_avail_resources * PPV4_QOS_DESC_SIZE;
+ 
+-	qdev->hwconf.qm_ddr_start = psrc->qm_ddr_start;
+-	return 0;
++	dma_free_coherent(dev, size, qdev->hwconf.qm_ddr_start_virt,
++			  qdev->hwconf.qm_ddr_start);
+ }
+-#endif
+-
+ 
+ static int pp_qos_config_from_of_node(
+ 		struct platform_device *pdev,
+@@ -429,6 +420,7 @@ static int pp_qos_config_from_platform_data(
+ 	pdrvdata->ddr = memaddr;
+ 
+ 	pdata->qm_ddr_start = psrc->qm_ddr_start;
++	pdata->qm_ddr_start_virt = psrc->qm_ddr_start_virt;
+ 	pdata->qm_num_pages = psrc->qm_num_pages;
+ 	pdata->fw_logger_start = psrc->fw_logger_start;
+ 	pdata->fw_stat = pdata->fw_logger_start + PPV4_QOS_LOGGER_BUF_SIZE;
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+index ac0bd3d18b1c..af88584667a4 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+@@ -2349,28 +2349,52 @@ int pp_qos_dev_init(struct pp_qos_dev *qdev, struct pp_qos_init_param *conf)
+ 
+ 	QOS_LOCK(qdev);
+ 	PP_QOS_ENTER_FUNC();
++
+ 	if (qdev->initialized) {
+ 		QOS_LOG_ERR("Device already initialized, can't initialize again\n");
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
++
+ 	if ((qdev->max_port + 1) & 7) {
+ 		QOS_LOG_ERR("Given max port %u is not last node of an octet\n",
+ 				qdev->max_port);
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
++
++	if (conf->wred_p_const > 1023) {
++		QOS_LOG_ERR("wred_p_const should be not greater than 1023\n");
++		rc = -EINVAL;
++		goto out;
++	}
++
++	qdev->hwconf.wred_total_avail_resources =
++		conf->wred_total_avail_resources;
++
++	if (!IS_ALIGNED(qdev->hwconf.wred_total_avail_resources,
++			PPV4_QOS_DESC_IN_PAGE)) {
++		QOS_LOG_ERR("Num resources %u must be aligned to %u\n",
++			    qdev->hwconf.wred_total_avail_resources,
++			    PPV4_QOS_DESC_IN_PAGE);
++		rc = -EINVAL;
++		goto out;
++	}
++
+ 	qdev->portsphys = free_ports_phys_init(
+ 			qdev->reserved_ports,
+ 			qdev->max_port,
+ 			conf->reserved_ports,
+ 			QOS_MAX_PORTS);
++	if (!qdev->portsphys) {
++		QOS_LOG_ERR("portsphys alloc failed\n");
++		rc = -EINVAL;
++		goto out;
++	}
+ 
+-	qdev->hwconf.wred_total_avail_resources =
+-		conf->wred_total_avail_resources;
+-
+-	rc = ALLOCATE_DDR_FOR_QM(qdev);
++	rc = allocate_ddr_for_qm(qdev);
+ 	if (rc) {
++		QOS_FREE(qdev->portsphys);
+ 		QOS_LOG_ERR("Could not allocate %u bytes for queue manager\n",
+ 				qdev->hwconf.wred_total_avail_resources *
+ 				PPV4_QOS_DESC_SIZE);
+@@ -2385,23 +2409,18 @@ int pp_qos_dev_init(struct pp_qos_dev *qdev, struct pp_qos_init_param *conf)
+ 		      qdev->hwconf.qm_num_pages);
+ 	QOS_LOG_DEBUG("clock\t\t\t%u\n", qdev->hwconf.qos_clock);
+ 
+-	if (conf->wred_p_const > 1023) {
+-		QOS_LOG_ERR("wred_p_const should be not greater than 1023\n");
+-		rc = -EINVAL;
+-		goto out;
+-	}
+-
+ 	qdev->hwconf.wred_const_p = conf->wred_p_const;
+ 	qdev->hwconf.wred_max_q_size = conf->wred_max_q_size;
+ 
+-	QOS_LOG_DEBUG("wred p const\t\t%u\n",
+-		      qdev->hwconf.wred_const_p);
+-	QOS_LOG_DEBUG("wred max q size\t\t%u\n",
+-		      qdev->hwconf.wred_max_q_size);
++	QOS_LOG_DEBUG("wred p const\t\t%u\n", qdev->hwconf.wred_const_p);
++	QOS_LOG_DEBUG("wred max q size\t\t%u\n", qdev->hwconf.wred_max_q_size);
+ 
+ 	rc = load_firmware(qdev, FIRMWARE_FILE);
+-	if (rc)
++	if (rc) {
++		free_ddr_for_qm(qdev);
++		QOS_FREE(qdev->portsphys);
+ 		goto out;
++	}
+ 
+ 	create_init_logger_cmd(qdev, UC_LOGGER_LEVEL_INFO);
+ 	create_init_qos_cmd(qdev);
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+index 60a121b378f7..a0a569f6d9c5 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+@@ -218,6 +218,7 @@ struct hw_conf {
+ 	unsigned int	wred_const_p;
+ 	unsigned int	wred_max_q_size;
+ 	unsigned int	qm_ddr_start;
++	void*		qm_ddr_start_virt;
+ 	unsigned int	qm_num_pages;
+ 	unsigned int	fw_logger_start;
+ 	unsigned int	fw_stat;
+@@ -265,6 +266,7 @@ struct ppv4_qos_platform_data  {
+ 	unsigned int	max_port;
+ 	unsigned int	wred_prioritize_pop;
+ 	unsigned int	qm_ddr_start;
++	void*		qm_ddr_start_virt;
+ 	unsigned int	qm_num_pages;
+ 	unsigned int	fw_logger_start;
+ 	unsigned int	fw_stat;
+@@ -701,6 +703,7 @@ void update_children_position(
+ 			struct qos_node *parent,
+ 			struct qos_node *node_src);
+ int allocate_ddr_for_qm(struct pp_qos_dev *qdev);
++void free_ddr_for_qm(struct pp_qos_dev *qdev);
+ int allocate_ddr_for_qm_on_platform(struct pp_qos_dev *qdev);
+ int check_sync_with_fw(struct pp_qos_dev *qdev);
+ 

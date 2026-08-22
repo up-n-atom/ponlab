@@ -1,0 +1,659 @@
+From 57c5d6f0e55307ad582d344d3605dadca08aabae Mon Sep 17 00:00:00 2001
+From: chdugw_auto <jkulkarni@maxlinear.com>
+Date: Tue, 31 Aug 2021 19:11:46 +0300
+Subject: [PATCH] Merge pull request #3475 in SW_UGW/linux from
+ feature/UGW_SW-61355-prototype-mcast_helper_get_skb_gid-api-8.x to master
+
+* commit 'c7f7430d7a6593e644dce08b2abae51c5fef3439':
+  UGW_SW-61355 : Prototyping mcast_helper_get_skb_gid API
+---
+ include/net/mcast_helper_api.h      |  83 +++++++++++++++++++++++
+ net/mcast_helper/mcast_helper.c     | 128 +++++++++++++++++++++++++++++++-----
+ net/mcast_helper/mcast_helper.h     |  66 ++++---------------
+ net/mcast_helper/mcast_helper_reg.c |  90 ++++++++++++-------------
+ 4 files changed, 251 insertions(+), 116 deletions(-)
+
+diff --git a/include/net/mcast_helper_api.h b/include/net/mcast_helper_api.h
+new file mode 100644
+index 000000000000..17baf69c2ccf
+--- /dev/null
++++ b/include/net/mcast_helper_api.h
+@@ -0,0 +1,83 @@
++/*******************************************************************************
++*
++* Copyright (c) 2020 - 2021, MaxLinear, Inc.
++*
++*******************************************************************************/
++
++#ifndef _MCAST_HELPER_API_H
++#define _MCAST_HELPER_API_H
++
++#include <net/addrconf.h>
++#include <net/ipv6.h>
++
++/* Reg/dereg flag definition */
++#define MCH_F_REGISTER		0x01
++#define MCH_F_DEREGISTER	0x02
++#define MCH_F_DIRECTPATH	0x04
++#define MCH_F_UPDATE_MAC_ADDR	0x08
++#define MCH_F_FW_RESET		0x10
++#define MCH_F_NEW_STA		0x20
++#define MCH_F_DISCONN_MAC	0x40
++
++/* Callback flag definition */
++#define MCH_CB_F_ADD		0x01
++#define MCH_CB_F_DEL		0x02
++#define MCH_CB_F_UPD		0x03
++#define MCH_CB_F_DEL_UPD	0x08
++
++#define MAX_MAC			64
++
++#define MCH_GID_BCAST		0
++#define MCH_GID_ERR		-1
++
++/** Protocol type */
++typedef enum {
++	IPV4 = 0,
++	IPV6 = 1,
++	INVALID,
++} ptype_t;
++
++typedef struct _ip_addr_t {
++	/* Protocol type IPV4 or IPV6 */
++	ptype_t ipType;
++	union {
++		struct in_addr ipAddr;
++		struct in6_addr ip6Addr;
++	} ipA;
++} IP_Addr_t;
++
++typedef struct  _mcast_stream_t {
++	/* Rx NetDevice */
++	struct net_device *rxDev;
++	/* Source IP - v4 or v6 */
++	IP_Addr_t sIP;
++	/* Destination IP (GA) - v4 or v6 */
++	IP_Addr_t dIP;
++	/* Protocol Type */
++	uint32_t proto;
++	/* Source Port */
++	uint32_t sPort;
++	/* Destination Port */
++	uint32_t dPort;
++	/* LAN/WLAN source Mac address  */
++	unsigned char src_mac[ETH_ALEN];
++	/* Number of Joined MACs */
++	uint32_t num_joined_macs;
++	/* Lan/wlan array of joined Mac Address */
++	unsigned char macaddr[MAX_MAC][ETH_ALEN];
++} MCAST_STREAM_t;
++
++typedef int32_t (*Mcast_module_callback_t)(unsigned int grpidx,
++		struct net_device *netdev, void *mc_stream, unsigned int flag);
++
++extern void  mcast_helper_register_module(
++	struct net_device *dev,		/* Registered netdev e.g. wlan0 */
++	struct module *modName,		/* Kernel Module Name */
++	char *addlName,			/* Optional Additional Name */
++	Mcast_module_callback_t *fnCB,	/* Callback Function */
++	void *data,			/* Variable input data */
++	unsigned int flags);		/* Flag - MCH_F_* */
++
++extern int mcast_helper_get_skb_gid(struct sk_buff *skb);
++
++#endif  /* _MCAST_HELPER_API_H */
+diff --git a/net/mcast_helper/mcast_helper.c b/net/mcast_helper/mcast_helper.c
+index 49c305142542..1d7c52796497 100644
+--- a/net/mcast_helper/mcast_helper.c
++++ b/net/mcast_helper/mcast_helper.c
+@@ -145,6 +145,7 @@ extern int mcast_helper_invoke_callback(unsigned int grpidx,
+ 		struct net_device *netdev, void *mc_stream,
+ 		unsigned int flag, unsigned int count);
+ extern int (*mcast_helper_sig_check_update_ptr)(struct sk_buff *skb);
++extern int (*mcast_helper_get_skb_gid_ptr)(struct sk_buff *skb);
+ 
+ /**mcast helper function prototype */
+ static int mcast_helper_invoke_return_callback(unsigned int grpidx,
+@@ -478,7 +479,7 @@ static MCAST_GIMC_t *mcast_helper_update_five_tuple(struct sk_buff *skb,
+ 	struct list_head *liter = NULL;
+ 	struct list_head *tliter = NULL;
+ 	struct list_head *gimc_list;
+-	unsigned int flag = MC_F_ADD;
++	unsigned int flag = MCH_CB_F_ADD;
+ 	const unsigned char *src_mac = eth_hdr(skb)->h_source;
+ 
+ 	if (skb->protocol == htons(ETH_P_IP))
+@@ -497,7 +498,7 @@ static MCAST_GIMC_t *mcast_helper_update_five_tuple(struct sk_buff *skb,
+ 	if (update) {
+ 		memcpy(gimc_rec->mc_stream.src_mac, src_mac, ETH_ALEN);
+ 		gimc_rec->mc_stream.rxDev = mch_get_netif_by_idx(skb->skb_iif);
+-		flag = MC_F_UPD;
++		flag = MCH_CB_F_UPD;
+ 	}
+ 
+ 	/* If not asked to update always, depends on br_callback_flag */
+@@ -840,6 +841,97 @@ mcast_helper_search_gimc_record(IP_Addr_t *gaddr,
+ 	return NULL;
+ }
+ 
++/**
++ * mcast_helper_get_skb_gid_internal - get MCGID from socket buffer
++ *
++ * @skb: pointer to the socket buffer
++ *
++ * Return: MCGID (>=0) on success else negative in case of failure
++ */
++static int mcast_helper_get_skb_gid_internal(struct sk_buff *skb)
++{
++	int mc_gid = MCH_GID_BCAST;
++	MCAST_GIMC_t *gimc_rec;
++	struct list_head *gimc_list;
++	IP_Addr_t saddr;
++	IP_Addr_t daddr;
++	struct iphdr *iph;
++	struct ipv6hdr *iph6;
++	const unsigned char *dest;
++	unsigned short network_header_offset;
++	unsigned short protocol;
++	ptype_t ptype;
++
++	if (!skb_mac_header_was_set(skb)) {
++		struct ethhdr *eth_hdr = (struct ethhdr *)skb->data;
++
++		dest = eth_hdr->h_dest;
++		protocol = eth_hdr->h_proto;
++		network_header_offset = skb->data - skb->head + ETH_HLEN;
++	} else {
++		dest = eth_hdr(skb)->h_dest;
++		protocol = skb->protocol;
++		network_header_offset = skb->network_header;
++	}
++
++	if (!is_multicast_ether_addr(dest))
++		return MCH_GID_ERR;
++
++	if (is_broadcast_ether_addr(dest))
++		return MCH_GID_BCAST;
++
++	/* TODO: Handle one or more vlan tag if present */
++
++	switch (ntohs(protocol)) {
++	case ETH_P_IP:
++		iph = (struct iphdr *)(skb->head + network_header_offset);
++		ptype = IPV4;
++
++		mcast_helper_init_ipaddr(&saddr, ptype, &iph->saddr);
++		mcast_helper_init_ipaddr(&daddr, ptype, &iph->daddr);
++		/* Check link-local multicast space 224.0.0.0/24
++		 * and IPv4 Service Discovery Protocol address 239.255.255.250
++		 */
++		if (ipv4_is_local_multicast(iph->daddr) ||
++		    (ntohl(iph->daddr) == 0xEFFFFFFAU)) {
++			mch_debug("{%pI4, %pI4} => %d\n",
++				  &saddr.ipA, &daddr.ipA, MCH_GID_BCAST);
++			return MCH_GID_BCAST;
++		}
++		break;
++#if IS_ENABLED(CONFIG_IPV6)
++	case ETH_P_IPV6:
++		iph6 = (struct ipv6hdr *)(skb->head + network_header_offset);
++		ptype = IPV6;
++
++		mcast_helper_init_ipaddr(&saddr, ptype, &iph6->saddr);
++		mcast_helper_init_ipaddr(&daddr, ptype, &iph6->daddr);
++		if (ipv6_addr_is_ll_all_nodes(&iph6->daddr) ||
++		    IPV6_ADDR_MC_SCOPE(&iph6->daddr) < IPV6_ADDR_SCOPE_LINKLOCAL) {
++			mch_debug("{%pI6c, %pI6c} => %d\n",
++				  &saddr.ipA, &daddr.ipA, MCH_GID_BCAST);
++			return MCH_GID_BCAST;
++		}
++		break;
++#endif /* CONFIG_IPV6 */
++	default:
++		mch_debug("{*, %pM} => %d\n", dest, MCH_GID_BCAST);
++		return MCH_GID_BCAST;
++	}
++
++	gimc_list = mcast_helper_list_p(ptype);
++	gimc_rec = mcast_helper_search_gimc_record(&daddr, &saddr, gimc_list);
++	if (gimc_rec)
++		mc_gid = gimc_rec->grpIdx;
++
++	if (ptype == IPV4)
++		mch_debug("{%pI4, %pI4} => %d\n", &saddr.ipA, &daddr.ipA, mc_gid);
++	else if (ptype == IPV6)
++		mch_debug("{%pI6c, %pI6c} => %d\n", &saddr.ipA, &daddr.ipA, mc_gid);
++
++	return mc_gid;
++}
++
+ /*=============================================================================
+  *Function Name: mcast_helper_add_gimc_record
+  *Description	: Function  to create and add 5 tuple entry into gimc record list
+@@ -1052,12 +1144,12 @@ mcast_helper_update_mac_list(MCAST_MEMBER_t *gitxmc_rec,
+ 	memset(stream->macaddr, 0, MAX_MAC * ETH_ALEN);
+ 	stream->num_joined_macs = 0;
+ 
+-	if ((gitxmc_rec->macaddr_count == 1) && (action == MC_F_DEL)) {
++	if ((gitxmc_rec->macaddr_count == 1) && (action == MCH_CB_F_DEL)) {
+ 		if (macaddr != NULL) {
+ 			memcpy(stream->macaddr[0], macaddr, ETH_ALEN);
+ 			stream->num_joined_macs = 1;
+ 		}
+-		flag = MC_F_DEL;
++		flag = MCH_CB_F_DEL;
+ 	} else {
+ 		list_for_each_safe(liter, tliter, &gitxmc_rec->macaddr_list) {
+ 			mac_rec = list_entry(liter, MCAST_MAC_t, list);
+@@ -1453,7 +1545,7 @@ mcast_helper_update_entry(struct net_device *netdev, MCAST_REC_t *mc_rec)
+ 	MCAST_GIMC_t *gimc_rec = NULL;
+ 	MCAST_MEMBER_t *gitxmc_rec = NULL;
+ 	MCAST_MAC_t *mac_rec = NULL;
+-	unsigned int flag = MC_F_UPD;
++	unsigned int flag = MCH_CB_F_UPD;
+ 	struct list_head *gimc_list = NULL;
+ 
+ 	gimc_list = mcast_helper_list_p(mc_rec->groupIP.ipType);
+@@ -1601,7 +1693,7 @@ static int mcast_helper_add_entry(struct net_device *netdev,
+ 	memcpy(gimc_rec->mc_stream.macaddr, mc_rec->macaddr, ETH_ALEN);
+ 	if (routed) {
+ 		flag = mcast_helper_update_mac_list(gitxmc_rec, gimc_rec,
+-				mc_rec->macaddr, MC_F_ADD);
++				mc_rec->macaddr, MCH_CB_F_ADD);
+ 		mch_debug("added member for routed path into GID=%d\n",
+ 			  gimc_rec->grpIdx);
+ 		atomic_inc(&mch_br_capture_pkt);
+@@ -1645,9 +1737,9 @@ static int mcast_helper_add_entry(struct net_device *netdev,
+ 				gimc_rec_l->br_callback_flag = 1;
+ 			gimc_rec->br_callback_flag = 1;
+ 			flag = mcast_helper_update_mac_list(gitxmc_rec,
+-					gimc_rec, mc_rec->macaddr, MC_F_ADD);
++					gimc_rec, mc_rec->macaddr, MCH_CB_F_ADD);
+ 			mcast_helper_invoke_return_callback(gimc_rec->grpIdx,
+-					netdev, &gimc_rec->mc_stream, MC_F_ADD,
++					netdev, &gimc_rec->mc_stream, MCH_CB_F_ADD,
+ 					gitxmc_rec->macaddr_count);
+ 	        }
+ 	}
+@@ -1691,7 +1783,7 @@ mcast_helper_delete_entry(struct net_device *netdev, MCAST_REC_t *mc_mem)
+ 	if (mac && gitxmc_rec->macaddr_count <= 1) {
+ 		/* MAC count 1 and matching, inform and remove */
+ 		mcast_helper_delete_gitxmc_record(gitxmc_rec, gimc_rec,
+-				netdev, mc_mem->macaddr, MC_F_DEL);
++				netdev, mc_mem->macaddr, MCH_CB_F_DEL);
+ 		list_del(&mac->list);
+ 		kfree(mac);
+ 		mch_debug("deleting member=%s from GIMC=%p GID=%d\n",
+@@ -1703,7 +1795,7 @@ mcast_helper_delete_entry(struct net_device *netdev, MCAST_REC_t *mc_mem)
+ 		kfree(mac);
+ 		gitxmc_rec->macaddr_count--;
+ 		mcast_helper_delete_gitxmc_record(gitxmc_rec, gimc_rec,
+-				netdev, mc_mem->macaddr, MC_F_DEL_UPD);
++				netdev, mc_mem->macaddr, MCH_CB_F_DEL_UPD);
+ 	}
+ 
+ 	if (list_empty(&gimc_rec->mc_mem_list))
+@@ -2397,7 +2489,7 @@ static int mcast_helper_sig_check_update_ip(struct sk_buff *skb)
+ 				gitxmc_rec->aclBlocked = 0;
+ #endif
+ 				flag = mcast_helper_update_mac_list(gitxmc_rec,
+-						gimc_rec, NULL, MC_F_ADD);
++						gimc_rec, NULL, MCH_CB_F_ADD);
+ 				mcast_helper_invoke_return_callback(
+ 						gimc_rec->grpIdx,
+ 						gitxmc_rec->memDev,
+@@ -2460,7 +2552,7 @@ static int mcast_helper_sig_check_update_ip6(struct sk_buff *skb)
+ 				gitxmc_rec->aclBlocked = 0;
+ #endif
+ 				flag = mcast_helper_update_mac_list(gitxmc_rec,
+-						gimc_rec, NULL, MC_F_UPD);
++						gimc_rec, NULL, MCH_CB_F_UPD);
+ 				mcast_helper_invoke_return_callback(
+ 						gimc_rec->grpIdx,
+ 						gitxmc_rec->memDev,
+@@ -2534,12 +2626,12 @@ static void mcast_helper_timer_handler_probe(MCAST_GIMC_t *gimc_rec)
+ 				if (gitxmc_rec->aclBlocked == 1) {
+ 					flag = mcast_helper_update_mac_list(
+ 							gitxmc_rec, gimc_rec,
+-							NULL, MC_F_ADD);
++							NULL, MCH_CB_F_ADD);
+ 					mcast_helper_invoke_return_callback(
+ 							gimc_rec->grpIdx,
+ 							gitxmc_rec->memDev,
+ 							&gimc_rec->mc_stream,
+-							MC_F_ADD,
++							MCH_CB_F_ADD,
+ 							gitxmc_rec->macaddr_count);
+ 					gitxmc_rec->aclBlocked = 0;
+ 				}
+@@ -2555,7 +2647,7 @@ static void mcast_helper_timer_handler_probe(MCAST_GIMC_t *gimc_rec)
+ 			 * call back for this if any
+ 			 */
+ 			flag = mcast_helper_update_mac_list(gitxmc_rec,
+-					gimc_rec, NULL, MC_F_DEL);
++					gimc_rec, NULL, MCH_CB_F_DEL);
+ 			mcast_helper_invoke_return_callback(
+ 					gimc_rec->grpIdx, gitxmc_rec->memDev,
+ 					&gimc_rec->mc_stream, flag,
+@@ -2751,14 +2843,14 @@ mcast_helper_delete_all_mac(MCAST_GIMC_t *gimc_rec, MCAST_MEMBER_t *mem_rec)
+ 			/* MAC count 1 and matching, inform and remove */
+ 			mcast_helper_delete_gitxmc_record(mem_rec,
+ 					gimc_rec, mem_rec->memDev,
+-					mac_rec->macaddr, MC_F_DEL);
++					mac_rec->macaddr, MCH_CB_F_DEL);
+ 			list_del(&mac_rec->list);
+ 			kfree(mac_rec);
+ 		}
+ 	} else {
+ 		/* More than one MAC, delete at once */
+ 		mcast_helper_delete_gitxmc_record(mem_rec, gimc_rec,
+-				mem_rec->memDev, NULL, MC_F_DEL);
++				mem_rec->memDev, NULL, MCH_CB_F_DEL);
+ 		list_for_each_safe(liter, tliter, &mem_rec->macaddr_list) {
+ 			mac_rec = list_entry(liter, MCAST_MAC_t, list);
+ 			list_del(&mac_rec->list);
+@@ -2889,6 +2981,7 @@ static int __init mcast_helper_init_module(void)
+ 	five_tuple_br_info_ptr = (void *)mcast_helper_five_tuple_br_info;
+ 	five_tuple_br_info_hook = (void *)mcast_helper_five_tuple_br_hook;
+ 	mcast_helper_sig_check_update_ptr = mcast_helper_sig_check_update;
++	mcast_helper_get_skb_gid_ptr = mcast_helper_get_skb_gid_internal;
+ 	mcast_helper_init_timer(MCH_UPDATE_TIMER);
+ 	mcast_lanserver_init_timer(LANSERVER_UPDATE_TIMER);
+ 
+@@ -2926,6 +3019,7 @@ static void __exit mcast_helper_exit_module(void)
+ 	five_tuple_br_info_ptr = NULL;
+ 	five_tuple_br_info_hook = NULL;
+ 	mcast_helper_sig_check_update_ptr = NULL;
++	mcast_helper_get_skb_gid_ptr = NULL;
+ 
+ 	if (skb_buff)
+ 		kfree_skb(skb_buff);
+diff --git a/net/mcast_helper/mcast_helper.h b/net/mcast_helper/mcast_helper.h
+index 9ca1e8efc146..3218c169b735 100644
+--- a/net/mcast_helper/mcast_helper.h
++++ b/net/mcast_helper/mcast_helper.h
+@@ -22,13 +22,14 @@
+  *
+  */
+ 
+-#ifndef MCAST_HELPER_H
+-#define MCAST_HELPER_H
++#ifndef _MCAST_HELPER_H
++#define _MCAST_HELPER_H
+ #include <uapi/linux/in.h> 
+ #include <linux/ioctl.h>
+ #include <linux/cdev.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <net/mcast_helper_api.h>
+ 
+ #define MCH_MAGIC 'M'
+ #define MCH_MEMBER_ENTRY_ADD _IOR(MCH_MAGIC, 0, char *)
+@@ -36,66 +37,25 @@
+ #define MCH_MEMBER_ENTRY_REMOVE _IOR(MCH_MAGIC, 2, char *)
+ #define MCH_SERVER_ENTRY_GET _IOR(MCH_MAGIC, 3, char *)
+ 
+-#define LTQ_MC_F_REGISTER 0x01
+-#define LTQ_MC_F_DEREGISTER 0x02
++#define SUCCESS					0x1
++#define FAILURE					0x0
+ 
+-#define MCH_MAX_CALLBACK_FUNC 10
++#define IPSTRLEN				40
+ 
+-#define SUCCESS 0x1
+-#define FAILURE 0x0
++#define FIRST_MINOR				0
++#define MINOR_CNT				1
++#define DEVICE_NAME				"mcast"
+ 
+-#define IPSTRLEN 40
+-
+-#define FIRST_MINOR 0
+-#define MINOR_CNT 1
+-#define DEVICE_NAME "mcast"
+-#define uint32_t unsigned int
+ #define IN6_ARE_ADDR_EQUAL(a,b) \
+ 	(!memcmp ((const void*)(a), (const void*)(b), sizeof (struct in6_addr)))
+-
+ #ifndef IN6_IS_ADDR_UNSPECIFIED
+ # define IN6_IS_ADDR_UNSPECIFIED(a) \
+ 	(((uint32_t *) (a))[0] == 0 && ((uint32_t *) (a))[1] == 0 && \
+ 	 ((uint32_t *) (a))[2] == 0 && ((uint32_t *) (a))[3] == 0)
+ #endif
+ 
+-#define MAX_CALLBACK 2
+-typedef void (*Mcast_module_callback_t)(unsigned int grpidx,struct net_device *netdev,void *mc_stream,unsigned int flag);
+-
+-#define MC_F_ADD 0x01
+-#define MC_F_DEL 0x02
+-#define MC_F_UPD 0x03
+-#define MC_F_DEL_UPD 0x08
+-#define FTUPLE_ARR_SIZE 10
+-#define IFSIZE 20
+-#define MAX_MAC 64
+-
+-/** Protocol type */
+-typedef enum {
+-	IPV4 = 0,
+-	IPV6 = 1,
+-	INVALID,
+-} ptype_t;
+-
+-typedef struct _ip_addr_t {
+-	ptype_t  ipType ;/* IPv4 or IPv6 */
+-	union {
+-		struct in_addr ipAddr;
+-		struct in6_addr ip6Addr;
+-	} ipA;
+-} IP_Addr_t;
+-
+-typedef struct  _mcast_stream_t {
+-	struct net_device *rxDev; /* Rx NetDevice */
+-	IP_Addr_t sIP; /* Source IP - v4 or v6 */
+-	IP_Addr_t dIP; /* Destination IP (GA) - v4 or v6 */
+-	uint32_t proto; /* Protocol Type */
+-	uint32_t sPort; /* Source Port */
+-	uint32_t dPort; /* Destination Port */
+-	unsigned char src_mac[ETH_ALEN];/* LAN/WLAN source Mac address  */
+-	uint32_t num_joined_macs; /* Number of Joined MACs */
+-	unsigned char macaddr[MAX_MAC][ETH_ALEN]; /* Lan/wlan array of joined Mac Address */
+-} MCAST_STREAM_t;
++#define FTUPLE_ARR_SIZE			10
++#define IFSIZE				20
+ 
+ typedef struct _mcast_mac_t {
+ 	unsigned char macaddr[ETH_ALEN];
+@@ -115,7 +75,6 @@ typedef struct _mcast_member_t {
+ 	struct list_head list;	/* mcast_member interface map  List  */
+ } MCAST_MEMBER_t;
+ 
+-
+ typedef struct _mcast_rec_t {
+ 	char memIntrfName[IFSIZE]; /* Member NetDevice */
+ 	char rxIntrfName[IFSIZE]; /* Rx Member NetDevice */
+@@ -139,7 +98,6 @@ typedef struct  _mcast_gimc_t {
+ 	int br_callback_flag;	/* Flag for bridge five tuple info */
+ } MCAST_GIMC_t;
+ 
+-
+ typedef struct
+ {
+ 	int status, dignity, ego;
+@@ -160,4 +118,4 @@ typedef struct _ftuple_info_t {
+ #define QUERY_CLR_VARIABLES _IO('q', 2)
+ #define QUERY_SET_VARIABLES _IOW('q', 3, query_arg_t *)
+ 
+-#endif
++#endif /* _MCAST_HELPER_H */
+diff --git a/net/mcast_helper/mcast_helper_reg.c b/net/mcast_helper/mcast_helper_reg.c
+index 1369ebf3d253..dc25ca1ae671 100644
+--- a/net/mcast_helper/mcast_helper_reg.c
++++ b/net/mcast_helper/mcast_helper_reg.c
+@@ -32,41 +32,32 @@
+ #include <net/net_namespace.h>
+ #include <linux/string.h>
+ #include <linux/rtnetlink.h>
++#include <net/mcast_helper_api.h>
+ 
+-#define SUCCESS 0x1
+-#define FAILURE 0x0
++#define SUCCESS			0x1
++#define FAILURE			0x0
+ 
+-/* reg/dereg flag definition */
+-#define LTQ_MC_F_REGISTER 0x01
+-#define LTQ_MC_F_DEREGISTER 0x02
+-#define LTQ_MC_F_DIRECTPATH 0x04
+-#define LTQ_MC_F_UPDATE_MAC_ADDR 0x08
+-#define LTQ_MC_F_FW_RESET 0x10
+-#define LTQ_MC_F_NEW_STA  0x20
+-#define LTQ_MC_F_DISCONN_MAC 0x40
++#define MCAST_PROCESS_NAME	"mcastd"
+ 
+-/* callback flag definition */
+-#define LTQ_MC_F_ADD 0x01
+-#define LTQ_MC_F_DEL 0x02
+-#define LTQ_MC_F_UPD 0x03
+-#define LTQ_MC_F_DEL_UPD 0x08
++#define IF_INFO_SIZE		NLMSG_ALIGN(sizeof(struct ifinfomsg))
++#define TOTAL_SIZE		NLMSG_ALIGN(sizeof(struct ifinfomsg)) +\
++				nla_total_size(MAX_ADDR_LEN)
+ 
+-#define MCAST_PROCESS_NAME "mcastd"
+-
+-#define IF_INFO_SIZE	NLMSG_ALIGN(sizeof(struct ifinfomsg))
+-#define TOTAL_SIZE	NLMSG_ALIGN(sizeof(struct ifinfomsg)) + nla_total_size(MAX_ADDR_LEN)
+-
+-typedef void (*Mcast_module_callback_t)(unsigned int grpidx, struct net_device *netdev, void *mc_stream, unsigned int flag);
+ typedef struct _mcast_callback_t{
+ 	int numCbf;
+-	struct net_device *netDev; /* Member NetDevice */
++	/* Member NetDevice */
++	struct net_device *netDev;
+ 	struct module *modName;
+ 	Mcast_module_callback_t callbackfun;
+-	struct list_head list;	/* mcast_member interface map  List  */
++	/* mcast_member interface map List */
++	struct list_head list;
+ 	uint32_t uflag;
+ 	struct rcu_head rcu_head;
+ } MCAST_CALLBACK_t;
+ 
++int (*mcast_helper_get_skb_gid_ptr)(struct sk_buff *skb) = NULL;
++EXPORT_SYMBOL(mcast_helper_get_skb_gid_ptr);
++
+ static DEFINE_MUTEX(mch_cb_list_lock);
+ 
+ LIST_HEAD(mch_callback_list_g);
+@@ -149,12 +140,12 @@ static int mcast_helper_reg_callback(struct net_device *netdev,
+ 	mc_callback_rec->netDev = netdev;
+ 	mc_callback_rec->callbackfun = (void *)fun;
+ 	mc_callback_rec->modName = modName;
+-	mc_callback_rec->uflag = flags & LTQ_MC_F_DIRECTPATH;
++	mc_callback_rec->uflag = flags & MCH_F_DIRECTPATH;
+ 	INIT_LIST_HEAD(&mc_callback_rec->list);
+ 	mutex_lock(&mch_cb_list_lock);
+ 	list_add_tail_rcu(&mc_callback_rec->list, head);
+ 	mutex_unlock(&mch_cb_list_lock);
+-	if ((flags & LTQ_MC_F_FW_RESET) == LTQ_MC_F_FW_RESET)
++	if ((flags & MCH_F_FW_RESET) == MCH_F_FW_RESET)
+ 		mcast_helper_send_netlink_msg_user(netdev, RTM_NEWLINK, 0, NULL);
+ 
+ 	return SUCCESS;
+@@ -182,7 +173,7 @@ static int mcast_helper_dereg_callback(struct net_device *netdev,
+ 						list_del_rcu(&mc_callback_rec->list);
+ 						kfree_rcu(mc_callback_rec, rcu_head);
+ 						mutex_unlock(&mch_cb_list_lock);
+-						if ((flags & LTQ_MC_F_FW_RESET) == LTQ_MC_F_FW_RESET)
++						if ((flags & MCH_F_FW_RESET) == MCH_F_FW_RESET)
+ 							mcast_helper_send_netlink_msg_user(netdev, RTM_DELLINK, 0, NULL);
+ 						return SUCCESS;
+ 					}
+@@ -195,26 +186,26 @@ static int mcast_helper_dereg_callback(struct net_device *netdev,
+ }
+ 
+ /** Register callback function **/
+-void  mcast_helper_register_module (
+-		struct net_device *dev, /*Registered netdev e.g. wlan0 */
++void mcast_helper_register_module (
++		struct net_device *dev, /* Registered netdev e.g. wlan0 */
+ 		struct module *modName, /* Kernel Module Name */
+-		char *addlName, /* Optional Additional Name*/
++		char *addlName, /* Optional Additional Name */
+ 		Mcast_module_callback_t *fnCB, /* Callback Fn */
+ 		void *data, /* Variable input data */
+-		unsigned int flags) /* Flag - LTQ_F_REGISTER or LTQ_F_DEREGISTER*/
++		unsigned int flags) /* Flag - MCH_F_* */
+ {
+ 
+ 	if (dev->name != NULL) {
+ 
+-		if ((flags & LTQ_MC_F_REGISTER) == LTQ_MC_F_REGISTER) {
++		if ((flags & MCH_F_REGISTER) == MCH_F_REGISTER) {
+ 			mcast_helper_reg_callback(dev, fnCB, modName, &mch_callback_list_g, flags);
+-		} else if ((flags & LTQ_MC_F_DEREGISTER) == LTQ_MC_F_DEREGISTER) {
++		} else if ((flags & MCH_F_DEREGISTER) == MCH_F_DEREGISTER) {
+ 			mcast_helper_dereg_callback(dev, fnCB, modName, &mch_callback_list_g, flags);
+-		} else if((flags & LTQ_MC_F_NEW_STA) == LTQ_MC_F_NEW_STA) {
++		} else if((flags & MCH_F_NEW_STA) == MCH_F_NEW_STA) {
+ 			mcast_helper_send_netlink_msg_user(dev, RTM_NEWLINK, 1, NULL);
+-		} else if ((flags & LTQ_MC_F_DISCONN_MAC) == LTQ_MC_F_DISCONN_MAC) {
++		} else if ((flags & MCH_F_DISCONN_MAC) == MCH_F_DISCONN_MAC) {
+ 			if (data == NULL)
+-				pr_info("MAC is NULL - flag : LTQ_MC_F_DISCONN_MAC\n");
++				pr_info("MAC is NULL - flag : MCH_F_DISCONN_MAC\n");
+ 			else
+ 				mcast_helper_send_netlink_msg_user(dev, RTM_DELLINK, 0, data);
+ 		}
+@@ -234,25 +225,25 @@ int mcast_helper_invoke_callback(unsigned int grpidx,struct net_device *netdev,v
+ 			{
+ 				if(mc_callback_rec->callbackfun != NULL)
+ 				{
+-					if(((mc_callback_rec->uflag & LTQ_MC_F_DIRECTPATH)!= 0 ) )
++					if(((mc_callback_rec->uflag & MCH_F_DIRECTPATH)!= 0 ) )
+ 					{
+-						if((mc_callback_rec->uflag & LTQ_MC_F_UPDATE_MAC_ADDR) == 0) {
+-							if(flag == LTQ_MC_F_UPD)
+-								passflag = LTQ_MC_F_ADD;
+-							if((flag !=  LTQ_MC_F_DEL_UPD) )
++						if((mc_callback_rec->uflag & MCH_F_UPDATE_MAC_ADDR) == 0) {
++							if(flag == MCH_CB_F_UPD)
++								passflag = MCH_CB_F_ADD;
++							if((flag != MCH_CB_F_DEL_UPD) )
+ 								mc_callback_rec->callbackfun(grpidx,netdev,mc_stream,passflag);
+ 
+ 						}
+ 						else {
+-							if((flag & LTQ_MC_F_DEL_UPD) == LTQ_MC_F_DEL_UPD )
+-								passflag = LTQ_MC_F_UPD;
++							if((flag & MCH_CB_F_DEL_UPD) == MCH_CB_F_DEL_UPD )
++								passflag = MCH_CB_F_UPD;
+ 							mc_callback_rec->callbackfun(grpidx,netdev,mc_stream,passflag);
+ 
+ 						}
+ 					}
+-					else if (mc_callback_rec->uflag != LTQ_MC_F_DIRECTPATH) {
+-						if((flag & LTQ_MC_F_DEL_UPD) == LTQ_MC_F_DEL_UPD )
+-							passflag = LTQ_MC_F_UPD;
++					else if (mc_callback_rec->uflag != MCH_F_DIRECTPATH) {
++						if((flag & MCH_CB_F_DEL_UPD) == MCH_CB_F_DEL_UPD )
++							passflag = MCH_CB_F_UPD;
+ 						mc_callback_rec->callbackfun(grpidx,netdev,mc_stream,passflag);
+ 					}
+ 				}
+@@ -265,5 +256,14 @@ int mcast_helper_invoke_callback(unsigned int grpidx,struct net_device *netdev,v
+ 
+ EXPORT_SYMBOL(mcast_helper_invoke_callback);
+ 
++int mcast_helper_get_skb_gid(struct sk_buff *skb)
++{
++	if (mcast_helper_get_skb_gid_ptr)
++		return mcast_helper_get_skb_gid_ptr(skb);
++
++	return MCH_GID_ERR;
++}
++EXPORT_SYMBOL(mcast_helper_get_skb_gid);
++
+ #endif
+ 

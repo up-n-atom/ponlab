@@ -1,0 +1,335 @@
+From 1241949db468cd003ae217d98cfd7182ff429d8f Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Thu, 12 Sep 2019 13:35:00 +0300
+Subject: [PATCH] PONRTSYS-5043: PPv4 QoS - proper handling of queue move
+ between ports
+
+---
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c  | 67 ++++++++++++++++++-
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c   |  2 +-
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c | 77 ++++++++++++++++++++--
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h  |  2 +-
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c    | 16 +++++
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h    | 12 ++++
+ 6 files changed, 168 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c
+index 540ffad1506c..115c9c4ff98c 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c
+@@ -54,8 +54,6 @@ static ssize_t read_table_entry(struct file *file, const char __user *buf,
+ 	u32 table_id;
+ 	struct platform_device *pdev;
+ 	struct pp_qos_drv_data *pdata;
+-	u32 id = 0;
+-	s32 ret;
+ 
+ 	pdev = (struct platform_device *)(file->private_data);
+ 	pdata = platform_get_drvdata(pdev);
+@@ -368,6 +366,63 @@ static ssize_t allocate_node_help(struct file *file,
+ 	return ret;
+ }
+ 
++static ssize_t flush(struct file *file,
++		     const char __user *buf, size_t count, loff_t *pos)
++{
++	char *lbuf;
++	struct pp_qos_dev *qdev;
++	u32 id;
++	struct platform_device *pdev;
++	struct pp_qos_drv_data *pdata;
++
++	pdev = (struct platform_device *)(file->private_data);
++	pdata = platform_get_drvdata(pdev);
++	qdev = pdata->qdev;
++
++	if (count >= PP_QOS_DBG_MAX_INPUT)
++		return count;
++
++	lbuf = kzalloc(count, GFP_KERNEL);
++	if (!lbuf)
++		return -ENOMEM;
++
++	if (copy_from_user(lbuf, buf, count))
++		goto flush_done;
++
++	lbuf[count - 1] = '\0';
++
++	if (kstrtou32(buf, 0, &id)) {
++		QOS_LOG_ERR("kstrtou32 err\n");
++		goto flush_done;
++	}
++
++	if (pp_qos_queue_flush(qdev, id))
++		QOS_LOG_ERR("Flushing queue id %u failed\n", id);
++
++flush_done:
++	kfree(lbuf);
++	return count;
++}
++
++static ssize_t flush_help(struct file *file,
++			  char __user *user_buf,
++			  size_t count, loff_t *ppos)
++{
++	char *buff;
++	u32 len = 0;
++	ssize_t ret = 0;
++
++	buff = kmalloc(PP_QOS_DBG_MAX_BUF, GFP_KERNEL);
++	if (!buff)
++		return -ENOMEM;
++
++	len = scnprintf(buff, PP_QOS_DBG_MAX_BUF, "<queue id>\n");
++	ret = simple_read_from_buffer(user_buf, count, ppos, buff, len);
++	kfree(buff);
++
++	return ret;
++}
++
+ #define DBG_MAX_PROPS	(32)
+ 
+ struct dbg_prop {
+@@ -1023,6 +1078,13 @@ static const struct file_operations debug_allocate_node_fops = {
+ 	.llseek  = default_llseek,
+ };
+ 
++static const struct file_operations debug_flush_fops = {
++	.open    = simple_open,
++	.read    = flush_help,
++	.write   = flush,
++	.llseek  = default_llseek,
++};
++
+ static const struct file_operations debug_port_fops = {
+ 	.open    = simple_open,
+ 	.read    = port_help,
+@@ -1769,6 +1831,7 @@ static struct debugfs_file qos_debugfs_files[] = {
+ 	{"port", &debug_port_fops, 0400},
+ 	{"sched", &debug_sched_fops, 0400},
+ 	{"queue", &debug_queue_fops, 0400},
++	{"flush", &debug_flush_fops, 0400},
+ 	{"resume_run", &resume_run_fops, 0400},
+ };
+ 
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+index c0286f5ff5aa..4f4b73507bcc 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+@@ -2212,7 +2212,7 @@ static uint32_t *set_port_cmd_wrapper(
+ 
+ 	if (QOS_BITS_IS_SET(modified, QOS_MODIFIED_DISABLE)) {
+ 		QOS_BITS_SET(fwdata->type_data.port.valid, PORT_CONF_ACTIVE);
+-		fwdata->type_data.port.active = !!cmd->prop.disable;
++		fwdata->type_data.port.active = !cmd->prop.disable;
+ 	}
+ 
+ 	if (QOS_BITS_IS_SET(modified, QOS_MODIFIED_PORT_GREEN_THRESHOLD)) {
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+index 17a77b5a2bb5..a79059ee8116 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+@@ -815,6 +815,8 @@ static void node_queue_init(struct pp_qos_dev *qdev, struct qos_node *node)
+ {
+ 	node_init(qdev, node, 1, 0, 1);
+ 	memset(&(node->data.queue), 0x0, sizeof(struct _queue));
++	node->data.queue.port_phy = QOS_INVALID_PHY;
++	node->data.queue.last_active_port_phy = QOS_INVALID_PHY;
+ 	node->type = TYPE_QUEUE;
+ }
+ 
+@@ -910,6 +912,10 @@ static int set_queue_specific_prop(struct pp_qos_dev *qdev,
+ 				QOS_NODE_FLAGS_QUEUE_BLOCKED)) {
+ 		QOS_BITS_TOGGLE(node->flags, QOS_NODE_FLAGS_QUEUE_BLOCKED);
+ 		QOS_BITS_SET(*modified, QOS_MODIFIED_BLOCKED);
++
++		/* Store port phy once we block queue */
++		node->data.queue.last_active_port_phy =
++			node->data.queue.port_phy;
+ 	}
+ 	return 0;
+ }
+@@ -1248,14 +1254,15 @@ static int _pp_qos_queue_set(
+ 		struct qos_node *alias_node)
+ {
+ 	int rc;
+-	unsigned int phy;
++	unsigned int phy, parent_phy;
+ 	unsigned int prev_phy;
+ 	struct qos_node *parent;
+ 	struct qos_node node;
+ 	struct qos_node *nodep;
+ 	uint32_t modified;
+ 	int parent_changed;
+-	unsigned int dst_port;
++	unsigned int src_port, dst_port;
++	struct pp_qos_queue_stat qstat;
+ 
+ 	modified = 0;
+ 	nodep = NULL;
+@@ -1283,6 +1290,49 @@ static int _pp_qos_queue_set(
+ 		conf->queue_wred_fixed_drop_prob_yellow,
+ 		conf->queue_wred_min_guaranteed, conf->queue_wred_max_allowed);
+ 
++	phy = get_phy_from_id(qdev->mapping, id);
++	if (!QOS_PHY_VALID(phy))
++		goto no_port_move;
++
++	nodep = get_node_from_phy(qdev->nodes, phy);
++	parent_phy = get_phy_from_id(qdev->mapping,
++				     conf->queue_child_prop.parent);
++	src_port = get_port(qdev->nodes, phy);
++	dst_port = get_port(qdev->nodes, parent_phy);
++
++	if (src_port == dst_port)
++		goto no_port_move;
++
++	/* Queue must be blocked while moving between ports */
++	if (!QOS_BITS_IS_SET(nodep->flags, QOS_NODE_FLAGS_QUEUE_BLOCKED) &&
++	    !conf->blocked) {
++		QOS_LOG_ERR("Q%u must be blocked during port move(%u => %u)\n",
++			    id, src_port, dst_port);
++		return -EINVAL;
++	}
++
++	/* Check if queue is about to be unblocked */
++	if (QOS_BITS_IS_SET(nodep->flags, QOS_NODE_FLAGS_QUEUE_BLOCKED) &&
++	    !conf->blocked) {
++		/* Once unblocked after port move, Queue must be empty */
++		if (QOS_PHY_VALID(nodep->data.queue.last_active_port_phy) &&
++		    (nodep->data.queue.last_active_port_phy != dst_port)) {
++			create_get_queue_stats_cmd(qdev, phy,
++						   nodep->data.queue.rlm,
++						   qdev->hwconf.fw_stat,
++						   &qstat);
++			update_cmd_id(&qdev->drvcmds);
++			transmit_cmds(qdev);
++
++			if (qstat.queue_packets_occupancy) {
++				QOS_LOG_ERR("Cannot unblock Q%u (Occ %u)\n",
++					    id, qstat.queue_packets_occupancy);
++				return -EINVAL;
++			}
++		}
++	}
++
++no_port_move:
+ 	rc = check_queue_conf_validity(qdev, id, conf,
+ 			&node, &modified, alias_node);
+ 	parent_changed = QOS_BITS_IS_SET(modified, QOS_MODIFIED_PARENT);
+@@ -1841,17 +1891,36 @@ static int _pp_qos_sched_set(
+ 		const struct pp_qos_sched_conf *conf)
+ {
+ 	int rc;
+-	unsigned int phy;
++	unsigned int phy, parent_phy;
+ 	unsigned int prev_phy;
+ 	struct qos_node *parent;
+ 	struct qos_node node;
+ 	struct qos_node *nodep;
+ 	struct qos_node *oldnode;
+ 	uint32_t modified;
+-	unsigned int dst_port;
++	unsigned int src_port, dst_port;
++	u32 num_nonblocked_queues;
+ 
+ 	modified = 0;
+ 
++	phy = get_phy_from_id(qdev->mapping, id);
++	if (QOS_PHY_VALID(phy)) {
++		nodep = get_node_from_phy(qdev->nodes, phy);
++		parent_phy = get_phy_from_id(qdev->mapping,
++					     conf->sched_child_prop.parent);
++		src_port = get_port(qdev->nodes, phy);
++		dst_port = get_port(qdev->nodes, parent_phy);
++
++		if (src_port != dst_port) {
++			get_num_nonblocked_queues(qdev, phy, &num_nonblocked_queues);
++			if (num_nonblocked_queues) {
++				QOS_LOG_ERR("All Sched's %u queues must be blocked during sched move(%u => %u)\n",
++					    id, src_port, dst_port);
++				return -EINVAL;
++			}
++		}
++	}
++
+ 	rc = check_sched_conf_validity(qdev, id, conf, &node, &modified);
+ 	if (rc)
+ 		return rc;
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+index f4a85a52c5df..845117b32d15 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+@@ -12,7 +12,7 @@
+ // UC version
+ #define UC_VERSION_MAJOR (1)
+ #define UC_VERSION_MINOR (6)
+-#define UC_VERSION_BUILD (1)
++#define UC_VERSION_BUILD (2)
+ 
+ /**************************************************************************
+  *! @enum UC_STATUS
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
+index b287e3a8a384..d512769b030e 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
+@@ -1774,6 +1774,14 @@ static int node_bw_limited_wrapper(const struct pp_qos_dev *qdev,
+ 		(node->bandwidth_limit || node->shared_bandwidth_group);
+ }
+ 
++static int queue_node_nonblocked_wrapper(const struct pp_qos_dev *qdev,
++					 const struct qos_node *node,
++					 void *data)
++{
++	return node_queue(node) &&
++		!QOS_BITS_IS_SET(node->flags, QOS_NODE_FLAGS_QUEUE_BLOCKED);
++}
++
+ void update_bwl_buffer(struct pp_qos_dev *qdev, unsigned int phy)
+ {
+ 	post_order_travers_tree(qdev, phy,
+@@ -1807,6 +1815,14 @@ void get_active_port_rlms(struct pp_qos_dev *qdev, u32 phy,
+ 					      update_rlm_container, &data);
+ }
+ 
++void get_num_nonblocked_queues(struct pp_qos_dev *qdev,
++			       unsigned int phy,
++			       unsigned int *queues_num)
++{
++	*queues_num = post_order_travers_tree(qdev, phy,
++					      queue_node_nonblocked_wrapper,
++					      NULL, NULL, NULL);
++}
+ static int node_in_grp(const struct pp_qos_dev *qdev,
+ 		const struct qos_node *node, void *data)
+ {
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+index be3c56f6d30d..593133aff3fe 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+@@ -165,6 +165,7 @@ struct qos_node {
+ 			uint16_t	alias_slave_id;
+ 			uint16_t	alias_master_id;
+ 			uint16_t	port_phy;
++			uint16_t	last_active_port_phy;
+ 		} queue;
+ 	} data;
+ 
+@@ -600,6 +601,17 @@ void get_active_port_rlms(struct pp_qos_dev *qdev, u32 phy,
+ 			  u16 *rlms,
+ 			  u32 size, u32 *queues_num);
+ 
++/**
++ * get_num_blocked_queues() - Return ammount of non-blocked
++ * queue on subtree
++ * @qdev:
++ * @phy:       Phy of subtree's node
++ * @queues_num: The number of non-blocked queues on the subtree
++ */
++void get_num_nonblocked_queues(struct pp_qos_dev *qdev,
++			       unsigned int phy,
++			       unsigned int *queues_num);
++
+ /**
+  * get_node_queues() - Return all queues on a subtree
+  * @qdev:

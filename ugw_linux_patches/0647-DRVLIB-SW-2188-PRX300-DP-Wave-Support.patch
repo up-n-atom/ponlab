@@ -1,0 +1,389 @@
+From 62e63cfc58f98e3a9ee29e608be2bec8a021aff6 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Thu, 16 May 2019 16:16:37 +0800
+Subject: [PATCH] DRVLIB_SW-2188: PRX300 DP Wave Support
+
+---
+ drivers/net/datapath/dpm/datapath.h      |   8 ++
+ drivers/net/datapath/dpm/datapath_api.c  | 175 +++++++++++++++++++++++++++++--
+ drivers/net/datapath/dpm/datapath_proc.c |  67 ++++++++++++
+ include/net/datapath_api.h               |   3 +-
+ include/net/intel_datapath_umt.h         |   1 +
+ 5 files changed, 242 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 0747a350b672..48b185156ae8 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -49,6 +49,7 @@
+ #include "datapath_swdev.h"
+ #endif
+ #include <net/datapath_inst.h>
++#include <net/intel_datapath_umt.h>
+ 
+ #define MAX_SUBIFS 256  /* Max subif per DPID */
+ #define MAX_DP_PORTS  16
+@@ -547,6 +548,13 @@ struct pmac_port_info {
+ 	struct dma_tx_desc_1 dma1_mask_template[MAX_TEMPLATE];
+ 	struct dma_tx_desc_3 dma3_template[MAX_TEMPLATE];
+ 	struct dma_tx_desc_3 dma3_mask_template[MAX_TEMPLATE];
++	u32 num_tx_ring; /* Num of Tx ring */
++	u32 num_rx_ring; /* Num of Rx ring */
++	struct dp_rx_ring rx_ring[DP_RX_RING_NUM]; /*!< DC rx ring info	*/
++	struct dp_tx_ring tx_ring[DP_TX_RING_NUM]; /*!< DC tx ring info	*/
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	struct dp_umt_param umt_param; /*!< UMT Param */
++#endif
+ 	/* These members must be end. */
+ 	u32 tail;
+ 	struct dp_subif_info *subif_info;
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 54246d3897a6..940ebc074be8 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -73,6 +73,13 @@ int dp_init_ok;
+ DP_DEFINE_LOCK(dp_lock);
+ unsigned int dp_dbg_err = 1; /*print error */
+ EXPORT_SYMBOL(dp_dbg_err);
++static int dp_register_dc(int inst, uint32_t port_id,
++			  struct cbm_dp_alloc_complete_data *cbm_data,
++			  struct dp_dev_data *data, uint32_t flags);
++
++static int dp_build_cqm_data(int inst, uint32_t port_id,
++			     struct cbm_dp_alloc_complete_data *cbm_data,
++			     struct dp_dev_data *data);
+ 
+ /*port 0 is reserved and never assigned to any one */
+ int dp_inst_num;
+@@ -898,10 +905,8 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ {
+ 	int res = DP_FAILURE;
+ 	struct pmac_port_info *port_info;
+-#if 0
+-	struct cbm_dp_alloc_complete_data cbm_data = {0};
+-#endif
+ 	struct dp_dev_data tmp_data = {0};
++	struct cbm_dp_alloc_complete_data *cbm_data = NULL;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		PR_ERR("dp_register_dev failed for datapath not init yet\n");
+@@ -934,6 +939,10 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 			port_info->status = PORT_ALLOCATED;
+ 			DP_CB(inst, dev_platform_set)(inst, port_id, data,
+ 						      flags);
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)			
++			if (port_info->umt_param.id)
++				dp_umt_release(&port_info->umt_param, flags);
++#endif
+ 			res = DP_SUCCESS;
+ 		} else {
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+@@ -945,17 +954,12 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 		return res;
+ 	}
+ 
+-#if 0
+ 	/*register a device */
+-	if (cbm_dp_port_alloc_complete(owner, port_info->dev,
+-		port_info->dev_port, port_id, &cbm_data, flags)) {
+-		;
+-	}
+-#endif
+ 	if (port_info->status != PORT_ALLOCATED) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+ 			 "No de-register for %s for unknown status:%d\n",
+ 			 owner->name, port_info->status);
++		DP_LIB_UNLOCK(&dp_lock);
+ 		return DP_FAILURE;
+ 	}
+ 
+@@ -965,12 +969,55 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, uint32_t port_id,
+ 		DP_LIB_UNLOCK(&dp_lock);
+ 		return res;
+ 	}
++
++	DP_CB(inst, dev_platform_set)(inst, port_id, data, flags);
++
++	cbm_data = kzalloc(sizeof(*cbm_data), GFP_KERNEL);
++	if (!cbm_data) {
++		DP_LIB_UNLOCK(&dp_lock);
++		return res;
++	}
++
++	res = dp_build_cqm_data(inst, port_id, cbm_data, data);
++	if (res == DP_FAILURE) {
++		kfree(cbm_data);
++		DP_LIB_UNLOCK(&dp_lock);
++		return res;
++	}
++
++	/*register a device */
++	if (cbm_dp_port_alloc_complete(owner,
++				       port_info->dev,
++				       port_info->dev_port,
++				       port_id,
++				       cbm_data,
++				       port_info->alloc_flags)) {
++
++		DP_DEBUG(DP_DBG_FLAG_REG, "CBM port alloc failed\n");
++		kfree(cbm_data);
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_FAILURE;
++	}
++
++	if (data->num_rx_ring || data->num_tx_ring) {
++		res = dp_register_dc(inst, port_id, cbm_data, data, flags);
++		if (res == DP_FAILURE) {
++			kfree(cbm_data);
++			DP_LIB_UNLOCK(&dp_lock);
++			return res;
++		}
++	}
++
++	/* TODO: Need a HAL layer API for CQM and DMA Setup for CQM QoS path
++	 * especially for LGM 4 Ring case
++	 */
+ 	port_info->status = PORT_DEV_REGISTERED;
+ 	if (dp_cb)
+ 		port_info->cb = *dp_cb;
+ 
+-	DP_CB(inst, dev_platform_set)(inst, port_id, data, flags);
+ 	DP_LIB_UNLOCK(&dp_lock);
++	kfree(cbm_data);
++
+ 	return DP_SUCCESS;
+ }
+ EXPORT_SYMBOL(dp_register_dev_ext);
+@@ -1340,6 +1387,114 @@ int32_t dp_get_netif_subifid_priv(struct net_device *netif, struct sk_buff *skb,
+ 	return res;
+ }
+ 
++static int dp_build_cqm_data(int inst, uint32_t port_id,
++			     struct cbm_dp_alloc_complete_data *cbm_data,
++			     struct dp_dev_data *data)
++{
++	int i = 0;
++	struct pmac_port_info *port = get_dp_port_info(inst, port_id);
++
++	if ((data->num_rx_ring > DP_RX_RING_NUM) ||
++	    (data->num_tx_ring > DP_TX_RING_NUM)) {
++		PR_ERR("Error RxRing = %d TxRing = %d\n",
++		       data->num_rx_ring, data->num_tx_ring);
++		return DP_FAILURE;
++	}
++
++	/* HOST -> ACA */
++	/* For PRX300 No: of Tx Ring is 1 */
++	cbm_data->num_tx_ring = data->num_tx_ring;
++
++	/* TX Ring */
++	for (i = 0; i < data->num_tx_ring; i++) {
++		memcpy(&cbm_data->tx_ring[i], &data->tx_ring[i],
++		       sizeof(struct dp_tx_ring));
++	}
++
++	cbm_data->deq_port = port->deq_port_base;
++
++	/* ACA -> HOST */
++	/* For PRX300 No: of Rx Ring is 1 */
++	cbm_data->num_rx_ring = data->num_rx_ring;
++
++	/* RX ring */
++	for (i = 0; i < data->num_rx_ring; i++) {
++		memcpy(&cbm_data->rx_ring[i], &data->rx_ring[i],
++		       sizeof(struct dp_rx_ring));
++	}
++
++	return 0;
++}
++
++static int dp_register_dc(int inst, uint32_t port_id,
++			  struct cbm_dp_alloc_complete_data *cbm_data,
++			  struct dp_dev_data *data, uint32_t flags)
++{
++	struct dp_umt_param umt_param = {0};
++	int i = 0;
++	struct pmac_port_info *port = get_dp_port_info(inst, port_id);
++
++	/* Fill in the output data to the the DCDP driver for the RX rings
++	 * and Save Info for debugging
++	 */
++	for (i = 0; i < data->num_rx_ring; i++) {
++		memcpy(&data->rx_ring[i], &cbm_data->rx_ring[i],
++		       sizeof(struct dp_rx_ring));
++		memcpy(&port->rx_ring[i], &cbm_data->rx_ring[i],
++		       sizeof(struct dp_rx_ring));
++	}
++
++	for (i = 0; i < data->num_tx_ring; i++) {
++		memcpy(&data->tx_ring[i], &cbm_data->tx_ring[i],
++		       sizeof(struct dp_tx_ring));
++		memcpy(&port->tx_ring[i], &cbm_data->tx_ring[i],
++		       sizeof(struct dp_tx_ring));
++	}
++
++	/* Save info for debugging */
++	port->num_rx_ring = data->num_rx_ring;
++	port->num_tx_ring = data->num_tx_ring;
++
++	/* UMT Interface is not supported for old products */
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	umt_param.id = 0xFF;
++
++	/* For PRX300, RXOUT is to DMA Channel,
++	 * For LGM, RXOUT is to CQEM Deq port
++	 */
++	umt_param.rx_src = DP_UMT_RX_FROM_DMA;
++	umt_param.dma_id = data->rx_ring[0].out_dma_ch_to_gswip;
++	umt_param.dma_ch_num = data->rx_ring[0].num_out_tx_dma_ch;
++
++	/* For PRX300/LGM, TXIN counter is from CQM Deq port,
++	 * Message Mode is SelfCounting
++	 */
++	umt_param.cqm_dq_pid = port->deq_port_base;
++	umt_param.msg_mode = data->umt->umt_mode;
++	umt_param.period =  data->umt->umt_msg_timer;
++	umt_param.sw_msg = DP_UMT_MSG0_MSG1;
++	umt_param.daddr = (u32)data->umt->umt_msg_paddr;
++
++	if (dp_umt_request(&umt_param, 0)) {
++		PR_ERR("UMT request Fail!! DMA ID %x CQM_PID %d MSG_MODE %d"
++		       "PERIOD %d SW_MSG %d DADDR 0x%08x\n", umt_param.dma_id,
++		       umt_param.cqm_dq_pid, umt_param.msg_mode,
++		       umt_param.period, umt_param.sw_msg, umt_param.daddr);
++		return DP_FAILURE;
++	}
++	if (dp_umt_set(&umt_param, 0)) {
++		PR_ERR("UMT port set fail !! DMA ID %x CQM_PID %d MSG_MODE %d"
++		       "PERIOD %d SW_MSG %d DADDR 0x%08x\n", umt_param.dma_id,
++		       umt_param.cqm_dq_pid, umt_param.msg_mode,
++		       umt_param.period, umt_param.sw_msg, umt_param.daddr);
++		return DP_FAILURE;
++	}
++
++	/* Save umt params */
++	memcpy(&port->umt_param, &umt_param, sizeof(struct dp_umt_param));
++#endif
++	return DP_SUCCESS;
++}
+ /* return DP_SUCCESS -- found
+  * return DP_FAILURE -- not found
+  */
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index a269d0ad4c3e..1b81c31bab89 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -53,6 +53,69 @@ int proc_port_init(void)
+ 	return 0;
+ }
+ 
++int dump_dc_info(struct seq_file *s, struct pmac_port_info *port)
++{
++	int i = 0;
++	u32 cid, pid, nid;
++	for (i = 0; i < port->num_tx_ring; i++) {
++		seq_printf(s, "    DC TxRing:      %d\n", i);
++		seq_printf(s, "      TXIN  DeqRingSize/paddr:      %d/0x%p\n",
++			   port->tx_ring[i].in_deq_ring_size,
++			   port->tx_ring[i].in_deq_paddr);
++		seq_printf(s, "      TXOUT FreeRingSize/paddr:     %d/0x%p\n",
++			   port->tx_ring[i].out_free_ring_size,
++			   port->tx_ring[i].out_free_paddr);
++		seq_printf(s, "      TXOUT PolicyBase/Poolid:      %d/%d\n",
++			   port->tx_ring[i].txout_policy_base,
++			   port->tx_ring[i].tx_poolid);
++		seq_printf(s, "      PolicyNum:                    %d\n",
++			   port->tx_ring[i].policy_num);
++		seq_printf(s, "      NumOfTxPkt/TxPktSize:         %d/%d\n",
++			   port->tx_ring[i].num_tx_pkt,
++			   port->tx_ring[i].tx_pkt_size);
++	}
++
++	for (i = 0; i < port->num_rx_ring; i++) {
++		seq_printf(s, "    DC RxRing:      %d\n", i);
++		seq_printf(s, "      RXOUT EnqRingSize/paddr/pid:  %d/0x%p/%d\n",
++			   port->rx_ring[i].out_enq_ring_size,
++			   port->rx_ring[i].out_enq_paddr,
++			   port->rx_ring[i].out_enq_port_id);
++		seq_printf(s, "      RXOUT NumOfDmaCh:             %d\n",
++			   port->rx_ring[i].num_out_tx_dma_ch);
++		cid = _DMA_CONTROLLER(port->rx_ring[i].out_dma_ch_to_gswip);
++		pid = _DMA_PORT(port->rx_ring[i].out_dma_ch_to_gswip);
++		nid = _DMA_CHANNEL(port->rx_ring[i].out_dma_ch_to_gswip);
++		seq_printf(s, "      RXOUT dma-ctrl/port/chan:     %d/%d/%d\n",
++			   cid, pid, nid);
++		seq_printf(s, "      RXOUT NumOfCqmDqPort/pid:     %d/%d\n",
++			   port->rx_ring[i].num_out_cqm_deq_port,
++			   port->rx_ring[i].out_cqm_deq_port_id);
++		seq_printf(s, "      RXIN  InAllocRingSize/Paddr:  %d/0x%p\n",
++			   port->rx_ring[i].in_alloc_ring_size,
++			   port->rx_ring[i].in_alloc_paddr);
++		seq_printf(s, "      NumPkt/Pktsize/Policybase:    %d/%d/%d\n",
++			   port->rx_ring[i].num_pkt,
++			   port->rx_ring[i].rx_pkt_size,
++			   port->rx_ring[i].rx_policy_base);
++		seq_printf(s, "      PreFillPktNum/PktBase:        %d/0x%p\n",
++			   port->rx_ring[i].prefill_pkt_num,
++			   port->rx_ring[i].pkt_base_paddr);
++	}
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	seq_printf(s, "    UMT id/CqmDeqPid/msg_mode:      %d/%d/%d\n",
++		   port->umt_param.id,
++		   port->umt_param.cqm_dq_pid,
++		   port->umt_param.msg_mode);
++	seq_printf(s, "    UMT period/daddr:               %d/0x%08x\n",
++		   port->umt_param.period,
++		   port->umt_param.daddr);
++#endif
++
++	return 0;
++}
++
++
+ int proc_port_dump(struct seq_file *s, int pos)
+ {
+ 	int i, j;
+@@ -159,6 +222,10 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	seq_printf(s, "    tx_ring_size:      %d\n", port->tx_ring_size);
+ 	seq_printf(s, "    tx_ring_offset:    %d(to next dequeue port)\n",
+ 		   port->tx_ring_offset);
++
++	if (port->num_rx_ring || port->num_tx_ring)
++		dump_dc_info(s, port);
++
+ 	if (pos == 0)
+ 		loop = info->cap.max_num_subif_per_port;
+ 	else
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index 46026f8cc68a..160e1af6f10a 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -29,7 +29,7 @@
+ #error "wrong DP HAL selected"
+ #endif
+ #endif /*DATAPATH_HAL_LAYER */
+-#include <net/datapath_api_umt.h>
++#include <net/intel_datapath_umt.h>
+ #include <net/datapath_api_vlan.h>
+ #include <net/switch_api/lantiq_gsw_api.h>
+ #include <net/switch_api/lantiq_gsw_flow.h>
+@@ -979,7 +979,6 @@ enum DP_UMT_MODE {
+ 	DP_UMT_MODE_HW_SELF, /*!< HW UMT self couting mode */
+ 	DP_UMT_MODE_HW_USER, /*!< HW UMT user Mode */
+ 	DP_UMT_MODE_SW, /*!< SW UMT: no need to call UMT API */
+-	DP_UMT_MODE_MAX, /*!< Not valid UMT mode */
+ };
+ 
+ enum DP_UMT_MSG_MODE {
+diff --git a/include/net/intel_datapath_umt.h b/include/net/intel_datapath_umt.h
+index c5c2aff3fc21..f25be59763a4 100644
+--- a/include/net/intel_datapath_umt.h
++++ b/include/net/intel_datapath_umt.h
+@@ -130,5 +130,6 @@ int dp_umt_set(struct dp_umt_param *umt, unsigned long flag);
+ int dp_umt_enable(struct dp_umt_param *umt, unsigned long flag, int enable);
+ int dp_umt_suspend_sending(struct dp_umt_param *umt,
+ 			   unsigned long flag, int halt);
++int dp_umt_release(struct dp_umt_param *umt, unsigned long flag);
+ 
+ #endif
+\ No newline at end of file

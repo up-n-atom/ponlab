@@ -1,0 +1,140 @@
+From 905af978912877636690e4a9cda3b58b643e6528 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Thu, 23 Jul 2020 11:18:50 +0300
+Subject: [PATCH] PONRTSYS-7979: ipsec support ip fragmentation for esp
+ sessions
+
+Enable support for ESP packets fragmentation sessions
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 76 +++++++++++-----------
+ 1 file changed, 39 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index c1ced4438572..526edd328b08 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -158,6 +158,7 @@ union work_args {
+  */
+ #define SESS_MOD_FLAG_SET(s, f)                     set_bit(f,   (s)->mod_flags)
+ #define SESS_MOD_FLAG_CLR(s, f)                     clear_bit(f, (s)->mod_flags)
++#define SESS_MOD_FLAG_TEST(s, f)                    test_bit(f, (s)->mod_flags)
+ 
+ /**
+  * @brief Shortcuts for testing session flags
+@@ -568,6 +569,30 @@ static inline bool __smgr_is_pppoe_encap(struct sess_info *s)
+ 	return false;
+ }
+ 
++/**
++ * @brief Test whether a packet is reassembled
++ * @param s
++ * @param lvl
++ * @return bool true if it is, false otherwise
++ */
++static inline bool is_reass_pkt(struct sess_info *s, enum pktprs_hdr_level lvl)
++{
++	return (pktprs_first_frag(SESS_RX_PKT(s), lvl) &&
++		!pktprs_first_frag(SESS_TX_PKT(s), lvl));
++}
++
++/**
++ * @brief Test whether a packet is fragmented
++ * @param s
++ * @param lvl
++ * @return bool true if it is, false otherwise
++ */
++static inline bool is_frag_pkt(struct sess_info *s, enum pktprs_hdr_level lvl)
++{
++	return (!pktprs_first_frag(SESS_RX_PKT(s), lvl) &&
++		pktprs_first_frag(SESS_TX_PKT(s), lvl));
++}
++
+ /**
+  * @brief Test whether fragments can be supported for the session
+  * @param s the session
+@@ -582,16 +607,8 @@ static inline bool __smgr_is_frag_supported(struct sess_info *s)
+ 	    !pktprs_is_ip_frag(SESS_TX_PKT(s), HDR_INNER))
+ 		return true;
+ 
+-	/* outer reassembly */
+-	if (pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER) &&
+-	    !pktprs_first_frag(SESS_TX_PKT(s), HDR_OUTER)) {
+-		/* supported only if reassembly NF is enabled */
+-		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+-	}
+-
+-	/* inner reassembly */
+-	if (pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER) &&
+-	    !pktprs_first_frag(SESS_TX_PKT(s), HDR_INNER)) {
++	/* outer or inner reassembly */
++	if (is_reass_pkt(s, HDR_OUTER) || is_reass_pkt(s, HDR_INNER)) {
+ 		/* supported only if reassembly NF is enabled */
+ 		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+ 	}
+@@ -602,30 +619,16 @@ static inline bool __smgr_is_frag_supported(struct sess_info *s)
+ 		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+ 	}
+ 
+-	/* outer fragmentation with tunnel encapsulation */
+-	if (!pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER) &&
+-	    pktprs_first_frag(SESS_TX_PKT(s), HDR_OUTER)) {
+-		/* Tunnel encapsulation */
+-		if (__smgr_is_iptun_encp_sess(s))
+-			/* supported only if frag NF is enabled */
+-			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+-
+-		/* PPPoE encapsulation */
+-		if (__smgr_is_pppoe_encap(s))
+-			/* supported only if frag NF is enabled */
+-			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+-	}
+-
+-	/* inner fragmentation with tunnel encapsulation */
+-	if (!pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER) &&
+-	    pktprs_first_frag(SESS_TX_PKT(s), HDR_INNER)) {
++	/* outer or inner fragmentation with tunnel */
++	if (is_frag_pkt(s, HDR_OUTER) || is_frag_pkt(s, HDR_INNER)) {
+ 		/* Tunnel encapsulation */
+-		if (__smgr_is_iptun_encp_sess(s))
++		if (__smgr_is_iptun_encp_sess(s) || __smgr_is_pppoe_encap(s))
+ 			/* supported only if frag NF is enabled */
+ 			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+ 
+-		/* PPPoE encapsulation */
+-		if (__smgr_is_pppoe_encap(s))
++		/* ESP Tunnel */
++		if (is_frag_pkt(s, HDR_OUTER) &&
++		    (SESS_TX_OUTER_V4_NEXT(s) == PKTPRS_PROTO_ESP))
+ 			/* supported only if frag NF is enabled */
+ 			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+ 	}
+@@ -2275,11 +2278,12 @@ static void __smgr_sess_flags_set(struct sess_info *s)
+ 	if (SESS_ARGS_IS_FLAG_ON(s, PP_SESS_FLAG_SYNCQ_BIT))
+ 		SESS_FLAG_SET(s->db_ent, SESS_FLAG_SYNCQ);
+ 
+-	/* Fragmentation should be potentialy done when adding a tunnel */
++	/* Fragmentation should be potentially done when adding a tunnel */
+ 	if (pp_misc_is_nf_en(PP_NF_FRAGMENTER)) {
+-		if ((__smgr_is_iptun_encp_sess(s) ||
++		if (((__smgr_is_iptun_encp_sess(s) ||
+ 		     __smgr_is_pppoe_encap(s)) &&
+-		    !SESS_RX_IS_OUTER_TCP(s)) {
++		    !SESS_RX_IS_OUTER_TCP(s)) ||
++		    SESS_MOD_FLAG_TEST(s, MOD_ESP_V4_TUNNL_BPAS_BIT)) {
+ 			SESS_FLAG_SET(s->db_ent, SESS_FLAG_MTU_CHCK);
+ 			pr_debug("SESS_FLAG_MTU_CHCK is set\n");
+ 		}
+@@ -2764,11 +2768,9 @@ static void __smgr_si_flags_set(struct sess_info *s)
+ 	    pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER))
+ 		set_bit(SI_CHCK_FLAG_DVRT_FRAG, &chck_flags);
+ 
+-	if ((pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER)) &&
+-	    !(pktprs_first_frag(SESS_TX_PKT(s), HDR_OUTER)))
++	if (is_reass_pkt(s, HDR_OUTER))
+ 		s->si.ext_reassembly = true;
+-	if ((pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER)) &&
+-	    !(pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER)))
++	if (is_reass_pkt(s, HDR_INNER))
+ 		s->si.int_reassembly = true;
+ 
+ 	/* align the reassembly flags to the ones set by the parser in the UD

@@ -1,0 +1,190 @@
+From ee655dd5d9a92e58037460671d44b0a507bbde5d Mon Sep 17 00:00:00 2001
+From: yixin zhu <yixin.zhu@intel.com>
+Date: Fri, 26 Apr 2019 14:18:28 +0800
+Subject: [PATCH] DRVLIB_SW-2133: add pcie adaption for HRST reset
+
+---
+ drivers/pci/host/pcie-intel.c       | 44 +++++++++++++++++++++++++++++--------
+ drivers/phy/intel/phy-intel-combo.c |  6 ++---
+ drivers/reset/reset-intel-syscon.c  | 11 +++++-----
+ 3 files changed, 42 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/pci/host/pcie-intel.c b/drivers/pci/host/pcie-intel.c
+index efcdcdb75281..28df65a4e532 100644
+--- a/drivers/pci/host/pcie-intel.c
++++ b/drivers/pci/host/pcie-intel.c
+@@ -6,7 +6,6 @@
+  *
+  * Based on the Xilinx PCIe driver
+  */
+-
+ #include <linux/clk.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/interrupt.h>
+@@ -15,9 +14,9 @@
+ #include <linux/msi.h>
+ #endif
+ #include <linux/mfd/syscon.h>
++#include <linux/of_irq.h>
+ #include <linux/of_pci.h>
+ #include <linux/of_platform.h>
+-#include <linux/of_irq.h>
+ #include <linux/pci.h>
+ #include <linux/phy/phy.h>
+ #include <linux/platform_device.h>
+@@ -386,6 +385,7 @@ struct intel_pcie_port {
+ #endif /* CONFIG_PCIE_INTEL_MSI_PIC */
+ 	struct clk *core_clk;
+ 	struct reset_control *core_rst;
++	struct reset_control *rcu_rst;
+ 	struct phy *phy;
+ 	struct list_head resources;
+ 	u8 root_bus_nr;
+@@ -794,12 +794,10 @@ static int intel_pcie_wait_phy_link_up(struct intel_pcie_port *lpp)
+ 				 val, ((val & PCIE_DBR1_PHY_LINK_UP) &&
+ 				 (!(val & PCIE_DBR1_PHY_IN_TRAINING))),
+ 				 50, 1000 * USEC_PER_MSEC);
+-	if (err) {
++	if (err)
+ 		dev_err(dev, "%s port %d timeout\n", __func__, lpp->id);
+-		return err;
+-	}
+ 
+-	return 0;
++	return err;
+ }
+ 
+ static void intel_pcie_bridge_class_code_setup(struct intel_pcie_port *lpp)
+@@ -1070,13 +1068,32 @@ static int intel_pcie_ep_rst_init(struct intel_pcie_port *lpp)
+ 	int err;
+ 	struct device *dev = lpp->dev;
+ 
+-	lpp->reset_gpio = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	lpp->reset_gpio = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+ 	if (IS_ERR(lpp->reset_gpio)) {
+ 		err = PTR_ERR(lpp->reset_gpio);
+ 		dev_err(dev, "failed to request PCIe GPIO: %d\n", err);
+ 		return err;
+ 	}
+ 
++	lpp->rcu_rst = devm_reset_control_get_optional(lpp->dev, "rcu_rst");
++	if (IS_ERR(lpp->rcu_rst)) {
++		err = PTR_ERR(lpp->rcu_rst);
++		if (err == -ENOENT) {
++			lpp->rcu_rst = NULL;
++		} else {
++			dev_err(dev, "failed to get rcu reset: %d\n", err);
++			return err;
++		}
++	}
++
++	/* Only one of them is needed */
++	if ((lpp->reset_gpio && lpp->rcu_rst) ||
++	    (!lpp->reset_gpio && !lpp->rcu_rst))
++		return -EINVAL;
++
++	if (lpp->rcu_rst)
++		reset_control_deassert(lpp->rcu_rst);
++
+ 	msleep(100);
+ 	return 0;
+ }
+@@ -1151,13 +1168,22 @@ static void intel_pcie_core_rst_deassert(struct intel_pcie_port *lpp)
+ 
+ static void intel_pcie_device_rst_assert(struct intel_pcie_port *lpp)
+ {
+-	gpiod_set_value_cansleep(lpp->reset_gpio, 1);
++	if (lpp->reset_gpio)
++		gpiod_set_value_cansleep(lpp->reset_gpio, 1);
++
++	if (lpp->rcu_rst)
++		reset_control_assert(lpp->rcu_rst);
+ }
+ 
+ static void intel_pcie_device_rst_deassert(struct intel_pcie_port *lpp)
+ {
+ 	msleep(lpp->rst_interval);
+-	gpiod_set_value_cansleep(lpp->reset_gpio, 0);
++
++	if (lpp->reset_gpio)
++		gpiod_set_value_cansleep(lpp->reset_gpio, 0);
++
++	if (lpp->rcu_rst)
++		reset_control_deassert(lpp->rcu_rst);
+ }
+ 
+ static int intel_pcie_enable_clks(struct intel_pcie_port *lpp)
+diff --git a/drivers/phy/intel/phy-intel-combo.c b/drivers/phy/intel/phy-intel-combo.c
+index d784bce10354..72900fff71ff 100644
+--- a/drivers/phy/intel/phy-intel-combo.c
++++ b/drivers/phy/intel/phy-intel-combo.c
+@@ -846,10 +846,8 @@ static int intel_phy_dt_parse(struct intel_combo_phy *priv,
+ 
+ 	if (iphy->id == 0) {
+ 		/* Dual lane configuration only required on PHY 0 */
+-		if (!device_property_read_u32(dev, "intel,aggregation", &prop))
+-			aggregated = !!prop;
+-		else
+-			aggregated = false;
++		aggregated = device_property_read_bool(dev,
++						       "intel,aggregation");
+ 
+ 		if (aggregated) {
+ 			priv->aggr_mode = PHY_DL_MODE;
+diff --git a/drivers/reset/reset-intel-syscon.c b/drivers/reset/reset-intel-syscon.c
+index 0b18c3b1327d..66263cef8560 100644
+--- a/drivers/reset/reset-intel-syscon.c
++++ b/drivers/reset/reset-intel-syscon.c
+@@ -3,7 +3,6 @@
+  * Copyright (C) 2017 Intel Corporation.
+  * Lei Chuanhua <Chuanhua.lei@intel.com>
+  */
+-
+ #include <linux/bitops.h>
+ #include <linux/io.h>
+ #include <linux/init.h>
+@@ -48,7 +47,7 @@ static int intel_assert_device(struct reset_controller_dev *rcdev,
+ 	u32 val;
+ 	struct intel_reset_data *data = to_reset_data(rcdev);
+ 	u32 regoff = id >> 8;
+-	u32 regbit = id & 0x3f;
++	u32 regbit = id & 0x1f;
+ 	u32 regstoff;
+ 
+ 	ret = regmap_update_bits(data->regmap, regoff,
+@@ -70,7 +69,7 @@ static int intel_deassert_device(struct reset_controller_dev *rcdev,
+ 	u32 val;
+ 	struct intel_reset_data *data = to_reset_data(rcdev);
+ 	u32 regoff = id >> 8;
+-	u32 regbit = id & 0x3f;
++	u32 regbit = id & 0x1f;
+ 	u32 regstoff;
+ 
+ 	ret = regmap_update_bits(data->regmap, regoff,
+@@ -90,7 +89,7 @@ static int intel_reset_device(struct reset_controller_dev *rcdev,
+ {
+ 	struct intel_reset_data *data = to_reset_data(rcdev);
+ 	u32 regoff = id >> 8;
+-	u32 regbit = id & 0x3f;
++	u32 regbit = id & 0x1f;
+ 	u32 regstoff;
+ 	unsigned int val = 0;
+ 	int ret;
+@@ -109,7 +108,7 @@ static int intel_reset_status(struct reset_controller_dev *rcdev,
+ {
+ 	struct intel_reset_data *data = to_reset_data(rcdev);
+ 	u32 regoff = id >> 8;
+-	u32 regbit = id & 0x3f;
++	u32 regbit = id & 0x1f;
+ 	u32 regstoff;
+ 	unsigned int val;
+ 	int ret;
+@@ -137,7 +136,7 @@ static int intel_reset_xlate(struct reset_controller_dev *rcdev,
+ 	offset = spec->args[0];
+ 	bit = spec->args[1];
+ 
+-	return (offset << 8) | bit;
++	return (offset << 8) | (bit & 0x1f);
+ }
+ 
+ static int intel_reset_restart_handler(struct notifier_block *nb,

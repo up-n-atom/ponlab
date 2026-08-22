@@ -1,0 +1,3756 @@
+From 130b22c6715681b0d07634b3aa2e04002d0dc6ce Mon Sep 17 00:00:00 2001
+From: Kamil Rywacki <kamil.rywacki@intel.com>
+Date: Mon, 27 Apr 2020 18:16:06 +0200
+Subject: [PATCH] PONRTSYS-6699:
+
+PON QOS:
+- Implement TC flower management and storage
+- Implement generic VLAN handling and storage
+- Implement LCT support as part generic VLAN
+- Implement Extended VLAN
+- Implement DSCP support as part of Extended VLAN
+- Implement VLAN filter
+- Implement Mirred action
+
+DPM:
+- Extend VLAN handling to use generic linux lists
+
+Description:
+This driver stores all supported operations performed on hardware for management purposes in form of hash table described below.
+Every type of operation is doing separate translation and local management below flower management.
+
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Flower storage (Linux hashtable)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Key (Flower rule cookie)  |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+| Type (Flower rule type)   |
++-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|
+|  +-+-+-+-+-+-+-+-+-+
+|- | TC_TYPE_MIRRED  |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  | VLAN forwarding configuration         |
+|  | Creates hardware PCE rule using GSWIP |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|
+|  +-+-+-+-+-+-+-+-+-+
+|- | TC_TYPE_QUEUE   |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  | Qdisc configuration               |
+|  | Full description in: 3486b516f0c  |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|
+|  +-+-+-+-+-+-+-+-+-+-+
+|- | TC_TYPE_EXT_VLAN  |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|  | Extended VLAN rule translation to DP manager  |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+|
+|  +-+-+-+-+-+-+-+-+-+-+-+
+|- | TC_TYPE_VLAN_FILTER |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+   | VLAN filtering rule translation to DP manager |
+   +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	| VLAN Storage (Linux linked list)          |
+	| Used by Extended VLAN and VLAN filtering  |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	| Network device  |
+	+-+-+-+-+-+-+-+-+-+
+	| Direction       |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	| VLAN tag (untagged, single tagged, double tagged) |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+	| Number of rules |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-++-+-+-+-+-+-+-+-+-++-+-+-+
+	| Linux linked list of rules (dp_vlan0 || dp_vlan1 || dp_vlan2) |
+	+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-++-+-+-+-+-+-+-+-+-++-+-+-+
+
+Signed-off-by: Rywacki, Kamil <kamil.rywacki@intel.com>
+---
+ .../datapath/dpm/gswip31/datapath_tc_asym_vlan.c   | 286 +++++++++++-
+ drivers/net/datapath/pon_qos/Makefile              |   9 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c | 337 ++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h |  18 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.c   | 203 +++++++-
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.h   |  24 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_lct.c      | 361 +++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_lct.h      |  45 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c   | 305 ++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_mirred.h   |  28 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.c      | 483 +++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.h      |  35 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c     |  34 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h     |   2 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c      |   2 +-
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_filter.c  | 275 +++++++++++
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_filter.h  |  18 +
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c | 513 +++++++++++++++++++++
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_prepare.h |  52 +++
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.c | 267 +++++++++++
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.h |  45 ++
+ include/net/datapath_api_vlan.h                    |  23 +-
+ 22 files changed, 3333 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_tc_asym_vlan.c b/drivers/net/datapath/dpm/gswip31/datapath_tc_asym_vlan.c
+index ce36f9ed5aef..07179fe14da2 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_tc_asym_vlan.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_tc_asym_vlan.c
+@@ -249,6 +249,187 @@ static int vlan_filter_mode(struct dp_pattern_vlan *pout)
+ 	return k;
+ }
+ 
++#if IS_ENABLED(CONFIG_PON_QOS)
++static int tc_vlan_filter_untagged_parse(struct dp_tc_vlan *vlan,
++					 int *untagged)
++{
++	struct dp_vlan0 *p0;
++
++	if (!vlan->vlan0_head)
++		return 0;
++
++	list_for_each_entry(p0, vlan->vlan0_head, list) {
++		/* VLAN filter for untagged packet have default rule only */
++		if (!p0->def)
++			return -1;
++		if (p0->act.act & DP_VLAN_ACT_FWD) {
++			/* default value was set to drop */
++			if (*untagged > 0)
++				return -1;
++			/* default value is forward */
++			*untagged = 0;
++		} else if (p0->act.act & DP_VLAN_ACT_DROP) {
++			/* default value was set to forward */
++			if (*untagged == 0)
++				return -1;
++			/* default value is drop */
++			*untagged = 1;
++		} else {
++			/* packet editing required */
++			return -1;
++		}
++		continue;
++	}
++
++	return 0;
++}
++
++static int tc_vlan_filter_single_tagged_parse(struct dp_tc_vlan *vlan,
++					      int *tagged,
++					      GSW_VLANFILTER_config_t *pcfg,
++					      int *j,
++					      int total)
++{
++	struct dp_vlan1 *p1;
++	int mode = -1;
++	int k;
++
++	if (!vlan->vlan1_head)
++		return 0;
++
++	list_for_each_entry(p1, vlan->vlan1_head, list) {
++		if ((*j) >= total) {
++			pr_err("%s: found rules > total rules\n", __func__);
++			return -1;
++		}
++		if (p1->def) {
++			if (p1->act.act & DP_VLAN_ACT_FWD) {
++				/* default value was set to drop */
++				if (*tagged > 0)
++					return -1;
++				*tagged = 0;
++			} else if (p1->act.act & DP_VLAN_ACT_DROP) {
++				/* default value was set to forward */
++				if (*tagged == 0)
++					return -1;
++				*tagged = 1;
++			} else {
++				/* packet editing required */
++				return -1;
++			}
++			continue;
++		}
++		/* Action other than FWD/DROP is not accepted */
++		if (p1->act.act & DP_VLAN_ACT_FWD)
++			pcfg[*j].bDiscardMatched = LTQ_FALSE;
++		else if (p1->act.act & DP_VLAN_ACT_DROP)
++			pcfg[*j].bDiscardMatched = LTQ_TRUE;
++		else
++			return -1;
++		/* VLAN filter only support VID, PCP, or TCI only */
++		k = vlan_filter_mode(&p1->outer);
++		switch (k) {
++		case 1:
++			pcfg[*j].eVlanFilterMask = GSW_VLAN_FILTER_TCI_MASK_VID;
++			pcfg[*j].nVal = (u32)p1->outer.vid;
++			break;
++		case 2:
++			pcfg[*j].eVlanFilterMask = GSW_VLAN_FILTER_TCI_MASK_PCP;
++			pcfg[*j].nVal = (u32)p1->outer.prio;
++			break;
++		case 7:
++			pcfg[*j].eVlanFilterMask = GSW_VLAN_FILTER_TCI_MASK_TCI;
++			pcfg[*j].nVal = (u32)p1->outer.vid & 0xFFF;
++			pcfg[*j].nVal |= ((u32)p1->outer.prio & 7) << 13;
++			pcfg[*j].nVal |= ((u32)p1->outer.dei & 1) << 12;
++			break;
++		default:
++			return -1;
++		}
++		if (mode < 0)
++			mode = k;
++		else if (mode != k)
++			return -1;
++		(*j)++;
++	}
++
++	return 0;
++}
++
++static int tc_vlan_filter_double_tagged_parse(struct dp_tc_vlan *vlan,
++					      int *tagged,
++					      GSW_VLANFILTER_config_t *pcfg,
++					      int *j,
++					      int total)
++{
++	struct dp_vlan2 *p2;
++	int mode = -1;
++	int k;
++
++	if (!vlan->vlan2_head)
++		return 0;
++
++	list_for_each_entry(p2, vlan->vlan2_head, list) {
++		if ((*j) >= total) {
++			pr_err("%s: found rules > total rules\n", __func__);
++			return -1;
++		}
++		if (p2->def) {
++			if (p2->act.act & DP_VLAN_ACT_FWD) {
++				if (*tagged > 0)
++					return -1;
++				*tagged = 0;
++			} else if (p2->act.act & DP_VLAN_ACT_DROP) {
++				if (*tagged == 0)
++					return -1;
++				*tagged = 1;
++			} else {
++				return -1;
++			}
++			continue;
++		}
++		/* Action other than FWD/DROP is not accepted */
++		if (p2->act.act & DP_VLAN_ACT_FWD)
++			pcfg[*j].bDiscardMatched = LTQ_FALSE;
++		else if (p2->act.act & DP_VLAN_ACT_DROP)
++			pcfg[*j].bDiscardMatched = LTQ_TRUE;
++		else
++			return -1;
++		/* VLAN filter only support VID, PCP, or TCI only */
++		k = vlan_filter_mode(&p2->outer);
++		switch (k) {
++		case 1:
++			pcfg[*j].eVlanFilterMask = GSW_VLAN_FILTER_TCI_MASK_VID;
++			pcfg[*j].nVal = (u32)p2->outer.vid;
++			break;
++		case 2:
++			pcfg[*j].eVlanFilterMask = GSW_VLAN_FILTER_TCI_MASK_PCP;
++			pcfg[*j].nVal = (u32)p2->outer.prio;
++			break;
++		case 7:
++			pcfg[*j].eVlanFilterMask = GSW_VLAN_FILTER_TCI_MASK_TCI;
++			pcfg[*j].nVal = (u32)p2->outer.vid & 0xFFF;
++			pcfg[*j].nVal |= ((u32)p2->outer.prio & 7) << 13;
++			pcfg[*j].nVal |= ((u32)p2->outer.dei & 1) << 12;
++			break;
++		default:
++			return -1;
++		}
++		if (mode < 0)
++			mode = k;
++		else if (mode != k)
++			return -1;
++		/* Inner VLAN should be "don't care" for all fields */
++		k = vlan_filter_mode(&p2->inner);
++		if (k != 0)
++			return -1;
++		(*j)++;
++	}
++
++	return 0;
++}
++#endif
++
+ static int tc_vlan_filter(struct core_ops *ops,
+ 			  struct dp_tc_vlan *vlan,
+ 			  struct dp_tc_vlan_info *info)
+@@ -258,10 +439,13 @@ static int tc_vlan_filter(struct core_ops *ops,
+ 	int total = vlan->n_vlan0 + vlan->n_vlan1 + vlan->n_vlan2;
+ 	int untagged = -1;
+ 	int tagged = -1;
+-	int mode = -1;
+ 	GSW_VLANFILTER_alloc_t alloc;
+ 	GSW_VLANFILTER_config_t *pcfg;
+-	int i, j, k;
++	int i, j;
++#if !IS_ENABLED(CONFIG_PON_QOS)
++	int mode = -1;
++	int k;
++#endif
+ 
+ 	if (total <= 0) {
+ 		/* Update bridge port */
+@@ -281,6 +465,16 @@ static int tc_vlan_filter(struct core_ops *ops,
+ 
+ 	j = 0;
+ 
++#if IS_ENABLED(CONFIG_PON_QOS)
++	if (tc_vlan_filter_untagged_parse(vlan, &untagged))
++		goto EXIT;
++
++	if (tc_vlan_filter_single_tagged_parse(vlan, &tagged, pcfg, &j, total))
++		goto EXIT;
++
++	if (tc_vlan_filter_double_tagged_parse(vlan, &tagged, pcfg, &j, total))
++		goto EXIT;
++#else /* IS_ENABLED(CONFIG_PON_QOS) */
+ 	/* untagged rule */
+ 	for (i = 0; i < vlan->n_vlan0; i++) {
+ 		if (!vlan->vlan0_list[i].def)
+@@ -421,6 +615,7 @@ static int tc_vlan_filter(struct core_ops *ops,
+ 			goto EXIT;
+ 		j++;
+ 	}
++#endif /* IS_ENABLED(CONFIG_PON_QOS) */
+ 
+ 	/* Check if we have anything to configure */
+ 	if (j <= 0) {
+@@ -790,7 +985,14 @@ static int tc_ext_vlan(struct core_ops *ops,
+ 	int total = vlan->n_vlan0 + vlan->n_vlan1 + vlan->n_vlan2;
+ 	GSW_EXTENDEDVLAN_alloc_t alloc = {0};
+ 	GSW_EXTENDEDVLAN_config_t cfg;
+-	int i, j;
++	int j;
++#if IS_ENABLED(CONFIG_PON_QOS)
++	struct dp_vlan0 *p0;
++	struct dp_vlan1 *p1;
++	struct dp_vlan2 *p2;
++#else
++	int i;
++#endif
+ 
+ 	if (total > 0) {
+ 		alloc.nNumberOfEntries = (u32)total;
+@@ -803,6 +1005,83 @@ static int tc_ext_vlan(struct core_ops *ops,
+ 
+ 		j = 0;
+ 
++#if IS_ENABLED(CONFIG_PON_QOS)
++		/* untagged rule */
++		if (vlan->vlan0_head) {
++			list_for_each_entry(p0, vlan->vlan0_head, list) {
++				if (j >= total) {
++					pr_err("%s: found rules > total rules\n",
++					       __func__);
++					goto ERROR;
++				}
++				memset(&cfg, 0, sizeof(cfg));
++				cfg.nExtendedVlanBlockId =
++					alloc.nExtendedVlanBlockId;
++				cfg.nEntryIndex = j;
++				j++;
++				ret = ext_vlan_cfg(ops,
++						   &cfg,
++						   p0->def,
++						   p0->outer.proto,
++						   NULL,
++						   NULL,
++						   &p0->act);
++				if (ret != 0)
++					goto ERROR;
++			}
++		}
++
++		/* 1-tag rule */
++		if (vlan->vlan1_head) {
++			list_for_each_entry(p1, vlan->vlan1_head, list) {
++				if (j >= total) {
++					pr_err("%s: found rules > total rules\n",
++					       __func__);
++					goto ERROR;
++				}
++				memset(&cfg, 0, sizeof(cfg));
++				cfg.nExtendedVlanBlockId =
++					alloc.nExtendedVlanBlockId;
++				cfg.nEntryIndex = j;
++				j++;
++				ret = ext_vlan_cfg(ops,
++						   &cfg,
++						   p1->def,
++						   p1->outer.proto,
++						   &p1->outer,
++						   NULL,
++						   &p1->act);
++				if (ret != 0)
++					goto ERROR;
++			}
++		}
++
++		/* 2-tag rule */
++		if (vlan->vlan2_head) {
++			list_for_each_entry(p2, vlan->vlan2_head, list) {
++				if (j >= total) {
++					pr_err("%s: found rules > total rules\n",
++					       __func__);
++					goto ERROR;
++				}
++				memset(&cfg, 0, sizeof(cfg));
++				cfg.nExtendedVlanBlockId =
++					alloc.nExtendedVlanBlockId;
++				cfg.nEntryIndex = j;
++				j++;
++				ret = ext_vlan_cfg(ops,
++						   &cfg,
++						   p2->def,
++						   p2->outer.proto,
++						   &p2->outer,
++						   &p2->inner,
++						   &p2->act);
++				if (ret != 0)
++					goto ERROR;
++			}
++		}
++	}
++#else /* IS_ENABLED(CONFIG_PON_QOS) */
+ 		/* untagged rule */
+ 		for (i = 0; i < vlan->n_vlan0; i++) {
+ 			memset(&cfg, 0, sizeof(cfg));
+@@ -854,6 +1133,7 @@ static int tc_ext_vlan(struct core_ops *ops,
+ 				goto ERROR;
+ 		}
+ 	}
++#endif /* IS_ENABLED(CONFIG_PON_QOS) */
+ 
+ 	if ((info->dev_type & 0x01) == 0) {
+ 		/* Configure CTP */
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index e56349b75b67..4561f438a81b 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -7,4 +7,11 @@ pon_qos-objs := \
+ 	pon_qos_tc_drr.o \
+ 	pon_qos_tc_prio.o \
+ 	pon_qos_tc_mqprio.o \
+-	pon_qos_tc_flower.o
++	pon_qos_tc_flower.o \
++	pon_qos_tc_vlan_prepare.o \
++	pon_qos_tc_vlan_storage.o \
++	pon_qos_tc_ext_vlan.o \
++	pon_qos_tc_vlan_filter.o \
++	pon_qos_tc_lct.o \
++	pon_qos_tc_pce.o \
++	pon_qos_tc_mirred.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+new file mode 100644
+index 000000000000..23fdc5a37417
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+@@ -0,0 +1,337 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <linux/list.h>
++#include <linux/list_sort.h>
++#include <linux/netdevice.h>
++#include <net/pkt_cls.h>
++#include <net/flow_dissector.h>
++#include <net/tc_act/tc_vlan.h>
++#include <net/tc_act/tc_gact.h>
++#include <net/tc_act/tc_mirred.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_vlan.h>
++#include <uapi/linux/tc_act/tc_vlan.h>
++#include "pon_qos_tc_flower.h"
++#include "pon_qos_tc_vlan_prepare.h"
++#include "pon_qos_tc_vlan_storage.h"
++#include "pon_qos_tc_ext_vlan.h"
++#include "pon_qos_tc_lct.h"
++
++static LIST_HEAD(tc_ext_vlan_storage);
++
++static int dscp_merge(struct dp_act_vlan *old,
++		      struct dp_act_vlan *new)
++{
++	int i;
++
++	if (old->act != new->act)
++		return -1;
++
++	if (!old->push_n || !new->push_n)
++		return -1;
++
++	if (old->push_n != new->push_n)
++		return -1;
++
++	if (old->pop_n != new->pop_n)
++		return -1;
++
++	for (i = 0; i < old->push_n; i++) {
++		if (old->prio[i] != DERIVE_FROM_DSCP ||
++		    new->prio[i] != DERIVE_FROM_DSCP)
++			return -1;
++		if (old->prio[i] != new->prio[i])
++			return -1;
++		if (old->tpid[i] != new->tpid[i])
++			return -1;
++		if (old->vid[i] != new->vid[i])
++			return -1;
++	}
++
++	for (i = 0; i < DP_DSCP_MAP; i++) {
++		if (new->dscp_pcp_map_valid[i]) {
++			old->dscp_pcp_map[i] = new->dscp_pcp_map[i];
++			old->dscp_pcp_map_valid[i] = true;
++		}
++	}
++
++	return 0;
++}
++
++static int untagged_add(struct net_device *dev,
++			struct tc_cls_flower_offload *f,
++			struct pon_qos_vlan_storage_node *node,
++			struct dp_tc_vlan *dp_vlan)
++{
++	struct dp_vlan0 *rule, *p;
++	int err = 0;
++
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	err = pon_qos_tc_vlan_untagged_prepare(dev, f, dp_vlan, rule);
++	if (err) {
++		kfree(rule);
++		return err;
++	}
++
++	/* Attempt to merge new rule into existing one */
++	list_for_each_entry(p, &node->rules, list) {
++		if (!dscp_merge(&p->act, &rule->act)) {
++			kfree(rule);
++			return 0;
++		}
++	}
++
++	err = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_EXT_VLAN,
++					    node, rule);
++	if (err < 0) {
++		kfree(rule);
++		return err;
++	}
++
++	list_add_tail(&rule->list, &node->rules);
++	list_sort(NULL, &node->rules, pon_qos_tc_cookie_cmp0);
++
++	node->rule_cnt++;
++
++	return 0;
++}
++
++static int single_tagged_add(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     struct pon_qos_vlan_storage_node *node)
++{
++	struct dp_vlan1 *rule, *p;
++	int err;
++
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	err = pon_qos_tc_vlan_single_tagged_prepare(dev, f, rule);
++	if (err) {
++		kfree(rule);
++		return err;
++	}
++
++	/* Attempt to merge new rule into existing one */
++	list_for_each_entry(p, &node->rules, list) {
++		if (!dscp_merge(&p->act, &rule->act)) {
++			kfree(rule);
++			return 0;
++		}
++	}
++
++	err = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_EXT_VLAN,
++					    node, rule);
++	if (err < 0) {
++		kfree(rule);
++		return err;
++	}
++
++	list_add_tail(&rule->list, &node->rules);
++	list_sort(NULL, &node->rules, pon_qos_tc_cookie_cmp1);
++
++	node->rule_cnt++;
++
++	return 0;
++}
++
++static int double_tagged_add(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     struct pon_qos_vlan_storage_node *node)
++{
++	struct dp_vlan2 *rule, *p;
++	int err;
++
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	err = pon_qos_tc_vlan_double_tagged_prepare(dev, f, rule);
++	if (err) {
++		kfree(rule);
++		return err;
++	}
++
++	/* Attempt to merge new rule into existing one */
++	list_for_each_entry(p, &node->rules, list) {
++		if (!dscp_merge(&p->act, &rule->act)) {
++			kfree(rule);
++			return 0;
++		}
++	}
++
++	err = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_EXT_VLAN,
++					    node, rule);
++	if (err < 0) {
++		kfree(rule);
++		return err;
++	}
++
++	list_add_tail(&rule->list, &node->rules);
++	list_sort(NULL, &node->rules, pon_qos_tc_cookie_cmp2);
++
++	node->rule_cnt++;
++
++	return 0;
++}
++
++static void dp_vlan_list_update(struct net_device *dev,
++				struct dp_tc_vlan *dp_vlan,
++				struct pon_qos_vlan_storage_node *node)
++{
++	switch (node->tag) {
++	case TC_VLAN_UNTAGGED:
++		dp_vlan->vlan0_head = &node->rules;
++		dp_vlan->n_vlan0 = node->rule_cnt;
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		dp_vlan->vlan1_head = &node->rules;
++		dp_vlan->n_vlan1 = node->rule_cnt;
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		dp_vlan->vlan2_head = &node->rules;
++		dp_vlan->n_vlan2 = node->rule_cnt;
++		break;
++	default:
++		break;
++	}
++}
++
++static int dp_update(struct net_device *dev,
++		     struct dp_tc_vlan *dp_vlan,
++		     bool ingress)
++{
++	struct pon_qos_vlan_storage_node *p;
++
++	list_for_each_entry(p, &tc_ext_vlan_storage, list) {
++		if (dev == p->dev &&
++		    ingress == p->ingress) {
++			dp_vlan_list_update(dev, dp_vlan, p);
++		}
++	}
++
++	if (dp_vlan_set(dp_vlan, 0) != DP_SUCCESS) {
++		netdev_err(dev, "dp_vlan_set failed!\n");
++		return -EPERM;
++	}
++
++	return 0;
++}
++
++int pon_qos_tc_ext_vlan_add(struct net_device *dev,
++			    struct tc_cls_flower_offload *f)
++{
++	struct dp_tc_vlan dp_vlan = {0};
++	struct pon_qos_vlan_storage_node *node;
++	enum tc_flower_vlan_tag tag;
++	bool ingress = pon_qos_tc_flower_is_ingress(dev, f);
++	int err = 0;
++
++	netdev_dbg(dev, "Extended VLAN add start\n");
++
++	tag = pon_qos_tc_vlan_tag_get(dev, f);
++	if (tag == TC_VLAN_UNKNOWN)
++		return -EIO;
++
++	node = pon_qos_tc_vlan_storage_get(dev, ingress, tag,
++					   &tc_ext_vlan_storage);
++	if (!node) {
++		err = pon_qos_tc_vlan_storage_crt(dev, ingress, tag, &node);
++		if (err)
++			return err;
++		list_add(&node->list, &tc_ext_vlan_storage);
++	}
++
++	pon_qos_tc_dp_vlan_prepare(dev, &dp_vlan, ingress);
++
++	switch (tag) {
++	case TC_VLAN_UNTAGGED:
++		err = untagged_add(dev, f, node, &dp_vlan);
++		if (err)
++			goto err;
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		err = single_tagged_add(dev, f, node);
++		if (err)
++			goto err;
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		err = double_tagged_add(dev, f, node);
++		if (err)
++			goto err;
++		break;
++	default:
++		err = -EIO;
++		goto err;
++	}
++
++	netdev_dbg(dev, "Extended VLAN rule added, storage: %p, ingress: %d, tag: %d, rule_cnt: %d\n",
++		   node, node->ingress, node->tag, node->rule_cnt);
++
++	return dp_update(dev, &dp_vlan, ingress);
++err:
++	pon_qos_tc_vlan_storage_del(dev, node);
++	return err;
++}
++
++int pon_qos_tc_ext_vlan_del(struct net_device *dev,
++			    void *vlan_storage,
++			    void *rule)
++{
++	struct dp_tc_vlan dp_vlan = {0};
++	struct pon_qos_vlan_storage_node *node;
++	struct dp_vlan0 *rule0;
++	struct dp_vlan1 *rule1;
++	struct dp_vlan2 *rule2;
++	bool ingress;
++
++	netdev_dbg(dev, "Extended VLAN delete start, node: %p, rule: %p\n",
++		   vlan_storage, rule);
++
++	if (!vlan_storage || !rule)
++		return -EIO;
++
++	node = vlan_storage;
++	ingress = node->ingress;
++
++	pon_qos_tc_dp_vlan_prepare(dev, &dp_vlan, ingress);
++
++	switch (node->tag) {
++	case TC_VLAN_UNTAGGED:
++		rule0 = rule;
++		pon_qos_lct_cleanup(rule0);
++		list_del(&rule0->list);
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		rule1 = rule;
++		list_del(&rule1->list);
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		rule2 = rule;
++		list_del(&rule2->list);
++		break;
++	default:
++		return -EIO;
++	}
++
++	kfree(rule);
++	node->rule_cnt--;
++
++	netdev_dbg(dev, "Extended VLAN rule deleted, storage: %p, ingress: %d, tag: %d, rule_cnt: %d\n",
++		   node, node->ingress, node->tag, node->rule_cnt);
++
++	pon_qos_tc_vlan_storage_del(dev, node);
++
++	return dp_update(dev, &dp_vlan, ingress);
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h
+new file mode 100644
+index 000000000000..869da96486fd
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_EXT_VLAN_
++#define _PON_QOS_TC_EXT_VLAN_
++
++int pon_qos_tc_ext_vlan_add(struct net_device *dev,
++			    struct tc_cls_flower_offload *f);
++
++int pon_qos_tc_ext_vlan_del(struct net_device *dev,
++			    void *vlan_storage,
++			    void *rule);
++
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+index 5b02569c35bc..b76cc555fbb7 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+@@ -5,21 +5,216 @@
+  *
+  *****************************************************************************/
+ #include <net/pkt_cls.h>
++#include <net/tc_act/tc_mirred.h>
++#include <net/flow_dissector.h>
++#include "pon_qos_tc_flower.h"
++#include "pon_qos_tc_ext_vlan.h"
++#include "pon_qos_tc_vlan_filter.h"
+ #include "pon_qos_tc_qmap.h"
++#include "pon_qos_tc_mirred.h"
++
++struct pon_qos_storage_node {
++	/** Unique key for TC flower - flower cookie */
++	unsigned long key;
++	/** Type of TC flower */
++	enum pon_qos_tc_flower_type type;
++	/** Pointer to structure of specific type */
++	void *arg1;
++	/** Pointer to structure of specific type */
++	void *arg2;
++	/** Hash table identifier */
++	struct hlist_node node;
++};
++
++static DEFINE_HASHTABLE(pon_qos_storage, 16);
++
++static char *flower_type_str_get(enum pon_qos_tc_flower_type type)
++{
++	switch (type) {
++	case TC_TYPE_EXT_VLAN:
++		return "TC_TYPE_EXT_VLAN";
++	case TC_TYPE_VLAN_FILTER:
++		return "TC_TYPE_VLAN_FILTER";
++	case TC_TYPE_QUEUE:
++		return "TC_TYPE_QUEUE";
++	case TC_TYPE_MIRRED:
++		return "TC_TYPE_MIRRED";
++	default:
++		return "TC_TYPE_UNKNOWN";
++	}
++}
++
++int pon_qos_tc_flower_storage_add(struct net_device *dev,
++				  unsigned long cookie,
++				  enum pon_qos_tc_flower_type type,
++				  void *arg1, void *arg2)
++{
++	struct pon_qos_storage_node *entry;
++
++	entry = kzalloc(sizeof(*entry), GFP_KERNEL);
++	if (!entry)
++		return -ENOMEM;
++
++	entry->key = cookie;
++	entry->type = type;
++	entry->arg1 = arg1;
++	entry->arg2 = arg2;
++
++	hash_add(pon_qos_storage, &entry->node, entry->key);
++	netdev_dbg(dev, "PON flower storage add, cookie: %lx, type: %s, arg1: %p, arg2: %p\n",
++		   entry->key, flower_type_str_get(entry->type),
++		   entry->arg1, entry->arg2);
++
++	return 0;
++}
++
++static int flower_remove(struct net_device *dev,
++			 u32 handle,
++			 struct tc_cls_flower_offload *f,
++			 enum pon_qos_tc_flower_type type,
++			 void *arg1, void *arg2)
++{
++	switch (type) {
++	case TC_TYPE_EXT_VLAN:
++		return pon_qos_tc_ext_vlan_del(dev, arg1, arg2);
++	case TC_TYPE_VLAN_FILTER:
++		return pon_qos_tc_vlan_filter_del(dev, arg1, arg2);
++	case TC_TYPE_QUEUE:
++		return pon_qos_tc_flower_unassign_tc(dev, arg1);
++	case TC_TYPE_MIRRED:
++		return pon_qos_mirred_unoffload(dev, f, handle);
++	default:
++		return -EOPNOTSUPP;
++	}
++
++	return -EOPNOTSUPP;
++}
++
++static int pon_qos_tc_flower_storage_del(struct net_device *dev,
++					 u32 handle,
++					 struct tc_cls_flower_offload *f)
++{
++	struct pon_qos_storage_node *entry;
++	struct hlist_node *tmp;
++
++	hash_for_each_possible_safe(pon_qos_storage, entry, tmp, node,
++				    f->cookie) {
++		if (f->cookie != entry->key)
++			continue;
++		flower_remove(dev, handle, f, entry->type, entry->arg1,
++			      entry->arg2);
++		netdev_dbg(dev, "PON flower storage del, cookie: %lx, type: %s\n",
++			   entry->key, flower_type_str_get(entry->type));
++		hash_del(&entry->node);
++		kfree(entry);
++	}
++
++	return 0;
++}
++
++static bool is_type_mirred(struct net_device *dev,
++			   struct tc_cls_flower_offload *f)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++
++	if (tc_no_actions(f->exts))
++		return false;
++
++	tcf_exts_to_list(f->exts, &actions);
++	list_for_each_entry(a, &actions, list)
++		if (is_tcf_mirred_redirect(a))
++			return true;
++
++	return false;
++}
++
++static bool is_type_queue(struct net_device *dev,
++			  struct tc_cls_flower_offload *f)
++{
++	return !!f->classid;
++}
++
++static bool is_type_vlan_filter(struct net_device *dev,
++				struct tc_cls_flower_offload *f)
++{
++	struct net_device *indev = NULL;
++	int ifi = (int)*(int *)f->key;
++
++	if (ifi) {
++		indev = dev_get_by_index(dev_net(dev), ifi);
++		if (!indev)
++			return false;
++
++		if (!strncmp(dev->name, indev->name, strlen(dev->name))) {
++			dev_put(indev);
++			return true;
++		}
++		dev_put(indev);
++	}
++
++	return false;
++}
++
++static bool is_type_ext_vlan(struct net_device *dev,
++			     struct tc_cls_flower_offload *f)
++{
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC) ||
++	    dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN) ||
++	    dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_CVLAN))
++		return true;
++
++	return false;
++}
++
++static enum pon_qos_tc_flower_type
++flower_type_get(struct net_device *dev, struct tc_cls_flower_offload *f)
++{
++	if (is_type_mirred(dev, f))
++		return TC_TYPE_MIRRED;
++
++	if (is_type_queue(dev, f))
++		return TC_TYPE_QUEUE;
++
++	if (is_type_vlan_filter(dev, f))
++		return TC_TYPE_VLAN_FILTER;
++
++	if (is_type_ext_vlan(dev, f))
++		return TC_TYPE_EXT_VLAN;
++
++	return TC_TYPE_UNKNOWN;
++}
+ 
+ static int pon_qos_tc_flower_replace(struct net_device *dev,
++				     u32 handle,
+ 				     struct tc_cls_flower_offload *f)
+ {
+-	if (f->classid)
++	enum pon_qos_tc_flower_type type;
++
++	type = flower_type_get(dev, f);
++	netdev_dbg(dev, "TC TYPE: %s", flower_type_str_get(type));
++
++	switch (type) {
++	case TC_TYPE_EXT_VLAN:
++		return pon_qos_tc_ext_vlan_add(dev, f);
++	case TC_TYPE_VLAN_FILTER:
++		return pon_qos_tc_vlan_filter_add(dev, f);
++	case TC_TYPE_QUEUE:
+ 		return pon_qos_tc_flower_assign_tc(dev, f);
++	case TC_TYPE_MIRRED:
++		return pon_qos_mirred_offload(dev, f, handle);
++	default:
++		return -EOPNOTSUPP;
++	}
+ 
+ 	return -EOPNOTSUPP;
+ }
+ 
+ static int pon_qos_tc_flower_destroy(struct net_device *dev,
++				     u32 handle,
+ 				     struct tc_cls_flower_offload *f)
+ {
+-	return pon_qos_tc_flower_unassign_tc(dev, f);
++	return pon_qos_tc_flower_storage_del(dev, handle, f);
+ }
+ 
+ int pon_qos_tc_flower_offload(struct net_device *dev,
+@@ -37,13 +232,13 @@ int pon_qos_tc_flower_offload(struct net_device *dev,
+ 	case TC_CLSFLOWER_REPLACE:
+ 	{
+ 		netdev_dbg(dev, "%s:replace:\n", __func__);
+-		ret = pon_qos_tc_flower_replace(dev, f);
++		ret = pon_qos_tc_flower_replace(dev, handle, f);
+ 		break;
+ 	}
+ 	case TC_CLSFLOWER_DESTROY:
+ 	{
+ 		netdev_dbg(dev, "%s:destroy:\n", __func__);
+-		ret = pon_qos_tc_flower_destroy(dev, f);
++		ret = pon_qos_tc_flower_destroy(dev, handle, f);
+ 		break;
+ 	}
+ 	case TC_CLSFLOWER_STATS:
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+new file mode 100644
+index 000000000000..aa5d800adbe9
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_FLOWER_
++#define _PON_QOS_TC_FLOWER_
++
++enum pon_qos_tc_flower_type {
++	TC_TYPE_UNKNOWN = 0,
++	TC_TYPE_EXT_VLAN = 1,
++	TC_TYPE_VLAN_FILTER = 2,
++	TC_TYPE_QUEUE = 3,
++	TC_TYPE_MIRRED = 4,
++};
++
++int pon_qos_tc_flower_storage_add(struct net_device *dev,
++				  unsigned long cookie,
++				  enum pon_qos_tc_flower_type type,
++				  void *arg1, void *arg2);
++
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_lct.c b/drivers/net/datapath/pon_qos/pon_qos_tc_lct.c
+new file mode 100644
+index 000000000000..87d068a470b3
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_lct.c
+@@ -0,0 +1,361 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ * For licensing information, see the file 'LICENSE' in the root folder of
++ * this software module.
++ *
++ *****************************************************************************/
++
++#include <linux/netdevice.h>
++#include <net/datapath_api_vlan.h>
++#include <net/datapath_api.h>
++#include "pon_qos_tc_lct.h"
++
++/** Maximum number of supported LAN ports */
++#define PON_QOS_LCT_MAX 2
++/** PCE rule not configured */
++#define PON_QOS_PCE_NOT_CONFIGURED 0
++/** PCE rule configured */
++#define PON_QOS_PCE_CONFIGURED 1
++
++/** LCT configuration */
++struct pon_qos_lct_control {
++	/** LAN interface name */
++	char ifname[IFNAMSIZ];
++	/** LCT interface name */
++	char lctname[IFNAMSIZ];
++	/** PCE rules for LCT configured */
++	u8 configured;
++	/** PCE MAC rule index */
++	s32 mac_rule_idx;
++	/** PCE Multicast Broadcast rule index */
++	s32 mc_rule_idx;
++	/** PCE ARP broadcast rule index */
++	s32 arp_rule_idx;
++	/** PCE IEEE1588 (PTP) rule index */
++	s32 ptp_rule_idx;
++	/** CPU port is mapped in LCT (HW default: true) */
++	u8 cpu_port_mapped;
++	/* TODO: Remove manual mapping control when DP is fixed */
++};
++
++static struct pon_qos_lct_control pon_qos_lct_db[PON_QOS_LCT_MAX] = {
++	{"eth0_0", "eth0_0_1_lct", PON_QOS_PCE_NOT_CONFIGURED, 40, 41, 42, 43,
++	 true},
++	{"eth0_1", "eth0_1_1_lct", PON_QOS_PCE_NOT_CONFIGURED, 44, 45, 46, 47,
++	 true},
++};
++
++static int pce_rule_lct_mac_to_cpu(struct net_device *dev,
++				   struct core_ops *gsw_handle,
++				   dp_subif_t dp_subif,
++				   uint32_t idx)
++{
++	GSW_PCE_rule_t pce_rule = {0};
++	GSW_return_t ret;
++	s32 i;
++
++	pce_rule.pattern.nIndex = idx;
++	pce_rule.pattern.bEnable = 1;
++	pce_rule.pattern.bPortIdEnable = 1;
++	pce_rule.pattern.nPortId = dp_subif.port_id;
++	pce_rule.pattern.bSubIfIdEnable = 1;
++	pce_rule.pattern.nSubIfId = dp_subif.subif;
++	pce_rule.pattern.bMAC_DstEnable = 1;
++	for (i = 0; i < ARRAY_SIZE(pce_rule.pattern.nMAC_Dst); i++)
++		pce_rule.pattern.nMAC_Dst[i] = dev->dev_addr[i];
++
++	pce_rule.action.ePortMapAction = GSW_PCE_ACTION_PORTMAP_CPU;
++	pce_rule.action.nTrafficClassAlternate = 11;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle,
++							   &pce_rule);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleWrite [LCT MAC to CPU] for interface \"%s\" failed: %d\n",
++		       __func__, dev->name, ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int pce_rule_lct_mc_bc_to_cpu(struct net_device *dev,
++				     struct core_ops *gsw_handle,
++				     dp_subif_t dp_subif,
++				     uint32_t idx)
++{
++	GSW_PCE_rule_t pce_rule = {0};
++	GSW_return_t ret;
++
++	pce_rule.pattern.nIndex = idx;
++	pce_rule.pattern.bEnable = 1;
++	pce_rule.pattern.bPortIdEnable = 1;
++	pce_rule.pattern.nPortId = dp_subif.port_id;
++	pce_rule.pattern.bSubIfIdEnable = 1;
++	pce_rule.pattern.nSubIfId = dp_subif.subif;
++	pce_rule.pattern.bMAC_DstEnable = 1;
++	/* IPv6 multicast: 33:33:xx:xx:xx:xx.
++	 * Each DstMask bit represents a nibble of the MAC as do-not-care.
++	 */
++	pce_rule.pattern.nMAC_Dst[0] = 0x33;
++	pce_rule.pattern.nMAC_Dst[1] = 0x33;
++	pce_rule.pattern.nMAC_DstMask = 0xFF;
++	pce_rule.pattern.bEtherTypeEnable = 1;
++	pce_rule.pattern.nEtherType = ETH_P_IPV6;
++
++	pce_rule.action.ePortMapAction = GSW_PCE_ACTION_PORTMAP_CPU;
++	pce_rule.action.nTrafficClassAlternate = 12;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle,
++							   &pce_rule);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleWrite [LCT Multicast Broadcast to CPU] for interface \"%s\" failed: %d\n",
++		       __func__, dev->name, ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int pce_rule_lct_arp_bc_to_cpu(struct net_device *dev,
++				      struct core_ops *gsw_handle,
++				      dp_subif_t dp_subif,
++				      uint32_t idx)
++{
++	GSW_PCE_rule_t pce_rule = {0};
++	GSW_return_t ret;
++	s32 i;
++
++	pce_rule.pattern.nIndex = idx;
++	pce_rule.pattern.bEnable = 1;
++	pce_rule.pattern.bPortIdEnable = 1;
++	pce_rule.pattern.nPortId = dp_subif.port_id;
++	pce_rule.pattern.bSubIfIdEnable = 1;
++	pce_rule.pattern.nSubIfId = dp_subif.subif;
++	pce_rule.pattern.bMAC_DstEnable = 1;
++	for (i = 0; i < 6; i++)
++		pce_rule.pattern.nMAC_Dst[i] = 0xFF;
++	pce_rule.pattern.bEtherTypeEnable = 1;
++	pce_rule.pattern.nEtherType = ETH_P_ARP;
++
++	pce_rule.action.ePortMapAction = GSW_PCE_ACTION_PORTMAP_CPU;
++	pce_rule.action.nTrafficClassAlternate = 13;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle,
++							   &pce_rule);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleWrite [LCT ARP Broadcast to CPU] for interface \"%s\" failed: %d\n",
++		       __func__, dev->name, ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int pce_rule_lct_ptp_to_cpu(struct net_device *dev,
++				   struct core_ops *gsw_handle,
++				   dp_subif_t dp_subif,
++				   uint32_t idx)
++{
++	GSW_PCE_rule_t pce_rule = {0};
++	GSW_return_t ret;
++
++	pce_rule.pattern.nIndex = idx;
++	pce_rule.pattern.bEnable = 1;
++	pce_rule.pattern.bPortIdEnable = 1;
++	pce_rule.pattern.nPortId = dp_subif.port_id;
++	pce_rule.pattern.bSubIfIdEnable = 1;
++	pce_rule.pattern.nSubIfId = dp_subif.subif;
++	pce_rule.pattern.bEtherTypeEnable = 1;
++	pce_rule.pattern.nEtherType = ETH_P_1588;
++
++	pce_rule.action.ePortMapAction = GSW_PCE_ACTION_PORTMAP_CPU;
++	pce_rule.action.eTrafficClassAction = 2;
++	/* Use high priroity queue for PTP next to OMCI */
++	pce_rule.action.nTrafficClassAlternate = 9;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle,
++							   &pce_rule);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleWrite [PTP to CPU] for interface \"%s\" failed: %d\n",
++		       __func__, dev->name, ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++static void pce_rule_remove(uint32_t idx)
++{
++	struct core_ops *gsw_handle;
++	GSW_PCE_ruleDelete_t pce_rule = {0};
++	GSW_return_t ret;
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle)
++		return;
++
++	pce_rule.nIndex = idx;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleDelete(gsw_handle,
++							    &pce_rule);
++	if (ret != GSW_statusOk)
++		pr_err("%s: TFLOW_PceRuleDelete with idx \"%u\" failed: %d\n",
++		       __func__, idx, ret);
++}
++
++static int pce_rules_lct_to_cpu(struct net_device *dev,
++				uint8_t lct_idx)
++{
++	struct core_ops *gsw_handle;
++	dp_subif_t dp_subif;
++	s32 ret;
++
++	if (pon_qos_lct_db[lct_idx].configured == PON_QOS_PCE_CONFIGURED)
++		return 0;
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle)
++		return -1;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++	if (ret != DP_SUCCESS)
++		return -1;
++
++	ret = pce_rule_lct_mac_to_cpu(dev, gsw_handle, dp_subif,
++				      pon_qos_lct_db[lct_idx].mac_rule_idx);
++	if (ret != 0)
++		return -1;
++
++	ret = pce_rule_lct_mc_bc_to_cpu(dev, gsw_handle, dp_subif,
++					pon_qos_lct_db[lct_idx].mc_rule_idx);
++	if (ret != 0) {
++		pce_rule_remove(pon_qos_lct_db[lct_idx].mac_rule_idx);
++		return -1;
++	}
++
++	ret = pce_rule_lct_arp_bc_to_cpu(dev, gsw_handle, dp_subif,
++					 pon_qos_lct_db[lct_idx].arp_rule_idx);
++	if (ret != 0) {
++		pce_rule_remove(pon_qos_lct_db[lct_idx].mac_rule_idx);
++		pce_rule_remove(pon_qos_lct_db[lct_idx].mc_rule_idx);
++		return -1;
++	}
++
++	ret = pce_rule_lct_ptp_to_cpu(dev, gsw_handle, dp_subif,
++				      pon_qos_lct_db[lct_idx].ptp_rule_idx);
++	if (ret != 0) {
++		pce_rule_remove(pon_qos_lct_db[lct_idx].mac_rule_idx);
++		pce_rule_remove(pon_qos_lct_db[lct_idx].mc_rule_idx);
++		pce_rule_remove(pon_qos_lct_db[lct_idx].arp_rule_idx);
++		return -1;
++	}
++
++	pon_qos_lct_db[lct_idx].configured = PON_QOS_PCE_CONFIGURED;
++	return 0;
++}
++
++/* TODO: Remove this function when DP is fixed */
++static int cpu_port_disconnect(struct net_device *dev)
++{
++	struct core_ops *gsw_handle;
++	GSW_BRIDGE_portConfig_t bp;
++	dp_subif_t dp_subif;
++	GSW_return_t ret;
++	s32 err;
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle)
++		return -1;
++
++	err = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++	if (err != GSW_statusOk)
++		return -1;
++
++	bp.nBridgePortId = dp_subif.bport;
++	bp.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
++	ret = gsw_handle->gsw_brdgport_ops.BridgePort_ConfigGet(gsw_handle,
++								&bp);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: GSW_BRIDGE_PORT_CONFIG_GET failed: %d\n", __func__,
++		       ret);
++		return -1;
++	}
++
++	bp.nBridgePortMap[0] = 0;
++	ret = gsw_handle->gsw_brdgport_ops.BridgePort_ConfigSet(gsw_handle,
++								&bp);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: GSW_BRIDGE_PORT_CONFIG_SET failed: %d\n", __func__,
++		       ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pon_qos_lct_configure(struct net_device *dev,
++			  struct dp_tc_vlan *dp_vlan,
++			  struct dp_vlan0 *rule)
++{
++	struct net_device *lct_dev;
++	s32 ret, i;
++
++	if (dp_vlan->def_apply != DP_VLAN_APPLY_CTP)
++		return -1;
++
++	for (i = 0; i < PON_QOS_LCT_MAX; i++) {
++		if (!strncmp(pon_qos_lct_db[i].ifname, dev->name,
++			     sizeof(pon_qos_lct_db[i].ifname)))
++			break;
++	}
++
++	if (!(i < PON_QOS_LCT_MAX))
++		return -1;
++
++	lct_dev = dev_get_by_name(&init_net, pon_qos_lct_db[i].lctname);
++	if (!lct_dev)
++		return -1;
++
++	if (pon_qos_lct_db[i].cpu_port_mapped) {
++		ret = cpu_port_disconnect(lct_dev);
++		if (ret != 0)
++			return ret;
++		pon_qos_lct_db[i].cpu_port_mapped = false;
++	}
++
++	ret = pce_rules_lct_to_cpu(lct_dev, i);
++	if (ret != 0)
++		return -1;
++
++	rule->act.ract.act = DP_BP_REASSIGN;
++	rule->act.ract.bp_dev = lct_dev;
++
++	return 0;
++}
++
++void pon_qos_lct_cleanup(struct dp_vlan0 *rule)
++{
++	if (rule->act.ract.bp_dev)
++		dev_put(rule->act.ract.bp_dev);
++}
++
++void pon_qos_lct_lan_ctp(struct net_device *dev,
++			 struct dp_tc_vlan *dp_vlan)
++{
++	int i;
++
++	for (i = 0; i < PON_QOS_LCT_MAX; i++) {
++		if (!strncmp(pon_qos_lct_db[i].ifname, dev->name,
++			     sizeof(pon_qos_lct_db[i].ifname)))
++			break;
++	}
++
++	if (!(i < PON_QOS_LCT_MAX))
++		return;
++
++	dp_vlan->def_apply = dp_vlan->dir == DP_DIR_INGRESS ?
++			     DP_VLAN_APPLY_CTP : 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_lct.h b/drivers/net/datapath/pon_qos/pon_qos_tc_lct.h
+new file mode 100644
+index 000000000000..ae29f317767e
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_lct.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ * For licensing information, see the file 'LICENSE' in the root folder of
++ * this software module.
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_LCT_
++#define _PON_QOS_TC_LCT_
++#include <linux/if.h>
++
++struct dp_vlan0;
++struct dp_tc_vlan;
++
++/**
++ *  Configure LCT associated with device for LAN interfaces.
++ *  Update "rule" for bridge port reassignment (working only for CTP).
++ *
++ *  \param[in] dev	Network device.
++ *  \param[out] dp_vlan VLAN configuration for base device.
++ *  \param[out] rule	Untagged extended VLAN rule.
++ */
++int32_t pon_qos_lct_configure(struct net_device *dev,
++			      struct dp_tc_vlan *dp_vlan,
++			      struct dp_vlan0 *rule);
++
++/**
++ *  Cleanup allocated resources used for LCT configuration.
++ *
++ *  \param[in] rule	Untagged extended VLAN rule.
++ */
++void pon_qos_lct_cleanup(struct dp_vlan0 *rule);
++
++/**
++ * Configure LAN interfaces rules associated with LCT on CTP.
++ *
++ *  \param[in] dev	Network device.
++ *  \param[out] dp_vlan VLAN configuration for base device.
++ */
++void pon_qos_lct_lan_ctp(struct net_device *dev,
++			 struct dp_tc_vlan *dp_vlan);
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+new file mode 100644
+index 000000000000..3f92cc391366
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+@@ -0,0 +1,305 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#include <linux/list.h>
++#include <net/switch_api/gsw_types.h>
++#include <net/switch_api/lantiq_gsw.h>
++#include <net/switch_api/gsw_dev.h>
++#include <net/switch_api/lantiq_gsw_flow.h>
++#include <net/datapath_api.h>
++#include <net/flow_dissector.h>
++#include <net/pkt_cls.h>
++#include <net/tc_act/tc_mirred.h>
++#include "pon_qos_tc_flower.h"
++#include <net/tc_act/tc_gact.h>
++#include "pon_qos_tc_pce.h"
++#include "pon_qos_tc_mirred.h"
++
++struct pon_qos_mirr_filter {
++	int proto;
++	struct flow_dissector_key_vlan key;
++	struct flow_dissector_key_vlan mask;
++	bool drop;
++	enum pce_type pce_type;
++};
++
++static int pon_qos_parse_flower(struct net_device *dev,
++				struct tc_cls_flower_offload *f,
++				struct pon_qos_mirr_filter *flt)
++{
++	memset(flt, 0, sizeof(*flt));
++
++	flt->proto = f->common.protocol;
++	/* Classification/Matching arguments parsing */
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN)) {
++		struct flow_dissector_key_vlan *key =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_VLAN,
++						  f->key);
++		struct flow_dissector_key_vlan *mask =
++			skb_flow_dissector_target(f->dissector,
++						  FLOW_DISSECTOR_KEY_VLAN,
++						  f->mask);
++		netdev_dbg(dev, "%s: match vid: %#x/%#x pcp: %#x\n", __func__,
++			   key->vlan_id,
++			   key->vlan_priority,
++			   mask->vlan_id);
++		flt->key = *key;
++		flt->mask = *mask;
++
++		return 0;
++	}
++
++	netdev_err(dev, "%s: Unsupported key used: 0x%x\n", __func__,
++		   f->dissector->used_keys);
++	return -EINVAL;
++}
++
++static int pon_qos_parse_act_mirred(struct net_device *dev,
++				    struct tcf_exts *exts,
++				    struct net_device **mirr_dev,
++				    bool *drop_act)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++	int ifindex;
++	int ret = -EINVAL;
++
++	*drop_act = false;
++
++	if (tc_no_actions(exts))
++		return -EINVAL;
++
++	tcf_exts_to_list(exts, &actions);
++	list_for_each_entry(a, &actions, list) {
++		if (is_tcf_mirred_redirect(a) && ret != 0) {
++			ifindex = tcf_mirred_ifindex(a);
++			*mirr_dev = dev_get_by_index(dev_net(dev),
++						     ifindex);
++			if (!(*mirr_dev))
++				continue;
++			ret = 0;
++		}
++		if (is_tcf_gact_shot(a))
++			*drop_act =  true;
++	}
++
++	netdev_dbg(dev, "%s: ret: %d\n", __func__, ret);
++	return ret;
++}
++
++static int pon_qos_flow_get_bp_id(struct net_device *dev)
++{
++	dp_subif_t subif;
++	int err;
++
++	err = dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0);
++	if (err != DP_SUCCESS)
++		return -1;
++
++	return subif.bport;
++}
++
++static int pon_qos_vlan_to_pce_single(struct net_device *dev,
++				      struct pon_qos_mirr_filter *flt,
++				      GSW_PCE_rule_t *rule)
++{
++	rule->pattern.bSLAN_Vid = 1;
++	rule->pattern.nSLAN_Vid = flt->key.vlan_id;
++	rule->pattern.nOuterVidRange = 0x0;
++	rule->pattern.bSVidRange_Select = 0;
++	rule->pattern.bOuterVid_Original = 0;
++	rule->action.ePortFilterType_Action = 1;
++
++	if (flt->drop) {
++		pr_debug("%s: Mirring VLAN forward\n", __func__);
++		flt->pce_type = PCE_MIRR_VLAN_DROP;
++	} else {
++		pr_debug("%s: Mirring VLAN drop\n", __func__);
++		flt->pce_type = PCE_MIRR_VLAN_FWD;
++	}
++
++	return 0;
++}
++
++static int pon_qos_vlan_to_pce_wildcard(struct net_device *dev,
++					struct pon_qos_mirr_filter *flt,
++					GSW_PCE_rule_t *rule)
++{
++	rule->pattern.bSLAN_Vid = 1;
++	rule->pattern.nSLAN_Vid = 0;
++	rule->pattern.nOuterVidRange = 4095;
++	rule->pattern.bSVidRange_Select = 1;
++	rule->pattern.bOuterVid_Original = 0;
++	rule->action.ePortFilterType_Action = 1;
++
++	netdev_dbg(dev, "%s: Mirring VLAN wildcard\n", __func__);
++	flt->pce_type = PCE_MIRR_VLAN_WILD;
++
++	return 0;
++}
++
++static int pon_qos_vlan_to_pce(struct net_device *dev,
++			       struct pon_qos_mirr_filter *flt,
++			       GSW_PCE_rule_t *rule)
++{
++	int ret = -1;
++
++	if (!flt->key.vlan_id && !flt->mask.vlan_id)
++		ret = pon_qos_vlan_to_pce_wildcard(dev, flt, rule);
++	else if (flt->key.vlan_id && flt->mask.vlan_id == 0xfff)
++		ret = pon_qos_vlan_to_pce_single(dev, flt, rule);
++
++	return ret;
++}
++
++static int pon_qos_all_to_pce(struct net_device *dev,
++			      struct pon_qos_mirr_filter *flt,
++			      GSW_PCE_rule_t *rule)
++{
++	rule->pattern.bSLAN_Vid = 1;
++	rule->pattern.nSLAN_Vid = 0;
++	rule->pattern.nOuterVidRange = 4095;
++	rule->pattern.bSLANVid_Exclude = 1;
++	rule->pattern.bSVidRange_Select = 1;
++	rule->pattern.bOuterVid_Original = 0;
++	rule->action.ePortFilterType_Action = 1;
++
++	if (flt->drop) {
++		netdev_dbg(dev, "%s: Mirring VLAN untag drop\n", __func__);
++		flt->pce_type = PCE_MIRR_UNTAG_DROP;
++	} else {
++		netdev_dbg(dev, "%s: Mirring VLAN untag forward\n", __func__);
++		flt->pce_type = PCE_MIRR_UNTAG_FWD;
++	}
++
++	return 0;
++}
++
++static int pon_qos_tc_to_pce(struct net_device *dev,
++			     struct net_device *mirr_dev,
++			     struct pon_qos_mirr_filter *flt,
++			     GSW_PCE_rule_t *pce_rule)
++{
++	dp_subif_t dp_subif;
++	int ret = 0;
++	int bp = 0, pidx;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "%s: dp_get_netif_subifid failed\n",
++			   __func__);
++		return -1;
++	}
++
++	netdev_dbg(dev, "%s: using port: %d subif: %d\n",
++		   __func__, dp_subif.port_id, dp_subif.subif);
++
++	pce_rule->pattern.bEnable = 1;
++	pce_rule->pattern.bPortIdEnable = 1;
++	pce_rule->pattern.nPortId = dp_subif.port_id;
++	pce_rule->pattern.bSubIfIdEnable = 1;
++	pce_rule->pattern.nSubIfId = dp_subif.subif;
++
++	if (flt->proto == ETH_P_ALL) {
++		ret = pon_qos_all_to_pce(dev, flt, pce_rule);
++	} else if (eth_type_vlan(flt->proto)) {
++		ret = pon_qos_vlan_to_pce(dev, flt, pce_rule);
++	} else {
++		netdev_err(dev, "%s: Unsupported mirred TC protocol\n",
++			   __func__);
++		return -1;
++	}
++
++	if (ret != 0)
++		return ret;
++
++	if (flt->drop) {
++		netdev_dbg(dev, "%s: PCE rule prepared\n", __func__);
++		return ret;
++	}
++
++	bp = pon_qos_flow_get_bp_id(mirr_dev);
++	if (bp < 0) {
++		netdev_err(dev, "%s: cannot get BP id from DPM\n",
++			   __func__);
++		return -1;
++	}
++
++	/* Set destination bridge port id in 256 bit nForwardPortMap
++	 * which is split into 16 u16 blocks.
++	 */
++	pidx = ((bp / 16)) % 16;
++	pce_rule->action.nForwardPortMap[pidx] = 1 << (bp - (pidx << 4));
++
++	netdev_dbg(dev, "%s: PCE rule prepared\n", __func__);
++	return ret;
++}
++
++int pon_qos_mirred_offload(struct net_device *dev,
++			   struct tc_cls_flower_offload *f,
++			   uint32_t tc_handle)
++{
++	struct pon_qos_mirr_filter flt = {0};
++	struct net_device *mirr_dev = NULL;
++	GSW_PCE_rule_t *pce_rule = NULL;
++	int pref = f->common.prio >> 16;
++	int ret = 0;
++
++	ret = pon_qos_parse_flower(dev, f, &flt);
++	if (ret != 0)
++		return ret;
++
++	ret = pon_qos_parse_act_mirred(dev, f->exts, &mirr_dev, &flt.drop);
++	if (ret != 0)
++		return ret;
++
++	pce_rule = kzalloc(sizeof(*pce_rule), GFP_KERNEL);
++	if (!pce_rule) {
++		ret = -1;
++		goto err;
++	}
++
++	ret = pon_qos_tc_to_pce(dev, mirr_dev, &flt, pce_rule);
++	if (ret != 0) {
++		kfree(pce_rule);
++		goto err;
++	}
++
++	ret = pon_qos_pce_rule_create(dev, tc_handle, pref,
++				      flt.pce_type, pce_rule);
++	if (ret != 0) {
++		kfree(pce_rule);
++		goto err;
++	}
++
++	kfree(pce_rule);
++
++	ret = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_MIRRED,
++					    NULL, NULL);
++	if (ret < 0) {
++		(void)pon_qos_pce_rule_delete(tc_handle, pref);
++		goto err;
++	}
++
++err:
++	dev_put(mirr_dev);
++
++	return ret;
++}
++
++int pon_qos_mirred_unoffload(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     uint32_t tc_handle)
++{
++	int pref = f->common.prio >> 16;
++	int ret = 0;
++
++	ret = pon_qos_pce_rule_delete(tc_handle, pref);
++	return ret;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.h b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.h
+new file mode 100644
+index 000000000000..b79ad94e2814
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.h
+@@ -0,0 +1,28 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++/**
++ *  Offload mirred actions to HW using PCE rules.
++ *
++ *  \param[in]	dev		Network device
++ *  \param[in]	f		Flower offload
++ *  \param[in]	tc_handle	TC command identifier
++ */
++int pon_qos_mirred_offload(struct net_device *dev,
++			   struct tc_cls_flower_offload *f,
++			   uint32_t tc_handle);
++
++/**
++ *  Remove mirred actions from HW by removing PCE rule.
++ *
++ *  \param[in]	dev		Network device
++ *  \param[in]	f		Flower offload
++ *  \param[in]	tc_handle	TC command identifier
++ */
++int pon_qos_mirred_unoffload(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     uint32_t tc_handle);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+new file mode 100644
+index 000000000000..71d634f9b424
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+@@ -0,0 +1,483 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#include <linux/list.h>
++#include <net/switch_api/gsw_types.h>
++#include <net/switch_api/lantiq_gsw.h>
++#include <net/switch_api/gsw_dev.h>
++#include <net/switch_api/lantiq_gsw_flow.h>
++#include <net/datapath_api.h>
++#include "pon_qos_tc_pce.h"
++
++/** Mark PCE rule index as reserved */
++#define PON_QOS_PCE_RESERVED 1
++/** Mark PCE rule index as unreserved */
++#define PON_QOS_PCE_UNRESERVED 0
++
++/** Maximum numbers of entries per PCE block */
++#define PON_QOS_PCE_BLOCK_ENTRIES_MAX 64
++/** Special value used for common block */
++#define PON_QOS_PCE_BLOCK_COMMON -1
++
++/** This structure represent list element storing relation between
++ *  TC command and PCE rule.
++ */
++struct pce_node {
++	/** TC command handle used as dual identificator */
++	s32 handle;
++	/** TC command preference used as dual identificator */
++	int pref;
++	/** Logical port id, common block is using -1 id. */
++	s64 portid;
++	/** CTP id, used for PCE block management,
++	 *  Common block is using -1 id.
++	 */
++	s64 subif;
++	/** PCE rule index used in hardware */
++	u32 index;
++	struct list_head list;
++};
++
++/** This structure represent list element storing PCE rules reservation arrays
++ *  for common and ctp PCE rules blocks.
++ */
++struct pce_block_node {
++	/** Logical port id, Common block is using -1 id. */
++	s64 portid;
++	/** CTP id, used for PCE block management,
++	 *  Common block is using -1 id.
++	 */
++	s64 subif;
++	/** Reserved block id,
++	 *  used for non-common block management
++	 */
++	s64 blockid;
++	/** Reservation table per block */
++	u8 reserved[PON_QOS_PCE_BLOCK_ENTRIES_MAX];
++	/** Reservation counter,
++	 *  used for non-common block management cleanup
++	 */
++	u8 reservation_cnt;
++	struct list_head list;
++};
++
++static LIST_HEAD(tc_pce_list);
++static LIST_HEAD(tc_pce_block_list);
++
++static int pce_block_delete(int portid, int subif,
++			    struct pce_block_node *block);
++
++static int pce_index_range_get(enum pce_type type,
++			       u32 *start,
++			       u32 *stop)
++{
++	switch (type) {
++	case PCE_COMMON:
++		*start = 0;
++		*stop = PON_QOS_PCE_BLOCK_ENTRIES_MAX;
++		break;
++	case PCE_MIRR_VLAN_FWD:
++		*start = 0;
++		*stop = 16;
++		break;
++	case PCE_MIRR_VLAN_DROP:
++		*start = 16;
++		*stop = 26;
++		break;
++	case PCE_MIRR_VLAN_WILD:
++		*start = 26;
++		*stop = 27;
++		break;
++	case PCE_MIRR_UNTAG_FWD:
++		*start = 27;
++		*stop = 28;
++		break;
++	case PCE_MIRR_UNTAG_DROP:
++		*start = 28;
++		*stop = 29;
++		break;
++	default:
++		pr_err("%s: Range not found!\n", __func__);
++		return -1;
++	}
++
++	pr_debug("%s: Range assigned, start: %u, stop: %u\n", __func__,
++		 *start, *stop);
++	return 0;
++}
++
++static int pce_free_index_get(u32 *index,
++			      enum pce_type type,
++			      int portid, int subif,
++			      struct pce_block_node *block)
++{
++	struct core_ops *gsw_handle;
++	GSW_PCE_rule_t pce_rule;
++	GSW_return_t ret;
++	u32 i, j;
++
++	ret = pce_index_range_get(type, &i, &j);
++	if (ret != 0)
++		return ret;
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle) {
++		pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
++		return -1;
++	}
++
++	for (; i < j; i++) {
++		if (block->reserved[i] == PON_QOS_PCE_RESERVED)
++			continue;
++
++		pce_rule.pattern.nIndex = i;
++		if (type != PCE_COMMON) {
++			pce_rule.logicalportid = portid;
++			pce_rule.subifidgroup = subif;
++			pce_rule.region = GSW_PCE_RULE_CTP;
++		}
++
++		ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleRead(gsw_handle,
++								  &pce_rule);
++		if (ret != GSW_statusOk) {
++			pr_err("%s: TFLOW_PceRuleRead failed, nIndex: %u, ret: %d\n",
++			       __func__, pce_rule.pattern.nIndex, ret);
++			return -1;
++		}
++
++		if (!pce_rule.pattern.bEnable) {
++			*index = i;
++			pr_debug("%s: Free index found, index: %u\n", __func__,
++				 *index);
++			return 0;
++		}
++	}
++
++	pr_err("%s: Free index not found\n", __func__);
++	return -1;
++}
++
++static int pce_rule_write(GSW_PCE_rule_t *pce_rule)
++{
++	struct core_ops *gsw_handle;
++	GSW_return_t ret;
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle)
++		return -1;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleWrite(gsw_handle,
++							   pce_rule);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleWrite failed, nIndex: %u, ret: %d\n",
++		       __func__, pce_rule->pattern.nIndex, ret);
++		return -1;
++	}
++
++	pr_debug("%s: TFLOW_PceRuleWrite success, nIndex: %u\n",
++		 __func__, pce_rule->pattern.nIndex);
++	return 0;
++}
++
++static int get_subif_data(struct net_device *dev,
++			  enum pce_type type,
++			  int *portid,
++			  int *subif)
++{
++	dp_subif_t dp_subif;
++	s32 ret;
++
++	switch (type) {
++	case PCE_COMMON:
++		*portid = PON_QOS_PCE_BLOCK_COMMON;
++		*subif = PON_QOS_PCE_BLOCK_COMMON;
++		pr_debug("%s: portid: %u, subif: %u\n", __func__,
++			 PON_QOS_PCE_BLOCK_COMMON, PON_QOS_PCE_BLOCK_COMMON);
++		break;
++	case PCE_MIRR_VLAN_FWD:
++	case PCE_MIRR_VLAN_DROP:
++	case PCE_MIRR_VLAN_WILD:
++	case PCE_MIRR_UNTAG_FWD:
++	case PCE_MIRR_UNTAG_DROP:
++		ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &dp_subif, 0);
++		if (ret != DP_SUCCESS)
++			return -1;
++		pr_debug("%s: portid: %u, subif: %u\n", __func__,
++			 dp_subif.port_id, dp_subif.subif);
++		*portid = dp_subif.port_id;
++		*subif = dp_subif.subif;
++		break;
++	default:
++		pr_err("%s: PCE type unknown\n", __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int pce_block_create(int portid, int subif,
++			    enum pce_type type,
++			    struct pce_block_node **block)
++{
++	struct core_ops *gsw_handle;
++	GSW_PCE_rule_alloc_t alloc = {0};
++	GSW_CTP_portConfig_t ctp = {0};
++	struct pce_block_node *pce_block;
++	GSW_return_t ret;
++
++	if (type != PCE_COMMON) {
++		gsw_handle = gsw_get_swcore_ops(0);
++		if (!gsw_handle) {
++			pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
++			return -1;
++		}
++
++		alloc.num_of_rules = PON_QOS_PCE_BLOCK_ENTRIES_MAX;
++
++		ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleAlloc(gsw_handle,
++								   &alloc);
++		if (ret != GSW_statusOk) {
++			pr_err("%s: TFLOW_PceRuleAlloc failed, num_of_rules: %u, ret: %d\n",
++			       __func__, alloc.num_of_rules, ret);
++			return -1;
++		}
++
++		pr_debug("%s: TFLOW_PceRuleAlloc success, num_of_rules: %u, block_id: %u\n",
++			 __func__, alloc.num_of_rules, alloc.blockid);
++
++		ctp.nLogicalPortId = portid;
++		ctp.nFirstFlowEntryIndex = alloc.blockid;
++		ctp.eMask |= GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
++
++		ret = gsw_handle->gsw_ctp_ops.CTP_PortConfigSet(gsw_handle,
++								&ctp);
++		if (ret != GSW_statusOk) {
++			pr_err("%s: CTP_PortConfigSet failed, nLogicalPortId: %u, nFirstFlowEntryIndex: %u, ret: %d\n",
++			       __func__, ctp.nLogicalPortId,
++			       ctp.nFirstFlowEntryIndex, ret);
++			return -1;
++		}
++
++		pr_debug("%s: CTP_PortConfigSet success, nLogicalPortId: %u, nFirstFlowEntryIndex: %u\n",
++			 __func__, ctp.nLogicalPortId,
++			 ctp.nFirstFlowEntryIndex);
++	}
++
++	pce_block = kzalloc(sizeof(*pce_block), GFP_KERNEL);
++	if (!pce_block)
++		return -1;
++
++	pce_block->subif = subif;
++	pce_block->portid = portid;
++	if (type != PCE_COMMON)
++		pce_block->blockid = alloc.blockid;
++	else
++		pce_block->blockid = PON_QOS_PCE_BLOCK_COMMON;
++	memset(pce_block->reserved, 0, sizeof(pce_block->reserved));
++	pce_block->reservation_cnt = 0;
++
++	list_add(&pce_block->list, &tc_pce_block_list);
++
++	*block = pce_block;
++
++	pr_debug("%s: PCE block created\n", __func__);
++	return 0;
++}
++
++static int pce_block_get(int portid, int subif,
++			 struct pce_block_node **block)
++{
++	struct pce_block_node *p, *n;
++
++	list_for_each_entry_safe(p, n, &tc_pce_block_list, list) {
++		if (p->subif == subif && p->portid == portid) {
++			*block = p;
++			pr_debug("%s: PCE block found\n", __func__);
++			return 0;
++		}
++	}
++
++	pr_debug("%s: PCE block not found\n", __func__);
++	return -1;
++}
++
++int pon_qos_pce_rule_create(struct net_device *dev,
++			    u32 tc_handle, int pref,
++			    enum pce_type type,
++			    GSW_PCE_rule_t *pce_rule)
++{
++	u32 index;
++	s32 ret;
++	struct pce_node *tc_pce = NULL;
++	struct pce_block_node *block;
++	int portid, subif;
++
++	ret = get_subif_data(dev, type, &portid, &subif);
++	if (ret != 0)
++		return ret;
++
++	ret = pce_block_get(portid, subif, &block);
++	if (ret != 0) {
++		ret = pce_block_create(portid, subif, type, &block);
++		if (ret != 0)
++			return ret;
++	}
++
++	ret = pce_free_index_get(&index, type, portid, subif, block);
++	if (ret != 0)
++		goto error_block;
++
++	pce_rule->pattern.nIndex = index;
++
++	if (type != PCE_COMMON) {
++		pce_rule->logicalportid = portid;
++		pce_rule->subifidgroup = subif;
++		pce_rule->region = GSW_PCE_RULE_CTP;
++	}
++
++	ret = pce_rule_write(pce_rule);
++	if (ret != 0)
++		goto error_block;
++
++	tc_pce = kzalloc(sizeof(*tc_pce), GFP_KERNEL);
++	if (!tc_pce)
++		goto error_block;
++
++	tc_pce->handle = tc_handle;
++	tc_pce->pref = pref;
++	tc_pce->index = index;
++	tc_pce->portid = portid;
++	tc_pce->subif = subif;
++
++	list_add(&tc_pce->list, &tc_pce_list);
++
++	block->reserved[index] = PON_QOS_PCE_RESERVED;
++	block->reservation_cnt++;
++
++	pr_debug("%s: PCE rule created\n", __func__);
++	return 0;
++
++error_block:
++	if (!block->reservation_cnt)
++		(void)pce_block_delete(portid, subif, block);
++
++	return ret;
++}
++
++static int pce_block_delete(int portid, int subif,
++			    struct pce_block_node *block)
++{
++	struct core_ops *gsw_handle;
++	GSW_PCE_rule_alloc_t alloc = {0};
++	GSW_CTP_portConfig_t ctp = {0};
++	GSW_return_t ret;
++
++	if (block->blockid == PON_QOS_PCE_BLOCK_COMMON) {
++		pr_debug("%s: Common block\n", __func__);
++		return 0;
++	}
++
++	ctp.nLogicalPortId = portid;
++	ctp.nFirstFlowEntryIndex = 0xFFFFFFFF;
++	ctp.eMask |= GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle) {
++		pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
++		return -1;
++	}
++
++	ret = gsw_handle->gsw_ctp_ops.CTP_PortConfigSet(gsw_handle,
++							&ctp);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: CTP_PortConfigSet failed, nLogicalPortId: %u, nFirstFlowEntryIndex: %u, ret: %d\n",
++		       __func__, ctp.nLogicalPortId, ctp.nFirstFlowEntryIndex,
++		       ret);
++		return -1;
++	}
++
++	pr_debug("%s: CTP_PortConfigSet success, nLogicalPortId: %u, nFirstFlowEntryIndex: %u\n",
++		 __func__, ctp.nLogicalPortId, ctp.nFirstFlowEntryIndex);
++	alloc.blockid = block->blockid;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleFree(gsw_handle, &alloc);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleFree failed, block_id: %u, ret: %d\n",
++		       __func__, alloc.blockid, ret);
++		return -1;
++	}
++
++	list_del(&block->list);
++	kfree(block);
++
++	pr_debug("%s: PCE block deleted\n", __func__);
++	return 0;
++}
++
++int pon_qos_pce_rule_delete(u32 tc_handle, int pref)
++{
++	struct core_ops *gsw_handle;
++	struct pce_node *p, *n;
++	bool deletion = false;
++	GSW_PCE_ruleDelete_t pce_rule = {0};
++	struct pce_block_node *block;
++	GSW_return_t ret;
++
++	list_for_each_entry_safe(p, n, &tc_pce_list, list) {
++		if (tc_handle == p->handle && pref == p->pref) {
++			deletion = true;
++			break;
++		}
++	}
++
++	if (!deletion) {
++		pr_debug("%s: Nothing to delete\n", __func__);
++		return -1;
++	}
++
++	ret = pce_block_get(p->portid, p->subif, &block);
++	if (ret != 0)
++		return ret;
++
++	if (p->subif != PON_QOS_PCE_BLOCK_COMMON &&
++	    p->portid != PON_QOS_PCE_BLOCK_COMMON) {
++		pce_rule.logicalportid = p->portid;
++		pce_rule.subifidgroup = p->subif;
++		pce_rule.region = GSW_PCE_RULE_CTP;
++	}
++
++	gsw_handle = gsw_get_swcore_ops(0);
++	if (!gsw_handle) {
++		pr_err("%s: gsw_get_swcore_ops failed\n", __func__);
++		return -1;
++	}
++
++	pce_rule.nIndex = p->index;
++
++	ret = gsw_handle->gsw_tflow_ops.TFLOW_PceRuleDelete(gsw_handle,
++							    &pce_rule);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: TFLOW_PceRuleDelete failed, nIndex: %u, ret: %d\n",
++		       __func__, pce_rule.nIndex, ret);
++		return -1;
++	}
++
++	block->reserved[p->index] = PON_QOS_PCE_UNRESERVED;
++	block->reservation_cnt--;
++
++	if (!block->reservation_cnt) {
++		ret = pce_block_delete(p->portid, p->subif, block);
++		if (ret != 0)
++			return ret;
++	}
++
++	list_del(&p->list);
++	kfree(p);
++
++	pr_debug("%s: PCE rule deleted\n", __func__);
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h
+new file mode 100644
+index 000000000000..4e05d407f11e
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.h
+@@ -0,0 +1,35 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++enum pce_type {
++	PCE_COMMON = 0,
++	PCE_MIRR_VLAN_FWD = 1,
++	PCE_MIRR_VLAN_DROP = 2,
++	PCE_MIRR_VLAN_WILD = 3,
++	PCE_MIRR_UNTAG_FWD = 4,
++	PCE_MIRR_UNTAG_DROP = 5,
++};
++
++/**
++ *  Create PCE rule in hardware.
++ *
++ *  \param[in]	tc_handle	TC command identifier
++ *  \param[in]	pref		TC command preference
++ *  \param[in]	pce_rule	PCE rule derived from TC command
++ */
++int pon_qos_pce_rule_create(struct net_device *dev,
++			    u32 tc_handle, int pref,
++			    enum pce_type type,
++			    GSW_PCE_rule_t *pce_rule);
++
++/**
++ *  Delete PCE rule from hardware.
++ *
++ *  \param[in]	tc_handle	TC command identifier
++ *  \param[in]	pref		TC command preference
++ */
++int pon_qos_pce_rule_delete(u32 tc_handle, int pref);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index bfd89a9eaa2e..100d9298c900 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -11,6 +11,7 @@
+ #include <net/tc_act/tc_gact.h>
+ #include <net/pon_qos_tc.h>
+ #include "pon_qos_tc_qos.h"
++#include "pon_qos_tc_flower.h"
+ 
+ struct flower_cls_map {
+ 	__be16 proto;
+@@ -26,19 +27,6 @@ struct flower_cls_map {
+ 
+ static LIST_HEAD(tc_class_list);
+ 
+-static struct flower_cls_map *pon_qos_tc_flower_get_cls(struct net_device *dev,
+-							u32 pref)
+-{
+-	struct flower_cls_map *p, *n;
+-
+-	list_for_each_entry_safe(p, n, &tc_class_list, list) {
+-		if (p->dev == dev && p->pref == pref)
+-			return p;
+-	}
+-
+-	return NULL;
+-}
+-
+ static int pon_qos_tc_flower_action_valid(struct tcf_exts *exts)
+ {
+ 	const struct tc_action *a;
+@@ -88,8 +76,6 @@ static int pon_qos_parse_tc_flower(struct tc_cls_flower_offload *f,
+ 	pr_debug("%s: Supported key used: 0x%x\n", __func__,
+ 		 f->dissector->used_keys);
+ 
+-	memset(*flt, 0, sizeof(**flt));
+-
+ 	(*flt)->pref = f->common.prio >> 16;
+ 	(*flt)->proto = f->common.protocol;
+ 	(*flt)->classid = f->classid;
+@@ -155,7 +141,14 @@ int pon_qos_tc_flower_assign_tc(struct net_device *dev,
+ 		goto err;
+ 	}
+ 
++	ret = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_QUEUE,
++					    (void *)map, NULL);
++	if (ret < 0)
++		goto err;
++
+ 	list_add(&map->list, &tc_class_list);
++
+ 	return 0;
+ err:
+ 	if (map->indev)
+@@ -166,15 +159,16 @@ int pon_qos_tc_flower_assign_tc(struct net_device *dev,
+ EXPORT_SYMBOL(pon_qos_tc_flower_assign_tc);
+ 
+ int pon_qos_tc_flower_unassign_tc(struct net_device *dev,
+-				  struct tc_cls_flower_offload *f)
++				  void *list_node)
+ {
+-	struct flower_cls_map *map = NULL;
++	struct flower_cls_map *map;
+ 	struct pon_qos_qmap_tc qmap = { 0 };
+ 	int ret = 0;
+ 
+-	map = pon_qos_tc_flower_get_cls(dev, f->common.prio >> 16);
+-	if (!map)
+-		return -EOPNOTSUPP;
++	if (!list_node)
++		return -EIO;
++
++	map = list_node;
+ 
+ 	qmap.indev = map->indev;
+ 	qmap.tc = map->key.vlan_priority;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
+index 741ab6ce643d..33c430fc8b0d 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.h
+@@ -11,6 +11,6 @@ int pon_qos_tc_flower_assign_tc(struct net_device *dev,
+ 				struct tc_cls_flower_offload *f);
+ 
+ int pon_qos_tc_flower_unassign_tc(struct net_device *dev,
+-				  struct tc_cls_flower_offload *f);
++				  void *list_node);
+ 
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 480cdb61970a..14a9f732c05b 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -831,7 +831,7 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 		tc = q_tc->tc;
+ 	}
+ 
+-	netdev_dbg(dev, "port: %d deq_i: %d qid: %d handl: %#x tc: %d ds:%s\n",
++	netdev_dbg(dev, "port: %d deq_i: %d qid: %d handle: %#x tc: %d ds:%s\n",
+ 		   sch->port, sch->deq_idx, qid->qid, q_tc->handle, tc,
+ 		   sch->ds ? "true" : "false");
+ 
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
+new file mode 100644
+index 000000000000..de9007193963
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <linux/list.h>
++#include <linux/list_sort.h>
++#include <linux/netdevice.h>
++#include <net/pkt_cls.h>
++#include <net/flow_dissector.h>
++#include <net/tc_act/tc_vlan.h>
++#include <net/tc_act/tc_gact.h>
++#include <net/tc_act/tc_mirred.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_vlan.h>
++#include <uapi/linux/tc_act/tc_vlan.h>
++#include "pon_qos_tc_flower.h"
++#include "pon_qos_tc_vlan_prepare.h"
++#include "pon_qos_tc_vlan_storage.h"
++#include "pon_qos_tc_vlan_filter.h"
++#include "pon_qos_tc_lct.h"
++
++#define PON_QOS_TC_FILTER_DEF_PRIO_THRESHOLD 64000
++
++static LIST_HEAD(tc_vlan_filter_storage);
++
++static int untagged_add(struct net_device *dev,
++			struct tc_cls_flower_offload *f,
++			struct pon_qos_vlan_storage_node *node,
++			struct dp_tc_vlan *dp_vlan)
++{
++	struct dp_vlan0 *rule;
++	int err = 0;
++
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	err = pon_qos_tc_vlan_untagged_flt_prepare(dev, f, dp_vlan, rule);
++	if (err) {
++		kfree(rule);
++		return err;
++	}
++
++	err = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_VLAN_FILTER,
++					    node, rule);
++	if (err < 0) {
++		kfree(rule);
++		return err;
++	}
++
++	if (rule->prio > PON_QOS_TC_FILTER_DEF_PRIO_THRESHOLD)
++		rule->def = DP_VLAN_DEF_RULE;
++
++	list_add(&rule->list, &node->rules);
++
++	node->rule_cnt++;
++
++	return 0;
++}
++
++static int single_tagged_add(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     struct pon_qos_vlan_storage_node *node)
++{
++	struct dp_vlan1 *rule;
++	int err;
++
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	err = pon_qos_tc_vlan_single_tagged_flt_prepare(dev, f, rule);
++	if (err) {
++		kfree(rule);
++		return err;
++	}
++
++	err = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_VLAN_FILTER,
++					    node, rule);
++	if (err < 0) {
++		kfree(rule);
++		return err;
++	}
++
++	if (rule->prio > PON_QOS_TC_FILTER_DEF_PRIO_THRESHOLD)
++		rule->def = DP_VLAN_DEF_RULE;
++
++	list_add(&rule->list, &node->rules);
++
++	node->rule_cnt++;
++
++	return 0;
++}
++
++static int double_tagged_add(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     struct pon_qos_vlan_storage_node *node)
++{
++	struct dp_vlan2 *rule;
++	int err;
++
++	rule = kzalloc(sizeof(*rule), GFP_KERNEL);
++	if (!rule)
++		return -ENOMEM;
++
++	err = pon_qos_tc_vlan_double_tagged_flt_prepare(dev, f, rule);
++	if (err) {
++		kfree(rule);
++		return err;
++	}
++
++	err = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_VLAN_FILTER,
++					    node, rule);
++	if (err < 0) {
++		kfree(rule);
++		return err;
++	}
++
++	if (rule->prio > PON_QOS_TC_FILTER_DEF_PRIO_THRESHOLD)
++		rule->def = DP_VLAN_DEF_RULE;
++
++	list_add(&rule->list, &node->rules);
++
++	node->rule_cnt++;
++
++	return 0;
++}
++
++static void dp_vlan_list_update(struct net_device *dev,
++				struct dp_tc_vlan *dp_vlan,
++				struct pon_qos_vlan_storage_node *node)
++{
++	switch (node->tag) {
++	case TC_VLAN_UNTAGGED:
++		dp_vlan->vlan0_head = &node->rules;
++		dp_vlan->n_vlan0 = node->rule_cnt;
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		dp_vlan->vlan1_head = &node->rules;
++		dp_vlan->n_vlan1 = node->rule_cnt;
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		dp_vlan->vlan2_head = &node->rules;
++		dp_vlan->n_vlan2 = node->rule_cnt;
++		break;
++	default:
++		break;
++	}
++}
++
++static int dp_update(struct net_device *dev,
++		     struct dp_tc_vlan *dp_vlan,
++		     bool ingress)
++{
++	struct pon_qos_vlan_storage_node *p;
++
++	list_for_each_entry(p, &tc_vlan_filter_storage, list) {
++		if (dev == p->dev &&
++		    ingress == p->ingress) {
++			dp_vlan_list_update(dev, dp_vlan, p);
++		}
++	}
++
++	if (dp_vlan_set(dp_vlan, 0) == DP_FAILURE) {
++		netdev_err(dev, "dp_vlan_set failed!\n");
++		return -EPERM;
++	}
++
++	return 0;
++}
++
++int pon_qos_tc_vlan_filter_add(struct net_device *dev,
++			       struct tc_cls_flower_offload *f)
++{
++	struct dp_tc_vlan dp_vlan = {0};
++	struct pon_qos_vlan_storage_node *node;
++	enum tc_flower_vlan_tag tag;
++	bool ingress = pon_qos_tc_flower_is_ingress(dev, f);
++	int err = 0;
++
++	netdev_dbg(dev, "VLAN filter add, flower: %p\n", f);
++
++	tag = pon_qos_tc_vlan_tag_get(dev, f);
++	if (tag == TC_VLAN_UNKNOWN)
++		return -EIO;
++
++	node = pon_qos_tc_vlan_storage_get(dev, ingress, tag,
++					   &tc_vlan_filter_storage);
++	if (!node) {
++		err = pon_qos_tc_vlan_storage_crt(dev, ingress, tag, &node);
++		if (err)
++			return err;
++		list_add(&node->list, &tc_vlan_filter_storage);
++	}
++
++	pon_qos_tc_dp_vlan_prepare(dev, &dp_vlan, ingress);
++
++	switch (tag) {
++	case TC_VLAN_UNTAGGED:
++		err = untagged_add(dev, f, node, &dp_vlan);
++		if (err)
++			goto err;
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		err = single_tagged_add(dev, f, node);
++		if (err)
++			goto err;
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		err = double_tagged_add(dev, f, node);
++		if (err)
++			goto err;
++		break;
++	default:
++		err = -EIO;
++		goto err;
++	}
++
++	return dp_update(dev, &dp_vlan, ingress);
++err:
++	pon_qos_tc_vlan_storage_del(dev, node);
++	return err;
++}
++
++int pon_qos_tc_vlan_filter_del(struct net_device *dev,
++			       void *vlan_storage,
++			       void *rule)
++{
++	struct dp_tc_vlan dp_vlan = {0};
++	struct pon_qos_vlan_storage_node *node;
++	struct dp_vlan0 *rule0;
++	struct dp_vlan1 *rule1;
++	struct dp_vlan2 *rule2;
++	bool ingress;
++
++	netdev_dbg(dev, "VLAN filter del, node: %p, rule: %p\n",
++		   vlan_storage, rule);
++
++	if (!vlan_storage || !rule)
++		return -EIO;
++
++	node = vlan_storage;
++	ingress = node->ingress;
++
++	pon_qos_tc_dp_vlan_prepare(dev, &dp_vlan, ingress);
++
++	switch (node->tag) {
++	case TC_VLAN_UNTAGGED:
++		rule0 = (struct dp_vlan0 *)rule;
++		pon_qos_lct_cleanup(rule0);
++		list_del(&rule0->list);
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		rule1 = (struct dp_vlan1 *)rule;
++		list_del(&rule1->list);
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		rule2 = (struct dp_vlan2 *)rule;
++		list_del(&rule2->list);
++		break;
++	default:
++		return -EIO;
++	}
++
++	kfree(rule);
++	node->rule_cnt--;
++	pon_qos_tc_vlan_storage_del(dev, node);
++
++	return dp_update(dev, &dp_vlan, ingress);
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.h b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.h
+new file mode 100644
+index 000000000000..508a0475a353
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_VLAN_FILTER_
++#define _PON_QOS_TC_VLAN_FILTER_
++
++int pon_qos_tc_vlan_filter_add(struct net_device *dev,
++			       struct tc_cls_flower_offload *f);
++
++int pon_qos_tc_vlan_filter_del(struct net_device *dev,
++			       void *vlan_storage,
++			       void *rule);
++
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c
+new file mode 100644
+index 000000000000..ac09cc988678
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.c
+@@ -0,0 +1,513 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <net/flow_dissector.h>
++#include <net/tc_act/tc_vlan.h>
++#include <net/tc_act/tc_gact.h>
++#include <net/tc_act/tc_mirred.h>
++#include <net/datapath_api_vlan.h>
++#include <uapi/linux/tc_act/tc_vlan.h>
++#include "pon_qos_tc_vlan_prepare.h"
++#include "pon_qos_tc_lct.h"
++
++/* This file provides functions which parse the Linux flower (VLAN) dissectors
++ * and actions, these information are then covered into the matching dp manager
++ * struct dp_vlan(0,1,2) structures.
++ */
++
++bool pon_qos_tc_flower_is_ingress(struct net_device *dev,
++				  struct tc_cls_flower_offload *f)
++{
++	return TC_H_MIN(f->common.classid) != TC_H_MIN(TC_H_MIN_EGRESS);
++}
++
++void pon_qos_tc_dp_vlan_prepare(struct net_device *dev,
++				struct dp_tc_vlan *dp_vlan,
++				bool ingress)
++{
++	dp_vlan->dev = dev;
++	dp_vlan->dir = ingress ? DP_DIR_INGRESS : DP_DIR_EGRESS;
++	pon_qos_lct_lan_ctp(dev, dp_vlan);
++}
++
++static enum tc_flower_vlan_tag
++__pon_qos_tc_vlan_tag_get(struct net_device *dev,
++			  struct tc_cls_flower_offload *f)
++{
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_CVLAN))
++		return TC_VLAN_DOUBLE_TAGGED;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN))
++		return TC_VLAN_SINGLE_TAGGED;
++
++	return TC_VLAN_UNKNOWN;
++}
++
++enum tc_flower_vlan_tag
++pon_qos_tc_vlan_tag_get(struct net_device *dev,
++			struct tc_cls_flower_offload *f)
++{
++	struct flow_dissector_key_basic *key = NULL;
++	struct flow_dissector_key_basic *mask = NULL;
++	struct flow_dissector *d = f->dissector;
++
++	if (eth_type_vlan(f->common.protocol))
++		return __pon_qos_tc_vlan_tag_get(dev, f);
++
++	if (f->common.protocol == ETH_P_ALL)
++		return TC_VLAN_UNTAGGED;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
++		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
++						f->key);
++		mask = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
++						 f->mask);
++
++		if (mask->n_proto && !eth_type_vlan(key->n_proto)) {
++			netdev_dbg(dev, "%s: 0-tag rule\n", __func__);
++			return TC_VLAN_UNTAGGED;
++		}
++	}
++
++	netdev_dbg(dev, "%s: unknown tag\n", __func__);
++	return TC_VLAN_UNKNOWN;
++}
++
++static int pon_qos_tc_get_ethtype(struct net_device *dev,
++				  struct tc_cls_flower_offload *f)
++{
++	struct flow_dissector_key_basic *key = NULL;
++	struct flow_dissector_key_basic *mask = NULL;
++	struct flow_dissector *d = f->dissector;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
++		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
++						f->key);
++		mask = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
++						 f->mask);
++
++		if (mask->n_proto) {
++			netdev_dbg(dev, "%s:etype %#x\n",
++				   __func__, key->n_proto);
++			return key->n_proto;
++		}
++	}
++
++	return DP_VLAN_PATTERN_NOT_CARE;
++}
++
++static void vlan_pattern_default_set(struct dp_pattern_vlan *patt)
++{
++	patt->proto = DP_VLAN_PATTERN_NOT_CARE;
++	patt->prio = DP_VLAN_PATTERN_NOT_CARE;
++	patt->vid = DP_VLAN_PATTERN_NOT_CARE;
++	patt->tpid = DP_VLAN_PATTERN_NOT_CARE;
++	patt->dei = DP_VLAN_PATTERN_NOT_CARE;
++}
++
++static void vlan_action_default_set(struct dp_act_vlan *act)
++{
++	act->act = 0;
++	act->pop_n = 0;
++	act->push_n = 0;
++}
++
++static bool fwd_drop_action_parse(struct net_device *dev,
++				  struct tc_cls_flower_offload *f,
++				  struct dp_act_vlan *act)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++
++	tcf_exts_to_list(f->exts, &actions);
++	list_for_each_entry(a, &actions, list) {
++		/* DROP and PASS make no sense together */
++		if (is_tcf_gact_shot(a)) {
++			act->act = DP_VLAN_ACT_DROP;
++			netdev_dbg(dev, "DROP action detected, act: %x\n",
++				   act->act);
++			return true;
++		}
++		if (a->ops && a->ops->type == TCA_ACT_GACT &&
++		    ((struct tcf_gact *)a)->tcf_action == TC_ACT_OK) {
++			act->act = DP_VLAN_ACT_FWD;
++			netdev_dbg(dev, "DROP action detected, act: %x\n",
++				   act->act);
++			return true;
++		}
++	}
++
++	return false;
++}
++
++static int __vlan_parse(struct net_device *dev,
++			struct tc_cls_flower_offload *f,
++			struct dp_pattern_vlan *patt,
++			enum flow_dissector_key_id key_id)
++{
++	struct flow_dissector_key_vlan *key;
++	struct flow_dissector_key_vlan *mask;
++
++	if (!dissector_uses_key(f->dissector, key_id))
++		return -EIO;
++
++	key = skb_flow_dissector_target(f->dissector,
++					key_id,
++					f->key);
++	mask = skb_flow_dissector_target(f->dissector,
++					 key_id,
++					 f->mask);
++
++	if (mask && key) {
++		if (mask->vlan_id == 0xfff)
++			patt->vid = key->vlan_id;
++		if (mask->vlan_priority == 0x7)
++			patt->prio = key->vlan_priority;
++		patt->tpid = key->vlan_tpid;
++	}
++
++	netdev_dbg(dev, "VLAN parsed, vid: %d, tpid: %x, prio: %d\n",
++		   patt->vid, patt->tpid, patt->prio);
++
++	return 0;
++}
++
++static int vlan_parse(struct net_device *dev,
++		      struct tc_cls_flower_offload *f,
++		      struct dp_pattern_vlan *patt)
++{
++	return __vlan_parse(dev, f, patt, FLOW_DISSECTOR_KEY_VLAN);
++}
++
++static int cvlan_parse(struct net_device *dev,
++		       struct tc_cls_flower_offload *f,
++		       struct dp_pattern_vlan *patt)
++{
++	return __vlan_parse(dev, f, patt, FLOW_DISSECTOR_KEY_CVLAN);
++}
++
++static void cookie_parse(struct net_device *dev,
++			 struct tc_cls_flower_offload *f,
++			 struct dp_act_vlan *act)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++
++	tcf_exts_to_list(f->exts, &actions);
++	list_for_each_entry(a, &actions, list) {
++		if (a->act_cookie) {
++			u8 *p = a->act_cookie->data;
++			int i;
++
++			if (a->act_cookie->len < 8) {
++				netdev_warn(dev, "%s: cookie is too short!\n",
++					    __func__);
++				continue;
++			}
++
++			/* Save first two words (64 bits) from cookie
++			 * data as cookie priority
++			 */
++			for (i = 7; i > -1; i--) {
++				u64 cookie_byte = *p;
++
++				act->sort_key |=
++					(cookie_byte << i * 8);
++				p++;
++			}
++			netdev_dbg(dev, "Cookie parsed: %llx\n",
++				   act->sort_key);
++			return;
++		}
++	}
++}
++
++#define IP_TOS_TO_DSCP 0xFC
++static void dscp_parse(struct net_device *dev,
++		       struct tc_cls_flower_offload *f,
++		       struct dp_act_vlan *act,
++		       const struct tc_action *a)
++{
++	struct flow_dissector_key_ip *key;
++	u32 dscp_value;
++
++	if (!dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_IP))
++		return;
++
++	key = skb_flow_dissector_target(f->dissector,
++					FLOW_DISSECTOR_KEY_IP,
++					f->key);
++
++	dscp_value = (key->tos & IP_TOS_TO_DSCP) >> 2;
++	act->dscp_pcp_map[dscp_value] =
++		((struct tcf_vlan *)a)->tcfv_push_prio;
++	act->dscp_pcp_map_valid[dscp_value] = true;
++	act->prio[act->push_n] = DERIVE_FROM_DSCP;
++	netdev_dbg(dev, "DSCP detected, value: %u, prio: %u\n",
++		   dscp_value, act->dscp_pcp_map[dscp_value]);
++}
++
++static void vlan_action_modify_prio_parse(struct net_device *dev,
++					  const struct tc_action *a,
++					  enum tc_flower_vlan_tag tag,
++					  int *prio)
++{
++	*prio = ((struct tcf_vlan *)a)->tcfv_push_prio;
++
++	if (*prio)
++		return;
++
++	if (tag == TC_VLAN_SINGLE_TAGGED)
++		*prio = CP_FROM_INNER;
++	else if (tag == TC_VLAN_DOUBLE_TAGGED)
++		*prio = CP_FROM_OUTER;
++}
++
++static int vlan_action_parse(struct net_device *dev,
++			     struct tc_cls_flower_offload *f,
++			     struct dp_act_vlan *act,
++			     enum tc_flower_vlan_tag tag)
++{
++	const struct tc_action *a;
++	LIST_HEAD(actions);
++
++	if (tc_no_actions(f->exts)) {
++		netdev_dbg(dev, "TC no actions!\n");
++		return -EIO;
++	}
++	netdev_dbg(dev, "TC actions count: %d\n",
++		   (f->exts)->nr_actions);
++
++	tcf_exts_to_list(f->exts, &actions);
++	list_for_each_entry(a, &actions, list) {
++		if (!is_tcf_vlan(a))
++			continue;
++
++		if (tcf_vlan_action(a) == TCA_VLAN_ACT_POP) {
++			act->act |= DP_VLAN_ACT_POP;
++			act->pop_n++;
++			netdev_dbg(dev, "POP action detected, pop_n: %d, act: %x\n",
++				   act->pop_n, act->act);
++			continue;
++		}
++
++		if (act->push_n >= DP_VLAN_NUM) {
++			netdev_warn(dev, "%s: push action overlod\n", __func__);
++			continue;
++		}
++
++		if (tcf_vlan_action(a) == TCA_VLAN_ACT_PUSH) {
++			act->act |= DP_VLAN_ACT_PUSH;
++			act->prio[act->push_n] =
++				((struct tcf_vlan *)a)->tcfv_push_prio;
++			netdev_dbg(dev, "PUSH action detected, push_n: %d, act: %x\n",
++				   act->push_n + 1, act->act);
++		} else if (tcf_vlan_action(a) == TCA_VLAN_ACT_MODIFY) {
++			act->act = DP_VLAN_ACT_POP | DP_VLAN_ACT_PUSH;
++			act->pop_n++;
++			vlan_action_modify_prio_parse(dev, a, tag,
++						      &act->prio[act->push_n]);
++			netdev_dbg(dev, "MODIFY action detected, push_n: %d, pop_n: %d, act: %x\n",
++				   act->push_n + 1, act->pop_n, act->act);
++		}
++
++		act->vid[act->push_n] = tcf_vlan_push_vid(a);
++		act->tpid[act->push_n] = tcf_vlan_push_proto(a);
++		act->dei[act->push_n] = 0;
++
++		netdev_dbg(dev, "PUSH action parsed, vid: %d, tpid: %x, prio: %d, dei: %d\n",
++			   act->vid[act->push_n],
++			   act->tpid[act->push_n],
++			   act->prio[act->push_n],
++			   act->dei[act->push_n]);
++
++		dscp_parse(dev, f, act, a);
++
++		act->push_n++;
++	}
++
++	return 0;
++}
++
++static void default_prio_parse(struct net_device *dev,
++			       struct tc_cls_flower_offload *f,
++			       int *prio)
++{
++	*prio = f->common.prio >> 16;
++	netdev_dbg(dev, "Default prio: %d\n", *prio);
++}
++
++int pon_qos_tc_vlan_untagged_prepare(struct net_device *dev,
++				     struct tc_cls_flower_offload *f,
++				     struct dp_tc_vlan *dp_vlan,
++				     struct dp_vlan0 *rule)
++{
++	u32 proto = f->common.protocol;
++	bool drop;
++	int err;
++
++	vlan_pattern_default_set(&rule->outer);
++	vlan_action_default_set(&rule->act);
++
++	if (proto != ETH_P_ALL)
++		rule->outer.proto = proto;
++
++	/* Can not drop the untagged packets from/to the LCT port because then
++	 * the LCT port would not work any more.
++	 */
++	if (fwd_drop_action_parse(dev, f, &rule->act)) {
++		drop = (rule->act.act == DP_VLAN_ACT_DROP) ? true : false;
++		if (drop && (pon_qos_lct_configure(dev, dp_vlan, rule) == 0))
++			rule->act.act = DP_VLAN_ACT_FWD;
++	} else {
++		err = vlan_action_parse(dev, f, &rule->act,
++					TC_VLAN_UNTAGGED);
++		if (err)
++			return err;
++	}
++
++	cookie_parse(dev, f, &rule->act);
++	default_prio_parse(dev, f, &rule->prio);
++
++	return 0;
++}
++
++int pon_qos_tc_vlan_untagged_flt_prepare(struct net_device *dev,
++					 struct tc_cls_flower_offload *f,
++					 struct dp_tc_vlan *dp_vlan,
++					 struct dp_vlan0 *rule)
++{
++	u32 proto = f->common.protocol;
++	int err;
++
++	vlan_pattern_default_set(&rule->outer);
++	vlan_action_default_set(&rule->act);
++
++	if (proto != ETH_P_ALL)
++		rule->outer.proto = proto;
++
++	if (!fwd_drop_action_parse(dev, f, &rule->act))
++		return -EINVAL;
++
++	err = vlan_action_parse(dev, f, &rule->act, TC_VLAN_UNTAGGED);
++	if (err)
++		return err;
++
++	default_prio_parse(dev, f, &rule->prio);
++
++	return 0;
++}
++
++int pon_qos_tc_vlan_single_tagged_prepare(struct net_device *dev,
++					  struct tc_cls_flower_offload *f,
++					  struct dp_vlan1 *rule)
++{
++	int err;
++
++	vlan_pattern_default_set(&rule->outer);
++	vlan_action_default_set(&rule->act);
++
++	fwd_drop_action_parse(dev, f, &rule->act);
++
++	err = vlan_parse(dev, f, &rule->outer);
++	if (err)
++		return err;
++
++	err = vlan_action_parse(dev, f, &rule->act,
++				TC_VLAN_SINGLE_TAGGED);
++	if (err)
++		return err;
++
++	rule->outer.proto = pon_qos_tc_get_ethtype(dev, f);
++
++	cookie_parse(dev, f, &rule->act);
++	default_prio_parse(dev, f, &rule->prio);
++
++	return 0;
++}
++
++int pon_qos_tc_vlan_single_tagged_flt_prepare(struct net_device *dev,
++					      struct tc_cls_flower_offload *f,
++					      struct dp_vlan1 *rule)
++{
++	int err;
++
++	vlan_pattern_default_set(&rule->outer);
++	vlan_action_default_set(&rule->act);
++
++	fwd_drop_action_parse(dev, f, &rule->act);
++
++	if (!fwd_drop_action_parse(dev, f, &rule->act))
++		return -EINVAL;
++
++	err = vlan_parse(dev, f, &rule->outer);
++	if (err)
++		return err;
++
++	rule->outer.tpid = DP_VLAN_PATTERN_NOT_CARE;
++
++	default_prio_parse(dev, f, &rule->prio);
++
++	return 0;
++}
++
++int pon_qos_tc_vlan_double_tagged_prepare(struct net_device *dev,
++					  struct tc_cls_flower_offload *f,
++					  struct dp_vlan2 *rule)
++{
++	int err;
++
++	vlan_pattern_default_set(&rule->outer);
++	vlan_pattern_default_set(&rule->inner);
++	vlan_action_default_set(&rule->act);
++
++	fwd_drop_action_parse(dev, f, &rule->act);
++
++	err = vlan_parse(dev, f, &rule->outer);
++	if (err)
++		return err;
++
++	err = cvlan_parse(dev, f, &rule->inner);
++	if (err)
++		return err;
++
++	err = vlan_action_parse(dev, f, &rule->act,
++				TC_VLAN_DOUBLE_TAGGED);
++	if (err)
++		return err;
++
++	rule->outer.proto = pon_qos_tc_get_ethtype(dev, f);
++
++	cookie_parse(dev, f, &rule->act);
++	default_prio_parse(dev, f, &rule->prio);
++
++	return 0;
++}
++
++int pon_qos_tc_vlan_double_tagged_flt_prepare(struct net_device *dev,
++					      struct tc_cls_flower_offload *f,
++					      struct dp_vlan2 *rule)
++{
++	int err;
++
++	vlan_pattern_default_set(&rule->outer);
++	vlan_pattern_default_set(&rule->inner);
++	vlan_action_default_set(&rule->act);
++
++	if (!fwd_drop_action_parse(dev, f, &rule->act))
++		return -EINVAL;
++
++	err = vlan_parse(dev, f, &rule->outer);
++	if (err)
++		return err;
++
++	rule->outer.tpid = DP_VLAN_PATTERN_NOT_CARE;
++
++	default_prio_parse(dev, f, &rule->prio);
++
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.h b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.h
+new file mode 100644
+index 000000000000..ff806a648fb3
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_prepare.h
+@@ -0,0 +1,52 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_VLAN_PREPARE_
++#define _PON_QOS_TC_VLAN_PREPARE_
++
++enum tc_flower_vlan_tag {
++	TC_VLAN_UNKNOWN = 0,
++	TC_VLAN_UNTAGGED = 1,
++	TC_VLAN_SINGLE_TAGGED = 2,
++	TC_VLAN_DOUBLE_TAGGED = 3,
++};
++
++bool pon_qos_tc_flower_is_ingress(struct net_device *dev,
++				  struct tc_cls_flower_offload *f);
++
++void pon_qos_tc_dp_vlan_prepare(struct net_device *dev,
++				struct dp_tc_vlan *dp_vlan,
++				bool ingress);
++
++enum tc_flower_vlan_tag
++pon_qos_tc_vlan_tag_get(struct net_device *dev,
++			struct tc_cls_flower_offload *f);
++
++int pon_qos_tc_vlan_untagged_prepare(struct net_device *dev,
++				     struct tc_cls_flower_offload *f,
++				     struct dp_tc_vlan *dp_vlan,
++				     struct dp_vlan0 *rule);
++int pon_qos_tc_vlan_untagged_flt_prepare(struct net_device *dev,
++					 struct tc_cls_flower_offload *f,
++					 struct dp_tc_vlan *dp_vlan,
++					 struct dp_vlan0 *rule);
++
++int pon_qos_tc_vlan_single_tagged_prepare(struct net_device *dev,
++					  struct tc_cls_flower_offload *f,
++					  struct dp_vlan1 *rule);
++int pon_qos_tc_vlan_single_tagged_flt_prepare(struct net_device *dev,
++					      struct tc_cls_flower_offload *f,
++					      struct dp_vlan1 *rule);
++
++int pon_qos_tc_vlan_double_tagged_prepare(struct net_device *dev,
++					  struct tc_cls_flower_offload *f,
++					  struct dp_vlan2 *rule);
++int pon_qos_tc_vlan_double_tagged_flt_prepare(struct net_device *dev,
++					      struct tc_cls_flower_offload *f,
++					      struct dp_vlan2 *rule);
++
++#endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
+new file mode 100644
+index 000000000000..5777112eab9f
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
+@@ -0,0 +1,267 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <linux/netdevice.h>
++#include <net/datapath_api_vlan.h>
++#include "pon_qos_tc_vlan_prepare.h"
++#include "pon_qos_tc_vlan_storage.h"
++
++struct pon_qos_vlan_storage_node
++*pon_qos_tc_vlan_storage_get(struct net_device *dev,
++			     bool ingress,
++			     enum tc_flower_vlan_tag tag,
++			     struct list_head *head)
++{
++	struct pon_qos_vlan_storage_node *p;
++
++	list_for_each_entry(p, head, list) {
++		if (dev == p->dev &&
++		    ingress == p->ingress &&
++		    tag == p->tag) {
++			netdev_dbg(dev, "VLAN storage found: %p\n", p);
++			return p;
++		}
++	}
++
++	netdev_dbg(dev, "VLAN storage not found\n");
++	return NULL;
++}
++
++int pon_qos_tc_vlan_storage_crt(struct net_device *dev,
++				bool ingress,
++				enum tc_flower_vlan_tag tag,
++				struct pon_qos_vlan_storage_node **node)
++{
++	*node = kzalloc(sizeof(*node), GFP_KERNEL);
++	if (!*node) {
++		netdev_err(dev, "Out of memory!\n");
++		return -ENOMEM;
++	}
++
++	(*node)->dev = dev;
++	(*node)->ingress = ingress;
++	(*node)->tag = tag;
++	INIT_LIST_HEAD(&(*node)->rules);
++
++	netdev_dbg(dev, "VLAN storage created: %p\n", *node);
++	return 0;
++}
++
++void pon_qos_tc_vlan_storage_del(struct net_device *dev,
++				 struct pon_qos_vlan_storage_node *node)
++{
++	if (node->rule_cnt > 0)
++		return;
++
++	if (!list_empty(&node->list))
++		netdev_warn(dev, "%s: list not empty!\n", __func__);
++
++	netdev_dbg(dev, "VLAN storage deleted: %p\n", node);
++	list_del(&node->list);
++	kfree(node);
++}
++
++#define FILTER_OUTER_PRIO(x) (((x) >> 60) & 0xF)
++#define FILTER_OUTER_VID(x) (((x) >> 47) & 0x1FFF)
++#define FILTER_OUTER_TPID(x) (((x) >> 44) & 0x7)
++#define FILTER_INNER_PRIO(x) (((x) >> 28) & 0xF)
++#define FILTER_INNER_VID(x) (((x) >> 15) & 0x1FFF)
++#define FILTER_INNER_TPID(x) (((x) >> 12) & 0x7)
++#define FILTER_ETHERTYPE(x) (((x) >> 0) & 0xF)
++#define FILTER_PRIO_IGNORE 15
++#define FILTER_PRIO_DEFAULT 14
++#define FILTER_ETHERTYPE_ANY 0
++#define FILTER_VID_ANY 4096
++#define FILTER_TPID_ANY 0
++
++/* This sorting method although not strictly following the OMCI standard
++ * is preferred and enabled by default. When sorting, it will compare by VID
++ * first and then by priority.
++ */
++static int cookie_cmp(u64 a, u64 b)
++{
++	unsigned short vid_a, vid_b;
++
++	if (((FILTER_OUTER_PRIO(a) == 15) || (FILTER_OUTER_PRIO(a) == 14)) &&
++	    ((FILTER_INNER_PRIO(a) == 15) || (FILTER_INNER_PRIO(a) == 14))) {
++		vid_a = 4097;
++	} else {
++		if ((FILTER_OUTER_VID(a) < 4096) &&
++		    (FILTER_OUTER_PRIO(a) != 15)) {
++			vid_a = FILTER_OUTER_VID(a);
++		} else {
++			vid_a = FILTER_INNER_VID(a);
++		}
++	}
++
++	if (((FILTER_OUTER_PRIO(b) == 15) || (FILTER_OUTER_PRIO(b) == 14)) &&
++	    ((FILTER_INNER_PRIO(b) == 15) || (FILTER_INNER_PRIO(b) == 14))) {
++		vid_b = 4097;
++	} else {
++		if ((FILTER_OUTER_VID(b) < 4096) &&
++		    (FILTER_OUTER_PRIO(b) != 15)) {
++			vid_b = FILTER_OUTER_VID(b);
++		} else {
++			vid_b = FILTER_INNER_VID(b);
++		}
++	}
++
++	if (vid_a != vid_b)
++		return (vid_a - vid_b);
++	else if (FILTER_OUTER_PRIO(a) != FILTER_OUTER_PRIO(b))
++		return (FILTER_OUTER_PRIO(a) - FILTER_OUTER_PRIO(b));
++	else if (FILTER_INNER_PRIO(a) != FILTER_INNER_PRIO(b))
++		return (FILTER_INNER_PRIO(a) - FILTER_INNER_PRIO(b));
++	else if (FILTER_OUTER_TPID(a) != FILTER_OUTER_TPID(b))
++		return (FILTER_OUTER_TPID(b) - FILTER_OUTER_TPID(a));
++	else if (FILTER_INNER_TPID(a) != FILTER_INNER_TPID(b))
++		return (FILTER_INNER_TPID(b) - FILTER_INNER_TPID(a));
++
++	return (FILTER_ETHERTYPE(b) - FILTER_ETHERTYPE(a));
++}
++
++static int prio_cmp(int a, int b)
++{
++	if (a < b)
++		return -1;
++
++	if (a > b)
++		return 1;
++
++	return 0;
++}
++
++#define PON_QOS_TC_FILTER_DEF_PRIO_THRESHOLD 64000
++
++enum rule_sort_category {
++	/* Non default rules are placed first */
++	SORT_NONDEFAULT = 0,
++	/* Then we have rules with
++	 * prio > QOS_MGR_TC_FILTER_DEF_PRIO_THRESHOLD
++	 * defined by the userspace application.
++	 */
++	SORT_DEFAULT = 1,
++	/* Then there is a zero tagged default rule defined by ITU-T G.988 */
++	SORT_DEFAULT_G988_ZERO = 2,
++	/* Then there is a single tagged default rule defined by ITU-T G.988 */
++	SORT_DEFAULT_G988_SINGLE = 3,
++	/* Then there is a double tagged default rule defined by ITU-T G.988 */
++	SORT_DEFAULT_G988_DOUBLE = 4,
++};
++
++/* When we sort rules, we can't only use a cookie. It matters if
++ * the rule is the non-default, default zero, default single or
++ * default double tagged. The default rules shall go always after non
++ * default rules to ensure correct behavior.
++ * See enum rule_sort_category for details
++ */
++static enum rule_sort_category rule_sort_category_get(int prio, u64 cookie_prio)
++{
++	u64 filter_outer_prio = FILTER_OUTER_PRIO(cookie_prio);
++	u64 filter_outer_vid = FILTER_OUTER_VID(cookie_prio);
++	u64 filter_outer_tpid = FILTER_OUTER_TPID(cookie_prio);
++	u64 filter_inner_prio = FILTER_INNER_PRIO(cookie_prio);
++	u64 filter_inner_vid = FILTER_INNER_VID(cookie_prio);
++	u64 filter_inner_tpid = FILTER_INNER_TPID(cookie_prio);
++	u64 filter_ethertype = FILTER_ETHERTYPE(cookie_prio);
++
++	/* If non-default rule */
++	if (prio <= PON_QOS_TC_FILTER_DEF_PRIO_THRESHOLD)
++		return SORT_NONDEFAULT;
++
++	/* If default untagged Ext. Vlan rule */
++	if (filter_outer_prio == FILTER_PRIO_IGNORE &&
++	    filter_inner_prio == FILTER_PRIO_IGNORE &&
++	    filter_ethertype == FILTER_TPID_ANY)
++		return SORT_DEFAULT_G988_ZERO;
++
++	/* If default single tagged Ext. Vlan rule */
++	if (filter_outer_prio == FILTER_PRIO_IGNORE &&
++	    filter_inner_prio == FILTER_PRIO_DEFAULT &&
++	    filter_inner_vid == FILTER_VID_ANY &&
++	    filter_inner_tpid == FILTER_TPID_ANY &&
++	    filter_ethertype == FILTER_ETHERTYPE_ANY)
++		return SORT_DEFAULT_G988_SINGLE;
++
++	/* If default double tagged Ext. Vlan rule */
++	if (filter_outer_prio == FILTER_PRIO_DEFAULT &&
++	    filter_outer_vid == FILTER_VID_ANY &&
++	    filter_outer_tpid == FILTER_TPID_ANY &&
++	    filter_inner_prio == FILTER_PRIO_DEFAULT &&
++	    filter_inner_vid == FILTER_VID_ANY &&
++	    filter_inner_tpid == FILTER_TPID_ANY &&
++	    filter_ethertype == FILTER_ETHERTYPE_ANY)
++		return SORT_DEFAULT_G988_DOUBLE;
++
++	/* If a rule is default, but doesn't match the above
++	 * 3 categories then we assign it to SORT_DEFAULT category, so
++	 * that it is placed after the non-default rules but before
++	 * last-resort default rules.
++	 */
++	return SORT_DEFAULT;
++}
++
++static int sort_category_cmp(int prio_a, u64 a, int prio_b, u64 b)
++{
++	return rule_sort_category_get(prio_a, a) -
++	       rule_sort_category_get(prio_b, b);
++}
++
++int pon_qos_tc_cookie_cmp0(void *priv, struct list_head *lh_a,
++			   struct list_head *lh_b)
++{
++	struct dp_vlan0 *la = list_entry(lh_a, struct dp_vlan0, list);
++	struct dp_vlan0 *lb = list_entry(lh_b, struct dp_vlan0, list);
++	int ret;
++
++	ret = sort_category_cmp(la->prio, la->act.sort_key, lb->prio,
++				lb->act.sort_key);
++	if (ret != 0)
++		return ret;
++
++	if (la->act.sort_key != 0 && lb->act.sort_key != 0)
++		return cookie_cmp(la->act.sort_key, lb->act.sort_key);
++
++	return prio_cmp(la->prio, lb->prio);
++}
++
++int pon_qos_tc_cookie_cmp1(void *priv, struct list_head *lh_a,
++			   struct list_head *lh_b)
++{
++	struct dp_vlan1 *la = list_entry(lh_a, struct dp_vlan1, list);
++	struct dp_vlan1 *lb = list_entry(lh_b, struct dp_vlan1, list);
++	int ret;
++
++	ret = sort_category_cmp(la->prio, la->act.sort_key, lb->prio,
++				lb->act.sort_key);
++	if (ret != 0)
++		return ret;
++
++	if (la->act.sort_key != 0 && lb->act.sort_key != 0)
++		return cookie_cmp(la->act.sort_key, lb->act.sort_key);
++
++	return prio_cmp(la->prio, lb->prio);
++}
++
++int pon_qos_tc_cookie_cmp2(void *priv, struct list_head *lh_a,
++			   struct list_head *lh_b)
++{
++	struct dp_vlan2 *la = list_entry(lh_a, struct dp_vlan2, list);
++	struct dp_vlan2 *lb = list_entry(lh_b, struct dp_vlan2, list);
++	int ret;
++
++	ret = sort_category_cmp(la->prio, la->act.sort_key, lb->prio,
++				lb->act.sort_key);
++	if (ret != 0)
++		return ret;
++
++	if (la->act.sort_key != 0 && lb->act.sort_key != 0)
++		return cookie_cmp(la->act.sort_key, lb->act.sort_key);
++
++	return prio_cmp(la->prio, lb->prio);
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+new file mode 100644
+index 000000000000..a7391ab847a7
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+@@ -0,0 +1,45 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#ifndef _PON_QOS_TC_VLAN_STORAGE_
++#define _PON_QOS_TC_VLAN_STORAGE_
++
++#include "pon_qos_tc_vlan_prepare.h"
++
++struct pon_qos_vlan_storage_node {
++	struct net_device *dev;
++	bool ingress;
++	enum tc_flower_vlan_tag tag;
++	struct list_head rules;
++	int rule_cnt;
++	struct list_head list;
++};
++
++struct pon_qos_vlan_storage_node
++*pon_qos_tc_vlan_storage_get(struct net_device *dev,
++			     bool ingress,
++			     enum tc_flower_vlan_tag tag,
++			     struct list_head *head);
++
++int pon_qos_tc_vlan_storage_crt(struct net_device *dev,
++				bool ingress,
++				enum tc_flower_vlan_tag tag,
++				struct pon_qos_vlan_storage_node **node);
++
++void pon_qos_tc_vlan_storage_del(struct net_device *dev,
++				 struct pon_qos_vlan_storage_node *node);
++
++int pon_qos_tc_cookie_cmp0(void *priv, struct list_head *lh_a,
++			   struct list_head *lh_b);
++
++int pon_qos_tc_cookie_cmp1(void *priv, struct list_head *lh_a,
++			   struct list_head *lh_b);
++
++int pon_qos_tc_cookie_cmp2(void *priv, struct list_head *lh_a,
++			   struct list_head *lh_b);
++
++#endif
+diff --git a/include/net/datapath_api_vlan.h b/include/net/datapath_api_vlan.h
+index 528ad41ea050..e5df2de65ec1 100644
+--- a/include/net/datapath_api_vlan.h
++++ b/include/net/datapath_api_vlan.h
+@@ -96,30 +96,43 @@ struct dp_act_vlan {
+ 				*  copy from recv pkt's inner tag(CP_FROM_INNER)
+ 				*  copy from recv pkt's outer tag(CP_FROM_OUTER)
+ 				*/
+-	unsigned char dscp_pcp_map[64]; /* DSCP to P-bit mapping table */
++#define DP_DSCP_MAP 64
++	unsigned char dscp_pcp_map[DP_DSCP_MAP]; /*! DSCP to P-bit mapping
++						  *  for hardware table
++						  */
++	bool dscp_pcp_map_valid[DP_DSCP_MAP]; /*! DSCP to P-bit mapping
++					       *  validity table
++					       */
+ 	struct dp_act_reassign ract; /* VLAN reassignment action */
++	u64 sort_key; /*! Special user key used to sort rules */
+ };
+ 
+ #define DP_VLAN_DEF_RULE 1
+ struct dp_vlan0 {
++	int prio; /*! Base rule priority */
+ 	int def;		/* default rule for untagged packet */
+ 	struct dp_pattern_vlan outer;	/* match pattern.
+ 					 * only proto is valid for this case
+ 					 */
+ 	struct dp_act_vlan act; /*action once matched */
++	struct list_head list; /*! Linux linked list */
+ };
+ 
+ struct dp_vlan1 {
++	int prio; /*! Base rule priority */
+ 	int def;		/* default rule for 1-tag packet */
+ 	struct dp_pattern_vlan outer;	/*outer VLAN match pattern */
+ 	struct dp_act_vlan act; /*action once matched */
++	struct list_head list; /*! Linux linked list */
+ };
+ 
+ struct dp_vlan2 {
++	int prio; /*! Base rule priority */
+ 	int def;		/* default rule for 2-tag packet */
+ 	struct dp_pattern_vlan outer;	/*outer VLAN match pattern */
+ 	struct dp_pattern_vlan inner;	/*inner VLAN match pattern */
+ 	struct dp_act_vlan act; /*action once matched */
++	struct list_head list; /*! Linux linked list */
+ };
+ 
+ struct dp_tc_vlan {
+@@ -149,7 +162,13 @@ struct dp_tc_vlan {
+ 				      */
+ 	struct dp_vlan1 *vlan1_list; /* single vlan matching rules */
+ 	struct dp_vlan2 *vlan2_list; /* double vlan matching rules */
+-
++#if IS_ENABLED(CONFIG_PON_QOS)
++	struct list_head *vlan0_head; /* non-vlan matching rules,
++				       * ie, ether type matching only
++				       */
++	struct list_head *vlan1_head; /* single vlan matching rules */
++	struct list_head *vlan2_head; /* double vlan matching rules */
++#endif /* IS_ENABLED(CONFIG_PON_QOS) */
+ };
+ 
+ /* API dp_vlan_set: Asymmetric VLAN handling via TC command

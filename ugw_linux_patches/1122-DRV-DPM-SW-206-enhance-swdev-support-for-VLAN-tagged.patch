@@ -1,0 +1,437 @@
+From 7be64dfdfb64b08a6679b5f09cbe9a7e54ea151e Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Fri, 3 Apr 2020 23:07:35 +0800
+Subject: [PATCH] DRV_DPM_SW-206 - enhance swdev support for VLAN tagged
+ devices(DRV_DPM_SW-222)
+
+---
+ drivers/net/datapath/dpm/datapath_api.c            |   7 +-
+ drivers/net/datapath/dpm/datapath_notifier.c       |   6 +
+ drivers/net/datapath/dpm/datapath_swdev.c          | 198 ++++++++++++---------
+ drivers/net/datapath/dpm/datapath_swdev.h          |   2 +
+ .../net/datapath/dpm/gswip31/datapath_ext_vlan.c   |   3 +-
+ .../net/datapath/dpm/gswip31/datapath_switchdev.c  |   4 +-
+ 6 files changed, 130 insertions(+), 90 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 383df1602ba7..6ed69de0233d 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -702,6 +702,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 			sif->swdev_en = port_info->swdev_en;
+ #endif
+ 		port_info->status = PORT_SUBIF_REGISTERED;
++		sif->cpu_port_en = 1;
+ 		subif_id->port_id = port_id;
+ 		subif_id->subif = sif->subif;
+ 		/* set port as LCT port */
+@@ -2607,6 +2608,7 @@ int dp_set_bp_attr(struct dp_bp_attr *conf, u32 flag)
+ 	dp_subif_t subif = {0};
+ 	int ret = DP_SUCCESS;
+ 	struct inst_info *dp_info;
++	int vap;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("%s failed: datapath not initialized yet\n", __func__);
+@@ -2627,8 +2629,9 @@ int dp_set_bp_attr(struct dp_bp_attr *conf, u32 flag)
+ 	}
+ 
+ 	port_info = get_dp_port_info(conf->inst, subif.port_id);
+-	port_info->subif_info->cpu_port_en = conf->en;
+-
++	vap = GET_VAP(subif.subif, port_info->vap_offset,
++		      port_info->vap_mask);
++	get_dp_port_subif(port_info, vap)->cpu_port_en = conf->en;
+ 	DP_LIB_UNLOCK(&dp_lock);
+ 
+ 	dp_info = get_dp_prop_info(subif.inst);
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index eb40c7f3a285..c5c587b4c4ad 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -138,6 +138,12 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 			}
+ 		}
+ 		dp_info->dp_mac_reset(0, dp_dev->fid, dp_dev->inst, addr);
++		/* de-register vlan device from DP if vlan interface removed
++		 * when in linux bridge
++		 */
++		br_dev = netdev_master_upper_dev_get(dev);
++		if (br_dev)
++			dp_del_br_if(dev, br_dev, dp_dev->inst, dp_dev->bp);
+ 		break;
+ 	case NETDEV_CHANGEUPPER:
+ 		dp_info->dp_mac_reset(0, dp_dev->fid, dp_dev->inst, addr);
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index 86a7d8d0d408..ed9c47f15a15 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -119,7 +119,6 @@ struct br_info *dp_swdev_bridge_entry_lookup(char *br_name)
+ 	int i = 0;
+ 
+ 	idx = dp_swdev_cal_hash(br_name);
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "hash index:%d\n", idx);
+ 	for (i = 0; i < DP_MAX_INST; i++) {
+ 		tmp = (&g_bridge_id_entry_hash_table[i][idx]);
+ 		hlist_for_each_entry(br_item, tmp, br_hlist) {
+@@ -136,8 +135,6 @@ struct br_info *dp_swdev_bridge_entry_lookup(char *br_name)
+ 			}
+ 		}
+ 	}
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "No hash entry found(%s)\n",
+-		 br_name);
+ 	return NULL;
+ }
+ 
+@@ -286,7 +283,12 @@ static int dp_swdev_cfg_vlan(struct bridge_id_entry_item *br_item,
+ 	u32 idx, inst;
+ 	int vap;
+ 	struct inst_info *i_info;
++	struct pmac_port_info *p_info;
++	struct dp_bp_attr conf;
+ 
++	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
++	if (p_info->swdev_en != 1)
++		return 0;
+ 	if (br_item->flags & LOGIC_DEV_REGISTER) {
+ 		idx = dp_dev_hash(dev, NULL);
+ 		dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
+@@ -304,7 +306,14 @@ static int dp_swdev_cfg_vlan(struct bridge_id_entry_item *br_item,
+ 			      get_dp_port_info(inst, dp_dev->ep)->vap_mask);
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV, "vap=%d ep=%d bp=%d\n",
+ 			 vap, dp_dev->ep, dp_dev->bp);
+-		i_info->dp_cfg_vlan(br_item->inst, vap, dp_dev->ep);
++		if (br_item->flags & CPU_PORT_DISABLE) {
++		/* For vUNI vlan dev need to remove CPU from bp member list */
++			conf.inst = inst;
++			conf.dev = dev;
++			conf.en = 0;
++			i_info->dp_set_bp_attr(&conf, br_item->portid, 0);
++		}
++		i_info->dp_cfg_vlan(inst, vap, dp_dev->ep);
+ 	}
+ 	return 0;
+ }
+@@ -435,6 +444,54 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 	return 0;
+ }
+ 
++/* this API handles de-registration of vlan device created during add_if */
++static int dp_del_swdev_reg_vlan(struct bridge_id_entry_item *br_item,
++				 struct net_device *dev, u8 *addr)
++{
++	struct net_device *base;
++	dp_subif_t subif = {0};
++	struct pmac_port_info *p_info;
++
++	if (br_item) {
++		swdev_lock();
++		dp_swdev_clr_gswip_cfg(br_item, addr);
++		/* De-Register Logical Dev i.e. VLAN DEV
++		 * if it is registered
++		 */
++		if (!(br_item->flags & LOGIC_DEV_REGISTER)) {
++			swdev_unlock();
++			return 0;
++		}
++		base = get_base_dev(dev, -1);
++		DP_DEBUG(DP_DBG_FLAG_SWDEV, "base dev name:%s\n",
++			 base ? base->name : "NULL");
++		if (!base)
++			base = dev;
++		dp_swdev_cfg_vlan(br_item, dev);
++		swdev_unlock();
++		if (dp_get_netif_subifid(base, NULL, NULL,
++					NULL, &subif, 0)) {
++			pr_err("dp_get_netif_subifid fail:%s(%s)\n",
++			       base->name, __func__);
++			/*Cannot Return -EOPNOTSUPP
++			 * in swdev commit stage
++			 */
++			return 0;
++		}
++		p_info = get_dp_port_info(subif.inst, subif.port_id);
++		if (dp_register_subif(p_info->owner, dev, dev->name,
++				      &subif, DP_F_DEREGISTER)) {
++			pr_err("dp_register_subif fail: %s(%s)\n",
++			       dev->name, __func__);
++			/* Cannot Return -EOPNOTSUPP
++			 * in swdev commit stage
++			 */
++			return 0;
++		}
++	}
++	return 0;
++}
++
+ static int dp_swdev_add_if(struct net_device *dev,
+ 			   const struct switchdev_attr *attr,
+ 			   struct switchdev_trans *trans,
+@@ -473,24 +530,21 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 		res = dp_get_netif_subifid(base, NULL, NULL, NULL,
+ 					   &subif, 0);
+ 		if (res) {
+-			pr_err("dp_get_netif_subifid fail:%s\n",
+-			       base->name);
++			pr_err("dp_get_netif_subifid fail:%s\n", base->name);
+ 			return -EOPNOTSUPP;
+ 		}
+ 		port = subif.port_id;
+ 		inst = subif.inst;
+ 		subif.subif = -1;
+-		if (dp_register_subif(
+-			get_dp_port_info(inst, port)->owner,
+-			dev, dev->name, &subif,
+-			DP_F_SUBIF_LOGICAL)) {
++		p_info = get_dp_port_info(inst, port);
++		if (dp_register_subif(p_info->owner, dev, dev->name,
++				      &subif, DP_F_SUBIF_LOGICAL)) {
+ 			pr_err("dp_register_subif fail: %s\n",
+-			       dev->name);
++					dev->name);
+ 			return -EOPNOTSUPP;
+ 		}
+ 		flag = LOGIC_DEV_REGISTER;
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "registered subif,bp=%d port=%d\n",
++		DP_DEBUG(DP_DBG_FLAG_SWDEV, "registered subif,bp=%d port=%d\n",
+ 			 subif.bport, subif.port_id);
+ 	}
+ 	p_info = get_dp_port_info(subif.inst, subif.port_id);
+@@ -509,23 +563,23 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 		/* current bridge member port*/
+ 		br_item->portid = subif.bport;
+ 		br_item->dp_port = subif.port_id;
+-
+-		/* Alloc Flag is needed by HAL layer to see the interface is
+-		 * LAN or GPON or EPON
+-		 */
+-		br_item->priv_flag = dev->priv_flags;
++		/* dev->priv_flags should be set only for base dev */
++		if (!(flag & LOGIC_DEV_REGISTER))
++			br_item->priv_flag = dev->priv_flags;
+ 
+ 		swdev_lock();
+ 		br_info = dp_swdev_bridge_entry_lookup(br_dev->name);
+ 		br_item->no_loop_flag = p_info->loop_dis;
+ 		br_item->hairpin = p_info->bp_hairpin_cap;
++		if (!sif->cpu_port_en)
++			br_item->flags |= CPU_PORT_DISABLE;
+ 		if (br_info) {
+ 			strcpy(br_item->br_device_name,
+ 			       br_info->br_device_name);
+ 			br_item->fid = br_info->fid;
+-			br_item->flags = flag;
++			br_item->flags |= flag;
+ 		} else {
+-			br_item->flags = ADD_BRENTRY | flag;
++			br_item->flags |= ADD_BRENTRY | flag;
+ 			if (sif->swdev_en == 1) {
+ 				br_id = i_info->swdev_alloc_bridge_id(
+ 							br_item->inst);
+@@ -568,19 +622,21 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 	return 0;
+ }
+ 
++/* flags = DP_SWDEV_BRIDGE_ITEM - britem pointer is valid
++ * flags = 0 - trans pointer is valid
++ */
+ static int dp_swdev_del_if(struct net_device *dev,
+-			   const struct switchdev_attr *attr,
+ 			   struct switchdev_trans *trans,
+-			   struct net_device *br_dev)
++			   struct net_device *br_dev,
++			   struct bridge_id_entry_item *britem,
++			   int flags)
+ {
+ 	struct br_info *br_info;
+ 	struct pmac_port_info *p_info;
+ 	struct bridge_id_entry_item *br_item;
+-	struct net_device *base;
+ 	struct bridge_member_port *temp_list = NULL;
+ 	dp_subif_t subif = {0};
+ 	int vap = 0;
+-	int port, inst;
+ 	u8 *addr = (u8 *)dev->dev_addr;
+ 	struct dp_subif_info *sif;
+ 
+@@ -624,9 +680,19 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 				}
+ 			}
+ 		} else {
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-				 "No bridge entry or bport to delete\r\n");
+-			br_item->flags = BRIDGE_NO_ACTION;
++			/* Check if dev is vlan_dev,
++			 * de-register vlan device with datapath
++			 */
++			if (is_vlan_dev(dev)) {
++				br_item->inst = subif.inst;
++				br_item->dp_port = subif.port_id;
++				br_item->flags = LOGIC_DEV_REGISTER |
++							BRIDGE_NO_ACTION;
++			} else {
++				DP_DEBUG(DP_DBG_FLAG_SWDEV,
++					 "No bridge entry or bp to delete\r\n");
++				br_item->flags = BRIDGE_NO_ACTION;
++			}
+ 		}
+ 		/*TODO check return value & enqueue*/
+ 		switchdev_trans_item_enqueue(trans, br_item, dp_kfree,
+@@ -634,56 +700,13 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 		swdev_unlock();
+ 		return 0;
+ 	}
+-	/*Check bridge port exists otherwise register device with datapath
+-	 *i.e. only in case of new VLAN interface
+-	 */
+-	/*configure switch in commit phase and it cannot return failure*/
+-	swdev_lock();
+-	br_item = switchdev_trans_item_dequeue(trans);
+-	if (br_item) {
+-		if (sif->swdev_en == 1)
+-			dp_swdev_clr_gswip_cfg(br_item, addr);
+-		/* De-Register Logical Dev i.e. VLAN DEV
+-		 * if it is registered
+-		 */
+-		if (br_item->flags & LOGIC_DEV_REGISTER) {
+-			base = get_base_dev(dev, -1);
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-				 "base dev name:%s\n",
+-				 base ? base->name : "NULL");
+-			if (!base)
+-				base = dev;
+-			/*the previous sequence was running into a deadlock in
+-			 * taking the swdev_lock
+-			 */
+-			dp_swdev_cfg_vlan(br_item, dev);
+-			swdev_unlock();
+-			if (dp_get_netif_subifid(base, NULL, NULL,
+-						 NULL, &subif, 0)) {
+-				pr_err("dp_get_netif_subifid fail:%s\n",
+-				       base->name);
+-				/*Cannot Return -EOPNOTSUPP
+-				 * in swdev commit stage
+-				 */
+-				return 0;
+-			}
+-			port = subif.port_id;
+-			inst = subif.inst;
+-			if (dp_register_subif(
+-					get_dp_port_info(inst, port)->owner,
+-					dev, dev->name, &subif,
+-					DP_F_DEREGISTER)) {
+-				pr_err("dp_register_subif fail: %s\n",
+-				       dev->name);
+-				/* Cannot Return -EOPNOTSUPP
+-				 * in swdev commit stage
+-				 */
+-				return 0;
+-			}
+-			swdev_lock();
+-		}
+-	}
+-	swdev_unlock();
++	if (flags == DP_SWDEV_BRIDGE_ITEM)
++		br_item = britem;
++	else
++		/*configure switch in commit phase & it cannot return failure*/
++		br_item = switchdev_trans_item_dequeue(trans);
++	if (sif->swdev_en)
++		dp_del_swdev_reg_vlan(br_item, dev, addr);
+ 	return 0;
+ }
+ 
+@@ -693,7 +716,6 @@ int dp_del_br_if(struct net_device *dev, struct net_device *br_dev,
+ 	struct br_info *br_info;
+ 	struct bridge_id_entry_item *br_item;
+ 	struct bridge_member_port *temp_list = NULL;
+-	u8 *addr = (u8 *)dev->dev_addr;
+ 
+ 	br_item = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_item), GFP_ATOMIC);
+ 	if (!br_item)
+@@ -714,14 +736,18 @@ int dp_del_br_if(struct net_device *dev, struct net_device *br_dev,
+ 			}
+ 		}
+ 	} else {
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "No bridge entry or bport to delete\r\n");
+-		br_item->flags = BRIDGE_NO_ACTION;
++		if (is_vlan_dev(dev)) {
++			br_item->inst = inst;
++			br_item->flags = LOGIC_DEV_REGISTER |
++				BRIDGE_NO_ACTION;
++		} else {
++			DP_DEBUG(DP_DBG_FLAG_SWDEV,
++					"No bridge entry or bport to delete\r\n");
++			br_item->flags = BRIDGE_NO_ACTION;
++		}
+ 	}
+-
+-	if (br_item)
+-		dp_swdev_clr_gswip_cfg(br_item, addr);
+ 	swdev_unlock();
++	dp_swdev_del_if(dev, NULL, br_dev, br_item, DP_SWDEV_BRIDGE_ITEM);
+ 	devm_kfree(&g_dp_dev->dev, br_item);
+ 	return 0;
+ }
+@@ -837,7 +863,7 @@ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 		/* STP STATE disabled or ifconfig DOWN - del bridge*/
+ 		else if (attr->u.stp_state == BR_STATE_DISABLED) {
+ 			err = dp_swdev_del_if(attr->orig_dev,
+-					      attr, trans, br_dev);
++					      trans, br_dev, NULL, 0);
+ 			if (err != 0)
+ 				err = -EOPNOTSUPP;
+ 		} else {
+@@ -898,6 +924,8 @@ static int dp_swdev_port_attr_get(struct net_device *dev,
+ 		br_info = dp_swdev_bridge_entry_lookup(br_dev->name);
+ 		if (!br_info)
+ 			return 0;
++		if (br_info->fid < 0)
++			return -EOPNOTSUPP;
+ 		attr->u.ppid.id_len = sizeof(br_info->fid);
+ 		memcpy(&attr->u.ppid.id, &br_info->fid, attr->u.ppid.id_len);
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.h b/drivers/net/datapath/dpm/datapath_swdev.h
+index 4057354e3e3a..b26e43209841 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.h
++++ b/drivers/net/datapath/dpm/datapath_swdev.h
+@@ -22,7 +22,9 @@
+ #define DEL_BRENTRY	0x00000002
+ #define BRIDGE_NO_ACTION 0x00000004
+ #define LOGIC_DEV_REGISTER 0x00000008
++#define CPU_PORT_DISABLE   0x00000010
+ 
++#define DP_SWDEV_BRIDGE_ITEM 1
+ struct bridge_id_entry_item {
+ 	u8 br_device_name[IFNAMSIZ];
+ 	u16 fid;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ext_vlan.c b/drivers/net/datapath/dpm/gswip31/datapath_ext_vlan.c
+index 71f605c193c5..733e8f1bb02e 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ext_vlan.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ext_vlan.c
+@@ -615,6 +615,7 @@ int set_gswip_ext_vlan(struct core_ops *ops, struct ext_vlan_info *vlan,
+ 	vlan->priv = new_priv;
+ 
+ 	/* free old private data if any */
+-	devm_kfree(&g_dp_dev->dev, (old_priv));
++	if (old_priv)
++		devm_kfree(&g_dp_dev->dev, (old_priv));
+ 	return ret;
+ }
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+index 912911866771..8dae0c28247f 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+@@ -488,8 +488,8 @@ int dp_gswip_ext_vlan(int inst, int vap, int ep)
+ 	vlan->n_vlan2 = v2;
+ 	vlan->bp = sif->bp;
+ 	vlan->logic_port = port->port_id;
+-	vlan->subif_grp = sif->subif;/*subif value*/
+-
++	/*subif value*/
++	vlan->subif_grp = GET_VAP(sif->subif, port->vap_offset, port->vap_mask);
+ 	if (sif->swdev_priv)
+ 		vlan->priv = sif->swdev_priv;
+ 	else

@@ -1,0 +1,1793 @@
+From f5e6888ec598df85e1541e137cedf9accff51019 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Sun, 22 Mar 2020 11:06:12 +0200
+Subject: [PATCH] PONRTSYS-7747: Fix PPv4 buffer manager policy reset
+
+And add new verification test for buffers pools
+
+Signed-off-by: Emergi Idan <idan.emergi@intel.com>
+---
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c  | 775 ++++++++++++++-------
+ .../pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c   |  87 ++-
+ .../pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h  |  35 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c   |  19 +
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  |  55 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h  |  23 +-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |   2 +-
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.c        | 114 ++-
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.h        |  22 +-
+ 9 files changed, 755 insertions(+), 377 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+index ba9fd894373b..d5948da22303 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+@@ -43,11 +43,11 @@ static struct workqueue_struct *bmgr_wq;
+ /**
+  * @brief This structure is used to pass data to the work queue
+  * @work work queue structure
+- * @policy_reset_id policy to reset
++ * @policy_id policy to reset
+  */
+ struct policy_reset_action {
+ 	struct delayed_work work;
+-	u16    policy_reset_id;
++	u16    policy_id;
+ 	void   (*cb)(s32 ret);
+ };
+ 
+@@ -89,6 +89,24 @@ static inline bool __bmgr_is_ready(void)
+ 	return false;
+ }
+ 
++static inline bool bmgr_is_pool_id_valid(u32 id)
++{
++	if (likely(id < db->cfg.max_pools))
++		return true;
++
++	pr_err("Invalid pool id %d\n", id);
++	return false;
++}
++
++static inline bool bmgr_is_policy_id_valid(u32 id)
++{
++	if (likely(id < db->cfg.max_policies))
++		return true;
++
++	pr_err("Invalid policy id %d\n", id);
++	return false;
++}
++
+ /**
+  * @brief Check wheather pool parameters are valid
+  * @param pool_params: Pool param from user
+@@ -202,6 +220,80 @@ static s32 __bmgr_pool_pop_enable(u8 pool_id, bool enable)
+ 	return 0;
+ }
+ 
++/**
++ * @brief get pool pop status
++ * @param pool_id: Pool ID
++ * @param enable: out arg, true if enabled, false if disabled
++ * @return 0 on success, other error code on failure
++ */
++static s32 bmgr_pool_pop_status_get(u8 pool_id, bool *enable)
++{
++	*enable = true;
++
++	/* Pool Pop Enable */
++	if (db->cfg.pool_pop_hw_en)
++		return bm_pool_pop_status_get(pool_id, enable);
++
++	return 0;
++}
++
++/**
++ * @brief Pause a group, disable popping buffers from the pool
++ * @param pool the pool DB ptr
++ * @param pause to pause or not
++ * @param validate validate if all resources are back in the pool
++ * @return s32 0 on success, error code otherwise
++ */
++static s32 pool_pause(struct bmgr_pool_db_entry *pool, bool pause,
++		      bool validate)
++{
++	struct pp_bmgr_pool_stats pool_stats;
++	bool pop_enable, pool_pop_enable;
++	s32 ret = 0;
++
++	/* pausing pool means to disable popping from it, so, pause
++	 * means disable pop (false), continue means enable pop (true)
++	 */
++	pop_enable = pause ? false : true;
++
++	/* Get the pool current pop enable status */
++	ret = bmgr_pool_pop_status_get(pool->pool_id, &pool_pop_enable);
++	if (unlikely(ret)) {
++		pr_err("failed to get pool %u pop enable status\n",
++			pool->pool_id);
++		return ret;
++	}
++
++	/* if the pool is already in the right state, do nothing */
++	if (pop_enable == pool_pop_enable)
++		return 0;
++
++	ret = __bmgr_pool_pop_enable(pool->pool_id, pop_enable);
++	if (unlikely(ret)) {
++		pr_err("failed to %s pool %u pop\n", BOOL2EN(pop_enable),
++		       pool->pool_id);
++		return ret;
++	}
++
++	/* if we enabled to pool or doesn't need to validate the resources,
++	 * finish
++	 */
++	if (pop_enable || !validate)
++		return 0;
++
++	/* Verify the pool gained back its resources */
++	ret = pp_bmgr_pool_stats_get(&pool_stats, pool->pool_id);
++	if (unlikely(ret)) {
++		pr_err("Failed to get pool %d stats\n", pool->pool_id);
++		return ret;
++	} else if (pool_stats.pool_allocated_ctr != 0) {
++		pr_err("Pool %d resources are still in use\n", pool->pool_id);
++		return -EBUSY;
++	}
++
++	return ret;
++}
++
+ /**
+  * @brief Pause/Unpause buffer allocation in pools associated
+  *        with a group
+@@ -214,19 +306,12 @@ static s32 __group_pause(u8 group_id, struct group_pause_config *cfg)
+ {
+ 	struct bmgr_group_db_entry *group;
+ 	struct bmgr_pool_db_entry *pool;
+-	struct pp_bmgr_pool_stats pool_stats;
+-	bool pool_pop_enable;
+-	s32  ret = 0;
+-
+-	if (cfg->pause)
+-		pool_pop_enable = false;
+-	else
+-		pool_pop_enable = true;
++	s32 ret = 0;
+ 
+ 	/* Group entry in db */
+ 	group = &db->groups[group_id];
+ 
+-	/* Disable pop for all pools in group */
++	/* pause/continue all pools in group */
+ 	list_for_each_entry(pool, &group->pools_head, group_link) {
+ 		if (!pool->is_busy) {
+ 			pr_err("Pool %d in Group %d is not active\n",
+@@ -234,30 +319,15 @@ static s32 __group_pause(u8 group_id, struct group_pause_config *cfg)
+ 			continue;
+ 		}
+ 
+-		ret = __bmgr_pool_pop_enable(pool->pool_id, pool_pop_enable);
++		ret = pool_pause(pool, cfg->pause, cfg->validate_resources);
+ 		if (unlikely(ret)) {
+-			pr_err("bmgr_pool_pop_enable %d failed\n",
+-			       pool->pool_id);
++			pr_err("failed to %s pool %u, ret %d\n",
++			       BOOL2EN(cfg->pause), pool->pool_id, ret);
+ 			return ret;
+ 		}
+-
+-		/* Verify pool gained back its resources */
+-		if (!pool_pop_enable && cfg->validate_resources) {
+-			ret = pp_bmgr_pool_stats_get(&pool_stats,
+-						     pool->pool_id);
+-			if (unlikely(ret)) {
+-				pr_err("Pool %d get stats error\n",
+-				       pool->pool_id);
+-				return ret;
+-			} else if (pool_stats.pool_allocated_ctr != 0) {
+-				pr_err("Pool %d resources are still in use\n",
+-				       pool->pool_id);
+-				return -EBUSY;
+-			}
+-		}
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ /**
+@@ -279,7 +349,7 @@ static s32 __add_pool_to_group(u8 group_id, u8 pool_id)
+ 	pool = &db->pools[pool_id];
+ 
+ 	list_add_tail(&pool->group_link, &grp->pools_head);
+-	grp->available_buffers += pool->pool_params.num_buffers;
++	grp->available_buffers += pool->params.num_buffers;
+ 
+ 	return bm_group_available_set(group_id, grp->available_buffers);
+ }
+@@ -313,6 +383,7 @@ __add_pools_to_policy(u16 policy_id,
+ 
+ 		/* Update pool/policy reference count */
+ 		db->pools[pool_id].policy_ref_cnt++;
++		set_bit(policy_id, db->pools[pool_id].policies_bmap);
+ 
+ 		/* Update group if it's the first time this pool is in use */
+ 		if (db->pools[pool_id].policy_ref_cnt == 1) {
+@@ -367,7 +438,7 @@ static s32 __remove_pool_from_group(u8 group_id, u8 pool_id)
+ 	pool = &db->pools[pool_id];
+ 
+ 	list_del(&pool->group_link);
+-	grp->available_buffers -= pool->pool_params.num_buffers;
++	grp->available_buffers -= pool->params.num_buffers;
+ 
+ 	/* Group's rsrvd buffers will be updated when configuring the policy */
+ 	return bm_group_available_set(group_id, grp->available_buffers);
+@@ -396,6 +467,7 @@ __remove_pools_from_policy(u16 policy_id,
+ 	for (idx = 0; idx < policy_params->num_pools_in_policy; idx++) {
+ 		pool_id = policy_params->pools_in_policy[idx].pool_id;
+ 		db->pools[pool_id].policy_ref_cnt--;
++		clear_bit(policy_id, db->pools[pool_id].policies_bmap);
+ 
+ 		/* Update group only if pool is not used by any policy */
+ 		if (db->pools[pool_id].policy_ref_cnt == 0) {
+@@ -444,23 +516,6 @@ __remove_pools_from_policy(u16 policy_id,
+ 	return ret;
+ }
+ 
+-/**
+- * @brief get pool pop status
+- * @param pool_id: Pool ID
+- * @param enable: out arg, true if enabled, false if disabled
+- * @return 0 on success, other error code on failure
+- */
+-static s32 bmgr_pool_pop_status_get(u8 pool_id, bool *enable)
+-{
+-	*enable = true;
+-
+-	/* Pool Pop Enable */
+-	if (db->cfg.pool_pop_hw_en)
+-		return bm_pool_pop_status_get(pool_id, enable);
+-
+-	return 0;
+-}
+-
+ /**
+  * @brief Enable pool
+  * @param pool_id: Pool ID
+@@ -484,6 +539,309 @@ static s32 __bmgr_pool_enable(u8 pool_id, bool enable)
+ 	return ret;
+ }
+ 
++/**
++ * @brief Convert buffer pointer of a specific pool to an index
++ * @param pool_id the pool
++ * @param buff the buffer to convert
++ * @return u32 the index
++ */
++static inline u32 buff_ptr_to_index(u32 pool_id, u64 buff)
++{
++	struct bmgr_pool_db_entry *pool = &db->pools[pool_id];
++	u64 index = buff - (u64)pool->phys;
++
++	do_div(index, pool->params.size_of_buffer);
++
++	return index;
++}
++
++/**
++ * @brief Convert buffer index of a specific pool to a pointer
++ * @param pool_id the pool
++ * @param index the index
++ * @return u64 the pointer
++ */
++static inline u64 buff_index_to_ptr(u32 pool_id, u32 index)
++{
++	struct bmgr_pool_db_entry *pool = &db->pools[pool_id];
++
++	return (index * pool->params.size_of_buffer) + pool->phys;
++}
++
++/**
++ * @brief Test whether a buffer pointer is in the range of a pool
++ *        addresses range
++ * @param pool_id the pool
++ * @param buff the buffer
++ * @return bool True if it is in the range, false otherwise
++ */
++static inline bool bmgr_is_buff_in_pool_range(u32 pool_id, u64 buff)
++{
++	struct bmgr_pool_db_entry *pool = &db->pools[pool_id];
++	u64 base, end;
++
++	base = end = pool->phys;
++	end += pool->params.num_buffers * pool->params.size_of_buffer;
++
++	return (base <= buff && buff < end);
++}
++
++/**
++ * @brief Disable/Enable pop for all the policy's pools specified by a bitmap
++ * @param policy the policy
++ * @param bmap bitmap specified for which pools the pop should be
++ *             disabled/enabled
++ */
++static s32 bmgr_policy_pool_pop_en(u32 policy_id, ulong bmap, bool en)
++{
++	struct bmgr_policy_db_entry *policy;
++	struct pp_bmgr_pool_in_policy_info *pool_in_policy;
++	s32 ret;
++	u32 i;
++
++	policy = &db->policies[policy_id];
++	for (i = 0; i < policy->params.num_pools_in_policy; i++) {
++		pool_in_policy = &policy->params.pools_in_policy[i];
++
++		/* if the pool isn't set in the bitmap, do nothing */
++		if (!test_bit(pool_in_policy->pool_id, &bmap))
++			continue;
++
++		/* else, disable/enable the pool */
++		pr_info("%s pool %u pop\n", BOOL2EN(en),
++			pool_in_policy->pool_id);
++		ret = __bmgr_pool_pop_enable(pool_in_policy->pool_id, en);
++		if (!ret)
++			continue;
++		pr_err("fail to disable pool %u pop\n",
++		       pool_in_policy->pool_id);
++	}
++
++	return 0;
++}
++
++/**
++ * @brief Pops all the buffers from the specified policy and test:
++ *          1. if the actual pool is as expected
++ *          2. if all the buffers are in range
++ *          3. if there are duplicates buffers
++ *        It returns 4 values:
++ *          1. bitmap contains all the popped buffers, bit per buffer
++ *          2. number of out of range buffers
++ *          3. number of duplicates buffers
++ *          4. number of valid popped buffers
++ * @param policy the policy to pop from
++ * @param pool the expected pool
++ * @param bmap the bitmap
++ * @param out_of_range out of range counter
++ * @param duplicates duplicates counter
++ * @param num valid counter
++ * @return s32 0 on successfull run, error code otherwise
++ */
++static s32 bmgr_pool_policy_verify(u32 policy, u32 pool, ulong *bmap,
++				   u32 *out_of_range, u32 *duplicates,
++				   u32 *num)
++{
++	u64 buff = 0;
++	u32 real_pool;
++	s32 ret;
++
++	do {
++		ret = bm_pop_buffer(policy, &real_pool, &buff);
++		if (ret) {
++			pr_err("failed to pop buffer from policy %u, ret %d\n",
++				policy, ret);
++			return ret;
++		}
++		if (!buff)
++			break;
++
++		pr_debug("pop buffer %#llx, bit %u\n", buff,
++			 buff_ptr_to_index(pool, buff));
++
++		if (real_pool != pool) {
++			pr_debug("wrong pool %u, expected %u, policy %u\n",
++			       real_pool, pool, policy);
++			return -EINVAL;
++		}
++
++		/* check if buffer is in the pool range */
++		if (!bmgr_is_buff_in_pool_range(pool, buff)) {
++			pr_debug("found out of range buff %#llx\n", buff);
++			if (out_of_range)
++				(*out_of_range)++;
++			continue;
++		}
++		/* check if buffer is duplicated */
++		if (test_bit(buff_ptr_to_index(pool, buff), bmap)) {
++			pr_debug("found duplicate buff %#llx\n", buff);
++			if (duplicates)
++				(*duplicates)++;
++			continue;
++		}
++
++		set_bit(buff_ptr_to_index(pool, buff), bmap);
++		if (num)
++			(*num)++;
++
++	} while (buff);
++
++	return 0;
++}
++
++/**
++ * @brief Try to push 'num' amount of buffers specified as indexes
++ *        by 'bitmap' to 'policy' and 'pool'
++ *        Returns tha actual number of buffers pushed
++ * @param policy the policy
++ * @param pool the pool
++ * @param bmap the bitmap
++ * @param num number of buffers to push
++ * @param actual actual num of buffers pushed
++ * @return s32 0 on success regardless of the actual pushed buffers,
++ *             error code otherwise
++ */
++static s32 bmgr_pool_push_buffers(u32 policy, u32 pool, ulong *bmap, u32 num,
++				  u32 *actual)
++{
++	u64 buff;
++	u32 index, pool_size;
++	s32 ret;
++
++	pool_size = db->pools[pool].params.num_buffers;
++	*actual   = 0;
++	for_each_set_bit(index, bmap, pool_size) {
++		if (!num)
++			return 0;
++
++		buff = buff_index_to_ptr(pool, index);
++		ret = bm_push_buffer(policy, pool, buff);
++		if (ret) {
++			pr_err("failed to push buff %#llx to policy %u pool %u, ret %d\n",
++			       buff, policy, pool, ret);
++			return ret;
++		}
++		pr_debug("push buffer %#llx, bit %u\n", buff, index);
++
++		num--;
++		(*actual)++;
++		clear_bit(index, bmap);
++	}
++
++	return 0;
++}
++
++s32 pp_bmgr_pool_verification(u32 id)
++{
++	struct pp_bmgr_policy_stats stats;
++	struct bmgr_policy_db_entry *policy;
++	struct pp_bmgr_pool_in_policy_info *pool_in_policy;
++	struct bmgr_pool_db_entry *pool;
++	u32 num_pop[PP_BM_MAX_POLICIES]; /* per policy num of buffers popped */
++	ulong *buf_bmap;
++	u32 i, policy_id, out_of_range, duplicates, total;
++	s32 ret;
++
++	if (unlikely(!bmgr_is_pool_id_valid(id)))
++		return -EINVAL;
++
++	__bmgr_db_lock();
++
++	pool = &db->pools[id];
++	if (unlikely(!pool->is_busy)) {
++		pr_err("pool %u isn't active\n", id);
++		__bmgr_db_unlock();
++		return -EINVAL;
++	}
++
++	/* Countes the maximum buffers can be popped from all policies
++	 * from the specified pool
++	 */
++	total = 0;
++	for_each_set_bit(policy_id, pool->policies_bmap, PP_BM_MAX_POLICIES) {
++		bm_policy_stats_get(&stats, policy_id);
++		policy = &db->policies[policy_id];
++
++		for (i = 0; i < policy->params.num_pools_in_policy; i++) {
++			pool_in_policy = &policy->params.pools_in_policy[i];
++			if (pool_in_policy->pool_id == id)
++				total += pool_in_policy->max_allowed;
++		}
++	}
++	if (total < pool->params.num_buffers)
++		pr_warn("Warning: bad configuration, results may not be accurate\n");
++
++	/* allocate bitmap of num_buffers bits, to mark every buffer we
++	 * found inside the pool to detect duplicate buffers
++	 */
++	buf_bmap = kcalloc(BITS_TO_LONGS(pool->params.num_buffers),
++			   sizeof(*buf_bmap), GFP_ATOMIC);
++	if (!buf_bmap) {
++		pr_err("failed to allocate %u bits bitmap for pool %u\n",
++		       pool->params.num_buffers, id);
++		__bmgr_db_unlock();
++		return -ENOMEM;
++	}
++
++	pr_info("Start verification of pool %u\n", pool->pool_id);
++	pr_info("\tpool base %#llx\n", (u64)pool->phys);
++	pr_info("\tnumber of buffers %u\n", pool->params.num_buffers);
++	pr_info("\tbuffers to pop %u\n", total);
++	pr_info("\tbuffer size %u\n", pool->params.size_of_buffer);
++	pr_info("\tused by policies %*pbl\n", PP_BM_MAX_POLICIES,
++		pool->policies_bmap);
++	/* iterate over all policies that uses the pool pop all the buffers */
++	memset(num_pop, 0, sizeof(num_pop));
++	out_of_range = 0;
++	duplicates = 0;
++	total = 0;
++	for_each_set_bit(policy_id, pool->policies_bmap, PP_BM_MAX_POLICIES) {
++		pr_info("Verifying policy %u\n", policy_id);
++
++		/* disable pop for all the pools used by current policy
++		 * other than our pool
++		 */
++		ret = bmgr_policy_pool_pop_en(policy_id, ~BIT(pool->pool_id),
++					      false);
++		if (ret)
++			goto free_mem;
++
++		bmgr_pool_policy_verify(policy_id, pool->pool_id, buf_bmap,
++					&out_of_range, &duplicates,
++					&num_pop[policy_id]);
++
++		total += num_pop[policy_id];
++
++		pr_info("popped %u buffers from policy %u\n",
++			num_pop[policy_id], policy_id);
++
++		/* enable back the pop for all the pools in policy */
++		ret = bmgr_policy_pool_pop_en(policy_id, ~BIT(pool->pool_id),
++					      true);
++		if (ret)
++			goto free_mem;
++	}
++
++	/* return all the buffers back to the pool */
++	for_each_set_bit(policy_id, pool->policies_bmap, PP_BM_MAX_POLICIES) {
++		bmgr_pool_push_buffers(policy_id, pool->pool_id, buf_bmap,
++				       num_pop[policy_id], &num_pop[policy_id]);
++		pr_info("push %u buffers to policy %u\n", num_pop[policy_id],
++			policy_id);
++	}
++
++	pr_info("Pool %u: pool size %u, total popped %u, missing %u, out of range %u, duplicates %u\n",
++		pool->pool_id, pool->params.num_buffers, total,
++		pool->params.num_buffers - total, out_of_range,
++		duplicates);
++
++free_mem:
++	__bmgr_db_unlock();
++	kfree(buf_bmap);
++
++	return 0;
++}
++
+ static s32
+ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		      u8 *pool_id, bool lock)
+@@ -492,6 +850,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	struct bmgr_pool_cfg cfg;
+ 	u32 *temp_pointers_table_ptr = NULL;
+ 	u32  idx = 0;
++	u32  low_addr, high_addr;
+ 	s32  ret = 0;
+ 	u64  user_array_ptr;
+ 	bool pool_enable;
+@@ -514,7 +873,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		}
+ 
+ 		/* If not found (Can be done also using num_pools) */
+-		if (idx == db->cfg.max_pools) {
++		if (!bmgr_is_pool_id_valid(idx)) {
+ 			pr_err("bmgr_pool_configure: pools DB is full!\n");
+ 			ret = -EIO;
+ 			goto unlock;
+@@ -522,8 +881,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	}
+ 
+ 	/* Verify pool is valid */
+-	if (*pool_id >= db->cfg.max_pools) {
+-		pr_err("Pool %d id not valid\n", *pool_id);
++	if (!bmgr_is_pool_id_valid(*pool_id)) {
+ 		ret = -EINVAL;
+ 		goto unlock;
+ 	}
+@@ -544,6 +902,28 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	if (lock)
+ 		__bmgr_db_unlock();
+ 
++	/* if the base address is zero, allocate the pool memory */
++	if (!pool_params->base_addr_high && !pool_params->base_addr_low) {
++		pool->sz =
++			pool_params->num_buffers * pool_params->size_of_buffer;
++		pool->sz = PAGE_ALIGN(pool->sz);
++		pool->virt = pp_dma_alloc(pool->sz, GFP_ATOMIC, &pool->phys);
++
++		if (!pool->virt) {
++			pr_err("Could not allocate %u buffers of %u size\n",
++			       pool_params->num_buffers,
++			       pool_params->size_of_buffer);
++			return -ENOMEM;
++		}
++		pr_info("allocate pool buffers @ %#llx\n", (u64)pool->phys);
++		low_addr = (u32)pool->phys;
++		high_addr = pool->phys >> BITS_PER_U32;
++	} else {
++		low_addr = pool_params->base_addr_low;
++		high_addr = pool_params->base_addr_high;
++		pool->phys = PP_BUILD_64BIT_WORD(low_addr, high_addr);
++	}
++
+ 	/* Allocate pool_param->pool_num_of_buff * POINTER_SIZE bytes array */
+ 	pool->internal_ptrs_sz = PAGE_ALIGN(sizeof(unsigned int) *
+ 					    pool_params->num_buffers);
+@@ -557,16 +937,14 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		/* Mark pool as not used since pool allocation failed */
+ 		pool->is_busy = 0;
+ 		ret = -ENOMEM;
+-		goto pool_conf_done;
++		goto free_memory;
+ 	}
+ 
+ 	if (lock)
+ 		__bmgr_db_lock();
+ 
+ 	temp_pointers_table_ptr = (unsigned int *)pool->internal_ptrs_virt;
+-
+-	user_array_ptr = (pool_params->base_addr_low) |
+-		((u64)pool_params->base_addr_high << 32);
++	user_array_ptr = (low_addr) | ((u64)high_addr << BITS_PER_U32);
+ 
+ 	for (idx = 0; idx < pool_params->num_buffers; idx++) {
+ 		*temp_pointers_table_ptr = user_array_ptr >> 6;
+@@ -596,7 +974,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	}
+ 
+ 	/* Update pool's DB */
+-	memcpy(&pool->pool_params, pool_params,
++	memcpy(&pool->params, pool_params,
+ 	       sizeof(struct pp_bmgr_pool_params));
+ 	db->num_pools++;
+ 
+@@ -609,17 +987,25 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	if (lock)
+ 		__bmgr_db_unlock();
+ 
+-pool_conf_done:
+ 	pr_debug("done (%d)\n", ret);
+ 	return ret;
+ 
+ free_memory:
+ 	/* free pointers_table */
+-	pp_dma_free(pool->internal_ptrs_sz,
+-		    (void *)pool->internal_ptrs_virt,
+-		    &pool->internal_ptrs_phys);
++	if (pool->internal_ptrs_virt) {
++		pp_dma_free(pool->internal_ptrs_sz,
++			    (void *)pool->internal_ptrs_virt,
++			    &pool->internal_ptrs_phys);
++		pool->internal_ptrs_sz = 0;
++	}
++	if (pool->virt) {
++		pp_dma_free(pool->sz, pool->virt, &pool->phys);
++		pool->virt = 0;
++	}
+ 	pool->is_busy = 0;
+-	__bmgr_db_unlock();
++	if (lock)
++		__bmgr_db_unlock();
++
+ 	return ret;
+ }
+ 
+@@ -643,10 +1029,8 @@ s32 pp_bmgr_pool_pop_disable(u8 pool_id)
+ 		return -EPERM;
+ 
+ 	/* Verify pool if is valid */
+-	if (pool_id >= db->cfg.max_pools) {
+-		pr_err("Pool %d id not valid\n", pool_id);
++	if (!bmgr_is_pool_id_valid(pool_id))
+ 		return -EINVAL;
+-	}
+ 
+ 	__bmgr_db_lock();
+ 
+@@ -684,7 +1068,14 @@ s32 pp_bmgr_pool_pop_disable(u8 pool_id)
+ }
+ EXPORT_SYMBOL(pp_bmgr_pool_pop_disable);
+ 
+-static s32 __bmgr_pool_remove(u8 pool_id, bool lock)
++/**
++ * @brief Removes a pool
++ * @param pool_id pool id to remove
++ * @param lock remove under db lock or not
++ * @param validate validate all resources are back in the pool
++ * @return s32 0 on success, error code otherwise
++ */
++static s32 __bmgr_pool_remove(u8 pool_id, bool lock, bool validate)
+ {
+ 	struct pp_bmgr_pool_stats pool_stats;
+ 	struct bmgr_pool_db_entry *pool;
+@@ -696,10 +1087,9 @@ static s32 __bmgr_pool_remove(u8 pool_id, bool lock)
+ 	pr_debug("Removing pool %d\n", pool_id);
+ 
+ 	/* Verify pool if is valid */
+-	if (unlikely(pool_id >= db->cfg.max_pools)) {
+-		pr_err("Pool id %d not valid\n", pool_id);
++	if (unlikely(!bmgr_is_pool_id_valid(pool_id)))
+ 		return -EINVAL;
+-	}
++
+ 	if (lock)
+ 		__bmgr_db_lock();
+ 
+@@ -724,15 +1114,17 @@ static s32 __bmgr_pool_remove(u8 pool_id, bool lock)
+ 	}
+ 
+ 	/* Verify pool gained back its resources */
+-	ret = pp_bmgr_pool_stats_get(&pool_stats, pool_id);
+-	if (unlikely(ret)) {
+-		pr_err("Pool %d get stats error\n", pool_id);
+-		ret = -EINVAL;
+-		goto unlock;
+-	} else if (pool_stats.pool_allocated_ctr != 0) {
+-		pr_err("Pool %d resources are still in use\n", pool_id);
+-		ret = -EBUSY;
+-		goto unlock;
++	if (validate) {
++		ret = pp_bmgr_pool_stats_get(&pool_stats, pool_id);
++		if (unlikely(ret)) {
++			pr_err("Pool %d get stats error\n", pool_id);
++			ret = -EINVAL;
++			goto unlock;
++		} else if (pool_stats.pool_allocated_ctr != 0) {
++			pr_err("Pool %d resources are still in use\n", pool_id);
++			ret = -EBUSY;
++			goto unlock;
++		}
+ 	}
+ 
+ 	/* Disable pool */
+@@ -747,9 +1139,16 @@ static s32 __bmgr_pool_remove(u8 pool_id, bool lock)
+ 
+ 	/* free pointers_table */
+ 	pp_dma_free(pool->internal_ptrs_sz,
+-		    (void *)pool->internal_ptrs_virt,
++		    pool->internal_ptrs_virt,
+ 		    &pool->internal_ptrs_phys);
+ 
++	/* free the pool memory */
++	if (pool->virt) {
++		pr_info("free pool buffers @ %#llx\n", (u64)pool->phys);
++		pp_dma_free(pool->sz, pool->virt, &pool->phys);
++		pool->virt = 0;
++	}
++
+ 	/* Reset pool config */
+ 	cfg.min_guaranteed_enable = false;
+ 	cfg.num_buffers = 0;
+@@ -786,7 +1185,7 @@ s32 pp_bmgr_pool_remove(u8 pool_id)
+ 	if (unlikely(!__bmgr_is_ready()))
+ 		return -EPERM;
+ 
+-	return __bmgr_pool_remove(pool_id, true);
++	return __bmgr_pool_remove(pool_id, true, true);
+ }
+ EXPORT_SYMBOL(pp_bmgr_pool_remove);
+ 
+@@ -820,7 +1219,7 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 		}
+ 
+ 		/* If not found (Can be done also using num_policies) */
+-		if (idx == db->cfg.max_policies) {
++		if (!bmgr_is_policy_id_valid(idx)) {
+ 			pr_err("No free policy!\n");
+ 			ret = -EIO;
+ 			goto unlock;
+@@ -828,8 +1227,7 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 	}
+ 
+ 	/* Verify policy id is valid */
+-	if (unlikely(*policy_id >= db->cfg.max_policies)) {
+-		pr_err("Invalid policy id %d\n", *policy_id);
++	if (unlikely(!bmgr_is_policy_id_valid(*policy_id))) {
+ 		ret = -EINVAL;
+ 		goto unlock;
+ 	}
+@@ -848,10 +1246,7 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 		pool_id = plcy_params->pools_in_policy[idx].pool_id;
+ 
+ 		/* Verify pool in policy is valid */
+-		if (unlikely(pool_id >= db->cfg.max_pools)) {
+-			pr_err("pool_id %d out of range %d\n",
+-			       pool_id,
+-			       db->cfg.max_pools);
++		if (unlikely(!bmgr_is_pool_id_valid(pool_id))) {
+ 			ret = -EINVAL;
+ 			goto unlock;
+ 		}
+@@ -865,7 +1260,7 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 		}
+ 
+ 		/* Verify isolated pool is not used by any policy */
+-		if (db->pools[pool_id].pool_params.flags &
++		if (db->pools[pool_id].params.flags &
+ 		    POOL_ISOLATED) {
+ 			if (db->pools[pool_id].policy_ref_cnt) {
+ 				pr_err("Isolated Pool %d has a policy\n",
+@@ -928,9 +1323,8 @@ __bmgr_policy_configure(const struct pp_bmgr_policy_params * const plcy_params,
+ 	db->num_policies++;
+ 	db->policies[*policy_id].is_busy = 1;
+ 	db->policies[*policy_id].group_id = group_id;
+-	memcpy(&db->policies[*policy_id].policy_params,
+-	       plcy_params,
+-	       sizeof(struct pp_bmgr_policy_params));
++	memcpy(&db->policies[*policy_id].params, plcy_params,
++	       sizeof(*plcy_params));
+ 
+ 	if (bm_ctrl_poll()) {
+ 		pr_err("bm_ctrl_poll failed\n");
+@@ -976,11 +1370,8 @@ static s32 __bmgr_policy_remove(u16 policy_id, bool lock)
+ 	pr_debug("Removing policy %d\n", policy_id);
+ 
+ 	/* Verify policy id is valid */
+-	if (unlikely(policy_id >= db->cfg.max_policies)) {
+-		pr_err("Invalid policy id %d\n", policy_id);
+-		ret = -EINVAL;
+-		return ret;
+-	}
++	if (unlikely(!bmgr_is_policy_id_valid(policy_id)))
++		return -EINVAL;
+ 
+ 	if (lock)
+ 		__bmgr_db_lock();
+@@ -1004,7 +1395,7 @@ static s32 __bmgr_policy_remove(u16 policy_id, bool lock)
+ 	}
+ 
+ 	/* Fetch policy params from db */
+-	plcy_params = &db->policies[policy_id].policy_params;
++	plcy_params = &db->policies[policy_id].params;
+ 
+ 	/* Add policy pools and update group */
+ 	ret = __remove_pools_from_policy(policy_id, group_id, plcy_params);
+@@ -1076,121 +1467,69 @@ EXPORT_SYMBOL(pp_bmgr_policy_remove);
+ 
+ static void __bmgr_work_handler(struct work_struct *w)
+ {
+-	struct group_pause_config pause_cfg;
+-	struct policy_reset_action *current_action;
+-	struct delayed_work *dwork;
+-	struct pp_bmgr_policy_params policy_params;
+-	struct pp_bmgr_pool_params pool_params[PP_BM_MAX_POOLS_PER_PLCY];
+-	u16    policy_reset_id;
+-	u8     pools_in_policy;
+-	u8     pool_idx;
+-	u8     pool_id;
+-	u8     group_id;
+-	s32    ret;
+-
+-	/* Extract delayed work structure */
+-	dwork = container_of(w,
+-			     struct delayed_work,
+-			     work);
++	struct bmgr_policy_db_entry *policy;
++	struct policy_reset_action *act;
++	u32 pool_id, i, buff_idx, num_buffers;
++	u64 buff;
++	s32 ret;
+ 
+ 	/* Extract action structure */
+-	current_action = container_of(dwork,
+-				      struct policy_reset_action,
+-				      work);
++	act = container_of(w, struct policy_reset_action, work.work);
++	policy = &db->policies[act->policy_id];
+ 
+-	policy_reset_id = current_action->policy_reset_id;
+-	pr_debug("Work queue active - Policy %d\n", policy_reset_id);
++	pr_debug("Reset policy %u WQ starts\n", act->policy_id);
+ 	__bmgr_db_lock();
+ 
+-	/* Get policy */
+-	pr_debug("Copy policy %d from db\n", policy_reset_id);
+-	memcpy(&policy_params,
+-	       &db->policies[policy_reset_id].policy_params,
+-	       sizeof(struct pp_bmgr_policy_params));
+-	pools_in_policy = policy_params.num_pools_in_policy;
+-
+-	/* Get pools */
+-	for (pool_idx = 0 ; pool_idx < pools_in_policy ; pool_idx++) {
+-		pool_id = policy_params.pools_in_policy[pool_idx].pool_id;
+-		pr_debug("Copy pool %d from db\n", pool_id);
+-
+-		memcpy(&pool_params[pool_idx],
+-		       &db->pools[pool_id].pool_params,
+-		       sizeof(struct pp_bmgr_pool_params));
+-	}
+-
+-	/* Remove policy */
+-	ret = __bmgr_policy_remove(policy_reset_id, false);
+-	if (unlikely(ret)) {
+-		pr_err("__bmgr_policy_remove %d failed\n", policy_reset_id);
+-		goto unlock;
+-	}
+-
+-	/* Re-Configure pools */
+-	for (pool_idx = 0 ; pool_idx < pools_in_policy ; pool_idx++) {
+-		pool_id = policy_params.pools_in_policy[pool_idx].pool_id;
+-
+-		ret = __bmgr_pool_remove(pool_id, false);
+-		if (unlikely(ret)) {
+-			pr_err("__bmgr_pool_remove %d failed\n", pool_id);
+-			goto unlock;
+-		}
+-
+-		ret = __bmgr_pool_configure(&pool_params[pool_idx],
+-					    &pool_id, false);
+-		if (unlikely(ret)) {
+-			pr_err("__bmgr_pool_configure %d failed\n", pool_id);
++	/* pop all buffers from all the pools */
++	do {
++		ret = bm_pop_buffer(act->policy_id, NULL, &buff);
++		if (ret) {
++			pr_err("failed to pop buffer from policy %u, ret %d\n",
++			       act->policy_id, ret);
+ 			goto unlock;
+ 		}
++		if (buff)
++			pr_debug("pop buffer %#llx\n", buff);
++	} while (buff);
++
++	/* push all buffers from all pools back into the policy */
++	for (i = 0; i < policy->params.num_pools_in_policy; i++) {
++		pool_id = policy->params.pools_in_policy[i].pool_id;
++		num_buffers = db->pools[pool_id].params.num_buffers;
++
++		for (buff_idx = 0; buff_idx < num_buffers; buff_idx++) {
++			buff = buff_index_to_ptr(pool_id, buff_idx);
++			ret = bm_push_buffer(act->policy_id, pool_id, buff);
++			if (!ret) {
++				pr_debug("push buffer %#llx\n", buff);
++				continue;
++			}
+ 
+-		ret = __bmgr_pool_pop_enable(pool_id, false);
+-		if (unlikely(ret)) {
+-			pr_err("__bmgr_pool_pop_enable %d failed\n", pool_id);
+-			goto unlock;
++			pr_err("failed to push buffer %#llx to policy %u pool %u, ret %d\n",
++			       buff, act->policy_id, pool_id, ret);
+ 		}
+ 	}
+ 
+-	/* Add policy */
+-	ret = __bmgr_policy_configure(&policy_params, &policy_reset_id, false);
+-	if (unlikely(ret)) {
+-		pr_err("__bmgr_policy_configure %d failed\n", policy_reset_id);
+-		goto unlock;
+-	}
+-
+-	group_id = db->policies[policy_reset_id].group_id;
+-
+-	/* Resume group */
+-	pause_cfg.pause = false;
+-	pause_cfg.validate_resources = false;
+-	if (unlikely(__group_pause(group_id, &pause_cfg))) {
+-		pr_err("Group %d resume failed\n", group_id);
+-		goto unlock;
+-	}
+-
+ unlock:
+ 	__bmgr_db_unlock();
+-	if (current_action->cb)
+-		(*current_action->cb)(ret);
++	if (act->cb)
++		(*act->cb)(ret);
+ 
+-	kfree(current_action);
++	kfree(act);
+ 	pr_debug("done (%d)\n", ret);
+ }
+ 
+ s32 pp_bmgr_policy_reset(u16 policy_id, void (*cb)(s32 ret))
+ {
+-	s32 ret = 0;
+-	u8  group_id;
+-	struct group_pause_config pause_cfg;
+ 	struct policy_reset_action *action;
++	s32 ret = 0;
+ 
+ 	if (unlikely(!__bmgr_is_ready()))
+ 		return -EPERM;
+ 
+ 	/* Verify policy id is valid */
+-	if (unlikely(policy_id >= db->cfg.max_policies)) {
+-		pr_err("Invalid policy id %d\n", policy_id);
++	if (unlikely(!bmgr_is_policy_id_valid(policy_id)))
+ 		return -EINVAL;
+-	}
+ 
+ 	pr_debug("Resetting policy %d\n", policy_id);
+ 
+@@ -1210,28 +1549,17 @@ s32 pp_bmgr_policy_reset(u16 policy_id, void (*cb)(s32 ret))
+ 		goto unlock;
+ 	}
+ 
+-	group_id = db->policies[policy_id].group_id;
+-
+-	/* Pause group before policy reset */
+-	pause_cfg.pause = true;
+-	pause_cfg.validate_resources = false;
+-	ret = __group_pause(group_id, &pause_cfg);
+-	if (unlikely(ret)) {
+-		pr_err("Group %d pause failed\n", group_id);
+-		goto group_resume;
+-	}
+-
+ 	action = kzalloc(sizeof(*action), GFP_ATOMIC);
+ 	if (!action) {
+ 		ret = -ENOMEM;
+-		goto group_resume;
++		goto unlock;
+ 	}
+ 
+ 	__bmgr_db_unlock();
+ 
+ 	/* Trigger delayed work queue */
+ 	INIT_DELAYED_WORK(&action->work, __bmgr_work_handler);
+-	action->policy_reset_id = policy_id;
++	action->policy_id = policy_id;
+ 	if (cb)
+ 		action->cb = cb;
+ 
+@@ -1242,14 +1570,6 @@ s32 pp_bmgr_policy_reset(u16 policy_id, void (*cb)(s32 ret))
+ 	pr_debug("done (%d)\n", ret);
+ 	return ret;
+ 
+-group_resume:
+-	/* Pause group before policy reset */
+-	pause_cfg.pause = false;
+-	pause_cfg.validate_resources = false;
+-	ret = __group_pause(group_id, &pause_cfg);
+-	if (unlikely(ret))
+-		pr_err("Group %d resume failed\n", group_id);
+-
+ unlock:
+ 	__bmgr_db_unlock();
+ 	pr_debug("done (%d)\n", ret);
+@@ -1288,12 +1608,8 @@ s32 pp_bmgr_pool_conf_get(u8 pool_id,
+ 	}
+ 
+ 	/* Validity check */
+-	if (unlikely(pool_id >= db->cfg.max_pools)) {
+-		pr_err("pool_id %d out of range %d\n",
+-		       pool_id,
+-		       db->cfg.max_pools);
++	if (unlikely(!bmgr_is_pool_id_valid(pool_id)))
+ 		return -EINVAL;
+-	}
+ 
+ 	__bmgr_db_lock();
+ 
+@@ -1305,7 +1621,7 @@ s32 pp_bmgr_pool_conf_get(u8 pool_id,
+ 	}
+ 
+ 	memcpy(pool_params,
+-	       &db->pools[pool_id].pool_params,
++	       &db->pools[pool_id].params,
+ 	       sizeof(struct pp_bmgr_pool_params));
+ 
+ unlock:
+@@ -1327,12 +1643,8 @@ s32 pp_bmgr_pool_stats_get(struct pp_bmgr_pool_stats * const stats, u8 pool_id)
+ 	}
+ 
+ 	/* Validity check */
+-	if (unlikely(pool_id >= db->cfg.max_pools)) {
+-		pr_err("pool_id %d out of range %d\n",
+-		       pool_id,
+-		       db->cfg.max_pools);
++	if (unlikely(!bmgr_is_pool_id_valid(pool_id)))
+ 		return -EINVAL;
+-	}
+ 
+ 	/* Active check */
+ 	if (unlikely(!db->pools[pool_id].is_busy)) {
+@@ -1362,12 +1674,8 @@ s32 pp_bmgr_policy_conf_get(u16 policy_id,
+ 	}
+ 
+ 	/* Validity check */
+-	if (unlikely(policy_id >= db->cfg.max_policies)) {
+-		pr_err("policy_id %d out of range %d\n",
+-		       policy_id,
+-		       db->cfg.max_policies);
++	if (unlikely(!bmgr_is_policy_id_valid(policy_id)))
+ 		return -EINVAL;
+-	}
+ 
+ 	__bmgr_db_lock();
+ 
+@@ -1378,9 +1686,8 @@ s32 pp_bmgr_policy_conf_get(u16 policy_id,
+ 		goto unlock;
+ 	}
+ 
+-	memcpy(policy_params,
+-	       &db->policies[policy_id].policy_params,
+-	       sizeof(struct pp_bmgr_policy_params));
++	memcpy(policy_params, &db->policies[policy_id].params,
++	       sizeof(*policy_params));
+ 
+ unlock:
+ 	__bmgr_db_unlock();
+@@ -1403,11 +1710,8 @@ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 	}
+ 
+ 	/* Validity check */
+-	if (unlikely(policy_id >= db->cfg.max_policies)) {
+-		pr_err("policy_id %d out of range %d\n", policy_id,
+-		       db->cfg.max_policies);
++	if (unlikely(!bmgr_is_policy_id_valid(policy_id)))
+ 		return -EINVAL;
+-	}
+ 
+ 	/* Active check */
+ 	if (unlikely(!db->policies[policy_id].is_busy)) {
+@@ -1420,7 +1724,7 @@ s32 pp_bmgr_policy_stats_get(struct pp_bmgr_policy_stats * const stats,
+ 		pr_err("bm_policy_stats_get %d failed\n", policy_id);
+ 
+ 	num_pools_in_policy =
+-		db->policies[policy_id].policy_params.num_pools_in_policy;
++		db->policies[policy_id].params.num_pools_in_policy;
+ 
+ 	stats->policy_pools[0] = (stats->policy_pools_mapping & 0xFF);
+ 	stats->policy_pools[1] =
+@@ -1570,16 +1874,11 @@ bool pp_bmgr_is_policy_active(u16 policy)
+ 		return -EPERM;
+ 
+ 	/* Verify policy id is valid */
+-	if (unlikely(policy >= db->cfg.max_policies)) {
+-		pr_err("Invalid policy id %d\n", policy);
++	if (unlikely(!bmgr_is_policy_id_valid(policy)))
+ 		return false;
+-	}
+ 
+ 	/* Check if policy is active in db */
+-	if (db->policies[policy].is_busy == 0)
+-		return false;
+-	else
+-		return true;
++	return !!db->policies[policy].is_busy;
+ }
+ EXPORT_SYMBOL(pp_bmgr_is_policy_active);
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
+index 4d1207b58230..7e29567914bb 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_debugfs.c
+@@ -40,7 +40,7 @@ PP_DEFINE_DEBUGFS(conf_set, __dbg_conf_set_help, __dbg_conf_set);
+ void __dbg_pool_add_help(struct seq_file *f)
+ {
+ 	seq_puts(f,
+-		 "<flags> <num_buffs> <buff_size> <base addr - 0 for fpga>\n");
++		 "<flags> <num_buffs> <buff_size> <base addr - 0 allocating memory>\n");
+ }
+ 
+ void __dbg_pool_add(char *cmd_buf, void *data)
+@@ -59,11 +59,6 @@ void __dbg_pool_add(char *cmd_buf, void *data)
+ 
+ 	cfg.base_addr_high = 0;
+ 
+-	if (cfg.base_addr_low == 0) {
+-		pr_err("Pool address is 0\n");
+-		return;
+-	}
+-
+ 	if (pp_bmgr_pool_configure(&cfg, &pool_id)) {
+ 		pr_err("pp_bmgr_pool_configure failed\n");
+ 		return;
+@@ -107,6 +102,29 @@ void __dbg_pool_rem(char *cmd_buf, void *data)
+ 
+ PP_DEFINE_DEBUGFS(pool_rem, __dbg_pool_rem_help, __dbg_pool_rem);
+ 
++void pool_verify_help(struct seq_file *f)
++{
++	seq_puts(f, "<pool_id>\n");
++}
++
++void pool_verify(char *buf, void *data)
++{
++	int ret;
++	u32 id;
++
++	ret = kstrtouint(buf, 0, &id);
++	if (ret) {
++		pr_err("unable to parse %s, ret %d\n", buf, ret);
++		return;
++	}
++
++	ret = pp_bmgr_pool_verification(id);
++	if (ret)
++		pr_info("Pool verification failed, ret %d\n", ret);
++}
++
++PP_DEFINE_DEBUGFS(pool_verify, pool_verify_help, pool_verify);
++
+ void __dbg_policy_add_help(struct seq_file *f)
+ {
+ 	seq_puts(f, "<max_allowed> <min_guaranteed> <poolN id>"
+@@ -238,15 +256,15 @@ static void dump_pools(struct seq_file *f)
+ 		seq_printf(f, "\t\tInternal table address: %p\n",
+ 			   pool->internal_ptrs_virt);
+ 		seq_printf(f, "\t\tNum buffers: %d\n",
+-			   pool->pool_params.num_buffers);
++			   pool->params.num_buffers);
+ 		seq_printf(f, "\t\tSize of buffer: %d\n",
+-			   pool->pool_params.size_of_buffer);
++			   pool->params.size_of_buffer);
+ 		seq_printf(f, "\t\tBase address low: 0x%x\n",
+-			   pool->pool_params.base_addr_low);
++			   pool->params.base_addr_low);
+ 		seq_printf(f, "\t\tBase address high: 0x%x\n",
+-			   pool->pool_params.base_addr_high);
++			   pool->params.base_addr_high);
+ 		seq_printf(f, "\t\tFlags: %d\n",
+-			   pool->pool_params.flags);
++			   pool->params.flags);
+ 	}
+ }
+ 
+@@ -298,14 +316,14 @@ static void dump_policies(struct seq_file *f)
+ 		seq_printf(f, "\t\tNum deallocated buffers: %d\n",
+ 			   policy->num_deallocated_buffers);
+ 		seq_printf(f, "\t\tMax allowed: %d\n",
+-			   policy->policy_params.max_allowed);
++			   policy->params.max_allowed);
+ 		seq_printf(f, "\t\tMin guaranteed: %d\n",
+-			   policy->policy_params.min_guaranteed);
++			   policy->params.min_guaranteed);
+ 		seq_puts(f, "\t\tPools in policy:\n");
+-		num = policy->policy_params.num_pools_in_policy;
++		num = policy->params.num_pools_in_policy;
+ 		for (idx2 = 0; idx2 < num; idx2++) {
+ 			pool_in_policy =
+-				&policy->policy_params.pools_in_policy[idx2];
++				&policy->params.pools_in_policy[idx2];
+ 			pool_id = pool_in_policy->pool_id;
+ 			max_allowed = pool_in_policy->max_allowed;
+ 
+@@ -377,7 +395,7 @@ void __dbg_dump_hw_stats(struct seq_file *f)
+ 			continue;
+ 
+ 		pool_isolated =
+-			db->pools[i].pool_params.flags &
++			db->pools[i].params.flags &
+ 			POOL_ISOLATED;
+ 
+ 		pp_bmgr_pool_stats_get(&pool_stats, i);
+@@ -467,7 +485,7 @@ void __dbg_dump_hw_stats(struct seq_file *f)
+ 		if (!db->policies[i].is_busy)
+ 			continue;
+ 
+-		policy_params = &db->policies[i].policy_params;
++		policy_params = &db->policies[i].params;
+ 
+ 		pp_bmgr_policy_stats_get(&policy_stats, i);
+ 		for (j = 0; j < policy_params->num_pools_in_policy; j++) {
+@@ -498,24 +516,23 @@ void pop_help(struct seq_file *f)
+ 
+ void pop(char *cmd_buf, void *data)
+ {
+-	struct bmgr_buff_info buff_info;
+-	u32 policy, num_buff, buff_idx;
++	u32 policy, pool, n, i;
++	u64 buff = 0;
+ 
+-	if (sscanf(cmd_buf, "%u %u", &policy, &num_buff) != 2)
++	if (sscanf(cmd_buf, "%u %u", &policy, &n) != 2)
+ 		return;
+ 
+-	buff_info.policy_id = policy;
+-
+-	if (!num_buff)
+-		num_buff = BM_MAX_BUFFER_POPS;
++	if (!n)
++		n = BM_MAX_BUFFER_POPS;
+ 
+-	for (buff_idx = 0; buff_idx < num_buff; buff_idx++) {
+-		if (bm_pop_buffer(&buff_info))
++	for (i = 0; i < n; i++) {
++		bm_pop_buffer(policy, &pool, &buff);
++		if (!buff)
+ 			break;
+ 
+-		pr_info("POP ==> %#llx (pool %u)\n", buff_info.address,
+-			buff_info.pool_id);
++		pr_info("POP ==> %#llx (pool %u)\n", buff, pool);
+ 	}
++	pr_info("POP total of %u buffers\n", i);
+ }
+ 
+ PP_DEFINE_DEBUGFS(pop, pop_help, pop);
+@@ -527,17 +544,14 @@ void push_help(struct seq_file *f)
+ 
+ void push(char *cmd_buf, void *data)
+ {
+-	struct bmgr_buff_info buff_info;
++	u32 policy, pool;
++	u64 buff;
+ 
+-	if (sscanf(cmd_buf, "%llx %hhu %hu", &buff_info.address,
+-		   &buff_info.pool_id, &buff_info.policy_id) != 3) {
++	if (sscanf(cmd_buf, "%llx %u %u", &buff, &pool, &policy) != 3)
+ 		return;
+-	}
+-
+-	pr_info("<== PUSH %#llx (pool %u, policy %u)\n", buff_info.address,
+-		buff_info.pool_id, buff_info.policy_id);
+ 
+-	bm_push_buffer(&buff_info);
++	pr_info("<== PUSH %#llx (pool %u, policy %u)\n", buff, pool, policy);
++	bm_push_buffer(policy, pool, buff);
+ }
+ 
+ PP_DEFINE_DEBUGFS(push, push_help, push);
+@@ -551,6 +565,7 @@ static struct debugfs_file bm_debugfs_files[] = {
+ 	{"conf_set", &PP_DEBUGFS_FOPS(conf_set)},
+ 	{"pool_add", &PP_DEBUGFS_FOPS(pool_add)},
+ 	{"pool_rem", &PP_DEBUGFS_FOPS(pool_rem)},
++	{"pool_verify", &PP_DEBUGFS_FOPS(pool_verify)},
+ 	{"policy_add", &PP_DEBUGFS_FOPS(policy_add)},
+ 	{"policy_rem", &PP_DEBUGFS_FOPS(policy_rem)},
+ 	{"policy_reset", &PP_DEBUGFS_FOPS(policy_reset)},
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
+index e2c2665e8d80..8286dae7401a 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr_internal.h
+@@ -3,7 +3,7 @@
+  * Description: Packet Processor Buffer Manager Driver Internal
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #ifndef _BM_DRV_INTERNAL_H_
+ #define _BM_DRV_INTERNAL_H_
+@@ -78,21 +78,22 @@ struct bmgr_group_db_entry {
+ 
+ /**
+  * @brief This structure holds the pool database
+- * @pool_params Pool params
+- * @num_allocated_buffers Num allocated buffers
+- * @num_deallocated_buffers Num deallocated buffers
+- * @is_busy Is entry in used
+- * @internal_pointers_tables Ptrs table to be used in HW
+  */
+ struct bmgr_pool_db_entry {
+-	struct pp_bmgr_pool_params pool_params;
++	struct pp_bmgr_pool_params params; /*! pools params */
+ 	struct list_head group_link;
+-	u32    num_allocated_buffers;
+-	u32    num_deallocated_buffers;
++	ulong  policies_bmap[BITS_TO_LONGS(PP_BM_MAX_POLICIES)];
++	u32    num_allocated_buffers;   /*! Num allocated buffers */
++	u32    num_deallocated_buffers; /*! Num deallocated buffers */
+ 	u32    policy_ref_cnt;
+ 	u8     pool_id;
+-	u8     is_busy;
+-	void   *internal_ptrs_virt;
++	u8     is_busy;   /*! Is entry in used */
++	void      *virt;  /*! pool virtual address, used when the pool is
++			   *  allocated internally by the buffer manager
++			   */
++	dma_addr_t phys;  /*! pool physical address */
++	size_t sz;        /*! pool size */
++	void      *internal_ptrs_virt; /*! Ptrs table to be used in HW */
+ 	dma_addr_t internal_ptrs_phys;
+ 	size_t     internal_ptrs_sz;
+ };
+@@ -105,7 +106,7 @@ struct bmgr_pool_db_entry {
+  * @is_busy Is entry in used
+  */
+ struct bmgr_policy_db_entry {
+-	struct pp_bmgr_policy_params policy_params;
++	struct pp_bmgr_policy_params params;
+ 	bool   is_isolated;
+ 	u32    num_allocated_buffers;
+ 	u32    num_deallocated_buffers;
+@@ -150,6 +151,16 @@ s32 bmgr_get_cfg_regs(struct bmgr_cfg_regs * const regs);
+  */
+ s32 bmgr_group_stats_get(struct bmgr_group_stats * const stats, u8 group_id);
+ 
++/**
++ * @brief Verify the pool doesn't contain duplicate buffers or
++ *        buffers which are out of the pool addresses range
++ * @note this should not run under traffic
++ * @param id pool id to verify
++ * @return s32 0 if the pool is ok, error code if something is wrong
++ *             or the verification failed
++ */
++s32 pp_bmgr_pool_verification(u32 id);
++
+ #ifdef CONFIG_DEBUG_FS
+ /**
+  * @brief bm debug init
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+index 76e08c95f14a..f22040e33d14 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+@@ -3981,8 +3981,21 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 		goto sbwl_alloc_err;
+ 	}
+ 
++	/* Allocate buffer for dma usage */
++	cfg->dma_buff_sz = PAGE_ALIGN(PPV4_QOS_DMA_BUFF_SIZE);
++	cfg->dma_buff_virt = pp_dma_alloc(cfg->dma_buff_sz, GFP_KERNEL,
++					  &cfg->dma_buff_phys);
++	if (unlikely(!cfg->dma_buff_virt)) {
++		pr_err("Could not allocate %u bytes for dma buffer\n",
++		       (u32)cfg->dma_buff_sz);
++		goto dma_buff_err;
++	}
++
+ 	return 0;
+ 
++dma_buff_err:
++	pp_dma_free(cfg->sbwl_sz, cfg->sbwl_ddr_virt, &cfg->sbwl_ddr_phys);
++
+ sbwl_alloc_err:
+ 	pp_dma_free(cfg->bwl_sz, cfg->bwl_ddr_virt, &cfg->bwl_ddr_phys);
+ 
+@@ -4075,6 +4088,12 @@ void __qos_ddr_free(struct pp_qos_dev *qdev)
+ 			    &qdev->hwconf.sbwl_ddr_phys);
+ 	}
+ 
++	if (qdev->hwconf.dma_buff_virt) {
++		pp_dma_free(qdev->hwconf.dma_buff_sz,
++			    qdev->hwconf.dma_buff_virt,
++			    &qdev->hwconf.dma_buff_phys);
++	}
++
+ 	/* Free API string buffer */
+ 	kfree(qdev->hwconf.api_str_buf);
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index ebce4a565946..f1ba7141d01e 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -4442,21 +4442,66 @@ s32 qos_drv_stats_get(struct pp_qos_dev *qdev, struct qos_drv_stats *stats)
+ 	return 0;
+ }
+ 
+-void qos_uc_mcdma_copy(struct pp_qos_dev *qdev, u32 src_phy, u32 dst_phy,
+-		       u32 size)
++s32 qos_uc_mcdma_copy_from_hw(struct pp_qos_dev *qdev, u32 src_phy, void *dst,
++			      u32 size)
+ {
+ 	s32 ret;
+ 
++	if (ptr_is_null(dst))
++		return -EINVAL;
++
+ 	if (!qos_device_ready(qdev))
+-		return;
++		return -EPERM;
++
++	if (qdev->hwconf.dma_buff_sz < size) {
++		QOS_LOG_ERR("dma buffer too small\n");
++		return -ENOMEM;
++	}
+ 
+ 	QOS_LOCK(qdev);
+-	create_mcdma_copy_cmd(qdev, src_phy, dst_phy, size);
++	create_mcdma_copy_cmd(qdev, src_phy, qdev->hwconf.dma_buff_phys, size);
+ 	update_cmd_id(&qdev->drvcmds);
+ 	ret = transmit_cmds(qdev);
+ 	if (unlikely(ret))
+-		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++		QOS_LOG_ERR("dma copy failed (%d)\n", ret);
++	pp_cache_invalidate(qdev->hwconf.dma_buff_virt, size);
++	/* copy to the user buffer */
++	memcpy(dst, qdev->hwconf.dma_buff_virt, size);
++	QOS_UNLOCK(qdev);
++
++	return ret;
++}
++
++s32 qos_uc_mcdma_copy_to_hw(struct pp_qos_dev *qdev, void *src, u32 dst_phy,
++			    u32 size)
++{
++	s32 ret;
++
++	if (ptr_is_null(src))
++		return -EINVAL;
++
++	if (!qos_device_ready(qdev))
++		return -EPERM;
++
++	if (qdev->hwconf.dma_buff_sz < size) {
++		QOS_LOG_ERR("dma buffer too small\n");
++		return -ENOMEM;
++	}
++
++	QOS_LOCK(qdev);
++	/* copy from the user buffer */
++	memcpy(qdev->hwconf.dma_buff_virt, src, size);
++	pp_cache_writeback(qdev->hwconf.dma_buff_virt, size);
++
++	create_mcdma_copy_cmd(qdev, qdev->hwconf.dma_buff_phys, dst_phy, size);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret))
++		QOS_LOG_ERR("dma copy failed (%d)\n", ret);
++
+ 	QOS_UNLOCK(qdev);
++
++	return ret;
+ }
+ 
+ void qos_descriptor_push(struct pp_qos_dev *qdev, u32 queue_id, u32 size,
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+index ae565ab53041..06eff42d033e 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+@@ -37,6 +37,8 @@
+ #define PPV4_QOS_LOGGER_BUF_SIZE (PPV4_QOS_LOGGER_HEADROOM_SIZE +   \
+ 				 (PPV4_QOS_LOGGER_MSG_SIZE * 4096))
+ 
++#define PPV4_QOS_DMA_BUFF_SIZE 4096
++
+ #define FIRMWARE_FILE "ppv4-qos-fw.elf"
+ /******************************************************************************/
+ /*                              DEFINES                                       */
+@@ -391,6 +393,9 @@ struct driver_cmds {
+ 
+ /* HW configuration */
+ struct hw_conf {
++	void         *dma_buff_virt;
++	dma_addr_t   dma_buff_phys;
++	size_t       dma_buff_sz;
+ 	void         *qm_ddr_virt;
+ 	dma_addr_t   qm_ddr_phys;
+ 	u32          qm_num_pages;
+@@ -1209,14 +1214,26 @@ void __qos_ddr_free(struct pp_qos_dev *qdev);
+ s32 allocate_ddr_for_qm_on_platform(struct pp_qos_dev *qdev);
+ 
+ /**
+- * @brief Copy using qos uC mcdma (8 bytes transaction)
++ * @brief Copy from pp hw address using qos mcdma engine
+  * @param qdev
+  * @param src_phy physical source address
++ * @param dst_phy destination address
++ * @param size number of bytes to copy
++ * @return 0 on success, error code otherwise
++ */
++s32 qos_uc_mcdma_copy_from_hw(struct pp_qos_dev *qdev, u32 src_phy, void *dst,
++			      u32 size);
++
++/**
++ * @brief Copy to pp hw address using qos uC mcdma
++ * @param qdev
++ * @param src source address
+  * @param dst_phy physical destination address
+  * @param size number of bytes to copy
++ * @return 0 on success, error code otherwise
+  */
+-void qos_uc_mcdma_copy(struct pp_qos_dev *qdev, u32 src_phy, u32 dst_phy,
+-		       u32 size);
++s32 qos_uc_mcdma_copy_to_hw(struct pp_qos_dev *qdev, void *src, u32 dst_phy,
++			    u32 size);
+ 
+ /**
+  * @brief Push qos descriptor to queue
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 831943f5d8bd..80dda55a9418 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -3874,7 +3874,7 @@ EXPORT_SYMBOL(pp_sgc_alloc);
+ 
+ s32 pp_sgc_free(u32 owner, u8 grp, u16 *counters, u16 count)
+ {
+-	s32 ret;
++	s32 ret = 0;
+ 	u32 i;
+ 
+ 	if (unlikely(!pp_is_ready()))
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+index 36483c1c2a14..1cebf85659f6 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+@@ -620,7 +620,7 @@ s32 bm_pool_configure(u8 pool_id, const struct bmgr_pool_cfg * const cfg)
+ 	/* Set minimum guaranteed bit per pool */
+ 	reg_val = PP_REG_RD32(PP_BM_POOL_MIN_GRNT_MASK_REG);
+ 	reg_val = PP_FIELD_MOD(BM_POOL_MIN_GRNT_FIELD(pool_id),
+-			       cfg->min_guaranteed_enable ? 1 : 0,
++			       !cfg->min_guaranteed_enable ? 1 : 0,
+ 			       reg_val);
+ 	PP_REG_WR32(PP_BM_POOL_MIN_GRNT_MASK_REG, reg_val);
+ 
+@@ -632,20 +632,23 @@ s32 bm_pool_configure(u8 pool_id, const struct bmgr_pool_cfg * const cfg)
+ 	return 0;
+ }
+ 
+-#define BM_POP_NULL_ADDRESS 0xFFFFFFFFF
++#define BM_POP_NULL_ADDRESS 0xFFFFFFFFFULL
+ #define BM_POP_ADDR_OFFSET(policy) (policy << 8)
+ 
+-s32 bm_pop_buffer(struct bmgr_buff_info *buff_info)
++s32 bm_pop_buffer(u32 policy, u32 *pool, u64 *buff)
+ {
+-	u32         low, high, sz;
+-	void        *dst_addr;
+-	struct      pp_qos_dev *qdev;
+-	dma_addr_t  dst_addr_phys;
+-	phys_addr_t bm_addr_phys = db->bm_pop_push_addr;
+-	s32 ret = 0;
++	phys_addr_t bm_addr_phys;
++	struct pp_qos_dev *qdev;
++	s32 ret;
++
++	if (ptr_is_null(buff))
++		return -EINVAL;
++
++	*buff = 0;
+ 
+-	if (!buff_info) {
+-		pr_err("buff_info is NULL\n");
++	if (policy >= db->max_policies) {
++		pr_err("invalid policy id %u, maximum is %d\n",
++		       policy, db->max_policies - 1);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -654,79 +657,44 @@ s32 bm_pop_buffer(struct bmgr_buff_info *buff_info)
+ 		return -EINVAL;
+ 
+ 	/* Write the Policy */
+-	bm_addr_phys |= BM_POP_ADDR_OFFSET(buff_info->policy_id);
+-
+-	sz = PAGE_ALIGN(2 * sizeof(u32));
+-	dst_addr = pp_dma_alloc(sz, GFP_KERNEL | GFP_DMA, &dst_addr_phys);
+-	if (!dst_addr) {
+-		pr_err("Could not allocate using dma_alloc\n");
+-		return -ENOMEM;
+-	}
++	bm_addr_phys = db->bm_pop_push_addr + BM_POP_ADDR_OFFSET(policy);
++	ret = qos_uc_mcdma_copy_from_hw(qdev, bm_addr_phys, buff,
++					sizeof(*buff));
++	if (ret)
++		return ret;
+ 
+-	qos_uc_mcdma_copy(qdev, bm_addr_phys, (u32)dst_addr_phys, 8);
+-	pp_cache_invalidate(dst_addr, 8);
++	if (pool)
++		*pool = (*buff & 0xFF00000000000000ULL) >> 56;
+ 
+-	low = PP_REG_RD32(dst_addr);
+-	high = PP_REG_RD32(dst_addr + 4);
++	*buff &= 0xFFFFFFFFFULL;
++	if (*buff == BM_POP_NULL_ADDRESS)
++		*buff = 0;
+ 
+-	buff_info->address = PP_BUILD_64BIT_WORD(low, high & 0xF);
+-	if (buff_info->address == BM_POP_NULL_ADDRESS) {
+-		ret = -EAGAIN;
+-		goto free_mem;
+-	}
+-
+-	buff_info->address = buff_info->address;
+-	buff_info->pool_id = (high & 0xFF000000) >> 24;
+-
+-free_mem:
+-	pp_dma_free(sz, dst_addr, &dst_addr_phys);
+-
+-	return ret;
++	return 0;
+ }
+ 
+-s32 bm_push_buffer(struct bmgr_buff_info *buff_info)
++s32 bm_push_buffer(u32 policy, u32 pool, u64 buff)
+ {
+-	u32         value, addr_low, sz;
+-	s32         ret = 0;
+-	u8          addr_high;
+-	void        *src_addr;
+-	struct      pp_qos_dev *qdev;
+-	dma_addr_t  src_addr_phys;
+-	phys_addr_t bm_addr_phys = db->bm_pop_push_addr;
+-
+-	if (unlikely(!buff_info)) {
+-		pr_err("buff_info is NULL\n");
++	phys_addr_t bm_addr_phys;
++	struct pp_qos_dev *qdev;
++
++	if (policy >= db->max_policies) {
++		pr_err("invalid policy id %u, maximum is %d\n",
++			policy, db->max_policies - 1);
+ 		return -EINVAL;
+ 	}
+ 
+-	qdev = pp_qos_dev_open(PP_QOS_INSTANCE_ID);
+-	if (unlikely(ptr_is_null(qdev)))
++	if (pool >= db->max_pools) {
++		pr_err("invalid pool id %u, maximum is %d\n",
++			policy, db->max_pools - 1);
+ 		return -EINVAL;
+-
+-	sz = PAGE_ALIGN(2 * sizeof(u32));
+-	src_addr = pp_dma_alloc(sz, GFP_KERNEL | GFP_DMA, &src_addr_phys);
+-	if (!src_addr) {
+-		pr_err("Could not allocate using dma_alloc\n");
+-		ret = -ENOMEM;
+-		goto free_mem;
+ 	}
+ 
+-	/* Write the Policy */
+-	bm_addr_phys |= BM_POP_ADDR_OFFSET(buff_info->policy_id);
+-
+-	/* write to ddr */
+-	addr_high = buff_info->address >> 32;
+-	addr_low = (u32)buff_info->address;
+-	value = addr_high | ((buff_info->pool_id & U8_MAX) << 24);
+-
+-	*(u32 *)src_addr = addr_low;
+-	*(((u32 *)src_addr) + 1) = value;
+-	pp_cache_writeback(src_addr, 8);
+-
+-	qos_uc_mcdma_copy(qdev, src_addr_phys, bm_addr_phys, 8);
+-
+-free_mem:
+-	pp_dma_free(sz, src_addr, &src_addr_phys);
++	qdev = pp_qos_dev_open(PP_QOS_INSTANCE_ID);
++	if (unlikely(ptr_is_null(qdev)))
++		return -EINVAL;
+ 
+-	return 0;
++	bm_addr_phys = db->bm_pop_push_addr + BM_POP_ADDR_OFFSET(policy);
++	buff = buff | ((u64)pool << 56);
++	return qos_uc_mcdma_copy_to_hw(qdev, &buff, bm_addr_phys, sizeof(buff));
+ }
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.h b/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
+index 33dba1c52560..132f5fd93d4d 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.h
+@@ -3,7 +3,7 @@
+  * Description: PP Buffer Manager Hal Driver
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #ifndef _BM_H_
+@@ -233,18 +233,22 @@ s32 bm_group_reserved_set(u8 group_id, u32 reserved_buffers);
+ s32 bm_group_stats_get(u8 group_id, struct bmgr_group_stats * const stats);
+ 
+ /**
+- * @brief Pop buffer
+- * @param buff_info buffer descriptor
+- * @return 0 on success, other error code on failure
++ * @brief Pop a buffer from a policy
++ * @param policy policy id to pop from
++ * @param pool the pool id the buffer was popped from
++ * @param buff the buffer pointer
++ * @return s32 0 on success, error code otherwise
+  */
+-s32 bm_pop_buffer(struct bmgr_buff_info *buff_info);
++s32 bm_pop_buffer(u32 policy, u32 *pool, u64 *buff);
+ 
+ /**
+- * @brief Push buffer
+- * @param buff_info buffer descriptor
+- * @return 0 on success, other error code on failure
++ * @brief Push a buffer to a policy and pool
++ * @param policy policy id to push to
++ * @param pool pool id to push to
++ * @param buff the buffer pointer
++ * @return s32 0 on success, error code otherwise
+  */
+-s32 bm_push_buffer(struct bmgr_buff_info *buff_info);
++s32 bm_push_buffer(u32 policy, u32 pool, u64 buff);
+ 
+ /**
+  * @brief Set default configuration

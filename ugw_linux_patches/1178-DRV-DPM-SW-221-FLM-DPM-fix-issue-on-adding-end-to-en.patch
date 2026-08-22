@@ -1,0 +1,382 @@
+From 83c3a9858cfdba2e3f3e570e8f3a3774cf9e247e Mon Sep 17 00:00:00 2001
+From: Gu Chao <gux.chao@intel.com>
+Date: Mon, 18 May 2020 16:40:29 +0800
+Subject: [PATCH] DRV_DPM_SW-221: FLM DPM fix issue on adding end-to-end qos
+ link
+
+- fix dp_link_set() to always set parent arbitration
+- refactor dp_link_add_31()
+- fix qos debugfs add_q cmd
+---
+ drivers/net/datapath/dpm/datapath_proc_qos.c       | 105 ++++++++++-
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   | 193 +++++----------------
+ 2 files changed, 150 insertions(+), 148 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_proc_qos.c b/drivers/net/datapath/dpm/datapath_proc_qos.c
+index 4c72dc5aa79e..5667c8184b30 100644
+--- a/drivers/net/datapath/dpm/datapath_proc_qos.c
++++ b/drivers/net/datapath/dpm/datapath_proc_qos.c
+@@ -947,6 +947,107 @@ void qos_create_qos_help(void)
+ 	pr_info("                resume/suspend: for all nodes\n");
+ }
+ 
++static int get_arbi(struct dp_node_child *c, enum dp_arbitate *p)
++{
++	struct dp_node_prio prio = {0};
++	int i;
++
++	if (!c)
++		return DP_FAILURE;
++	if (c->id.sch_id == DP_NODE_AUTO_ID)
++		return DP_SUCCESS;
++	if (dp_children_get(c, 0)) {
++		pr_err("%s: fail to get children of node %d\n",
++		       __func__, c->id.sch_id);
++		return DP_FAILURE;
++	}
++	if (!c->num)
++		return DP_SUCCESS;
++	for (i = 0; i < DP_MAX_CHILD_PER_NODE; i++) {
++		if (c->child[i].type)
++			goto found;
++	}
++	pr_err("%s: no valid children found for node %d\n",
++	       __func__, c->id.sch_id);
++	return DP_FAILURE;
++found:
++	prio.inst = c->inst;
++	prio.type = c->child[i].type;
++	prio.id = c->child[i].id;
++	if (dp_qos_link_prio_get(&prio, 0)) {
++		pr_err("%s: fail to get arbi of node %d via child %d\n",
++		       __func__, c->id.sch_id, prio.id.sch_id);
++		return DP_FAILURE;
++	}
++	if (p)
++		*p = prio.arbi;
++	return DP_SUCCESS;
++}
++
++static int get_prio(int inst, int id, enum dp_node_type type, int *p)
++{
++	struct dp_node_prio prio = {0};
++
++	if (id == DP_NODE_AUTO_ID)
++		return DP_SUCCESS;
++	prio.inst = inst;
++	prio.type = type;
++	prio.id.sch_id = id;
++	if (dp_qos_link_prio_get(&prio, 0)) {
++		pr_err("%s: fail to get priority of node %d\n", __func__, id);
++		return DP_FAILURE;
++	}
++	if (p)
++		*p = prio.prio_wfq;
++	return DP_SUCCESS;
++}
++
++static void dump_qos_link(struct dp_qos_link *cfg)
++{
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
++	struct dp_sch_lvl *s;
++	int i;
++
++	if (!cfg || !(dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL))
++		return;
++	pr_info(" QUEUE: id=%02d, prio=%d, leaf=%d, arbi=%d\n",
++		cfg->q_id, cfg->q_prio_wfq, cfg->q_leaf, cfg->q_arbi);
++	for (i = 0; i < cfg->n_sch_lvl; i++) {
++		s = &cfg->sch[i];
++		pr_info("SCH[%d]: id=%02d, prio=%d, leaf=%d, arbi=%d\n",
++			i, s->id, s->prio_wfq, s->leaf, s->arbi);
++	}
++	pr_info("  PORT: id=%02d\n", cfg->cqm_deq_port);
++#endif
++}
++
++static int add_qos_link(struct dp_qos_link *cfg, int flag)
++{
++	struct dp_node_child node = {0};
++	struct dp_sch_lvl *s;
++	int i;
++
++	node.inst = cfg->inst;
++	node.type = DP_NODE_PORT;
++	node.id.cqm_deq_port = cfg->cqm_deq_port;
++
++	for (i = cfg->n_sch_lvl - 1; i >= 0; i--) {
++		s = &cfg->sch[i];
++		if (get_arbi(&node, &s->arbi))
++			return DP_FAILURE;
++		if (get_prio(cfg->inst, s->id, DP_NODE_SCH, &s->prio_wfq))
++			return DP_FAILURE;
++		node.type = DP_NODE_SCH;
++		node.id.sch_id = s->id;
++	}
++	if (get_arbi(&node, &cfg->q_arbi))
++		return DP_FAILURE;
++	if (get_prio(cfg->inst, cfg->q_id, DP_NODE_QUEUE, &cfg->q_prio_wfq))
++		return DP_FAILURE;
++	dump_qos_link(cfg);
++	return dp_link_add(cfg, flag);
++}
++
+ ssize_t proc_qos_write(struct file *file, const char *buf, size_t count,
+ 		       loff_t *ppos)
+ {
+@@ -1008,8 +1109,8 @@ ssize_t proc_qos_write(struct file *file, const char *buf, size_t count,
+ 		}
+ 
+ 		pr_info("PORT %d\n", cfg.cqm_deq_port);
+-		if (dp_link_add(&cfg, 0)) {
+-			pr_err("dp_link_add failed\n");
++		if (add_qos_link(&cfg, 0)) {
++			pr_err("fail to add qos link\n");
+ 			return count;
+ 		}
+ 	} else if (dp_strncmpi(param_list[0], "del_q", strlen("del_q")) == 0) {
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index d9c4803337f2..575da037f83c 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -2321,7 +2321,9 @@ static int dp_link_set(struct dp_node_link *info, int parent_node, int flag)
+ 
+ 		goto EXIT;
+ 	} else if (info->node_type == DP_NODE_SCH) {
+-		dp_qos_sched_conf_set_default(sched_cfg);
++		node_id = info->node_id.sch_id;
++		if (dp_qos_sched_conf_get(priv->qdev, node_id, sched_cfg))
++			dp_qos_sched_conf_set_default(sched_cfg);
+ 		sched_cfg->sched_child_prop.parent = parent_node;
+ 		if (info->arbi == ARBITRATION_WRR)
+ 			sched_cfg->sched_child_prop.wrr_weight = info->prio_wfq;
+@@ -2330,10 +2332,6 @@ static int dp_link_set(struct dp_node_link *info, int parent_node, int flag)
+ 		else
+ 			pr_err("Invalid Arbi %s %d\n", __func__, info->arbi);
+ 
+-		sched_cfg->sched_parent_prop.arbitration =
+-			arbi_dp2pp(info->arbi);
+-		node_id = info->node_id.sch_id;
+-
+ 		DP_DEBUG(DP_DBG_FLAG_QOS,
+ 			 "Try to link SCH[/%d] to parent[%d/%d] port[%d]\n",
+ 			 node_id,
+@@ -2369,17 +2367,15 @@ static int dp_link_set(struct dp_node_link *info, int parent_node, int flag)
+ 	DP_DEBUG(DP_DBG_FLAG_QOS,
+ 		 "node_stat_update after %s end\n", __func__);
+ 	dp_map_qid_to_cqmdeq(info, flag);
+-	/* Set parent arbitration for Q node */
+-	if (info->node_type == DP_NODE_QUEUE) {
+-		if (set_parent_arbi(info->inst, node_id, info->arbi, flag)) {
+-			pr_err("fail to set arbi:%d in Parent of Q:%d\n",
+-			       info->arbi, node_id);
+-			return DP_FAILURE;
+-		}
+-		DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
+-			 "%s:Q=%d arbi=%d prio=%d\n", __func__,
+-			 info->node_id.q_id, info->arbi, info->prio_wfq);
++	/* Set parent arbitration */
++	if (set_parent_arbi(info->inst, node_id, info->arbi, flag)) {
++		pr_err("fail to set arbi:%d in Parent of node:%d\n",
++		       info->arbi, node_id);
++		return DP_FAILURE;
+ 	}
++	DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
++		 "%s:node=%d arbi=%d prio=%d\n", __func__,
++		 info->node_id.q_id, info->arbi, info->prio_wfq);
+ ERROR_EXIT:
+ 
+ 	devm_kfree(&g_dp_dev->dev, queue_cfg);
+@@ -3488,156 +3484,61 @@ int dp_link_get_31(struct dp_qos_link *cfg, int flag)
+ int dp_link_add_31(struct dp_qos_link *cfg, int flag)
+ {
+ 	struct dp_node_link info = {0};
+-	int i;
+-	int f_q_free = 0;
+-	int f_q_auto = 0; /* flag if node is DP_NODE_AUTO_ID */
+-	struct f {
+-		u16 flag;
+-		u16 sch_id;
+-		u16 f_auto; /* flag if node is DP_NODE_AUTO_ID */
+-	};
+-	struct f f_sch_free[DP_MAX_SCH_LVL] = {0};
++	struct dp_node_alloc node = {0};
++	int i, id;
+ 
+ 	if (!cfg) {
+-		pr_err("cfg cannot be NULL\n");
++		pr_err("%s: cfg cannot be NULL\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+-
+-	if (cfg->n_sch_lvl > DP_MAX_SCH_LVL) {
+-		pr_err("Incorrect sched_lvl:%s(%d) > %s(%d)\n",
+-		       "cfg->n_sch_lvl", cfg->n_sch_lvl,
+-		       "DP_MAX_SCH_LVL", DP_MAX_SCH_LVL);
++	if (cfg->n_sch_lvl > DP_MAX_SCH_LVL || cfg->n_sch_lvl < 0) {
++		pr_err("%s: n_sch_lvl out of range, expect 0 ~ %d\n",
++		       __func__, DP_MAX_SCH_LVL);
+ 		return DP_FAILURE;
+ 	}
+-
+ 	info.inst = cfg->inst;
+ 	info.dp_port = cfg->dp_port;
+-	info.node_id.q_id = cfg->q_id;
+ 	info.cqm_deq_port.cqm_deq_port = cfg->cqm_deq_port;
++	info.p_node_id.cqm_deq_port = cfg->cqm_deq_port;
++	info.p_node_type = DP_NODE_PORT;
+ 
+-	if (cfg->q_id == DP_NODE_AUTO_ID)
+-		f_q_auto = 1;
+-
+-	DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
+-		 "inst=%d dp_port=%d q_id=%d cqm_deq_port=%d n_sch_lvl=%d\n",
+-		 info.inst, info.dp_port, info.node_id.q_id,
+-		 info.cqm_deq_port.cqm_deq_port, cfg->n_sch_lvl);
+-	if (cfg->n_sch_lvl) {
+-		info.node_id.sch_id = cfg->sch[cfg->n_sch_lvl - 1].id;
++	for (i = cfg->n_sch_lvl - 1; i >= 0; i--) {
++		info.node_id.sch_id = cfg->sch[i].id;
+ 		info.node_type = DP_NODE_SCH;
+-		info.p_node_id.cqm_deq_port = cfg->cqm_deq_port;
+-		info.p_node_type = DP_NODE_PORT;
+-		info.arbi = cfg->sch[cfg->n_sch_lvl - 1].arbi;
+-		info.leaf = cfg->sch[cfg->n_sch_lvl - 1].leaf;
+-		info.prio_wfq = cfg->sch[cfg->n_sch_lvl - 1].prio_wfq;
+-		f_sch_free[cfg->n_sch_lvl - 1].flag = 1;
+-
+-		if (dp_node_link_add_31(&info, flag)) {
+-			pr_err("Failed to link Sch:%d to Port:%d\n",
+-			       cfg->sch[cfg->n_sch_lvl - 1].id,
+-			       cfg->cqm_deq_port);
+-			goto EXIT;
+-		}
+-		/* link sched to port */
+-		if (cfg->sch[cfg->n_sch_lvl - 1].id == DP_NODE_AUTO_ID)
+-			f_sch_free[cfg->n_sch_lvl - 1].f_auto = 1;
+-
+-		f_sch_free[cfg->n_sch_lvl - 1].sch_id = info.node_id.sch_id;
+-
+-		/* link sched to sched */
+-		for (i = (cfg->n_sch_lvl - 2); i >= 0; i--) {
+-			info.node_id.sch_id = cfg->sch[i].id;
+-			info.node_type = DP_NODE_SCH;
+-			info.p_node_id.sch_id = f_sch_free[i + 1].sch_id;
+-			info.p_node_type = DP_NODE_SCH;
+-			info.arbi = cfg->sch[i].arbi;
+-			info.leaf = cfg->sch[i].leaf;
+-			info.prio_wfq = cfg->sch[i].prio_wfq;
+-			f_sch_free[i].flag = 1;
+-
+-			if (dp_node_link_add_31(&info, flag)) {
+-				pr_err("Failed to link Sch:%d to Sch:%d\n",
+-				       cfg->sch[i].id, cfg->sch[i + 1].id);
+-				goto EXIT;
+-			}
+-			if (cfg->sch[i].id == DP_NODE_AUTO_ID)
+-				f_sch_free[i].f_auto = 1;
+-
+-			f_sch_free[i].sch_id = info.node_id.sch_id;
+-		}
+-		/* link Queue to sched */
+-		info.node_type = DP_NODE_QUEUE;
+-		info.node_id.q_id = cfg->q_id;
+-		info.p_node_id.sch_id = f_sch_free[0].sch_id;
+-		info.p_node_type = DP_NODE_SCH;
+-		info.arbi = cfg->sch[0].arbi;
+-		info.leaf = cfg->sch[0].leaf;
+-		info.prio_wfq = cfg->sch[0].prio_wfq;
+-
+-		if (dp_node_link_add_31(&info, flag)) {
+-			pr_err("Failed to link Q:%d to Sch:%d\n",
+-			       cfg->q_id, cfg->sch[0].id);
+-			f_q_free = 1;
+-			goto EXIT;
+-		}
+-	} else {
+-		/* link Queue to Port */
+-		info.node_type = DP_NODE_QUEUE;
+-		info.p_node_id.cqm_deq_port = cfg->cqm_deq_port;
+-		info.p_node_type = DP_NODE_PORT;
+-		info.arbi = cfg->q_arbi;
+-		info.leaf = cfg->q_leaf;
+-		info.prio_wfq = cfg->q_prio_wfq;
+-
++		info.leaf = cfg->sch[i].leaf;
++		info.arbi = cfg->sch[i].arbi;
++		info.prio_wfq = cfg->sch[i].prio_wfq;
+ 		if (dp_node_link_add_31(&info, flag)) {
+-			pr_err("Failed to link Q:%d to Port:%d\n",
+-			       cfg->q_id, cfg->cqm_deq_port);
+-			f_q_free = 1;
+-			goto EXIT;
++			pr_err("%s: fail to link node %d to %d\n", __func__,
++			       info.node_id.sch_id, info.p_node_id.sch_id);
++			goto ERR;
+ 		}
++		info.p_node_id = info.node_id;
++		info.p_node_type = info.node_type;
++	}
++	info.node_id.q_id = cfg->q_id;
++	info.node_type = DP_NODE_QUEUE;
++	info.leaf = cfg->q_leaf;
++	info.arbi = cfg->q_arbi;
++	info.prio_wfq = cfg->q_prio_wfq;
++	if (dp_node_link_add_31(&info, flag)) {
++		pr_err("%s: fail to link node %d to %d\n", __func__,
++		       info.node_id.q_id, info.p_node_id.sch_id);
++		goto ERR;
+ 	}
+ 	return DP_SUCCESS;
+-EXIT:
+-	for (i = (cfg->n_sch_lvl - 1); i >= 0; i--) {
+-		if (!f_sch_free[i].flag)
+-			continue;
+-		/* sch is auto_alloc move it to FREE */
+-		if (f_sch_free[i].f_auto) {
+-			struct dp_node_alloc node = {0};
+-
+-			node.id.sch_id = f_sch_free[i].sch_id;
+-			node.type = DP_NODE_SCH;
+-			node.dp_port = cfg->dp_port;
++ERR:
++	while (i < cfg->n_sch_lvl) {
++		id = i < 0 ? cfg->q_id : cfg->sch[i].id;
++		if (id == DP_NODE_AUTO_ID) {
+ 			node.inst = cfg->inst;
+-			dp_node_free_31(&node,
+-					flag);
+-		}
+-		/* sch provided by caller move it to ALLOC */
+-		if (node_stat_update(info.inst, f_sch_free[i].sch_id,
+-				     DP_NODE_DEC)) {
+-			pr_err("Failed to %s sched:%d DP_NODE_DEC\n",
+-			       "node_stat_update",
+-			       f_sch_free[i].sch_id);
+-			continue;
+-		}
+-	}
+-	if (f_q_free) {
+-		/* queue is auto_alloc move it to FREE */
+-		if (f_q_auto) {
+-			struct dp_node_alloc node = {0};
+-
+-			node.id.q_id = cfg->q_id;
+-			node.type = DP_NODE_QUEUE;
+ 			node.dp_port = cfg->dp_port;
+-			node.inst = cfg->inst;
++			node.type = i < 0 ? DP_NODE_QUEUE : DP_NODE_SCH;
++			node.id.sch_id = id;
+ 			dp_node_free_31(&node, flag);
+ 		}
+-		/* queue provided by caller move it to ALLOC */
+-		if (node_stat_update(info.inst, cfg->q_id, DP_NODE_DEC)) {
+-			pr_err("Failed to update stat qid %d DP_NODE_DEC\n",
+-			       cfg->q_id);
+-			return DP_FAILURE;
+-		}
++		node_stat_update(cfg->inst, id, DP_NODE_DEC);
++		i++;
+ 	}
+ 	return DP_FAILURE;
+ }

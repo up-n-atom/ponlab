@@ -1,0 +1,1111 @@
+From 086278d07e5618598b711ea59050fd91785b7623 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Tue, 3 Jul 2018 16:20:36 +0300
+Subject: [PATCH] FALCONSW-782-wsp: New WSP behaviour to save user position
+
+---
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c   |  29 +-
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c |  42 +-
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h  |  19 +-
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c    | 456 ++++++++++++++-------
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h    |  14 +-
+ 5 files changed, 377 insertions(+), 183 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+index ee6b4affaad3..aa6644ec75ad 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+@@ -543,7 +543,7 @@ void create_move_cmd(
+ 		cmd.rlm = -1;
+ 
+ 	fill_preds(qdev->nodes, dst, cmd.preds, 6);
+-	QOS_LOG_DEBUG("cmd %u:%u CMD_TYPE_MOVE %u-->%u type:%d, rlm:%d, port:%u\n",
++	QOS_LOG_DEBUG("cmd %u:%u CMD_TYPE_MOVE %u-->%u type:%d, q:%d, port:%u",
+ 			qdev->drvcmds.cmd_id,
+ 			qdev->drvcmds.cmd_fw_id,
+ 			src,
+@@ -1231,7 +1231,8 @@ void add_suspend_port(struct pp_qos_dev *qdev, unsigned int port)
+ 	for (i = 0; i <  internals->suspend_port_index; ++i)
+ 		if (internals->suspend_ports[i] == port)
+ 			return;
+-	QOS_ASSERT(internals->suspend_port_index <= qdev->max_port, "Suspend ports buffer is full\n");
++	QOS_ASSERT(internals->suspend_port_index <= qdev->max_port,
++		   "Suspend ports buffer is full\n");
+ 	internals->suspend_ports[internals->suspend_port_index] = port;
+ 	++(internals->suspend_port_index);
+ }
+@@ -1425,7 +1426,7 @@ static uint32_t *fw_write_set_sched_cmd(
+ 
+ 	*buf++ = qos_u32_to_uc(UC_QOS_COMMAND_SET_SCHEDULER);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(15);
++	*buf++ = qos_u32_to_uc(16);
+ 	*buf++ = qos_u32_to_uc(phy);
+ 	*buf++ = qos_u32_to_uc(common->valid | parent->valid |
+ 			child->valid | sched->valid);
+@@ -1439,6 +1440,7 @@ static uint32_t *fw_write_set_sched_cmd(
+ 	*buf++ = qos_u32_to_uc(common->bw_limit);
+ 	*buf++ = qos_u32_to_uc(parent->best_effort_enable);
+ 	*buf++ = qos_u32_to_uc(parent->first_wrr);
++	*buf++ = qos_u32_to_uc(child->bw_share);
+ 	*buf++ = qos_u32_to_uc(common->shared_bw_group);
+ 
+ 	for (i = 0; i < 6; ++i)
+@@ -1502,12 +1504,13 @@ static uint32_t *fw_write_set_queue_cmd(
+ 
+ 	*buf++ = qos_u32_to_uc(UC_QOS_COMMAND_SET_QUEUE);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(25);
++	*buf++ = qos_u32_to_uc(26);
+ 	*buf++ = qos_u32_to_uc(phy);
+ 	*buf++ = qos_u32_to_uc(queue->rlm);
+ 	*buf++ = qos_u32_to_uc(common->valid | child->valid);
+ 	*buf++ = qos_u32_to_uc(common->suspend);
+ 	*buf++ = qos_u32_to_uc(common->bw_limit);
++	*buf++ = qos_u32_to_uc(child->bw_share);
+ 	*buf++ = qos_u32_to_uc(common->shared_bw_group);
+ 	for (i = 0; i < 6; ++i)
+ 		*buf++ = qos_u32_to_uc(child->preds[i]);
+@@ -1784,13 +1787,19 @@ static void set_child(
+ 		struct fw_set_child *child,
+ 		uint32_t modified)
+ {
+-	uint32_t valid;
++	uint32_t valid = 0;
+ 
+-	valid = 0;
+-	if (QOS_BITS_IS_SET(modified, QOS_MODIFIED_VIRT_BW_SHARE)) {
++	if (QOS_BITS_IS_SET(modified, QOS_MODIFIED_BW_WEIGHT)) {
++		QOS_BITS_SET(valid, TSCD_NODE_CONF_NODE_WEIGHT);
++		child->bw_share = conf->bandwidth_share;
++	}
++
++	// Should be changed. Currently both are using bw_share variable
++	if (QOS_BITS_IS_SET(modified, QOS_MODIFIED_SHARED_GROUP_ID)) {
+ 		QOS_BITS_SET(valid, TSCD_NODE_CONF_SHARED_BWL_GROUP);
+ 		child->bw_share = conf->bandwidth_share;
+ 	}
++
+ 	child->valid = valid;
+ }
+ 
+@@ -2505,9 +2514,9 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 	struct fw_internal *internals;
+ 	unsigned int pushed;
+ 	unsigned int i;
+-	struct fw_set_common common;
+-	struct fw_set_parent parent;
+-	struct fw_set_port port;
++	struct fw_set_common common = {0};
++	struct fw_set_parent parent = {0};
++	struct fw_set_port port = {0};
+ 
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+index 8f07e2bac90f..176911c867f7 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+@@ -765,8 +765,9 @@ static int check_queue_conf_validity(
+ 		QOS_BITS_SET(*modified,
+ 			     QOS_MODIFIED_NODE_TYPE |
+ 			     QOS_MODIFIED_BANDWIDTH_LIMIT |
+-			     QOS_MODIFIED_VIRT_BW_SHARE |
++			     QOS_MODIFIED_BW_WEIGHT |
+ 			     QOS_MODIFIED_PARENT |
++			     QOS_MODIFIED_PRIORITY |
+ 			     QOS_MODIFIED_MAX_BURST |
+ 			     QOS_MODIFIED_BLOCKED |
+ 			     QOS_MODIFIED_WRED_ENABLE |
+@@ -1039,8 +1040,6 @@ static int _pp_qos_queue_set(
+ 		parent = get_node_from_phy(
+ 				qdev->nodes,
+ 				nodep->child_prop.parent_phy);
+-		if (nodep->child_prop.virt_bw_share && node_internal(parent))
+-			update_internal_bandwidth(qdev, parent);
+ 	} else {
+ 		phy = get_phy_from_id(qdev->mapping, id);
+ 		nodep = get_node_from_phy(qdev->nodes, phy);
+@@ -1049,17 +1048,15 @@ static int _pp_qos_queue_set(
+ 				nodep->child_prop.parent_phy);
+ 
+ 		/* Child of WSP changes priority i.e. position */
+-		if (parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP) {
++		if ((parent->parent_prop.arbitration ==
++			 PP_QOS_ARBITRATION_WSP)
++			&&
++			QOS_BITS_IS_SET(modified, QOS_MODIFIED_PRIORITY)) {
+ 			update_children_position(
+ 					qdev,
+ 					nodep,
+ 					parent,
+-					min(conf->queue_child_prop.priority,
+-					(unsigned int)parent->
+-					parent_prop.num_of_children),
+ 					&node);
+-
+-
+ 		}  else {
+ 			memcpy(nodep, &node, sizeof(struct qos_node));
+ 		}
+@@ -1073,6 +1070,10 @@ static int _pp_qos_queue_set(
+ 				nodep->child_prop.parent_phy,
+ 				nodep->data.queue.rlm,
+ 				modified);
++
++	if (parent_changed && nodep->child_prop.virt_bw_share)
++		update_internal_bandwidth(qdev, parent);
++
+ out:
+ 	if (rc) {
+ 		if (parent_changed) {
+@@ -1365,7 +1366,7 @@ static int check_sched_conf_validity(
+ 			     QOS_MODIFIED_NODE_TYPE |
+ 			     QOS_MODIFIED_SHARED_GROUP_ID |
+ 			     QOS_MODIFIED_BANDWIDTH_LIMIT |
+-			     QOS_MODIFIED_VIRT_BW_SHARE |
++			     QOS_MODIFIED_BW_WEIGHT |
+ 			     QOS_MODIFIED_PARENT |
+ 			     QOS_MODIFIED_ARBITRATION |
+ 			     QOS_MODIFIED_BEST_EFFORT);
+@@ -1500,7 +1501,9 @@ static int _pp_qos_sched_set(
+ 			add_suspend_port(qdev, get_port(qdev->nodes, prev_phy));
+ 			dst_port = get_port(qdev->nodes, phy);
+ 			create_move_cmd(qdev, phy, prev_phy, dst_port);
+-			node_update_children(qdev, prev_phy, phy);
++			node_update_children(qdev,
++				get_node_from_phy(qdev->nodes, prev_phy),
++				phy);
+ 			map_invalidate_id(qdev->mapping, id);
+ 			map_id_phy(qdev->mapping, id, phy);
+ 			oldnode = get_node_from_phy(qdev->nodes, prev_phy);
+@@ -1521,8 +1524,6 @@ static int _pp_qos_sched_set(
+ 		parent = get_node_from_phy(
+ 				qdev->nodes,
+ 				nodep->child_prop.parent_phy);
+-		if (nodep->child_prop.virt_bw_share && node_internal(parent))
+-			update_internal_bandwidth(qdev, parent);
+ 	} else {
+ 		phy = get_phy_from_id(qdev->mapping, id);
+ 		nodep = get_node_from_phy(qdev->nodes, phy);
+@@ -1531,17 +1532,13 @@ static int _pp_qos_sched_set(
+ 				nodep->child_prop.parent_phy);
+ 
+ 		/* Child of WSP changes priority i.e. position */
+-		if (parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP) {
++		if (parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP &&
++			QOS_BITS_IS_SET(modified, QOS_MODIFIED_PRIORITY)) {
+ 			update_children_position(
+ 					qdev,
+ 					nodep,
+ 					parent,
+-					min(conf->sched_child_prop.priority,
+-					(unsigned int)parent->
+-					parent_prop.num_of_children),
+ 					&node);
+-
+-
+ 		}  else {
+ 			memcpy(nodep, &node, sizeof(struct qos_node));
+ 		}
+@@ -1554,6 +1551,11 @@ static int _pp_qos_sched_set(
+ 				phy,
+ 				nodep->child_prop.parent_phy,
+ 				modified);
++
++	if (QOS_BITS_IS_SET(modified, QOS_MODIFIED_PARENT) &&
++	    nodep->child_prop.virt_bw_share)
++		update_internal_bandwidth(qdev, parent);
++
+ 	return 0;
+ }
+ 
+@@ -2022,7 +2024,7 @@ struct pp_qos_dev *create_qos_dev_desc(struct qos_dev_init_info *initinfo)
+ 		return NULL;
+ 	}
+ 
+-	qdev = _qos_init(initinfo->pl_data.max_port);
++	_qos_init(initinfo->pl_data.max_port, &qdev);
+ 	if (qdev) {
+ 		qdev->hwconf.wred_prioritize_pop =
+ 			initinfo->pl_data.wred_prioritize_pop;
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+index a5ef4f6e0676..64ccff9f639d 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+@@ -37,7 +37,7 @@
+ // UC version
+ #define UC_VERSION_MAJOR	(1)
+ #define UC_VERSION_MINOR	(0)
+-#define UC_VERSION_BUILD	(4)
++#define UC_VERSION_BUILD	(5)
+ 
+ /**************************************************************************
+  *! @enum	UC_STATUS
+@@ -131,26 +131,29 @@ enum tscd_node_conf {
+ 	//!< First Weighted-Round-Robin node (Not relevant for queue)
+ 	TSCD_NODE_CONF_FIRST_WRR_NODE		=	0x0020,
+ 
++	//!< Node Weight (Not relevant for ports)
++	TSCD_NODE_CONF_NODE_WEIGHT			=	0x0040,
++
+ 	//!< Update predecessor 0 (Not relevant for port)
+-	TSCD_NODE_CONF_PREDECESSOR_0		=	0x0040,
++	TSCD_NODE_CONF_PREDECESSOR_0		=	0x0080,
+ 
+ 	//!< Update predecessor 1 (Not relevant for port)
+-	TSCD_NODE_CONF_PREDECESSOR_1		=	0x0080,
++	TSCD_NODE_CONF_PREDECESSOR_1		=	0x0100,
+ 
+ 	//!< Update predecessor 2 (Not relevant for port)
+-	TSCD_NODE_CONF_PREDECESSOR_2		=	0x0100,
++	TSCD_NODE_CONF_PREDECESSOR_2		=	0x0200,
+ 
+ 	//!< Update predecessor 3 (Not relevant for port)
+-	TSCD_NODE_CONF_PREDECESSOR_3		=	0x0200,
++	TSCD_NODE_CONF_PREDECESSOR_3		=	0x0400,
+ 
+ 	//!< Update predecessor 4 (Not relevant for port)
+-	TSCD_NODE_CONF_PREDECESSOR_4		=	0x0400,
++	TSCD_NODE_CONF_PREDECESSOR_4		=	0x0800,
+ 
+ 	//!< Update predecessor 5 (Not relevant for port)
+-	TSCD_NODE_CONF_PREDECESSOR_5		=	0x0800,
++	TSCD_NODE_CONF_PREDECESSOR_5		=	0x1000,
+ 
+ 	//!< Shared BW limit group (0: no shared BW limit, 1-511: group ID)
+-	TSCD_NODE_CONF_SHARED_BWL_GROUP		=	0x1000,
++	TSCD_NODE_CONF_SHARED_BWL_GROUP		=	0x2000,
+ 
+ 	//!< All flags are set
+ 	TSCD_NODE_CONF_ALL					=	0xFFFF
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
+index b61c80696b5a..4b53f9bf9dce 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
+@@ -24,22 +24,12 @@
+  *  2200 Mission College Blvd.
+  *  Santa Clara, CA  97052
+  */
++
++#include <linux/gcd.h>
+ #include "pp_qos_common.h"
+ #include "pp_qos_fw.h"
+ #include "pp_qos_utils.h"
+ 
+-//#define VERY_VERBOSE_TESTS
+-#ifdef VERY_VERBOSE_TESTS
+-
+-#define ISSUE_BW_CMD(phy, numinator, denominator) do {  \
+-if (denominator)					\
+-QOS_LOG("Issue bw change for phy %u: %u : %u\n", phy, numinator, denominator);\
+-} while (0)
+-
+-#else
+-#define ISSUE_BW_CMD(phy, numinator, denominator)
+-
+-#endif
+ 
+ #define QOS_INVALID_PRIORITY   0xF
+ 
+@@ -520,7 +510,7 @@ static void pp_nodes_clean(struct pp_nodes *nodes)
+ 	if (nodes)
+ 		QOS_FREE(nodes);
+ }
+-
++#if 0
+ static unsigned int get_child_node_order(
+ 		struct pp_nodes *nodes,
+ 		const struct qos_node *node)
+@@ -534,7 +524,7 @@ static unsigned int get_child_node_order(
+ 			node->child_prop.parent_phy);
+ 	return (phy - parent_node->parent_prop.first_child_phy);
+ }
+-
++#endif
+ /******************************************************************************/
+ /*                                 Mapping                                    */
+ /******************************************************************************/
+@@ -647,7 +637,7 @@ static int node_child_of(struct pp_nodes *nodes,
+  * @first:     The phy that the first node of tmp_nodes
+  *             represents
+  * @count:     How many children should be updated on tmp_nodes
+- * @phy:       original phy of parent
++ * @parent:    parent
+  * @new_phy:   new phy of parent
+  *
+  * Does not create update predecessor cmds.
+@@ -659,16 +649,14 @@ static void node_update_children_internal(
+ 				   struct qos_node *tmp_nodes,
+ 				   unsigned int first,
+ 				   unsigned int count,
+-				   unsigned int phy,
++				   struct qos_node *parent,
+ 				   unsigned int new_phy)
+ 
+ {
+ 	unsigned int last;
+ 	unsigned int cur;
+ 	struct qos_node *child;
+-	struct qos_node *parent;
+ 
+-	parent = get_node_from_phy(nodes, phy);
+ 	cur = parent->parent_prop.first_child_phy;
+ 	last = cur + parent->parent_prop.num_of_children - 1;
+ 	for (; cur <= last; ++cur) {
+@@ -686,14 +674,12 @@ static void node_update_children_internal(
+  */
+ void node_update_children(
+ 			  struct pp_qos_dev *qdev,
+-			  unsigned int phy,
++			  struct qos_node *parent,
+ 			  unsigned int new_phy)
+ {
+ 	unsigned int num;
+ 	struct qos_node *child;
+-	struct qos_node *parent;
+ 
+-	parent = get_node_from_phy(qdev->nodes, phy);
+ 	child = get_node_from_phy(
+ 			qdev->nodes,
+ 			parent->parent_prop.first_child_phy);
+@@ -709,7 +695,17 @@ void node_update_children(
+  * Update parent's first child phy and num of children, given that count nodes
+  * starting from src_phy are moving to dst_phy
+  *
++ * tmpnodes - local copy of all moved nodes (not only of this parent)
++ * src_first - src phy of first moved node (not only of this parent)
++ * size - total number of nodes moving (not only of this parent)
++ * src_phy - src phy of child
++ * dst_phy - dst phy of child
++ * count - how many more nodes have not move yet and should be moved
++ *         not only of this parent)
++ *
+  * Note number of children is calculated as last_child - first_child + 1
++ *
++ * Returns number of moved nodes for this children
+  */
+ static int node_update_parent(struct pp_qos_dev *qdev,
+ 		struct qos_node *tmpnodes, unsigned int src_first,
+@@ -749,7 +745,7 @@ static int node_update_parent(struct pp_qos_dev *qdev,
+ 			"source nodes %u and %u are not in the same octet\n",
+ 			first, last);
+ 
+-	/* Number of children going to move */
++	/* Number of children of this parent going to move */
+ 	moving = min(count, num - (src_phy - first));
+ 	QOS_ASSERT(same_octet(dst_phy, dst_phy + moving - 1),
+ 			"destination nodes %u and %u are not in the same octet\n",
+@@ -761,14 +757,22 @@ static int node_update_parent(struct pp_qos_dev *qdev,
+ 		QOS_ASSERT(same_octet(dst_phy, src_phy),
+ 				"src phy %u and dst phy %u are not in same octet\n",
+ 				src_phy, dst_phy);
+-		if (first != src_phy) /* first is not moving */
++
++		/* first is not moving, but its sibling may left skip him */
+ 			first = min(first, dst_phy);
+-		else   /* first is moving */
++		if (first != src_phy)
++			first = min(first, dst_phy);
++
++		/* first is moving, optionally skip right its sibling */
++		else
+ 			first = min(first + moving, dst_phy);
+ 
+-		if (last != src_phy + moving - 1)  /* last is not moving */
++		/* last is not moving, but it sibling may right skip it */
++		if (last != src_phy + moving - 1)
+ 			last = max(last, dst_phy + moving - 1);
+-		else  /* last is moving */
++
++		/* last is moving, optionally right skip it */
++		else
+ 			last = max(last - moving, dst_phy + moving - 1);
+ 
+ 		QOS_ASSERT(same_octet(first, last),
+@@ -813,6 +817,10 @@ static void nodes_update_stake_holders(struct pp_qos_dev *qdev,
+ 	map = qdev->mapping;
+ 	index = 0;
+ 
++	/* Copy of all nodes that are going to move moved
++	 * Changes on these nodes will be done on it and then copied
++	 * to database
++	 */
+ 	memcpy(&tmp_nodes, qdev->nodes->nodes + src_phy,
+ 			sizeof(struct qos_node) * count);
+ 
+@@ -832,7 +840,7 @@ static void nodes_update_stake_holders(struct pp_qos_dev *qdev,
+ 					tmp_nodes,
+ 					src_phy,
+ 					count,
+-					i,
++					node,
+ 					dst_phy + i - src_phy);
+ 
+ 		if (node_child(node) && (node >= next_updated_parent)) {
+@@ -1047,7 +1055,8 @@ STATIC_UNLESS_TEST void nodes_move(struct pp_qos_dev *qdev,
+ 			ports[j] = get_port(qdev->nodes, i);
+ 			j++;
+ 		}
+-		QOS_ASSERT(j <= 2 * MAX_MOVING_NODES, "Suspended ports buffer was filled\n");
++		QOS_ASSERT(j <= 2 * MAX_MOVING_NODES,
++			   "Suspended ports buffer was filled\n");
+ 		i = remove_duplicates(ports, j);
+ 		for (j = 0; j < i; ++j)
+ 			add_suspend_port(qdev, ports[j]);
+@@ -1213,7 +1222,7 @@ void node_phy_delete(struct pp_qos_dev *qdev, unsigned int phy)
+ 	if (node_child(node)) {
+ 		parent_phy = node->child_prop.parent_phy;
+ 		parent = get_node_from_phy(qdev->nodes, parent_phy);
+-		if (node->child_prop.virt_bw_share && node_internal(parent)) {
++		if (node->child_prop.virt_bw_share) {
+ 			update_bw = 1;
+ 			id = get_id_from_phy(qdev->mapping, parent_phy);
+ 		}
+@@ -1300,66 +1309,163 @@ int node_flush(struct pp_qos_dev *qdev, struct qos_node *node)
+ 	return 0;
+ }
+ 
++#if 0 // Testing purposes
++// Calc greatest_common_divisor
++static int calc_gcd(int num1, int num2)
++{
++	// If num1 is 0, then num2 is the result
++	if (num1 == 0)
++		return num2;
++
++	/// otherwise we are dividing the number and check for the reminder
++	return calc_gcd(num2 % num1, num1);
++}
++#endif
++
++static int calc_gcd_for_n_numbers(int arr[], int count)
++{
++	int res = arr[0];
++	int ind;
++
++	for (ind = 1; ind < count; ind++)
++		res = gcd(arr[ind], res); // res = calc_gcd(arr[ind], res);
++
++	return res;
++}
++
++static void send_bw_weight_command(struct pp_qos_dev *qdev,
++				   const struct qos_node *child,
++				   int bw_weight)
++{
++	struct pp_qos_sched_conf s_conf;
++	struct pp_qos_queue_conf q_conf;
++	uint32_t modified = 0;
++
++	QOS_LOG_DEBUG("child %u: Sending new BW weight %d\n",
++			get_phy_from_node(qdev->nodes, child),
++			bw_weight);
++
++	QOS_BITS_SET(modified, QOS_MODIFIED_BW_WEIGHT);
++
++	if (node_sched(child)) {
++		get_node_prop(qdev, child, &s_conf.common_prop,
++			&s_conf.sched_parent_prop,
++			&s_conf.sched_child_prop);
++
++		s_conf.sched_child_prop.bandwidth_share = bw_weight;
++
++		create_set_sched_cmd(qdev,
++			&s_conf,
++			get_phy_from_node(qdev->nodes, child),
++			child->child_prop.parent_phy,
++			modified);
++	} else if (node_queue(child)) {
++		get_node_prop(qdev, child, &q_conf.common_prop,
++				NULL,
++				&q_conf.queue_child_prop);
++
++		q_conf.queue_child_prop.bandwidth_share = bw_weight;
++
++		create_set_queue_cmd(qdev,
++			&q_conf,
++			get_phy_from_node(qdev->nodes, child),
++			child->child_prop.parent_phy,
++			child->data.queue.rlm,
++			modified);
++	}
++}
++
++static void get_children_bw_weight(const struct pp_qos_dev *qdev,
++				   const struct qos_node *parent,
++				   int weights[],
++				   int *num_weights)
++{
++	struct qos_node *child;
++	unsigned int cnt;
++
++	child = get_node_from_phy(qdev->nodes,
++			parent->parent_prop.first_child_phy);
++	cnt = parent->parent_prop.num_of_children;
++	for (; cnt; --cnt) {
++		QOS_ASSERT(node_child(child), "Node is not a child\n");
++		if (child->child_prop.virt_bw_share) {
++			weights[(*num_weights)++] =
++					child->child_prop.virt_bw_share;
++		}
++		++child;
++	}
++}
++
++static void set_children_bw_weight(struct pp_qos_dev *qdev,
++				   const struct qos_node *parent,
++				   int gcd)
++{
++	struct qos_node *child;
++	unsigned int cnt;
++	int bw_weight = 0;
++
++	child = get_node_from_phy(qdev->nodes,
++			parent->parent_prop.first_child_phy);
++	cnt = parent->parent_prop.num_of_children;
++
++	for (; cnt; --cnt) {
++		QOS_ASSERT(node_child(child), "Node is not a child\n");
++
++		bw_weight = child->child_prop.virt_bw_share / gcd;
++
++		if (child->child_prop.bw_weight != bw_weight) {
++			child->child_prop.bw_weight = bw_weight;
++			send_bw_weight_command(qdev, child, bw_weight);
++		}
++
++		++child;
++	}
++}
++
+ STATIC_UNLESS_TEST unsigned int get_children_bandwidth_share(
+ 		const struct pp_qos_dev *qdev,
+ 		const struct qos_node *parent);
+-void update_internal_bandwidth(const struct pp_qos_dev *qdev,
++
++void update_internal_bandwidth(struct pp_qos_dev *qdev,
+ 		struct qos_node *parent)
+ {
+ 	unsigned int share;
+-	const struct qos_node *child;
+-	struct qos_node *tmp;
+-	unsigned int cnt;
+-	unsigned int phy;
++	struct qos_node *cur_parent;
+ 	struct qos_node *internals[10];
+-	unsigned int index;
+-	unsigned int parent_share;
++	int index; // Should not be unsigned
++	int weights[10] = { 0 };
++	int num_weights = 0;
++	int gcd = 0;
++
++	// Update weights only in WRR. Currently WSP acts as SP
++	if (parent->parent_prop.arbitration != PP_QOS_ARBITRATION_WRR)
++		return;
+ 
+-	tmp = parent;
++	cur_parent = parent;
+ 	index = 0;
+-	do {
+-		QOS_ASSERT(node_internal(tmp), "Node is not internal\n");
+-		share = get_children_bandwidth_share(qdev, tmp);
+-		tmp->child_prop.virt_bw_share = share;
+-		internals[index++] = tmp;
+-		phy = tmp->child_prop.parent_phy;
+-		tmp = get_node_from_phy(qdev->nodes, phy);
+-	} while (node_internal(tmp));
+ 
+-	--index;
+-	tmp = internals[index];
+-	ISSUE_BW_CMD(get_phy_from_node(qdev->nodes, tmp),
+-			tmp->child_prop.virt_bw_share, 1U);
+-	do {
+-		QOS_ASSERT(node_internal(tmp), "Node is not internal\n");
+-		parent_share = tmp->child_prop.virt_bw_share;
+-		//TODO remove when parent share is used and compiler
+-		//does not shout
+-		parent_share = parent_share;
+-
+-		child = get_const_node_from_phy(qdev->nodes,
+-				tmp->parent_prop.first_child_phy);
+-		cnt = tmp->parent_prop.num_of_children;
+-		for (; cnt; --cnt) {
+-			QOS_ASSERT(node_child(child), "Node is not a child\n");
+-			if (child->child_prop.virt_bw_share)
+-				ISSUE_BW_CMD(
+-					get_phy_from_node(
+-						qdev->nodes,
+-						child),
+-					child->child_prop.virt_bw_share *
+-					10000U,
+-					parent_share * 100);
+-			++child;
+-		}
++	while (node_internal(cur_parent)) {
++		QOS_ASSERT(node_internal(cur_parent), "Node is not internal");
++		share = get_children_bandwidth_share(qdev, cur_parent);
++		cur_parent->child_prop.virt_bw_share = share;
++		internals[index++] = cur_parent;
++		cur_parent = get_node_from_phy(qdev->nodes,
++				cur_parent->child_prop.parent_phy);
++	}
+ 
+-		if (index > 0) {
+-			--index;
+-			tmp = internals[index];
+-		} else {
+-			break;
+-		}
+-	} while (1);
++	// We arrive here with all internal schedulers added to internals[]
++	// array. In addition, the uper level concrete parent (not IS) is held
++	// in cur_parent variable.
++
++	// Even if no IS, we still want to enter this "for" once
++	for (; index >= 0; index--) {
++		get_children_bw_weight(qdev, cur_parent, weights, &num_weights);
++		gcd = calc_gcd_for_n_numbers(weights, num_weights + 1);
++		set_children_bw_weight(qdev, cur_parent, gcd);
++
++		if (index > 0)
++			cur_parent = internals[index-1];
++	}
+ }
+ 
+ /**
+@@ -1404,56 +1510,54 @@ static void link_with_parent(
+ 
+ }
+ 
+-struct pp_qos_dev *_qos_init(unsigned int max_port)
++void _qos_init(unsigned int max_port, struct pp_qos_dev **qdev)
+ {
+-	struct pp_qos_dev *qdev;
+ 	unsigned int i;
+ 
+-	qdev = QOS_MALLOC(sizeof(struct pp_qos_dev));
+-	if (qdev) {
+-		memset(qdev, 0, sizeof(struct pp_qos_dev));
+-		qdev->max_port = max_port;
++	*qdev = QOS_MALLOC(sizeof(struct pp_qos_dev));
++	if (*qdev) {
++		memset(*qdev, 0, sizeof(struct pp_qos_dev));
++		(*qdev)->max_port = max_port;
+ 
+-		qdev->octets = octets_init(octet_of_phy(max_port));
+-		if (qdev->octets == NULL)
++		(*qdev)->octets = octets_init(octet_of_phy(max_port));
++		if ((*qdev)->octets == NULL)
+ 			goto fail;
+ 
+-		qdev->nodes = pp_nodes_init();
+-		if (qdev->nodes == NULL)
++		(*qdev)->nodes = pp_nodes_init();
++		if ((*qdev)->nodes == NULL)
+ 			goto fail;
+ 
+-		qdev->ids = free_id_init();
+-		if (qdev->ids == NULL)
++		(*qdev)->ids = free_id_init();
++		if ((*qdev)->ids == NULL)
+ 			goto fail;
+ 
+-		qdev->rlms = free_rlm_init();
+-		if (qdev->rlms == NULL)
++		(*qdev)->rlms = free_rlm_init();
++		if ((*qdev)->rlms == NULL)
+ 			goto fail;
+ 
+-		qdev->mapping = pp_mapping_init();
+-		if (qdev->mapping == NULL)
++		(*qdev)->mapping = pp_mapping_init();
++		if ((*qdev)->mapping == NULL)
+ 			goto fail;
+ 
+-		qdev->queue = pp_queue_init(1024);
+-		if (qdev->queue == NULL)
++		(*qdev)->queue = pp_queue_init(1024);
++		if ((*qdev)->queue == NULL)
+ 			goto fail;
+ 
+-		qdev->drvcmds.cmdq = cmd_queue_init();
+-		if (qdev->drvcmds.cmdq == NULL)
++		(*qdev)->drvcmds.cmdq = cmd_queue_init();
++		if ((*qdev)->drvcmds.cmdq == NULL)
+ 			goto fail;
+ 
+-		qdev->drvcmds.pendq = cmd_queue_init();
+-		if (qdev->drvcmds.pendq == NULL)
++		(*qdev)->drvcmds.pendq = cmd_queue_init();
++		if ((*qdev)->drvcmds.pendq == NULL)
+ 			goto fail;
+ 
+ 		for (i = 0; i <= QOS_MAX_SHARED_BANDWIDTH_GROUP; ++i)
+-			qdev->groups[i].used = 0;
+-		QOS_LOCK_INIT(qdev);
++			(*qdev)->groups[i].used = 0;
++		QOS_LOCK_INIT((*qdev));
+ 	}
+-	return qdev;
++	return;
+ fail:
+-	_qos_clean(qdev);
+-	return NULL;
++	_qos_clean(*qdev);
+ }
+ 
+ void _qos_clean(struct pp_qos_dev *qdev)
+@@ -1747,7 +1851,7 @@ int tree_remove(struct pp_qos_dev *qdev, unsigned int phy)
+ 	rc = post_order_travers_tree(qdev, phy, node_used_wrapper, NULL,
+ 			node_remove_wrapper, NULL);
+ 	if (rc) {
+-		QOS_LOG("Error while trying to delete subtree whose root is %u\n",
++		QOS_LOG("Error while trying to delete subtree with root %u\n",
+ 				phy);
+ 		return -EBUSY;
+ 	}
+@@ -1788,7 +1892,7 @@ int tree_modify_blocked_status(
+ 			NULL, node_modify_blocked_status,
+ 			(void *)(uintptr_t)status);
+ 	if (rc) {
+-		QOS_LOG_ERR("Error when change blocked status to %u on tree with root %u\n",
++		QOS_LOG_ERR("Error when change blocked status to %u (root %u)",
+ 				status, phy);
+ 		rc =  -EBUSY;
+ 	}
+@@ -1856,15 +1960,21 @@ static int child_cfg_valid(
+ 	unsigned int cur_virt_parent_phy;
+ 
+ 	QOS_ASSERT(node_child(node), "node is not a child\n");
++	if (node->child_prop.priority > QOS_MAX_CHILD_PRIORITY) {
++		QOS_LOG_ERR("Illegal priority %u\n",
++				node->child_prop.priority);
++		return 0;
++	}
++
+ 	parent_phy = node->child_prop.parent_phy;
+ 	if (parent_phy > NUM_OF_NODES - 1) {
+-		QOS_LOG("Illegal parent %u\n", parent_phy);
++		QOS_LOG_ERR("Illegal parent %u\n", parent_phy);
+ 		return 0;
+ 	}
+ 
+ 	parent =  get_const_node_from_phy(qdev->nodes, parent_phy);
+ 	if (!node_parent(parent)) {
+-		QOS_LOG("Node's parent %u is not a parent\n", parent_phy);
++		QOS_LOG_ERR("Node's parent %u is not a parent\n", parent_phy);
+ 		return 0;
+ 	}
+ 
+@@ -1912,7 +2022,7 @@ static int parent_cfg_valid(
+ 	num = node->parent_prop.num_of_children;
+ 	if ((num > 0) &&
+ 	    (first <= qdev->max_port || first > NUM_OF_NODES - 1)) {
+-		QOS_LOG_ERR("node has %u children but first child %u is illegal\n",
++		QOS_LOG_ERR("node has %u children but first (%u) is illegal\n",
+ 			node->parent_prop.num_of_children, first);
+ 		return 0;
+ 	}
+@@ -1977,13 +2087,13 @@ int get_node_prop(const struct pp_qos_dev *qdev,
+ 
+ 	if (child) {
+ 		/*
+-		 * Internal schedulers are tranparent to clients. Clients see
++		 * Internal schedulers are transparent to clients. Clients see
+ 		 * only virtual parent - the first parent in hierarchy which is
+ 		 * not internal scheduler
+ 		 */
+ 		child->parent = get_id_from_phy(qdev->mapping,
+ 				get_virtual_parent_phy(qdev->nodes, node));
+-		child->priority = get_child_node_order(qdev->nodes, node);
++		child->priority = node->child_prop.priority;
+ 		child->bandwidth_share = node->child_prop.virt_bw_share;
+ 	}
+ 
+@@ -2038,6 +2148,7 @@ static int set_child(struct pp_qos_dev *qdev,
+ {
+ 	unsigned int conf_parent_phy;
+ 	unsigned int virt_parent_phy;
++	struct qos_node *parent;
+ 
+ 	/* Equals to virtual parent phy since client is not aware of internal
+ 	 * schedulers, they are transparent to him
+@@ -2055,7 +2166,14 @@ static int set_child(struct pp_qos_dev *qdev,
+ 
+ 	if (node->child_prop.virt_bw_share != child->bandwidth_share) {
+ 		node->child_prop.virt_bw_share = child->bandwidth_share;
+-		QOS_BITS_SET(*modified, QOS_MODIFIED_VIRT_BW_SHARE);
++		QOS_BITS_SET(*modified, QOS_MODIFIED_BW_WEIGHT);
++	}
++
++	parent = get_node_from_phy(qdev->nodes, node->child_prop.parent_phy);
++	if ((parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP) &&
++			(node->child_prop.priority != child->priority)) {
++		node->child_prop.priority = child->priority;
++		QOS_BITS_SET(*modified, QOS_MODIFIED_PRIORITY);
+ 	}
+ 
+ 	return 0;
+@@ -2097,6 +2215,7 @@ static void node_child_init(struct qos_node *node)
+ {
+ 	node->child_prop.parent_phy = QOS_INVALID_PHY;
+ 	node->child_prop.virt_bw_share = 0;
++	node->child_prop.priority = 0;
+ }
+ 
+ static void node_common_init(struct qos_node *node)
+@@ -2141,20 +2260,27 @@ void node_init(const struct pp_qos_dev *qdev,
+ static unsigned int calculate_new_child_location(
+ 		struct pp_qos_dev *qdev,
+ 		struct qos_node *parent,
+-		unsigned int child_priority)
++		unsigned int priority)
+ {
+ 	unsigned int phy;
++	unsigned int num;
++	struct qos_node *child;
+ 
+ 	QOS_ASSERT(node_parent(parent), "node is not a parent\n");
+-	if (parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WRR)
++	if (parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WRR) {
+ 		phy = parent->parent_prop.first_child_phy +
+ 			parent->parent_prop.num_of_children;
+-	else
+-		phy = parent->parent_prop.first_child_phy +
+-			min(
+-					child_priority,
+-					(unsigned int)parent->
+-					parent_prop.num_of_children);
++	} else {
++		num = parent->parent_prop.num_of_children;
++		phy = parent->parent_prop.first_child_phy;
++		child = get_node_from_phy(qdev->nodes, phy);
++		while ((priority > child->child_prop.priority) && num) {
++			++phy;
++			++child;
++			--num;
++		}
++	}
++
+ 	return phy;
+ }
+ 
+@@ -2225,10 +2351,13 @@ static unsigned int has_less_than_8_children_on_full_octet(
+ 			get_phy_from_node(qdev->nodes, parent));
+ 	QOS_ASSERT(octet_get_use_count(qdev->octets, children_octet) == 8,
+ 			"Octet %d is not full\n", children_octet);
+-	min_parent =  octet_get_min_sibling_group(qdev, children_octet,
++	min_parent = octet_get_min_sibling_group(qdev, children_octet,
+ 			parent, &num_of_required_entries);
+ 	QOS_ASSERT(min_parent != NULL, "Can't find min_parent for octet %d\n",
+ 			children_octet);
++	if (min_parent == NULL)
++		return QOS_INVALID_PHY;
++
+ 	octet = octet_get_with_at_least_free_entries(
+ 			qdev->octets,
+ 			num_of_required_entries);
+@@ -2365,9 +2494,8 @@ static unsigned int create_internal_scheduler_on_node(
+ 	id = get_id_from_phy(qdev->mapping, phy);
+ 	map_id_phy(qdev->mapping, id, new_phy);
+ 	if (node_parent(node))
+-		node_update_children(qdev,
+-				get_phy_from_node(qdev->nodes, node),
+-				new_phy);
++		node_update_children(qdev, node, new_phy);
++
+ 	memcpy(new_node, node, sizeof(struct qos_node));
+ 	new_node->child_prop.parent_phy = phy;
+ 	create_move_cmd(qdev, new_phy, phy, get_port(qdev->nodes, new_phy));
+@@ -2392,7 +2520,7 @@ static unsigned int create_internal_scheduler_on_node(
+ 			QOS_MODIFIED_NODE_TYPE |
+ 			QOS_MODIFIED_BANDWIDTH_LIMIT |
+ 			QOS_MODIFIED_SHARED_GROUP_ID |
+-			QOS_MODIFIED_VIRT_BW_SHARE |
++			QOS_MODIFIED_BW_WEIGHT |
+ 			QOS_MODIFIED_PARENT | QOS_MODIFIED_ARBITRATION |
+ 			QOS_MODIFIED_BEST_EFFORT);
+ 
+@@ -2538,11 +2666,10 @@ int check_sync_with_fw(struct pp_qos_dev *qdev)
+ 	create_num_used_nodes_cmd(qdev, qdev->hwconf.fw_stat, &res);
+ 	update_cmd_id(&qdev->drvcmds);
+ 	transmit_cmds(qdev);
+-	QOS_ASSERT(
+-			res == used,
+-			"Driver's DB has %u used nodes, while firmware reports %u\n",
+-			used,
+-			res);
++	QOS_ASSERT(res == used,
++		   "Driver's DB has %u used nodes, while firmware reports %u\n",
++		   used,
++		   res);
+ 
+ 	id = pp_pool_get(pool);
+ 	while (QOS_ID_VALID(id)) {
+@@ -2574,11 +2701,53 @@ int qos_device_ready(const struct pp_qos_dev *qdev)
+ 	return 1;
+ }
+ 
++/*
++ * Return new phy of a node whose original node was
++ * orig_node and now has a new priority
++ */
++static unsigned int find_child_position_by_priority(
++			struct pp_qos_dev *qdev,
++			struct qos_node *parent,
++			struct qos_node *orig_node,
++			unsigned int priority)
++{
++	struct qos_node *first;
++	struct qos_node *child;
++	struct qos_node *last;
++	unsigned int pos;
++	unsigned int num;
++
++	QOS_ASSERT(parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP,
++			"Parent is not wsp\n");
++
++	num = parent->parent_prop.num_of_children;
++	QOS_ASSERT(num, "Function can't be used on parent with no children\n");
++
++	pos = parent->parent_prop.first_child_phy;
++
++	first = get_node_from_phy(qdev->nodes, pos);
++	last = get_node_from_phy(qdev->nodes, pos + num - 1);
++
++	for (child = first; child <= last; ++child) {
++		if (child == orig_node)
++			continue;
++		if (priority <= child->child_prop.priority)
++			break;
++		++pos;
++	}
++	return pos;
++}
++
++/*
++ * Update wsp child position based on its position
++ * child - original child node before moving (stored at db)
++ * parent - parent node of child
++ * node_src - copy of child node (stored at stack)
++ */
+ void update_children_position(
+ 			struct pp_qos_dev *qdev,
+ 			struct qos_node *child,
+ 			struct qos_node *parent,
+-			unsigned int position,
+ 			struct qos_node *node_src)
+ {
+ 	unsigned int old_phy;
+@@ -2589,14 +2758,18 @@ void update_children_position(
+ 	unsigned int first;
+ 	unsigned int cnt;
+ 
+-	QOS_ASSERT(parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP,
+-			"Parent is not wsp\n");
+-
+ 	old_phy = get_phy_from_node(qdev->nodes, child);
+-	new_phy = parent->parent_prop.first_child_phy + position;
+ 
+-	if (new_phy == old_phy)
++	new_phy = find_child_position_by_priority(qdev,
++			parent,
++			child,
++			node_src->child_prop.priority);
++
++	if (new_phy == old_phy) {
++		node = get_node_from_phy(qdev->nodes, new_phy);
++		memcpy(node, node_src, sizeof(struct qos_node));
+ 		return;
++	}
+ 
+ 	first = parent->parent_prop.first_child_phy;
+ 	cnt = parent->parent_prop.num_of_children;
+@@ -2613,8 +2786,9 @@ void update_children_position(
+ 	create_move_cmd(qdev, new_phy, PP_QOS_TMP_NODE, dst_port);
+ 
+ 	map_id_phy(qdev->mapping, id, new_phy);
+-	if (node_parent(child))
+-		node_update_children(qdev, old_phy, new_phy);
++
++	if (node_parent(node_src))
++		node_update_children(qdev, node_src, new_phy);
+ 
+ 	node = get_node_from_phy(qdev->nodes, new_phy);
+ 	memcpy(node, node_src, sizeof(struct qos_node));
+@@ -2622,6 +2796,10 @@ void update_children_position(
+ 	nodes_modify_used_status(qdev, new_phy, 1, 1);
+ 	parent->parent_prop.first_child_phy = first;
+ 	parent->parent_prop.num_of_children = cnt;
++
++	create_parent_change_cmd(qdev,
++			get_phy_from_node(qdev->nodes, parent));
++
+ 	if (node_parent(child))
+ 		tree_update_predecessors(qdev, new_phy);
+ }
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+index 853af6afea74..77ed8389f6d4 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+@@ -75,7 +75,8 @@
+ #define QOS_MODIFIED_SHARED_GROUP_ID		BIT(3)
+ #define QOS_MODIFIED_ARBITRATION		BIT(5)
+ #define QOS_MODIFIED_BEST_EFFORT		BIT(6)
+-#define QOS_MODIFIED_VIRT_BW_SHARE		BIT(8)
++#define QOS_MODIFIED_PRIORITY			BIT(7)
++#define QOS_MODIFIED_BW_WEIGHT			BIT(8)
+ #define QOS_MODIFIED_PARENT			BIT(9)
+ #define QOS_MODIFIED_RING_ADDRESS		BIT(10)
+ #define QOS_MODIFIED_RING_SIZE			BIT(11)
+@@ -115,7 +116,9 @@ enum node_type {
+ 
+ struct child_node_properties {
+ 	uint16_t	parent_phy;
++	uint8_t		priority;
+ 	uint8_t		virt_bw_share;
++	uint8_t		bw_weight;
+ };
+ 
+ struct parent_node_properties {
+@@ -439,7 +442,7 @@ unsigned int octet_get_least_free_entries(struct pp_octets *octets);
+ /*
+  * Initialize qos dev, max port designates phy of highest port
+  */
+-struct pp_qos_dev *_qos_init(unsigned int max_port);
++void _qos_init(unsigned int max_port, struct pp_qos_dev **qdev);
+ void _qos_clean(struct pp_qos_dev *qdev);
+ 
+ /*
+@@ -562,7 +565,7 @@ unsigned int get_virtual_parent_phy(const struct pp_nodes *nodes,
+ 				    const struct qos_node *child);
+ 
+ void node_update_children(struct pp_qos_dev *qdev,
+-				 unsigned int phy,
++				 struct qos_node *parent,
+ 				 unsigned int new_phy);
+ 
+ void tree_update_predecessors(struct pp_qos_dev *qdev, unsigned int phy);
+@@ -573,10 +576,10 @@ void tree_update_predecessors(struct pp_qos_dev *qdev, unsigned int phy);
+  * 2. If sched's parent is also internal scheduler
+  *    update its virtual bandwidth share also to be the update
+  *    bw share sum of its children. And keep doing that
+- *    up the tree hirarchy so long parent is an internal scheduler
++ *    up the tree hierarchy so long parent is an internal scheduler
+  * 3. For each
+  */
+-void update_internal_bandwidth(const struct pp_qos_dev *qdev,
++void update_internal_bandwidth(struct pp_qos_dev *qdev,
+ 			       struct qos_node *sched);
+ 
+ /* Remove all nodes (including root) of a subtree */
+@@ -629,7 +632,6 @@ void update_children_position(
+ 			struct pp_qos_dev *qdev,
+ 			struct qos_node *child,
+ 			struct qos_node *parent,
+-			unsigned int position,
+ 			struct qos_node *node_src);
+ int allocate_ddr_for_qm(struct pp_qos_dev *qdev);
+ int allocate_ddr_for_qm_on_platform(struct pp_qos_dev *qdev);

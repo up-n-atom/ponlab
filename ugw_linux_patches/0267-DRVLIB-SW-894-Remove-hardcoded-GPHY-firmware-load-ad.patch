@@ -1,0 +1,139 @@
+From 035bbba1fc91b85a9508d55957b14b7deb2696c3 Mon Sep 17 00:00:00 2001
+From: Peter Harliman Liem <peter.harliman.liem@intel.com>
+Date: Mon, 10 Sep 2018 10:02:23 +0800
+Subject: [PATCH] DRVLIB_SW-894 - Remove hardcoded GPHY firmware load address
+
+- Remove workaround of hardcoded SRAM address in prx300
+  We can now use DDR for firmware load
+  address, as long as we set correct alignment (which apparently
+  is different with xrx platform; 128kB instead of 16kB).
+- Change dma_alloc_coherent() to dmam_alloc_coherent()
+  This is a managed version, which will release memory upon detach.
+---
+ drivers/net/ethernet/lantiq/xrx500_phy_fw.c | 45 +++++++++--------------------
+ 1 file changed, 13 insertions(+), 32 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index b3068d976b0a..6ef08b0a2047 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -15,8 +15,6 @@
+ #include <linux/regmap.h>
+ #include <linux/mfd/syscon.h>
+ 
+-#define XRX200_GPHY_FW_ALIGN	(16 * 1024)
+-
+ #define XRX500_GPHY_NUM 5 /* phy2-5 + phyf */
+ struct xrx500_reset_control {
+ 	struct reset_control *phy[XRX500_GPHY_NUM];
+@@ -33,9 +31,7 @@ struct xway_gphy_data {
+ 	struct regmap *syscfg, *cgu_syscfg;
+ 	void __iomem *base;
+ 
+-	size_t fw_size;
+ 	dma_addr_t dma_addr;
+-	void *virt_addr;
+ 
+ 	/* Number of resets and names are SoC specific. Hence we place it as
+ 	 * union here.
+@@ -49,6 +45,7 @@ struct xway_gphy_data {
+ 	const struct xway_gphy_soc_data {
+ 		int (*boot_func)(struct xway_gphy_data *);
+ 		int (*dt_parse_func)(struct xway_gphy_data *);
++		int align;
+ 	} *soc_data;
+ };
+ 
+@@ -83,7 +80,6 @@ static u32 xrx500_gphy[] = {
+ #define PRX300_GPHY0_GPS1 0x808
+ #define PRX300_GPHY0_GPS0_LO 0x3f004000
+ #define PRX300_GPHY0_GPS0_HI 0
+-#define PRX300_FW_LOAD_ADDR 0x18da0000
+ /* GPHY CDB */
+ #define PRX300_GPHY_CDB_PDI_PLL_CFG0 0x0
+ #define PRX300_GPHY_CDB_PDI_PLL_CFG2 0x8
+@@ -160,23 +156,6 @@ static int xrx500_dt_parse(struct xway_gphy_data *priv)
+ static int prx300_gphy_boot(struct xway_gphy_data *priv)
+ {
+ 	struct prx300_reset_control *rst = &priv->rst.prx300;
+-	void *virt_addr;
+-
+-	/* Temporary workaround for PRX300 GPHY issue.
+-	 * Firmware loading in PRX300 GPHY does not work if address
+-	 * is in DDR. For this reason we hardcode the address to SRAM
+-	 * location (which is assumed to be free at the beginning of
+-	 * boot).
+-	 */
+-	virt_addr = devm_ioremap_nocache(priv->dev, PRX300_FW_LOAD_ADDR,
+-					 priv->fw_size);
+-	memcpy(virt_addr, priv->virt_addr, priv->fw_size);
+-	dma_free_coherent(priv->dev, priv->fw_size, priv->virt_addr,
+-			  priv->dma_addr);
+-	priv->dma_addr = (dma_addr_t)PRX300_FW_LOAD_ADDR;
+-	priv->virt_addr = virt_addr;
+-	dev_info(priv->dev, "Temporary use SRAM for firmware %p:%x\n",
+-		 priv->virt_addr, priv->dma_addr);
+ 
+ 	/* set LAN interface to GPHY */
+ 	regmap_update_bits(priv->syscfg, PRX300_IFMUX_CFG, PRX300_LAN_MUX_MASK,
+@@ -224,8 +203,6 @@ static int prx300_gphy_boot(struct xway_gphy_data *priv)
+ 	msleep(100);
+ 
+ 	dev_info(priv->dev, "booting GPHY firmware for PRX300\n");
+-
+-	devm_iounmap(priv->dev, priv->virt_addr);
+ 	return 0;
+ }
+ 
+@@ -274,6 +251,8 @@ static int xway_gphy_load(struct xway_gphy_data *priv)
+ {
+ 	const struct firmware *fw;
+ 	const char *fw_name;
++	void *virt_addr;
++	size_t size;
+ 
+ 	if (of_property_read_string(priv->dev->of_node, "firmware", &fw_name)) {
+ 		dev_err(priv->dev, "failed to load firmware filename\n");
+@@ -288,20 +267,20 @@ static int xway_gphy_load(struct xway_gphy_data *priv)
+ 
+ 	/**
+ 	 * GPHY cores need the firmware code in a persistent and contiguous
+-	 * memory area with a 16 kB boundary aligned start address
++	 * memory area with a boundary aligned start address.
+ 	 */
+-	priv->fw_size = fw->size + XRX200_GPHY_FW_ALIGN;
+-	priv->virt_addr = dma_alloc_coherent(priv->dev, priv->fw_size,
+-					     &priv->dma_addr, GFP_KERNEL);
+-	if (!priv->virt_addr) {
++	size = fw->size + priv->soc_data->align;
++	virt_addr = dmam_alloc_coherent(priv->dev, size, &priv->dma_addr,
++					GFP_KERNEL);
++	if (!virt_addr) {
+ 		dev_err(priv->dev, "failed to alloc firmware memory\n");
+ 		release_firmware(fw);
+ 		return -ENOMEM;
+ 	}
+ 
+-	priv->virt_addr = PTR_ALIGN(priv->virt_addr, XRX200_GPHY_FW_ALIGN);
+-	priv->dma_addr = ALIGN(priv->dma_addr, XRX200_GPHY_FW_ALIGN);
+-	memcpy(priv->virt_addr, fw->data, fw->size);
++	virt_addr = PTR_ALIGN(virt_addr, priv->soc_data->align);
++	priv->dma_addr = ALIGN(priv->dma_addr, priv->soc_data->align);
++	memcpy(virt_addr, fw->data, fw->size);
+ 
+ 	release_firmware(fw);
+ 	return 0;
+@@ -366,11 +345,13 @@ EXPORT_SYMBOL(is_xway_gphy_fw_loaded);
+ static struct xway_gphy_soc_data xrx500_gphy_data = {
+ 	.boot_func = &xrx500_gphy_boot,
+ 	.dt_parse_func = &xrx500_dt_parse,
++	.align = 16 * 1024,
+ };
+ 
+ static struct xway_gphy_soc_data prx300_gphy_data = {
+ 	.boot_func = &prx300_gphy_boot,
+ 	.dt_parse_func = &prx300_dt_parse,
++	.align = 128 * 1024,
+ };
+ 
+ static const struct of_device_id xway_phy_match[] = {

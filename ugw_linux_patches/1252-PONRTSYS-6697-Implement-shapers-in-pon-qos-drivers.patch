@@ -1,0 +1,304 @@
+From 3c834890027546f49defa46f31cc8f57ab1e7422 Mon Sep 17 00:00:00 2001
+From: Jan Dominiak <janx.dominiak@intel.com>
+Date: Tue, 9 Jun 2020 08:37:01 +0200
+Subject: [PATCH] PONRTSYS-6697: Implement shapers in pon qos drivers
+
+---
+ drivers/net/datapath/pon_qos/Makefile          |   3 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.c |   2 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.h |   4 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c  |  64 ++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h  |   6 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_tbf.c  | 160 +++++++++++++++++++++++++
+ 6 files changed, 238 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index f1b7fbf49ec9..8964c86d222f 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -17,4 +17,5 @@ pon_qos-objs := \
+ 	pon_qos_tc_pce.o \
+ 	pon_qos_tc_mirred.o \
+ 	pon_qos_tc_ds_tc_remap.o \
+-	pon_qos_tc_colmark.o
++	pon_qos_tc_colmark.o \
++	pon_qos_tc_tbf.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+index 0be6d6b904b1..f3c4d8755d09 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+@@ -41,6 +41,8 @@ int pon_qos_setup_tc(struct net_device *dev,
+ 					      port_id, deq_idx);
+ 	case TC_SETUP_QDISC_RED:
+ 		return pon_qos_tc_red_offload(dev, handle, tc);
++	case TC_SETUP_TBF:
++		return pon_qos_tc_tbf_offload(dev, handle, tc);
+ 	default:
+ 		netdev_err(dev, "offload type:%d not supported\n", tc->type);
+ 		ret = -EOPNOTSUPP;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.h b/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
+index 717fca9171fa..f5234153a592 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
+@@ -32,4 +32,8 @@ int pon_qos_tc_flower_offload(struct net_device *dev,
+ int pon_qos_tc_red_offload(struct net_device *dev,
+ 			   u32 handle,
+ 			   struct tc_to_netdev *tc);
++
++int pon_qos_tc_tbf_offload(struct net_device *dev,
++			   u32 handle,
++			   struct tc_to_netdev *tc);
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index c4cfc65b0569..a8071c4323c8 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -1102,3 +1102,67 @@ int pon_qos_qdata_remove(struct net_device *dev, struct pon_qos_q_data *qid,
+ 		   __func__);
+ 	return 0;
+ }
++
++static void pon_qos_shaper_config_init(struct pon_qos_qdisc *sch,
++			       struct pon_qos_q_data *qdata,
++			       enum dp_shaper_cmd cmd,
++			       struct dp_shaper_conf *cfg)
++{
++	cfg->inst = sch->inst;
++	cfg->type = DP_NODE_QUEUE;
++	cfg->cmd = cmd;
++	cfg->id.q_id = (int) qdata->qid;
++}
++
++int pon_qos_shaper_add(struct pon_qos_qdisc *sch,
++		       struct pon_qos_q_data *qdata,
++		       struct tc_tbf_qopt_offload_params *params)
++{
++	struct dp_shaper_conf cfg = {0};
++	int ret;
++
++	pon_qos_shaper_config_init(sch, qdata, DP_SHAPER_CMD_ADD, &cfg);
++
++	netdev_dbg(sch->dev, "%s: inst: %d type: %d cmd: %d q_id: %d sch_id: %d cqm_deq_port: %d\n",
++		   __func__, cfg.inst, cfg.type, cfg.cmd, cfg.id.q_id,
++		   cfg.id.sch_id, cfg.id.cqm_deq_port);
++
++	cfg.cir = div_u64(params->rate, 1000);
++	cfg.pir = div_u64(params->prate, 1000);
++	cfg.cbs = params->burst;
++	cfg.pbs = params->pburst;
++
++	netdev_dbg(sch->dev, "%s: cir: %d pir: %d cbs: %d pbs: %d\n",
++		   __func__, cfg.cir, cfg.pir, cfg.cbs, cfg.pbs);
++
++	ret = dp_shaper_conf_set(&cfg, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: shaper config set failed %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++int pon_qos_shaper_remove(struct pon_qos_qdisc *sch,
++			  struct pon_qos_q_data *qdata)
++{
++	struct dp_shaper_conf cfg = {0};
++	int ret;
++
++	pon_qos_shaper_config_init(sch, qdata, DP_SHAPER_CMD_REMOVE, &cfg);
++
++	netdev_dbg(sch->dev, "%s: inst: %d type: %d cmd: %d q_id: %d sch_id: %d cqm_deq_port: %d\n",
++		   __func__, cfg.inst, cfg.type, cfg.cmd, cfg.id.q_id,
++		   cfg.id.sch_id, cfg.id.cqm_deq_port);
++
++	ret = dp_shaper_conf_set(&cfg, 0);
++	if (ret == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: shaper config set failed %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index 979d7762192e..d033526a84f7 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -178,4 +178,10 @@ int pon_qos_qdata_add(struct net_device *dev, struct pon_qos_q_data *qid,
+ 				     u32 parent));
+ int pon_qos_qdata_remove(struct net_device *dev, struct pon_qos_q_data *qid,
+ 			 u32 handle, u32 parent);
++
++int pon_qos_shaper_add(struct pon_qos_qdisc *sch,
++		       struct pon_qos_q_data *qid,
++		       struct tc_tbf_qopt_offload_params *params);
++int pon_qos_shaper_remove(struct pon_qos_qdisc *sch,
++			  struct pon_qos_q_data *qid);
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_tbf.c b/drivers/net/datapath/pon_qos/pon_qos_tc_tbf.c
+new file mode 100644
+index 000000000000..c7bf3e09aec7
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_tbf.c
+@@ -0,0 +1,160 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include "pon_qos_tc_qos.h"
++
++static int pon_tbf_remove(struct net_device *dev, u32 handle, u32 parent)
++{
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	struct pon_qos_port *port = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_err(dev, "tc-tbf port get failed\n");
++		return -1;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, parent);
++	if (!qdisc) {
++		netdev_err(dev, "tc-tbf qdisc get failed\n");
++		return -1;
++	}
++
++
++	qid = pon_qos_qdata_qid_get(dev, qdisc, parent);
++	if (!qid) {
++		ret = pon_qos_get_queue_by_handle(dev, parent, &qid);
++		if (ret < 0 || !qid) {
++			netdev_err(dev, "%s: handle not found err %d\n",
++				__func__, ret);
++			return -1;
++		}
++	}
++
++	ret = pon_qos_shaper_remove(qdisc, qid);
++	if (ret < 0)
++		return ret;
++
++	radix_tree_delete(&port->qdiscs, TC_H_MAJ(handle));
++
++	return 0;
++}
++
++static int pon_qos_tc_tbf_replace(struct net_device *dev,
++			   struct tc_tbf_qopt_offload *opt)
++{
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	struct pon_qos_port *port = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_err(dev, "tc-tbf port get failed\n");
++		return -1;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, opt->parent);
++	if (!qdisc) {
++		netdev_err(dev, "tc-tbf qdisc get failed\n");
++		return -1;
++	}
++
++	qid = pon_qos_qdata_qid_get(dev, qdisc, opt->parent);
++	if (!qid) {
++		ret = pon_qos_get_queue_by_handle(dev, opt->parent, &qid);
++		if (ret < 0 || !qid) {
++			netdev_err(dev, "%s: handle not found err %d\n",
++				__func__, ret);
++			return -1;
++		}
++	}
++
++	ret = pon_qos_shaper_add(qdisc, qid, &opt->set_params);
++	if (ret < 0)
++		return ret;
++
++	ret = pon_qos_qdata_add(dev, qid, opt->handle, opt->parent,
++				PON_QOS_QDATA_TBF, pon_tbf_remove);
++	if (ret < 0)
++		return -1;
++
++	ret = radix_tree_insert(&port->qdiscs, TC_H_MAJ(opt->handle), qdisc);
++	if (ret < 0) {
++		netdev_err(dev, "%s: qdisc insertion to radix tree failed: %d\n",
++			   __func__, ret);
++		return ret;
++	}
++
++	return 0;
++}
++
++static int pon_qos_tc_tbf_destroy(struct net_device *dev,
++				  struct tc_tbf_qopt_offload *opt)
++{
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	struct pon_qos_port *port = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_err(dev, "tc-tbf port get failed\n");
++		return -1;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, opt->parent);
++	if (!qdisc) {
++		netdev_err(dev, "tc-tbf qdisc get failed\n");
++		return -1;
++	}
++
++	qid = pon_qos_qdata_qid_get(dev, qdisc, opt->parent);
++	if (!qid) {
++		ret = pon_qos_get_queue_by_handle(dev, opt->parent, &qid);
++		if (ret < 0 || !qid) {
++			netdev_err(dev, "%s: handle not found err %d\n",
++				__func__, ret);
++			return -1;
++		}
++	}
++
++	return pon_qos_qdata_remove(dev, qid, opt->handle, opt->parent);
++}
++
++int pon_qos_tc_tbf_offload(struct net_device *dev,
++			   u32 handle,
++			   struct tc_to_netdev *tc)
++{
++	int err = 0;
++	struct tc_tbf_qopt_offload *opt = tc->sch_tbf;
++
++	switch (opt->command) {
++	case TC_TBF_REPLACE:
++		err = pon_qos_tc_tbf_replace(dev, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-tbf replace failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_TBF_DESTROY:
++		err = pon_qos_tc_tbf_destroy(dev, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-tbf destroy failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_TBF_STATS:
++		return -EOPNOTSUPP;
++	default:
++		break;
++	}
++
++	return 0;
++}

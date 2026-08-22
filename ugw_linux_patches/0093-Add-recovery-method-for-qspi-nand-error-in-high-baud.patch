@@ -1,0 +1,145 @@
+From 4cb2bf03923cced18a8bbc78ce8c9b645ee3574a Mon Sep 17 00:00:00 2001
+From: Peter Harliman Liem <peter.harliman.liem@intel.com>
+Date: Wed, 6 Jun 2018 14:07:35 +0800
+Subject: [PATCH] Add recovery method for qspi nand error in high-baudrate
+
+QSPI NAND write in prx board has corruption issues when we
+use high baudrate (> 16 MHz). This is deemed to be caused
+by board/controller problem; SRAM write occasionally gets
+unstable during transfer.
+This commit is to workaround the problem:
+- Add error detection in qspi write.
+  We will write to SRAM, wait for complete interrupt, and
+  recheck the SRAM fill level. In error case, the level
+  will be non-zero, in which case we return -EAGAIN.
+  Upper-layer could then retry the operation, if they
+  decide to.
+- Add retry in ltq_spinand program ops
+  We retry if program ops fail. During experiment, retry
+  value 3 is enough to avoid corruption all together.
+---
+ drivers/mtd/ltq-spinand/ltq_spinand.c | 18 ++++++++++---
+ drivers/spi/spi-cadence-qspi-apb.c    | 50 +++++++++++++++++++++--------------
+ 2 files changed, 45 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/mtd/ltq-spinand/ltq_spinand.c b/drivers/mtd/ltq-spinand/ltq_spinand.c
+index 0a623834ca4f..8d31432c1bd8 100644
+--- a/drivers/mtd/ltq-spinand/ltq_spinand.c
++++ b/drivers/mtd/ltq-spinand/ltq_spinand.c
+@@ -1024,6 +1024,7 @@ static int spinand_program_page(struct spi_device *spi,
+ 	int retval;
+ 	u8 status = 0;
+ 	uint8_t *wbuf;
++	int retry = 3;
+ 
+ 	wbuf = buf;
+ 
+@@ -1035,10 +1036,21 @@ static int spinand_program_page(struct spi_device *spi,
+ 	if (wait_till_ready(spi))
+ 		dev_err(&spi->dev, "wait timedout!!!\n");
+ 
+-	retval = spinand_program_data_to_cache(spi, page_id,
+-			offset, len, wbuf);
+-	if (retval < 0)
++	while (retry--) {
++		retval = spinand_program_data_to_cache(spi, page_id, offset,
++						       len, wbuf);
++		if (retval != -EAGAIN)
++			break;
++
++		dev_dbg(&spi->dev, "fail to program data to cache, retrying\n");
++		cpu_relax();
++	}
++
++	if (retval < 0) {
++		dev_err(&spi->dev, "error %d program data to cache\n", retval);
+ 		return retval;
++	}
++
+ 	retval = spinand_program_execute(spi, page_id);
+ 	if (retval < 0)
+ 		return retval;
+diff --git a/drivers/spi/spi-cadence-qspi-apb.c b/drivers/spi/spi-cadence-qspi-apb.c
+index 367dfbf3ec15..db344ac29653 100644
+--- a/drivers/spi/spi-cadence-qspi-apb.c
++++ b/drivers/spi/spi-cadence-qspi-apb.c
+@@ -801,18 +801,14 @@ static int cadence_qspi_apb_indirect_write_execute(
+ 	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_START_MASK,
+ 			reg_base + CQSPI_REG_INDIRECTWR);
+ 
+-	/* Write a page or remaining bytes. */
+-	write_bytes = remaining > page_size ? page_size : remaining;
+-
+-	/* Fill up the data at the beginning */
+-	cadence_qspi_apb_write_fifo_data(ahb_base, txbuf, write_bytes,
+-					 flash_type);
+-	txbuf += write_bytes;
+-	remaining -= write_bytes;
+-
+ 	while (remaining > 0) {
++		/* Calculate number of bytes to write. */
++		write_bytes = remaining > page_size ? page_size : remaining;
++		cadence_qspi_apb_write_fifo_data(ahb_base, txbuf, write_bytes,
++						 flash_type);
++
+ 		ret = wait_event_interruptible_timeout(cadence_qspi->waitqueue,
+-						       *irq_status,
++						       *irq_status & CQSPI_IRQ_MASK_WR,
+ 						       CQSPI_TIMEOUT_MS);
+ 		if (!ret) {
+ 			pr_err("QSPI: Indirect write timeout\n");
+@@ -826,16 +822,9 @@ static int cadence_qspi_apb_indirect_write_execute(
+ 			ret = -EPERM;
+ 			goto failwr;
+ 		}
+-		if (*irq_status & (CQSPI_REG_IRQ_UNDERFLOW |
+-			CQSPI_REG_IRQ_IND_COMP | CQSPI_REG_IRQ_WATERMARK)){
+-			/* Calculate number of bytes to write. */
+-			write_bytes = remaining > page_size ?
+-				page_size : remaining;
+-			cadence_qspi_apb_write_fifo_data(ahb_base, txbuf,
+-				write_bytes, flash_type);
+-			txbuf  += write_bytes;
+-			remaining -= write_bytes;
+-		}
++
++		txbuf  += write_bytes;
++		remaining -= write_bytes;
+ 	}
+ 
+ 	/* Check indirect done status */
+@@ -851,6 +840,23 @@ static int cadence_qspi_apb_indirect_write_execute(
+ 		ret = -ETIMEDOUT;
+ 		goto failwr;
+ 	}
++
++	/* We observe issues in high frequency in which write transfer fail in
++	 * between, which eventually causes issues at higher layer (e.g. file
++	 * system corruption). To workaround, we check the sram fill level
++	 * after write. If it is not zero, we assume transfer failure, and
++	 * return -EAGAIN so that user layer can retry operation in a clean
++	 * way.
++	 */
++	fill_level = (((CQSPI_READL(reg_base + CQSPI_REG_SDRAMLEVEL)) >>
++		       CQSPI_REG_SDRAMLEVEL_WR_LSB) &
++		      CQSPI_REG_SDRAMLEVEL_WR_MASK);
++	if (fill_level) {
++		pr_debug("%s fill level is %u\n", __func__, fill_level);
++		ret = -EAGAIN;
++		goto failwr;
++	}
++
+ 	/* Disable interrupt. */
+ 	CQSPI_WRITEL(0, reg_base + CQSPI_REG_IRQMASK);
+ 	/* Clear indirect completion status */
+@@ -866,6 +872,10 @@ static int cadence_qspi_apb_indirect_write_execute(
+ 	/* Cancel the indirect write */
+ 	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_CANCEL_MASK,
+ 		reg_base + CQSPI_REG_INDIRECTWR);
++	/* Clear indirect completion status */
++	CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_DONE_MASK,
++		     reg_base + CQSPI_REG_INDIRECTWR);
++
+ 	return ret;
+ }
+ void cadence_qspi_apb_controller_enable(void *reg_base)

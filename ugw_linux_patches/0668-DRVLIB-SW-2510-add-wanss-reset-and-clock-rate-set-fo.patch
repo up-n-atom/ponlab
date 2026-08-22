@@ -1,0 +1,452 @@
+From 988f07ac84590120970575700bae1a541180a903 Mon Sep 17 00:00:00 2001
+From: yixin zhu <yixin.zhu@intel.com>
+Date: Wed, 3 Jul 2019 11:57:34 +0800
+Subject: [PATCH] DRVLIB_SW-2510: add wanss reset and clock rate set for wan
+ xpcs
+
+---
+ drivers/clk/intel/clk-cgu-pll.c        | 72 ++++++++++++++++----------
+ drivers/clk/intel/clk-prx300.c         |  8 +--
+ drivers/phy/intel/phy-intel-combo.c    | 47 ++++++++---------
+ drivers/phy/intel/phy-intel-wan-xpcs.c | 93 ++++++++++++++++------------------
+ 4 files changed, 116 insertions(+), 104 deletions(-)
+
+diff --git a/drivers/clk/intel/clk-cgu-pll.c b/drivers/clk/intel/clk-cgu-pll.c
+index 4e2ea5cb615c..5a3ec3cf0249 100644
+--- a/drivers/clk/intel/clk-cgu-pll.c
++++ b/drivers/clk/intel/clk-cgu-pll.c
+@@ -93,7 +93,7 @@ grx500_early_recalc_rate(struct clk_hw *hw, unsigned long prate)
+ 	return intel_pll_calc_rate(prate, mult, div, frac, BIT(20));
+ }
+ 
+-const static struct clk_ops grx500_clk_early_ops = {
++static const struct clk_ops grx500_clk_early_ops = {
+ 	.recalc_rate = grx500_early_recalc_rate,
+ };
+ 
+@@ -126,7 +126,7 @@ prx300_early_recalc_rate(struct clk_hw *hw, unsigned long prate)
+ 	return intel_pll_calc_rate(prate, mult, div, frac, BIT(24));
+ }
+ 
+-const static struct clk_ops prx300_clk_early_ops = {
++static const struct clk_ops prx300_clk_early_ops = {
+ 	.recalc_rate = prx300_early_recalc_rate,
+ };
+ 
+@@ -223,7 +223,7 @@ static int grx500_pll_is_enabled(struct clk_hw *hw)
+ 	return intel_get_clk_val(pll->map, pll->reg, 1, 1);
+ }
+ 
+-const static struct clk_ops intel_grx500_pll_ops = {
++static const struct clk_ops intel_grx500_pll_ops = {
+ 	.recalc_rate	= grx500_pll_recalc_rate,
+ 	.is_enabled	= grx500_pll_is_enabled,
+ };
+@@ -241,6 +241,7 @@ static int
+ prx300_pll_set_params(struct intel_clk_pll *pll, unsigned int mult,
+ 		      unsigned int div, unsigned int frac)
+ {
++	intel_set_clk_val(pll->map, pll->reg + 0x8, 28, 1, 1);
+ 	intel_set_clk_val(pll->map, pll->reg + 0x8, 0, 12, mult);
+ 	intel_set_clk_val(pll->map, pll->reg + 0x8, 18, 6, div);
+ 	intel_set_clk_val(pll->map, pll->reg, 2, 24, frac);
+@@ -347,7 +348,7 @@ prx300_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+ 	return prx300_pll_set_params(pll, mult, div, frac);
+ }
+ 
+-const static struct clk_ops intel_prx300_pll_ops = {
++static const struct clk_ops intel_prx300_pll_ops = {
+ 	.recalc_rate	= prx300_pll_recalc_rate,
+ 	.is_enabled	= prx300_pll_is_enabled,
+ 	.enable		= prx300_pll_enable,
+@@ -432,35 +433,50 @@ void intel_clk_plls_parse_vco_config(struct intel_clk_provider *ctx,
+ 				     const struct intel_pll_clk_data *list,
+ 				     u32 nr_clk)
+ {
++	const struct intel_pll_clk_data *plls;
+ 	struct device *dev = ctx->dev;
+-	struct device_node *np = dev->of_node;
+-	const struct intel_pll_clk_data *tmp;
+-	struct of_phandle_args args;
+-	u32 count = 0, idx;
++	struct of_phandle_args r;
+ 	struct clk *clk;
+-
+-	do {
+-		if (of_parse_phandle_with_fixed_args(np,
+-						     "intel,pll_clks_vco",
+-						     3, count, &args) < 0)
++	u32 clk_id, clk_rate, clk_en;
++	int cnt, idx, ret;
++
++	for (cnt = 0;; cnt++) {
++		/* arg0: Clk ID, arg1: Clk rate, arg2: Clk Enable */
++		ret = of_parse_phandle_with_fixed_args(dev->of_node,
++						       "intel,pll-clks",
++						       3, cnt, &r);
++		if (ret)
+ 			break;
+ 
+-		for (idx = 0, tmp = list; idx < nr_clk; idx++, tmp++) {
+-			if (tmp->id == args.args[0]) {
+-				clk = __clk_lookup(tmp->name);
+-				if (clk_prepare_enable(clk) == 0) {
+-					if (!args.args[2]) {
+-						clk_disable_unprepare(clk);
+-					} else {
+-						if (clk_set_rate(clk, args.args[1]))
+-							dev_warn(ctx->dev, "%s clk: %s clk_set_rate failed\n",
+-								__func__, tmp->name);
+-					}
+-				} else
+-					dev_warn(ctx->dev, "%s clk: %s enable failed\n",
+-						__func__, tmp->name);
++		clk_id   = r.args[0];
++		clk_rate = r.args[1];
++		clk_en   = r.args[2];
++
++		for (idx = 0, plls = list; idx < nr_clk; idx++, plls++) {
++			if (plls->id == clk_id)
++				break;
++		}
++		if (plls->id != clk_id) {
++			dev_warn(dev, "PLL%u: not supported!\n", clk_id);
++			continue;
++		}
++
++		clk = __clk_lookup(plls->name);
++		if (clk_en) {
++			clk_prepare_enable(clk);
++			if (clk_set_rate(clk, clk_rate)) {
++				dev_warn(dev, "PLL %s not support rate: %u\n",
++					 plls->name, clk_rate);
++				clk_disable_unprepare(clk);
+ 			}
++		} else {
++			/* PLL HW default is enabled.
++			 * Linux clock default is disabled.
++			 * Disable PLL clk requires to enable first in logic
++			 */
++			clk_prepare_enable(clk);
++			clk_disable_unprepare(clk);
+ 		}
+-	} while (++count);
++	}
+ }
+ 
+diff --git a/drivers/clk/intel/clk-prx300.c b/drivers/clk/intel/clk-prx300.c
+index 886ff0caf277..ee5c89e36947 100644
+--- a/drivers/clk/intel/clk-prx300.c
++++ b/drivers/clk/intel/clk-prx300.c
+@@ -191,7 +191,8 @@ static const struct intel_clk_branch prx300_branch_clks[] __initconst = {
+ 		   28, GATE_CLK_HW, 0),
+ 	INTEL_GATE(PRX300_GCLK_PON, "g_pon", "pondef", 0, CGU_GATE1,
+ 		   29, GATE_CLK_HW, 0),
+-	INTEL_GATE(PRX300_GCLK_AON, "g_aon", NULL, 0, CGU_GATE1,
++	INTEL_GATE(PRX300_GCLK_AON, "g_aon", "pon_phy",
++		   CLK_SET_RATE_PARENT, CGU_GATE1,
+ 		   30, GATE_CLK_HW, 0),
+ 	INTEL_GATE(PRX300_GCLK_DDR, "g_ddr", NULL, CLK_IGNORE_UNUSED, CGU_GATE1,
+ 		   31, GATE_CLK_HW, 0),
+@@ -219,8 +220,9 @@ static const struct intel_clk_branch prx300_branch_clks[] __initconst = {
+ 		   31, GATE_CLK_HW, 0),
+ 
+ 	/* Gate3 clock */
+-	INTEL_GATE(PRX300_GCLK_SWREF, "g_swref", NULL, 0, CGU_IF_CLK,
+-		   4, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SWREF, "g_swref", "g_aon",
++		   CLK_SET_RATE_PARENT, CGU_IF_CLK,
++		   4, GATE_CLK_SW, 0),
+ 	INTEL_GATE(PRX300_GCLK_CBPHY0, "cbphy0", NULL, 0, CGU_IF_CLK,
+ 		   24, GATE_CLK_SW, 0),
+ 	INTEL_GATE(PRX300_GCLK_CBPHY1, "cbphy1", NULL, 0, CGU_IF_CLK,
+diff --git a/drivers/phy/intel/phy-intel-combo.c b/drivers/phy/intel/phy-intel-combo.c
+index 72900fff71ff..9a74b72dff79 100644
+--- a/drivers/phy/intel/phy-intel-combo.c
++++ b/drivers/phy/intel/phy-intel-combo.c
+@@ -61,7 +61,7 @@ enum intel_phy_mode {
+ 	PHY_MAX_MODE
+ };
+ 
+-struct intel_phy_calibrate{
++struct intel_phy_calibrate {
+ 	u32 resv:31;
+ 	u32 rx_auto_adapt:1;
+ };
+@@ -326,7 +326,7 @@ static int intel_phy_gate_clk_enable(struct phy_ctx *iphy)
+ 	return 0;
+ }
+ 
+-static void intel_phy_gate_clk_disable(struct phy_ctx *iphy)
++static __maybe_unused void intel_phy_gate_clk_disable(struct phy_ctx *iphy)
+ {
+ 	if (iphy->phy_gate_clk)
+ 		clk_disable_unprepare(iphy->phy_gate_clk);
+@@ -341,7 +341,7 @@ static int intel_phy_freq_clk_enable(struct phy_ctx *iphy)
+ 	return 0;
+ }
+ 
+-static void intel_phy_freq_clk_disable(struct phy_ctx *iphy)
++static __maybe_unused void intel_phy_freq_clk_disable(struct phy_ctx *iphy)
+ {
+ 	if (iphy->phy_freq_clk)
+ 		clk_disable_unprepare(iphy->phy_freq_clk);
+@@ -380,7 +380,7 @@ static int intel_pcie_set_clk_src(struct phy_ctx *iphy)
+ static int phy_rxeq_autoadapt(struct phy *phy)
+ {
+ 	struct phy_ctx *iphy;
+-	int i, err;
++	int err;
+ 	u32 val;
+ 	struct device *dev;
+ 
+@@ -410,7 +410,7 @@ static int phy_rxeq_autoadapt(struct phy *phy)
+ 		(RAWLANEN_RX_OV_IN_3 << 2), val, (!!(val & BIT(0))),
+ 		5, 5 * PHY_RXADAPT_POLL_CNT);
+ 	/* if auto adapt fail, run auto adapt one more time */
+-	if (IS_ERR(err)) {
++	if (err) {
+ 		/* ADAPT_REQ Bit 11 and ADAPT_REQ_OVRD_EN Bit 12 */
+ 		val = readl(iphy->cr_base + (RAWLANEN_RX_OV_IN_3 << 2));
+ 		writel(val & ~(BIT(11) | BIT(12)), iphy->cr_base + (RAWLANEN_RX_OV_IN_3 << 2));
+@@ -427,39 +427,41 @@ static int phy_rxeq_autoadapt(struct phy *phy)
+ 	/* Stop RX Adaptation */
+ 	combo_phy_w32(iphy->cr_base, 0x0, (RAWLANEN_RX_OV_IN_3 << 2));
+ 	dev_dbg(dev, "RX Adaptation Turn off after done:\n");
+-	dev_dbg(dev, "RAWLANEN_RX_OV_IN_3 (0x%08x) = 0x%08x\n",
++	dev_dbg(dev, "RAWLANEN_RX_OV_IN_3 (0x%p) = 0x%08x\n",
+ 		(iphy->cr_base + (RAWLANEN_RX_OV_IN_3 << 2)),
+ 		combo_phy_r32(iphy->cr_base, (RAWLANEN_RX_OV_IN_3 << 2)));
+ 
+ 	/* Display RX Adapt Value in PMA */
+ 	dev_dbg(dev, "Read back on RX Adapted Value\n");
+ 	/* LANEN_RX_ADPT_ATT_STAT ATT Adaptation code */
+-	dev_dbg(dev, "LANEN_RX_ADPT_ATT_STAT [ (0x%08x) = 0x%08x\n",
++	dev_dbg(dev, "LANEN_RX_ADPT_ATT_STAT [ (0x%p) = 0x%08x\n",
+ 		(iphy->cr_base + (LANEN_RX_ADPT_ATT_STAT << 2)),
+ 		combo_phy_r32(iphy->cr_base, (LANEN_RX_ADPT_ATT_STAT << 2)));
+ 
+ 	/* LANEN_RX_ADPT_VGA_STAT VGA Adaptation code */
+-	dev_dbg(dev, "LANEN_RX_ADPT_VGA_STAT [ (0x%08x) = 0x%08x\n",
++	dev_dbg(dev, "LANEN_RX_ADPT_VGA_STAT [ (0x%p) = 0x%08x\n",
+ 		(iphy->cr_base + (LANEN_RX_ADPT_VGA_STAT << 2)),
+ 		combo_phy_r32(iphy->cr_base, (LANEN_RX_ADPT_VGA_STAT << 2)));
+ 
+ 	/* LANEN_RX_ADPT_CTLE_STAT CTLE Adaptation code */
+-	dev_dbg(dev, "LANEN_RX_ADPT_CTLE_STAT [ (0x%08x) = 0x%08x\n",
++	dev_dbg(dev, "LANEN_RX_ADPT_CTLE_STAT [ (0x%p) = 0x%08x\n",
+ 		(iphy->cr_base + (LANEN_RX_ADPT_CTLE_STAT << 2)),
+ 		combo_phy_r32(iphy->cr_base, (LANEN_RX_ADPT_CTLE_STAT << 2)));
+ 
+ 	/* LANEN_RX_ADPT_DFETAP1_STAT DFE Tap1 Adaptation code */
+-	dev_dbg(dev, "LANEN_RX_ADPT_DFETAP1_STAT [ (0x%08x) = 0x%08x\n",
++	dev_dbg(dev, "LANEN_RX_ADPT_DFETAP1_STAT [ (0x%p) = 0x%08x\n",
+ 		(iphy->cr_base + (LANEN_RX_ADPT_DFETAP1_STAT << 2)),
+ 		combo_phy_r32(iphy->cr_base, (LANEN_RX_ADPT_DFETAP1_STAT << 2)));
+ 
+ 	if (err) {
+-		dev_warn(dev, "RX Adaptation not done\n", iphy->parent->id);
++		dev_warn(dev, "PHY(%u:%u): RX Adaptation not done\n",
++			 COMBO_PHY_ID(iphy), PHY_ID(iphy));
+ 		return -1;
+-	} else {
+-		dev_dbg(dev, "RX Adaptation done\n", iphy->parent->id);
+-		return 0;
+ 	}
++
++	dev_dbg(dev, "PHY(%u:%u): RX Adaptation done\n",
++		COMBO_PHY_ID(iphy), PHY_ID(iphy));
++	return 0;
+ }
+ 
+ static int intel_phy_power_on(struct phy_ctx *iphy)
+@@ -520,6 +522,7 @@ static int intel_phy_power_off(struct phy_ctx *iphy)
+ 		return ret;
+ 	}
+ 
++	/* prx300 cannot disable clk */
+ 	iphy->power_en = false;
+ 
+ 	return 0;
+@@ -681,9 +684,9 @@ static int intel_combo_phy_calibrate(struct phy *phy)
+ 	int ret = 0;
+ 
+ 	iphy = phy_get_drvdata(phy);
+-	if (iphy->calibrate.rx_auto_adapt) {
++	if (iphy->calibrate.rx_auto_adapt)
+ 		ret = phy_rxeq_autoadapt(phy);
+-	}
++
+ 	return ret;
+ }
+ 
+@@ -1222,17 +1225,11 @@ static void twh_combo_phy_mode_set(struct intel_combo_phy *priv)
+ 			   priv->cb_phy_mode << cb_mode_bit_off);
+ }
+ 
+-/* Falconmx platform data */
++/* PRX300 platform data */
+ static unsigned long prx300_get_clk_rate(enum intel_phy_mode mode)
+ {
+-	if (mode == PHY_PCIE_MODE) {
+-		return CLK_100MHZ;
+-	} else if (mode == PHY_XPCS_MODE) {
+-		/* 156.25Mhz */
+-		return CLK_156MHZ;
+-	}
+-
+-	return 0;  /* Other mode No support */
++	/* PRX300 only support 156.25Mhz */
++	return CLK_156MHZ;
+ }
+ 
+ static u32 prx300_get_phy_cap(unsigned int id)
+diff --git a/drivers/phy/intel/phy-intel-wan-xpcs.c b/drivers/phy/intel/phy-intel-wan-xpcs.c
+index 933fdbe2fa19..d7afabca6876 100644
+--- a/drivers/phy/intel/phy-intel-wan-xpcs.c
++++ b/drivers/phy/intel/phy-intel-wan-xpcs.c
+@@ -23,28 +23,28 @@
+ #include <linux/regmap.h>
+ 
+ /* chiptop aon/pon config; this is platform specific */
+-#define CHIP_TOP_IFMUX_CFG	0x120
+-#define WAN_MUX_AON	0x1
+-#define WAN_MUX_MASK	0x1
+-
+-enum clk_control {
+-	FREQ_CLK,
+-	GATE_CLK,
+-	HWEN_CLK,
+-	MAX_CLK,
++#define CHIP_TOP_IFMUX_CFG 0x120
++#define WAN_MUX_AON        0x1
++#define WAN_MUX_MASK       0x1
++
++enum {
++	PHY_RST,
++	WANSS_RST,
++	MAX_RST
+ };
+ 
+-static const char *clk_name[MAX_CLK] = {
+-	"freq", "xpcs", "hwclken"
++static const char *rst_name[MAX_RST] = {
++	"phy", "wanss"
+ };
+ 
+ struct intel_wan_xpcs_phy {
+-	struct phy *phy;
++	struct phy             *phy;
+ 	struct platform_device *pdev;
+-	struct device *dev;
+-	struct clk *clk[MAX_CLK];
+-	struct regmap *syscfg;
+-	struct reset_control *resets;
++	struct device          *dev;
++	struct clk             *clk;
++	u32                    clk_freq;
++	struct regmap          *syscfg;
++	struct reset_control   *resets[MAX_RST];
+ };
+ 
+ static int intel_wan_xpcs_phy_init(struct phy *phy)
+@@ -67,29 +67,26 @@ static int intel_wan_xpcs_phy_power_on(struct phy *phy)
+ 
+ 	dev_dbg(priv->dev, "Power on intel wan xpcs phy\n");
+ 
+-	ret = clk_prepare_enable(priv->clk[GATE_CLK]);
++	ret = clk_prepare_enable(priv->clk);
+ 	if (ret) {
+ 		dev_err(dev, "Failed to enable PHY gate clock\n");
+ 		return ret;
+ 	}
+-	ret = clk_prepare_enable(priv->clk[HWEN_CLK]);
+-	if (ret) {
+-		dev_err(dev, "Failed to enable PHY gate hwen clock\n");
+-		return ret;
+-	}
+ 
+-	ret = clk_prepare_enable(priv->clk[FREQ_CLK]);
++	if (priv->clk_freq)
++		clk_set_rate(priv->clk, priv->clk_freq);
++
++	ret = reset_control_deassert(priv->resets[PHY_RST]);
+ 	if (ret) {
+-		dev_err(dev, "Failed to enable PHY clock\n");
++		dev_err(dev, "Failed to deassert phy reset\n");
+ 		return ret;
+ 	}
+ 
+-	ret = reset_control_deassert(priv->resets);
++	ret = reset_control_deassert(priv->resets[WANSS_RST]);
+ 	if (ret) {
+-		dev_err(dev, "Failed to deassert phy reset\n");
++		dev_err(dev, "Failed to deassert wanss reset\n");
+ 		return ret;
+ 	}
+-
+ 	udelay(2);
+ 
+ 	return 0;
+@@ -103,15 +100,18 @@ static int intel_wan_xpcs_phy_power_off(struct phy *phy)
+ 
+ 	dev_dbg(priv->dev, "Power off intel xpcs phy\n");
+ 
+-	ret = reset_control_assert(priv->resets);
++	ret = reset_control_assert(priv->resets[PHY_RST]);
+ 	if (ret) {
+-		dev_err(dev, "Failed to assert xpcs reset\n");
++		dev_err(dev, "Failed to assert phy reset\n");
+ 		return ret;
+ 	}
+ 
+-	clk_disable_unprepare(priv->clk[FREQ_CLK]);
+-	clk_disable_unprepare(priv->clk[GATE_CLK]);
+-	clk_disable_unprepare(priv->clk[HWEN_CLK]);
++	ret = reset_control_assert(priv->resets[WANSS_RST]);
++	if (ret) {
++		dev_err(dev, "Failed to assert WANSS reset\n");
++		return ret;
++	}
++	clk_disable_unprepare(priv->clk);
+ 
+ 	return 0;
+ }
+@@ -122,24 +122,21 @@ static int intel_wan_xpcs_phy_dt_parse(struct intel_wan_xpcs_phy *priv)
+ 	struct device_node *np = dev->of_node;
+ 	int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(priv->clk); i++) {
+-		priv->clk[i] = devm_clk_get(dev, clk_name[i]);
+-		if (IS_ERR(priv->clk[i])) {
+-			if (i == FREQ_CLK) {
+-				dev_err(dev, "Failed to retrieve clk %s\n",
+-					clk_name[i]);
+-				return PTR_ERR(priv->clk[i]);
+-			}
+-
+-			/* others are optional */
+-			priv->clk[i] = NULL;
+-		}
++	priv->clk = devm_clk_get(dev, NULL);
++	if (IS_ERR(priv->clk)) {
++		dev_err(dev, "Failed to retrieve clk\n");
++		return PTR_ERR(priv->clk);
+ 	}
+ 
+-	priv->resets = devm_reset_control_get(dev, NULL);
+-	if (IS_ERR(priv->resets)) {
+-		dev_err(dev, "Failed to retrieve rst controller\n");
+-		return PTR_ERR(priv->resets);
++	if (device_property_read_u32(dev, "clock-frequency", &priv->clk_freq))
++		priv->clk_freq = 0;
++
++	for (i = 0; i < MAX_RST; i++) {
++		priv->resets[i] = devm_reset_control_get(dev, rst_name[i]);
++		if (IS_ERR(priv->resets[i])) {
++			dev_err(dev, "Failed to retrieve rst controller\n");
++			return PTR_ERR(priv->resets[i]);
++		}
+ 	}
+ 
+ 	/* get chiptop regmap */

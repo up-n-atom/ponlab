@@ -1,0 +1,216 @@
+From 090c1b98a167587b3f40713d0378ec6518a91a12 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Tue, 8 Sep 2020 15:35:11 +0300
+Subject: [PATCH] LMTSYS-3921: Create shadow exception si for PPv4 LGM
+
+Create new shadow exception si in DDR to be used by the FW
+instead of original SRAM address
+---
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c |  4 +-
+ drivers/net/ppv4/pp-hal/checker/checker.c          | 49 ++++++++++++++++++++--
+ drivers/net/ppv4/pp-hal/checker/checker.h          |  8 +++-
+ drivers/net/ppv4/pp-hal/checker/checker_internal.h |  7 +++-
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      |  6 ++-
+ drivers/net/ppv4/pp-hal/session-info/pp_si.h       |  1 +
+ 6 files changed, 67 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 910d3368826d..8be714427f5c 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -2324,7 +2324,7 @@ s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
+ 	cid = 0;
+ 	stats = (struct reassembly_stats *)s;
+ 	for_each_arr_entry(str, cntrs_str, ARRAY_SIZE(cntrs_str), cid++) {
+-		pr_buf_cat(buf, sz, *n, "| %-15s ", *str);
++		pr_buf_cat(buf, sz, *n, "| %-17s ", *str);
+ 		for_each_arr_entry(it, stats, num) {
+ 			pr_buf_cat(buf, sz, *n, "| %10llu ",
+ 				   *(((u64 *)it) + cid));
+@@ -2332,7 +2332,7 @@ s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
+ 		pr_buf_cat(buf, sz, *n, "|\n");
+ 	}
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|---------------------------------------------------------------------|\n\n");
++		   "|-----------------------------------------------------------------------|\n\n");
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.c b/drivers/net/ppv4/pp-hal/checker/checker.c
+index 0af8cda827f0..43dd5e4603a5 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.c
++++ b/drivers/net/ppv4/pp-hal/checker/checker.c
+@@ -35,6 +35,10 @@ struct chk_database {
+ 	void      *dsi_base_virt;
+ 	dma_addr_t dsi_base_phys;
+ 	size_t     dsi_sz;
++	/* shadow DB for exception sessions to be used by FWs */
++	void      *exp_base_virt;
++	dma_addr_t exp_base_phys;
++	size_t     exp_sz;
+ 	bool       nf_reass_en;
+ 	 /*! specify which exception session is used */
+ 	ulong      excp_sess_bmap[BITS_TO_LONGS(CHK_NUM_EXCEPTION_SESSIONS)];
+@@ -86,6 +90,14 @@ dma_addr_t chk_excp_si_phys_base_get(void)
+ 	return pp_virt_to_phys((void *)(ulong)CHK_ALT_SI_RAM(0));
+ }
+ 
++dma_addr_t chk_sh_excp_si_phys_base_get(void)
++{
++	if (unlikely(!db))
++		return 0;
++
++	return db->exp_base_phys;
++}
++
+ dma_addr_t chk_dsi_phys_base_get(void)
+ {
+ 	if (unlikely(!db))
+@@ -547,8 +559,9 @@ static s32 __chk_exception_session_si_get(u32 id, struct pp_si *alt_si)
+ static s32 __chk_exception_session_si_set(u32 id, struct pp_si *alt_si)
+ {
+ 	struct pp_hw_si hw_si;
+-	u32 idx;
++	u32 i;
+ 	s32 ret;
++	u32 *ddr_addr, *sram_addr;
+ 
+ 	memset(&hw_si, 0, sizeof(hw_si));
+ 	ret = pp_si_encode_top(&hw_si, alt_si);
+@@ -557,9 +570,17 @@ static s32 __chk_exception_session_si_set(u32 id, struct pp_si *alt_si)
+ 		return ret;
+ 	}
+ 
++	ddr_addr = db->exp_base_virt + CHK_EXCEPTION_SI_OFF(id);
++	sram_addr = (u32 *)CHK_ALT_SI_RAM(id);
++
+ 	/* Write alt si to checker ram */
+-	for (idx = 0 ; idx < PP_SI_TOP_WORDS_CNT ; idx++)
+-		PP_REG_WR32(CHK_ALT_SI_RAM(id) + (idx << 2), hw_si.word[idx]);
++	for (i = 0 ; i < PP_SI_TOP_WORDS_CNT ; i++, sram_addr++, ddr_addr++) {
++		PP_REG_WR32(sram_addr, hw_si.word[i]);
++
++		/* for a-step we keep the shadow alt si updated */
++		if (pp_silicon_step_get() == PP_SSTEP_A)
++			*ddr_addr = hw_si.word[i];
++	}
+ 
+ 	return 0;
+ }
+@@ -1107,6 +1128,22 @@ s32 __chk_ddr_allocate(void)
+ 		return -ENOMEM;
+ 	}
+ 	memset(db->dsi_base_virt, 0, db->dsi_sz);
++
++	if (pp_silicon_step_get() == PP_SSTEP_A) {
++		db->exp_sz =
++			PAGE_ALIGN(CHK_NUM_EXCEPTION_SESSIONS * PP_SI_TOP_SZ);
++		db->exp_base_virt =
++			dma_alloc_attrs(pp_dev_get(), db->exp_sz,
++					&db->exp_base_phys, GFP_KERNEL,
++					DMA_ATTR_NON_CONSISTENT);
++		if (!db->exp_base_virt) {
++			pr_err("Could not allocate %zu bytes exception session shadow DB\n",
++			       db->exp_sz);
++			return -ENOMEM;
++		}
++		memset(db->exp_base_virt, 0, db->exp_sz);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -1117,6 +1154,12 @@ void __chk_ddr_free(void)
+ 				  db->dsi_base_virt,
+ 				  db->dsi_base_phys);
+ 	}
++
++	if (db->exp_base_virt) {
++		dma_free_attrs(pp_dev_get(), db->exp_sz,
++				  db->exp_base_virt,
++				  db->exp_base_phys, DMA_ATTR_NON_CONSISTENT);
++	}
+ }
+ 
+ s32 chk_init(struct pp_chk_init_param *init_param)
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.h b/drivers/net/ppv4/pp-hal/checker/checker.h
+index 00bc3c1c9188..ed60570d56c1 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.h
++++ b/drivers/net/ppv4/pp-hal/checker/checker.h
+@@ -141,7 +141,7 @@ struct crawler_cfg {
+ 	/*! Timer init val */
+ 	u32 timer_init_val;
+ 	/*! mailbox Crawler Timer pace. Dec' value for Crawler internal Timer */
+-	u16 timer_pace;	
++	u16 timer_pace;
+ 	/*! command counter */
+ 	u16 command_counter;
+ 	/*! mailbox Crawler DDR Mode */
+@@ -587,6 +587,12 @@ s32 chk_crawler_get(struct crawler_cfg *crawler);
+  */
+ dma_addr_t chk_excp_si_phys_base_get(void);
+ 
++/**
++ * @brief Get exception SI shadow DB base address
++ * @return dma_addr_t
++ */
++dma_addr_t chk_sh_excp_si_phys_base_get(void);
++
+ /**
+  * @brief Get DSI base address
+  * @return dma_addr_t
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker_internal.h b/drivers/net/ppv4/pp-hal/checker/checker_internal.h
+index 2b99dad75485..bfdf06fc7bad 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker_internal.h
++++ b/drivers/net/ppv4/pp-hal/checker/checker_internal.h
+@@ -20,6 +20,11 @@ extern u64 chk_cache_base_addr;
+ #define CHK_RAM_BASE_ADDR chk_ram_base_addr
+ #define CNTR_CACHE_BASE_ADDR chk_cache_base_addr
+ 
++/**
++ * @define define the offset to an exception SI base address
++ */
++#define CHK_EXCEPTION_SI_OFF(id) ((id) << 5)
++
+ /**
+  * @define Sync Queue - session id
+  */
+@@ -57,7 +62,7 @@ extern u64 chk_cache_base_addr;
+  */
+ #define CHK_ALT_SI_RAM_BASE                        (CHK_RAM_BASE_ADDR + 0x40000)
+ #define CHK_ALT_SI_RAM(exception_session)                \
+-	(CHK_ALT_SI_RAM_BASE + ((exception_session) << 5))
++	(CHK_ALT_SI_RAM_BASE + CHK_EXCEPTION_SI_OFF(exception_session))
+ 
+ /**
+  * @define Exception session counter read
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 2c6c7bf8b39a..9b5c5ec92176 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -1472,8 +1472,12 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 	info.host_policies_bmap = dflt_si.policies_map;
+ 	info.host_pid           = dflt_si.eg_port;
+ 	info.rxdma_base         = UC_PP_ADDR(rxdma_base_addr);
+-	info.excp_si_base       = UC_PP_ADDR(chk_excp_si_phys_base_get());
+ 	info.si_base = __convert_36b_addr_to_32b(cls_si_phys_base_get());
++	if (pp_silicon_step_get() == PP_SSTEP_A)
++		info.excp_si_base = __convert_36b_addr_to_32b(
++			chk_sh_excp_si_phys_base_get());
++	else
++		info.excp_si_base = UC_PP_ADDR(chk_excp_si_phys_base_get());
+ 
+ 	port_cfg.port_id = dflt_si.eg_port;
+ 	ret = rx_dma_port_get(&port_cfg);
+diff --git a/drivers/net/ppv4/pp-hal/session-info/pp_si.h b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+index 56ac4855bdcb..f482d556cb64 100644
+--- a/drivers/net/ppv4/pp-hal/session-info/pp_si.h
++++ b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+@@ -51,6 +51,7 @@
+  * @brief SI top size in 32bit words granularity
+  */
+ #define PP_SI_TOP_WORDS_CNT             (8)
++#define PP_SI_TOP_SZ                    (PP_SI_TOP_WORDS_CNT * sizeof(u32))
+ 
+ /**
+  * @brief SI size in 32bit words granularity

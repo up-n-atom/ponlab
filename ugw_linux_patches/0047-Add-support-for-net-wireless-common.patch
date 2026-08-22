@@ -1,0 +1,647 @@
+From 958a51da2f2bbe0ab65c6367dc7a228ba986f455 Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:06 +0800
+Subject: [PATCH] Add support for net wireless common
+
+---
+ net/wireless/Kconfig   |  2 +-
+ net/wireless/chan.c    |  5 ++-
+ net/wireless/core.c    | 13 ++++++--
+ net/wireless/core.h    |  4 +++
+ net/wireless/mlme.c    | 88 ++++++++++++++++++++++++++++++++++++++++++++------
+ net/wireless/nl80211.c | 70 +++++++++++++++++++++++++++++++++------
+ net/wireless/nl80211.h |  3 +-
+ net/wireless/reg.c     |  7 ++--
+ net/wireless/scan.c    | 22 ++++++++++---
+ net/wireless/sme.c     | 21 ++++++++++--
+ net/wireless/util.c    | 19 ++++++++---
+ 11 files changed, 218 insertions(+), 36 deletions(-)
+
+diff --git a/net/wireless/Kconfig b/net/wireless/Kconfig
+index 6c606120abfe..15f8f21aac04 100644
+--- a/net/wireless/Kconfig
++++ b/net/wireless/Kconfig
+@@ -181,7 +181,7 @@ config CFG80211_WEXT
+ 	  extensions with cfg80211-based drivers.
+ 
+ config CFG80211_WEXT_EXPORT
+-	bool
++	bool "Export cfg80211's wext compatibility symbols"
+ 	depends on CFG80211
+ 	help
+ 	  Drivers should select this option if they require cfg80211's
+diff --git a/net/wireless/chan.c b/net/wireless/chan.c
+index 5497d022fada..ffd8ce75c267 100644
+--- a/net/wireless/chan.c
++++ b/net/wireless/chan.c
+@@ -150,7 +150,7 @@ static void chandef_primary_freqs(const struct cfg80211_chan_def *c,
+ 	}
+ }
+ 
+-static int cfg80211_chandef_get_width(const struct cfg80211_chan_def *c)
++int cfg80211_chandef_get_width(const struct cfg80211_chan_def *c)
+ {
+ 	int width;
+ 
+@@ -251,6 +251,8 @@ static void cfg80211_set_chans_dfs_state(struct wiphy *wiphy, u32 center_freq,
+ 		if (!c || !(c->flags & IEEE80211_CHAN_RADAR))
+ 			continue;
+ 
++		pr_debug("Setting the DFS state of channel %hu to 0x%02x\n",
++		       c->hw_value, dfs_state);
+ 		c->dfs_state = dfs_state;
+ 		c->dfs_state_entered = jiffies;
+ 	}
+@@ -277,6 +279,7 @@ void cfg80211_set_dfs_state(struct wiphy *wiphy,
+ 	cfg80211_set_chans_dfs_state(wiphy, chandef->center_freq2,
+ 				     width, dfs_state);
+ }
++EXPORT_SYMBOL(cfg80211_set_dfs_state);
+ 
+ static u32 cfg80211_get_start_freq(u32 center_freq,
+ 				   u32 bandwidth)
+diff --git a/net/wireless/core.c b/net/wireless/core.c
+index 74554bdd9a5b..e19ee79d02a2 100644
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -39,6 +39,7 @@ MODULE_ALIAS_GENL_FAMILY(NL80211_GENL_NAME);
+ 
+ /* RCU-protected (and RTNL for writers) */
+ LIST_HEAD(cfg80211_rdev_list);
++EXPORT_SYMBOL(cfg80211_rdev_list);
+ int cfg80211_rdev_list_generation;
+ 
+ /* for debugfs */
+@@ -440,6 +441,8 @@ struct wiphy *wiphy_new_nm(const struct cfg80211_ops *ops, int sizeof_priv,
+ 		}
+ 	}
+ 
++	rdev->scan_expire_time = IEEE80211_SCAN_RESULT_EXPIRE;
++
+ 	INIT_LIST_HEAD(&rdev->wiphy.wdev_list);
+ 	INIT_LIST_HEAD(&rdev->beacon_registrations);
+ 	spin_lock_init(&rdev->beacon_registrations_lock);
+@@ -538,9 +541,9 @@ static int wiphy_verify_combinations(struct wiphy *wiphy)
+ 				CFG80211_MAX_NUM_DIFFERENT_CHANNELS))
+ 			return -EINVAL;
+ 
+-		/* DFS only works on one channel. */
++		/* Two different channels allowed by WLAN driver during CSA */
+ 		if (WARN_ON(c->radar_detect_widths &&
+-			    (c->num_different_channels > 1)))
++			    (c->num_different_channels > 2)))
+ 			return -EINVAL;
+ 
+ 		if (WARN_ON(!c->n_limits))
+@@ -966,6 +969,12 @@ void cfg80211_unregister_wdev(struct wireless_dev *wdev)
+ }
+ EXPORT_SYMBOL(cfg80211_unregister_wdev);
+ 
++struct workqueue_struct *cfg80211_get_cfg80211_wq(void)
++{
++	return cfg80211_wq;
++}
++EXPORT_SYMBOL(cfg80211_get_cfg80211_wq);
++
+ static const struct device_type wiphy_type = {
+ 	.name	= "wlan",
+ };
+diff --git a/net/wireless/core.h b/net/wireless/core.h
+index 5f5867f90fed..5bd0ae19eb72 100644
+--- a/net/wireless/core.h
++++ b/net/wireless/core.h
+@@ -18,6 +18,7 @@
+ 
+ 
+ #define WIPHY_IDX_INVALID	-1
++#define IEEE80211_SCAN_RESULT_EXPIRE	(30 * HZ)
+ 
+ struct cfg80211_registered_device {
+ 	const struct cfg80211_ops *ops;
+@@ -75,6 +76,7 @@ struct cfg80211_registered_device {
+ 	struct cfg80211_scan_request *scan_req; /* protected by RTNL */
+ 	struct sk_buff *scan_msg;
+ 	struct cfg80211_sched_scan_request __rcu *sched_scan_req;
++	u32 scan_expire_time;
+ 	unsigned long suspend_at;
+ 	struct work_struct scan_done_wk;
+ 	struct work_struct sched_scan_results_wk;
+@@ -493,6 +495,8 @@ void cfg80211_stop_p2p_device(struct cfg80211_registered_device *rdev,
+ void cfg80211_stop_nan(struct cfg80211_registered_device *rdev,
+ 		       struct wireless_dev *wdev);
+ 
++int cfg80211_chandef_get_width(const struct cfg80211_chan_def *c);
++
+ #define CFG80211_MAX_NUM_DIFFERENT_CHANNELS 10
+ 
+ #ifdef CONFIG_CFG80211_DEVELOPER_WARNINGS
+diff --git a/net/wireless/mlme.c b/net/wireless/mlme.c
+index 76775a2b421d..acec3a8dc7d1 100644
+--- a/net/wireless/mlme.c
++++ b/net/wireless/mlme.c
+@@ -505,6 +505,13 @@ int cfg80211_mlme_register_mgmt(struct wireless_dev *wdev, u32 snd_portid,
+ 	nreg->frame_type = cpu_to_le16(frame_type);
+ 	nreg->wdev = wdev;
+ 	list_add(&nreg->list, &wdev->mgmt_registrations);
++
++	if (frame_type == IEEE80211_STYPE_PROBE_RESP ||
++		frame_type == IEEE80211_STYPE_BEACON) {
++		wdev->vendor_events_filter = nreg->match;
++		wdev->vendor_events_filter_len = nreg->match_len;
++	}
++
+ 	spin_unlock_bh(&wdev->mgmt_registrations_lock);
+ 
+ 	/* process all unregistrations to avoid driver confusion */
+@@ -762,7 +769,7 @@ void cfg80211_dfs_channels_update_work(struct work_struct *work)
+ 
+ 				nl80211_radar_notify(rdev, &chandef,
+ 						     NL80211_RADAR_NOP_FINISHED,
+-						     NULL, GFP_ATOMIC);
++						     NULL, 0, GFP_ATOMIC);
+ 				continue;
+ 			}
+ 
+@@ -782,26 +789,72 @@ void cfg80211_dfs_channels_update_work(struct work_struct *work)
+ }
+ 
+ 
++static void cfg80211_set_chans_dfs_state_bit_map (struct wiphy *wiphy, u32 center_freq,
++						  u32 bandwidth, u8 radar_bit_map, u8 *bit_idx,
++						  enum nl80211_dfs_state dfs_state)
++{
++	struct ieee80211_channel *c;
++	u32 freq;
++
++	for (freq = center_freq - bandwidth/2 + 10;
++	     freq <= center_freq + bandwidth/2 - 10;
++	     freq += 20) {
++		if (radar_bit_map & (1 << *bit_idx)) {
++			c = ieee80211_get_channel(wiphy, freq);
++			if (!c || !(c->flags & IEEE80211_CHAN_RADAR)) {
++				(*bit_idx)++;
++				continue;
++			}
++
++			c->dfs_state = dfs_state;
++			c->dfs_state_entered = jiffies;
++		}
++		(*bit_idx)++;
++	}
++}
++
++void cfg80211_set_dfs_state_bit_map (struct wiphy *wiphy, struct cfg80211_chan_def *chandef,
++				     u8 radar_bit_map, enum nl80211_dfs_state dfs_state)
++{
++	u8 bit_idx = 0;
++	u32 center_freq, bandwidth;
++
++	center_freq = chandef->center_freq1;
++	bandwidth   = cfg80211_chandef_get_width(chandef);
++
++	cfg80211_set_chans_dfs_state_bit_map(wiphy, center_freq, bandwidth,
++					     radar_bit_map, &bit_idx, dfs_state);
++
++	if (NL80211_CHAN_WIDTH_80P80 != bandwidth)
++		return;
++
++	center_freq = chandef->center_freq2;
++	cfg80211_set_chans_dfs_state_bit_map(wiphy, center_freq, bandwidth,
++					     radar_bit_map, &bit_idx, dfs_state);
++}
++EXPORT_SYMBOL(cfg80211_set_dfs_state_bit_map);
++
++
+ void cfg80211_radar_event(struct wiphy *wiphy,
+ 			  struct cfg80211_chan_def *chandef,
+-			  gfp_t gfp)
++			  u8 radar_bit_map, gfp_t gfp)
+ {
+ 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+ 	unsigned long timeout;
+ 
+ 	trace_cfg80211_radar_event(wiphy, chandef);
+ 
+-	/* only set the chandef supplied channel to unavailable, in
+-	 * case the radar is detected on only one of multiple channels
+-	 * spanned by the chandef.
+-	 */
+-	cfg80211_set_dfs_state(wiphy, chandef, NL80211_DFS_UNAVAILABLE);
++	if (radar_bit_map)
++		cfg80211_set_dfs_state_bit_map(wiphy, chandef, radar_bit_map,
++					       NL80211_DFS_UNAVAILABLE);
++	else
++		cfg80211_set_dfs_state(wiphy, chandef, NL80211_DFS_UNAVAILABLE);
+ 
+ 	timeout = msecs_to_jiffies(IEEE80211_DFS_MIN_NOP_TIME_MS);
+ 	queue_delayed_work(cfg80211_wq, &rdev->dfs_update_channels_wk,
+ 			   timeout);
+ 
+-	nl80211_radar_notify(rdev, chandef, NL80211_RADAR_DETECTED, NULL, gfp);
++	nl80211_radar_notify(rdev, chandef, NL80211_RADAR_DETECTED, NULL, radar_bit_map, gfp);
+ }
+ EXPORT_SYMBOL(cfg80211_radar_event);
+ 
+@@ -837,6 +890,23 @@ void cfg80211_cac_event(struct net_device *netdev,
+ 	}
+ 	wdev->cac_started = false;
+ 
+-	nl80211_radar_notify(rdev, chandef, event, netdev, gfp);
++	nl80211_radar_notify(rdev, chandef, event, netdev, 0, gfp);
+ }
+ EXPORT_SYMBOL(cfg80211_cac_event);
++
++int cfg80211_rx_vendor_specific_mgmt(struct wireless_dev *wdev, int freq,
++		      const u8 *buf, size_t len, gfp_t gfp)
++{
++	struct wiphy *wiphy = wdev->wiphy;
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++	struct cfg80211_mgmt_registration *reg;
++	int res = 0;
++
++	list_for_each_entry(reg, &wdev->mgmt_registrations, list) {
++		res = nl80211_send_mgmt(rdev, wdev, reg->nlportid, freq, 0, buf, len, 0, gfp);
++		break;
++	}
++
++	return res;
++}
++EXPORT_SYMBOL(cfg80211_rx_vendor_specific_mgmt);
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index ab8bca39afa3..81dd4efc93cd 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -286,6 +286,7 @@ static const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
+ 	[NL80211_ATTR_BEACON_TAIL] = { .type = NLA_BINARY,
+ 				       .len = IEEE80211_MAX_DATA_LEN },
+ 	[NL80211_ATTR_STA_AID] = { .type = NLA_U16 },
++	[NL80211_ATTR_STA_RSSI] = { .type = NLA_U32 },
+ 	[NL80211_ATTR_STA_FLAGS] = { .type = NLA_NESTED },
+ 	[NL80211_ATTR_STA_LISTEN_INTERVAL] = { .type = NLA_U16 },
+ 	[NL80211_ATTR_STA_SUPPORTED_RATES] = { .type = NLA_BINARY,
+@@ -426,6 +427,7 @@ static const struct nla_policy nl80211_policy[NUM_NL80211_ATTR] = {
+ 	[NL80211_ATTR_VENDOR_DATA] = { .type = NLA_BINARY },
+ 	[NL80211_ATTR_QOS_MAP] = { .type = NLA_BINARY,
+ 				   .len = IEEE80211_QOS_MAP_LEN_MAX },
++	[NL80211_ATTR_VENDOR_WDS] = { .type = NLA_U32 },
+ 	[NL80211_ATTR_MAC_HINT] = { .len = ETH_ALEN },
+ 	[NL80211_ATTR_WIPHY_FREQ_HINT] = { .type = NLA_U32 },
+ 	[NL80211_ATTR_TDLS_PEER_CAPABILITY] = { .type = NLA_U32 },
+@@ -4261,6 +4263,7 @@ static int nl80211_send_station(struct sk_buff *msg, u32 cmd, u32 portid,
+ 
+ 	PUT_SINFO(CONNECTED_TIME, connected_time, u32);
+ 	PUT_SINFO(INACTIVE_TIME, inactive_time, u32);
++	PUT_SINFO(MAX_RSSI, max_rssi, u32);
+ 
+ 	if (sinfo->filled & (BIT(NL80211_STA_INFO_RX_BYTES) |
+ 			     BIT(NL80211_STA_INFO_RX_BYTES64)) &&
+@@ -4938,6 +4941,9 @@ static int nl80211_new_station(struct sk_buff *skb, struct genl_info *info)
+ 	    !info->attrs[NL80211_ATTR_PEER_AID])
+ 		return -EINVAL;
+ 
++	if (!info->attrs[NL80211_ATTR_STA_RSSI])
++		return -EINVAL;
++
+ 	mac_addr = nla_data(info->attrs[NL80211_ATTR_MAC]);
+ 	params.supported_rates =
+ 		nla_data(info->attrs[NL80211_ATTR_STA_SUPPORTED_RATES]);
+@@ -4946,6 +4952,11 @@ static int nl80211_new_station(struct sk_buff *skb, struct genl_info *info)
+ 	params.listen_interval =
+ 		nla_get_u16(info->attrs[NL80211_ATTR_STA_LISTEN_INTERVAL]);
+ 
++	if (info->attrs[NL80211_ATTR_FRAME]) {
++		params.resp = nla_data(info->attrs[NL80211_ATTR_FRAME]);
++		params.resp_len = nla_len(info->attrs[NL80211_ATTR_FRAME]);
++	}
++
+ 	if (info->attrs[NL80211_ATTR_STA_SUPPORT_P2P_PS]) {
+ 		u8 tmp;
+ 
+@@ -4970,6 +4981,8 @@ static int nl80211_new_station(struct sk_buff *skb, struct genl_info *info)
+ 	if (!params.aid || params.aid > IEEE80211_MAX_AID)
+ 		return -EINVAL;
+ 
++	params.rssi = nla_get_u32(info->attrs[NL80211_ATTR_STA_RSSI]);
++
+ 	if (info->attrs[NL80211_ATTR_STA_CAPABILITY]) {
+ 		params.capability =
+ 			nla_get_u16(info->attrs[NL80211_ATTR_STA_CAPABILITY]);
+@@ -7262,33 +7275,51 @@ static int nl80211_start_radar_detection(struct sk_buff *skb,
+ 	unsigned int cac_time_ms;
+ 	int err;
+ 
++	pr_debug("Starting radar detection\n");
++
+ 	dfs_region = reg_get_dfs_region(wdev->wiphy);
+-	if (dfs_region == NL80211_DFS_UNSET)
++	if (dfs_region == NL80211_DFS_UNSET) {
++		pr_debug("DFS master region not specified\n");
+ 		return -EINVAL;
++	}
+ 
+ 	err = nl80211_parse_chandef(rdev, info, &chandef);
+-	if (err)
++	if (err) {
++		pr_debug("Could not parse the channel definition\n");
+ 		return err;
++	}
+ 
+-	if (netif_carrier_ok(dev))
++	if (netif_carrier_ok(dev)) {
++		pr_debug("Carrier isn't present on device\n");
+ 		return -EBUSY;
++	}
+ 
+-	if (wdev->cac_started)
++	if (wdev->cac_started) {
++		pr_debug("CAC already started\n");
+ 		return -EBUSY;
++	}
+ 
+ 	err = cfg80211_chandef_dfs_required(wdev->wiphy, &chandef,
+ 					    wdev->iftype);
+-	if (err < 0)
++	if (err < 0) {
++		pr_debug("Error looking for DFS-required channels\n");
+ 		return err;
++	}
+ 
+-	if (err == 0)
++	if (err == 0) {
++		pr_debug("No DFS-required channels found\n");
+ 		return -EINVAL;
++	}
+ 
+-	if (!cfg80211_chandef_dfs_usable(wdev->wiphy, &chandef))
++	if (!cfg80211_chandef_dfs_usable(wdev->wiphy, &chandef)) {
++		pr_debug("Channels are not all in DFS_USABLE state\n");
+ 		return -EINVAL;
++	}
+ 
+-	if (!rdev->ops->start_radar_detection)
++	if (!rdev->ops->start_radar_detection) {
++		pr_debug("Device does not support radar detection\n");
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	cac_time_ms = cfg80211_chandef_dfs_cac_time(&rdev->wiphy, &chandef);
+ 	if (WARN_ON(!cac_time_ms))
+@@ -7300,7 +7331,10 @@ static int nl80211_start_radar_detection(struct sk_buff *skb,
+ 		wdev->cac_started = true;
+ 		wdev->cac_start_time = jiffies;
+ 		wdev->cac_time_ms = cac_time_ms;
++	} else {
++		pr_debug("Start radar detection in device failed\n");
+ 	}
++
+ 	return err;
+ }
+ 
+@@ -7439,6 +7473,12 @@ static int nl80211_channel_switch(struct sk_buff *skb, struct genl_info *info)
+ 	if (err)
+ 		return err;
+ 
++	if (info->attrs[NL80211_ATTR_SB_DFS_BW])
++		params.sb_dfs_bw = nla_get_u8(info->attrs[NL80211_ATTR_SB_DFS_BW]);
++
++	if (params.sb_dfs_bw)
++		cfg80211_set_dfs_state(&rdev->wiphy, &params.chandef, NL80211_DFS_AVAILABLE);
++
+ 	if (!cfg80211_reg_can_beacon_relax(&rdev->wiphy, &params.chandef,
+ 					   wdev->iftype))
+ 		return -EINVAL;
+@@ -8015,6 +8055,10 @@ static int nl80211_associate(struct sk_buff *skb, struct genl_info *info)
+ 			return -EINVAL;
+ 	}
+ 
++	if (info->attrs[NL80211_ATTR_VENDOR_WDS]) {
++		req.vendor_wds = nla_get_u32(info->attrs[NL80211_ATTR_VENDOR_WDS]);
++	}
++
+ 	if (info->attrs[NL80211_ATTR_PREV_BSSID])
+ 		req.prev_bssid = nla_data(info->attrs[NL80211_ATTR_PREV_BSSID]);
+ 
+@@ -14096,7 +14140,8 @@ void
+ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 		     const struct cfg80211_chan_def *chandef,
+ 		     enum nl80211_radar_event event,
+-		     struct net_device *netdev, gfp_t gfp)
++		     struct net_device *netdev,
++		     u8 radar_bit_map, gfp_t gfp)
+ {
+ 	struct sk_buff *msg;
+ 	void *hdr;
+@@ -14130,6 +14175,12 @@ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 	if (nl80211_send_chandef(msg, chandef))
+ 		goto nla_put_failure;
+ 
++	if (radar_bit_map) {
++		if (NL80211_RADAR_DETECTED == event &&
++		    nla_put_u8(msg, NL80211_ATTR_RADAR_BIT_MAP, radar_bit_map))
++			goto nla_put_failure;
++	}
++
+ 	genlmsg_end(msg, hdr);
+ 
+ 	genlmsg_multicast_netns(&nl80211_fam, wiphy_net(&rdev->wiphy), msg, 0,
+@@ -14140,6 +14191,7 @@ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 	genlmsg_cancel(msg, hdr);
+ 	nlmsg_free(msg);
+ }
++EXPORT_SYMBOL(nl80211_radar_notify);
+ 
+ void cfg80211_probe_status(struct net_device *dev, const u8 *addr,
+ 			   u64 cookie, bool acked, gfp_t gfp)
+diff --git a/net/wireless/nl80211.h b/net/wireless/nl80211.h
+index 7e3821d7fcc5..a858b164d77d 100644
+--- a/net/wireless/nl80211.h
++++ b/net/wireless/nl80211.h
+@@ -91,7 +91,8 @@ void
+ nl80211_radar_notify(struct cfg80211_registered_device *rdev,
+ 		     const struct cfg80211_chan_def *chandef,
+ 		     enum nl80211_radar_event event,
+-		     struct net_device *netdev, gfp_t gfp);
++		     struct net_device *netdev,
++		     u8 radar_bit_map, gfp_t gfp);
+ 
+ void nl80211_send_ap_stopped(struct wireless_dev *wdev);
+ 
+diff --git a/net/wireless/reg.c b/net/wireless/reg.c
+index 04da31c52d09..0e9d8ddb9efd 100644
+--- a/net/wireless/reg.c
++++ b/net/wireless/reg.c
+@@ -130,15 +130,17 @@ static u32 reg_is_indoor_portid;
+ 
+ static void restore_regulatory_settings(bool reset_user);
+ 
+-static const struct ieee80211_regdomain *get_cfg80211_regdom(void)
++const struct ieee80211_regdomain *get_cfg80211_regdom(void)
+ {
+ 	return rtnl_dereference(cfg80211_regdomain);
+ }
++EXPORT_SYMBOL(get_cfg80211_regdom);
+ 
+ const struct ieee80211_regdomain *get_wiphy_regdom(struct wiphy *wiphy)
+ {
+ 	return rtnl_dereference(wiphy->regd);
+ }
++EXPORT_SYMBOL(get_wiphy_regdom);
+ 
+ static const char *reg_dfs_region_str(enum nl80211_dfs_regions dfs_region)
+ {
+@@ -1864,8 +1866,9 @@ __reg_process_hint_user(struct regulatory_request *user_request)
+ 	if (reg_request_cell_base(lr))
+ 		return REG_REQ_IGNORE;
+ 
++	/* Don't do intersection between mac80211 and cfg80211 regdom */
+ 	if (lr->initiator == NL80211_REGDOM_SET_BY_COUNTRY_IE)
+-		return REG_REQ_INTERSECT;
++		return REG_REQ_OK;
+ 	/*
+ 	 * If the user knows better the user should set the regdom
+ 	 * to their country before the IE is picked up
+diff --git a/net/wireless/scan.c b/net/wireless/scan.c
+index 71a8e6980e2f..4ac2929ed89d 100644
+--- a/net/wireless/scan.c
++++ b/net/wireless/scan.c
+@@ -70,8 +70,6 @@ module_param(bss_entries_limit, int, 0644);
+ MODULE_PARM_DESC(bss_entries_limit,
+                  "limit to number of scan BSS entries (per wiphy, default 1000)");
+ 
+-#define IEEE80211_SCAN_RESULT_EXPIRE	(30 * HZ)
+-
+ static void bss_free(struct cfg80211_internal_bss *bss)
+ {
+ 	struct cfg80211_bss_ies *ies;
+@@ -400,7 +398,7 @@ void cfg80211_bss_age(struct cfg80211_registered_device *rdev,
+ 
+ void cfg80211_bss_expire(struct cfg80211_registered_device *rdev)
+ {
+-	__cfg80211_bss_expire(rdev, jiffies - IEEE80211_SCAN_RESULT_EXPIRE);
++	__cfg80211_bss_expire(rdev, jiffies - rdev->scan_expire_time);
+ }
+ 
+ const u8 *cfg80211_find_ie_match(u8 eid, const u8 *ies, int len,
+@@ -659,7 +657,7 @@ struct cfg80211_bss *cfg80211_get_bss(struct wiphy *wiphy,
+ 		if (!is_valid_ether_addr(bss->pub.bssid))
+ 			continue;
+ 		/* Don't get expired BSS structs */
+-		if (time_after(now, bss->ts + IEEE80211_SCAN_RESULT_EXPIRE) &&
++		if (time_after(now, bss->ts + rdev->scan_expire_time) &&
+ 		    !atomic_read(&bss->hold))
+ 			continue;
+ 		if (is_bss(&bss->pub, bssid, ssid, ssid_len)) {
+@@ -1271,6 +1269,22 @@ void cfg80211_unlink_bss(struct wiphy *wiphy, struct cfg80211_bss *pub)
+ }
+ EXPORT_SYMBOL(cfg80211_unlink_bss);
+ 
++void cfg80211_set_scan_expire_time(struct wiphy *wiphy, unsigned long time)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++
++	rdev->scan_expire_time = time;
++}
++EXPORT_SYMBOL(cfg80211_set_scan_expire_time);
++
++u32 cfg80211_get_scan_expire_time(struct wiphy *wiphy)
++{
++	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
++
++	return rdev->scan_expire_time;
++}
++EXPORT_SYMBOL(cfg80211_get_scan_expire_time);
++
+ #ifdef CONFIG_CFG80211_WEXT
+ static struct cfg80211_registered_device *
+ cfg80211_get_dev_from_ifindex(struct net *net, int ifindex)
+diff --git a/net/wireless/sme.c b/net/wireless/sme.c
+index ce6823646f63..8c64aa74e531 100644
+--- a/net/wireless/sme.c
++++ b/net/wireless/sme.c
+@@ -635,10 +635,24 @@ static bool cfg80211_is_all_idle(void)
+ 	return is_all_idle;
+ }
+ 
++static bool cfg80211_drv_is_all_idle(void)
++{
++	struct cfg80211_registered_device *rdev;
++	bool is_all_idle = true;
++
++	list_for_each_entry(rdev, &cfg80211_rdev_list, list) {
++		if (!rdev_is_all_iface_idle(rdev))
++			is_all_idle = false;
++	 }
++
++	return is_all_idle;
++}
++
++
+ static void disconnect_work(struct work_struct *work)
+ {
+ 	rtnl_lock();
+-	if (cfg80211_is_all_idle())
++	if (cfg80211_is_all_idle() && cfg80211_drv_is_all_idle())
+ 		regulatory_hint_disconnect();
+ 	rtnl_unlock();
+ }
+@@ -756,8 +770,9 @@ void __cfg80211_connect_result(struct net_device *dev, const u8 *bssid,
+ 	 * - country_ie + 2, the start of the country ie data, and
+ 	 * - and country_ie[1] which is the IE length
+ 	 */
+-	regulatory_hint_country_ie(wdev->wiphy, bss->channel->band,
+-				   country_ie + 2, country_ie[1]);
++	if (!(wdev->wiphy->flags & WIPHY_FLAG_DISABLE_11D_HINT))
++		regulatory_hint_country_ie(wdev->wiphy, bss->channel->band,
++						country_ie + 2, country_ie[1]);
+ 	kfree(country_ie);
+ }
+ 
+diff --git a/net/wireless/util.c b/net/wireless/util.c
+index a16e805c4857..58149e714e0c 100644
+--- a/net/wireless/util.c
++++ b/net/wireless/util.c
+@@ -1645,20 +1645,29 @@ int cfg80211_iter_combinations(struct wiphy *wiphy,
+ 			}
+ 		}
+ 
+-		if (radar_detect != (c->radar_detect_widths & radar_detect))
++		if (radar_detect != (c->radar_detect_widths & radar_detect)) {
++			pr_debug("combination %u, radar detect_widths 0x%02x",
++			       i, c->radar_detect_widths);
+ 			goto cont;
++		}
+ 
+ 		if (radar_detect && c->radar_detect_regions &&
+-		    !(c->radar_detect_regions & BIT(region)))
++		    !(c->radar_detect_regions & BIT(region))) {
++			pr_debug("radar_detect_regions 0x%x, region %d)",
++			       c->radar_detect_regions, region);
+ 			goto cont;
++		}
+ 
+ 		/* Finally check that all iftypes that we're currently
+ 		 * using are actually part of this combination. If they
+ 		 * aren't then we can't use this combination and have
+ 		 * to continue to the next.
+ 		 */
+-		if ((all_iftypes & used_iftypes) != used_iftypes)
++		if ((all_iftypes & used_iftypes) != used_iftypes) {
++			pr_debug("all_iftypes 0x%02x, used_iftypes 0x%02x",
++			       all_iftypes, used_iftypes);
+ 			goto cont;
++		}
+ 
+ 		/* This combination covered all interface types and
+ 		 * supported the requested numbers, so we're good.
+@@ -1693,8 +1702,10 @@ int cfg80211_check_combinations(struct wiphy *wiphy,
+ 					 cfg80211_iter_sum_ifcombs, &num);
+ 	if (err)
+ 		return err;
+-	if (num == 0)
++	if (num == 0) {
++		pr_debug("No suitable interface combination found\n");
+ 		return -EBUSY;
++	}
+ 
+ 	return 0;
+ }

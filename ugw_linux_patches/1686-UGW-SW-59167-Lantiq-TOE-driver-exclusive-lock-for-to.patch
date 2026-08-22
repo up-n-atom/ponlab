@@ -1,0 +1,317 @@
+From 99991dffafd325bb0fbaf9e03838df346b8da3f5 Mon Sep 17 00:00:00 2001
+From: Anath Bandhu Garai <agarai@maxlinear.com>
+Date: Mon, 7 Jun 2021 13:14:55 +0530
+Subject: [PATCH] UGW_SW-59167 : Lantiq TOE driver: exclusive lock for toe/lro
+ register access
+
+Two separate lock variable, one is to protect toe common registers
+and other is to protect lro specific registers.
+
+Also other change is to fix compile warning
+and re-structure code in lro_tasklet()/lro_stop_flow().
+---
+ drivers/net/ethernet/lantiq/ltq_toe_drv.c | 114 ++++++++++++------------------
+ 1 file changed, 44 insertions(+), 70 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_toe_drv.c b/drivers/net/ethernet/lantiq/ltq_toe_drv.c
+index b1f11b72c7ad..7c569c776f54 100644
+--- a/drivers/net/ethernet/lantiq/ltq_toe_drv.c
++++ b/drivers/net/ethernet/lantiq/ltq_toe_drv.c
+@@ -124,8 +124,7 @@ int lro_stop_flow (int session_id, int timeout, int flags);
+ int lro_start_flow (int *session_id, int timeout, int flags, struct cpumask cpumask);
+ static void lro_process_output_context(int port, int oc_flag_no);
+ 
+-spinlock_t tso_irq_lock;	/*!< spin lock */
+-spinlock_t tso_tx_lock;		/*!< spin lock */
++spinlock_t toe_register_lock;	/*!< spin lock */
+ spinlock_t lro_register_lock;
+ 
+ #define skb_tso_size(x)       (skb_shinfo(x)->gso_size)
+@@ -365,11 +364,11 @@ static irqreturn_t lro_port_except_isr (int irq, void *priv)
+ 
+ 	//printk("except_isr\n");
+ 
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
++
+ 	/* Mask the interrupt */
+ 	ltq_toe_w32_mask((1 << TOE_INT_MASK_LRO_EXP_POS), 0, TOE_INT_EN);
+ 
+-	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+-
+ 	/* Clear the exception and interrupt if there is any */
+ 	int_status = ltq_toe_r32(TOE_INT_STAT);
+ 	if(int_status & TOE_INT_STAT_LRO_EXP_MASK) {
+@@ -377,10 +376,10 @@ static irqreturn_t lro_port_except_isr (int irq, void *priv)
+ 	} else {
+ 		/* Unmask the interrupt */
+ 		ltq_toe_w32_mask(0, (1 << TOE_INT_MASK_LRO_EXP_POS), TOE_INT_EN);
+-		spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 		return IRQ_HANDLED;
+ 	}
+-	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 
+ 	except_entries = ltq_toe_r32(LRO_EXP_EFLAG);
+ 	for(i=0; i<32; i++) {
+@@ -420,20 +419,22 @@ static void ltq_lro_ovflow_tasklet(unsigned long dev)
+ 		pr_info("ecovfl writing: %x bcos except_flag = %x at pos =%d !\n", (unsigned int)flag_wr, (unsigned int)except_flag, pos);
+ 		ltq_toe_w32(flag_wr, LRO_EXP_EFLAG);
+ 	}
++	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+ 
+ 	/* unmask the interrupt */
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 	//ltq_toe_w32_mask((1 << TOE_INT_MASK_S22_POS), 0 , TOE_INT_MASK);
+ 	ltq_toe_w32_mask(0, (1 << TOE_INT_EN_S22_POS), TOE_INT_EN);
+-	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ }
+ 
+ static irqreturn_t lro_port_overflow_isr (int irq, void *priv)
+ {
+ 	unsigned long tso_rl_flags;
+ 
+-	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 	ltq_toe_w32_mask((1 << TOE_INT_EN_S22_POS), 0, TOE_INT_EN);
+-	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 	return IRQ_HANDLED;
+ }
+ 
+@@ -444,12 +445,11 @@ static irqreturn_t lro_port_context_isr (int irq, void *priv)
+ 
+ 	pr_info_once("%s called with irq: %d\n", __func__, irq);
+ 
+-
+-	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 	int_status = ltq_toe_r32(TOE_INT_STAT);
+ 	if (!(int_status & (1 << (pport->port_num + TOE_INT_MASK_LRO0_POS)))) {
+-		spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+-	    return IRQ_NONE;
++		spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
++		return IRQ_NONE;
+ 	}
+ 
+ 	/* Mask the interrupt */
+@@ -457,7 +457,7 @@ static irqreturn_t lro_port_context_isr (int irq, void *priv)
+ 	//ltq_toe_w32_mask(0, (1 << (pport->port_num + TOE_INT_MASK_LRO0_POS)), TOE_INT_MASK);
+ 
+ 	wmb();
+-	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 
+ 	/* Schedule the tasklet for housekeeping */
+ 	tasklet_schedule(&lro_tasklet[pport->port_num]);
+@@ -760,66 +760,53 @@ static void ltq_lro_exception_tasklet(unsigned long dev __maybe_unused)
+ 	read_pos = i;
+ 
+ 	/* Unmask the interrupt */
+-	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 	ltq_toe_w32_mask(0, (1 << TOE_INT_MASK_LRO_EXP_POS), TOE_INT_EN);
+-	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 	return;
+ }
+ 
+ static void ltq_lro_tasklet (unsigned long dev)
+ {
+-	uint32_t port, context_ready ;
++	uint32_t port, context_ready;
+ 	uint32_t current_context = 0;
+ 	struct ltq_lro_port *pport = (struct ltq_lro_port *)dev;
+ 	uint8_t budget = 20;
+ 	unsigned long tso_rl_flags;
+ 
+ 	port = pport->port_num;
+-lro_process:
++
++	/* Clear the INT status */
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
++	ltq_toe_w32((1 << (port + TOE_INT_MASK_LRO0_POS)), TOE_INT_STAT);
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
++
+ 	context_ready = ltq_toe_r32(LRO_OC_OWNER(port, current_context));
+-	if(!context_ready) {
++	if (!context_ready) {
+ 		current_context = !current_context;
+ 		context_ready = ltq_toe_r32(LRO_OC_OWNER(port, current_context));
+-		if( !context_ready)
+-			goto leave;
+ 	}
+ 
+ 	/* Keep checking the ownership bit till its not HW */
+-	 while(context_ready && budget) {
++	while (context_ready && budget) {
+ 		lro_process_output_context(port, current_context);
+ 		current_context = !current_context;
+ 		context_ready = ltq_toe_r32(LRO_OC_OWNER(port, current_context));
+ 		--budget;
+-	 }
++	}
+ 
+-	if( ltq_toe_r32(LRO_OC_OWNER(port, 0)) ||
+-		ltq_toe_r32(LRO_OC_OWNER(port, 1)) ) {
+-		/*
+-		 * Interrupt missed, re-schedule tasklet to process the IRQ
+-		 */
++	if (ltq_toe_r32(LRO_OC_OWNER(port, 0)) ||
++	    ltq_toe_r32(LRO_OC_OWNER(port, 1))) {
++		/* Keep interrupt disabled, re-schedule tasklet to process the IRQ */
+ 		tasklet_schedule(&lro_tasklet[port]);
+-		return ;
++		return;
+ 	}
+ 
+-leave:
+-	spin_lock_irqsave(&lro_register_lock, tso_rl_flags);
+-	/* Clear the INT status */
+-	ltq_toe_w32((1 << (port + TOE_INT_MASK_LRO0_POS)), TOE_INT_STAT);
+ 	/* Unmask the interrupt for other output context */
++	spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 	ltq_toe_w32_mask(0, (1 << (port + TOE_INT_MASK_LRO0_POS)), TOE_INT_EN);
+ 	wmb();
+-	spin_unlock_irqrestore(&lro_register_lock, tso_rl_flags);
+-
+-	if( ltq_toe_r32(LRO_OC_OWNER(port, 0)) ||
+-		ltq_toe_r32(LRO_OC_OWNER(port, 1)) ) {
+-		/*
+-		 * Interrupt missed, re-schedule tasklet to process the IRQ
+-		 */
+-		if(budget)
+-			goto lro_process;
+-		tasklet_schedule(&lro_tasklet[port]);
+-	}
+-	return;
++	spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ }
+ 
+ static struct ltq_lro_port *ltq_allocate_lro_port (void)
+@@ -979,14 +966,6 @@ int lro_stop_flow (int session_id, int timeout, int flags)
+ 
+ 	pr_info("triggering the stop the flow for %d\n", session_id);
+ 
+-	if (ltq_toe_r32(LRO_OC_OWNER(port, 0)) ||
+-		ltq_toe_r32(LRO_OC_OWNER(port, 1))) {
+-		/*
+-		 * Interrupt missed, re-schedule tasklet to process the IRQ
+-		 */
+-		tasklet_schedule(&lro_tasklet[port]);
+-		pr_info("Pkts pending in LRO engine are processed for port: %d\n", port);
+-	}
+ 	/* Flag the session should be stopped */
+ 	mod_timer(&pport->lro_timer, jiffies + lro_time);
+ 
+@@ -1766,6 +1745,7 @@ int tso_enqueue_hw(ltq_tso_port_t* tsoPort,
+ 	return ret;
+ }
+ 
++#if 0 /* unused */
+ static void tso_timer(unsigned long data)
+ {
+ 	ltq_tso_port_t* tsoPort = (ltq_tso_port_t*)(data);
+@@ -1778,13 +1758,12 @@ static void tso_timer(unsigned long data)
+ 
+ 	return;
+ }
++#endif
+ 
+ static void ltq_tso_tasklet(unsigned long dev)
+ {
+-	u32 tso_done;
+ 	ltq_tso_port_t *tsoPort = (ltq_tso_port_t *) dev;
+ 	u32 port;
+-	unsigned long tso_rl_flags;
+ 	int tsoBudget = SG_BUFFER_PER_PORT;
+ 	struct toe_sg_buffer* sgBuff = NULL;
+ 
+@@ -1801,8 +1780,6 @@ static void ltq_tso_tasklet(unsigned long dev)
+ 			tso_sgbuffs_available(tsoPort) &&
+ 			tsoBudget) {
+ 
+-		struct toe_sg_buffer* sgBuff;
+-
+ 		sgBuff = tso_get_sgbuff(tsoPort);
+ 		BUG_ON(sgBuff == NULL);
+ 		sgBuff->skb = skb_dequeue(&tsoPort->processQ);
+@@ -1819,8 +1796,6 @@ static void ltq_tso_tasklet(unsigned long dev)
+ #define TSO_USE_TASKLET_IN_IRQ 1
+ static irqreturn_t ltq_tso_tx_int(int irq, void *data)
+ {
+-	struct sk_buff *skb;
+-	unsigned long tso_done;
+ 	unsigned long tso_rl_flags;
+ 	struct ltq_tso_port *tsoPort = (struct ltq_tso_port *)(data);
+ 	int port;
+@@ -1829,27 +1804,27 @@ static irqreturn_t ltq_tso_tx_int(int irq, void *data)
+ 
+ 	if (ltq_toe_r32(TOE_INT_STAT) & (1 << port)) {
+ #ifndef TSO_USE_TASKLET_IN_IRQ
+-		spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++		spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 		/* Mask the interrupt */
+ 		ltq_toe_w32_mask((1<<port), 0, TOE_INT_EN);
+ 
+ 		wmb();
+-		spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 
+ 		process_tso_results(tsoPort); /* Process TSO result"S" of this port */
+ 
+-		spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++		spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 		ltq_toe_w32((1<<port), TOE_INT_STAT);	/* Clear the interrupt */
+ 		ltq_toe_w32_mask(0, (1<<port), TOE_INT_EN);	/* Unmask the interrupt */
+ 		wmb();
+ #error "Unexcpted compilation"
+-		spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ #else
+-		spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++		spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 		/* Mask the interrupt */
+ 		ltq_toe_w32_mask((1 << port), 0, TOE_INT_EN);
+ 		wmb();
+-		spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++		spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 		/* Schedule the tasklet for housekeeping */
+ 		tasklet_schedule(&tsoPort->tasklet);
+ #endif
+@@ -1887,12 +1862,12 @@ static inline int process_tso_results(ltq_tso_port_t* tsoPort)
+ 			done = 1;
+ 			++results;
+ 
+-			spin_lock_irqsave(&tso_irq_lock, tso_rl_flags);
++			spin_lock_irqsave(&toe_register_lock, tso_rl_flags);
+ 			/* Clear the interrupt */
+ 			ltq_toe_w32((1 << port), TOE_INT_STAT);
+ 			/* Unmask the interrupt */
+ 			ltq_toe_w32_mask(0, (1 << port), TOE_INT_EN);
+-			spin_unlock_irqrestore(&tso_irq_lock, tso_rl_flags);
++			spin_unlock_irqrestore(&toe_register_lock, tso_rl_flags);
+ 		}
+ 		TSO_DELAY(); /* delay before read next TSO result*/
+ 	} while (done);
+@@ -2063,7 +2038,7 @@ ssize_t ltq_stats_write (struct file *file, const char *user_buf,
+ 
+ 	if (tmp == 0) {
+ 		for_each_online_cpu(cpu) {
+-			ltq_tso_port_t *tsoPort = (ltq_tso_port + cpu);
++			tsoPort = (ltq_tso_port + cpu);
+ 			memset(tsoPort->fragsStats, 0, sizeof(struct tso_frags_stats) * MAX_TSO_FRAGS_STATS);
+ 		}
+ 		g_unmatched_entry = 0;
+@@ -2567,9 +2542,8 @@ static int ltq_toe_init(struct platform_device *pdev)
+ 	/* Initialise the proc filesystem */
+ 	ltq_toe_proc_init();
+ 
++	spin_lock_init(&toe_register_lock);
+ 	spin_lock_init(&lro_register_lock);
+-	spin_lock_init(&tso_irq_lock);
+-	spin_lock_init(&tso_tx_lock);
+ 
+ 	g_toe_dev = &pdev->dev;
+ 

@@ -1,0 +1,517 @@
+From f500e2e2c62588bd99ae616f64d42e1cd5b04869 Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Fri, 17 Jul 2020 19:46:28 +0800
+Subject: [PATCH] DRVLIB_SW-3692: GSW API - add MACsec Engine (E160) adaptation
+ logic in MAC APIs
+
+---
+ .../net/ethernet/lantiq/switch-api/mac/Makefile    |   1 +
+ .../net/ethernet/lantiq/switch-api/mac/gswss_api.c |   6 +-
+ .../net/ethernet/lantiq/switch-api/mac/gswss_api.h |   6 -
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.c   | 161 +++++++++++++++++++++
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.h   |   3 +
+ .../net/ethernet/lantiq/switch-api/mac/mac_drv.c   |   9 ++
+ .../ethernet/lantiq/switch-api/mac/macsec_drv.c    | 122 ++++++++++++++++
+ .../ethernet/lantiq/switch-api/mac/macsec_drv.h    |  18 +++
+ .../ethernet/lantiq/switch-api/mac/xgmac_common.h  |   5 +
+ include/net/switch_api/adap_ops.h                  |   6 +-
+ include/net/switch_api/mac_ops.h                   |  18 +++
+ 11 files changed, 344 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/Makefile b/drivers/net/ethernet/lantiq/switch-api/mac/Makefile
+index cf22be60675f..a1214a5010aa 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/Makefile
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/Makefile
+@@ -5,6 +5,7 @@
+ EXTRA_CFLAGS += -I$(src)
+ obj-$(CONFIG_LTQ_ETHSW_API) += mac_driver.o
+ 
++mac_driver-objs = macsec_drv.o 
+ mac_driver-objs += mac_drv.o 
+ mac_driver-objs += xgmac_main.o 
+ mac_driver-objs += xgmac_debug.o 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c
+index 08a1c2d7d8a0..74f65c601a80 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c
+@@ -384,13 +384,14 @@ int gswss_set_macsec_to_mac(void *pdev, u32 mac_idx, u32 enable)
+ 	struct adap_prv_data *pdata = GET_ADAP_PDATA(pdev);
+ 	u32 macsec_en;
+ 
++	if (mac_idx < MAC_2 || mac_idx >= MAC_LAST)
++		return -1;
++
+ #ifdef __KERNEL__
+ 	spin_lock_bh(&pdata->adap_lock);
+ #endif
+ 	macsec_en = GSWSS_RGRD(pdata, MACSEC_EN);
+ 
+-	mac_idx += 2;
+-
+ 	if (enable) {
+ 		mac_dbg("GSWSS: MACSEC enabled to MAC %d data traffic\n",
+ 			   mac_idx);
+@@ -398,6 +399,7 @@ int gswss_set_macsec_to_mac(void *pdev, u32 mac_idx, u32 enable)
+ 	} else {
+ 		mac_dbg("GSWSS: MACSEC to MAC mapping : DISABLED\n");
+ 		MAC_SET_VAL(macsec_en, MACSEC_EN, SEL, 0);
++		MAC_SET_VAL(macsec_en, MACSEC_EN, RES, 1);
+ 	}
+ 
+ 	GSWSS_RGWR(pdata, MACSEC_EN, macsec_en);
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.h b/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.h
+index 3077095b96d1..b7d9880f8a12 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.h
+@@ -175,12 +175,6 @@ enum {
+ 	LINK
+ };
+ 
+-enum {
+-	XGMAC2 = 0,
+-	XGMAC3,
+-	XGMAC4,
+-};
+-
+ struct adap_prv_data;
+ 
+ struct adap_prv_data {
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+index ef0011d4bd76..19a6489cbeb3 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+@@ -17,6 +17,8 @@
+ #include <net/switch_api/gsw_dev.h>
+ #endif
+ 
++#include "macsec_drv.h"
++
+ int mac_set_flowctrl(void *pdev, u32 val)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+@@ -1409,6 +1411,163 @@ int mac_irq_clr(void *pdev, u32 event)
+ 	return 0;
+ }
+ 
++static int macsec_reg_rd(struct platform_device *pdev, u32 off, u32 *data)
++{
++	struct macsec_prv_data *pdata = platform_get_drvdata(pdev);
++	volatile u8 __iomem *addr = pdata->eip160_base;
++
++	addr += off;
++	*data = readl(addr);
++
++	return 0;
++}
++
++static int macsec_reg_wr(struct platform_device *pdev, u32 off, u32 data)
++{
++	struct macsec_prv_data *pdata = platform_get_drvdata(pdev);
++	volatile u8 __iomem *addr = pdata->eip160_base;
++
++	addr += off;
++	writel(data, addr);
++
++	return 0;
++}
++
++static void macsec_stag_cfg(struct platform_device *pdev, bool has_stag)
++{
++	u32 reg;
++
++	/* SoC specific register to enable Special Tag handling.
++	   Bit 0 - 1: enable Special Tag handling, 0: disable
++	 */
++	macsec_reg_rd(pdev, 0x7B84, &reg);
++	if (has_stag)
++		reg |= BIT(0);
++	else
++		reg &= ~BIT(0);
++	macsec_reg_wr(pdev, 0x7B84, reg);
++}
++
++int mac_e160_prepare(void *pdev, struct mac_e160_ops *e160)
++{
++	int ret = 0;
++	struct mac_prv_data *pdata;
++	struct device *dev;
++	struct gswss *gswdev;
++	struct adap_ops *ops;
++	struct device_node *ig_node = NULL, *eg_node = NULL;
++	struct platform_device *ig_pdev, *eg_pdev;
++	int mac_idx;
++	int stag;
++
++	pr_debug("Enter %s %u\n", __FUNCTION__, __LINE__);
++
++	if (!pdev || !e160)
++		return -EINVAL;
++	pdata = GET_MAC_PDATA(pdev);
++
++	if (pdata->ig_pdev && pdata->eg_pdev)
++		return 0;
++
++	dev = pdata->dev;
++	if (!dev)
++		return -EINVAL;
++
++	gswdev = dev_get_drvdata(dev->parent);
++	ops = gswdev->adap_ops;
++	if (!ops)
++		return -EINVAL;
++
++	if (gswss_get_mac_rxfcs_op(pdev) == (RX_FCS_NO_REMOVE & 3)) {
++		pr_crit("MACsec engine can't accept RX packet which has FCS not stripped.\n");
++		return -EPERM;
++	}
++
++	if (!pdata->ig_pdev) {
++		ig_node = of_parse_phandle(dev->of_node, "macsec_ig", 0);
++		if (!ig_node) {
++			pr_err("Can't not find macsec_ig in MAC device tree.\n");
++			return -EINVAL;
++		}
++		ig_pdev = of_find_device_by_node(ig_node);
++		if (!ig_pdev) {
++			pr_err("Can't get macsec_ig platform device.\n");
++			ret = -EINVAL;
++			goto END;
++		}
++		pdata->ig_pdev = ig_pdev;
++	}
++
++	if (!pdata->eg_pdev) {
++		eg_node = of_parse_phandle(dev->of_node, "macsec_eg", 0);
++		if (!eg_node) {
++			pr_err("Can't not find macsec_eg in MAC device tree.\n");
++			ret = -EINVAL;
++			goto END;
++		}
++		eg_pdev = of_find_device_by_node(eg_node);
++		if (!eg_pdev) {
++			pr_err("Can't get macsec_eg platform device.\n");
++			ret = -EINVAL;
++			goto END;
++		}
++		pdata->eg_pdev = eg_pdev;
++	}
++
++	mac_idx = ops->ss_get_macsec_mac(ops);
++	if (mac_idx == 0) {
++		gswss_set_xgmac_rx_disable(pdev, 1);
++		udelay(2);
++		ops->ss_core_en(ops, 0);
++		udelay(2);
++		ret = ops->ss_set_macsec_mac(ops, pdata->mac_idx, 1);
++		udelay(1);
++		ops->ss_core_en(ops, 1);
++		gswss_set_xgmac_rx_disable(pdev, 0);
++		if (ret) {
++			pr_crit("Failed in attaching MACsec to MAC %u", pdata->mac_idx);
++			goto END;
++		}
++	} else if (mac_idx != (int)pdata->mac_idx) {
++		pr_err("%s (%u): Only one time attachment is supported.\n",
++			__FUNCTION__, __LINE__);
++		ret = -EPERM;
++		goto END;
++	}
++
++	stag = gswss_get_mac_txsptag_op(pdev);
++	pr_debug("TX stag = %u\n", stag);
++	macsec_stag_cfg(pdata->eg_pdev, stag != (TX_SPTAG_NOTAG & 3));
++
++	stag = gswss_get_mac_rxsptag_op(pdev);
++	pr_debug("RX stag = %u\n", stag);
++	macsec_stag_cfg(pdata->ig_pdev,
++			stag == (RX_SPTAG_INSERT & 3)
++			|| stag == (RX_SPTAG_NO_INSERT & 3));
++
++	e160->ig_pdev = pdata->ig_pdev;
++	e160->eg_pdev = pdata->eg_pdev;
++	e160->reg_rd = macsec_reg_rd;
++	e160->reg_wr = macsec_reg_wr;
++
++END:
++	if (ig_node)
++		of_node_put(ig_node);
++	if (eg_node)
++		of_node_put(eg_node);
++	pr_debug("Exit %s %u, return %d\n", __FUNCTION__, __LINE__, ret);
++	return ret;
++}
++
++int mac_e160_unprepare(void *pdev)
++{
++	/* Do nothing at the moment during unsolved data path re-configuration
++	 * when unattach MACsec from MAC
++	 */
++	pr_debug("Enter/Exit %s %u\n", __FUNCTION__, __LINE__);
++	return 0;
++}
++
+ static void mac_soft_restart(void *pdev)
+ {
+ 	/* Bring Down and up Xgmac Tx and Rx, Not all register reset */
+@@ -1579,4 +1738,6 @@ void mac_init_fn_ptrs(struct mac_ops *mac_op)
+ 	mac_op->IRQ_UnRegister = mac_irq_unregister;
+ 
+ 	mac_op->mac_op_cfg = mac_oper_cfg;
++	mac_op->mac_e160_prepare = mac_e160_prepare;
++	mac_op->mac_e160_unprepare = mac_e160_unprepare;
+ }
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.h b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.h
+index dd7d47760ebb..956cb7d8a470 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.h
+@@ -64,6 +64,9 @@ int mac_int_enable(void *pdev);
+ int mac_int_disable(void *pdev);
+ 
+ int mac_oper_cfg(void *pdev, MAC_OPER_CFG oper);
++int mac_e160_prepare(void *pdev, struct mac_e160_ops *e160);
++int mac_e160_unprepare(void *pdev);
++
+ int xgmac_cfg_main(GSW_MAC_Cli_t *params);
+ 
+ #endif
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
+index 853e6c26d4f9..d1a89819dc21 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
+@@ -27,6 +27,15 @@ static irqreturn_t mac_isr(int irq, void *dev_id)
+ 	u32 max_mac = gsw_get_mac_subifcnt(devid);
+ 	int task_sched = 0;
+ 
++	/* Clear link related interrupts.
++	 * Link status change or re-configuration on the path triggers interrupt
++	 * and must be cleared to avoid dead loop in interrupt handling. */
++	mac_int_sts = gswss_get_int_stat(adap_ops, LINK);
++	if (mac_int_sts) {
++		pr_info("Link status change: 0x%04X\n", mac_int_sts);
++		GSWSS_RGWR(GET_ADAP_PDATA(adap_ops), GSWIPSS_ISR1, mac_int_sts);
++	}
++
+ 	/* Handle all the MAC Interrupts */
+ 	for (i = 0; i < max_mac; i++) {
+ 		task_sched = 0;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/macsec_drv.c b/drivers/net/ethernet/lantiq/switch-api/mac/macsec_drv.c
+new file mode 100644
+index 000000000000..fe4d9d91d356
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/macsec_drv.c
+@@ -0,0 +1,122 @@
++// SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0-only)
++/*
++ * Driver for MACsec Engine inside Intel CHD GSWIP
++ *
++ * Copyright 2019 - 2020 Intel Corporation
++ */
++
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/of.h>
++
++#include "macsec_drv.h"
++
++#define MACSEC_DEV_NAME		"gsw_macsec"
++
++#ifdef CONFIG_OF
++static int e160_parse_dts(struct platform_device *pdev,
++			  struct macsec_prv_data **pdata)
++{
++	struct device *dev = &pdev->dev;
++	u32 prop = 0;
++
++	(*pdata) = devm_kzalloc(dev, sizeof(struct macsec_prv_data),
++				GFP_KERNEL);
++
++	if (!(*pdata))
++		return -ENOMEM;
++
++	/* Retrieve the macsec devid */
++	if (!device_property_read_u32(dev, "e160-devid", &prop)) {
++		(*pdata)->devid = prop;
++		return 0;
++	}
++
++	dev_err(dev, "macsec devid: cannot get property\n");
++	return -EINVAL;
++}
++
++#else
++static int e160_parse_dts(struct platform_device *pdev,
++			  struct macsec_prv_data *pdata,
++			  struct resource *res)
++{
++	return -1;
++}
++#endif
++
++static int e160_macsec_probe(struct platform_device *pdev)
++{
++	struct resource *res;
++	struct macsec_prv_data *pdata = NULL;
++	struct device *dev = &pdev->dev;
++
++	if (dev->of_node) {
++		if (e160_parse_dts(pdev, &pdata)) {
++			dev_err(dev, "e160 dt parse failed!\n");
++			return -EINVAL;
++		}
++
++		platform_set_drvdata(pdev, pdata);
++	} else { /* Read private data from end point */
++		pdata = dev_get_drvdata(dev);
++
++		if (!pdata) {
++			dev_err(dev,
++				"Get private data from end point failed!\n");
++			return -EINVAL;
++		}
++	}
++
++	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "e160_reg");
++
++	if (!res) {
++		dev_err(dev, "Failed to get %s iomem res!\n", "e160_reg");
++		return -ENOENT;
++	}
++
++	pdata->eip160_base = devm_ioremap_resource(&pdev->dev, res);
++
++	if (IS_ERR(pdata->eip160_base)) {
++		dev_err(dev, "Failed to ioremap resource: %pr !\n", res);
++		return -EINVAL;
++	}
++
++	pdata->irq_num = platform_get_irq_byname(pdev, "e160_irq");
++
++	if (pdata->irq_num <= 0) {
++		dev_err(dev, "Cannot get eip160_irq !!\n");
++		return -ENODEV;
++	}
++
++	dev_info(dev, "EIP160 %d: Initialized!!\n", pdata->devid);
++
++	return 0;
++}
++
++static int e160_macsec_release(struct platform_device *pdev)
++{
++	return 0;
++}
++
++static const struct of_device_id e160_macsec_match[] = {
++	{ .compatible = "intel,gsw_macsec" },
++	{},
++};
++MODULE_DEVICE_TABLE(of, e160_macsec_match);
++
++static struct platform_driver e160_macsec_driver = {
++	.probe = e160_macsec_probe,
++	.remove = e160_macsec_release,
++	.driver = {
++		.name = MACSEC_DEV_NAME,
++		.of_match_table = of_match_ptr(e160_macsec_match),
++	}
++};
++
++module_platform_driver(e160_macsec_driver);
++
++MODULE_AUTHOR("Joby Thampan");
++MODULE_DESCRIPTION("Intel GSW Macsec driver");
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/macsec_drv.h b/drivers/net/ethernet/lantiq/switch-api/mac/macsec_drv.h
+new file mode 100644
+index 000000000000..82090a7c2e69
+--- /dev/null
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/macsec_drv.h
+@@ -0,0 +1,18 @@
++// SPDX-License-Identifier: (BSD-3-Clause OR GPL-2.0-only)
++/*
++ * Driver for MACsec Engine inside Intel CHD GSWIP
++ *
++ * Copyright 2019 - 2020 Intel Corporation
++ */
++
++#ifndef _MACSEC_DRV_H_
++#define _MACSEC_DRV_H_
++
++struct macsec_prv_data {
++	u32 devid;
++	void __iomem *eip160_base;
++	int irq_num;
++};
++
++#endif
++
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+index 8e0eaf845775..932e6153a206 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+@@ -428,6 +428,11 @@ struct mac_prv_data {
+ 	struct phy_device *phydev;
+ 	struct tasklet_struct mac_tasklet;
+ 	struct clk *ker_ptp_clk;
++
++	/* Platform Device for Ingress MACsec (EIP160) slice. */
++	struct platform_device *ig_pdev;
++	/* Platform Device for Egress MACsec (EIP160) slice. */
++	struct platform_device *eg_pdev;
+ #endif
+ 	u32 exts_enabled[N_EXT_TS];
+ 	u32 snaptype;
+diff --git a/include/net/switch_api/adap_ops.h b/include/net/switch_api/adap_ops.h
+index fbdd074e4c57..e98ef4dfba91 100644
+--- a/include/net/switch_api/adap_ops.h
++++ b/include/net/switch_api/adap_ops.h
+@@ -124,9 +124,9 @@ struct adap_ops {
+ 	int(*ss_get_core_en)(void *);
+ 	/* This function Sets MACSEC to a Mac Module Attachment.
+ 	 *  param[in/out]IN:	ops Adaption ops Struct registered.
+-	 * param[in/out]IN:	Mac Index	0 - MAC2 is attached to MACSEC,
+-	 * 	 				1 - MAC3 is attached to MACSEC,
+-	 * 					2 - MAC4 is attached to MACSEC.
++	 * param[in/out]IN:	Mac Index	2 - MAC2 is attached to MACSEC,
++	 * 	 				3 - MAC3 is attached to MACSEC,
++	 * 					4 - MAC4 is attached to MACSEC.
+ 	 * param[in/out]IN:	Enable		1 - Enable MACSEC to MAC Mapping
+ 	 * 	 			0 - Disable MACSEC to MAC Mapping,
+ 	 * return	OUT  0:	MACSEC to Mac Module Attachment done
+diff --git a/include/net/switch_api/mac_ops.h b/include/net/switch_api/mac_ops.h
+index 17c7eeeefd3e..2a37163131a2 100644
+--- a/include/net/switch_api/mac_ops.h
++++ b/include/net/switch_api/mac_ops.h
+@@ -175,6 +175,13 @@ struct mac_fifo_entry {
+ 	struct sk_buff **ptp_tx_skb_loc;
+ };
+ 
++struct mac_e160_ops {
++	struct platform_device *ig_pdev;
++	struct platform_device *eg_pdev;
++
++	int (*reg_rd)(struct platform_device *pdev, u32 off, u32 *pdata);
++	int (*reg_wr)(struct platform_device *pdev, u32 off, u32 data);
++};
+ 
+ /** \brief MAC Cli struct.
+      MAC Cli struct for passing args and argument values. */
+@@ -822,6 +829,17 @@ struct mac_ops {
+ 	 * return	OUT	int -	Success/Fail
+ 	 */
+ 	int (*mac_op_cfg)(void *, MAC_OPER_CFG);
++	/* This sequence is used for MACsec Preparation
++	 * param[in/out]IN:	ops -	MAC ops Struct registered for MAC 0/1/2.
++	 * param[out]OUT:	e160_metadata - E160 Meta Data
++	 * return	OUT	int -	Success/Fail
++	 */
++	int (*mac_e160_prepare)(void *, struct mac_e160_ops *e160);
++	/* This sequence is used for MACsec Un-preparation
++	 * param[in/out]IN:	ops -	MAC ops Struct registered for MAC 0/1/2.
++	 * return	OUT	int -	Success/Fail
++	 */
++	int (*mac_e160_unprepare)(void *);
+ };
+ 
+ #endif

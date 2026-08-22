@@ -1,0 +1,144 @@
+From 1a2520813111c39a9c364f73cc3b4d2760a785d9 Mon Sep 17 00:00:00 2001
+From: Peter Harliman Liem <peter.harliman.liem@intel.com>
+Date: Mon, 27 May 2019 17:26:09 +0800
+Subject: [PATCH] DRVLIB_SW-2331 - Add gphy reset in prx300 watchdog
+
+Certain platform (i.e. prx300) does not reset gphy RCU
+during global SW reset, which eventually causes issue
+during reboot. We explicitly set gphy reset at watchdog
+irq for this reason.
+
+We use devm_reset_control_get_shared() to allow sharing
+between gphy fw driver and watchdog. Initial assertion in
+gphy fw driver is removed since shared reset_control does
+not allow assertion without deassert (at power up the
+signal is already asserted).
+
+Unrelated changes related to cleanup/structure, if needed,
+should be done in a separate/dedicated JIRA.
+---
+ drivers/net/ethernet/lantiq/xrx500_phy_fw.c |  6 +---
+ drivers/watchdog/grx500_wdt.c               | 48 +++++++++++++++++++++++++++++
+ 2 files changed, 49 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index e6f5ec149de3..3cf88a75baaa 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -326,10 +326,6 @@ static int prx300_gphy_boot(struct xway_gphy_data *priv)
+ 	regmap_update_bits(priv->syscfg, PRX300_IFMUX_CFG, PRX300_LAN_MUX_MASK,
+ 			   PRX300_LAN_MUX_GPHY);
+ 
+-	/* GPHY reset */
+-	reset_control_assert(rst->gphy);
+-	usleep_range(500, 1000);
+-
+ 	/* CDB and Power Down */
+ 	reset_control_assert(rst->gphy_cdb);
+ 	reset_control_assert(rst->gphy_pwr_down);
+@@ -449,7 +445,7 @@ static int prx300_dt_parse(struct xway_gphy_data *priv)
+ 		return PTR_ERR(priv->aspa_syscfg);
+ 	}
+ 
+-	rst->gphy = devm_reset_control_get(priv->dev, "gphy");
++	rst->gphy = devm_reset_control_get_shared(priv->dev, "gphy");
+ 	if (IS_ERR(rst->gphy)) {
+ 		dev_err(priv->dev, "fail to get gphy prop\n");
+ 		return PTR_ERR(rst->gphy);
+diff --git a/drivers/watchdog/grx500_wdt.c b/drivers/watchdog/grx500_wdt.c
+index 0bac3a79ccbb..fc94767861d7 100644
+--- a/drivers/watchdog/grx500_wdt.c
++++ b/drivers/watchdog/grx500_wdt.c
+@@ -22,6 +22,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/of.h>
+ #include <linux/of_irq.h>
++#include <linux/reset.h>
+ #include "../../arch/mips/lantiq/clk.h"
+ #include <linux/irqchip/mips-gic.h>
+ #include <lantiq.h>
+@@ -107,6 +108,12 @@ struct grx500_wdt_struct {
+ 	unsigned int		cpu;
+ 	struct notifier_block	restart_handler;
+ 	struct watchdog_device	wdd;
++
++	/* Some platform (e.g. prx300) requires explicit resets for
++	 * individual modules.
++	 */
++	int reset_count;
++	struct reset_control **resets;
+ };
+ 
+ #define to_grx500_wdt(wdd)	container_of(wdd, struct grx500_wdt_struct, wdd)
+@@ -275,8 +282,20 @@ static int grx500wdt_ping(struct watchdog_device *wdt_dev)
+ static irqreturn_t grx500wdt_irq(int irqno, void *param)
+ {
+ 	struct watchdog_device *grx500_wdt;
++	struct grx500_wdt_struct *priv;
++	int i;
+ 
+ 	grx500_wdt = &per_cpu(grx500wdt, smp_processor_id());
++	priv = watchdog_get_drvdata(grx500_wdt);
++
++	/* Certain platform (e.g. prx300) does not reset gphy RCU during
++	 * global reset. We then explicitly add reset here for workaround.
++	 */
++	for (i = 0; i < priv->reset_count; i++) {
++		if (!reset_control_status(priv->resets[i]))
++			reset_control_assert(priv->resets[i]);
++	}
++
+ 	/* enable this for dump data */
+ /*	grx500wdt_start(grx500_wdt);*/
+ 	WARN_ONCE(1, " IRQ %d triggered as WDT%d Timer Overflow on CPU %d!\n",
+@@ -309,7 +328,9 @@ static int grx500wdt_probe(struct platform_device *pdev)
+ {
+ 	/* struct resource *wdt_res; */
+ 	struct clk *clk;
++	struct grx500_wdt_struct *priv;
+ 	int ret, cpu, irq, resetcause;
++	int i;
+ 
+ 	/*
+ 	 * I/O memory need not be taken from Device Tree as WDT is part of
+@@ -320,6 +341,32 @@ static int grx500wdt_probe(struct platform_device *pdev)
+ 
+ 	irq = platform_get_irq(pdev, 0);
+ 
++	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->reset_count = of_count_phandle_with_args(pdev->dev.of_node,
++						       "resets",
++						       "#reset-cells");
++	if (priv->reset_count) {
++		priv->resets =
++			devm_kzalloc(&pdev->dev,
++				     priv->reset_count * sizeof(*priv->resets),
++				     GFP_KERNEL);
++		if (!priv->resets)
++			return -ENOMEM;
++	}
++
++	for (i = 0; i < priv->reset_count; i++) {
++		priv->resets[i] =
++			devm_reset_control_get_shared_by_index(&pdev->dev, i);
++		if (IS_ERR(priv->resets[i])) {
++			dev_err(&pdev->dev, "fail to get reset control %d\n",
++				i);
++			return PTR_ERR(priv->resets[i]);
++		}
++	}
++
+ 	/* set up per-cpu IRQ */
+ 	setup_percpu_irq(irq, &grx500wdt_irqaction);
+ 
+@@ -345,6 +392,7 @@ static int grx500wdt_probe(struct platform_device *pdev)
+ 		grx500_wdt->id = cpu;
+ 		grx500_wdt->info = &grx500wdt_info;
+ 		grx500_wdt->ops = &grx500wdt_ops;
++		watchdog_set_drvdata(grx500_wdt, priv);
+ 	}
+ 
+ 	regmap_read(ltq_rcu_base, RCU_IAP_WDT_RST_STAT, &resetcause);

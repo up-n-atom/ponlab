@@ -1,0 +1,723 @@
+From 2595a99ae79ebd2fd74ef60e13e00181c6e0bac2 Mon Sep 17 00:00:00 2001
+From: avishalo <avi1.shalom@intel.com>
+Date: Wed, 29 Jan 2020 15:05:48 +0200
+Subject: [PATCH] LMTSYS-6759: add-session-brief-command-to-ppv4-driver
+
+Signed-off-by: avishalo <avi1.shalom@intel.com>
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          | 178 ++++++++++++++++++++-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.h          |  15 +-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c  |  32 +++-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h |  46 +++++-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc_sysfs.c    |  32 +++-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.h    |  57 +++++++
+ .../pp-session-mgr/pp_session_mgr_internal.h       |  57 -------
+ drivers/net/ppv4/pp-hal/checker/checker.c          |  14 +-
+ drivers/net/ppv4/pp-hal/session-info/pp_si.c       |   4 +-
+ drivers/net/ppv4/pp-hal/session-info/pp_si.h       |   4 +-
+ 10 files changed, 363 insertions(+), 76 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index beb18e261b00..290641b563f5 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -3,7 +3,7 @@
+  * Description: PP Misc Driver
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #include <linux/kernel.h>
+@@ -14,6 +14,7 @@
+ #include <linux/slab.h>
+ #ifdef CONFIG_PPV4_LGM
+ #include <linux/skb_extension.h>
++#include <linux/learning_layer_api.h>
+ #endif
+ #include <linux/pp_qos_api.h>
+ #include <linux/pp_api.h>
+@@ -24,6 +25,7 @@
+ #include "checker.h"
+ #include "pp_desc.h"
+ #include "pp_misc_internal.h"
++#include "pp_session_mgr.h"
+ 
+ #ifdef CONFIG_PPV4_LGM
+ /**
+@@ -48,6 +50,9 @@ struct pp_misc_db {
+ 
+ 	/*! PP hw clock frequency in MHz */
+ 	u32 hw_clk;
++
++	/*! max prints for brief command */
++	u32 dbg_print_cnt;
+ };
+ 
+ static inline void __desc_free(skb_cookie c);
+@@ -621,6 +626,175 @@ s32 pp_global_stats_get(void *stats, u32 num_stats, void *data)
+ 	return 0;
+ }
+ 
++s32 pp_brief_stats_get(void *stats, u32 num_stats, void *data)
++{
++	struct pp_active_sess_stats *sess_stats;
++	s32    ret;
++	u32    n_bits, i, sess;
++	ulong  *bmap;
++
++	sess_stats = (struct pp_active_sess_stats *)stats;
++
++	if (unlikely(ptr_is_null(stats)))
++		return -EINVAL;
++
++	/* allocate bitmap for all sessions */
++	ret = smgr_sessions_bmap_alloc(&bmap, &n_bits);
++	if (unlikely(ret))
++		return ret;
++
++	/* get all opened sessions */
++	ret = smgr_open_sessions_bmap_get(bmap, n_bits);
++	if (unlikely(ret))
++		goto done;
++
++	/* iterate over all sessions */
++	i = 0;
++	for_each_set_bit(sess, bmap, n_bits) {
++		if (i == num_stats)
++			break;
++		sess_stats[i].id = sess;
++		pp_session_stats_get(sess_stats[i].id, &sess_stats[i].stats);
++		i++;
++	}
++
++done:
++	kfree(bmap);
++	return ret;
++}
++
++static struct pp_active_sess_stats
++__find_stat_by_id(struct pp_active_sess_stats *stats, u32 num, u32 id)
++{
++	u32 i;
++	struct pp_active_sess_stats tmp = {0};
++
++	tmp.id = id;
++	if (unlikely(ptr_is_null(stats)) || (!num))
++		return tmp;
++
++	for (i = 0 ; i < num ; i++)
++		if (stats[i].id == id) {
++			memcpy(&tmp.stats, &stats[i].stats, sizeof(tmp.stats));
++			break;
++		}
++
++	return tmp;
++}
++
++s32 pp_brief_stats_diff(void *pre, u32 num_pre, void *post, u32 num_post,
++			 void *delta, u32 num_delta, void *data)
++{
++	int i, j;
++	struct pp_active_sess_stats *__pre, *__post, *__delta, sess_stats;
++
++	if (unlikely(ptr_is_null(pre) || ptr_is_null(post) ||
++		     ptr_is_null(delta)))
++		return -EINVAL;
++
++	__pre   = pre;
++	__post  = post;
++	__delta = delta;
++
++	for (i = 0, j = 0; i < num_pre && j < num_delta; i++)
++		if (__pre[i].id == __post[i].id) {
++			U64_STRUCT_DIFF(&__pre[i].stats,
++			&__post[i].stats,
++			&__delta[j++].stats);
++		} else {
++			/* if not match, we will try to find session in the
++			 * pre. If not exists, it means that this is a new
++			 * session and we will copy counters and id
++			 */
++			sess_stats = __find_stat_by_id(__pre, num_pre,
++			__post[i].id);
++			U64_STRUCT_DIFF(&sess_stats, &__post[i].stats,
++			&__delta[j].stats);
++			__delta[j++].id = __post[i].id;
++		}
++	return 0;
++}
++
++s32 pp_brief_stats_show(char *buf, size_t sz, size_t *n, void *stats,
++			     u32 num_stats, void *data)
++{
++	struct sess_db_info info;
++	struct pp_active_sess_stats *sess_stats, temp;
++	int    i, j;
++	char   l3Type[10], l4Prot[10];
++
++	sess_stats = (struct  pp_active_sess_stats *) stats;
++
++	if (unlikely(ptr_is_null(buf) || ptr_is_null(n) || ptr_is_null(stats)))
++		return -EINVAL;
++
++	/* Sort the active sessions */
++	for (i = 0; i < num_stats; i++)
++		for (j = i ; j < num_stats ; j++)
++			if (sess_stats[i].stats.packets <
++				sess_stats[j].stats.packets) {
++					memcpy(&temp, &sess_stats[i],
++					sizeof(struct pp_active_sess_stats));
++					memcpy(&sess_stats[i], &sess_stats[j],
++					sizeof(struct pp_active_sess_stats));
++					memcpy(&sess_stats[j], &temp,
++					sizeof(struct pp_active_sess_stats));
++				}
++
++	pr_buf(buf, sz, *n,
++	       " +--------+--------+--------+---------+----------+---------+---------+\n");
++	pr_buf_cat(buf, sz, *n,
++	       " | id     | PPS    | Mbps   | In GPID | Out GPID | L3 Type | L4 Prot |\n");
++
++	/* Print only active sessions */
++	j = min(db->dbg_print_cnt, num_stats);
++	for (i = 0; i < j; i++) {
++		if (!sess_stats[i].stats.packets)
++			break;
++
++		if (smgr_session_info_get(sess_stats[i].id, &info))
++			continue;
++#ifdef CONFIG_DEBUG_FS
++		if (info.ingress.fv_outer_bitmap & FV_L3_IPV4)
++			strcpy(l3Type, "IPv4");
++		else if (info.ingress.fv_outer_bitmap & FV_L3_IPV6)
++			strcpy(l3Type, "IPv6");
++		else
++#endif
++		{
++			strcpy(l3Type, "N/A");
++		}
++
++#ifdef CONFIG_DEBUG_FS
++		if (info.ingress.fv_outer_bitmap & FV_L4_TCP)
++			strcpy(l4Prot, "TCP");
++		else if (info.ingress.fv_outer_bitmap & FV_L4_UDP)
++			strcpy(l4Prot, "UDP");
++		else
++#endif
++		{
++			strcpy(l4Prot, "N/A");
++		}
++
++		pr_buf_cat(buf, sz, *n,
++	       		" +--------+--------+--------+---------+----------+---------+---------+\n");
++		pr_buf_cat(buf, sz, *n,
++		" | %-6u | %-6llu | %-6llu | %-7u | %-8u | %-8s| %-8s|\n",
++		   sess_stats[i].id, sess_stats[i].stats.packets,
++		   sess_stats[i].stats.bytes*8/1000/1000,
++		   info.in_port, info.eg_port, l3Type, l4Prot);
++	}
++
++	pr_buf_cat(buf, sz, *n,
++	       " +--------+--------+--------+---------+----------+---------+---------+\n");
++	return 0;
++}
++
++void pp_misc_set_brief_cnt(u32 cnt)
++{
++	db->dbg_print_cnt = cnt ? cnt : 1;
++}
++
+ s32 pp_driver_stats_diff(void *pre, u32 num_pre, void *post, u32 num_post,
+ 			 void *delta, u32 num_delta, void *data)
+ {
+@@ -1070,7 +1244,7 @@ static s32 __pp_misc_db_init(struct pp_misc_init_param *init_param)
+ 	}
+ 
+ 	db->hw_clk = init_param->hw_clk;
+-
++	db->dbg_print_cnt = 10;
+ 	return 0;
+ }
+ #endif /* CONFIG_PPV4_LGM */
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+index fedb15d47430..230ec6241d1e 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+@@ -3,7 +3,7 @@
+  * Description: PP misc h file
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #ifndef __PP_MISC_H__
+ #define __PP_MISC_H__
+@@ -29,9 +29,9 @@
+  */
+ struct pp_misc_init_param {
+ 	bool        valid;
+-	u32         hw_clk;       /*! hw_clk HW Clock in MHz */
++	u32         hw_clk;       /*! hw_clk HW Clock in MHz             */
+ 	u32         ppv4_regs_sz; /*! size of ppv4 io registers in bytes */
+-	phys_addr_t ppv4_base;    /*! PP HW phyisical base addres */
++	phys_addr_t ppv4_base;    /*! PP HW phyisical base addres        */
+ 	struct dentry *root_dbgfs;
+ 	struct dentry *hal_dbgfs;
+ 	struct kobject *sysfs;
+@@ -79,6 +79,15 @@ struct pp_global_stats {
+ 	struct smgr_frag_stats      frag_stats;
+ };
+ 
++/**
++ * @struct pp_active_sess_stats
++ * @brief pp packets and bytes statistics per session id
++ */
++struct pp_active_sess_stats {
++	u32             id;
++	struct pp_stats stats;
++};
++
+ /**
+  * @brief Print PP resources status into a buffer
+  * @param buf the buffer to print to
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
+index 5d143d59e862..800c7fcb68c4 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
+@@ -3,7 +3,7 @@
+  * Description: PP Misc Driver Debug FS Interface
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #include <linux/kernel.h>
+ #include <linux/device.h>
+@@ -23,6 +23,7 @@
+ #include "rpb.h"
+ #include "bm.h"
+ #include "pp_desc.h"
++#include "pp_session_mgr.h"
+ 
+ /* PP infra Debug FS directory */
+ static struct dentry *dbgfs;
+@@ -128,6 +129,20 @@ PP_DEFINE_DEBUGFS(regs_wr, reg_write_32_rd, reg_write_32_wr);
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_PPV4_LGM)
++/**
++ * @brief Set brief max lines
++ */
++static void __brief_max_cnt_set(char *cmd_buf, void *data)
++{
++	u32 cnt;
++
++	if (kstrtou32(cmd_buf, 10, &cnt))
++		pr_info("failed to parse '%s'\n", cmd_buf);
++
++	pr_info("Brief max lines: %u\n", cnt);
++	pp_misc_set_brief_cnt(cnt);
++}
++
+ /**
+  * @brief Reset all PP HW (HAL) statistics
+  */
+@@ -187,6 +202,20 @@ static void __pp_hal_pps_stats_show(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(hal_pps, __pp_hal_pps_stats_show, __pp_global_reset);
+ 
++static void __pp_brief_show(struct seq_file *f)
++{
++	struct smgr_stats stats;
++
++	if (pp_smgr_stats_get(&stats))
++		return;
++
++	pp_pps_show_seq(f, sizeof(struct pp_active_sess_stats),
++		atomic_read(&stats.sess_open), pp_brief_stats_get,
++		pp_brief_stats_diff, pp_brief_stats_show, NULL);
++}
++
++PP_DEFINE_DEBUGFS(brief, __pp_brief_show, __brief_max_cnt_set);
++
+ /**
+  * @brief Debugfs stats attribute show API, prints global PP
+  *        statistics
+@@ -492,6 +521,7 @@ static struct debugfs_file files[] = {
+  * @brief files to create in the root folder
+  */
+ static struct debugfs_file drv_files[] = {
++	{"brief",        &PP_DEBUGFS_FOPS(brief)},
+ 	{"version",      &PP_DEBUGFS_FOPS(version)},
+ 	{"driver_stats", &PP_DEBUGFS_FOPS(dstats)},
+ 	{"global",       &PP_DEBUGFS_FOPS(global)},
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h
+index 7321e9d75b6f..8dcdf4ea6908 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h
+@@ -3,7 +3,7 @@
+  * Description: PP Misc Internal Definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #ifndef __PP_MISC_INTERNAL_H__
+@@ -39,6 +39,50 @@ s32 pp_hw_clock_freq_get(u32 *clk_MHz);
+  */
+ s32 misc_stats_get(struct misc_stats *stats);
+ 
++/**
++ * @brief get session statistics for brief command
++ * @param stats session statistics
++ * @param num_stats number of session statistics
++ * @param data data
++ * @return s32 0 for success, non-zero otherwise
++ */
++s32 pp_brief_stats_get(void *stats, u32 num_stats, void *data);
++
++/**
++ * @brief Calculate packets and bytes diff for opened sessions
++ * @param pre session statistics before mdelay
++ * @param num_pre number of session statistics
++ * @param post session statistics after mdelay
++ * @param num_post number of session statistics for post
++ * @param delta session statistics holding the delta between pre and post
++ * @param num_delta number of session statistics for delta
++ * @param data data
++ * @return s32 0 for success, non-zero otherwise
++ */
++s32 pp_brief_stats_diff(void *pre, u32 num_pre, void *post, u32 num_post,
++			 void *delta, u32 num_delta, void *data);
++
++/**
++ * @brief Show session statistics for brief command
++ * @param buf buffer for prints
++ * @param stats buffer length including trailing '\0'
++ * @param n number of characters written to the 'buf' excluding
++ *          trailing '\0'
++ * @param stats session statistics
++ * @param num_stats umber of session statistics
++ * @param data session statistics
++ * @return s32 0 for success, non-zero otherwise
++ */
++s32 pp_brief_stats_show(char *buf, size_t sz, size_t *n, void *stats,
++			     u32 num_stats, void *data);
++
++/**
++ * @brief Set max session statistics for brief command
++ * @param cnt max session count
++ * @return s32 0 for success, non-zero otherwise
++ */
++void pp_misc_set_brief_cnt(u32 cnt);
++
+ /**
+  * @brief Reset stats
+  * @return s32 0 for success, non-zero otherwise
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_sysfs.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_sysfs.c
+index e8bfc39d031a..f625e589e524 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_sysfs.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_sysfs.c
+@@ -4,7 +4,7 @@
+  *              Creates module's sysfs files
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2019 Intel Corporation
++ * Copyright (C) 2019-2020 Intel Corporation
+  */
+ 
+ #include <linux/kernel.h>
+@@ -14,6 +14,7 @@
+ #include "pp_sysfs_common.h"
+ #include "pp_misc.h"
+ #include "pp_misc_internal.h"
++#include "pp_session_mgr.h"
+ 
+ /**
+  * @brief Module's sysfs main directory
+@@ -50,6 +51,18 @@ static ssize_t __global_pps_show(char *buf, size_t sz)
+ 	return n;
+ }
+ 
++static ssize_t __brief_stats_max_cnt_set(const char *buf, size_t sz)
++{
++	u32 cnt;
++
++	if (kstrtou32(buf, 10, &cnt))
++		pr_info("failed to parse '%s'\n", buf);
++
++	pr_info("Brief max lines: %u\n", cnt);
++	pp_misc_set_brief_cnt(cnt);
++	return sz;
++}
++
+ static ssize_t __global_stats_reset(const char *buf, size_t sz)
+ {
+ 	if (strncmp(buf, "0", strlen("0")))
+@@ -59,6 +72,21 @@ static ssize_t __global_stats_reset(const char *buf, size_t sz)
+ 	return sz;
+ }
+ 
++static ssize_t __brief_show(char *buf, size_t sz)
++{
++	struct smgr_stats stats;
++	size_t n = 0;
++
++	if (pp_smgr_stats_get(&stats))
++		return -EINVAL;
++
++	pp_pps_show(sizeof(struct pp_active_sess_stats),
++		atomic_read(&stats.sess_open), pp_brief_stats_get,
++		pp_brief_stats_diff, pp_brief_stats_show, NULL, buf, sz, &n);
++
++	return n;
++}
++
+ static ssize_t __driver_stats_show(char *buf, size_t sz)
+ {
+ 	struct pp_qos_dev *qdev;
+@@ -121,6 +149,7 @@ static ssize_t __resources_show(char *buf, size_t sz)
+ 	return n;
+ }
+ 
++PP_DEFINE_SYSFS_ATTR(brief, __brief_show, __brief_stats_max_cnt_set);
+ PP_DEFINE_SYSFS_ATTR(global, __global_stats_show, __global_stats_reset);
+ PP_DEFINE_SYSFS_ATTR(pps, __global_pps_show, __global_stats_reset);
+ PP_DEFINE_SYSFS_ATTR(driver_stats, __driver_stats_show, __driver_stats_reset);
+@@ -128,6 +157,7 @@ PP_DEFINE_SYSFS_ATTR(version, __version_show, NULL);
+ PP_DEFINE_SYSFS_ATTR(resources, __resources_show, NULL);
+ 
+ static struct attribute *attrs[] = {
++	&PP_SYSFS_ATTR(brief).attr,
+ 	&PP_SYSFS_ATTR(global).attr,
+ 	&PP_SYSFS_ATTR(pps).attr,
+ 	&PP_SYSFS_ATTR(driver_stats).attr,
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+index 238fe4e021e5..7662484a19ef 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+@@ -233,6 +233,45 @@ struct smgr_tdox_stats {
+ 	u32 tdox_create_args_err;
+ };
+ 
++/**
++ * @struct Session manager session database info definition
++ * @flags session flags
++ * @mod_flags modification flags, the flags which were used to
++ *            determine the recipe
++ * @sess_id session id
++ * @in_port session ingress port
++ * @eg_port session egress port
++ * @fv_sz session field vector size for quick reference
++ * @hash session hash results calculated by the HW
++ * @mcast session mcast info
++ * @tdox_ent Link to turbodox entry
++ * @ingress session ingress packet, needed for debug printing
++ * @egress session egress packet, needed for debug printing
++ */
++struct sess_db_info {
++	ulong flags;
++	ulong mod_flags;
++	u32 sess_id;
++	u16 in_port;
++	u16 eg_port;
++	u8  fv_sz;
++	struct pp_hash hash;
++	struct pp_mcast mcast;
++	struct tdox_db_entry *tdox_ent;
++#ifdef CONFIG_DEBUG_FS
++	struct fv_pkt_info ingress;
++	struct fv_pkt_info egress;
++#endif
++};
++
++/**
++ * @brief Get PP session info
++ * @param id session id
++ * @param info buffer to save the info
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_session_info_get(u32 id, struct sess_db_info *info);
++
+ /**
+  * @brief Get session manager statistics
+  * @param stats buffer
+@@ -324,6 +363,24 @@ void smgr_tdox_dbg_timer_set(u32 period_ms);
+  */
+ bool smgr_tdox_enable_get(void);
+ 
++/**
++ * @brief Allocate bitmap with bit per session
++ * @note it is the user responsibility to free the memory
++ * @param bmap bitmap pointer to return the bitmap address
++ * @param n_bits bitmap size in bits, equal to number of sessions
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_sessions_bmap_alloc(ulong **bmap, u32 *n_bits);
++
++/**
++ * @brief Get session manager busy sessions bitmap, set bit specify
++ *        busy session, clear bit specify free session
++ * @param bmap buffer to save sessions list
++ * @param n_bits bitmap size in bits
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_open_sessions_bmap_get(unsigned long *bmap, u32 n_bits);
++
+ /**
+  * @brief initialized PP session manager driver
+  * @param init_param initial parameters
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 1aff4339875f..29ed5b64b5fd 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -172,37 +172,6 @@ enum smgr_state {
+ 	SMGR_STATES_NUM,
+ };
+ 
+-/**
+- * @struct Session manager session database info definition
+- * @flags session flags
+- * @mod_flags modification flags, the flags which were used to
+- *            determine the recipe
+- * @sess_id session id
+- * @in_port session ingress port
+- * @eg_port session egress port
+- * @fv_sz session field vector size for quick reference
+- * @hash session hash results calculated by the HW
+- * @mcast session mcast info
+- * @tdox_ent Link to turbodox entry
+- * @ingress session ingress packet, needed for debug printing
+- * @egress session egress packet, needed for debug printing
+- */
+-struct sess_db_info {
+-	ulong flags;
+-	ulong mod_flags;
+-	u32 sess_id;
+-	u16 in_port;
+-	u16 eg_port;
+-	u8  fv_sz;
+-	struct pp_hash hash;
+-	struct pp_mcast mcast;
+-	struct tdox_db_entry *tdox_ent;
+-#ifdef CONFIG_DEBUG_FS
+-	struct fv_pkt_info ingress;
+-	struct fv_pkt_info egress;
+-#endif
+-};
+-
+ /**
+  * @brief Tdox session information
+  */
+@@ -384,15 +353,6 @@ static inline bool smgr_is_sess_mcast_dst(const struct sess_db_info *sess)
+ 	return test_bit(SESS_FLAG_MCAST_DST, &sess->flags);
+ }
+ 
+-/**
+- * @brief Allocate bitmap with bit per session
+- * @note it is the user responsibility to free the memory
+- * @param bmap bitmap pointer to return the bitmap address
+- * @param n_bits bitmap size in bits, equal to number of sessions
+- * @return s32 0 on success, error code otherwise
+- */
+-s32 smgr_sessions_bmap_alloc(ulong **bmap, u32 *n_bits);
+-
+ /**
+  * @brief Test whether session id is valid or not
+  * @note Valid session id doesn't mean the session exist
+@@ -693,23 +653,6 @@ void smgr_tdox_late_init(void);
+ void smgr_tdox_exit(void);
+ 
+ #ifdef CONFIG_DEBUG_FS
+-/**
+- * @brief Get session manager busy sessions bitmap, set bit specify
+- *        busy session, clear bit specify free session
+- * @param bmap buffer to save sessions list
+- * @param n_bits bitmap size in bits
+- * @return s32 0 on success, error code otherwise
+- */
+-s32 smgr_open_sessions_bmap_get(unsigned long *bmap, u32 n_bits);
+-
+-/**
+- * @brief Get PP session info
+- * @param id session id
+- * @param info buffer to save the info
+- * @return s32 0 on success, error code otherwise
+- */
+-s32 smgr_session_info_get(u32 id, struct sess_db_info *info);
+-
+ /**
+  * @brief Set PP session manager state (enable/disable)
+  * @param state new state
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.c b/drivers/net/ppv4/pp-hal/checker/checker.c
+index 37fb25d79f49..711688a9ed67 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.c
++++ b/drivers/net/ppv4/pp-hal/checker/checker.c
+@@ -139,19 +139,19 @@ static s32 __chk_session_dsi_evict(u32 id)
+ 	dma_addr_t phys;
+ 	ulong mask = PP_CNTR_CACHE_SINGLE_OP_STATUS_STATUS_SINGLE_OP_MSK;
+ 
+-	/* poll on cache till the last single operation ends */
+-	if (unlikely(pp_reg_poll(PP_CNTR_CACHE_SINGLE_OP_STATUS_REG,
+-				 mask, 0))) {
+-		pr_err("cache is busy, cannot run single op\n");
+-		return -EBUSY;
+-	}
+-
+ 	phys = db->dsi_base_phys + CHK_DSI_OFFSET_GET(id);
+ 
+ 	/* evict */
+ 	__chk_lock();
++
+ 	/* DSI size (16 bytes) is exactly 1 cache line, so we evict 1 line */
+ 	PP_REG_WR32(PP_CNTR_CACHE_EVICT_ADDR_REG, phys >> 4);
++	if (unlikely(pp_reg_poll(PP_CNTR_CACHE_SINGLE_OP_STATUS_REG,
++				 mask, 0))) {
++		__chk_unlock();
++		pr_err("cache is busy, cannot run single op\n");
++		return -EBUSY;
++	}
+ 	__chk_unlock();
+ 
+ 	return 0;
+diff --git a/drivers/net/ppv4/pp-hal/session-info/pp_si.c b/drivers/net/ppv4/pp-hal/session-info/pp_si.c
+index ce2187f27c46..5da13403279f 100644
+--- a/drivers/net/ppv4/pp-hal/session-info/pp_si.c
++++ b/drivers/net/ppv4/pp-hal/session-info/pp_si.c
+@@ -148,7 +148,7 @@ static inline s32 __si_fld_set(struct pp_hw_si *si, enum pp_si_fld id, s32 val)
+  * @param id field id
+  * @return s32 the field value
+  */
+-static inline s32 __dsi_fld_get(const struct pp_hw_dsi *dsi, enum pp_dsi_fld id)
++static inline s64 __dsi_fld_get(const struct pp_hw_dsi *dsi, enum pp_dsi_fld id)
+ {
+ 	return buf_fld_get(&dsi_flds[id], dsi->word);
+ }
+@@ -540,7 +540,7 @@ s32 pp_si_fld_get(const struct pp_hw_si *si, enum pp_si_fld id, s32 *val)
+ 	return 0;
+ }
+ 
+-s32 pp_dsi_fld_get(const struct pp_hw_dsi *dsi, enum pp_dsi_fld id, s32 *val)
++s32 pp_dsi_fld_get(const struct pp_hw_dsi *dsi, enum pp_dsi_fld id, s64 *val)
+ {
+ 	if (unlikely(!(!ptr_is_null(dsi) &&
+ 		       !ptr_is_null(val))))
+diff --git a/drivers/net/ppv4/pp-hal/session-info/pp_si.h b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+index 8ba651660b2f..f86ce71fe6f6 100644
+--- a/drivers/net/ppv4/pp-hal/session-info/pp_si.h
++++ b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+@@ -673,9 +673,9 @@ s32 pp_si_encode(struct pp_hw_si *hw_si, struct pp_si *si);
+  * @param dsi dsi buffer to get the field from
+  * @param id field id
+  * @param val dsi field value
+- * @return s32 0 on success, error code otherwise
++ * @return s64 0 on success, error code otherwise
+  */
+-s32 pp_dsi_fld_get(const struct pp_hw_dsi *dsi, enum pp_dsi_fld id, s32 *val);
++s32 pp_dsi_fld_get(const struct pp_hw_dsi *dsi, enum pp_dsi_fld id, s64 *val);
+ 
+ /**
+  * @brief Set value into an DSI field

@@ -1,0 +1,95 @@
+From e19d544bac4530ad7bc442f7b415791b14f5c43b Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke.mehrtens@intel.com>
+Date: Thu, 15 Oct 2020 17:38:16 +0200
+Subject: [PATCH] PONRTSYS-8120: Get qid from grand parent if possible
+
+The code now checks first to get the queue ID from the grad parent and
+uses that if possible. Only if there is no grand parent it will use its
+minor number as queue id.
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c | 64 +++++++++++++++++++++++++--
+ 1 file changed, 60 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 2fed69c54cea..65d4dcc46832 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -160,6 +160,59 @@ int pon_qos_get_sch_by_handle(struct net_device *dev,
+ 	return 0;
+ }
+ 
++/**
++ * This function gets the the queue number from grandparent. For example if
++ * we have such hierarchy:
++ *
++ * tc class add dev tcont32768 parent 500c: handle 500c:3 drr quantum 8k
++ * tc qdisc add dev tcont32768 parent 500c:3 handle 1008: red limit 13650 \
++ *	min 6820 max 13650 avpkt 1k burst 9 probability 0.004
++ * tc qdisc add dev tcont32768 parent 1008:1 handle 2008: red limit 6820 \
++ *	min 3410 max 6820 avpkt 1k burst 4 probability 0.004
++ * tc filter add dev tcont32768 ingress handle 0x5 protocol all flower \
++ *	skip_sw classid 2008:1 indev gem5 action pass
++ *
++ * Then, we should take the queue from red grandparent (so for 2008:1 we should
++ * find red with handle 2008:, then take its parent 1008:
++ * and then see that its parent is 500c:3 and the queue should be :3)
++ */
++static int pon_qos_get_grandparent_queue_by_handle(struct net_device *dev,
++						   u32 handle,
++						   struct pon_qos_q_data **qid)
++{
++	struct pon_qos_qdisc *qdisc_parent = NULL;
++	struct pon_qos_qdata_params *p;
++	struct pon_qos_q_data *qid_iter;
++	struct pon_qos_qdisc *qdisc;
++	int ret;
++	int i;
++
++	ret = pon_qos_get_sch_by_handle(dev, handle, &qdisc);
++	if (ret < 0)
++		return ret;
++
++	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
++		qid_iter = &qdisc->qids[i];
++
++		if (!(qid_iter->qid))
++			continue;
++		list_for_each_entry(p, &qid_iter->params, list) {
++			if (TC_H_MAJ(p->handle) != TC_H_MAJ(handle))
++				continue;
++
++			ret = pon_qos_get_sch_by_handle(dev, p->parent,
++							&qdisc_parent);
++			if (ret < 0)
++				return ret;
++			*qid = pon_qos_qdata_qid_get(dev, qdisc_parent,
++						     p->parent);
++			if (*qid)
++				return 0;
++		}
++	}
++	return -ENOENT;
++}
++
+ int pon_qos_get_queue_by_handle(struct net_device *dev,
+ 				u32 handle,
+ 				struct pon_qos_q_data **qid)
+@@ -902,11 +955,14 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 	if (!sch)
+ 		return -EINVAL;
+ 
+-	ret = pon_qos_get_queue_by_handle(dev, q_tc->handle, &qid);
++	ret = pon_qos_get_grandparent_queue_by_handle(dev, q_tc->handle, &qid);
+ 	if (ret < 0 || !qid) {
+-		netdev_err(dev, "%s: en=%d, handle %#x not found err %d\n",
+-			   __func__, en, q_tc->handle, ret);
+-		return -EINVAL;
++		ret = pon_qos_get_queue_by_handle(dev, q_tc->handle, &qid);
++		if (ret < 0 || !qid) {
++			netdev_err(dev, "%s: en=%d, handle %#x not found err %d\n",
++				   __func__, en, q_tc->handle, ret);
++			return -EINVAL;
++		}
+ 	}
+ 
+ 	if (q_tc->indev) {

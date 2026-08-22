@@ -1,0 +1,566 @@
+From 53bb35b28d5684eef17c55ecdfcdbda558bb94ca Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <kamil.rywacki@intel.com>
+Date: Tue, 26 May 2020 11:30:59 +0200
+Subject: [PATCH] PONRTSYS-6698: Implement RED offload in pon qos driver
+
+- Implement WRED support
+
+Signed-off-by: Rywacki, Kamil <kamil.rywacki@intel.com>
+---
+ drivers/net/datapath/pon_qos/Kconfig           |   1 +
+ drivers/net/datapath/pon_qos/Makefile          |   1 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.c |  13 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.h |   3 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c  | 126 ++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h  |  25 +++
+ drivers/net/datapath/pon_qos/pon_qos_tc_red.c  | 269 +++++++++++++++++++++++++
+ 7 files changed, 431 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Kconfig b/drivers/net/datapath/pon_qos/Kconfig
+index 61c30726ee76..ec0c6b55eb4b 100644
+--- a/drivers/net/datapath/pon_qos/Kconfig
++++ b/drivers/net/datapath/pon_qos/Kconfig
+@@ -3,6 +3,7 @@
+ config PON_QOS
+ 	tristate "PON QoS driver"
+ 	depends on INTEL_DATAPATH
++	select NET_SCH_RED
+ 
+ 	help
+ 	  This driver provides user space API for configuring PON specific QoS
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index f515b87c5cd0..d518106a61fa 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -5,6 +5,7 @@ pon_qos-objs := \
+ 	pon_qos_tc_qos.o  \
+ 	pon_qos_tc_qmap.o \
+ 	pon_qos_tc_drr.o \
++	pon_qos_tc_red.o \
+ 	pon_qos_tc_prio.o \
+ 	pon_qos_tc_mqprio.o \
+ 	pon_qos_tc_flower.o \
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+index c8fbc89c62e8..0be6d6b904b1 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+@@ -24,24 +24,23 @@ int pon_qos_setup_tc(struct net_device *dev,
+ 	int ret = 0;
+ 
+ 	ASSERT_RTNL();
++	netdev_dbg(dev, "%s: start\n", __func__);
+ 	switch (tc->type) {
+ 	case TC_SETUP_CLSFLOWER:
+-		ret = pon_qos_tc_flower_offload(dev,
+-						handle,
+-						tc->cls_flower);
+-		break;
++		return pon_qos_tc_flower_offload(dev,
++						 handle,
++						 tc->cls_flower);
+ 	case TC_SETUP_MQPRIO:
+ 		return pon_qos_tc_mqprio_offload(dev, handle, tc,
+ 						 port_id, deq_idx);
+-		break;
+ 	case TC_SETUP_QDISC_PRIO:
+ 		return pon_qos_tc_prio_offload(dev, handle, tc,
+ 					       port_id, deq_idx);
+-		break;
+ 	case TC_SETUP_DRR:
+ 		return pon_qos_tc_drr_offload(dev, handle, tc,
+ 					      port_id, deq_idx);
+-		break;
++	case TC_SETUP_QDISC_RED:
++		return pon_qos_tc_red_offload(dev, handle, tc);
+ 	default:
+ 		netdev_err(dev, "offload type:%d not supported\n", tc->type);
+ 		ret = -EOPNOTSUPP;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.h b/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
+index 4cd4ca650029..717fca9171fa 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.h
+@@ -29,4 +29,7 @@ int pon_qos_tc_flower_offload(struct net_device *dev,
+ 			      u32 handle,
+ 			      struct tc_cls_flower_offload *f);
+ 
++int pon_qos_tc_red_offload(struct net_device *dev,
++			   u32 handle,
++			   struct tc_to_netdev *tc);
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index f79cbd50ede1..72a71071a4f8 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -582,6 +582,7 @@ int pon_qos_queue_add(struct pon_qos_qdisc *sch, int arbi, int prio_w, int idx)
+ 	sch->qids[idx].qid = anode.id.q_id;
+ 	sch->qids[idx].arbi = arbi;
+ 	sch->qids[idx].p_w = prio_w;
++	INIT_LIST_HEAD(&sch->qids[idx].params);
+ 
+ 	node.arbi = (arbi == PON_QOS_QDISC_DRR) ?
+ 		    ARBITRATION_WRR : ARBITRATION_WSP;
+@@ -614,6 +615,10 @@ int pon_qos_queue_add(struct pon_qos_qdisc *sch, int arbi, int prio_w, int idx)
+ 	return 0;
+ }
+ 
++static int pon_qos_qdata_child_remove(struct net_device *dev,
++				      struct pon_qos_q_data *qid,
++				      u32 handle);
++
+ int pon_qos_queue_del(struct pon_qos_qdisc *sch, int idx)
+ {
+ 	struct dp_node_alloc anode = {0};
+@@ -625,6 +630,11 @@ int pon_qos_queue_del(struct pon_qos_qdisc *sch, int idx)
+ 	if (idx < 0 || idx > PON_QOS_TC_MAX_Q - 1)
+ 		return -1;
+ 
++	ret = pon_qos_qdata_child_remove(sch->dev, &sch->qids[idx],
++					 sch->handle);
++	if (ret)
++		return ret;
++
+ 	anode.type = DP_NODE_QUEUE;
+ 	anode.id.q_id = sch->qids[idx].qid;
+ 	if (!anode.id.q_id /*|| atomic_read(&sch->qids[idx].ref_cnt)*/)
+@@ -936,3 +946,119 @@ int pon_qos_ports_cleanup(void)
+ 
+ 	return 0;
+ }
++
++int pon_qos_qdata_get_by_type(struct net_device *dev,
++			      struct pon_qos_q_data *qid,
++			      enum pon_qos_qdata_type type,
++			      u32 *handle, u32 *parent)
++{
++	struct pon_qos_qdata_params *p;
++
++	list_for_each_entry(p, &qid->params, list) {
++		if (p->type == type) {
++			netdev_dbg(dev, "%s: pid:%#x class/handle:%#x\n",
++				   __func__, p->parent, p->handle);
++			*handle = p->handle;
++			*parent = p->parent;
++			return 0;
++		}
++	}
++
++	netdev_dbg(dev, "%s: type not found\n", __func__);
++	return -1;
++}
++
++int pon_qos_qdata_add(struct net_device *dev, struct pon_qos_q_data *qid,
++		      u32 handle, u32 parent, enum pon_qos_qdata_type type,
++		      int (*destroy)(struct net_device *dev, u32 handle,
++				     u32 parent))
++{
++	struct pon_qos_qdata_params *params;
++	u32 tmp_h, tmp_p;
++
++	/* Only one queue setting type allowed */
++	if (!pon_qos_qdata_get_by_type(dev, qid, type, &tmp_h, &tmp_p)) {
++		netdev_err(dev, "%s: Duplicated setting pid:%#x class/handle:%#x\n",
++			   __func__, parent, handle);
++		return -1;
++	}
++
++	params = kzalloc(sizeof(*params), GFP_KERNEL);
++	if (!params)
++		return -ENOMEM;
++
++	params->handle = handle;
++	params->parent = parent;
++	params->type = type;
++	params->destroy = destroy;
++
++	list_add(&params->list, &qid->params);
++
++	return 0;
++}
++
++static int __pon_qos_qdata_remove(struct net_device *dev,
++				  struct pon_qos_q_data *qid,
++				  struct pon_qos_qdata_params *p);
++
++static int pon_qos_qdata_child_remove(struct net_device *dev,
++				      struct pon_qos_q_data *qid,
++				      u32 handle)
++{
++	struct pon_qos_qdata_params *p, *n;
++	int ret;
++
++	list_for_each_entry_safe(p, n, &qid->params, list) {
++		if (TC_H_MAJ(p->parent) == TC_H_MAJ(handle)) {
++			netdev_dbg(dev, "%s: pid:%#x class/handle:%#x\n",
++				   __func__, p->parent, p->handle);
++			ret = __pon_qos_qdata_remove(dev, qid, p);
++			if (ret)
++				return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int __pon_qos_qdata_remove(struct net_device *dev,
++				  struct pon_qos_q_data *qid,
++				  struct pon_qos_qdata_params *p)
++{
++	int ret;
++
++	netdev_dbg(dev, "%s: pid:%#x class/handle:%#x\n",
++		   __func__, p->parent, p->handle);
++
++	/* Remove all successors before removing ancestor */
++	ret = pon_qos_qdata_child_remove(dev, qid, p->handle);
++	if (ret)
++		return ret;
++
++	ret = p->destroy(dev, p->handle, p->parent);
++	if (ret) {
++		netdev_err(dev, "%s: failed to destroy qdata parameter\n",
++			   __func__);
++		return ret;
++	}
++
++	list_del(&p->list);
++	kfree(p);
++
++	return 0;
++}
++
++int pon_qos_qdata_remove(struct net_device *dev, struct pon_qos_q_data *qid,
++			 u32 handle, u32 parent)
++{
++	struct pon_qos_qdata_params *p;
++
++	list_for_each_entry(p, &qid->params, list) {
++		if (p->handle == handle && p->parent == parent)
++			return __pon_qos_qdata_remove(dev, qid, p);
++	}
++
++	netdev_dbg(dev, "%s: failed to find qdata parameter\n",
++		   __func__);
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index 31aa44db3c34..ef600a365229 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -31,12 +31,27 @@ struct pon_qos_qdisc_ops {
+ 	int (*unoffload)(struct net_device *dev, void *params);
+ };
+ 
++enum pon_qos_qdata_type {
++	PON_QOS_QDATA_GREEN,
++	PON_QOS_QDATA_YELLOW,
++	PON_QOS_QDATA_TBF,
++};
++
++struct pon_qos_qdata_params {
++	u32 handle;
++	u32 parent;
++	enum pon_qos_qdata_type type;
++	int (*destroy)(struct net_device *dev, u32 handle, u32 parent);
++	struct list_head list;
++};
++
+ struct pon_qos_q_data {
+ 	u32 qid;
+ 	int tc;
+ 	atomic_t ref_cnt;
+ 	int arbi;
+ 	int p_w;
++	struct list_head params;
+ };
+ 
+ struct pon_qos_dot1p {
+@@ -146,4 +161,14 @@ int pon_qos_tc_mappings_init(void);
+ 
+ int pon_qos_ports_cleanup(void);
+ 
++int pon_qos_qdata_get_by_type(struct net_device *dev,
++			      struct pon_qos_q_data *qid,
++			      enum pon_qos_qdata_type type,
++			      u32 *handle, u32 *parent);
++int pon_qos_qdata_add(struct net_device *dev, struct pon_qos_q_data *qid,
++		      u32 handle, u32 parent, enum pon_qos_qdata_type type,
++		      int (*destroy)(struct net_device *dev, u32 handle,
++				     u32 parent));
++int pon_qos_qdata_remove(struct net_device *dev, struct pon_qos_q_data *qid,
++			 u32 handle, u32 parent);
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_red.c b/drivers/net/datapath/pon_qos/pon_qos_tc_red.c
+new file mode 100644
+index 000000000000..6bc47fcb9c3b
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_red.c
+@@ -0,0 +1,269 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++#include <net/pkt_cls.h>
++#include <net/flow_dissector.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_qos.h>
++#include "pon_qos_tc_qos.h"
++
++#define WRED_GREEN_MAX_TH (500 * 1024)
++#define WRED_GREEN_MIN_TH ((WRED_GREEN_MAX_TH * 90) / 100)
++#define WRED_GREEN_MAX_P 100
++#define WRED_YELLOW_MAX_TH (250 * 1024)
++#define WRED_YELLOW_MIN_TH ((WRED_YELLOW_MAX_TH * 90) / 100)
++#define WRED_YELLOW_MAX_P 100
++
++static int wred_params_set(struct pon_qos_qdisc *sch,
++			   struct pon_qos_q_data *qid,
++			   enum pon_qos_qdata_type type,
++			   bool def,
++			   struct tc_red_qopt_offload_params *params)
++{
++	u64 prob_tmp;
++	int id;
++	struct dp_queue_conf q_cfg = {
++		.q_id = qid->qid,
++		.inst = sch->inst
++	};
++
++	if (!def && !params) {
++		netdev_err(sch->dev, "%s: non-defaults params missing\n",
++			   __func__);
++		return -1;
++	}
++
++	switch (type) {
++	case PON_QOS_QDATA_GREEN:
++		id = 0;
++		break;
++	case PON_QOS_QDATA_YELLOW:
++		id = 1;
++		break;
++	default:
++		netdev_err(sch->dev, "%s: wrong type\n",
++			   __func__);
++		return -1;
++	}
++
++	/** Read */
++	if (dp_queue_conf_get(&q_cfg, 0) == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: dp_queue_conf_get() failed\n",
++			   __func__);
++		return -1;
++	}
++
++	/** Modify */
++	if (def) {
++		q_cfg.min_size[id] = WRED_GREEN_MIN_TH;
++		q_cfg.max_size[id] = WRED_GREEN_MAX_TH;
++		q_cfg.wred_slope[id] = WRED_GREEN_MAX_P;
++	} else {
++		q_cfg.min_size[id] = params->min;
++		q_cfg.max_size[id] = params->max;
++		/* Calculate percent probability */
++		prob_tmp = params->probability;
++		prob_tmp = prob_tmp * 100;
++		prob_tmp = DIV_ROUND_UP(prob_tmp, 1 << 16);
++		prob_tmp = DIV_ROUND_UP(prob_tmp, 1 << 16);
++		q_cfg.wred_slope[id] = prob_tmp;
++	}
++
++	netdev_dbg(sch->dev, "%s: min_size: %u, max_size: %u, probability: %u\n",
++		   __func__, q_cfg.min_size[type], q_cfg.max_size[type],
++		   q_cfg.wred_slope[type]);
++
++	/** Write */
++	if (dp_queue_conf_set(&q_cfg, 1) == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: dp_queue_conf_set() failed\n",
++			   __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int __wred_destroy(struct net_device *dev, u32 handle, u32 parent,
++			  enum pon_qos_qdata_type type)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_err(dev, "tc-red port get failed\n");
++		return -1;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, parent);
++	if (!qdisc) {
++		/* Return success if parent was already removed */
++		netdev_dbg(dev, "tc-red qdisc get failed\n");
++		return 0;
++	}
++
++	ret = pon_qos_get_queue_by_handle(dev, parent, &qid);
++	if (ret < 0 || !qid) {
++		netdev_err(dev, "%s: handle not found err %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	ret = wred_params_set(qdisc, qid, type, true, NULL);
++	if (ret < 0)
++		return ret;
++
++	radix_tree_delete(&port->qdiscs, TC_H_MAJ(handle));
++
++	return 0;
++}
++
++static int wred_yellow_destroy(struct net_device *dev, u32 handle, u32 parent)
++{
++	return __wred_destroy(dev, handle, parent, PON_QOS_QDATA_YELLOW);
++}
++
++static int wred_green_destroy(struct net_device *dev, u32 handle, u32 parent)
++{
++	return __wred_destroy(dev, handle, parent, PON_QOS_QDATA_GREEN);
++}
++
++static int pon_qos_tc_red_replace(struct net_device *dev,
++				  u32 handle,
++				  struct tc_red_qopt_offload *opt)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	enum pon_qos_qdata_type type;
++	u32 tmp_h, tmp_p;
++	void *destroy;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		netdev_err(dev, "tc-red port get failed\n");
++		return -1;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, opt->parent);
++	if (!qdisc) {
++		netdev_err(dev, "tc-red qdisc get failed\n");
++		return -1;
++	}
++
++	ret = pon_qos_get_queue_by_handle(dev, opt->parent, &qid);
++	if (ret < 0 || !qid) {
++		netdev_err(dev, "%s: handle not found err %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	/* Set GREEN for first RED, YELLOW for second */
++	if (pon_qos_qdata_get_by_type(dev, qid, PON_QOS_QDATA_GREEN,
++				      &tmp_h, &tmp_p)) {
++		destroy = wred_green_destroy;
++		type = PON_QOS_QDATA_GREEN;
++		netdev_dbg(dev, "tc-red qdisc configuring green\n");
++	} else {
++		destroy = wred_yellow_destroy;
++		type = PON_QOS_QDATA_YELLOW;
++		netdev_dbg(dev, "tc-red qdisc configuring yellow\n");
++	}
++
++	ret = pon_qos_qdata_add(dev, qid, handle, opt->parent, type, destroy);
++	if (ret < 0)
++		return ret;
++
++	ret = wred_params_set(qdisc, qid, type, false, &opt->set);
++	if (ret < 0)
++		return ret;
++
++	ret = radix_tree_insert(&port->qdiscs, TC_H_MAJ(handle), qdisc);
++	if (ret) {
++		netdev_err(dev, "%s: qdisc insertion to radix tree failed: %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	return 0;
++}
++
++static int pon_qos_tc_red_destroy(struct net_device *dev,
++				  u32 handle,
++				  struct tc_red_qopt_offload *opt)
++{
++	struct pon_qos_port *port = NULL;
++	struct pon_qos_qdisc *qdisc = NULL;
++	struct pon_qos_q_data *qid = NULL;
++	int ret;
++
++	port = pon_qos_port_get(dev);
++	if (!port) {
++		/* Return success if port was already removed */
++		netdev_dbg(dev, "tc-red port get failed\n");
++		return 0;
++	}
++
++	qdisc = pon_qos_qdisc_find(port, opt->parent);
++	if (!qdisc) {
++		/* Return success if parent was already removed */
++		netdev_dbg(dev, "tc-red qdisc get failed\n");
++		return 0;
++	}
++
++	ret = pon_qos_get_queue_by_handle(dev, opt->parent, &qid);
++	if (ret < 0 || !qid) {
++		netdev_err(dev, "%s: handle not found err %d\n",
++			   __func__, ret);
++		return -1;
++	}
++
++	return pon_qos_qdata_remove(dev, qid, handle, opt->parent);
++}
++
++int pon_qos_tc_red_offload(struct net_device *dev,
++			   u32 handle,
++			   struct tc_to_netdev *tc)
++{
++	struct tc_red_qopt_offload *opt = tc->sch_red;
++	int err = 0;
++
++	ASSERT_RTNL();
++	netdev_dbg(dev, "RED: offload starting\n");
++
++	switch (opt->command) {
++	case TC_RED_REPLACE:
++		netdev_dbg(dev, "replace pid:%#x class/handle:%#x\n",
++			   opt->parent, opt->handle);
++		err = pon_qos_tc_red_replace(dev, handle, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-red replace failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_RED_DESTROY:
++		netdev_dbg(dev, "destroy pid:%#x class/handle:%#x\n",
++			   opt->parent, opt->handle);
++		err = pon_qos_tc_red_destroy(dev, handle, opt);
++		if (err < 0) {
++			netdev_err(dev, "tc-red destroy failed\n");
++			return -EINVAL;
++		}
++		break;
++	case TC_RED_STATS:
++	case TC_RED_XSTATS:
++		return -EOPNOTSUPP;
++	default:
++		break;
++	}
++
++	netdev_dbg(dev, "RED: offload end: %d\n", err);
++	return 0;
++}
++EXPORT_SYMBOL(pon_qos_tc_red_offload);

@@ -1,0 +1,270 @@
+From 9ae9da39c4bae64fc5f7b005fe7f3690aaa084da Mon Sep 17 00:00:00 2001
+From: Elad Fernandes <elad.fernandes@intel.com>
+Date: Mon, 15 Jun 2020 11:03:01 +0300
+Subject: [PATCH] PONRTSYS-7747: Lock the classifier command sequence for the
+ uc fake command
+
+---
+ drivers/net/ppv4/pp-hal/classifier/classifier.c    | 56 +++++++++++++++-------
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      |  1 -
+ drivers/net/ppv4/pp-hal/micro-controller/uc.h      | 18 +++++++
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   | 12 ++++-
+ .../net/ppv4/pp-hal/micro-controller/uc_internal.h | 18 -------
+ 5 files changed, 68 insertions(+), 37 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.c b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+index b3bde419d428..f8813eac09db 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+@@ -16,6 +16,9 @@
+ #include "classifier.h"
+ #include "classifier_internal.h"
+ #include "infra.h"
++/* For A-step only*/
++#include "uc.h"
++#include "uc_common.h"
+ 
+ /**
+  * @brief classifier HW base address
+@@ -534,6 +537,18 @@ static void __cls_dflt_si_set(void)
+ 		    CLS_DFLT_SI_FV_SZ);
+ }
+ 
++static inline void __cls_cmd_lock(void)
++{
++	if (pp_silicon_step_get() == PP_SSTEP_A)
++		uc_ccu_gpreg_set(UC_IS_EGR, CLS_LOCK_REG_IDX, 1);
++}
++
++static inline void __cls_cmd_unlock(void)
++{
++	if (pp_silicon_step_get() == PP_SSTEP_A)
++		uc_ccu_gpreg_set(UC_IS_EGR, CLS_LOCK_REG_IDX, 0);
++}
++
+ void cls_lu_stats_reset(void)
+ {
+ 	u32 reg;
+@@ -696,6 +711,7 @@ s32 cls_session_add(void *si, struct pp_hash *hash)
+ 		return -EINVAL;
+ 	}
+ 
++	__cls_cmd_lock();
+ 	session.key = (void *)CLS_FV_ADDR((unsigned long)(db->si_base_virt),
+ 					  s_id, fv_sz);
+ 	session.key_len    = fv_sz;
+@@ -707,23 +723,21 @@ s32 cls_session_add(void *si, struct pp_hash *hash)
+ 	ret = cuckoo_hash_insert(db->cuckoo, &session);
+ 	if (ret) {
+ 		pr_err("failed to add the session to cuckoo hash, %u\n", s_id);
++		__cls_cmd_unlock();
+ 		return ret;
+ 	}
++	__cls_cmd_unlock();
+ 
+ 	return db->cls_cmd_status;
+ }
+ 
+ static inline bool __cls_is_cmd_fifo_ready(u32 cmd_num_words)
+ {
+-	u32 reg;
+-
+ 	/* Check num of free words on FIFO */
+-	reg = FIELD_GET(PP_CLS_CMD_STATUS_FW_REMAIN_WORD_MSK,
+-			PP_REG_RD32(PP_CLS_CMD_STATUS_REG));
+-
+-	if (reg < cmd_num_words) {
+-		pr_err("Not enough space in cmd FIFO, needed=%u, left=%u\n",
+-		       CLS_UPDATE_CMD_SZ, reg);
++	if (pp_reg_poll(PP_CLS_CMD_STATUS_REG,
++			PP_CLS_CMD_STATUS_FW_REMAIN_WORD_MSK,
++			PP_CLS_CMD_STATUS_FW_REMAIN_WORD_RST)) {
++		pr_err("Failed polling on classifier FIFO status\n");
+ 		return false;
+ 	}
+ 
+@@ -767,8 +781,11 @@ s32 cls_session_dsi_update(u32 id, u16 dst_q, bool clr_cntr)
+ 		return -EINVAL;
+ 	}
+ 
+-	if (unlikely(!__cls_is_cmd_fifo_ready(CLS_UPDATE_CMD_SZ)))
++	__cls_cmd_lock();
++	if (unlikely(!__cls_is_cmd_fifo_ready(CLS_UPDATE_CMD_SZ))) {
++		__cls_cmd_unlock();
+ 		return -ENOMEM;
++	}
+ 
+ 	/* Write the hash results - NA for update command */
+ 	__cls_cmd_hash_wr(0, 0, 0);
+@@ -789,8 +806,11 @@ s32 cls_session_dsi_update(u32 id, u16 dst_q, bool clr_cntr)
+ 	/* Kick command */
+ 	__cls_cmd_start(CLS_CMD_IF_UPDATE);
+ 
+-	if (unlikely(!__cls_cmd_is_done()))
++	if (unlikely(!__cls_cmd_is_done())) {
++		__cls_cmd_unlock();
+ 		return -ETIME;
++	}
++	__cls_cmd_unlock();
+ 
+ 	pr_debug("CMD done successfully\n");
+ 
+@@ -811,7 +831,7 @@ s32 cls_session_del(u32 id, u32 fv_sz, struct pp_hash *hash)
+ 	}
+ 
+ 	db->cls_cmd_status = 0;
+-
++	__cls_cmd_lock();
+ 	/* prepare the cuckoo item */
+ 	session.key = (void *)CLS_FV_ADDR((unsigned long)(db->si_base_virt),
+ 					  id, fv_sz);
+@@ -823,8 +843,10 @@ s32 cls_session_del(u32 id, u32 fv_sz, struct pp_hash *hash)
+ 	ret = cuckoo_hash_remove(db->cuckoo, &session);
+ 	if (ret) {
+ 		pr_err("failed to del the session from cuckoo hash, %u\n", id);
++		__cls_cmd_unlock();
+ 		return ret;
+ 	}
++	__cls_cmd_unlock();
+ 
+ 	return db->cls_cmd_status;
+ }
+@@ -909,17 +931,17 @@ static void __cls_add_cmd_send(const struct cuckoo_hash_action *event)
+ 
+ 	pr_debug("CLS CMD add session\n");
+ 
+-	if (unlikely(!__cls_is_cmd_fifo_ready(CLS_ADD_CMD_SZ))) {
+-		db->cls_cmd_status = -ENOMEM;
+-		return;
+-	}
+-
+ 	ret = pp_si_fld_get((void *)db->cls_si_req, SI_FLD_DST_QUEUE, &dst_q);
+ 	if (unlikely(ret)) {
+ 		db->cls_cmd_status = ret;
+ 		return;
+ 	}
+ 
++	if (unlikely(!__cls_is_cmd_fifo_ready(CLS_ADD_CMD_SZ))) {
++		db->cls_cmd_status = -ENOMEM;
++		return;
++	}
++
+ 	/* Write the hash results */
+ 	__cls_cmd_hash_wr(event->item.h1, event->item.h2, event->item.sig);
+ 
+@@ -996,6 +1018,7 @@ s32 cls_session_update(u32 id, u32 fv_sz, struct pp_hash *hash,
+ 		return -EINVAL;
+ 	}
+ 
++	__cls_cmd_lock();
+ 	event.type = ITEM_ADDED;
+ 	event.item.key_len = fv_sz;
+ 	event.item.value = (void *)(unsigned long)id;
+@@ -1009,6 +1032,7 @@ s32 cls_session_update(u32 id, u32 fv_sz, struct pp_hash *hash,
+ 	event.old_slot = slot_idx;
+ 
+ 	__cls_add_cmd_send(&event);
++	__cls_cmd_unlock();
+ 
+ 	return db->cls_cmd_status;
+ }
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 3ced16b4b9c5..e8951ac32b20 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -681,7 +681,6 @@ s32 uc_ccu_maxcpus_get(bool uc_is_egr, u8 *max_cpus)
+ 	if (unlikely(ptr_is_null(max_cpus)))
+ 		return -EINVAL;
+ 
+-	/* read ccu gpreg */
+ 	if (pp_silicon_step_get() == PP_SSTEP_A) {
+ 		if (uc_is_egr)
+ 			reg = PP_REG_RD32(UC_A_CCU_MAXCPU_REG(EGRESS));
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.h b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+index 4cfdea10e759..7b6628d05d28 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+@@ -229,6 +229,24 @@ bool uc_is_cpu_active(bool uc_is_egr, u32 cid);
+  */
+ bool uc_is_cluster_valid(bool uc_is_egr);
+ 
++/**
++ * @brief get ccu GP register value
++ * @param uc_is_egr select the uc cluster
++ * @param idx gp register index
++ * @param gpreg gp register value
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_ccu_gpreg_get(bool uc_is_egr, u32 idx, u32 *gpreg);
++
++/**
++ * @brief set ccu GP register value
++ * @param uc_is_egr select the uc cluster
++ * @param idx gp register index
++ * @param gpreg gp register value
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_ccu_gpreg_set(bool uc_is_egr, u32 idx, u32 gpreg_val);
++
+ /**
+  * @brief Resets the uc statistics
+  */
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index a6ca24ac1727..22452b9f9aca 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -13,15 +13,23 @@
+  * the version here
+  */
+ #define EGRESS_VER_MAJOR  1
+-#define EGRESS_VER_MINOR  13
++#define EGRESS_VER_MINOR  14
+ 
+ #define INGRESS_VER_MAJOR 1
+ #define INGRESS_VER_MINOR 2
++
+ /**
+  * @define CMD_DONE_REG_IDX
+- * @brief GP register index for the mailbox command done signal
++ * @brief CCU GP register index for the mailbox command done
++ *        signal
+  */
+ #define CMD_DONE_REG_IDX  2
++/**
++ * @define CLS_LOCK_REG_IDX
++ * @brief CCU GP register index for A step classifier interface
++ *        lock
++ */
++#define CLS_LOCK_REG_IDX  7
+ 
+ /**
+  * @enum uc_mbox_cmd_type
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+index 579ebee837b3..a4f928b0c167 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+@@ -181,24 +181,6 @@ void uc_ccu_enable_set(bool uc_is_egr, u32 cid, bool enable);
+  */
+ s32 uc_ccu_irr_get(bool uc_is_egr, u32 *irr_bitmap);
+ 
+-/**
+- * @brief get ccu GP register value
+- * @param uc_is_egr select the uc cluster
+- * @param idx gp register index
+- * @param gpreg gp register value
+- * @return s32 0 on success, error code otherwise
+- */
+-s32 uc_ccu_gpreg_get(bool uc_is_egr, u32 idx, u32 *gpreg);
+-
+-/**
+- * @brief set ccu GP register value
+- * @param uc_is_egr select the uc cluster
+- * @param idx gp register index
+- * @param gpreg gp register value
+- * @return s32 0 on success, error code otherwise
+- */
+-s32 uc_ccu_gpreg_set(bool uc_is_egr, u32 idx, u32 gpreg_val);
+-
+ /**
+  * @brief get the maximum supported cpus in cluster
+  * @param uc_is_egr select the uc cluster

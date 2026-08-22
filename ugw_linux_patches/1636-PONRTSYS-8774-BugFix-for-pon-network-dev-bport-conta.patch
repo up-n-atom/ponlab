@@ -1,0 +1,566 @@
+From 21dd659d7b40cc1daafb6765d671e13900fab651 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Mon, 5 Apr 2021 13:38:12 +0800
+Subject: [PATCH] PONRTSYS-8774: BugFix for pon network dev bport contain all
+ other pmapper bports
+
+---
+ drivers/net/datapath/dpm/datapath_swdev.c          |   3 +-
+ drivers/net/datapath/dpm/gswip31/datapath_rx.c     |   3 +
+ .../net/datapath/dpm/gswip31/datapath_switchdev.c  | 378 +++++++++++----------
+ .../net/datapath/dpm/gswip31/datapath_switchdev.h  |   2 +-
+ include/net/datapath_inst.h                        |   4 +-
+ 5 files changed, 202 insertions(+), 188 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index 135b19bbb616..934860f1eb3d 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -306,8 +306,7 @@ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+ 		goto EXIT;
+ 
+ 	ret = i_info->swdev_bridge_port_cfg_reset(br_info, br_item->inst,
+-						  br_item->bportid,
+-						  p_info->bp_hairpin_cap);
++						  br_item->bportid);
+ 	if (ret == DEL_BRENTRY) {
+ 		i_info->swdev_free_brcfg(br_item->inst, br_item->fid);
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_rx.c b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+index e861012420e3..897866a10ef2 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_rx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+@@ -35,6 +35,9 @@ static void rx_dbg_hdr(char *parser, int parser_len, struct pmac_rx_hdr *pmac,
+ {
+ 	struct inst_info *dp_info = get_dp_prop_info(0);
+ 
++	if (!(dp_dbg_flag & DP_DBG_FLAG_DUMP_RX))
++		return;
++
+ 	if (!printk_ratelimit())
+ 		return;
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+index 77712ea7fb54..5dcb5b3f9658 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+@@ -41,70 +41,119 @@ int dp_swdev_get_dp_port_from_bp(struct br_info *br_item, int bport,
+ 	return DP_FAILURE;
+ }
+ 
+-int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
+-				 int inst, int bport)
++/* bport     - Bridge member port in the bport list
++ * cfg_bport - Bridge port to be configured to cur_bport port map
++ * cur_bport - Bport which is getting configured, only for debug
++ * isolate   - 1 - isolate feature is set, otherwise 0
++ * priv_flag - bp dev priv flags (like IFF_NO_QUEUE)
++ * loop_dis  - If set do not add this dp port's bp into other bp's member
++ *			   port map
++ * bport_cfg - Gswip structure for the currently configured bridge port
++ * reset	 - 1 means bridge config reset, otherwise setting
++ */
++static
++void dp_cfg_br_portmap(struct bridge_member_port *bport,
++		       int cfg_bport, int cur_bport, bool isolate, u32 priv_flag,
++		       u16 loop_dis, int dp_port, GSW_BRIDGE_portConfig_t *bport_cfg,
++		       int reset)
++{
++	if (reset || isolate) {
++		DP_DEBUG(DP_DBG_FLAG_SWDEV,
++			 "%s: UnSet BP=%d to BP=%d\n", __func__, cfg_bport, cur_bport);
++		UNSET_BP_MAP(bport_cfg->nBridgePortMap, cfg_bport);
++
++		return;
++	}
++
++	/* if member to be added for current bp,
++	 * share same dp_port with no loop set or with IFF_NO_QUEUE set
++	 * then don't add the member to its portmap
++	 */
++	if ((priv_flag & IFF_NO_QUEUE) ||
++	    (loop_dis && bport->dp_port == dp_port)) {
++		DP_DEBUG(DP_DBG_FLAG_SWDEV,
++			 "%s: UnSet BP=%d to BP=%d\n", __func__, cfg_bport, cur_bport);
++		UNSET_BP_MAP(bport_cfg->nBridgePortMap, cfg_bport);
++	} else {
++		DP_DEBUG(DP_DBG_FLAG_SWDEV,
++			 "%s: Set BP=%d to BP=%d\n", __func__, cfg_bport, cur_bport);
++		SET_BP_MAP(bport_cfg->nBridgePortMap, cfg_bport);
++	}
++
++	return;
++}
++
++/* Go through all other bridge ports in list other than cur bridge port,
++ * Reset=0
++ *     Unset all other bridge ports from the current bridge port if loop_dis=1
++ *     Set all other bridge ports to the current bridge port if loop_dis=0
++ *     if hairpin=1
++ *			set current bridge port to the current bridge port portmap
++ * Reset=1
++ *     Unset all other bridge ports from the current bridge port
++ *     if hairpin=1,
++ *			unset current bridge port from the crrent bridge port portmap
++ */
++static
++int dp_cfg_own_bridgeport(struct br_info *br_item, int inst, int bport,
++			  int reset)
+ {
+ 	struct bridge_member_port *bport_list = NULL;
+ 	GSW_BRIDGE_portConfig_t brportcfg = {0};
+ 	struct core_ops *gsw_ops;
+ 	struct brdgport_ops *gsw_bp;
+-	int dport;
++	int dp_port = -1;
+ 	u32 priv_flag = 0;
+ 	struct pmac_port_info *p_info;
+ 
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
++
+ 	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
+ 
++	/* In reset case, entry is already removed from bridge port list */
++	if (!reset) {
++		dp_port = dp_swdev_get_dp_port_from_bp(br_item, bport, &priv_flag);
++		if (dp_port < 0) {
++			pr_err("%s portid:%d for bport=%d invalid\n", __func__, dp_port);
++			return DP_FAILURE;
++		}
++	}
++
+ 	gsw_ops = dp_port_prop[inst].ops[GSWIP_R];
+ 	gsw_bp = &gsw_ops->gsw_brdgport_ops;
++
+ 	/* To set other bridge port members to the current bport */
+ 	brportcfg.nBridgePortId = bport;
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "Set current BP=%d inst:%d\n",
+-		 brportcfg.nBridgePortId, inst);
+ 	brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+ 	if (gsw_bp->BridgePort_ConfigGet(gsw_ops, &brportcfg)) {
+-		pr_err("%s fail in getting bridge port config\r\n", __func__);
++		DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s: BridgePort_ConfigGet fail:bp=%d\n",
++			 __func__, bport);
+ 		return DP_FAILURE;
+ 	}
+-	dport = dp_swdev_get_dp_port_from_bp(br_item, bport, &priv_flag);
+-	if (dport < 0) {
+-		pr_err("%s portid:%d invalid\n", __func__, dport);
+-		return DP_FAILURE;
++
++	if (p_info->bp_hairpin_cap) {
++		if (reset)
++			UNSET_BP_MAP(brportcfg.nBridgePortMap, bport);
++		else
++			SET_BP_MAP(brportcfg.nBridgePortMap, bport);
++
++		DP_DEBUG(DP_DBG_FLAG_SWDEV,
++			 "%s: Hairpin %s BP=%d to BP=%d\n", __func__, reset ? "Unset" : "Set",
++			 bport, bport);
+ 	}
++
+ 	list_for_each_entry(bport_list, &br_item->bp_list, list) {
+-		if (bport_list->bportid != bport) {
+-			/* if member to be added for current bp,
+-			 * share same dp_port with no loop set or
+-			 * with IFF_NO_QUEUE set
+-			 * adding brige port,
+-			 * then don't add the member to its portmap
+-			 */
+-			if ((bport_list->dev_priv_flag & IFF_NO_QUEUE) ||
+-			    (p_info->loop_dis &&
+-			     bport_list->dp_port == dport)) {
+-				DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s%d to %d%s",
+-					 "IFF_NO_QUEUE set Don't add BP=",
+-					 bport_list->bportid, bport,
+-					 " bp map\n");
+-				UNSET_BP_MAP(brportcfg.nBridgePortMap,
+-					     bport_list->bportid);
+-				continue;
+-			}
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s%d to %d%s",
+-				 "add BP=", bport_list->bportid, bport,
+-				 " bp map\n");
+-			SET_BP_MAP(brportcfg.nBridgePortMap,
+-				   bport_list->bportid);
+-		} else if (bport_list->bportid == bport) {
+-			if (p_info->bp_hairpin_cap) {
+-				SET_BP_MAP(brportcfg.nBridgePortMap,
+-					   bport);
+-				DP_DEBUG(DP_DBG_FLAG_SWDEV, "set SPL BP:%d\n",
+-					 bport);
+-			}
+-		}
++		if (bport_list->bportid == bport)
++			continue;
++		dp_cfg_br_portmap(bport_list, bport_list->bportid, bport, 0,
++				  bport_list->dev_priv_flag, p_info->loop_dis, dp_port,
++				  &brportcfg, reset);
+ 	}
+-	brportcfg.nBridgeId = br_item->fid;
+-	brportcfg.nBridgePortId = bport;
++
++	if (reset)
++		brportcfg.nBridgeId = CPU_FID; /* reset of FID */
++	else
++		brportcfg.nBridgeId = br_item->fid;
+ 	brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_ID |
+ 			  GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP |
+ 			  GSW_BRIDGE_PORT_CONFIG_MASK_MAC_LEARNING_LIMIT;
+@@ -115,48 +164,71 @@ int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
+ 	brportcfg.nMacLearningLimit = GSWIP_LEARN_LIMIT_PORT_MAX;
+ 	brportcfg.bMacLearningLimitEnable = 1;
+ 	if (gsw_bp->BridgePort_ConfigSet(gsw_ops, &brportcfg)) {
+-		pr_err("%s Fail in allocating/configuring bridge port\n",
+-		       __func__);
++		pr_err("%s Fail in allocating/configuring bridge port\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+-	/* To set other member portmap with current bridge port map */
++
++	return DP_SUCCESS;
++}
++
++/* Go through all other bridge ports in list other than cur bridge port,
++ * Reset=0
++ *     Unset currrent bridge port from all other bridge port if loop_dis=1
++ *     Set currrent bridge port from all other bridge port if loop_dis=0
++ *	   if isolate=1
++ *			Unset current bridge port from all other bridge ports if isolate=1
++ * Reset=1
++ *     Unset current bridge port from all other bridge ports in list
++ */
++static
++int dp_cfg_other_bridgeport(struct br_info *br_item, int inst,
++			    int bport, bool isolate, int reset)
++{
++	struct bridge_member_port *bport_list = NULL;
++	GSW_BRIDGE_portConfig_t brportcfg = {0};
++	struct core_ops *gsw_ops;
++	struct brdgport_ops *gsw_bp;
++	int dp_port = -1;
++	u32 priv_flag = 0;
++	struct pmac_port_info *p_info;
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
++
++	p_info = get_dp_port_info(br_item->inst, br_item->dp_port);
++
++	/* In reset case, entry is already removed from bridge port list */
++	if (!reset) {
++		dp_port = dp_swdev_get_dp_port_from_bp(br_item, bport, &priv_flag);
++		if (dp_port < 0) {
++			pr_err("%s portid:%d for bport=%d invalid\n", __func__, dp_port);
++			return DP_FAILURE;
++		}
++	}
++
++	gsw_ops = dp_port_prop[inst].ops[GSWIP_R];
++	gsw_bp = &gsw_ops->gsw_brdgport_ops;
++
++	/* To set other member portmap with current bridge port */
+ 	list_for_each_entry(bport_list, &br_item->bp_list, list) {
+ 		if (bport_list->bportid == bport)
+ 			continue;
++
+ 		memset(&brportcfg, 0, sizeof(GSW_BRIDGE_portConfig_t));
+ 		brportcfg.nBridgePortId = bport_list->bportid;
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "Set other BP=%d inst:%d\n",
+-			 brportcfg.nBridgePortId, inst);
+-		brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
++		brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_ID |
++				  GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+ 		if (gsw_bp->BridgePort_ConfigGet(gsw_ops, &brportcfg)) {
+-			pr_err("%s fail in getting br port config\r\n",
+-			       __func__);
++			pr_err("%s fail in getting br port config\r\n", __func__);
+ 			return DP_FAILURE;
+ 		}
+-		/* If netdevice have Flag IFF_NO_QUEUE or
+-		 * share same dp_port,
+-		 * with no_loop set between bridge port's
+-		 * then dont add the interface to gswip bridge portmap
+-		 */
+-		if ((priv_flag & IFF_NO_QUEUE) ||
+-		    (p_info->loop_dis &&
+-		     bport_list->dp_port == dport)) {
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-				 "%s %d to %d %s",
+-				 "IFF_NO_QUEUE/no_loop Don't add BP",
+-				 bport, bport_list->bportid,
+-				 "bp map\n");
+-			UNSET_BP_MAP(brportcfg.nBridgePortMap,
+-				     bport);
+-		} else {
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-				 "set %d to %d %s",
+-				 bport, bport_list->bportid,
+-				 "bp pmap\n");
+-			SET_BP_MAP(brportcfg.nBridgePortMap, bport);
+-		}
+-		brportcfg.nBridgeId = br_item->fid;
+-		brportcfg.nBridgePortId = bport_list->bportid;
++
++		dp_cfg_br_portmap(bport_list, bport, bport_list->bportid, isolate,
++				  priv_flag, p_info->loop_dis, dp_port, &brportcfg, reset);
++
++		if (reset)
++			brportcfg.nBridgeId = CPU_FID; /* reset of FID */
++		else
++			brportcfg.nBridgeId = br_item->fid;
+ 		brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_ID |
+ 				  GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+ 		if (gsw_bp->BridgePort_ConfigSet(gsw_ops, &brportcfg)) {
+@@ -168,89 +240,55 @@ int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
+ 	return DP_SUCCESS;
+ }
+ 
+-int dp_swdev_bridge_port_cfg_reset(struct br_info *br_item,
+-				   int inst, int bport, u16 hairpin)
++int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
++				 int inst, int bport)
+ {
+-	GSW_BRIDGE_portConfig_t brportcfg = {0};
+-	struct bridge_member_port *bport_list = NULL;
+-	int cnt = 0;
+-	struct core_ops *gsw_ops;
+-	struct brdgport_ops *gsw_bp;
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
+ 
+-	gsw_ops = dp_port_prop[inst].ops[GSWIP_R];
+-	gsw_bp = &gsw_ops->gsw_brdgport_ops;
+-	brportcfg.nBridgePortId = bport;
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "Reset BP=%d inst:%d\n",
+-		 brportcfg.nBridgePortId, inst);
+-	brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+-	/* Reset other members from current bport map */
+-	if (gsw_bp->BridgePort_ConfigGet(gsw_ops, &brportcfg)) {
+-		/* Note: here may fail if this device is not removed from
+-		 * linux bridge via brctl delif but user try to un-regiser
+-		 * from DP. The correct flow to unregister is like below:
+-		 *  1) brctl delif xxx xxxx: remove this device from bridge
+-		 *  2) dp_register_subif_ext: to un-register device from DP
+-		 * Anyway, it will also work if not follow this propsal.
+-		 * The only side effect is this API call fail since GSWIP
+-		 * bridge port is already freed during subif_hw_reset before
+-		 * this API call
+-		 */
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "GSW_BRIDGE_portConfig_t fail:bp=%d\n", bport);
++	/* To set other bridge port members to the current bport */
++	if (dp_cfg_own_bridgeport(br_item, inst, bport, 0)) {
++		pr_err("%s fail in dp_cfg_own_bridge\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+ 
+-	if (hairpin) {
+-		UNSET_BP_MAP(brportcfg.nBridgePortMap, bport);
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "reset spl BP %d\n", bport);
++	/* To set other member portmap with current bridge port map */
++	if (dp_cfg_other_bridgeport(br_item, inst, bport, 0, 0)) {
++		pr_err("%s fail in dp_cfg_other_bridge\n", __func__);
++		return DP_FAILURE;
+ 	}
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s success\n", __func__);
++
++	return DP_SUCCESS;
++}
++
++int dp_swdev_bridge_port_cfg_reset(struct br_info *br_item,
++				   int inst, int bport)
++{
++	struct bridge_member_port *bport_list = NULL;
++	int cnt = 0;
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
++
+ 	list_for_each_entry(bport_list, &br_item->bp_list, list) {
+ 		if (bport_list->bportid)
+ 			cnt++;
+-		if (bport_list->bportid != bport) {
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-				 "reset BP %d from current BP=%d inst:%d\n",
+-				 bport_list->bportid,
+-				 brportcfg.nBridgePortId, inst);
+-			UNSET_BP_MAP(brportcfg.nBridgePortMap,
+-				     bport_list->bportid);
+-		}
+ 	}
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "cnt:%d\n", cnt);
+-	brportcfg.nBridgeId = CPU_FID; /* reset of FID */
+-	brportcfg.nBridgePortId = bport;
+-	brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_ID |
+-			  GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+-	if (gsw_bp->BridgePort_ConfigSet(gsw_ops, &brportcfg)) {
+-		pr_err("%s Fail in configuring GSW_BRIDGE_portConfig_t\r\n",
+-		       __func__);
++
++	/* Unset all other bridge ports from the current bridge port portmap*/
++	if (dp_cfg_own_bridgeport(br_item, inst, bport, 1)) {
++		pr_err("%s fail in dp_cfg_own_bridge\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+-	/* Reset current bp from all other bridge port's port map */
+-	list_for_each_entry(bport_list, &br_item->bp_list, list) {
+-		if (bport_list->bportid == bport)
+-			continue;
+-		memset(&brportcfg, 0, sizeof(GSW_BRIDGE_portConfig_t));
+-		brportcfg.nBridgePortId = bport_list->bportid;
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-			 "reset current BP(%d) from other BP=%d inst:%d\n",
+-			 bport, brportcfg.nBridgePortId, inst);
+-		brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP |
+-				  GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_ID;
+-		if (gsw_bp->BridgePort_ConfigGet(gsw_ops, &brportcfg)) {
+-			pr_err("%s br port cfg get fail\r\n", __func__);
+-			return DP_FAILURE;
+-		}
+-		UNSET_BP_MAP(brportcfg.nBridgePortMap, bport);
+-		brportcfg.nBridgePortId = bport_list->bportid;
+-		brportcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_ID |
+-				  GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+-		if (gsw_bp->BridgePort_ConfigSet(gsw_ops, &brportcfg)) {
+-			pr_err("%s Fail alloc/cfg br port\n", __func__);
+-			return DP_FAILURE;
+-		}
++
++	/* Unset current bridge port from all other bridge ports portmap */
++	if (dp_cfg_other_bridgeport(br_item, inst, bport, 0, 1)) {
++		pr_err("%s fail in dp_cfg_other_bridge\n", __func__);
++		return DP_FAILURE;
+ 	}
++
+ 	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s success\n", __func__);
++
+ 	/* Remove bridge entry if no member in port map of
+ 	 * current bport except CPU port
+ 	 */
+@@ -273,14 +311,12 @@ int dp_swdev_bridge_cfg_set(int inst, u16 fid)
+ 	brcfg.eForwardUnknownMulticastNonIp = GSW_BRIDGE_FORWARD_FLOOD;
+ 	brcfg.eForwardUnknownUnicast = GSW_BRIDGE_FORWARD_FLOOD;
+ 	if (gsw_ops->gsw_brdg_ops.Bridge_ConfigSet(gsw_ops, &brcfg)) {
+-		pr_err("%s Fail to set bridge id(%d)\n",
+-		       __func__, brcfg.nBridgeId);
++		pr_err("%s Fail to set bridge id(%d)\n", __func__, brcfg.nBridgeId);
+ 		br.nBridgeId = fid;
+ 		gsw_ops->gsw_brdg_ops.Bridge_Free(gsw_ops, &br);
+ 		return DP_FAILURE;
+ 	}
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "FID(%d) cfg success for inst %d\n",
+-		 fid, inst);
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "FID(%d) cfg success for inst %d\n", fid, inst);
+ 
+ 	return DP_SUCCESS;
+ }
+@@ -291,6 +327,8 @@ static int dp_swdev_bp_hairpin_set(int bport, GSW_BRIDGE_portConfig_t *bpcfg,
+ {
+ 	struct bridge_member_port *bport_list = NULL;
+ 
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
++
+ 	/* add current BP into its own bridge port map to receive its
+ 	 * own traffic back
+ 	 */
+@@ -314,41 +352,14 @@ static int dp_swdev_bp_hairpin_set(int bport, GSW_BRIDGE_portConfig_t *bpcfg,
+ static int dp_swdev_bp_isolate_set(int inst, int bport, struct br_info *br_item,
+ 				   bool isolate)
+ {
+-	struct bridge_member_port *bport_list = NULL;
+-	struct core_ops *gsw_ops;
+-	struct brdgport_ops *gsw_bp;
+-	GSW_BRIDGE_portConfig_t bpcfg = {0};
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
+ 
+-	gsw_ops = dp_port_prop[inst].ops[GSWIP_R];
+-	gsw_bp = &gsw_ops->gsw_brdgport_ops;
+-
+-	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s: config isolation for BP=%d\n",
+-		 __func__, bport);
+-	/* Remove current bp from all other bridge port's port map
++	/* if isolate=1, Remove current bp from all other bridge port's port map
+ 	 * to isolate them from bridging
+ 	 */
+-	list_for_each_entry(bport_list, &br_item->bp_list, list) {
+-		if (bport_list->bportid == bport)
+-			continue;
+-		bpcfg.nBridgePortId = bport_list->bportid;
+-		bpcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+-		if (gsw_bp->BridgePort_ConfigGet(gsw_ops, &bpcfg)) {
+-			pr_err("%s: bridge port config get failed\n", __func__);
+-			return DP_FAILURE;
+-		}
+-		if (isolate)
+-			UNSET_BP_MAP(bpcfg.nBridgePortMap, bport);
+-		else
+-			SET_BP_MAP(bpcfg.nBridgePortMap, bport);
+-
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s:%s isolation for BP:%d\n",
+-			 __func__, isolate ? "Set" : "Reset",
+-			 bport_list->bportid);
+-
+-		if (gsw_bp->BridgePort_ConfigSet(gsw_ops, &bpcfg)) {
+-			pr_err("%s: config bridge port set failed\n", __func__);
+-			return DP_FAILURE;
+-		}
++	if (dp_cfg_other_bridgeport(br_item, inst, bport, isolate, 0)) {
++		pr_err("%s fail in dp_cfg_other_bridge\n", __func__);
++		return DP_FAILURE;
+ 	}
+ 
+ 	return DP_SUCCESS;
+@@ -362,12 +373,14 @@ int dp_swdev_bridge_port_flags_set(struct br_info *br_item, int inst, int bport,
+ 	struct brdgport_ops *gsw_bp;
+ 	unsigned long learning;
+ 
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s\n", __func__);
++
+ 	gsw_ops = dp_port_prop[inst].ops[GSWIP_R];
+ 	gsw_bp = &gsw_ops->gsw_brdgport_ops;
+ 
+ 	bpcfg.nBridgePortId = bport;
+ 	bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MC_SRC_MAC_LEARNING |
+-			GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
++		       GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+ 	if (gsw_bp->BridgePort_ConfigGet(gsw_ops, &bpcfg)) {
+ 		pr_err("%s: bridge port config get failed\r\n", __func__);
+ 		return DP_FAILURE;
+@@ -470,8 +483,7 @@ int dp_swdev_free_brcfg(int inst, u16 fid)
+ 	gsw_ops = dp_port_prop[inst].ops[GSWIP_R];
+ 	br.nBridgeId = fid;
+ 	if (gsw_ops->gsw_brdg_ops.Bridge_Free(gsw_ops, &br)) {
+-		pr_err("%s Fail to free bridge id(%d)\n",
+-		       __func__, br.nBridgeId);
++		pr_err("%s Fail to free bridge id(%d)\n", __func__, br.nBridgeId);
+ 		return DP_FAILURE;
+ 	}
+ 	DP_DEBUG(DP_DBG_FLAG_SWDEV, "FID(%d) freed for inst:%d\n", fid, inst);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
+index 70270d037eac..23a5f62ae160 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
+@@ -10,7 +10,7 @@ int dp_swdev_alloc_bridge_id(int inst);
+ int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
+ 				 int inst, int bport);
+ int dp_swdev_bridge_port_cfg_reset(struct br_info *br_item,
+-				   int inst, int bport, u16 hairpin);
++				   int inst, int bport);
+ int dp_swdev_bridge_cfg_set(int inst, u16 fid);
+ int dp_swdev_free_brcfg(int inst, u16 fid);
+ int dp_gswip_ext_vlan(int inst, int vap, int ep);
+diff --git a/include/net/datapath_inst.h b/include/net/datapath_inst.h
+index e1d6ca6a56ef..542723e47489 100644
+--- a/include/net/datapath_inst.h
++++ b/include/net/datapath_inst.h
+@@ -149,9 +149,9 @@ struct inst_info {
+ 	int (*swdev_free_brcfg)(int inst, u16 fid);
+ 	int (*swdev_bridge_cfg_set)(int inst, u16 fid);
+ 	int (*swdev_bridge_port_cfg_set)(struct br_info *br_item, int inst,
+-					 int port);
++					 int bport);
+ 	int (*swdev_bridge_port_cfg_reset)(struct br_info *br_item,
+-					   int inst, int bport, u16 hairpin);
++					   int inst, int bport);
+ 	int (*swdev_bridge_port_flags_set)(struct br_info *br_info,
+ 					   int inst, int bport,
+ 					   unsigned long flags);

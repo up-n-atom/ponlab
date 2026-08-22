@@ -1,0 +1,344 @@
+From e11ce32740ee4691a19b8e340bc2af978673bd60 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Wed, 23 Dec 2020 13:06:20 +0800
+Subject: [PATCH] DRV_DPM_SW-419 - changes to support port isolation,hairpin
+ feature for bridge port in PRX
+
+---
+ drivers/net/datapath/dpm/datapath_swdev.c          | 68 ++++++++++++++-
+ drivers/net/datapath/dpm/datapath_swdev.h          |  2 +
+ .../net/datapath/dpm/gswip31/datapath_switchdev.c  | 99 ++++++++++++++++++++--
+ .../net/datapath/dpm/gswip31/datapath_switchdev.h  |  3 +-
+ include/net/datapath_inst.h                        |  3 +-
+ net/switchdev/switchdev.c                          | 11 ++-
+ 6 files changed, 172 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index 45427bd6e33d..9de28ea29659 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -851,12 +851,35 @@ int dp_del_br_if(struct net_device *dev, struct net_device *br_dev,
+ 			DP_SWDEV_BRIDGE_ITEM);
+ }
+ 
++static void dp_set_bp_flags(unsigned long flags, struct bridge_member_port *bmp)
++{
++	if (flags & BR_HAIRPIN_MODE)
++		bmp->hairpin = 1;
++	else
++		bmp->hairpin = 0;
++
++	if (flags & BR_ISOLATED)
++		bmp->isolate = 1;
++	else
++		bmp->isolate = 0;
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s:BP=%d hairpin=%d isolate=%d\n",
++		 __func__, bmp->bportid, bmp->hairpin, bmp->isolate);
++}
++
+ static int dp_swdev_port_attr_bridge_flags_set(struct net_device *dev,
+ 					       unsigned long flags,
+ 					       struct switchdev_trans *trans)
+ {
+ 	struct inst_info *i_info;
+ 	dp_subif_t subif;
++	struct net_device *br_dev;
++	struct bridge_member_port *bmp;
++	struct br_info *br_info;
++
++	br_dev = netdev_master_upper_dev_get(dev);
++	if (!br_dev)
++		return -1;
+ 
+ 	if (switchdev_trans_ph_prepare(trans))
+ 		return DP_SUCCESS;
+@@ -868,11 +891,28 @@ static int dp_swdev_port_attr_bridge_flags_set(struct net_device *dev,
+ 		return -EINVAL;
+ 	}
+ 
++	DP_LIB_LOCK(&dp_lock);
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
++	if (br_info) {
++		list_for_each_entry(bmp, &br_info->bp_list, list) {
++			if (bmp->bportid == subif.bport) {
++				dp_set_bp_flags(flags, bmp);
++				break;
++			}
++		}
++	}
+ 	i_info = &dp_port_prop[subif.inst].info;
+-	if (i_info->swdev_bridge_port_flags_set)
+-		return i_info->swdev_bridge_port_flags_set(subif.inst,
+-						  subif.bport, flags);
+-
++	if (!i_info->swdev_bridge_port_flags_set)
++		goto EXIT;
++	if(i_info->swdev_bridge_port_flags_set(br_info, subif.inst, subif.bport,
++					       flags)) {
++		goto EXIT;
++	} else {
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_SUCCESS;
++	}
++EXIT:
++	DP_LIB_UNLOCK(&dp_lock);
+ 	return -EOPNOTSUPP;
+ }
+ 
+@@ -881,12 +921,32 @@ static int dp_swdev_port_attr_bridge_flags_get(struct net_device *dev,
+ {
+ 	struct inst_info *i_info;
+ 	dp_subif_t subif;
++	struct net_device *br_dev;
++	struct bridge_member_port *bmp;
++	struct br_info *br_info;
++
++	br_dev = netdev_master_upper_dev_get(dev);
++	if (!br_dev)
++		return -1;
+ 
+ 	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+ 		pr_err("%s get subif failed for %s\n", __func__, dev->name);
+ 		return -EINVAL;
+ 	}
+ 
++	rcu_read_lock();
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
++	if (br_info) {
++		list_for_each_entry(bmp, &br_info->bp_list, list) {
++			if (bmp->bportid == subif.bport) {
++				*flags |= bmp->hairpin ? BR_HAIRPIN_MODE : 0;
++				*flags |= bmp->isolate ? BR_ISOLATED : 0;
++				break;
++			}
++		}
++	}
++	rcu_read_unlock();
++
+ 	i_info = &dp_port_prop[subif.inst].info;
+ 	if (i_info->swdev_bridge_port_flags_get)
+ 		return i_info->swdev_bridge_port_flags_get(subif.inst,
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.h b/drivers/net/datapath/dpm/datapath_swdev.h
+index b61219fa283e..bffb98ca6432 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.h
++++ b/drivers/net/datapath/dpm/datapath_swdev.h
+@@ -60,6 +60,8 @@ struct bridge_member_port {
+ 	u16 bport[8];
+ 	u32 dev_priv_flag; /* to store bp dev priv flags (like IFF_NO_QUEUE) */
+ 	u32 dp_port;
++	bool isolate;
++	bool hairpin;
+ 	struct list_head bport_vlan_list; /* List pointing to the vlan entry */
+ };
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+index 67b16893e6cc..7201debfb146 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+@@ -299,7 +299,82 @@ int dp_swdev_bridge_cfg_set(int inst, u16 fid)
+ 	return 0;
+ }
+ 
+-int dp_swdev_bridge_port_flags_set(int inst, int bport, unsigned long flags)
++/* API to set bridge port hairpin mode */
++static int dp_swdev_bp_hairpin_set(int bport, GSW_BRIDGE_portConfig_t *bpcfg,
++				   struct br_info *br_item, bool hairpin)
++{
++	struct bridge_member_port *bport_list = NULL;
++
++	/* add current BP into its own bridge port map to receive its
++	 * own traffic back
++	 */
++	bpcfg->eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
++	list_for_each_entry(bport_list, &br_item->bp_list, list) {
++		if (bport_list->bportid != bport)
++			continue;
++		if (hairpin) {
++			DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s:set hairpin BP=%d\n",
++				 __func__, bport);
++			SET_BP_MAP(bpcfg->nBridgePortMap, bport);
++		} else {
++			DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s:unset hairpin BP=%d\n",
++				 __func__, bport);
++			UNSET_BP_MAP(bpcfg->nBridgePortMap, bport);
++		}
++	}
++	return 0;
++}
++
++/* API to configure bridge port isolation */
++static int dp_swdev_bp_isolate_set(int inst, int bport, struct br_info *br_item,
++				   bool isolate)
++{
++	GSW_return_t ret;
++	struct bridge_member_port *bport_list = NULL;
++	struct core_ops *gsw_handle;
++	struct brdgport_ops *gsw_bp;
++	GSW_BRIDGE_portConfig_t bpcfg = {0};
++
++	gsw_handle = dp_port_prop[inst].ops[0];
++	gsw_bp = &gsw_handle->gsw_brdgport_ops;
++
++	DP_DEBUG(DP_DBG_FLAG_SWDEV, "%s: config isolation for BP=%d\n",
++		 __func__, bport);
++	/* Remove current bp from all other bridge port's port map
++	 * to isolate them from bridging
++	 */
++	list_for_each_entry(bport_list, &br_item->bp_list, list) {
++		if (bport_list->bportid == bport)
++			continue;
++		bpcfg.nBridgePortId = bport_list->bportid;
++		bpcfg.eMask = GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
++		ret = gsw_bp->BridgePort_ConfigGet(gsw_handle, &bpcfg);
++		if (ret != GSW_statusOk) {
++			pr_err("%s: bridge port config get failed\n", __func__);
++			return -1;
++		}
++		if (isolate) {
++			DP_DEBUG(DP_DBG_FLAG_SWDEV,
++				 "%s:set isolation for BP:%d\n",
++				 __func__, bport_list->bportid);
++			UNSET_BP_MAP(bpcfg.nBridgePortMap, bport);
++		} else {
++			DP_DEBUG(DP_DBG_FLAG_SWDEV,
++				 "%s:reset isolation for BP:%d\n",
++				 __func__, bport_list->bportid);
++			SET_BP_MAP(bpcfg.nBridgePortMap, bport);
++		}
++		ret = gsw_bp->BridgePort_ConfigSet(gsw_handle, &bpcfg);
++		if (ret != GSW_statusOk) {
++			pr_err("%s: config bridge port set failed\n", __func__);
++			return -1;
++		}
++	}
++	return 0;
++}
++
++int dp_swdev_bridge_port_flags_set(struct br_info *br_item, int inst, int bport,
++				   unsigned long flags)
+ {
+ 	GSW_return_t ret;
+ 	GSW_BRIDGE_portConfig_t bpcfg = {0};
+@@ -311,10 +386,23 @@ int dp_swdev_bridge_port_flags_set(int inst, int bport, unsigned long flags)
+ 	gsw_bp = &gsw_handle->gsw_brdgport_ops;
+ 
+ 	bpcfg.nBridgePortId = bport;
+-	bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MC_SRC_MAC_LEARNING;
++	bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MC_SRC_MAC_LEARNING |
++			GSW_BRIDGE_PORT_CONFIG_MASK_BRIDGE_PORT_MAP;
+ 	ret = gsw_bp->BridgePort_ConfigGet(gsw_handle, &bpcfg);
+ 	if (ret != GSW_statusOk) {
+-		pr_err("%s: bridge port configi get failed\r\n", __func__);
++		pr_err("%s: bridge port config get failed\r\n", __func__);
++		return -1;
++	}
++
++	if (dp_swdev_bp_hairpin_set(bport, &bpcfg, br_item,
++				    (flags & BR_HAIRPIN_MODE))) {
++		pr_err("%s: bridge port hairpin cfg fail\n", __func__);
++		return -1;
++	}
++
++	if (dp_swdev_bp_isolate_set(inst, bport, br_item,
++				    (flags & BR_ISOLATED))) {
++		pr_err("%s: bridge port isolation cfg fail\n", __func__);
+ 		return -1;
+ 	}
+ 
+@@ -323,14 +411,13 @@ int dp_swdev_bridge_port_flags_set(int inst, int bport, unsigned long flags)
+ 		bpcfg.bSrcMacLearningDisable = !bpcfg.bSrcMacLearningDisable;
+ 		bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MC_SRC_MAC_LEARNING;
+ 	}
+-
+ 	ret = gsw_bp->BridgePort_ConfigSet(gsw_handle, &bpcfg);
+ 	if (ret != GSW_statusOk) {
+ 		pr_err("%s: config bridge port failed\r\n", __func__);
+ 		return -1;
+ 	}
+ 
+-	return ret;
++	return 0;
+ }
+ 
+ int dp_swdev_bridge_port_flags_get(int inst, int bport, unsigned long *flags)
+@@ -347,7 +434,7 @@ int dp_swdev_bridge_port_flags_get(int inst, int bport, unsigned long *flags)
+ 	bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MC_SRC_MAC_LEARNING;
+ 	ret = gsw_bp->BridgePort_ConfigGet(gsw_handle, &bpcfg);
+ 	if (ret != GSW_statusOk) {
+-		pr_err("%s: bridge port configi get failed\r\n", __func__);
++		pr_err("%s: bridge port config get failed\r\n", __func__);
+ 		return -1;
+ 	}
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
+index 77b9241e816f..f1279616f091 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
+@@ -14,7 +14,8 @@ int dp_swdev_bridge_port_cfg_reset(struct br_info *br_item,
+ int dp_swdev_bridge_cfg_set(int inst, u16 fid);
+ int dp_swdev_free_brcfg(int inst, u16 fid);
+ int dp_gswip_ext_vlan(int inst, int vap, int ep);
+-int dp_swdev_bridge_port_flags_set(int inst, int bport, unsigned long flags);
++int dp_swdev_bridge_port_flags_set(struct br_info *br_item, int inst, int bport,
++				   unsigned long flags);
+ int dp_swdev_bridge_port_flags_get(int inst, int bport, unsigned long *flags);
+ int dp_swdev_port_learning_limit_set(int inst, int bport, int learning_limit);
+ #endif
+diff --git a/include/net/datapath_inst.h b/include/net/datapath_inst.h
+index d639b6668a93..76c32928c035 100644
+--- a/include/net/datapath_inst.h
++++ b/include/net/datapath_inst.h
+@@ -153,7 +153,8 @@ struct inst_info {
+ 					 int port);
+ 	int (*swdev_bridge_port_cfg_reset)(struct br_info *br_item,
+ 					   int inst, int bport, u16 hairpin);
+-	int (*swdev_bridge_port_flags_set)(int inst, int bport,
++	int (*swdev_bridge_port_flags_set)(struct br_info *br_info,
++					   int inst, int bport,
+ 					   unsigned long flags);
+ 	int (*swdev_bridge_port_flags_get)(int inst, int bport,
+ 					   unsigned long *flags);
+diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
+index 3b95fe980fa2..78b92da51c6b 100644
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -768,7 +768,8 @@ int switchdev_port_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
+ 		.id = SWITCHDEV_ATTR_ID_PORT_BRIDGE_FLAGS,
+ 	};
+ 	u16 mode = BRIDGE_MODE_UNDEF;
+-	u32 mask = BR_LEARNING | BR_LEARNING_SYNC | BR_FLOOD;
++	u32 mask = BR_LEARNING | BR_LEARNING_SYNC | BR_FLOOD | BR_HAIRPIN_MODE |
++		BR_ISOLATED;
+ 	int err;
+ 
+ 	if (!netif_is_bridge_port(dev))
+@@ -819,6 +820,7 @@ switchdev_port_bridge_policy[IFLA_BRPORT_MAX + 1] = {
+ 	[IFLA_BRPORT_LEARNING]		= { .type = NLA_U8 },
+ 	[IFLA_BRPORT_LEARNING_SYNC]	= { .type = NLA_U8 },
+ 	[IFLA_BRPORT_UNICAST_FLOOD]	= { .type = NLA_U8 },
++	[IFLA_BRPORT_ISOLATED]		= { .type = NLA_U8 },
+ };
+ 
+ static int switchdev_port_br_setlink_protinfo(struct net_device *dev,
+@@ -832,7 +834,6 @@ static int switchdev_port_br_setlink_protinfo(struct net_device *dev,
+ 				  switchdev_port_bridge_policy);
+ 	if (err)
+ 		return err;
+-
+ 	nla_for_each_nested(attr, protinfo, rem) {
+ 		switch (nla_type(attr)) {
+ 		case IFLA_BRPORT_LEARNING:
+@@ -846,6 +847,12 @@ static int switchdev_port_br_setlink_protinfo(struct net_device *dev,
+ 		case IFLA_BRPORT_UNICAST_FLOOD:
+ 			err = switchdev_port_br_setflag(dev, attr, BR_FLOOD);
+ 			break;
++		case IFLA_BRPORT_MODE:
++			err = switchdev_port_br_setflag(dev, attr, BR_HAIRPIN_MODE);
++			break;
++		case IFLA_BRPORT_ISOLATED:
++			err = switchdev_port_br_setflag(dev, attr, BR_ISOLATED);
++			break;
+ 		default:
+ 			err = -EOPNOTSUPP;
+ 			break;

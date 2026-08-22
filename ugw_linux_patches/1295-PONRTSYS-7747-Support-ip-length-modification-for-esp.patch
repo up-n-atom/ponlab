@@ -1,0 +1,803 @@
+From 7ac375ea249c542792c15b9521b2c799517f2169 Mon Sep 17 00:00:00 2001
+From: Elad Fernandes <elad.fernandes@intel.com>
+Date: Sun, 19 Apr 2020 14:54:20 +0300
+Subject: [PATCH] PONRTSYS-7747: Support ip length modification for esp bypass
+ sessions
+
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 164 +++++++----
+ .../pp-session-mgr/pp_session_mgr_internal.h       |  34 ++-
+ drivers/net/ppv4/pp-hal/modifier/modifier.h        |  12 +-
+ .../net/ppv4/pp-hal/modifier/modifier_recipes.c    | 302 ++++++++++++++-------
+ 4 files changed, 333 insertions(+), 179 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 119319929d04..d633447745fd 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -466,7 +466,8 @@ static inline bool __smgr_is_iptun_decp_sess(struct sess_info *s)
+ static inline bool __smgr_is_iptun_encp_sess(struct sess_info *s)
+ {
+ 	return (!PKTPRS_IS_MULTI_IP(SESS_RX_PKT(s)) &&
+-		PKTPRS_IS_MULTI_IP(SESS_TX_PKT(s)));
++		PKTPRS_IS_MULTI_IP(SESS_TX_PKT(s)) &&
++		!SESS_TX_IS_OUTER_ESP(s));
+ }
+ 
+ static inline bool __smgr_is_first_frag_bypass(struct sess_info *s, u8 lvl)
+@@ -631,6 +632,46 @@ static inline bool __smgr_is_frag_supported(struct sess_info *s)
+ 	return false;
+ }
+ 
++/**
++ * for ESP sessions the support is for two cases:
++ * 1. esp encapsulation:
++ * rx - mac-vlan(opt)-ipv4-udp/tcp
++ * tx - mac-vlan(opt)-ipv4-esp-IV(opt)-ipv4-udp/tcp (clear text)
++ * @note NAT is not supported
++ * 2. esp bypass:
++ * rx - mac-vlan(opt)-pppoe(opt)-ipv4-esp
++ * tx - mac-vlan(opt)-pppoe(opt)-ipv4-esp
++ * @param s the session to test
++ * @return bool true if it is, false otherwise
++ */
++static inline bool __smgr_is_esp_supported(struct sess_info *s)
++{
++	/* for both cases tx must include esp and outer ipv4 */
++	if (!(SESS_TX_IS_OUTER_ESP(s) && SESS_TX_IS_OUTER_V4(s)))
++		return false;
++
++	/* encapsulation */
++	if (!SESS_RX_IS_OUTER_ESP(s) &&
++	    !PKTPRS_IS_PPPOE(SESS_TX_PKT(s), HDR_OUTER) &&
++	    (SESS_TX_OUTER_V4_NEXT(s) == PKTPRS_PROTO_ESP) &&
++	    (SESS_TX_ESP_NEXT(s) == PKTPRS_PROTO_IPV4) &&
++	    (pktprs_ipv4_hdr(SESS_RX_PKT(s), HDR_OUTER)->saddr ==
++	     pktprs_ipv4_hdr(SESS_TX_PKT(s), HDR_INNER)->saddr)) {
++		SESS_MOD_FLAG_SET(s, MOD_ESP_V4_TUNNL_ENCP_BIT);
++		return true;
++	}
++
++	/* bypass */
++	if (SESS_RX_IS_OUTER_ESP(s) &&
++	    (SESS_TX_OUTER_V4_NEXT(s) == PKTPRS_PROTO_ESP) &&
++	    (SESS_RX_PKT(s)->buf_sz == SESS_TX_PKT(s)->buf_sz)) {
++		SESS_MOD_FLAG_SET(s, MOD_ESP_V4_TUNNL_BPAS_BIT);
++		return true;
++	}
++
++	return false;
++}
++
+ /**
+  * @brief Test whether a changes in the ipv6 extension headers are supported
+  * @param s the session to test
+@@ -680,9 +721,9 @@ static inline bool __smgr_is_eogre_term_sess(struct sess_info *s)
+ 	    !SESS_RX_IS_L2_GRE(s)  &&
+ 	    SESS_TX_IS_INNER_IP(s) &&
+ 	    SESS_TX_IS_INNER_L4(s)) {
+-		if (SESS_TX_IS_OUTER_IPV4(s))
++		if (SESS_TX_IS_OUTER_V4(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_EOGRE_V4_ENCP_BIT);
+-		else if (SESS_TX_IS_OUTER_IPV6(s))
++		else if (SESS_TX_IS_OUTER_V6(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_EOGRE_V6_ENCP_BIT);
+ 		return true;
+ 	}
+@@ -711,9 +752,9 @@ static inline bool __smgr_is_ipogre_term_sess(struct sess_info *s)
+ 	if (SESS_TX_IS_IP_GRE(s)  &&
+ 	    !SESS_RX_IS_IP_GRE(s) &&
+ 	    SESS_TX_IS_INNER_L4(s)) {
+-		if (SESS_TX_IS_OUTER_IPV4(s))
++		if (SESS_TX_IS_OUTER_V4(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_IPOGRE_V4_ENCP_BIT);
+-		else if (SESS_TX_IS_OUTER_IPV6(s))
++		else if (SESS_TX_IS_OUTER_V6(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_IPOGRE_V6_ENCP_BIT);
+ 		return true;
+ 	}
+@@ -808,9 +849,9 @@ static inline bool __smgr_is_l2tpudp_term_sess(struct sess_info *s)
+ 	    !PKTPRS_IS_MULTI_LEVEL(SESS_RX_PKT(s)) &&
+ 	    SESS_TX_IS_INNER_IP(s)                 &&
+ 	    SESS_TX_IS_INNER_L4(s)) {
+-		if (SESS_TX_IS_OUTER_IPV4(s))
++		if (SESS_TX_IS_OUTER_V4(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_L2TPUDP_IPV4_ENCP_BIT);
+-		else if (SESS_TX_IS_OUTER_IPV6(s))
++		else if (SESS_TX_IS_OUTER_V6(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_L2TPUDP_IPV6_ENCP_BIT);
+ 		return true;
+ 	}
+@@ -849,9 +890,9 @@ static inline bool __smgr_is_l2tpip_term_sess(struct sess_info *s)
+ 	    !PKTPRS_IS_L2TP_OIP(SESS_RX_PKT(s), HDR_OUTER) &&
+ 	    SESS_TX_IS_INNER_IP(s)                 &&
+ 	    SESS_TX_IS_INNER_L4(s)) {
+-		if (SESS_TX_IS_OUTER_IPV4(s))
++		if (SESS_TX_IS_OUTER_V4(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_L2TPIP_IPV4_ENCP_BIT);
+-		else if (SESS_TX_IS_OUTER_IPV6(s))
++		else if (SESS_TX_IS_OUTER_V6(s))
+ 			SESS_MOD_FLAG_SET(s, MOD_L2TPIP_IPV6_ENCP_BIT);
+ 		return true;
+ 	}
+@@ -859,6 +900,16 @@ static inline bool __smgr_is_l2tpip_term_sess(struct sess_info *s)
+ 	return false;
+ }
+ 
++/**
++ * @brief Check whether a session is ESP
++ * @param s the session to test
++ * @return bool true if it is, false otherwise
++ */
++static inline bool __smgr_is_esp_sess(struct sess_info *s)
++{
++	return SESS_RX_IS_OUTER_ESP(s) || SESS_TX_IS_OUTER_ESP(s);
++}
++
+ /**
+  * @brief Check whether a session is ESP encapsulation
+  * @param s the session to test
+@@ -866,8 +917,7 @@ static inline bool __smgr_is_l2tpip_term_sess(struct sess_info *s)
+  */
+ static inline bool __smgr_is_esp_encp_sess(struct sess_info *s)
+ {
+-	return !PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_OUTER) &&
+-	       PKTPRS_IS_ESP(SESS_TX_PKT(s), HDR_OUTER);
++	return !SESS_RX_IS_OUTER_ESP(s) && SESS_TX_IS_OUTER_ESP(s);
+ }
+ 
+ /**
+@@ -2018,6 +2068,14 @@ static bool __smgr_is_sess_supported(struct sess_info *s)
+ 		goto not_supported;
+ 	}
+ 
++	/* ESP */
++	if (__smgr_is_esp_sess(s)) {
++		if (__smgr_is_esp_supported(s))
++			return true;
++		pr_debug("unsupported esp session\n");
++		goto not_supported;
++	}
++
+ 	/* tunnel bypass? supported */
+ 	if (__smgr_is_tunn_bypass_sess(s)) {
+ 		pr_debug("tunnel bypass session\n");
+@@ -2336,11 +2394,11 @@ static s32 __smgr_si_ipv6_nat_set(struct sess_info *s)
+ static s32 __smgr_si_nat_set(struct sess_info *s)
+ {
+ 	/* if the session is bridged and not tunnel termination,
+-	 * or if the session is esp encapsulation (TBD: adding esp NAT support)
++	 * or if the session is esp (TBD: adding esp NAT support)
+ 	 * no nat/napt is needed
+ 	 */
+ 	if ((__smgr_is_sess_bridged(s) && !__smgr_is_tunn_term_sess(s)) ||
+-	    __smgr_is_esp_encp_sess(s))
++	    SESS_TX_IS_OUTER_ESP(s))
+ 		return 0;
+ 
+ 	if (__smgr_is_sess_bridged(s) &&
+@@ -2393,60 +2451,50 @@ static void __smgr_si_newhdr_set(struct sess_info *s)
+ 	struct pp_si_bce *bce = &s->si.bce;
+ 	struct pp_si_dpu *dpu = &s->si.dpu;
+ 	struct pp_si_sce *sce = &s->si.sce;
+-	u8 inner_ip, outer_ip;
+-
+-	if (PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_OUTER))
+-		outer_ip = PKTPRS_PROTO_IPV4;
+-	else
+-		outer_ip = PKTPRS_PROTO_IPV6;
+-	if (PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_INNER))
+-		inner_ip = PKTPRS_PROTO_IPV4;
+-	else
+-		inner_ip = PKTPRS_PROTO_IPV6;
++	u8 tx_ip, tx_inner_ip;
+ 
+-	dpu->nhdr_l3_off = pktprs_hdr_off(SESS_TX_PKT(s), outer_ip, HDR_OUTER);
++	tx_ip = SESS_TX_IS_OUTER_V4(s) ? PKTPRS_PROTO_IPV4 : PKTPRS_PROTO_IPV6;
++	dpu->nhdr_l3_off = pktprs_hdr_off(SESS_TX_PKT(s), tx_ip, HDR_OUTER);
++	s->si.pkt_len_diff = SESS_TX_PKT(s)->buf_sz - SESS_RX_PKT(s)->buf_sz;
++	sce->tot_len_diff = 0;
+ 
+ 	if (__smgr_is_iptun_encp_sess(s)) {
+-		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s), inner_ip,
++		/* ip tunnel encapsulation session */
++		tx_inner_ip = SESS_RX_IS_INNER_V4(s) ?
++			      PKTPRS_PROTO_IPV4 : PKTPRS_PROTO_IPV6;
++		/* nhdr size is the tx header up to the inner ip offset */
++		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s), tx_inner_ip,
+ 					      HDR_INNER);
+ 		sce->tot_len_diff = dpu->nhdr_sz - dpu->nhdr_l3_off;
+-		if (outer_ip == PKTPRS_PROTO_IPV6 &&
+-		    inner_ip == PKTPRS_PROTO_IPV4)
++		if (tx_ip == PKTPRS_PROTO_IPV6 &&
++		    tx_inner_ip == PKTPRS_PROTO_IPV4)
+ 			sce->tot_len_diff -= sizeof(struct ipv6hdr);
+-		s->si.pkt_len_diff =
+-			dpu->nhdr_sz -
+-			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
+-	} else if (__smgr_is_esp_encp_sess(s)) {
+-		/* new header size should include the ESP header w/o the IV */
+-		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s),
+-					      PKTPRS_PROTO_ESP,
+-					      HDR_OUTER) + 8;
+-		/* total len should include the ESP header + IV */
+-		sce->tot_len_diff =
+-			pktprs_hdr_sz(SESS_TX_PKT(s),
+-				      PKTPRS_PROTO_ESP, HDR_OUTER) -
+-			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
+-		s->si.pkt_len_diff =
+-			dpu->nhdr_sz -
+-			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
+-		if (SESS_TX_IS_OUTER_IPV4(s)) {
+-			SESS_MOD_FLAG_SET(s, MOD_ESP_V4_TUNNL_ENCP_BIT);
++	} else if (SESS_TX_IS_OUTER_ESP(s)) {
++		/* esp session */
++		if (!SESS_RX_IS_OUTER_ESP(s)) {
++			/* esp outbound encapsulation session */
++			dpu->nhdr_sz = pktprs_hdr_sz(SESS_TX_PKT(s),
++						     PKTPRS_PROTO_ESP,
++						     HDR_OUTER);
++			/* tot_len_diff = nhdr_sz - tx_ip_off */
++			sce->tot_len_diff = dpu->nhdr_sz - dpu->nhdr_l3_off;
+ 		} else {
+-			SESS_MOD_FLAG_SET(s, MOD_ESP_V6_TUNNL_ENCP_BIT);
+-			sce->tot_len_diff -= sizeof(struct ipv6hdr);
++			/* esp inbound/outbound tunnel session */
++			dpu->nhdr_sz      = dpu->nhdr_l3_off;
+ 		}
++		/* TBD - for ipv6 need to reduce the ip header size
++		 * sce->tot_len_diff -= sizeof(struct ipv6hdr);
++		 */
+ 	} else if (__smgr_is_outer_l2_changed(s)) {
+-		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s), outer_ip,
+-					      HDR_OUTER);
+-		s->si.pkt_len_diff =
+-			dpu->nhdr_sz -
+-			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
++		/* routing and tunnel decapsulation sessions */
++		dpu->nhdr_sz = dpu->nhdr_l3_off;
+ 	} else {
++		/* no modification session */
+ 		dpu->nhdr_sz = 0;
+ 		dpu->nhdr_l3_off = 0;
+ 	}
+ 
+-	/* if no new header, done. */
++	/* if no new header, done */
+ 	if (!dpu->nhdr_sz)
+ 		return;
+ 
+@@ -2456,7 +2504,7 @@ static void __smgr_si_newhdr_set(struct sess_info *s)
+ 	memcpy(bce->nhdr, SESS_TX_PKT(s)->buf, dpu->nhdr_sz);
+ 
+ 	/* if new header including ipv4, update the ip layer */
+-	if (SESS_TX_IS_OUTER_IPV4(s) && (dpu->nhdr_sz > dpu->nhdr_l3_off))
++	if (SESS_TX_IS_OUTER_V4(s) && (dpu->nhdr_sz > dpu->nhdr_l3_off))
+ 		__smgr_newhdr_ipv4_update(s);
+ }
+ 
+@@ -2513,7 +2561,7 @@ static s32 __smgr_frag_si_ud_set(struct sess_info *s)
+ 	 */
+ 	if (frag_info.flags & FRAG_INFO_FLAG_FRAG_EXT) {
+ 		frag_info.l3_off = s->si.dpu.nhdr_l3_off;
+-		if (SESS_TX_IS_OUTER_IPV4(s)) {
++		if (SESS_TX_IS_OUTER_V4(s)) {
+ 			frag_info.flags |= FRAG_INFO_FLAG_IPV4;
+ 			if (pktprs_ipv4_hdr(SESS_TX_PKT(s),
+ 					    HDR_OUTER)->frag_off &
+@@ -2521,7 +2569,7 @@ static s32 __smgr_frag_si_ud_set(struct sess_info *s)
+ 				frag_info.flags |= FRAG_INFO_FLAG_EXT_DF;
+ 		}
+ 	} else {
+-		if (SESS_TX_IS_INNER_IPV4(s)) {
++		if (SESS_TX_IS_INNER_V4(s)) {
+ 			frag_info.l3_off = pktprs_hdr_off(SESS_TX_PKT(s),
+ 							  PKTPRS_PROTO_IPV4,
+ 							  HDR_INNER);
+@@ -2670,7 +2718,7 @@ static void __smgr_pppoe_mod_set(struct sess_info *s)
+ 			 * cause its length field doesn't include it
+ 			 */
+ 			if (__smgr_is_iptun_encp_sess(s) &&
+-			    SESS_TX_IS_OUTER_IPV6(s))
++			    SESS_TX_IS_OUTER_V6(s))
+ 				sce->pppoe_diff += sizeof(struct ipv6hdr);
+ 			dpu->pppoe_off = pktprs_hdr_off(SESS_TX_PKT(s),
+ 							PKTPRS_PROTO_PPPOE,
+@@ -2703,7 +2751,7 @@ static void __smgr_pppoe_mod_set(struct sess_info *s)
+  */
+ static void __smgr_si_l2_mod_set(struct sess_info *s)
+ {
+-	if (__smgr_is_outer_l2_changed(s))
++	if (__smgr_is_outer_l2_changed(s) || SESS_TX_IS_OUTER_ESP(s))
+ 		SESS_MOD_FLAG_SET(s, MOD_HDR_RPLC_BIT);
+ 
+ 	if (__smgr_is_pppoe_changed(s, HDR_INNER))
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 825ba574e8b6..e837eaf815b9 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -114,27 +114,30 @@ enum smgr_sess_flags {
+  * @brief Shortcuts for checking if session is ipv4
+  * @param s session info pointer
+  */
+-#define SESS_RX_IS_OUTER_IPV4(s)       PKTPRS_IS_IPV4(SESS_RX_PKT(s), HDR_OUTER)
+-#define SESS_TX_IS_OUTER_IPV4(s)       PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_OUTER)
+-#define SESS_RX_IS_INNER_IPV4(s)       PKTPRS_IS_IPV4(SESS_RX_PKT(s), HDR_INNER)
+-#define SESS_TX_IS_INNER_IPV4(s)       PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_INNER)
+-#define SESS_RX_IS_OUTER_IPV6(s)       PKTPRS_IS_IPV6(SESS_RX_PKT(s), HDR_OUTER)
+-#define SESS_TX_IS_OUTER_IPV6(s)       PKTPRS_IS_IPV6(SESS_TX_PKT(s), HDR_OUTER)
+-#define SESS_RX_IS_INNER_IPV6(s)       PKTPRS_IS_IPV6(SESS_RX_PKT(s), HDR_INNER)
+-#define SESS_TX_IS_INNER_IPV6(s)       PKTPRS_IS_IPV6(SESS_TX_PKT(s), HDR_INNER)
++#define SESS_RX_IS_OUTER_V4(s)         PKTPRS_IS_IPV4(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_V4(s)         PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_V4(s)         PKTPRS_IS_IPV4(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_V4(s)         PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_INNER)
++#define SESS_RX_IS_OUTER_V6(s)         PKTPRS_IS_IPV6(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_V6(s)         PKTPRS_IS_IPV6(SESS_TX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_V6(s)         PKTPRS_IS_IPV6(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_V6(s)         PKTPRS_IS_IPV6(SESS_TX_PKT(s), HDR_INNER)
++
++#define SESS_TX_OUTER_V4_NEXT(s) \
++PKTPRS_PROTO_NEXT(SESS_TX_PKT(s), PKTPRS_PROTO_IPV4, HDR_OUTER)
+ 
+ /**
+  * @brief Shortcuts for checking if session is ip
+  * @param s session info pointer
+  */
+ #define SESS_RX_IS_OUTER_IP(s) \
+-(SESS_RX_IS_OUTER_IPV4(s) || SESS_RX_IS_OUTER_IPV6(s))
++(SESS_RX_IS_OUTER_V4(s) || SESS_RX_IS_OUTER_V6(s))
+ #define SESS_TX_IS_OUTER_IP(s) \
+-(SESS_TX_IS_OUTER_IPV4(s) || SESS_TX_IS_OUTER_IPV6(s))
++(SESS_TX_IS_OUTER_V4(s) || SESS_TX_IS_OUTER_V6(s))
+ #define SESS_RX_IS_INNER_IP(s) \
+-(SESS_RX_IS_INNER_IPV4(s) || SESS_RX_IS_INNER_IPV6(s))
++(SESS_RX_IS_INNER_V4(s) || SESS_RX_IS_INNER_V6(s))
+ #define SESS_TX_IS_INNER_IP(s) \
+-(SESS_TX_IS_INNER_IPV4(s) || SESS_TX_IS_INNER_IPV6(s))
++(SESS_TX_IS_INNER_V4(s) || SESS_TX_IS_INNER_V6(s))
+ 
+ /**
+  * @brief Shortcuts for checking if session is udp
+@@ -159,9 +162,12 @@ enum smgr_sess_flags {
+  * @param s session info pointer
+  */
+ #define SESS_RX_IS_OUTER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_OUTER)
+-#define SESS_TX_IS_OUTER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_ESP(s)         PKTPRS_IS_ESP(SESS_TX_PKT(s), HDR_OUTER)
+ #define SESS_RX_IS_INNER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_INNER)
+-#define SESS_TX_IS_INNER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_ESP(s)         PKTPRS_IS_ESP(SESS_TX_PKT(s), HDR_INNER)
++
++#define SESS_TX_ESP_NEXT(s) \
++PKTPRS_PROTO_NEXT(SESS_TX_PKT(s), PKTPRS_PROTO_ESP, HDR_OUTER)
+ 
+ /**
+  * @brief Shortcuts for checking if session is supported L4
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier.h b/drivers/net/ppv4/pp-hal/modifier/modifier.h
+index 1f078ea31adb..0025b2a5515e 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier.h
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier.h
+@@ -2,7 +2,7 @@
+  * Description: Packet Processor Modifier Definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #ifndef __MODIFIER_H__
+@@ -90,10 +90,10 @@ enum mod_rcp_type {
+ 	 *	without nat changes in the inner headers
+ 	 */
+ 	MOD_RCP_ESP_V4_TUNNL_ENCAP,
+-	/*! Recipe for encapsulating ESP tunnel mode over ipv6(outer)
+-	 *	without nat changes in the inner headers
++	/*! Recipe for ESP tunnel mode over ipv4(outer) bypass
++	 *	without nat changes, only total length update
+ 	 */
+-	MOD_RCP_ESP_V6_TUNNL_ENCAP,
++	MOD_RCP_ESP_V4_TUNNL_BPAS,
+ 	/*! Recipe for decapsulating L2TP v2 UDP tunnel over ipv4/ipv6 with
+ 	 *  inner [ipv4][tcp/udp] packet
+ 	 */
+@@ -159,8 +159,8 @@ enum mod_flags {
+ 	MOD_6RD_DECP_BIT,
+ 	/*! ESP V4 tunnel was added */
+ 	MOD_ESP_V4_TUNNL_ENCP_BIT,
+-	/*! ESP V6 tunnel was added */
+-	MOD_ESP_V6_TUNNL_ENCP_BIT,
++	/*! ESP V6 tunnel bypass */
++	MOD_ESP_V4_TUNNL_BPAS_BIT,
+ 	/*! L2TP (V2/V3) UDP over IPv4 was added */
+ 	MOD_L2TPUDP_IPV4_ENCP_BIT,
+ 	/*! L2TP (V2/V3) UDP over IPv6 was added */
+diff --git a/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c b/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
+index 56127d9392d2..3af38c95d9c0 100644
+--- a/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
++++ b/drivers/net/ppv4/pp-hal/modifier/modifier_recipes.c
+@@ -2,7 +2,7 @@
+  * Description: PP Modifier Recipes
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #define pr_fmt(fmt) "[PP_MODIFIER_RECIPES]: %s:%d: " fmt, __func__, __LINE__
+@@ -39,7 +39,7 @@ static const char * const mod_rcp_str[MOD_RCPS_NUM + 2] = {
+ 	[MOD_RCP_DSLITE_DECP_NAPT]        = "DsLite decap NAPT",
+ 	[MOD_RCP_6RD_DECP_ROUTED]         = "6RD decap",
+ 	[MOD_RCP_ESP_V4_TUNNL_ENCAP]      = "ESP over ipv4 encapsulation",
+-	[MOD_RCP_ESP_V6_TUNNL_ENCAP]      = "ESP over ipv6 encapsulation",
++	[MOD_RCP_ESP_V4_TUNNL_BPAS]       = "ESP over ipv4 bypass",
+ 	[MOD_RCP_L2TPUDP_DECP_IPV4_NAPT]  = "L2TP UDP decap inner ipv4 NAPT",
+ 	[MOD_RCP_L2TPUDP_DECP_IPV6_ROUTED] = "L2TP UDP decap inner ipv6 NAPT",
+ 	[MOD_RCP_L2TPIP_DECP_IPV4_NAPT]   = "L2TP IP decap inner ipv4 NAPT",
+@@ -68,7 +68,7 @@ static const char * const mod_flag_str[MOD_FLAG_NUM + 1] = {
+ 	[MOD_6RD_ENCP_BIT]          = "6RD encap",
+ 	[MOD_6RD_DECP_BIT]          = "6RD decap",
+ 	[MOD_ESP_V4_TUNNL_ENCP_BIT] = "ESPv4 tunnel encap",
+-	[MOD_ESP_V6_TUNNL_ENCP_BIT] = "ESPv6 tunnel encap",
++	[MOD_ESP_V4_TUNNL_BPAS_BIT] = "ESPv4 tunnel bypass",
+ 	[MOD_L2TPUDP_IPV4_ENCP_BIT] = "L2TPUDPv4 encap",
+ 	[MOD_L2TPUDP_IPV6_ENCP_BIT] = "L2TPUDPv6 encap",
+ 	[MOD_L2TPUDP_DECP_BIT]      = "L2TPUDP decap",
+@@ -95,7 +95,7 @@ static const char * const mod_flag_str[MOD_FLAG_NUM + 1] = {
+ #define MOD_6RD_ENCP_MSK          BIT(MOD_6RD_ENCP_BIT)
+ #define MOD_6RD_DECP_MSK          BIT(MOD_6RD_DECP_BIT)
+ #define MOD_ESP_V4_TUNNL_ENCP_MSK BIT(MOD_ESP_V4_TUNNL_ENCP_BIT)
+-#define MOD_ESP_V6_TUNNL_ENCP_MSK BIT(MOD_ESP_V6_TUNNL_ENCP_BIT)
++#define MOD_ESP_V4_TUNNL_BPAS_MSK BIT(MOD_ESP_V4_TUNNL_BPAS_BIT)
+ #define MOD_L2TPUDP_IPV4_ENCP_MSK BIT(MOD_L2TPUDP_IPV4_ENCP_BIT)
+ #define MOD_L2TPUDP_IPV6_ENCP_MSK BIT(MOD_L2TPUDP_IPV6_ENCP_BIT)
+ #define MOD_L2TPIP_IPV4_ENCP_MSK  BIT(MOD_L2TPIP_IPV4_ENCP_BIT)
+@@ -242,11 +242,11 @@ static const struct supp_mod supp_mod_types[] = {
+ 		.recipe = MOD_RCP_ESP_V4_TUNNL_ENCAP
+ 	},
+ 	/* ================================================================ */
+-	/*         ESP tunnel mode over IPv6(outer) Encapsulation           */
++	/*         ESP tunnel mode over IPv4(outer) Bypass                  */
+ 	/* ================================================================ */
+-	{ /* No inner layers, new header has ipv6 */
+-		.flags  = MOD_ESP_V6_TUNNL_ENCP_MSK | MOD_HDR_RPLC_MSK,
+-		.recipe = MOD_RCP_ESP_V6_TUNNL_ENCAP
++	{ /* No inner layers, new header has no ip */
++		.flags  = MOD_ESP_V4_TUNNL_BPAS_MSK | MOD_HDR_RPLC_MSK,
++		.recipe = MOD_RCP_ESP_V4_TUNNL_BPAS
+ 	},
+ 	/* ================================================================ */
+ 	/*                    GRE Decapsulation                             */
+@@ -376,15 +376,10 @@ static s32 mod_rcp_no_mod_set(s32 rcp_idx)
+ }
+ 
+ static s32 mod_rcp_hdr_rplc_set(s32 rcp_idx,
+-				enum mod_eu_stw_mux_sel strip_l3_off,
+-				enum rcp_new_hdr_ip_type nhdr)
++				enum mod_eu_stw_mux_sel strip_l3_off)
+ {
+ 	struct mod_recipe rcp;
+ 	s32 ret = 0;
+-	s32 stw_pkt_len        = DPU_RCP_REG0_B0;
+-	s32 stw_off_l3         = DPU_RCP_REG1_B0;
+-	s32 si_l3_tot_len_diff = DPU_RCP_REG2_B0;
+-	s32 si_nhdr_csum       = DPU_RCP_REG2_B2;
+ 
+ 	if (unlikely(rcp_idx > MOD_RCP_LAST)) {
+ 		pr_err("error: invalid recipe id, %d\n", rcp_idx);
+@@ -396,92 +391,12 @@ static s32 mod_rcp_hdr_rplc_set(s32 rcp_idx,
+ 	memset(&rcp, 0, sizeof(rcp));
+ 	rcp.index = rcp_idx;
+ 
+-	if (nhdr != RCP_NEW_HDR_NO_IP) {
+-		/*==========================================*/
+-		/* copy from sce mux to dpu registers (sce) */
+-		/*==========================================*/
+-		/* Fetch SI info: total length diff, tos, and new header csum */
+-		ret |= mod_sce_mux_to_reg_cpy(&rcp, stw_pkt_len, SCE_STW_SEL_PKT_LEN);
+-		/* Fetch SI info: total length diff, tos, and new header csum */
+-		ret |= mod_sce_mux_to_reg_cpy(&rcp, stw_off_l3, SCE_STW_SEL_L3_OFF0);
+-		/* Fetch SI info: total length diff, tos, and new header csum */
+-		ret |= mod_sce_mux_to_reg_cpy(&rcp, si_l3_tot_len_diff, SCE_SI_SEL_TOT_LEN_DIFF);
+-	}
+-
+-	/*=========================*/
+-	/*      ALU operations     */
+-	/*=========================*/
+-	/*  |-------------------------------|---------------------------|
+-	 *  |      ALU0                     |      ALU1                 |
+-	 *  |-------------------------------|---------------------------|
+-	 *  | pkt len -= off l3/4 (nhdr)    | NOP                       |
+-	 *  | pkt len += ip len diff        |                           |
+-	 *  | tot len for pppoe_encap (TBD) |                           |
+-	 *  | increment global id (nhdr v4) |                           |
+-	 *  | csum update new id (nhdr v4)  |                           |
+-	 *  | csum update tot len (nhdr v4) |                           |
+-	 *  |-------------------------------|---------------------------|
+-	 */
+-	if (nhdr != RCP_NEW_HDR_NO_IP) {
+-		/* Calculate new header tot_len/payload_len: pkt_len - off_L3 */
+-		ret |= mod_alu_sub(EU_ALU0, &rcp, stw_pkt_len, stw_off_l3,
+-				   stw_off_l3, 2);
+-		/* Calculate new header total length: + ip len diff */
+-		ret |= mod_alu_add(EU_ALU0, &rcp, stw_off_l3, 2,
+-				   si_l3_tot_len_diff, 1, si_l3_tot_len_diff);
+-		if (nhdr == RCP_NEW_HDR_V4) {
+-			/* Increment the global id */
+-			ret |= mod_alu_inc(EU_ALU0, &rcp, MOD_GLB_EXT_IPV4_ID,
+-					   MOD_GLB_EXT_IPV4_ID);
+-			/* Update the external L3 csum due to new id */
+-			ret |= mod_alu_csum16_sub(EU_ALU0, &rcp, MOD_GLB_EXT_IPV4_ID,
+-						  si_nhdr_csum, si_nhdr_csum);
+-			/* Update the external L3 csum due to new total len */
+-			ret |= mod_alu_csum16_sub(EU_ALU0, &rcp, si_l3_tot_len_diff,
+-						  si_nhdr_csum, si_nhdr_csum);
+-		}
+-	}
+-
+ 	/*============================================*/
+ 	/* copy from si bce (sram) to packet (insrep) */
+ 	/*============================================*/
+ 	/* replace old header with new header */
+ 	ret |= mod_hdr_rplc(&rcp, BCE_OFF_0, strip_l3_off);
+ 
+-	/*======================================================*/
+-	/* copy from dpu registers to packet new header (reps1) */
+-	/*======================================================*/
+-	if (nhdr == RCP_NEW_HDR_V6) {
+-		/* Replace L3 payload length with inner total length */
+-		ret |= mod_reg_to_new_hdr_cpy(&rcp, si_l3_tot_len_diff,
+-					      MOD_PKT_OFF_L3_EXT,
+-					      offsetof(struct ipv6hdr,
+-						       payload_len),
+-					      FIELD_SIZEOF(struct ipv6hdr,
+-							   payload_len));
+-
+-	} else if (nhdr == RCP_NEW_HDR_V4) {
+-		/* Update ipv4 id */
+-		ret |= mod_reg_to_new_hdr_cpy(&rcp, MOD_GLB_EXT_IPV4_ID,
+-					      MOD_PKT_OFF_L3_EXT,
+-					      offsetof(struct iphdr, id),
+-					      FIELD_SIZEOF(struct iphdr, id));
+-
+-		/* Update ipv4 total length */
+-		ret |= mod_reg_to_new_hdr_cpy(&rcp, si_l3_tot_len_diff,
+-					      MOD_PKT_OFF_L3_EXT,
+-					      offsetof(struct iphdr, tot_len),
+-					      FIELD_SIZEOF(struct iphdr,
+-							   tot_len));
+-
+-		/* Replace L3 CSUM */
+-		ret |= mod_reg_to_new_hdr_cpy(&rcp, si_nhdr_csum,
+-					      MOD_PKT_OFF_L3_EXT,
+-					      offsetof(struct iphdr, check),
+-					      FIELD_SIZEOF(struct iphdr,
+-							   check));
+-	}
+-
+ 	/*=================================================*/
+ 	/* complete recipe with nop command and 'last' bit */
+ 	/*=================================================*/
+@@ -991,6 +906,194 @@ static s32 mod_rcp_ipv6_routed_set(s32 rcp_idx, enum mod_eu_stw_mux_sel l3_off,
+ 	return ret;
+ }
+ 
++/**
++ * @brief Creates recipe for esp traffic
++ * @param rcp_idx Recipe index to create
++ * @param nhdr New IP header. NO_IP for flows without encapsulation
++ * @return s32 0 on success, error code otherwise
++ */
++static s32 mod_rcp_esp_set(s32 rcp_idx, enum rcp_new_hdr_ip_type nhdr)
++{
++	struct mod_recipe rcp;
++	s32 ret = 0;
++	u32 sync_off, sync_sz;
++	enum mod_eu_stw_mux_sel l3_off = EU_STW_SEL_L3_OFF0;
++
++	/* ================= */
++	/* Map dpu registers */
++	/* ================= */
++	s32 stw_pkt_len        = DPU_RCP_REG0_B0;
++	s32 stw_off_l3         = DPU_RCP_REG1_B0;
++	s32 si_l3_tot_len_diff = DPU_RCP_REG2_B0;
++	s32 si_nhdr_csum       = DPU_RCP_REG2_B2;
++	s32 pkt_l3_csum        = DPU_RCP_REG3_B0;
++	s32 pkt_l3_tot_len     = DPU_RCP_REG4_B0;
++
++	if (unlikely(rcp_idx > MOD_RCP_LAST)) {
++		pr_err("error: invalid recipe id, %d\n", rcp_idx);
++		return -EINVAL;
++	}
++
++	pr_debug("Configuring recipe %s(%u)\n", mod_rcp_to_str(rcp_idx),
++		 rcp_idx);
++	memset(&rcp, 0, sizeof(rcp));
++	rcp.index = rcp_idx;
++
++	/*==========================================*/
++	/* copy from sce mux to dpu registers (sce) */
++	/*==========================================*/
++	/*======================*/
++	/* STW info: packet len */
++	/*======================*/
++	ret |= mod_sce_mux_to_reg_cpy(&rcp, stw_pkt_len,
++				      SCE_STW_SEL_PKT_LEN);
++	/*======================*/
++	/* STW info: offset L3  */
++	/*======================*/
++	ret |= mod_sce_mux_to_reg_cpy(&rcp, stw_off_l3,
++				      SCE_STW_SEL_L3_OFF0);
++	/*========================*/
++	/* SI info: tot_len_diff  */
++	/*========================*/
++	ret |= mod_sce_mux_to_reg_cpy(&rcp, si_l3_tot_len_diff,
++				      SCE_SI_SEL_TOT_LEN_DIFF);
++
++	/*===========================================*/
++	/* copy from packet to dpu registers (store) */
++	/*===========================================*/
++	if (nhdr == RCP_NEW_HDR_NO_IP) {
++		/*====================*/
++		/* PKT: L3 total_len  */
++		/*====================*/
++		ret |= mod_pkt_to_reg_cpy(&rcp, pkt_l3_tot_len, l3_off,
++					  offsetof(struct iphdr, tot_len),
++					  FIELD_SIZEOF(struct iphdr, tot_len));
++		/*===================*/
++		/* PKT: L3 checksum  */
++		/*===================*/
++		ret |= mod_pkt_to_reg_cpy(&rcp, pkt_l3_csum, l3_off,
++					  offsetof(struct iphdr, check),
++					  FIELD_SIZEOF(struct iphdr, check));
++
++		sync_off = offsetof(struct iphdr, check);
++		sync_sz  = FIELD_SIZEOF(struct iphdr, check);
++	}
++
++	/*=========================*/
++	/*      ALU operations     */
++	/*=========================*/
++	/*  |--------------------------------|--------------------------------|
++	 *  |  ALU0 for RCP_NEW_HDR_NO_IP    |  ALU0 for RCP_NEW_HDR_V4       |
++	 *  |--------------------------------|--------------------------------|
++	 *  | sync                           | off_l3 = pkt_len - off_l3      |
++	 *  | off_l3 = pkt_len - off_l3      | pkt_len = off_l3 + tot_len_diff|
++	 *  | pkt_len = off_l3 + tot_len_diff| inc global_id                  |
++	 *  | csum += old total length       | csum -= global_id              |
++	 *  | csum -= pkt_len (new tot_len)  | csum -= pkt_len (new tot_len)  |
++	 *  |                                |                                |
++	 *  |--------------------------------|--------------------------------|
++	 */
++	if (nhdr == RCP_NEW_HDR_NO_IP) {
++		/* Synchronize ALU to last fetched info of STORE command */
++		ret |= mod_alu_synch(EU_ALU0, &rcp, STW_NEXT_LAYER(l3_off),
++				     sync_off, sync_sz);
++	}
++	/*=======================================*/
++	/* stw_off_l3 = stw_pkt_len - stw_off_l3 */
++	/*=======================================*/
++	ret |= mod_alu_sub(EU_ALU0, &rcp, stw_pkt_len, stw_off_l3,
++			   stw_off_l3, 2);
++	/*===============================================*/
++	/* stw_pkt_len = stw_off_l3 - si_l3_tot_len_diff */
++	/*===============================================*/
++	ret |= mod_alu_add(EU_ALU0, &rcp, stw_off_l3, 2,
++			   si_l3_tot_len_diff, 1, stw_pkt_len);
++	if (nhdr == RCP_NEW_HDR_V4) {
++		/*=======================*/
++		/* MOD_GLB_EXT_IPV4_ID++ */
++		/*=======================*/
++		ret |= mod_alu_inc(EU_ALU0, &rcp, MOD_GLB_EXT_IPV4_ID,
++				   MOD_GLB_EXT_IPV4_ID);
++		/*=====================================*/
++		/* si_nhdr_csum -= MOD_GLB_EXT_IPV4_ID */
++		/*=====================================*/
++		ret |= mod_alu_csum16_sub(EU_ALU0, &rcp, MOD_GLB_EXT_IPV4_ID,
++					  si_nhdr_csum, si_nhdr_csum);
++		/*=============================*/
++		/* si_nhdr_csum -= stw_pkt_len */
++		/*=============================*/
++		ret |= mod_alu_csum16_sub(EU_ALU0, &rcp, stw_pkt_len,
++					  si_nhdr_csum, si_nhdr_csum);
++	} else if (nhdr == RCP_NEW_HDR_NO_IP) {
++		/*===============================*/
++		/* pkt_l3_csum += pkt_l3_tot_len */
++		/*===============================*/
++		ret |= mod_alu_csum16_add(EU_ALU0, &rcp, pkt_l3_tot_len,
++					  pkt_l3_csum, pkt_l3_csum);
++		/*============================*/
++		/* pkt_l3_csum -= stw_pkt_len */
++		/*============================*/
++		ret |= mod_alu_csum16_sub(EU_ALU0, &rcp, stw_pkt_len,
++					  pkt_l3_csum, pkt_l3_csum);
++	}
++
++	/*==========================================*/
++	/* copy from dpu registers to packet (reps0) */
++	/*==========================================*/
++	if (nhdr == RCP_NEW_HDR_NO_IP) {
++		/* Replace L3 total length */
++		ret |= mod_reg_to_hdr_cpy(&rcp, stw_pkt_len, l3_off,
++					  offsetof(struct iphdr, tot_len),
++					  FIELD_SIZEOF(struct iphdr, tot_len));
++		/* Replace L3 CSUM */
++		ret |= mod_reg_to_hdr_cpy(&rcp, pkt_l3_csum, l3_off,
++					  offsetof(struct iphdr, check),
++					  FIELD_SIZEOF(struct iphdr, check));
++	}
++
++	/*============================================*/
++	/* copy from si bce (sram) to packet (insrep) */
++	/*============================================*/
++	/* replace old L2 with new header */
++	ret |= mod_hdr_rplc(&rcp, BCE_OFF_0, l3_off);
++
++	/*======================================================*/
++	/* copy from dpu registers to packet new header (reps1) */
++	/*======================================================*/
++	if (nhdr == RCP_NEW_HDR_V4) {
++		/* Update ipv4 id */
++		ret |= mod_reg_to_new_hdr_cpy(&rcp, MOD_GLB_EXT_IPV4_ID,
++					      MOD_PKT_OFF_L3_EXT,
++					      offsetof(struct iphdr, id),
++					      FIELD_SIZEOF(struct iphdr, id));
++
++		/* Update ipv4 total length */
++		ret |= mod_reg_to_new_hdr_cpy(&rcp, stw_pkt_len,
++					      MOD_PKT_OFF_L3_EXT,
++					      offsetof(struct iphdr, tot_len),
++					      FIELD_SIZEOF(struct iphdr,
++							   tot_len));
++
++		/* Replace L3 CSUM */
++		ret |= mod_reg_to_new_hdr_cpy(&rcp, si_nhdr_csum,
++					      MOD_PKT_OFF_L3_EXT,
++					      offsetof(struct iphdr, check),
++					      FIELD_SIZEOF(struct iphdr,
++							   check));
++	}
++
++	/*=================================================*/
++	/* complete recipe with nop command and 'last' bit */
++	/*=================================================*/
++	ret |= mod_rcp_complete(&rcp);
++	if (unlikely(ret)) {
++		pr_err("Failed to create recipe %s(%d)\n",
++		       mod_rcp_to_str(rcp_idx), rcp_idx);
++	}
++
++	return ret;
++}
++
+ s32 mod_rcp_init(void)
+ {
+ 	s32 ret;
+@@ -1001,8 +1104,7 @@ s32 mod_rcp_init(void)
+ 		goto err;
+ 
+ 	/* config recipe L2 replacing only */
+-	ret = mod_rcp_hdr_rplc_set(MOD_RCP_HDR_RPLC, EU_STW_SEL_L3_OFF0,
+-				   RCP_NEW_HDR_NO_IP);
++	ret = mod_rcp_hdr_rplc_set(MOD_RCP_HDR_RPLC, EU_STW_SEL_L3_OFF0);
+ 	if (unlikely(ret))
+ 		goto err;
+ 
+@@ -1123,14 +1225,12 @@ s32 mod_rcp_init(void)
+ 		goto err;
+ 
+ 	/* config recipe ESP over ipv4 encapsulation */
+-	ret = mod_rcp_hdr_rplc_set(MOD_RCP_ESP_V4_TUNNL_ENCAP,
+-				   EU_STW_SEL_L3_OFF0, RCP_NEW_HDR_V4);
++	ret = mod_rcp_esp_set(MOD_RCP_ESP_V4_TUNNL_ENCAP, RCP_NEW_HDR_V4);
+ 	if (unlikely(ret))
+ 		goto err;
+ 
+-	/* config recipe ESP over ipv6 encapsulation */
+-	ret = mod_rcp_hdr_rplc_set(MOD_RCP_ESP_V6_TUNNL_ENCAP,
+-				   EU_STW_SEL_L3_OFF0, RCP_NEW_HDR_V6);
++	/* config recipe ESP over ipv4 bypass */
++	ret = mod_rcp_esp_set(MOD_RCP_ESP_V4_TUNNL_BPAS, RCP_NEW_HDR_NO_IP);
+ 	if (unlikely(ret))
+ 		goto err;
+ 
