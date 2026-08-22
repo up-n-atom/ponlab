@@ -1,0 +1,765 @@
+From 4b2006372539f9745bf6f36076f123c05644322a Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Mon, 5 Oct 2020 15:13:19 +0300
+Subject: [PATCH] LMTSYS-3193: DPL (DOS Protection Layer) Platform driver
+ implementation for LGM PPv4
+
+---
+ drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c  | 174 +++++++++++++++++++--
+ drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h  |   6 +
+ .../ppv4/pp-api/pp-port-mgr/pp_port_mgr_internal.h |  11 +-
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c    |   2 +
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |  14 ++
+ drivers/net/ppv4/pp-hal/checker/checker.c          |  86 +++++++++-
+ drivers/net/ppv4/pp-hal/checker/checker.h          |  20 +++
+ drivers/net/ppv4/pp-hal/checker/checker_debugfs.c  | 111 ++++++++++---
+ include/linux/pp_api.h                             |  21 +++
+ 9 files changed, 401 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c
+index 9c507be8e470..67b12dc9ee8b 100644
+--- a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c
+@@ -80,6 +80,9 @@ static bool __pmgr_hif_db_dp_is_equal(struct pp_hif_datapath *dp,
+ 				      u8 eg_idx, u8 dp_num);
+ static u8   __pmgr_hif_db_dp_find(struct pp_hif_datapath *dp, u8 eg_idx,
+ 				  u8 *free_dp);
++static s32 __pmgr_excep_sess_map_get(u16 pid, u8 tc, u8 hoh, u8 *hal_dp);
++
++static s32 __pmgr_excep_sess_map_set(u16 pid, u8 tc, u8 hoh, u8 hal_dp);
+ 
+ /* Module internal routines */
+ static s32  __pmgr_db_init(void);
+@@ -534,6 +537,83 @@ s32 pp_port_stats_get(u16 pid, struct pp_stats *stats)
+ }
+ EXPORT_SYMBOL(pp_port_stats_get);
+ 
++/* pp_port_protect
++ * Called from DPL platform implementation.
++ * All packets received from the protected port will be
++ * diverted to the ingress uc
++ */
++s32 pp_port_protect(u16 pid)
++{
++	u8 id[PP_MAX_TC][CHK_HOH_MAX];
++	u8 tc_ind;
++	u8 hoh_ind;
++	s32 ret;
++
++	if (unlikely(!pp_is_ready()))
++		return -EPERM;
++
++	pr_debug("PP Start port %hu protection\n", pid);
++
++	if (db->port[pid].protected) {
++		pr_info("port %hu is already protected\n", pid);
++		return 0;
++	}
++
++	spin_lock_bh(&db->port_lock);
++
++	/* Save port dp's */
++	ret = chk_exception_session_port_map_get(pid, db->port[pid].map_id);
++	if (ret)
++		goto unlock;
++
++	for (tc_ind = 0; tc_ind < PP_MAX_TC; tc_ind++)
++		for (hoh_ind = 0; hoh_ind < CHK_HOH_MAX; hoh_ind++)
++			id[tc_ind][hoh_ind] = PMGR_HIF_PROTECTED_DP_IDX;
++
++	/* Set port dp's */
++	ret = chk_exception_session_port_map_set(pid, id);
++	if (ret)
++		goto unlock;
++
++	db->port[pid].protected = true;
++
++unlock:
++	spin_unlock_bh(&db->port_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(pp_port_protect);
++
++s32 pp_port_unprotect(u16 pid)
++{
++	s32 ret;
++
++	if (unlikely(!pp_is_ready()))
++		return -EPERM;
++
++	pr_debug("PP Stop port %hu protection\n", pid);
++
++	if (!db->port[pid].protected) {
++		pr_info("port %hu is already unprotected\n", pid);
++		return 0;
++	}
++
++	spin_lock_bh(&db->port_lock);
++
++	/* Set port dp's */
++	ret = chk_exception_session_port_map_set(pid, db->port[pid].map_id);
++	if (ret)
++		goto unlock;
++
++	db->port[pid].protected = false;
++
++unlock:
++	spin_unlock_bh(&db->port_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(pp_port_unprotect);
++
+ s32 pp_hostif_dflt_set(struct pp_hif_datapath *dp)
+ {
+ 	if (unlikely(!pp_is_ready()))
+@@ -905,10 +985,10 @@ u8 pmgr_port_hif_map_get(u16 pid, u8 tc, u8 hoh)
+ 
+ 	spin_lock_bh(&db->port_lock);
+ 
+-	/* Get the exception session ID (DP) from HAL */
+-	ret = chk_exception_session_map_get(pid, tc, hoh, &hal_dp);
++	/* Get the exception session ID (DP) */
++	ret = __pmgr_excep_sess_map_get(pid, tc, hoh, &hal_dp);
+ 	if (ret) {
+-		pr_err("Exception map get failed for port %d, tc %d\n",
++		pr_err("Exception map get failed for port %u, tc %u\n",
+ 		       pid, tc);
+ 	}
+ 
+@@ -1444,8 +1524,8 @@ static s32 __pmgr_hif_dp_update(struct pp_hostif_cfg *hif,
+ 	for_each_set_bit(tc, &bmap, PP_MAX_TC) {
+ 		PMGR_HIF_FOR_EACH_DP_HOH(i) {
+ 			dp = dp_num[PMGR_HOH_TO_DP_IDX(i, cnt)];
+-			chk_exception_session_map_get(hif->cls.port,
+-						      tc, i, &hal_dp);
++			__pmgr_excep_sess_map_get(hif->cls.port,
++						  tc, i, &hal_dp);
+ 			if (hal_dp != dp) {
+ 				/* Not match to user request, abort */
+ 				pr_err("Hal host-if mismatch %hhu\n", dp);
+@@ -1461,7 +1541,7 @@ static s32 __pmgr_hif_dp_update(struct pp_hostif_cfg *hif,
+ 	if (unlikely(ret))
+ 		goto abort;
+ 
+-	/* Clean old datapths from database */
++	/* Clean old datapaths from database */
+ 	__pmgr_hif_dp_clean(dp_num, ARRAY_SIZE(dp_num), dbg_en);
+ 
+ 	return 0;
+@@ -1505,8 +1585,8 @@ static s32 __pmgr_hif_cfg_del(struct pp_hostif_cfg *hif, bool dbg_en)
+ 	for_each_set_bit(tc, &bmap, PP_MAX_TC) {
+ 		PMGR_HIF_FOR_EACH_DP_HOH(i) {
+ 			dp = dp_num[PMGR_HOH_TO_DP_IDX(i, cnt)];
+-			chk_exception_session_map_get(hif->cls.port,
+-						      tc, i, &hal_dp);
++			__pmgr_excep_sess_map_get(hif->cls.port,
++						  tc, i, &hal_dp);
+ 			if (hal_dp != dp) {
+ 				/* Not match to user request, abort */
+ 				goto abort;
+@@ -1517,15 +1597,15 @@ static s32 __pmgr_hif_cfg_del(struct pp_hostif_cfg *hif, bool dbg_en)
+ 	/* Valid request, set default instead of deleted entries */
+ 	for_each_set_bit(tc, &bmap, PP_MAX_TC) {
+ 		PMGR_HIF_FOR_EACH_DP_HOH(i) {
+-			chk_exception_session_map_set(hif->cls.port, tc, i,
+-						      PMGR_HIF_DFLT_DP_IDX);
++			__pmgr_excep_sess_map_set(hif->cls.port, tc, i,
++						  PMGR_HIF_DFLT_DP_IDX);
+ 			db->hif_refc[PMGR_HIF_DFLT_DP_IDX]++;
+ 			dp = dp_num[PMGR_HOH_TO_DP_IDX(i, cnt)];
+ 			db->hif_refc[dp]--;
+ 		}
+ 	}
+ 
+-	/* Clean removed datapths */
++	/* Clean removed datapaths */
+ 	__pmgr_hif_dp_clean(dp_num, ARRAY_SIZE(dp_num), dbg_en);
+ 
+ 	return 0;
+@@ -1672,7 +1752,7 @@ static s32 __pmgr_hif_map_set(struct pp_hif_class *cls, u8 *dp_num_arr,
+ 	/* Check old mapping validity */
+ 	for_each_set_bit(tc, &bmap, PP_MAX_TC) {
+ 		PMGR_HIF_FOR_EACH_DP_HOH(i) {
+-			chk_exception_session_map_get(cls->port, tc, i, &dp);
++			__pmgr_excep_sess_map_get(cls->port, tc, i, &dp);
+ 			if (!PMGR_HIF_IS_DP_VALID(dp)) {
+ 				pr_err("Invalid Host interface datapath\n");
+ 				return -EPERM;
+@@ -1693,7 +1773,7 @@ static s32 __pmgr_hif_map_set(struct pp_hif_class *cls, u8 *dp_num_arr,
+ 	for_each_set_bit(tc, &bmap, PP_MAX_TC) {
+ 		PMGR_HIF_FOR_EACH_DP_HOH(i) {
+ 			dp = dp_num_arr[PMGR_HOH_TO_DP_IDX(i, cnt)];
+-			chk_exception_session_map_set(cls->port, tc, i, dp);
++			__pmgr_excep_sess_map_set(cls->port, tc, i, dp);
+ 			db->hif_refc[dp]++;
+ 		}
+ 	}
+@@ -1762,6 +1842,11 @@ static s32 __pmgr_hif_dp_add(struct pp_hif_datapath *dp,
+ 	exception_cfg.color = dp->color;
+ 	exception_cfg.sgc   = dp->sgc;
+ 	exception_cfg.tbm   = dp->tbm;
++	exception_cfg.flags = BIT(SI_CHCK_FLAG_UPDT_SESS_CNT);
++
++	/* logic will be done in ingress uc */
++	if (dp_num == PMGR_HIF_PROTECTED_DP_IDX)
++		exception_cfg.flags |= BIT(SI_CHCK_FLAG_SEND2FW);
+ 
+ 	ret = chk_exception_session_set(&exception_cfg);
+ 	if (unlikely(ret)) {
+@@ -1770,7 +1855,7 @@ static s32 __pmgr_hif_dp_add(struct pp_hif_datapath *dp,
+ 		goto out;
+ 	}
+ 
+-	/* Update databse */
++	/* Update database */
+ 	dp_db->eg[PMGR_HIF_DB_EGRESS_IDX].qos_q = dp->eg[eg_idx].qos_q;
+ 	dp_db->eg[PMGR_HIF_DB_EGRESS_IDX].pid   = dp->eg[eg_idx].pid;
+ 	dp_db->color = dp->color;
+@@ -1801,6 +1886,7 @@ static s32 __pmgr_hif_dp_add(struct pp_hif_datapath *dp,
+ static s32 __pmgr_hif_dp_dflt_set(struct pp_hif_datapath *dp, bool dbg_en)
+ {
+ 	u16 i;
++	s32 ret;
+ 
+ 	/* For default DP, egress must be set as first */
+ 	if ((!PP_IS_QUEUE_VALID(dp->eg[PMGR_HIF_DB_EGRESS_IDX].qos_q)) ||
+@@ -1819,8 +1905,24 @@ static s32 __pmgr_hif_dp_dflt_set(struct pp_hif_datapath *dp, bool dbg_en)
+ 		dp->eg[i].pid = PP_PORT_INVALID;
+ 	}
+ 
+-	return __pmgr_hif_dp_add(dp, PMGR_HIF_DFLT_DP_IDX,
++	ret = __pmgr_hif_dp_add(dp, PMGR_HIF_DFLT_DP_IDX,
++				PMGR_HIF_DB_EGRESS_IDX, dbg_en);
++	if (ret)
++		return ret;
++
++	/* Add the Protected exception session mapping
++	 * Defined the same as the default hostif,
++	 * with one difference - all packets are sent to the ingress fw
++	 */
++	ret = __pmgr_hif_dp_add(dp, PMGR_HIF_PROTECTED_DP_IDX,
+ 				 PMGR_HIF_DB_EGRESS_IDX, dbg_en);
++	if (ret)
++		return ret;
++
++	/* increase ref count so it will not be deleted */
++	db->hif_refc[PMGR_HIF_PROTECTED_DP_IDX]++;
++
++	return ret;
+ }
+ 
+ /**
+@@ -1999,6 +2101,48 @@ static u8 __pmgr_hif_db_dp_find(struct pp_hif_datapath *dp,
+ 	return PMGR_HIF_DP_INVALID;
+ }
+ 
++/**
++ * @brief get exception session mapping
++ * @note Retrieve from checker or from local db
++ * @param pid port index
++ * @param tc traffic class
++ * @param hoh hash of hash
++ * @param hal_dp out value
++ * @return 0 on success
++ */
++static s32 __pmgr_excep_sess_map_get(u16 pid, u8 tc, u8 hoh, u8 *hal_dp)
++{
++	s32 ret = 0;
++
++	if (db->port[pid].protected)
++		*hal_dp = db->port[pid].map_id[tc][hoh];
++	else
++		ret = chk_exception_session_map_get(pid, tc, hoh, hal_dp);
++
++	return ret;
++}
++
++/**
++ * @brief set exception session mapping
++ * @note Set the checker or the local db
++ * @param pid port index
++ * @param tc traffic class
++ * @param hoh hash of hash
++ * @param hal_dp value to set
++ * @return 0 on success
++ */
++static s32 __pmgr_excep_sess_map_set(u16 pid, u8 tc, u8 hoh, u8 hal_dp)
++{
++	s32 ret = 0;
++
++	if (db->port[pid].protected)
++		db->port[pid].map_id[tc][hoh] = hal_dp;
++	else
++		ret = chk_exception_session_map_set(pid, tc, hoh, hal_dp);
++
++	return ret;
++}
++
+ /**
+  * @brief Initialized module database
+  * @return s32 0 for success, non-zero otherwise
+diff --git a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h
+index 85f652150ea4..98263e0da93d 100644
+--- a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h
+@@ -31,6 +31,12 @@ struct pp_pmgr_init_param {
+  */
+ #define PMGR_HIF_DFLT_DP_IDX 0
+ 
++/**
++ * @define host interface number 1 is statically assigned to
++ *         protected dp
++ */
++#define PMGR_HIF_PROTECTED_DP_IDX 1
++
+ /**
+  * @struct module statistics (for debug)
+  */
+diff --git a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_internal.h
+index 1f2760426612..467415904dd2 100644
+--- a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_internal.h
+@@ -38,12 +38,13 @@
+ 
+ /**
+  * @define going trough all the host interfaces in database
++ *         Don't do it for dp 0/1 since they are driver internal
+  */
+ #define PMGR_HIF_DB_FOR_EACH_DP(i)     \
+-	for (i = 1; i < PMGR_HIF_DB_DP_MAX; i++)
++	for (i = 2; i < PMGR_HIF_DB_DP_MAX; i++)
+ 
+ /**
+- * @define for host interface datapths database, only queue
++ * @define for host interface datapaths database, only queue
+  *         index 0 is in used (for using the same data structure
+  *         in database
+  */
+@@ -83,11 +84,17 @@
+  * @cfg port configuration
+  * @rpb_map the RPB port mapping
+  * @active port status
++ * @map_id exception session mappings.
++ *         When port goes to protected mode, all mapping is saved here.
++ *         Once it goes back to normal mode, the original mapping are applied
++ * @protected is port protected
+  */
+ struct pmgr_db_port {
+ 	struct pp_port_cfg cfg;
+ 	u32                rpb_map;
+ 	bool               active;
++	u8                 map_id[PP_MAX_TC][CHK_HOH_MAX];
++	bool               protected;
+ };
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+index 0d9580004cdb..6e7c090cd62c 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+@@ -1230,6 +1230,8 @@ void pp_qos_dbg_tree_remove(struct seq_file *s)
+ 		}
+ 	}
+ 
++	memset(&stats, 0, sizeof(stats));
++
+ 	/* Read stats */
+ 	for (idx = 0; idx < 100; ++idx) {
+ 		total_occupancy = 0;
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 823bf0025c79..8e28e843a230 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -1464,6 +1464,20 @@ s32 pp_open_sessions_get(u32 *open_sessions)
+ }
+ EXPORT_SYMBOL(pp_open_sessions_get);
+ 
++s32 pp_created_sessions_get(u32 *created_sessions)
++{
++	if (unlikely(ptr_is_null(created_sessions)))
++		return -EINVAL;
++
++	if (unlikely(!pp_is_ready()))
++		return -EPERM;
++
++	*created_sessions = atomic_read(&db->stats.sess_created);
++
++	return 0;
++}
++EXPORT_SYMBOL(pp_created_sessions_get);
++
+ s32 pp_session_stats_get(u32 id, struct pp_stats *stats)
+ {
+ 	struct pp_dsi dsi;
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.c b/drivers/net/ppv4/pp-hal/checker/checker.c
+index 43dd5e4603a5..6fc20fb42fbc 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.c
++++ b/drivers/net/ppv4/pp-hal/checker/checker.c
+@@ -708,7 +708,7 @@ s32 chk_exception_session_set(struct exception_session_cfg *cfg)
+ 	alt_si.dst_q       = cfg->queue;
+ 	alt_si.tmpl_ud_sz  = CHK_EXCEPTION_TMP_UD_SZ;
+ 	alt_si.trim_l3_id  = SI_NO_TRIM_VALUE;
+-	alt_si.chck_flags  = BIT(SI_CHCK_FLAG_UPDT_SESS_CNT);
++	alt_si.chck_flags  = cfg->flags;
+ 
+ 	ret = pp_si_sgc_info_set(cfg->sgc, ARRAY_SIZE(alt_si.sgc), &alt_si);
+ 	if (ret) {
+@@ -762,6 +762,7 @@ s32 chk_exception_session_get(struct exception_session_cfg *cfg)
+ 	cfg->color = alt_si.color;
+ 	memcpy(cfg->sgc, &alt_si.sgc, sizeof(alt_si.sgc));
+ 	memcpy(cfg->tbm, &alt_si.tbm, sizeof(alt_si.tbm));
++	cfg->flags = alt_si.chck_flags;
+ 
+ 	return 0;
+ }
+@@ -794,13 +795,22 @@ s32 chk_exception_session_si_set(u32 id, struct pp_si *alt_si)
+ 	return ret;
+ }
+ 
+-s32 chk_exception_session_map_set(u16 port, u8 tc, u8 hoh, u8 id)
++static void __chk_map_set(u16 port, u8 tc, u8 hoh, u8 id)
+ {
+ 	unsigned long mapping_base_addr;
+ 	u32 mapping_val;
+ 
+ 	pr_debug("port %u. tc %u. hoh %u. id %u\n", port, tc, hoh, id);
+ 
++	mapping_base_addr = CHK_ALT_SI_MAP_RAM(port, tc);
++	mapping_val = PP_REG_RD32(mapping_base_addr);
++	mapping_val &= ~(0xFF << (BITS_PER_BYTE * hoh));
++	mapping_val |= id << (BITS_PER_BYTE * hoh);
++	PP_REG_WR32(mapping_base_addr, mapping_val);
++}
++
++s32 chk_exception_session_map_set(u16 port, u8 tc, u8 hoh, u8 id)
++{
+ 	if (id >= (CHK_NUM_EXCEPTION_SESSIONS - 1)) {
+ 		pr_err("Exception id %d exceeds maximum of %d\n",
+ 		       id, CHK_NUM_EXCEPTION_SESSIONS - 1);
+@@ -822,11 +832,7 @@ s32 chk_exception_session_map_set(u16 port, u8 tc, u8 hoh, u8 id)
+ 		return -EINVAL;
+ 	}
+ 
+-	mapping_base_addr = CHK_ALT_SI_MAP_RAM(port, tc);
+-	mapping_val = PP_REG_RD32(mapping_base_addr);
+-	mapping_val &= ~(0xFF << (BITS_PER_BYTE * hoh));
+-	mapping_val |= id << (BITS_PER_BYTE * hoh);
+-	PP_REG_WR32(mapping_base_addr, mapping_val);
++	__chk_map_set(port, tc, hoh, id);
+ 
+ 	return 0;
+ }
+@@ -862,6 +868,72 @@ s32 chk_exception_session_map_get(u16 port, u8 tc, u8 hoh, u8 *id)
+ 	return 0;
+ }
+ 
++s32 chk_exception_session_port_map_set(u16 port,
++				       u8 id[PP_MAX_TC][CHK_HOH_MAX])
++{
++	u8 tc_ind;
++	u8 hoh_ind;
++	u8 max_excep_sess = CHK_NUM_EXCEPTION_SESSIONS - 1;
++
++	pr_debug("set port %u mapping\n", port);
++
++	if (!PP_IS_PORT_VALID(port)) {
++		pr_err("Invalid port %u\n", port);
++		return -EINVAL;
++	}
++
++	/* Verify ID's are valid */
++	for (tc_ind = 0; tc_ind < PP_MAX_TC; tc_ind++) {
++		for (hoh_ind = 0; hoh_ind < CHK_HOH_MAX; hoh_ind++) {
++			if (id[tc_ind][hoh_ind] >= max_excep_sess) {
++				pr_err("id %u exceeds maximum of %u\n",
++				       id[tc_ind][hoh_ind],
++				       max_excep_sess);
++				return -EINVAL;
++			}
++		}
++	}
++
++	for (tc_ind = 0; tc_ind < PP_MAX_TC; tc_ind++) {
++		for (hoh_ind = 0; hoh_ind < CHK_HOH_MAX; hoh_ind++) {
++			__chk_map_set(port, tc_ind, hoh_ind,
++				      id[tc_ind][hoh_ind]);
++		}
++	}
++
++	return 0;
++}
++
++s32 chk_exception_session_port_map_get(u16 port,
++				       u8 id[PP_MAX_TC][CHK_HOH_MAX])
++{
++	unsigned long mapping_base_addr;
++	u32 mapping_val;
++	u8 tc_ind;
++	u8 hoh_ind;
++
++	if (port >= PP_MAX_PORT) {
++		pr_err("Invalid port %u\n", port);
++		return -EINVAL;
++	}
++
++	for (tc_ind = 0; tc_ind < PP_MAX_TC; tc_ind++) {
++		mapping_base_addr = CHK_ALT_SI_MAP_RAM(port, tc_ind);
++		mapping_val = PP_REG_RD32(mapping_base_addr);
++
++		for (hoh_ind = 0; hoh_ind < CHK_HOH_MAX; hoh_ind++) {
++			id[tc_ind][hoh_ind] = (mapping_val >>
++					      (BITS_PER_BYTE * hoh_ind)) &
++					      0xFF;
++
++			pr_debug("port %u. tc %u. hoh %u. id %u\n",
++				port, tc_ind, hoh_ind, id[tc_ind][hoh_ind]);
++		}
++	}
++
++	return 0;
++}
++
+ s32 chk_exception_stats_get(u8 id, struct pp_stats *stats)
+ {
+ 	struct hw_sgc hw_stats = { 0 };
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.h b/drivers/net/ppv4/pp-hal/checker/checker.h
+index ed60570d56c1..3ad50aab7186 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.h
++++ b/drivers/net/ppv4/pp-hal/checker/checker.h
+@@ -115,6 +115,7 @@ struct pp_chk_init_param {
+  * @color color to set on descriptor
+  * @sgc optional, sgc id's
+  * @tbm optional, tbm id's
++ * @flags checker flags
+  */
+ struct exception_session_cfg {
+ 	u8 id;
+@@ -123,6 +124,7 @@ struct exception_session_cfg {
+ 	u8 color;
+ 	u16 *sgc;
+ 	u16 *tbm;
++	u16 flags;
+ };
+ 
+ struct chk_stats {
+@@ -260,6 +262,24 @@ s32 chk_exception_session_map_set(u16 port, u8 tc, u8 hoh, u8 id);
+  */
+ s32 chk_exception_session_map_get(u16 port, u8 tc, u8 hoh, u8 *id);
+ 
++/**
++ * @brief Set all exception mappings for port
++ * @param port ingress port
++ * @param id array of exception id's
++ * @return s32 0 on success, error code otherwise
++ */
++s32 chk_exception_session_port_map_set(u16 port,
++				       u8 id[PP_MAX_TC][CHK_HOH_MAX]);
++
++/**
++ * @brief Get all exception mappings for port
++ * @param port ingress port
++ * @param id array of exception id's
++ * @return s32 0 on success, error code otherwise
++ */
++s32 chk_exception_session_port_map_get(u16 port,
++				       u8 id[PP_MAX_TC][CHK_HOH_MAX]);
++
+ /**
+  * @brief Get session DSI info
+  * @param id session id
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker_debugfs.c b/drivers/net/ppv4/pp-hal/checker/checker_debugfs.c
+index fd2463c8a48f..bc58044a1fc8 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker_debugfs.c
++++ b/drivers/net/ppv4/pp-hal/checker/checker_debugfs.c
+@@ -115,9 +115,76 @@ void exception_map_get(char *cmd_buf, void *data)
+ 
+ PP_DEFINE_DEBUGFS(map_get, exception_map_get_help, exception_map_get);
+ 
++void excep_port_map_set_help(struct seq_file *f)
++{
++	seq_puts(f, "<ingress port> #1 #2 #3...#16\n");
++	seq_puts(f, "#1 - id for tc=0 hoh=0\n");
++	seq_puts(f, "#2 - id for tc=0 hoh=1\n");
++	seq_puts(f, "#3 - id for tc=0 hoh=2\n");
++	seq_puts(f, "#4 - id for tc=0 hoh=3\n");
++	seq_puts(f, "#5 - id for tc=1 hoh=0\n");
++	seq_puts(f, "...\n");
++	seq_puts(f, "#16 - id for tc=3 hoh=3\n");
++}
++
++void excep_port_map_set(char *cmd_buf, void *data)
++{
++	u16 port;
++	u8 id[PP_MAX_TC][CHK_HOH_MAX];
++
++	if (sscanf(cmd_buf, "%hu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu %hhu",
++		   &port, &id[0][0], &id[0][1], &id[0][2], &id[0][3],
++		   &id[1][0], &id[1][1], &id[1][2], &id[1][3],
++		   &id[2][0], &id[2][1], &id[2][2], &id[2][3],
++		   &id[3][0], &id[3][1], &id[3][2], &id[3][3]) != 17) {
++		pr_err("sscanf err\n");
++		return;
++	}
++
++	if (chk_exception_session_port_map_set(port, id)) {
++		pr_err("chk_exception_session_port_map_set failed\n");
++		return;
++	}
++}
++
++PP_DEFINE_DEBUGFS(port_map_set, excep_port_map_set_help, excep_port_map_set);
++
++void excep_port_map_get_help(struct seq_file *f)
++{
++	seq_puts(f, "<ingress port>\n");
++}
++
++void excep_port_map_get(char *cmd_buf, void *data)
++{
++	u16 port;
++	u8 id[PP_MAX_TC][CHK_HOH_MAX];
++
++	if (sscanf(cmd_buf, "%hu", &port) != 1) {
++		pr_err("sscanf err\n");
++		return;
++	}
++
++	if (chk_exception_session_port_map_get(port, id)) {
++		pr_err("chk_exception_session_port_map_get failed\n");
++		return;
++	}
++
++	pr_info("Exception Id's:\n");
++	pr_info("tc 0 (hoh 0-3): %d %d %d %d\n",
++		id[0][0], id[0][1], id[0][2], id[0][3]);
++	pr_info("tc 1 (hoh 0-3): %d %d %d %d\n",
++		id[1][0], id[1][1], id[1][2], id[1][3]);
++	pr_info("tc 2 (hoh 0-3): %d %d %d %d\n",
++		id[2][0], id[2][1], id[2][2], id[2][3]);
++	pr_info("tc 3 (hoh 0-3): %d %d %d %d\n",
++		id[3][0], id[3][1], id[3][2], id[3][3]);
++}
++
++PP_DEFINE_DEBUGFS(port_map_get, excep_port_map_get_help, excep_port_map_get);
++
+ void exception_set_help(struct seq_file *f)
+ {
+-	seq_puts(f, "<id> <port> <queue> <color>\n");
++	seq_puts(f, "<id> <port> <queue> <color> <flags_bitmap>\n");
+ }
+ 
+ void exception_set(char *cmd_buf, void *data)
+@@ -127,11 +194,12 @@ void exception_set(char *cmd_buf, void *data)
+ 	u16  tbm[PP_SI_TBM_MAX];
+ 	u32  idx;
+ 
+-	if (sscanf(cmd_buf, "%hhu %hu %hu %hhu",
++	if (sscanf(cmd_buf, "%hhu %hu %hu %hhu %hx",
+ 		   &chk_cfg.id,
+ 		   &chk_cfg.port,
+ 		   &chk_cfg.queue,
+-		   &chk_cfg.color) != 4) {
++		   &chk_cfg.color,
++		   &chk_cfg.flags) != 5) {
+ 		pr_err("sscanf err\n");
+ 		return;
+ 	}
+@@ -142,8 +210,8 @@ void exception_set(char *cmd_buf, void *data)
+ 	for (idx = 0 ; idx < PP_SI_TBM_MAX ; idx++)
+ 		tbm[idx] = PP_TBM_INVALID;
+ 
+-	chk_cfg.sgc = sgc;
+-	chk_cfg.tbm = tbm;
++	chk_cfg.sgc   = sgc;
++	chk_cfg.tbm   = tbm;
+ 
+ 	if (chk_exception_session_set(&chk_cfg)) {
+ 		pr_err("chk_exception_session_set failed\n");
+@@ -246,6 +314,7 @@ static int exception_get(void *data, u64 val)
+ 		chk_cfg.tbm[1],
+ 		chk_cfg.tbm[2],
+ 		chk_cfg.tbm[3]);
++	pr_info("checker flags %#x\n", chk_cfg.flags);
+ 
+ 	return 0;
+ }
+@@ -764,21 +833,23 @@ void __chk_exceptions_pps_show(struct seq_file *f)
+ PP_DEFINE_DEBUGFS(exceptions_pps, __chk_exceptions_pps_show, NULL);
+ 
+ static struct debugfs_file chk_dbg_files[] = {
+-	{"crawler",           &PP_DEBUGFS_FOPS(crawler)},
+-	{"exceptions_pps",    &PP_DEBUGFS_FOPS(exceptions_pps)},
+-	{"exceptions_stats",  &PP_DEBUGFS_FOPS(exceptions_stats)},
+-	{"exception_tbm_set", &PP_DEBUGFS_FOPS(excep_tbm_set)},
+-	{"exception_set",     &PP_DEBUGFS_FOPS(excep_set)},
+-	{"exception_get",     &PP_DEBUGFS_FOPS(exception_get)},
+-	{"exception_map_set", &PP_DEBUGFS_FOPS(map_set)},
+-	{"exception_map_get", &PP_DEBUGFS_FOPS(map_get)},
+-	{"stats",             &PP_DEBUGFS_FOPS(stats)},
+-	{"syncq_enable",      &PP_DEBUGFS_FOPS(sq_enable)},
+-	{"syncq_disable",     &PP_DEBUGFS_FOPS(sq_disable)},
+-	{"tbm",               &PP_DEBUGFS_FOPS(tbm)},
+-	{"clock",             &PP_DEBUGFS_FOPS(clock)},
+-	{"cache_stats",       &PP_DEBUGFS_FOPS(cntr_cache_stats_show)},
+-	{"cache_bypass",      &PP_DEBUGFS_FOPS(cntr_cache_bypass)},
++	{"crawler",                &PP_DEBUGFS_FOPS(crawler)},
++	{"exceptions_pps",         &PP_DEBUGFS_FOPS(exceptions_pps)},
++	{"exceptions_stats",       &PP_DEBUGFS_FOPS(exceptions_stats)},
++	{"exception_tbm_set",      &PP_DEBUGFS_FOPS(excep_tbm_set)},
++	{"exception_set",          &PP_DEBUGFS_FOPS(excep_set)},
++	{"exception_get",          &PP_DEBUGFS_FOPS(exception_get)},
++	{"exception_map_set",      &PP_DEBUGFS_FOPS(map_set)},
++	{"exception_map_get",      &PP_DEBUGFS_FOPS(map_get)},
++	{"excep_port_map_set", &PP_DEBUGFS_FOPS(port_map_set)},
++	{"excep_port_map_get", &PP_DEBUGFS_FOPS(port_map_get)},
++	{"stats",                  &PP_DEBUGFS_FOPS(stats)},
++	{"syncq_enable",           &PP_DEBUGFS_FOPS(sq_enable)},
++	{"syncq_disable",          &PP_DEBUGFS_FOPS(sq_disable)},
++	{"tbm",                    &PP_DEBUGFS_FOPS(tbm)},
++	{"clock",                  &PP_DEBUGFS_FOPS(clock)},
++	{"cache_stats",            &PP_DEBUGFS_FOPS(cntr_cache_stats_show)},
++	{"cache_bypass",           &PP_DEBUGFS_FOPS(cntr_cache_bypass)},
+ };
+ 
+ static struct debugfs_file drv_dbg_files[] = {
+diff --git a/include/linux/pp_api.h b/include/linux/pp_api.h
+index 6412dbdf540b..59a916df53e1 100755
+--- a/include/linux/pp_api.h
++++ b/include/linux/pp_api.h
+@@ -990,6 +990,20 @@ s32 pp_port_del(u16 pid);
+  */
+ s32 pp_port_stats_get(u16 pid, struct pp_stats *stats);
+ 
++/**
++ * @brief Start port DPL white list protection
++ * @param pid pp port number
++ * @return s32 return 0 for success
++ */
++s32 pp_port_protect(u16 pid);
++
++/**
++ * @brief Stop port DPL white list protection
++ * @param pid pp port number
++ * @return s32 return 0 for success
++ */
++s32 pp_port_unprotect(u16 pid);
++
+ /**
+  * @brief set default PP to host interface
+  * @param dp default hostif datapath param
+@@ -1041,6 +1055,13 @@ s32 pp_max_sessions_get(u32 *max_sessions);
+  */
+ s32 pp_open_sessions_get(u32 *open_sessions);
+ 
++/**
++ * @brief get the pp number of created sessions
++ * @param created_sessions number of created sessions
++ * @return s32 return 0 for success
++ */
++s32 pp_created_sessions_get(u32 *created_sessions);
++
+ /**
+  * @brief get session statistics
+  * @note Cannot be used from irq context

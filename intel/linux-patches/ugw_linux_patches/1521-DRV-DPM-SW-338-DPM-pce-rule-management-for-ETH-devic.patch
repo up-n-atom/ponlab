@@ -1,0 +1,1504 @@
+From ace3c3768b75cda7be525d76659c13954abbee43 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Tue, 18 Aug 2020 13:39:18 +0800
+Subject: [PATCH] DRV_DPM_SW-338 - DPM pce rule management for ETH devices for
+ vlan aware feature 	       - DPM move datapath_br_vlan.c from HAL to DP
+ common & its related changes
+
+---
+ drivers/net/datapath/dpm/Makefile                  |   2 +-
+ drivers/net/datapath/dpm/datapath.h                |   8 +
+ drivers/net/datapath/dpm/datapath_api.c            |   1 -
+ .../datapath/dpm/{gswip31 => }/datapath_br_vlan.c  | 335 +++++++++++++++++++--
+ drivers/net/datapath/dpm/datapath_instance.c       |  12 +
+ drivers/net/datapath/dpm/datapath_instance.h       |   2 +
+ drivers/net/datapath/dpm/datapath_pce.c            | 191 +++++++-----
+ drivers/net/datapath/dpm/datapath_pce.h            |  55 ++++
+ drivers/net/datapath/dpm/datapath_proc.c           | 120 ++++++++
+ drivers/net/datapath/dpm/datapath_swdev.c          |  56 +---
+ drivers/net/datapath/dpm/datapath_swdev.h          |  21 +-
+ drivers/net/datapath/dpm/gswip31/Makefile          |   1 -
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   |  36 ++-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h   |   8 -
+ .../net/datapath/dpm/gswip31/datapath_switchdev.c  |  13 +-
+ include/net/datapath_api.h                         |   1 +
+ include/net/datapath_inst.h                        |   7 -
+ 17 files changed, 694 insertions(+), 175 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/Makefile b/drivers/net/datapath/dpm/Makefile
+index f2b73d2f8d5e..f1020ce5e1fd 100644
+--- a/drivers/net/datapath/dpm/Makefile
++++ b/drivers/net/datapath/dpm/Makefile
+@@ -13,7 +13,7 @@ obj-$(CONFIG_INTEL_DATAPATH) += gswip30/
+ endif
+ 
+ ifneq ($(CONFIG_INTEL_DATAPATH_SWITCHDEV),)
+-obj-$(CONFIG_INTEL_DATAPATH) += datapath_swdev.o
++obj-$(CONFIG_INTEL_DATAPATH) += datapath_swdev.o datapath_br_vlan.o
+ endif
+ 
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_ioctl.o
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index dceca3c58b6b..306d81ceecab 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -638,10 +638,18 @@ struct pmac_port_info {
+ 	struct dp_subif_info *subif_info;
+ };
+ 
++struct ctp_dev {
++	struct list_head list;
++	struct net_device *dev; /* CTP device pointer */
++	u16 bp; /* bridge port */
++	u16 ctp; /* CTP port */
++};
++
+ /*bridge port with pmapper supported dev structure */
+ struct bp_pmapper {
+ 	int flag;/*0-FREE, 1-Used*/
+ 	struct net_device *dev; /*bridge port device pointer */
++	struct list_head ctp_dev; /* CTP dev list */
+ 	int pcp[DP_PMAP_PCP_NUM];  /*PCP table */
+ 	int dscp[DP_PMAP_DSCP_NUM]; /*DSCP table*/
+ 	int def_ctp; /*Untag & nonip*/
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 48a3043af7f5..17fa195b2a6b 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -2848,7 +2848,6 @@ int dp_init_module(void)
+ 		pr_info("NMI_MASK\n");
+ #endif
+ 	dp_init_ok = 1;
+-
+ 	return res;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_br_vlan.c b/drivers/net/datapath/dpm/datapath_br_vlan.c
+similarity index 68%
+rename from drivers/net/datapath/dpm/gswip31/datapath_br_vlan.c
+rename to drivers/net/datapath/dpm/datapath_br_vlan.c
+index de7ef5ee0d51..556673c5af9d 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_br_vlan.c
++++ b/drivers/net/datapath/dpm/datapath_br_vlan.c
+@@ -6,8 +6,10 @@
+ #include <net/switch_api/gsw_flow_ops.h>
+ #include <net/datapath_api.h>
+ #include <net/datapath_api_vlan.h>
+-#include "../datapath.h"
+-#include "../datapath_instance.h"
++#include "datapath.h"
++#include "datapath_instance.h"
++#include "datapath_swdev.h"
++#include "datapath_pce.h"
+ #include <linux/if_bridge.h>
+ #include <../net/bridge/br_private.h>
+ 
+@@ -29,6 +31,10 @@ static int dp_del_vlan_entry(struct br_info *br_info,
+ 			     struct vlist_entry *vlist_entry, u16 bport,
+ 			     u16 vlanid, int flags);
+ 
++static int dp_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
++				 u16 flags);
++static int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
++				 u16 flags);
+ /* Check Bridge have the entry added through Self
+  * if vlanid=0, returns first entry
+  * if valid vlanid, returns entry pointed by VLAN ID
+@@ -128,9 +134,36 @@ struct vlist_entry *get_vlist_entry_in_bp(struct br_info *br_info,
+ 	return NULL;
+ }
+ 
++/* Get PCE Entry base on VLAN from a Bridge port */
++static
++struct pce_entry *get_vlan_pce_entry_in_bp(struct vlan_entry *ventry,
++		struct bridge_member_port *bmp)
++{
++	struct pce_entry *pce_entry = NULL;
++
++	list_for_each_entry(pce_entry, &bmp->pce_list, plist) {
++		if (ventry->vlan_id != pce_entry->vid)
++			continue;
++		return pce_entry;
++	}
++	return NULL;
++}
++
+ /* When Bridge Entry is created/deleted in DPM we check whether this bridge is
+  * VLAN Aware and change ndo_bridge ops
+  */
++#if (!IS_ENABLED(CONFIG_GRX500_CBM) && !IS_ENABLED(CONFIG_X86_INTEL_LGM))
++int dp_register_br_vlan(struct br_info *br_info, int flags)
++{
++	return DP_SUCCESS;
++}
++
++int dp_register_bport_vlan(struct br_info *br_info,
++			   struct net_device *dev, int bport, int flags)
++{
++	return DP_SUCCESS;
++}
++#else
+ int dp_register_br_vlan(struct br_info *br_info, int flags)
+ {
+ 	struct net_bridge *br;
+@@ -256,6 +289,7 @@ int dp_register_bport_vlan(struct br_info *br_info,
+ 
+ 	return DP_SUCCESS;
+ }
++#endif
+ 
+ /* Copy the Bridge Settings of bridge to the new Vlan Aware FiD's */
+ static int dp_gsw_bridge_cfg_copy(int inst, u16 src_fid, u16 dst_fid)
+@@ -354,6 +388,230 @@ static int allocate_br_vlan_fid(struct br_info *br_info,
+ 	return fid;
+ }
+ 
++/* Remove PCE BLK for CTP region and delete pce rule */
++static int dp_delete_pce(int pceidx, struct dp_pce_blk_info *blk_info)
++{
++	GSW_PCE_ruleDelete_t pce_del;
++
++	pce_del.logicalportid = blk_info->info.portid;
++	pce_del.subifidgroup = blk_info->info.subif;
++	pce_del.region = blk_info->region;
++	pce_del.nIndex = pceidx;
++
++	dp_pce_rule_del_priv(blk_info, &pce_del);
++
++	return 0;
++}
++
++/* Alloc PCE BLK for CTP region and create a new pce rule */
++static int dp_add_new_pce(struct br_info *br_info,
++			  struct vlan_entry *ventry,
++			  struct bridge_member_port *bmp)
++{
++	GSW_PCE_rule_t *pce_rule;
++	struct dp_subblk_info *blk_info;
++	dp_subif_t subif;
++	u32 flag;
++	int idx = 0;
++
++	if (!bmp->blk_info) {
++		pr_err("%s: pce_blk %x info not present\n",
++		       __func__, (u32)bmp->blk_info);
++		return -1;
++	}
++	
++	if (dp_get_netif_subifid(bmp->dev, NULL, NULL, NULL, &subif, 0)) {
++		pr_err("%s: dp_get_netif_subifid failed\n", __func__);
++		return DP_FAILURE;
++	}
++
++	pce_rule = kzalloc(sizeof(*pce_rule), GFP_ATOMIC);
++	if (!pce_rule)
++		return -1;
++
++	blk_info = &bmp->blk_info->info;
++	/* TODO-Update subif group */
++	if (!blk_info->subif)
++		blk_info->subif = subif.subif;
++	if (!blk_info->subblk_size)
++		blk_info->subblk_size = VLAN_PCE_MAX_SUBBLK_SIZE;
++	if (!blk_info->portid)
++		blk_info->portid = subif.port_id;
++	if (!strlen(blk_info->subblk_name)) {
++		strncpy(blk_info->subblk_name, "dp_br_vlan",
++			sizeof(blk_info->subblk_name) - 1);
++	}
++	bmp->blk_info->region = GSW_PCE_RULE_CTP;
++
++	pce_rule->logicalportid = subif.port_id;
++	pce_rule->subifidgroup = subif.subif_groupid;
++
++	/* pce_rule pattern setting */
++	pce_rule->region = GSW_PCE_RULE_CTP;
++	pce_rule->pattern.bEnable = 1;
++	pce_rule->pattern.bSubIfIdEnable = 1;
++	pce_rule->pattern.eSubIfIdType = GSW_PCE_SUBIFID_TYPE_BRIDGEPORT;
++	pce_rule->pattern.nSubIfId = bmp->bportid;
++	pce_rule->pattern.bSLAN_Vid = 1;
++	pce_rule->pattern.nSLAN_Vid = ventry->vlan_id;
++
++	/* action setting */
++	pce_rule->action.bFidEnable = 1;
++	pce_rule->action.nFId = ventry->fid;
++
++	idx = dp_pce_rule_add_priv(bmp->blk_info, pce_rule);
++	kfree(pce_rule);
++	return idx;
++}
++
++/* Delete pce entry from bridge port list
++ * pce_dis = 1 -> Disable the PCE index
++ * pce_dis = 0 -> Delete the PCE rule and remove from BP list
++ */
++static int dp_del_pce_entry_from_bp_list(struct vlan_entry *ventry,
++		struct bridge_member_port *bmp, int pce_dis)
++{
++	struct pce_entry *pce_entry = NULL;
++
++	pce_entry = get_vlan_pce_entry_in_bp(ventry, bmp);
++	if (!pce_entry) {
++		pr_err("%s: Cannot find vlanid %d in Bp %d\n", __func__,
++		       ventry->vlan_id, bmp->bportid);
++		return -1;
++	}
++
++	if (!pce_dis) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: delete pce idx(%d) for vid:%d\n",
++			 __func__, pce_entry->idx, pce_entry->vid);
++		dp_delete_pce(pce_entry->idx, bmp->blk_info);
++		list_del(&pce_entry->plist);
++		kfree(pce_entry);
++	} else {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: disable pce idx(%d) for vid:%d\n",
++			 __func__, pce_entry->idx, pce_entry->vid);
++		dp_update_pce_rule(pce_entry->idx, bmp->blk_info, pce_dis);
++		pce_entry->disable = pce_dis;
++	}
++	return 0;
++}
++
++/* Delete a pce rule, If vlan FID is deleted */
++static int dp_del_vlan_pce_rule(struct vlan_entry *ventry,
++				struct br_info *br_info, int bport,
++				int pce_dis)
++{
++	struct bridge_member_port *bmp = NULL;
++	int ret = DP_SUCCESS;
++	struct vlist_entry *list_entry;
++
++	/* check if vlan id present in bridge port ventry list */
++	list_for_each_entry(bmp, &br_info->bp_list, list) {
++		list_for_each_entry(list_entry, &bmp->bport_vlan_list, list) {
++			if (ventry->vlan_id != list_entry->vlan_entry->vlan_id)
++				continue;
++			ret = dp_del_pce_entry_from_bp_list(ventry,
++							    bmp,
++							    pce_dis);
++			break;
++		}
++	}
++	return ret;
++}
++
++/* Add pce entry to the bridge port list */
++static int dp_add_pce_entry_to_bp_list(struct vlan_entry *ventry,
++				       struct br_info *br_info,
++				       struct bridge_member_port *bmp)
++{
++	struct pce_entry *pce = NULL;
++
++	pce = kzalloc(sizeof(*pce), GFP_ATOMIC);
++	if (!pce)
++		return -1;
++
++	pce->idx = dp_add_new_pce(br_info, ventry, bmp);
++	if (pce->idx < 0) {
++		pr_err("%s: dp_add_new_pce for Vlan %d Bport %d failed\n",
++		       __func__, ventry->vlan_id, bmp->bportid);
++		return -1;
++	}
++
++	pce->vid = ventry->vlan_id;
++
++	/* Mark this PCE rule is enabled/disabled */
++	if (ventry->fid)
++		pce->disable = 0;
++	else
++		pce->disable = 1;
++	list_add(&pce->plist, &bmp->pce_list);
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: In vlan_id %d added(%s)\n",
++		 __func__, ventry->vlan_id,
++		 pce->disable ? "Disable" : "Enable");
++	return 0;
++}
++
++/* Add a new pce rule, If new vlan FID is created
++ * If PCE index exists already for a BP, Enable the previously added rule index
++ */
++static int dp_add_vlan_pce_rule(struct vlan_entry *ventry,
++				struct br_info *br_info, int bport)
++{
++	int ret = DP_SUCCESS;
++	struct pce_entry *pce_entry = NULL;
++	struct bridge_member_port *bmp = NULL;
++	struct vlist_entry *list_entry = NULL;
++
++	/* Go through all the Bridge Port members
++	 * check if vlan id present in bridge port ventry list
++	 */
++	list_for_each_entry(bmp, &br_info->bp_list, list) {
++		list_for_each_entry(list_entry, &bmp->bport_vlan_list, list) {
++			if (ventry->vlan_id != list_entry->vlan_entry->vlan_id)
++				continue;
++
++			/* First time when PCE list is empty */
++			if (list_empty(&bmp->pce_list))
++				goto ADD_NEW_PCE_RULE;
++
++			/* VLAN entry is there but no PCE rule yet, add it */
++			pce_entry = get_vlan_pce_entry_in_bp(ventry, bmp);
++			if (!pce_entry)
++				goto ADD_NEW_PCE_RULE;
++
++			/* Vlan Entry + PCE rule present, but rule disabled */
++			if (pce_entry->disable) {
++				DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++					 "%s: %s Bport %d vlanid %d\n",
++					 __func__,
++					 "Enabling PCE rule for",
++					 bmp->bportid,
++					 ventry->vlan_id);
++				dp_update_pce_rule(pce_entry->idx,
++						   bmp->blk_info,
++						   0);
++				pce_entry->disable = 0;
++			}
++			continue;
++			
++ADD_NEW_PCE_RULE:
++			DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++				 "%s: Creating PCE rule Bport %d vlanid %d\n",
++				 __func__,
++				 bmp->bportid,
++				 ventry->vlan_id);
++
++			/* It's a new pce rule for this bridge port add it */
++			if (dp_add_pce_entry_to_bp_list(list_entry->vlan_entry,
++							br_info, bmp))
++				return DP_FAILURE;
++		}
++	}
++	return ret;
++}
++
+ /* Add a VLAN Entry, If already have in BP or Bridge, reuse the VLAN entry
+  * In 1 Bridge Each VLAN have only 1 uniqueue FiD
+  * NewFID = VlanID + BridgeID
+@@ -363,17 +621,20 @@ static struct vlan_entry *dp_add_vlan_entry(struct br_info *br_info,
+ 		struct vlist_entry *bp_ventry,
+ 		int bport, u16 vlanid, int flags)
+ {
+-	struct vlist_entry *vlist_entry;
++	struct vlist_entry *vlist_entry, *curr_bp_ventry = NULL;
+ 	struct vlan_entry *ventry;
+ 	struct list_head *vhead;
+ 	int fid = 0;
+ 	bool alloc_fid = false;
++	bool add_pce_list = false;
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
+ 		 "%s: dev=%s bport=%d vlanid=%d flags=%08x\n", __func__,
+ 		 br_info->dev->name, bport, vlanid, flags);
+ 
+-	if (br_ventry && bp_ventry) {
++	if (flags & BRIDGE_FLAGS_MASTER)
++		curr_bp_ventry = get_vlist_entry_in_bp(br_info, bport, vlanid, 0);
++	if (br_ventry && bp_ventry && curr_bp_ventry) {
+ 		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
+ 			 "%s: No Need to add both br & bport have the entry\n",
+ 			 __func__);
+@@ -428,6 +689,12 @@ static struct vlan_entry *dp_add_vlan_entry(struct br_info *br_info,
+ 		/* BP already have, now we are going to create BR */
+ 		if (flags & BRIDGE_FLAGS_SELF)
+ 			alloc_fid = true;
++	} else if (br_ventry && bp_ventry && !curr_bp_ventry) {
++		DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++			 "%s: Allocating a bp entry for current bp\n",
++			 __func__);
++		vlist_entry->vlan_entry = br_ventry->vlan_entry;
++		add_pce_list = true;
+ 	} else {
+ 		pr_err("%s: Impossible alloc both BP and BR have VLAN Entry\n",
+ 		       __func__);
+@@ -444,10 +711,20 @@ static struct vlan_entry *dp_add_vlan_entry(struct br_info *br_info,
+ 			return NULL;
+ 		}
+ 		vlist_entry->vlan_entry->fid = fid;
++		add_pce_list = true;
+ 	}
+ 	vlist_entry->vlan_entry->ref_cnt++;
+-
+ 	list_add(&vlist_entry->list, vhead);
++
++	/* Add new pce rule for this vid if not created */
++	if (add_pce_list) {
++		if (dp_add_vlan_pce_rule(vlist_entry->vlan_entry, br_info,
++					 bport)) {
++			pr_err("%s: Failed", __func__);
++			return NULL;
++		}
++	}
++
+ 	return vlist_entry->vlan_entry;
+ }
+ 
+@@ -479,6 +756,10 @@ static int dp_del_vlan_entry(struct br_info *br_info,
+ 			 "Deleting entry in Br=%s Bp=%d vlanid=%d ref_cnt=%d\n",
+ 			 br_info->dev->name, bport, ventry->vlan_id,
+ 			 ventry->ref_cnt);
++		/* Disable pce rule index for this vid,
++		 * FID not freed yet, cannot delete rule
++		 */
++		dp_del_vlan_pce_rule(ventry, br_info, bport, 1);
+ 		ventry->ref_cnt--;
+ 		list_del(&vlist_entry->list);
+ 		devm_kfree(&g_dp_dev->dev, vlist_entry);
+@@ -491,8 +772,11 @@ static int dp_del_vlan_entry(struct br_info *br_info,
+ 		 vlanid, bport, ventry->ref_cnt);
+ 
+ 	/* Deallocate VLAN aware FiD, if FiD is > 0 */
+-	if (ventry->fid)
++	if (ventry->fid) {
++		/* Delete pce rule for this vid */
++		dp_del_vlan_pce_rule(ventry, br_info, bport, 0);
+ 		deallocate_br_vlan_fid(br_info, vlanid, ventry->fid);
++	}
+ 
+ 	/* Decrease ref count and delete the VLAN ID Entry */
+ 	ventry->ref_cnt--;
+@@ -549,7 +833,6 @@ static int dp_register_self(struct br_info *br_info, u16 vlanid,
+ 		       __func__, vlanid, br_info->dev->name);
+ 		goto EXIT;
+ 	}
+-
+ 	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
+ 		 "VLAN Id %d added for bridge %s Fid %d ref_cnt %d\n",
+ 		 ventry->vlan_id, br_info->dev->name, ventry->fid,
+@@ -659,8 +942,8 @@ static int parse_netlink_msg(struct nlmsghdr *nlh, u16 *vid,
+ /* This will be called for bridge add dev eth0 vid 100
+  * By this time bridge interface is added to bridge
+  */
+-int dp_ndo_br_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+-		      u16 flags)
++int dp_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
++			  u16 flags)
+ {
+ 	u16 vid;
+ 	u16 br_flags = 0;
+@@ -668,18 +951,20 @@ int dp_ndo_br_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+ 	struct br_info *br_info;
+ 	int ret = 0;
+ 
+-	if (!dev)
+-		return -EOPNOTSUPP;
++	if (!dev || !nlh)
++		return -EINVAL;
+ 	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s\n", __func__,
+ 		 dev ? dev->name : "NULL");
+ 
+-	if (netif_is_bridge_master(dev))
++	DP_LIB_LOCK(&dp_lock);
++	if (netif_is_bridge_master(dev)) {
+ 		br_dev = dev;
+-	else if (netif_is_bridge_port(dev))
++	} else if (netif_is_bridge_port(dev)) {
+ 		br_dev = netdev_master_upper_dev_get(dev);
+-	else
++	} else {
++		DP_LIB_UNLOCK(&dp_lock);
+ 		return -EOPNOTSUPP;
+-
++	}
+ 	if (parse_netlink_msg(nlh, &vid, &br_flags)) {
+ 		pr_err("%s: Error in parsing netlink message\n", __func__);
+ 		ret = -EINVAL;
+@@ -715,11 +1000,12 @@ int dp_ndo_br_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+ 
+ 	ret = 0;
+ EXIT:
++	DP_LIB_UNLOCK(&dp_lock);
+ 	return ret;
+ }
+ 
+-int dp_ndo_br_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+-		      u16 flags)
++int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
++			 u16 flags)
+ {
+ 	int ret = DP_SUCCESS;
+ 	u16 vid;
+@@ -727,18 +1013,20 @@ int dp_ndo_br_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+ 	struct net_device *br_dev;
+ 	struct br_info *br_info;
+ 
+-	if (!dev)
+-		return -EOPNOTSUPP;
++	if (!dev || !nlh)
++		return -EINVAL;
+ 	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s\n", __func__,
+ 		 dev ? dev->name : "NULL");
+ 
+-	if (netif_is_bridge_master(dev))
++	DP_LIB_LOCK(&dp_lock);
++	if (netif_is_bridge_master(dev)) {
+ 		br_dev = dev;
+-	else if (netif_is_bridge_port(dev))
++	} else if (netif_is_bridge_port(dev)) {
+ 		br_dev = netdev_master_upper_dev_get(dev);
+-	else
++	} else {
++		DP_LIB_UNLOCK(&dp_lock);
+ 		return -EOPNOTSUPP;
+-
++	}
+ 	if (parse_netlink_msg(nlh, &vid, &br_flags)) {
+ 		pr_err("%s: Error in parsing netlink message\n", __func__);
+ 		ret = -EINVAL;
+@@ -773,6 +1061,7 @@ int dp_ndo_br_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+ 
+ 	ret = 0;
+ EXIT:
++	DP_LIB_UNLOCK(&dp_lock);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index f902bc538bd3..b0aa3753cec2 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -243,6 +243,18 @@ static void dp_check_and_free_dp_dev(struct net_device *dev)
+ 	}
+ }
+ 
++struct ctp_dev *ctp_dev_list_lookup(struct list_head *head,
++				    struct net_device *dev)
++{
++	struct ctp_dev *pos;
++
++	list_for_each_entry(pos, head, list) {
++		if (pos->dev == dev)
++			return pos;
++	}
++	return NULL;
++}
++
+ int dp_inst_add_dev(struct net_device *dev, int inst,
+ 		    int ep, int bp, int ctp, u32 flag)
+ {
+diff --git a/drivers/net/datapath/dpm/datapath_instance.h b/drivers/net/datapath/dpm/datapath_instance.h
+index 4101a32da15a..9e262aeffd0d 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.h
++++ b/drivers/net/datapath/dpm/datapath_instance.h
+@@ -26,6 +26,8 @@ extern struct dp_hw_cap hw_cap_list[DP_MAX_HW_CAP];
+ extern struct hlist_head dp_dev_list[DP_DEV_HASH_SIZE];
+ u32 dp_dev_hash(void *dev);
+ struct dp_dev *dp_dev_lookup(struct net_device *dev);
++struct ctp_dev *ctp_dev_list_lookup(struct list_head *head,
++				    struct net_device *dev);
+ 
+ struct dp_mod {
+ 	struct hlist_node hlist;
+diff --git a/drivers/net/datapath/dpm/datapath_pce.c b/drivers/net/datapath/dpm/datapath_pce.c
+index 6bed007f8620..19a28f7b9cc0 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.c
++++ b/drivers/net/datapath/dpm/datapath_pce.c
+@@ -6,11 +6,9 @@
+ #include <linux/list.h>
+ #include <net/datapath_api.h>
+ #include "datapath.h"
++#include "datapath_pce.h"
+ #include <net/datapath_proc_api.h>	/* for proc api */
+ 
+-/* Max Block Size for CTP by default, if not given through alloc API */
+-#define PCE_MAX_BLK_SIZE_CTP	32
+-
+ /* PCE Flow Engine Common Region start index */
+ #define PCE_TFCR_START_IDX	0x46E
+ 
+@@ -26,36 +24,6 @@
+  */
+ #define DP_INVALID_SUB_BLK 0
+ 
+-/* Main PCE rule entry struct */
+-struct dp_pce_rule {
+-	u32 hw_rules_max;
+-	u32 glbl_firstindex;		/* Global Rule First Index */
+-	u32 glbl_rules_max;		/* Global rules Max allowed */
+-	struct list_head blk_list;	/* List of block's in PCE */
+-};
+-
+-/* Blocks which will be assigned Global have 1 block, Each CTP have 1 block */
+-struct dp_blk_entry {
+-	struct list_head list;
+-	struct dp_pce_blk_info info;  /* Block info */
+-	char blk_name[32];	      /* Block Name */
+-	u32 blk_firstindex;	      /* First PCE index for this Block */
+-	u32 blk_rules_max;	      /* num of rules allowed for this Block */
+-	u32 blk_rules_used;	      /* num of rules used for this Block */
+-	struct list_head subblk_list; /* Rules divided as Sub-Blks */
+-};
+-
+-/* Sub-Blocks which will be assigned for Global as well as CTP's */
+-struct dp_subblk_entry {
+-	struct list_head list;
+-	char subblk_name[32];	/* Sub-Block app name like vlan_aware */
+-	int subblk_id;		/* Sub-Block ID */
+-	int subblk_firstindex;	/* Sub-Block Starting Pce Index */
+-	u32 subblk_rules_max;	/* num of rules in this Sub-Block */
+-	u32 subblk_rules_used;	/* num of rules used for this Sub-Block */
+-	bool subblk_protected;  /* Indicates this sub-blk is protected or not */
+-};
+-
+ /* Global PCE Rule struct */
+ struct dp_pce_rule pce_rule;
+ 
+@@ -528,13 +496,11 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+ 			struct dp_subblk_entry *subblk_entry)
+ {
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
+-	int subblk_curr;
+ 
+ 	if (!ops)
+ 		return -1;
+ 
+-	subblk_curr = pce->nIndex - subblk_entry->subblk_firstindex;
+-	if (subblk_curr < 0 || subblk_curr > subblk_entry->subblk_rules_max) {
++	if (pce->nIndex > subblk_entry->subblk_rules_max) {
+ 		pr_err("%s: PCE Index for Block %d should be within 0 to %d\n",
+ 		       __func__, subblk_entry->subblk_id,
+ 		       subblk_entry->subblk_rules_max);
+@@ -744,7 +710,6 @@ int dp_pce_blk_del(struct dp_pce_blk_info *pce_blk_info)
+ 		pr_err("%s failed: datapath not initialized yet\n", __func__);
+ 		return DP_FAILURE;
+ 	}
+-
+ 	if (!pce_blk_info) {
+ 		pr_err("%s: blk_info %x Null\n", __func__, (u32)pce_blk_info);
+ 		return DP_FAILURE;
+@@ -818,13 +783,9 @@ int dp_pce_blk_del(struct dp_pce_blk_info *pce_blk_info)
+ }
+ EXPORT_SYMBOL(dp_pce_blk_del);
+ 
+-/* Add the PCE rule inside Sub-Block
+- * API will create Block, Sub-Block and Store PCE rule in HW
+- * Pass proper portid, subif, subblock id, subblock size, region
+- * Returns back the PCE Index where rule is added
+- */
+-int dp_pce_rule_add(struct dp_pce_blk_info *pce_blk_info,
+-		    GSW_PCE_rule_t *pce)
++/* PCE rule add API to call within DPM without lock */
++int dp_pce_rule_add_priv(struct dp_pce_blk_info *pce_blk_info,
++			 GSW_PCE_rule_t *pce)
+ {
+ 	struct dp_subblk_entry *subblk_entry;
+ 	struct core_ops *ops;
+@@ -833,17 +794,11 @@ int dp_pce_rule_add(struct dp_pce_blk_info *pce_blk_info,
+ 	struct dp_blk_entry *blk_entry;
+ 	int blk_size = 0, ret = DP_FAILURE;
+ 
+-	if (unlikely(!dp_init_ok)) {
+-		pr_err("%s failed: datapath not initialized yet\n", __func__);
+-		return DP_FAILURE;
+-	}
+-
+ 	if (!pce || !pce_blk_info) {
+ 		pr_err("%s: pce_rule %x pce_blk_info %x Failed\n",
+ 		       __func__, (u32)pce, (u32)pce_blk_info);
+ 		return ret;
+ 	}
+-
+ 	blk_info = &pce_blk_info->info;
+ 
+ 	ops = gsw_get_swcore_ops(0);
+@@ -884,7 +839,6 @@ int dp_pce_rule_add(struct dp_pce_blk_info *pce_blk_info,
+ 		 "Protected", blk_info->subblk_protected,
+ 		 "FirstIndex", blk_info->subblk_firstidx);
+ 
+-	DP_LIB_LOCK(&dp_lock);
+ 	blk_entry = blk_add(pce_blk_info, blk_size);
+ 	if (!blk_entry) {
+ 		pr_err("%s: No Block present or created\n", __func__);
+@@ -915,10 +869,9 @@ int dp_pce_rule_add(struct dp_pce_blk_info *pce_blk_info,
+ 		goto EXIT;
+ 	}
+ 
++	ret = subblk_entry->subblk_rules_used;
+ 	subblk_entry->subblk_rules_used++;
+ 
+-	ret = pce->pattern.nIndex;
+-
+ 	DP_DEBUG(DP_DBG_FLAG_PCE,
+ 		 "%s: %s %s %s %d %s %d %s %d %s %d %s %s %d %s %d %s %d\n",
+ 		 __func__,
+@@ -933,22 +886,17 @@ int dp_pce_rule_add(struct dp_pce_blk_info *pce_blk_info,
+ 		 "RuleMax", subblk_entry->subblk_rules_max,
+ 		 "RuleUsed", subblk_entry->subblk_rules_used);
+ EXIT:
+-	DP_LIB_UNLOCK(&dp_lock);
+ 	return ret;
+ }
+-EXPORT_SYMBOL(dp_pce_rule_add);
+ 
+-/* Delete the PCE rule inside Sub-Block
+- * Pass Subblk_Id,
+- * Pass portid and subifid if it is CTP
+- * Pass Index to delete in sub-block specify in pce->pattern.nIndex
++/* Add the PCE rule inside Sub-Block
++ * API will create Block, Sub-Block and Store PCE rule in HW
++ * Pass proper portid, subif, subblock id, subblock size, region
++ * Returns back the PCE Index where rule is added
+  */
+-int dp_pce_rule_del(struct dp_pce_blk_info *pce_blk_info,
+-		    GSW_PCE_ruleDelete_t *pce)
++int dp_pce_rule_add(struct dp_pce_blk_info *pce_blk_info,
++		    GSW_PCE_rule_t *pce)
+ {
+-	struct dp_blk_entry *blk_entry;
+-	struct dp_subblk_entry *subblk_entry;
+-	struct dp_subblk_info *blk_info;
+ 	int ret = DP_FAILURE;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+@@ -956,11 +904,28 @@ int dp_pce_rule_del(struct dp_pce_blk_info *pce_blk_info,
+ 		return DP_FAILURE;
+ 	}
+ 
++	DP_LIB_LOCK(&dp_lock);
++	ret = dp_pce_rule_add_priv(pce_blk_info, pce);
++	DP_LIB_UNLOCK(&dp_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(dp_pce_rule_add);
++
++/* PCE rule delete API to call within DPM without lock */
++int dp_pce_rule_del_priv(struct dp_pce_blk_info *pce_blk_info,
++			 GSW_PCE_ruleDelete_t *pce)
++{
++	struct dp_blk_entry *blk_entry;
++	struct dp_subblk_entry *subblk_entry;
++	struct dp_subblk_info *blk_info;
++	int ret = DP_FAILURE;
++
+ 	if (!pce || !pce_blk_info) {
+-		pr_err("%s: Pce Rule Info to delete is Null\n", __func__);
++		pr_err("%s: pce_rule %x pce_blk_info %x Failed\n",
++		       __func__, (u32)pce, (u32)pce_blk_info);
+ 		return ret;
+ 	}
+-
+ 	blk_info = &pce_blk_info->info;
+ 
+ 	if (pce->nIndex > pce_rule.hw_rules_max) {
+@@ -984,7 +949,6 @@ int dp_pce_rule_del(struct dp_pce_blk_info *pce_blk_info,
+ 		 blk_info->subif, blk_info->subblk_id,
+ 		 blk_info->subblk_protected);
+ 
+-	DP_LIB_LOCK(&dp_lock);
+ 	blk_entry = get_blk_entry(blk_info, pce_blk_info->region);
+ 	if (!blk_entry) {
+ 		pr_err("%s: Cannot find the blk_entry for portid=%d subif=%d\n",
+@@ -1018,24 +982,19 @@ int dp_pce_rule_del(struct dp_pce_blk_info *pce_blk_info,
+ 
+ 	ret = DP_SUCCESS;
+ EXIT:
+-	DP_LIB_UNLOCK(&dp_lock);
+ 	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: %s\n", __func__,
+ 		 (ret == DP_SUCCESS) ? "Success" : "Fail");
+ 	return ret;
+ }
+-EXPORT_SYMBOL(dp_pce_rule_del);
+ 
+-/* Get the PCE rule inside Sub-Block
++/* Delete the PCE rule inside Sub-Block
+  * Pass Subblk_Id,
+  * Pass portid and subifid if it is CTP
+- * Pass Index to get in sub-block specify in pce->pattern.nIndex
++ * Pass Index to delete in sub-block specify in pce->pattern.nIndex
+  */
+-int dp_pce_rule_get(struct dp_pce_blk_info *pce_blk_info,
+-		    GSW_PCE_rule_t *pce)
++int dp_pce_rule_del(struct dp_pce_blk_info *pce_blk_info,
++		    GSW_PCE_ruleDelete_t *pce)
+ {
+-	struct dp_blk_entry *blk_entry;
+-	struct dp_subblk_entry *subblk_entry;
+-	struct dp_subblk_info *blk_info;
+ 	int ret = DP_FAILURE;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+@@ -1043,11 +1002,27 @@ int dp_pce_rule_get(struct dp_pce_blk_info *pce_blk_info,
+ 		return DP_FAILURE;
+ 	}
+ 
++	DP_LIB_LOCK(&dp_lock);
++	ret = dp_pce_rule_del_priv(pce_blk_info, pce);
++	DP_LIB_UNLOCK(&dp_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL(dp_pce_rule_del);
++
++/* PCE rule get API to call within DPM without lock */
++int dp_pce_rule_get_priv(struct dp_pce_blk_info *pce_blk_info,
++			 GSW_PCE_rule_t *pce)
++{
++	struct dp_blk_entry *blk_entry;
++	struct dp_subblk_entry *subblk_entry;
++	struct dp_subblk_info *blk_info;
++	int ret = DP_FAILURE;
++
+ 	if (!pce || !pce_blk_info) {
+ 		pr_err("%s: Pce Rule Info to delete is Null\n", __func__);
+ 		return ret;
+ 	}
+-
+ 	blk_info = &pce_blk_info->info;
+ 
+ 	if (pce->pattern.nIndex > pce_rule.hw_rules_max) {
+@@ -1065,7 +1040,6 @@ int dp_pce_rule_get(struct dp_pce_blk_info *pce_blk_info,
+ 	if (!pce_blk_info->region)
+ 		pce_blk_info->region = pce->region;
+ 
+-	DP_LIB_LOCK(&dp_lock);
+ 	blk_entry = get_blk_entry(blk_info, pce_blk_info->region);
+ 	if (!blk_entry) {
+ 		pr_err("%s: Cannot find the blk_entry for portid=%d subif=%d\n",
+@@ -1112,11 +1086,72 @@ int dp_pce_rule_get(struct dp_pce_blk_info *pce_blk_info,
+ 		 "RuleMax", subblk_entry->subblk_rules_max,
+ 		 "RuleUsed", subblk_entry->subblk_rules_used);
+ EXIT:
++	return ret;
++}
++
++/* Get the PCE rule inside Sub-Block
++ * Pass Subblk_Id,
++ * Pass portid and subifid if it is CTP
++ * Pass Index to get in sub-block specify in pce->pattern.nIndex
++ */
++int dp_pce_rule_get(struct dp_pce_blk_info *pce_blk_info,
++		    GSW_PCE_rule_t *pce)
++{
++	int ret = DP_FAILURE;
++
++	if (unlikely(!dp_init_ok)) {
++		pr_err("%s failed: datapath not initialized yet\n", __func__);
++		return DP_FAILURE;
++	}
++
++	DP_LIB_LOCK(&dp_lock);
++	ret = dp_pce_rule_get_priv(pce_blk_info, pce);
+ 	DP_LIB_UNLOCK(&dp_lock);
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL(dp_pce_rule_get);
+ 
++/* Update current PCE rule index with enable/disable */
++int dp_update_pce_rule(int pceidx, struct dp_pce_blk_info *blk_info,
++		       int pce_dis)
++{
++	GSW_PCE_rule_t pce;
++	struct core_ops *ops;
++
++	ops = gsw_get_swcore_ops(0);
++	if (!ops)
++		return -1;
++
++	pce.logicalportid = blk_info->info.portid;
++	pce.subifidgroup = blk_info->info.subif;
++	pce.region = blk_info->region;
++	dp_pce_rule_get_priv(blk_info, &pce);
++	DP_DEBUG(DP_DBG_FLAG_PCE, "%s:region:%d index:%d\n",
++		 __func__, pce.region, pce.pattern.nIndex);
++
++	/* PCE struct is reset except for index after calling pce get */
++	pce.logicalportid = blk_info->info.portid;
++	pce.subifidgroup = blk_info->info.subif;
++	pce.region = blk_info->region;
++	if (pce_dis)
++		pce.pattern.bEnable = 0;
++	else
++		pce.pattern.bEnable = 1;
++	pce.pattern.nIndex = pceidx;
++	if (ops->gsw_tflow_ops.TFLOW_PceRuleWrite(ops, &pce)) {
++		pr_err("%s: TFLOW_PceRuleWite failed, nIndex: %u\n",
++		       __func__, pce.pattern.nIndex);
++		return -1;
++	}
++	DP_DEBUG(DP_DBG_FLAG_PCE, "%s:%s for pce idx(%d)\n",
++		 __func__,
++		 (pce.pattern.bEnable) ? "Enabled" : "Disabled",
++		 pce.pattern.nIndex);
++
++	return 0;
++}
++
+ /* Initialize the PCE rules table
+  * Get the Global Rules firstIndex and Global Rules Max from GSWIP
+  */
+diff --git a/drivers/net/datapath/dpm/datapath_pce.h b/drivers/net/datapath/dpm/datapath_pce.h
+new file mode 100644
+index 000000000000..b9261fd7d81b
+--- /dev/null
++++ b/drivers/net/datapath/dpm/datapath_pce.h
+@@ -0,0 +1,55 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) Intel Corporation
++ * Author: Joby Thampan
++ */
++
++#ifndef DATAPATH_PCE_H
++#define DATAPATH_PCE_H
++
++/* Max Block Size for CTP by default, if not given through alloc API */
++#define PCE_MAX_BLK_SIZE_CTP	32
++
++/* Max Sub-Block Size for CTP VLAN aware feature */
++#define VLAN_PCE_MAX_SUBBLK_SIZE 8
++
++/* Main PCE rule entry struct */
++struct dp_pce_rule {
++	u32 hw_rules_max;
++	u32 glbl_firstindex;		/* Global Rule First Index */
++	u32 glbl_rules_max;		/* Global rules Max allowed */
++	struct list_head blk_list;	/* List of block's in PCE */
++};
++
++/* Blocks which will be assigned Global have 1 block, Each CTP have 1 block */
++struct dp_blk_entry {
++	struct list_head list;
++	struct dp_pce_blk_info info;  /* Block info */
++	char blk_name[32];	      /* Block Name */
++	u32 blk_firstindex;	      /* First PCE index for this Block */
++	u32 blk_rules_max;	      /* num of rules allowed for this Block */
++	u32 blk_rules_used;	      /* num of rules used for this Block */
++	struct list_head subblk_list; /* Rules divided as Sub-Blks */
++};
++
++/* Sub-Blocks which will be assigned for Global as well as CTP's */
++struct dp_subblk_entry {
++	struct list_head list;
++	char subblk_name[32];	/* Sub-Block app name like vlan_aware */
++	int subblk_id;		/* Sub-Block ID */
++	int subblk_firstindex;	/* Sub-Block Starting Pce Index */
++	u32 subblk_rules_max;	/* num of rules in this Sub-Block */
++	u32 subblk_rules_used;	/* num of rules used for this Sub-Block */
++	bool subblk_protected;  /* Indicates this sub-blk is protected or not */
++};
++
++/* Global PCE Rule struct */
++extern struct dp_pce_rule pce_rule;
++int dp_pce_rule_add_priv(struct dp_pce_blk_info *pce_blk_info,
++			 GSW_PCE_rule_t *pce);
++int dp_pce_rule_del_priv(struct dp_pce_blk_info *pce_blk_info,
++			 GSW_PCE_ruleDelete_t *pce);
++int dp_pce_rule_get_priv(struct dp_pce_blk_info *pce_blk_info,
++			 GSW_PCE_rule_t *pce);
++int dp_update_pce_rule(int pceidx, struct dp_pce_blk_info *blk_info,
++		       int pce_dis);
++#endif /* DATAPATH_PCE_H */
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index 855eaf191619..e74b8842ef3e 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -33,7 +33,9 @@
+ #define DBGFS_EVENT    "event"
+ #define DBGFS_MIB_GLOBAL    "mib_global_stats"
+ #define DBGFS_BR_VLAN  "vlan"
++#define DBGFS_VLAN_PCE "pce_idx"
+ #define DBGFS_PCE      "pce"
++#define DBGFS_CTP_LIST "pmap_ctp_list"
+ 
+ 
+ #define DEBUGFS_DBG DP_DEBUGFS_PATH "/" DBGFS_DBG
+@@ -155,6 +157,75 @@ static int proc_brvlan_dump(struct seq_file *s, int pos)
+ 		pos++;
+ 	return pos;
+ }
++
++static int proc_vlanpce_start(void)
++{
++	br_hash_index = 0;
++	brdev_info = hlist_entry_safe
++		     ((get_dp_g_bridge_id_entry_hash_table_info(
++				     br_hash_index))->first,
++		      struct br_info, br_hlist);
++	return 0;
++}
++
++static int proc_vlanpce_dump(struct seq_file *s, int pos)
++{
++	struct pce_entry *pce = NULL;
++	struct bridge_member_port *tmp = NULL;
++	int pce_entry = 0, bp_entry = 0, i = 0;
++
++	while (!brdev_info) {
++		br_hash_index++;
++		pos = 0;
++		if (br_hash_index == BR_ID_ENTRY_HASH_TABLE_SIZE) {
++			seq_puts(s, "end\n");
++			return -1;
++		}
++		brdev_info = hlist_entry_safe
++			     ((get_dp_g_bridge_id_entry_hash_table_info(
++					     br_hash_index))->first,
++			      struct br_info, br_hlist);
++	}
++	if (!brdev_info->br_vlan_en)
++		goto EXIT;
++
++	if (pos == 0) {
++		seq_printf(s, "%-10s%-18s\n",
++			   "BP", "VLAN/PCEIDX/STATUS");
++		for (i = 0; i < 25; i++)
++			seq_printf(s, "=");
++		seq_printf(s, "\n");
++	}
++
++	bp_entry = 0;
++	list_for_each_entry(tmp, &brdev_info->bp_list, list) {
++		if (bp_entry) {
++			seq_printf(s, "\n");
++			seq_printf(s, "%-10s%-18s\n", "", "");
++		}
++		seq_printf(s, "%-10d", tmp->bportid);
++		bp_entry = 1;
++		pce_entry = 0;
++		list_for_each_entry(pce, &tmp->pce_list, plist) {
++			if (pce_entry) {
++				seq_printf(s, "\n");
++				seq_printf(s, "%-10s", "");
++			}
++			seq_printf(s, "%-4d/%-4d/%-4s",
++				   pce->vid, pce->idx,
++				   (pce->disable ? "Disabled" : "Enable"));
++			pce_entry = 1;
++		}
++	}
++	seq_puts(s, "\n");
++
++EXIT:
++	brdev_info = hlist_entry_safe((brdev_info)->br_hlist.next,
++				      struct br_info, br_hlist);
++	if (!seq_has_overflowed(s))
++		pos++;
++	return pos;
++}
+ #endif
+ 
+ static int proc_dp_mib_global_stats(struct seq_file *s, int pos)
+@@ -787,6 +858,53 @@ ssize_t proc_port_write(struct file *file, const char *buf, size_t count,
+ 	return count;
+ }
+ 
++#define DBG_CTP DP_DEBUGFS_PATH "/" DBGFS_CTP_LIST
++ssize_t proc_ctp_list_write(struct file *file, const char *buf, size_t count,
++			    loff_t *ppos)
++{
++	int len;
++	char str[64];
++	int num;
++	u16 bp = 0;
++	char *param_list[5];
++	struct ctp_dev *tmp;
++	struct bp_pmapper *bp_info;
++
++	if (!capable(CAP_SYS_PACCT))
++		return count;
++	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
++	len -= copy_from_user(str, buf, len);
++	str[len] = 0;
++	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
++
++	if (num <= 1)
++		goto help;
++	if (param_list[1])
++		bp = dp_atoi(param_list[1]);
++
++	if (strcasecmp(param_list[0], "bp_ctp") == 0) {
++		bp_info = get_dp_bp_info(0, bp);
++		if (!bp_info)
++			pr_info("bp:%d info not found\n", bp);
++		pr_info("%-10s%-10d\n", "Bp", bp);
++		list_for_each_entry(tmp, &bp_info->ctp_dev, list) {
++			if(!tmp->dev)
++				break;
++			pr_info("%-s:%-s(%-s:%-d)\n", "ctp_dev",
++				tmp->dev->name, "ctp", tmp->ctp);
++		}
++	} else {
++		goto help;
++	}
++
++	return count;
++help:
++	pr_info("usage:\n");
++	pr_info("  echo bp_ctp [bp] > %s\n", DBG_CTP);
++	return count;
++
++}
++
+ #if defined(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
+ void proc_dbg_read(struct seq_file *s)
+ {
+@@ -897,6 +1015,8 @@ static struct dp_proc_entry dp_proc_entries[] = {
+ 		proc_dp_mib_g_stats_write},
+ #if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
+ 	{DBGFS_BR_VLAN, NULL, proc_brvlan_dump, proc_brvlan_start, NULL},
++	{DBGFS_VLAN_PCE, NULL, proc_vlanpce_dump, proc_vlanpce_start, NULL},
++	{DBGFS_CTP_LIST, NULL, NULL, NULL, proc_ctp_list_write},
+ #endif
+ 	{DBGFS_PCE, NULL, proc_pce_dump, NULL, proc_pce_write},
+ 	/*the last place holder */
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index bef83bc5b110..f03207f39ce2 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -233,6 +233,7 @@ static int dp_swdev_del_bport_from_list(struct br_info *br_item,
+ 	if (found) {
+ 		list_del(&bmp->list);
+ 
++		kfree(bmp->blk_info);
+ 		kmem_cache_free(cache_br_port_list, bmp);
+ 
+ 		return DP_SUCCESS;
+@@ -261,12 +262,18 @@ static int dp_swdev_add_bport_to_list(struct br_info *br_item,
+ 			return DP_FAILURE;
+ 
+ 		INIT_LIST_HEAD(&bmp->bport_vlan_list);
++		INIT_LIST_HEAD(&bmp->pce_list);
+ 
+ 		bmp->dev_priv_flag = brid_item->priv_flag;
+ 		bmp->dev_reg_flag = br_item->flag;
+ 		bmp->bportid = brid_item->bportid;
+ 		bmp->dp_port = br_item->dp_port;
+ 		bmp->dev = dev;
++		bmp->blk_info = kzalloc(sizeof(struct dp_pce_blk_info), GFP_ATOMIC);
++		if (!bmp->blk_info) {
++			pr_err("blk info alloc fail(%s)\n", __func__);
++			return DP_FAILURE;
++		}
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV,
+ 			 "bport:%d reg_flag:%d priv_flag:0x%x\n",
+ 			 bmp->bportid, bmp->dev_reg_flag, bmp->dev_priv_flag);
+@@ -303,8 +310,7 @@ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+ 	i_info = &dp_port_prop[br_item->inst].info;
+ 
+ 	/* dev is the bridge port member dev */
+-	i_info->dp_reg_bport_vlan(br_info, dev, br_item->bportid,
+-				  DP_OPS_RESET);
++	dp_register_bport_vlan(br_info, dev, br_item->bportid, DP_OPS_RESET);
+ 
+ 	ret = i_info->swdev_bridge_port_cfg_reset(br_info, br_item->inst,
+ 						  br_item->bportid,
+@@ -312,7 +318,7 @@ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+ 	if (ret == DEL_BRENTRY) {
+ 		i_info->swdev_free_brcfg(br_item->inst, br_item->fid);
+ 
+-		i_info->dp_reg_br_vlan(br_info, DP_OPS_RESET);
++		dp_register_br_vlan(br_info, DP_OPS_RESET);
+ 
+ 		dp_swdev_remove_bridge_id_entry(br_info);
+ 
+@@ -475,11 +481,11 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 			dp_swdev_insert_bridge_id_entry(br_info);
+ 
+ 			/* br_info->dev is the bridge device */
+-			i_info->dp_reg_br_vlan(br_info, 0);
++			dp_register_br_vlan(br_info, 0);
+ 
+ 			/* dev is the bridge device */
+-			i_info->dp_reg_bport_vlan(br_info, dev,
+-						  br_item->bportid, 0);
++			dp_register_bport_vlan(br_info, dev,
++					       br_item->bportid, 0);
+ 
+ 			dp_swdev_add_bport_to_list(br_info, br_item, dev);
+ 
+@@ -507,7 +513,7 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item,
+ 			br_info->flag = LOGIC_DEV_REGISTER;
+ 
+ 		/* dev is the bridge port device */
+-		i_info->dp_reg_bport_vlan(br_info, dev, br_item->bportid, 0);
++		dp_register_bport_vlan(br_info, dev, br_item->bportid, 0);
+ 
+ 		dp_swdev_add_bport_to_list(br_info, br_item, dev);
+ 		i_info->swdev_bridge_port_cfg_set(br_info, br_item->inst,
+@@ -1073,7 +1079,7 @@ int dp_notif_br_free(struct net_device *br_dev)
+ 
+ 	i_info->swdev_free_brcfg(0, br_info->fid);
+ 
+-	i_info->dp_reg_br_vlan(br_info, DP_OPS_RESET);
++	dp_register_br_vlan(br_info, DP_OPS_RESET);
+ 
+ 	dp_swdev_remove_bridge_id_entry(br_info);
+ 
+@@ -1107,7 +1113,7 @@ int dp_notif_br_alloc(struct net_device *br_dev)
+ 		br_info->dev = br_dev;
+ 		br_info->fid = br_id;
+ 
+-		dp_info->dp_reg_br_vlan(br_info, 0);
++		dp_register_br_vlan(br_info, 0);
+ 		dp_swdev_insert_bridge_id_entry(br_info);
+ 	} else {
+ 		pr_err("Switch configuration failed\n");
+@@ -1154,38 +1160,6 @@ int dp_register_switchdev_ops(struct dp_dev *dp_dev, int reset)
+ 	return DP_SUCCESS;
+ }
+ 
+-int dp_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+-			  u16 flags)
+-{
+-	struct inst_info *dp_info = get_dp_prop_info(0);
+-	int ret = 0;
+-
+-	if (!dev || !nlh || !dp_info || !dp_info->dp_ndo_br_setlink)
+-		return -EINVAL;
+-
+-	DP_LIB_LOCK(&dp_lock);
+-	ret = dp_info->dp_ndo_br_setlink(dev, nlh, flags);
+-	DP_LIB_UNLOCK(&dp_lock);
+-
+-	return ret;
+-}
+-
+-int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+-			  u16 flags)
+-{
+-	struct inst_info *dp_info = get_dp_prop_info(0);
+-	int ret = 0;
+-
+-	if (!dev || !nlh || !dp_info || !dp_info->dp_ndo_br_dellink)
+-		return -EINVAL;
+-
+-	DP_LIB_LOCK(&dp_lock);
+-	ret = dp_info->dp_ndo_br_dellink(dev, nlh, flags);
+-	DP_LIB_UNLOCK(&dp_lock);
+-
+-	return ret;
+-}
+-
+ void dp_switchdev_exit(void)
+ {
+ 	dp_swdev_bridge_id_entry_free();
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.h b/drivers/net/datapath/dpm/datapath_swdev.h
+index e665835e1d2c..25dad55a4262 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.h
++++ b/drivers/net/datapath/dpm/datapath_swdev.h
+@@ -57,7 +57,11 @@ struct bridge_member_port {
+ 	u16 bport[8];
+ 	u32 dev_priv_flag; /* to store bp dev priv flags (like IFF_NO_QUEUE) */
+ 	u32 dp_port;
++	struct dp_pce_blk_info *blk_info;
+ 	struct list_head bport_vlan_list; /* List pointing to the vlan entry */
++	struct list_head pce_list; /* List pointing to PCE
++				    * (VID -> PCE index	mapping)
++				    */
+ };
+ 
+ struct vlist_entry {
+@@ -71,6 +75,13 @@ struct vlan_entry {
+ 	u32 ref_cnt;	/* Reference count for this VLAN */
+ };
+ 
++struct pce_entry {
++	struct list_head plist;
++	u16 idx; /* pce index */
++	u16 vid; /* VLAN id mapped to the PCE index */
++	bool disable; /* PCE rule index enabled or disabled */
++};
++
+ struct fdb_tbl {
+ 	struct list_head fdb_list;
+ 	struct net_device *port_dev;
+@@ -83,10 +94,10 @@ int dp_swdev_bridge_id_entry_init(void);
+ struct br_info *dp_swdev_bridge_entry_lookup_rcu(struct net_device *dev);
+ int dp_swdev_chk_bport_in_br(struct net_device *bp_dev, int bport,
+ 			     int inst);
+-int dp_ndo_bridge_setlink(struct net_device *dev,
+-			  struct nlmsghdr *nlh, u16 flags);
+-
+-int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+-			  u16 flags);
++int dp_swdev_get_dp_port_from_bp(struct br_info *br_item, int bport,
++                                 u32 *priv_flag);
++int dp_register_bport_vlan(struct br_info *br_info,
++			   struct net_device *dev, int bport, int flags);
++int dp_register_br_vlan(struct br_info *br_info, int flags);
+ void dp_switchdev_exit(void);
+ #endif /*DATAPATH_SWDEV_H*/
+diff --git a/drivers/net/datapath/dpm/gswip31/Makefile b/drivers/net/datapath/dpm/gswip31/Makefile
+index c22ef80cb4a4..255b7db21395 100644
+--- a/drivers/net/datapath/dpm/gswip31/Makefile
++++ b/drivers/net/datapath/dpm/gswip31/Makefile
+@@ -2,7 +2,6 @@ obj-$(CONFIG_INTEL_DATAPATH) += datapath_misc.o datapath_gswip.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_ppv4.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_ppv4_api.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_rx.o datapath_tx.o
+-obj-$(CONFIG_INTEL_DATAPATH) += datapath_br_vlan.o
+ 
+ ifneq ($(CONFIG_INTEL_DATAPATH_HAL_GSWIP31_MIB),)
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_mib.o
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index f161309b0308..19fa8a45e1a1 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1752,6 +1752,7 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 	struct cqm_port_info *deq_pinfo;
+ 	struct bp_pmapper *bp_info;
+ 	struct q_info *q_info;
++	struct ctp_dev *ctp_dev;
+ 
+ 	if (!data || !data->subif_data) {
+ 		pr_err("data NULL or subif_data NULL\n");
+@@ -1805,13 +1806,32 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 	bp_info = get_dp_bp_info(inst, bp);
+ 	if (data->subif_data->ctp_dev) {
+ 		DP_DEBUG(DP_DBG_FLAG_DBG,
+-			 "dp_bp_tbl[%d][%d]=%s current reg_cnt=%d\n",
++			 "dp_bp_tbl[%d][%d]=%s current ref_cnt=%d\n",
+ 			 inst, bp, data->dev->name,
+ 			 bp_info->ref_cnt);
++		if (bp_info->ref_cnt == 0)
++			INIT_LIST_HEAD(&bp_info->ctp_dev);
+ 		bp_info->dev = data->dev;
+ 		bp_info->ref_cnt++;
+ 		bp_info->flag = 1;
+ 		sif->ctp_dev = data->subif_data->ctp_dev;
++		ctp_dev = ctp_dev_list_lookup(&bp_info->ctp_dev, sif->ctp_dev);
++		if (!ctp_dev) {
++			ctp_dev = kzalloc(sizeof(*ctp_dev), GFP_ATOMIC);
++			if (!ctp_dev) {
++				DP_DEBUG(DP_DBG_FLAG_DBG, "kmalloc fail for %zd bytes\n",
++					 sizeof(*ctp_dev));
++				return -1;
++			}
++			ctp_dev->dev = sif->ctp_dev;
++			ctp_dev->bp = bp;
++			ctp_dev->ctp = subif_ix;
++			DP_DEBUG(DP_DBG_FLAG_DBG, "add ctp dev list\n");
++			list_add(&ctp_dev->list, &bp_info->ctp_dev);
++		} else {
++			DP_DEBUG(DP_DBG_FLAG_DBG, "Device already exist: %s\n",
++				 ctp_dev->dev->name);
++		}
+ 	}
+ 	DP_DEBUG(DP_DBG_FLAG_DBG,
+ 		 "inst=%d portid=%d dp numsubif=%d subif_ix=%d pmapper.cnt=%d\n",
+@@ -2034,6 +2054,7 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 	struct cqm_port_info *deq_pinfo;
+ 	struct bp_pmapper *bp_info;
+ 	struct q_info *q_info;
++	struct ctp_dev *ctp_dev;
+ 
+ 	if (!dp_dma_chan_tbl[inst]) {
+ 		pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
+@@ -2068,6 +2089,15 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 				     dma_ch_offset)->ref_cnt);
+ 		if (i == 0) { /* Cannot reset BP for all qid */
+ 			if (sif->ctp_dev) { /* pmapper */
++				ctp_dev = ctp_dev_list_lookup(&bp_info->ctp_dev, sif->ctp_dev);
++				if (!ctp_dev) {
++					DP_DEBUG(DP_DBG_FLAG_DBG, "Device not found: %s\n",
++						 ctp_dev->dev->name);
++					return -1;
++				}
++				DP_DEBUG(DP_DBG_FLAG_DBG, "del ctp dev list\n");
++				list_del(&ctp_dev->list);
++				kfree(ctp_dev);
+ 				sif->ctp_dev = NULL;
+ 				bp_info->ref_cnt--;
+ 				if (!bp_info->ref_cnt) {
+@@ -2452,10 +2482,6 @@ int register_dp_cap_gswip31(int flag)
+ 	cap.info.dp_mac_reset = dp_gswip_mac_entry_del;
+ 	cap.info.dp_cfg_vlan = dp_gswip_ext_vlan; /*for symmetric VLAN */
+ 	cap.info.dp_tc_vlan_set = tc_vlan_set_31;
+-	cap.info.dp_reg_bport_vlan = dp_register_bport_vlan;
+-	cap.info.dp_reg_br_vlan = dp_register_br_vlan;
+-	cap.info.dp_ndo_br_setlink = dp_ndo_br_setlink;
+-	cap.info.dp_ndo_br_dellink = dp_ndo_br_dellink;
+ #endif
+ 	cap.info.cap.hw_tso = 0;
+ 	cap.info.cap.hw_gso = 0;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 436330847dfc..bc7720ca1690 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -341,12 +341,4 @@ int dp_queue_block_flush_31(struct dp_qos_blk_flush_queue *cfg,
+ int dp_port_block_flush_31(struct dp_qos_blk_flush_port *cfg,
+ 			   int flag);
+ int dp_get_queue_qocc_31(struct dp_qos_queue_info *info, int flag);
+-int dp_register_br_vlan(struct br_info *br_info, int flags);
+-int dp_register_bport_vlan(struct br_info *br_info,
+-			   struct net_device *dev, int bport, int flags);
+-int dp_ndo_br_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+-		      u16 flags);
+-int dp_ndo_br_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+-		      u16 flags);
+-
+ #endif /* DATAPATH_MISC31_H */
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+index a09a30b1a503..a331ea7ff70d 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+@@ -29,8 +29,8 @@ int dp_swdev_alloc_bridge_id(int inst)
+ 	return br.nBridgeId;
+ }
+ 
+-int dp_swdev_get_bport_dp_port(struct br_info *br_item,	int bport,
+-			       u32 *priv_flag)
++int dp_swdev_get_dp_port_from_bp(struct br_info *br_item, int bport,
++				 u32 *priv_flag)
+ {
+ 	struct bridge_member_port *bport_list = NULL;
+ 
+@@ -40,7 +40,7 @@ int dp_swdev_get_bport_dp_port(struct br_info *br_item,	int bport,
+ 			return bport_list->dp_port;
+ 		}
+ 	}
+-	return 0;
++	return -1;
+ }
+ 
+ int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
+@@ -69,8 +69,11 @@ int dp_swdev_bridge_port_cfg_set(struct br_info *br_item,
+ 		pr_err("fail in getting bridge port config\r\n");
+ 		return -1;
+ 	}
+-	dport = dp_swdev_get_bport_dp_port(br_item, bport,
+-					   &priv_flag);
++	dport = dp_swdev_get_dp_port_from_bp(br_item, bport, &priv_flag);
++	if (dport < 0) {
++		pr_err("%s portid:%d invalid\n", __func__, dport);
++		return -1;
++	}
+ 	list_for_each_entry(bport_list, &br_item->bp_list, list) {
+ 		if (bport_list->bportid != bport) {
+ 			/* if member to be added for current bp,
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index be631e35a1cf..4c3a78316208 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -2364,6 +2364,7 @@ struct dp_subblk_info {
+  * block and Sub-Block
+  */
+ struct dp_pce_blk_info {
++	int inst;    /*! <in> dp instance */
+ 	GSW_PCE_RuleRegion_t region; /*!< [in] Region CTP/Global for PCE rule */
+ 	/*!< different block type will have different information */
+ 	union {
+diff --git a/include/net/datapath_inst.h b/include/net/datapath_inst.h
+index cef827bb9951..f7208d930c1d 100644
+--- a/include/net/datapath_inst.h
++++ b/include/net/datapath_inst.h
+@@ -160,13 +160,6 @@ struct inst_info {
+ 	int (*dp_mac_set)(int bport, int fid, int inst, u8 *addr);
+ 	int (*dp_mac_reset)(int bport, int fid, int inst, u8 *addr);
+ 	int (*dp_cfg_vlan)(int inst, int vap, int ep);
+-	int (*dp_reg_br_vlan)(struct br_info *br_info, int flags);
+-	int (*dp_reg_bport_vlan)(struct br_info *br_info,
+-			   struct net_device *dev, int bport, int flags);
+-	int (*dp_ndo_br_setlink)(struct net_device *dev,struct nlmsghdr *nlh, 
+-			u16 flags);
+-	int (*dp_ndo_br_dellink)(struct net_device *dev,struct nlmsghdr *nlh, 
+-			u16 flags);	
+ #endif
+ 	int (*dp_tc_vlan_set)(struct core_ops *ops, struct dp_tc_vlan *vlan,
+ 			      struct dp_tc_vlan_info *info,

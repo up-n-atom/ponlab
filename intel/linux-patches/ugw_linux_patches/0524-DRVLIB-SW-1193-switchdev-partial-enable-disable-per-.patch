@@ -1,0 +1,388 @@
+From f5db3aecd78e1e851e0e686735144caf5afa9051 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Tue, 12 Mar 2019 16:38:18 +0800
+Subject: [PATCH] DRVLIB_SW-1193: switchdev partial enable/disable per port at
+ DP level to support FMX/LGM HGU case and change some debug message print
+
+---
+ drivers/net/ethernet/lantiq/datapath/datapath.h    |  3 +
+ .../ethernet/lantiq/datapath/datapath_notifier.c   | 15 ++--
+ .../net/ethernet/lantiq/datapath/datapath_proc.c   |  2 +-
+ .../net/ethernet/lantiq/datapath/datapath_swdev.c  | 91 +++++++++++++---------
+ .../net/ethernet/lantiq/datapath/datapath_swdev.h  |  1 +
+ .../lantiq/datapath/gswip31/datapath_gswip.c       | 28 ++++---
+ .../lantiq/datapath/gswip31/datapath_ppv4_api.c    | 16 +++-
+ 7 files changed, 96 insertions(+), 60 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath.h b/drivers/net/ethernet/lantiq/datapath/datapath.h
+index 78d1dc3949c0..02f51e583a72 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath.h
+@@ -477,6 +477,9 @@ struct pmac_port_info {
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ 	u32 f_ptp:1; /* PTP1588 support enablement */
+ #endif
++#if IS_ENABLED(CONFIG_LTQ_DATAPATH_SWITCHDEV)
++	u32 swdev_en; /* swdev enable/disable flag for port */
++#endif
+ };
+ 
+ struct pmac_port_info2 {
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_notifier.c b/drivers/net/ethernet/lantiq/datapath/datapath_notifier.c
+index 3ede1ada0242..2bf6b16f335f 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_notifier.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_notifier.c
+@@ -127,12 +127,17 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 		if (br_info) {
+ 			dp_dev->fid = br_info->fid;
+ 		} else {
+-			fid = dp_notif_br_alloc(br_dev);
+-			if (fid > 0) {
+-				dp_dev->fid = fid;
++			if (port->swdev_en == 1) {
++				fid = dp_notif_br_alloc(br_dev);
++				if (fid > 0) {
++					dp_dev->fid = fid;
++				} else {
++					PR_ERR("FID alloc failed in %s\r\n",
++					       __func__);
++					return 0;
++				}
+ 			} else {
+-				PR_ERR("FID alloc failed in %s\r\n", __func__);
+-				return 0;
++				dp_dev->fid = 0;
+ 			}
+ 		}
+ 		for (i = 0; i < MAX_SUBIFS; i++) {
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+index c7262f4ac469..16d0953f5144 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+@@ -130,6 +130,7 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	seq_puts(s, "\n");
+ 	seq_printf(s, "    mode:              %d\n", port->cqe_lu_mode);
+ 	seq_printf(s, "    LCT:               %d\n", port->lct_idx);
++	seq_printf(s, "    Swdev:             %d\n", port->swdev_en);
+ 	seq_printf(s, "    cb->rx_fn:         0x%0x\n", (u32)port->cb.rx_fn);
+ 	seq_printf(s, "    cb->restart_fn:    0x%0x\n",
+ 		   (u32)port->cb.restart_fn);
+@@ -202,7 +203,6 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 			   cqm_p,
+ 			   port->subif_info[i].qos_deq_port,
+ 			   dp_deq_port_tbl[tmp_inst][cqm_p].ref_cnt);
+-
+ 		cid = _DMA_CONTROLLER(dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan);
+ 		pid = _DMA_PORT(dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan);
+ 		nid = _DMA_CHANNEL(dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan);
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c b/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c
+index 0e1fe0cb50a6..05c11b8e3593 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_swdev.c
+@@ -141,7 +141,7 @@ struct br_info *dp_swdev_bridge_entry_lookup(char *br_name)
+ 
+ static void dp_swdev_remove_bridge_id_entry(struct br_info *br_item)
+ {
+-	/*TODO reset switch bridge configurations*/
++	/*reset switch bridge configurations*/
+ 	DP_DEBUG(DP_DBG_FLAG_SWDEV, "hash del\n");
+ 	hlist_del(&br_item->br_hlist);
+ 	kfree(br_item);
+@@ -254,22 +254,25 @@ static int dp_swdev_clr_gswip_cfg(struct bridge_id_entry_item *br_item,
+ 	if (!br_info)
+ 		return 0;
+ 	if (dp_swdev_del_bport_from_list(br_info, br_item->portid)) {
+-		ret = dp_port_prop[br_item->inst].info.
+-			swdev_bridge_port_cfg_reset(br_info,
+-						    br_item->inst,
+-						    br_item->portid);
+-		if (ret == DEL_BRENTRY) {
+-			dp_port_prop[br_item->inst].info.
+-				swdev_free_brcfg(br_item->inst, br_item->fid);
+-			dp_swdev_remove_bridge_id_entry(br_info);
+-			DP_DEBUG(DP_DBG_FLAG_SWDEV,
+-				 "rem bport(%d),bridge(%s)\n",
+-				 br_item->portid,
+-				 br_item->br_device_name);
++		if (dp_port_info[br_item->inst][br_item->dp_port].
++							swdev_en == 1) {
++			ret = dp_port_prop[br_item->inst].info.
++				swdev_bridge_port_cfg_reset(br_info,
++							    br_item->inst,
++							    br_item->portid);
++			if (ret == DEL_BRENTRY) {
++				dp_port_prop[br_item->inst].info.
++					swdev_free_brcfg(br_item->inst, br_item->fid);
++				dp_swdev_remove_bridge_id_entry(br_info);
++				DP_DEBUG(DP_DBG_FLAG_SWDEV,
++					 "rem bport(%d),bridge(%s)\n",
++					 br_item->portid,
++					 br_item->br_device_name);
++			}
++			DP_DEBUG(DP_DBG_FLAG_SWDEV, "rem bport(%d)\n",
++				 br_item->portid);
++			return 0;
+ 		}
+-		DP_DEBUG(DP_DBG_FLAG_SWDEV, "rem bport(%d)\n",
+-			 br_item->portid);
+-		return 0;
+ 	}
+ 	return 0;
+ }
+@@ -281,9 +284,7 @@ static int dp_swdev_cfg_vlan(struct bridge_id_entry_item *br_item,
+ 	u32 idx, inst;
+ 	int vap;
+ 
+-	/*if (br_info->flag & LOGIC_DEV_REGISTER) {*/
+ 	if (br_item->flags & LOGIC_DEV_REGISTER) {
+-		/*get_vlan_via_dev(dev, &vlan_prop);*/
+ 		idx = dp_dev_hash(dev, NULL);
+ 		dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
+ 		if (!dp_dev) {
+@@ -354,6 +355,12 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item, u8 *addr)
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_SWDEV, "britem flags:%x\n", br_item->flags);
+ 	if (br_item->flags & ADD_BRENTRY) {
++		if (dp_port_info[br_item->inst][br_item->dp_port].
++							swdev_en == 0) {
++			DP_DEBUG(DP_DBG_FLAG_SWDEV, "swdev disable for bp %d\n",
++				 br_item->portid);
++			return 0;
++		}
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV, "Add br entry %s\n",
+ 			 br_item->br_device_name);
+ 		if ((dp_port_prop[br_item->inst].info.
+@@ -377,7 +384,6 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item, u8 *addr)
+ 			 * br/bport delete
+ 			 */
+ 			if (br_item->flags & LOGIC_DEV_REGISTER) {
+-				//br_item->flags &= ~LOGIC_DEV_REGISTER;
+ 				br_info->flag = LOGIC_DEV_REGISTER;
+ 			}
+ 			strcpy(br_info->br_device_name,
+@@ -405,10 +411,13 @@ static int dp_swdev_cfg_gswip(struct bridge_id_entry_item *br_item, u8 *addr)
+ 		if (br_item->flags & LOGIC_DEV_REGISTER)
+ 			br_info->flag = LOGIC_DEV_REGISTER;
+ 		dp_swdev_add_bport_to_list(br_info, br_item->portid);
+-		dp_port_prop[br_item->inst].info.
+-			swdev_bridge_port_cfg_set(br_info,
+-						  br_item->inst,
+-						  br_item->portid);
++		if (dp_port_info[br_item->inst][br_item->dp_port].
++							swdev_en == 1) {
++			dp_port_prop[br_item->inst].info.
++				swdev_bridge_port_cfg_set(br_info,
++							  br_item->inst,
++							  br_item->portid);
++		}
+ 		DP_DEBUG(DP_DBG_FLAG_SWDEV, "added bport(%d)\n",
+ 			 br_item->portid);
+ 		return 0;
+@@ -482,6 +491,7 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 		br_item->inst = subif.inst;
+ 		/* current bridge member port*/
+ 		br_item->portid = subif.bport;
++		br_item->dp_port = subif.port_id;
+ 		swdev_lock();
+ 		br_info = dp_swdev_bridge_entry_lookup(br_dev->name);
+ 		if (br_info) {
+@@ -491,20 +501,26 @@ static int dp_swdev_add_if(struct net_device *dev,
+ 			br_item->flags = flag;
+ 		} else {
+ 			br_item->flags = ADD_BRENTRY | flag;
+-			br_id = dp_port_prop[br_item->inst].info.
+-				swdev_alloc_bridge_id(br_item->inst);
+-			if (br_id) {
+-				/* Store bridge information to add in the table.
+-				 * This
+-				 * info is used during switchdev commit phase
+-				 */
++			if (dp_port_info[inst][port].swdev_en == 1) {
++				br_id = dp_port_prop[br_item->inst].info.
++					swdev_alloc_bridge_id(br_item->inst);
++				if (br_id) {
++					/* Store bridge information to add in the table.
++					 * This
++					 * info is used during switchdev commit phase
++					 */
++					strcpy(br_item->br_device_name,
++					       br_dev->name);
++					br_item->fid = br_id;
++				} else {
++					PR_ERR("Switch config failed\r\n");
++					kfree(br_item);
++					swdev_unlock();
++					return -EOPNOTSUPP;
++				}
++			} else {
+ 				strcpy(br_item->br_device_name, br_dev->name);
+ 				br_item->fid = br_id;
+-			} else {
+-				PR_ERR("Switch configuration failed\r\n");
+-				kfree(br_item);
+-				swdev_unlock();
+-				return -EOPNOTSUPP;
+ 			}
+ 		}
+ 		switchdev_trans_item_enqueue(trans, br_item,
+@@ -559,6 +575,7 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 			br_item->inst = subif.inst;
+ 			/* current bridge member port*/
+ 			br_item->portid = subif.bport;
++			br_item->dp_port = subif.port_id;
+ 			br_item->flags = BRIDGE_NO_ACTION;
+ 			strcpy(br_item->br_device_name,
+ 			       br_info->br_device_name);
+@@ -582,7 +599,7 @@ static int dp_swdev_del_if(struct net_device *dev,
+ 		swdev_unlock();
+ 		return 0;
+ 	}
+-	/*TODO Check bridge port exists otherwise register device with datapath
++	/*Check bridge port exists otherwise register device with datapath
+ 	 *i.e. only in case of new VLAN interface
+ 	 */
+ 	/*configure switch in commit phase and it cannot return failure*/
+@@ -711,7 +728,6 @@ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 	br_dev = netdev_master_upper_dev_get(attr->orig_dev);
+ 	if (!br_dev)
+ 		return -EOPNOTSUPP;
+-#if 1
+ 	switch (attr->id) {
+ 	case SWITCHDEV_ATTR_ID_PORT_STP_STATE:
+ 		/*STP STATE forwading or ifconfig UP - add bridge*/
+@@ -750,7 +766,6 @@ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 		break;
+ 	}
+ 	return err;
+-#endif
+ }
+ 
+ static int dp_swdev_port_attr_get(struct net_device *dev,
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_swdev.h b/drivers/net/ethernet/lantiq/datapath/datapath_swdev.h
+index 993233985948..af322d58faae 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_swdev.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_swdev.h
+@@ -28,6 +28,7 @@ struct bridge_id_entry_item {
+ 	u16 fid;
+ 	u32 flags;
+ 	u32 portid; /*Bridge port*/
++	u32 dp_port; /*DP port*/
+ 	u32 inst;
+ 	struct switchdev_trans_item tritem;
+ };
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_gswip.c b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_gswip.c
+index 60a8467e4f6b..2af185f16d54 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_gswip.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_gswip.c
+@@ -42,34 +42,35 @@ struct ctp_assign {
+ 	u32 vap_offset; /*VAP offset */
+ 	u32 vap_mask;  /*VAP Mask after shift vap_offset bits */
+ 	u32 lookup_mode; /*CQE lookup mode  */
++	u16 swdev_enable; /* To enable or disable switchdev feature */
+ };
+ 
+ static struct ctp_assign ctp_assign_info[] = {
+ 	/*note: multiple flags must put first */
+-	{DP_F_GPON, GSW_LOGICAL_PORT_GPON, 256, 0, 0xFF, CQE_LU_MODE1},
+-	{DP_F_EPON, GSW_LOGICAL_PORT_EPON, 256, 0, 0xFF, CQE_LU_MODE1},
+-	{DP_F_GINT, GSW_LOGICAL_PORT_GINT, 16, 0, 0xFF, CQE_LU_MODE1},
++	{DP_F_GPON, GSW_LOGICAL_PORT_GPON, 256, 0, 0xFF, CQE_LU_MODE1, 1},
++	{DP_F_EPON, GSW_LOGICAL_PORT_EPON, 256, 0, 0xFF, CQE_LU_MODE1, 1},
++	{DP_F_GINT, GSW_LOGICAL_PORT_GINT, 16, 0, 0xFF, CQE_LU_MODE1, 1},
+ /*#define DP_ETH_TEST*/
+ #ifndef DP_ETH_TEST
+ 	{DP_F_FAST_ETH_WAN, GSW_LOGICAL_PORT_8BIT_WLAN, 8, 8, 0xF,
+-		CQE_LU_MODE2},
++		CQE_LU_MODE2, 1},
+ 	{DP_F_FAST_ETH_LAN | DP_F_ALLOC_EXPLICIT_SUBIFID,
+-		GSW_LOGICAL_PORT_8BIT_WLAN, 8, 8, 0xF, CQE_LU_MODE2},
++		GSW_LOGICAL_PORT_8BIT_WLAN, 8, 8, 0xF, CQE_LU_MODE2, 1},
+ 	{DP_F_FAST_ETH_LAN, GSW_LOGICAL_PORT_8BIT_WLAN, 4, 8, 0xF,
+-		CQE_LU_MODE2},
++		CQE_LU_MODE2, 1},
+ #else /*testing only */
+-	{DP_F_FAST_ETH_WAN, GSW_LOGICAL_PORT_OTHER, 1, 8, 0xF, CQE_LU_MODE2},
++	{DP_F_FAST_ETH_WAN, GSW_LOGICAL_PORT_OTHER, 1, 8, 0xF, CQE_LU_MODE2, 1},
+ 	{DP_F_FAST_ETH_LAN | DP_F_ALLOC_EXPLICIT_SUBIFID,
+-		GSW_LOGICAL_PORT_OTHER, 1, 8, 0xF, CQE_LU_MODE2},
+-	{DP_F_FAST_ETH_LAN, GSW_LOGICAL_PORT_OTHER, 1, 8, 0xF, CQE_LU_MODE2},
++		GSW_LOGICAL_PORT_OTHER, 1, 8, 0xF, CQE_LU_MODE2, 1},
++	{DP_F_FAST_ETH_LAN, GSW_LOGICAL_PORT_OTHER, 1, 8, 0xF, CQE_LU_MODE2, 1},
+ #endif
+-	{DP_F_FAST_WLAN, GSW_LOGICAL_PORT_8BIT_WLAN, 16, 8, 0xF, CQE_LU_MODE2},
++	{DP_F_FAST_WLAN, GSW_LOGICAL_PORT_8BIT_WLAN, 16, 8, 0xF, CQE_LU_MODE2, 1},
+ 	{DP_F_FAST_WLAN_EXT, GSW_LOGICAL_PORT_9BIT_WLAN, 8, 9, 0x7,
+-		CQE_LU_MODE2}
++		CQE_LU_MODE2, 1}
+ };
+ 
+ static struct ctp_assign ctp_assign_def = {0, GSW_LOGICAL_PORT_8BIT_WLAN, 8, 8,
+-					   0xF, CQE_LU_MODE2};
++					   0xF, CQE_LU_MODE2, 1};
+ 
+ static struct gsw_itf itf_assign[PMAC_MAX_NUM] = {0};
+ 
+@@ -642,6 +643,9 @@ struct gsw_itf *ctp_port_assign(int inst, u8 ep, int bp_default,
+ 	dp_port_info[inst][ep].ctp_max = ctp_assign.nNumberOfCtpPort;
+ 	dp_port_info[inst][ep].vap_offset = assign->vap_offset;
+ 	dp_port_info[inst][ep].vap_mask = assign->vap_mask;
++#if IS_ENABLED(CONFIG_LTQ_DATAPATH_SWITCHDEV)
++	dp_port_info[inst][ep].swdev_en = assign->swdev_enable;
++#endif
+ 	return &itf_assign[ep];
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c
+index e329ea9722b4..88bbe5524e37 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_ppv4_api.c
+@@ -211,7 +211,6 @@ int arbi_pp2dp(int pp_arbi)
+ 		if (arbi_maps[i].pp_arbi == pp_arbi)
+ 			return arbi_maps[i].dp_arbi;
+ 	}
+-	PR_ERR("Wrong pp_arbitrate: %d\n", pp_arbi);
+ 	return DP_FAILURE;
+ }
+ 
+@@ -2254,12 +2253,24 @@ static int get_parent_arbi(int inst, int node_id, int flag)
+ 			return DP_FAILURE;
+ 		}
+ 		arbi = arbi_pp2dp(sched_cfg.sched_parent_prop.arbitration);
++		if (arbi == DP_FAILURE)
++			PR_ERR("Wrong pp_arbitrate: %d for %s:%d\n",
++			       port_cfg.port_parent_prop.arbitration,
++			       (priv->qos_sch_stat[node_id].type == DP_NODE_SCH)
++			       ? "sched" : "Q",
++			       node_id);
+ 	} else if (priv->qos_sch_stat[node_id].parent.type == DP_NODE_PORT) {
+ 		if (qos_port_conf_get(priv->qdev, pid, &port_cfg)) {
+ 			PR_ERR("fail to get port config\n");
+ 			return DP_FAILURE;
+ 		}
+ 		arbi = arbi_pp2dp(port_cfg.port_parent_prop.arbitration);
++		if (arbi == DP_FAILURE)
++			PR_ERR("Wrong pp_arbitrate: %d for %s:%d\n",
++			       port_cfg.port_parent_prop.arbitration,
++			       (priv->qos_sch_stat[node_id].type == DP_NODE_SCH)
++			       ? "sched" : "Q",
++			       node_id);
+ 	} else {
+ 		PR_ERR("incorrect parent type:0x%x for node:%d.\n",
+ 		       priv->qos_sch_stat[node_id].parent.type,
+@@ -2461,7 +2472,6 @@ int dp_qos_link_prio_get_31(struct dp_node_prio *info, int flag)
+ 		arbi = get_parent_arbi(info->inst, node_id, flag);
+ 
+ 		if (arbi == DP_FAILURE) {
+-			PR_ERR("get_parent_arbi fail for Q:%d!\n", node_id);
+ 			return DP_FAILURE;
+ 		}
+ 		info->arbi = arbi;
+@@ -2488,8 +2498,6 @@ int dp_qos_link_prio_get_31(struct dp_node_prio *info, int flag)
+ 		arbi = get_parent_arbi(info->inst, info->id.sch_id, flag);
+ 
+ 		if (arbi == DP_FAILURE) {
+-			PR_ERR("get_parent_arbi fail for Sched:%d!\n",
+-			       info->id.sch_id);
+ 			return DP_FAILURE;
+ 		}
+ 		info->arbi = arbi;

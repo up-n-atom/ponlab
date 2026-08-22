@@ -1,0 +1,162 @@
+From e6f6071834b88f6cd55b8aa37c776b4100e9aa40 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Fri, 8 Nov 2019 02:09:21 +0200
+Subject: [PATCH] PONRTSYS-6266: change PPv4 session manager DB memory
+ allocation method
+
+Signed-off-by: Emergi Idan <idan.emergi@intel.com>
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |  7 +-
+ drivers/net/ppv4/pp-headers/pp_common.h            | 99 +++++++++++++++++++++-
+ 2 files changed, 101 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 4a0a1eb07ce7..37d9fc6d1f00 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -3941,9 +3941,10 @@ static s32 __smgr_db_sessions_init(struct device *dev)
+ 
+ 	/* init free sessions list */
+ 	INIT_LIST_HEAD(&db->free_list);
++
+ 	/* allocate sessions db entries */
+-	db->sessions = devm_kcalloc(dev, db->n_sessions,
+-				    sizeof(*db->sessions), GFP_KERNEL);
++	db->sessions = pp_devm_kvcalloc(dev, db->n_sessions,
++					sizeof(*db->sessions), GFP_KERNEL);
+ 	if (unlikely(!db->sessions)) {
+ 		pr_err("Failed to allocate %u sessions memory\n",
+ 		       db->n_sessions);
+@@ -4161,7 +4162,7 @@ static void __smgr_db_destroy(void)
+ 	if (likely(db->workq_hi))
+ 		destroy_workqueue(db->workq_hi);
+ 	if (likely(db->sessions))
+-		devm_kfree(dev, db->sessions);
++		pp_devm_kvfree(dev, db->sessions);
+ 	if (likely(db->open_bmap))
+ 		devm_kfree(dev, db->open_bmap);
+ 	if (likely(db->ipv4_bmap))
+diff --git a/drivers/net/ppv4/pp-headers/pp_common.h b/drivers/net/ppv4/pp-headers/pp_common.h
+index 962cbd716349..26d4c91b845a 100644
+--- a/drivers/net/ppv4/pp-headers/pp_common.h
++++ b/drivers/net/ppv4/pp-headers/pp_common.h
+@@ -18,6 +18,9 @@
+ #include <linux/errno.h>
+ #include <linux/jiffies.h>
+ #include <linux/delay.h>
++#ifdef CONFIG_PPV4_FPGA
++#include <linux/vmalloc.h>
++#endif
+ #include <linux/pp_api.h>
+ 
+ /**
+@@ -1050,6 +1053,98 @@ static inline u64 buf_fld_max_val_get(struct buf_fld_info *fld)
+ 	return MASK2MAX(mask);
+ }
+ 
++static inline int pp_devm_kvmalloc_match(struct device *dev, void *res,
++				     void *match_data)
++{
++	return *((ulong *)res) == (ulong)match_data;
++}
++
++static inline void pp_devm_kvmalloc_release(struct device *dev, void *res)
++{
++	void *ptr = (void *)*((ulong *)res);
++
++#ifdef CONFIG_PPV4_FPGA
++	vfree(ptr);
++#else
++	kvfree(ptr);
++#endif
++}
++
++/**
++ * @brief Resource-managed kvfree
++ * @param dev Device this memory belongs to
++ * @param ptr Memory to free
++ *
++ * Free memory allocated with pp_devm_kvmalloc().
++ */
++static inline void pp_devm_kvfree(struct device *dev, void *ptr)
++{
++	s32 rc;
++
++	rc = devres_destroy(dev, pp_devm_kvmalloc_release,
++			    pp_devm_kvmalloc_match, ptr);
++	WARN_ON(rc);
++}
++
++/**
++ * @brief Resource-managed kvmalloc
++ * @param dev Device to allocate memory for
++ * @param sz Allocation size
++ * @param flags Allocation gfp flags
++ *
++ * Managed kvmalloc. Memory allocated with this function is
++ * automatically freed on driver detach.  Like all other devres
++ * resources, guaranteed alignment is unsigned long long.
++ * Allocated memory may not be physically contiguos, do not use
++ * for HW.
++ *
++ * @return Pointer to allocated memory on success, NULL on failure.
++ */
++static inline void *pp_devm_kvmalloc(struct device *dev, size_t sz, gfp_t flags)
++{
++	ulong *res;
++	void  *ptr;
++
++	res = devres_alloc(pp_devm_kvmalloc_release, sizeof(res), flags);
++	if (!res)
++		return NULL;
++
++#ifdef CONFIG_PPV4_FPGA
++	ptr = vmalloc(sz);
++#else
++	ptr = kvmalloc(sz, flags);
++#endif
++	if (!ptr) {
++		devres_free(res);
++		return NULL;
++	}
++
++	*res = (ulong)ptr;
++	devres_add(dev, res);
++	return ptr;
++}
++
++static inline void *pp_devm_kvzalloc(struct device *dev, size_t sz, gfp_t flags)
++{
++	return pp_devm_kvmalloc(dev, sz, flags | __GFP_ZERO);
++}
++
++static inline void *pp_devm_kvcalloc(struct device *dev, size_t n, size_t sz,
++				     gfp_t flags)
++{
++	size_t size;
++
++#ifdef CONFIG_PPV4_FPGA
++	size = sz * n;
++#else
++	if (unlikely(check_mul_overflow(n, sz, &size)))
++		return NULL;
++#endif
++
++	return pp_devm_kvmalloc(dev, size, flags | __GFP_ZERO);
++}
++
++
+ /**
+  * @brief Swap source buffer and write to dest buffer<br>
+  *        dst[0] = src[src_sz - 1]<br>
+@@ -1058,8 +1153,8 @@ static inline u64 buf_fld_max_val_get(struct buf_fld_info *fld)
+  * @return number of bytes swapped on success, negative error code
+  *         otherwise
+  */
+-static inline s32 __buf_swap(void *dst, size_t dst_sz,
+-			     const void *src, size_t src_sz)
++static inline s32 __buf_swap(void *dst, size_t dst_sz, const void *src,
++			     size_t src_sz)
+ {
+ 	const char *__src;
+ 	char       *__dst;

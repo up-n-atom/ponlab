@@ -1,0 +1,442 @@
+From b687886139076e36a0946095bc0eca6d24157f53 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Mon, 10 Sep 2018 13:08:28 +0800
+Subject: [PATCH] DRVLIB_SW-907: DP Multicast VLAN support
+
+---
+ drivers/net/ethernet/lantiq/datapath/datapath.h    |   7 +-
+ .../net/ethernet/lantiq/datapath/datapath_api.c    |  14 ++-
+ .../net/ethernet/lantiq/datapath/datapath_proc.c   |  56 ++++++-----
+ .../datapath/gswip31/datapath_tc_asym_vlan.c       | 102 +++++++++++++++------
+ include/net/datapath_api_vlan.h                    |   2 +
+ 5 files changed, 131 insertions(+), 50 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath.h b/drivers/net/ethernet/lantiq/datapath/datapath.h
+index 8ce19ed2ffb1..169d91ca5f65 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath.h
+@@ -600,8 +600,11 @@ struct ext_vlan_info {
+ };
+ 
+ struct dp_tc_vlan_info {
+-	int dev_type; /* 1: apply VLAN to bp,
+-		       * 0: apply VLAN to subix (subif group)
++	int dev_type; /* bit 0 - 1: apply VLAN to bp
++		       *         0: apply VLAN to subix (subif group)
++		       * bit 1 - 1: multicast session
++		       *         0: normal
++		       *
+ 		       */
+ 	int subix;  /*similar like GSWIP subif group*/
+ 	int bp;  /*bridge port id */
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+index 2872bfa819d2..405a375b274f 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -2529,7 +2529,19 @@ int dp_vlan_set(struct dp_tc_vlan *vlan, int flags)
+ 	info.bp = subif.bport;
+ 	info.dp_port = subif.port_id;
+ 	info.inst = subif.inst;
+-	info.dev_type = subif.flag_bp;
++	
++	if ((vlan->def_apply == DP_VLAN_APPLY_CTP) && 
++				(subif.flag_pmapper == 1)) {
++		PR_ERR("cannot apply VLAN rule for pmapper device\n");
++		return DP_FAILURE;
++	} else if (vlan->def_apply == DP_VLAN_APPLY_CTP) {
++		info.dev_type = 0;
++	} else {
++		info.dev_type |= subif.flag_bp;
++	}
++	if (vlan->mcast_flag == DP_MULTICAST_SESSION) 
++		info.dev_type |= 0x02;
++	PR_INFO("dev_type:0x%x\n", info.dev_type);
+ 	if (DP_CB(subif.inst, dp_tc_vlan_set))
+ 		return DP_CB(subif.inst, dp_tc_vlan_set)
+ 			    (dp_port_prop[subif.inst].ops[0],
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+index 875e6731563a..f981c1ce2532 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+@@ -804,10 +804,12 @@ static int proc_write_mem(struct file *file, const char *buf, size_t count,
+ }
+ 
+ static void set_dev(struct dp_tc_vlan *vlan, struct net_device *dev, int
+-		    def_apply, int dir, int n_vlan0, int n_vlan1, int n_vlan2)
++		    def_apply, int dir, int n_vlan0, int n_vlan1, int n_vlan2,
++		    int mcast)
+ {
+ 	vlan->dev = dev;
+ 	vlan->def_apply = def_apply;
++	vlan->mcast_flag = mcast;
+ 	vlan->dir = dir;
+ 	vlan->n_vlan0 = n_vlan0;
+ 	vlan->n_vlan1 = n_vlan1;
+@@ -858,6 +860,9 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 	int  k, len;
+ 	char dev_name[16];
+ 	int test_num = 0;
++	int ctp = 0;
++	int mcast = 0;
++	int dir = 0;
+ 	struct dp_tc_vlan vlan = {0};
+ 	struct dp_vlan0 vlan0_list = {0};
+ 	struct dp_vlan1 vlan1_list = {0};
+@@ -883,6 +888,15 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		} else if (dp_strncmpi(param_list[k], "-tnum", strlen("-tnum")) == 0) {
+ 			test_num = dp_atoi(param_list[k + 1]);
+ 			k += 2;
++		} else if (dp_strncmpi(param_list[k], "CTP", strlen("CTP")) == 0) {
++			ctp = dp_atoi(param_list[k + 1]);
++			k += 2;
++		} else if (dp_strncmpi(param_list[k], "mcast", strlen("mcast")) == 0) {
++			mcast = dp_atoi(param_list[k + 1]);
++			k += 2;
++		} else if (dp_strncmpi(param_list[k], "dir", strlen("dir")) == 0) {
++			dir = dp_atoi(param_list[k + 1]);
++			k += 2;
+ 		} else {
+ 			PR_INFO("unknown command option: %s\n",
+ 				param_list[k]);
+@@ -900,7 +914,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet with VID 10\n");
+ 		PR_INFO("Desc:pattern match = FALSE\n");
+ 		PR_INFO("Output:Enqueued packet is received without change\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		/*random proto for failing the pattern match*/
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+@@ -914,7 +928,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet without VLAN tag\n");
+ 		PR_INFO("Desc:pattern match = FALSE\n");
+ 		PR_INFO("Output:Enqueued packet is received without change\n");
+-		set_dev(&vlan, dev, 0, 0, 1, 0, 0);
++		set_dev(&vlan, dev, ctp, dir, 1, 0, 0, mcast);
+ 		vlan.vlan0_list = &vlan0_list;
+ 		/*random proto for failing the pattern match*/
+ 		set_pattern(&vlan0_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+@@ -928,7 +942,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet without VLAN tag\n");
+ 		PR_INFO("Desc:pattern match = TRUE\n");
+ 		PR_INFO("Output:Enqueued packet is not received\n");
+-		set_dev(&vlan, dev, 0, 0, 1, 0, 0);
++		set_dev(&vlan, dev, ctp, dir, 1, 0, 0, mcast);
+ 		vlan.vlan0_list = &vlan0_list;
+ 		/*random proto for failing the pattern match*/
+ 		set_pattern(&vlan0_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+@@ -945,7 +959,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet with VID 10\n");
+ 		PR_INFO("Desc:pattern match = TRUE and POP action\n");
+ 		PR_INFO("Output:Enqueued packet is received without vlantag\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    TEST_VID, DP_VLAN_PATTERN_NOT_CARE,
+@@ -959,7 +973,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet with double tag VID 10 and vid	100\n");
+ 		PR_INFO("Desc:pattern match = TRUE and POP action\n");
+ 		PR_INFO("Output:Enqueued packet is received without vlantag\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 0, 1);
++		set_dev(&vlan, dev, ctp, dir, 0, 0, 1, mcast);
+ 		vlan.vlan2_list = &vlan2_list;
+ 		set_pattern(&vlan2_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    TEST_VID, DP_VLAN_PATTERN_NOT_CARE,
+@@ -977,7 +991,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with vlan tag");
+ 		PR_INFO("that is pushed\n");
+-		set_dev(&vlan, dev, 0, 0, 1, 0, 0);
++		set_dev(&vlan, dev, ctp, dir, 1, 0, 0, mcast);
+ 		vlan.vlan0_list = &vlan0_list;
+ 		set_pattern(&vlan0_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -992,7 +1006,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with 2 vlan tags");
+ 		PR_INFO("that are pushed\n");
+-		set_dev(&vlan, dev, 0, 0, 1, 0, 0);
++		set_dev(&vlan, dev, ctp, 0, 1, 0, 0, mcast);
+ 		vlan.vlan0_list = &vlan0_list;
+ 		set_pattern(&vlan0_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1008,7 +1022,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with vlan tag");
+ 		PR_INFO("that is pushed\n");
+-		set_dev(&vlan, dev, 0, 1, 1, 0, 0);
++		set_dev(&vlan, dev, ctp, dir, 1, 0, 0, mcast);
+ 		vlan.vlan0_list = &vlan0_list;
+ 		set_pattern(&vlan0_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1023,7 +1037,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with 2 vlan tags");
+ 		PR_INFO("that are pushed\n");
+-		set_dev(&vlan, dev, 0, 1, 1, 0, 0);
++		set_dev(&vlan, dev, ctp, dir, 1, 0, 0, mcast);
+ 		vlan.vlan0_list = &vlan0_list;
+ 		set_pattern(&vlan0_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1038,7 +1052,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with 2 vlan tags,");
+ 		PR_INFO("the original and the pushed one\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1053,7 +1067,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with 3 vlan tags,");
+ 		PR_INFO("the original and 2 pushed ones\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1069,7 +1083,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with 2 vlan tags,");
+ 		PR_INFO("the original and the pushed one\n");
+-		set_dev(&vlan, dev, 0, 1, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1084,7 +1098,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE and PUSH action\n");
+ 		PR_INFO("Output:Enqueued packet is received with 3 vlan tags");
+ 		PR_INFO("the original and 2 pushed ones\n");
+-		set_dev(&vlan, dev, 0, 1, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    DP_VLAN_PATTERN_NOT_CARE, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1098,7 +1112,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet single vlan tag and vid 10\n");
+ 		PR_INFO("Desc:pattern match = FALSE and DROP action\n");
+ 		PR_INFO("Output:Enqueued packet is received unaltered\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    100, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1111,7 +1125,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet single vlan tag and vid 10\n");
+ 		PR_INFO("Desc:pattern match = TRUE and DROP action\n");
+ 		PR_INFO("Output:Enqueued packet is dropped\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 1, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 1, 0, mcast);
+ 		vlan.vlan1_list = &vlan1_list;
+ 		set_pattern(&vlan1_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    10, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1124,7 +1138,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet double vlan tag, vid 10 and vid 20\n");
+ 		PR_INFO("Desc:pattern match = FALSE and DROP action\n");
+ 		PR_INFO("Output:Enqueued packet is received unaltered\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 0, 1);
++		set_dev(&vlan, dev, ctp, dir, 0, 0, 1, mcast);
+ 		vlan.vlan2_list = &vlan2_list;
+ 		set_pattern(&vlan2_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    100, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1140,7 +1154,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Input:IP packet double vlan tag, vid 10 and vid 20\n");
+ 		PR_INFO("Desc:pattern match = TRUE and DROP action\n");
+ 		PR_INFO("Output:Enqueued packet is not received\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 0, 1);
++		set_dev(&vlan, dev, ctp, dir, 0, 0, 1, mcast);
+ 		vlan.vlan2_list = &vlan2_list;
+ 		set_pattern(&vlan2_list.outer, DP_VLAN_PATTERN_NOT_CARE,
+ 			    10, DP_VLAN_PATTERN_NOT_CARE,
+@@ -1162,7 +1176,7 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 		PR_INFO("Desc:pattern match = TRUE (vid match) , with action");
+ 		PR_INFO("PUSH for vid 5,6 POP for vid 7 and forward vid 8\n");
+ 		PR_INFO("Output:Enqueued packet received\n");
+-		set_dev(&vlan, dev, 0, 0, 0, 4, 0);
++		set_dev(&vlan, dev, ctp, dir, 0, 4, 0, mcast);
+ 		vlan1_list[0].def = DP_VLAN_DEF_ACCEPT;
+ 		vlan1_list[1].def = DP_VLAN_DEF_ACCEPT;
+ 		vlan1_list[2].def = DP_VLAN_DEF_ACCEPT;
+@@ -1203,8 +1217,8 @@ static int proc_asym_vlan(struct file *file, const char *buf, size_t count,
+ 	return count;
+ 
+ proc_help:
+-	PR_INFO("echo <dev> %s [-tnum %s]", "<device name>",
+-		"test_number");
++	PR_INFO("echo <dev> %s [-tnum %s] %s\n", "<device name>", "test_number",
++		"CTP <0/1> mcast <0/1> dir <0/1>");
+ 	return count;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_tc_asym_vlan.c b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_tc_asym_vlan.c
+index d2025137bb69..b9a8413c4a98 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_tc_asym_vlan.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_tc_asym_vlan.c
+@@ -115,6 +115,7 @@ static int update_ctp(struct core_ops *ops,
+ 		      u32 lpid,
+ 		      u32 subifidg,
+ 		      int ingress,
++		      int multicast,
+ 		      GSW_EXTENDEDVLAN_alloc_t *pextvlan)
+ {
+ 	int ret;
+@@ -125,24 +126,48 @@ static int update_ctp(struct core_ops *ops,
+ 	ctpcfg1.nSubIfIdGroup = subifidg;
+ 	ctpcfg2.nSubIfIdGroup = subifidg;
+ 	if (ingress) {
+-		ctpcfg1.eMask = GSW_CTP_PORT_CONFIG_MASK_INGRESS_VLAN;
+-		if (!pextvlan) {
+-			ctpcfg2.bIngressExtendedVlanEnable = LTQ_FALSE;
++		if (multicast) {
++			ctpcfg1.eMask = GSW_CTP_PORT_CONFIG_MASK_INGRESS_VLAN_IGMP;
++			if (!pextvlan) {
++				ctpcfg2.bIngressExtendedVlanIgmpEnable = LTQ_FALSE;
++			} else {
++				ctpcfg2.bIngressExtendedVlanIgmpEnable = LTQ_TRUE;
++				ctpcfg2.nIngressExtendedVlanBlockIdIgmp =
++					pextvlan->nExtendedVlanBlockId;
++				ctpcfg2.nIngressExtendedVlanBlockSizeIgmp = 0;
++			}
+ 		} else {
+-			ctpcfg2.bIngressExtendedVlanEnable = LTQ_TRUE;
+-			ctpcfg2.nIngressExtendedVlanBlockId =
+-				pextvlan->nExtendedVlanBlockId;
+-			ctpcfg2.nIngressExtendedVlanBlockSize = 0;
++			ctpcfg1.eMask = GSW_CTP_PORT_CONFIG_MASK_INGRESS_VLAN;
++			if (!pextvlan) {
++				ctpcfg2.bIngressExtendedVlanEnable = LTQ_FALSE;
++			} else {
++				ctpcfg2.bIngressExtendedVlanEnable = LTQ_TRUE;
++				ctpcfg2.nIngressExtendedVlanBlockId =
++					pextvlan->nExtendedVlanBlockId;
++				ctpcfg2.nIngressExtendedVlanBlockSize = 0;
++			}
+ 		}
+ 	} else {
+-		ctpcfg1.eMask = GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN;
+-		if (!pextvlan) {
+-			ctpcfg2.bEgressExtendedVlanEnable = LTQ_FALSE;
++		if (multicast) {
++			ctpcfg1.eMask = GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN_IGMP;
++			if (!pextvlan) {
++				ctpcfg2.bEgressExtendedVlanIgmpEnable = LTQ_FALSE;
++			} else {
++				ctpcfg2.bEgressExtendedVlanIgmpEnable = LTQ_TRUE;
++				ctpcfg2.nEgressExtendedVlanBlockIdIgmp =
++					pextvlan->nExtendedVlanBlockId;
++				ctpcfg2.nEgressExtendedVlanBlockSizeIgmp = 0;
++			}
+ 		} else {
+-			ctpcfg2.bEgressExtendedVlanEnable = LTQ_TRUE;
+-			ctpcfg2.nEgressExtendedVlanBlockId =
+-				pextvlan->nExtendedVlanBlockId;
+-			ctpcfg2.nEgressExtendedVlanBlockSize = 0;
++			ctpcfg1.eMask = GSW_CTP_PORT_CONFIG_MASK_EGRESS_VLAN;
++			if (!pextvlan) {
++				ctpcfg2.bEgressExtendedVlanEnable = LTQ_FALSE;
++			} else {
++				ctpcfg2.bEgressExtendedVlanEnable = LTQ_TRUE;
++				ctpcfg2.nEgressExtendedVlanBlockId =
++					pextvlan->nExtendedVlanBlockId;
++				ctpcfg2.nEgressExtendedVlanBlockSize = 0;
++			}
+ 		}
+ 	}
+ 	ctpcfg2.eMask = ctpcfg1.eMask;
+@@ -156,20 +181,40 @@ static int update_ctp(struct core_ops *ops,
+ 		return -EIO;
+ 
+ 	if (ingress) {
+-		if (ctpcfg1.bIngressExtendedVlanEnable != LTQ_FALSE) {
+-			GSW_EXTENDEDVLAN_alloc_t alloc = {0};
++		if (multicast) {
++			if (ctpcfg1.bIngressExtendedVlanIgmpEnable != LTQ_FALSE) {
++				GSW_EXTENDEDVLAN_alloc_t alloc = {0};
+ 
+-			alloc.nExtendedVlanBlockId =
+-				ctpcfg1.nIngressExtendedVlanBlockId;
+-			ops->gsw_extvlan_ops.ExtendedVlan_Free(ops, &alloc);
++				alloc.nExtendedVlanBlockId =
++					ctpcfg1.nIngressExtendedVlanBlockIdIgmp;
++				ops->gsw_extvlan_ops.ExtendedVlan_Free(ops, &alloc);
++			}
++		} else {
++			if (ctpcfg1.bIngressExtendedVlanEnable != LTQ_FALSE) {
++				GSW_EXTENDEDVLAN_alloc_t alloc = {0};
++
++				alloc.nExtendedVlanBlockId =
++					ctpcfg1.nIngressExtendedVlanBlockId;
++				ops->gsw_extvlan_ops.ExtendedVlan_Free(ops, &alloc);
++			}
+ 		}
+ 	} else {
+-		if (ctpcfg1.bEgressExtendedVlanEnable != LTQ_FALSE) {
+-			GSW_EXTENDEDVLAN_alloc_t alloc = {0};
++		if (multicast) {
++			if (ctpcfg1.bEgressExtendedVlanIgmpEnable != LTQ_FALSE) {
++				GSW_EXTENDEDVLAN_alloc_t alloc = {0};
+ 
+-			alloc.nExtendedVlanBlockId =
+-				ctpcfg1.nEgressExtendedVlanBlockId;
+-			ops->gsw_extvlan_ops.ExtendedVlan_Free(ops, &alloc);
++				alloc.nExtendedVlanBlockId =
++					ctpcfg1.nEgressExtendedVlanBlockIdIgmp;
++				ops->gsw_extvlan_ops.ExtendedVlan_Free(ops, &alloc);
++			}
++		} else {
++			if (ctpcfg1.bEgressExtendedVlanEnable != LTQ_FALSE) {
++				GSW_EXTENDEDVLAN_alloc_t alloc = {0};
++
++				alloc.nExtendedVlanBlockId =
++					ctpcfg1.nEgressExtendedVlanBlockId;
++				ops->gsw_extvlan_ops.ExtendedVlan_Free(ops, &alloc);
++			}
+ 		}
+ 	}
+ 
+@@ -746,12 +791,13 @@ static int tc_ext_vlan(struct core_ops *ops,
+ 			goto ERROR;
+ 	}
+ 
+-	if (info->dev_type == 0) {
++	if ((info->dev_type & 0x01) == 0) {
+ 		/* Configure CTP */
+ 		ret = update_ctp(ops,
+ 				 (u32)info->dp_port,
+ 				 (u32)info->subix,
+ 				 vlan->dir == DP_DIR_INGRESS,
++				 (info->dev_type & 0x02) != 0,
+ 				 &alloc);
+ 	} else {
+ 		/* Configure bridge port */
+@@ -787,9 +833,13 @@ int tc_vlan_set_31(struct core_ops *ops,
+ 		   int flag)
+ {
+ 	/* If it's bridge port, try to configure VLAN filter. */
+-	if (info->dev_type != 0) {
++	if ((info->dev_type & 0x01) != 0) {
+ 		int ret;
+ 
++		/* Multicast (IGMP Controlled) VLAN is not supported on Bridge Port */
++		if ((info->dev_type & 0x02) != 0)
++			return -EINVAL;
++
+ 		ret = tc_vlan_filter(ops, vlan, info);
+ 		/* Either managed to configure VLAN filter
+ 		 * or error happens in GSW API
+diff --git a/include/net/datapath_api_vlan.h b/include/net/datapath_api_vlan.h
+index 4783d5681620..66051ad1fb73 100644
+--- a/include/net/datapath_api_vlan.h
++++ b/include/net/datapath_api_vlan.h
+@@ -130,6 +130,8 @@ struct dp_tc_vlan {
+ #define DP_DIR_INGRESS 0
+ #define DP_DIR_EGRESS  1
+ 	int dir; /* DP_DIR_INGRESS(0) and DP_DIR_EGRESS(1) */
++#define DP_MULTICAST_SESSION 1  /*IGMP Multicast session */
++	int mcast_flag; /*normal or multicast session */
+ 
+ 	int n_vlan0, n_vlan1, n_vlan2; /*size of vlan0/vlan1/2_list*/
+ 	struct dp_vlan0 *vlan0_list; /* non-vlan matching rules,

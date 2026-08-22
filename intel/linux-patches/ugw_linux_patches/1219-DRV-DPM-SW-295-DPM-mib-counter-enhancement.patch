@@ -1,0 +1,419 @@
+From 22c2c8cb5baf81e06e045c9bfb938f851996e5cc Mon Sep 17 00:00:00 2001
+From: Shahed Shaikh <shahedx.shaikh@intel.com>
+Date: Sat, 6 Jun 2020 16:05:57 +0800
+Subject: [PATCH] DRV_DPM_SW-295: DPM mib counter enhancement
+
+add mib global statistics counter for all received and dropped
+packets in Rx and Tx data path.
+Use per cpu counters to avoid performance impact.
+aggregate counters while reporting.
+
+Signed-off-by: Shahed Shaikh <shahedx.shaikh@intel.com>
+---
+ drivers/net/datapath/dpm/datapath.h            | 23 +++++++++
+ drivers/net/datapath/dpm/datapath_api.c        |  3 ++
+ drivers/net/datapath/dpm/datapath_proc.c       | 68 ++++++++++++++++++++++++++
+ drivers/net/datapath/dpm/datapath_tx.c         |  4 +-
+ drivers/net/datapath/dpm/gswip30/datapath_rx.c | 15 ++++--
+ drivers/net/datapath/dpm/gswip30/datapath_tx.c |  6 ++-
+ drivers/net/datapath/dpm/gswip31/datapath_rx.c | 15 ++++--
+ drivers/net/datapath/dpm/gswip31/datapath_tx.c |  6 ++-
+ 8 files changed, 131 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index e636d87bb1e0..d0366b96a7d9 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -13,6 +13,7 @@
+ #include <linux/atomic.h>
+ #include <linux/version.h>
+ #include <net/qos_mgr/qos_mgr_tc_hook.h>
++#include <linux/percpu.h>
+ 
+ #if IS_ENABLED(CONFIG_PRX300_CQM) || \
+ 	IS_ENABLED(CONFIG_GRX500_CBM)
+@@ -387,6 +388,28 @@ struct dev_mib {
+ 	atomic_t tx_pkt_dropped;	/*! dropped packet counter */
+ };
+ 
++struct mib_global_stats {
++	u64 rx_rxif_pkts;
++	u64 rx_txif_pkts;
++	u64 rx_rxif_clone;
++	u64 rx_drop;
++	u64 tx_pkts;
++	u64 tx_drop;
++};
++
++DECLARE_PER_CPU_SHARED_ALIGNED(struct mib_global_stats, mib_g_stats);
++
++#define MIB_G_STATS_INC(member) do { \
++			per_cpu(mib_g_stats, get_cpu()).member++; \
++			put_cpu(); \
++		} while(0)
++
++#define MIB_G_STATS_RESET(member, cpu) do { \
++			per_cpu(mib_g_stats, cpu).member = 0; \
++		} while(0)
++
++#define MIB_G_STATS_GET(member, cpu) \
++			per_cpu(mib_g_stats, cpu).member
+ /**
+  * struct dp_reinsert_count - datapath re-insertion counters in TX
+  */
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 9403aac6b278..d5c4ea6a06e5 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -105,6 +105,9 @@ int aca_portid = -1;
+ 
+ static void *dp_ops[DP_MAX_INST][DP_OPS_CNT];
+ 
++/* Per CPU gobal Rx and Tx counters for DPM */
++DEFINE_PER_CPU_SHARED_ALIGNED(struct mib_global_stats, mib_g_stats);
++
+ void (*dp_dev_get_ethtool_stats_fn)(struct net_device *dev,
+ 				    struct ethtool_stats *stats,
+ 				    u64 *data) = NULL;
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index 01617351603e..605ad403cb66 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -33,6 +33,7 @@
+ #define DBGFS_INST     "inst"
+ #define DBGFS_QOS      "qos"
+ #define DBGFS_EVENT    "event"
++#define DBGFS_MIB_GLOBAL    "mib_global_stats"
+ 
+ typedef int (*print_ctp_bp_t)(struct seq_file *s, int inst,
+ 			      struct pmac_port_info *port,
+@@ -49,6 +50,71 @@ static int proc_port_dump(struct seq_file *s, int pos);
+ static int proc_port_init(void);
+ int proc_dp_event_list_dump(struct seq_file *s, int pos);
+ 
++static int proc_dp_mib_global_stats(struct seq_file *s, int pos)
++{
++	struct mib_global_stats stats = {0};
++	int cpu;
++
++	if (!capable(CAP_SYS_PACCT))
++		return -1;
++
++	for_each_online_cpu(cpu) {
++		stats.rx_rxif_pkts += MIB_G_STATS_GET(rx_rxif_pkts, cpu);
++		stats.rx_txif_pkts += MIB_G_STATS_GET(rx_txif_pkts, cpu);
++		stats.rx_rxif_clone += MIB_G_STATS_GET(rx_rxif_clone, cpu);
++		stats.rx_drop += MIB_G_STATS_GET(rx_drop, cpu);
++		stats.tx_pkts += MIB_G_STATS_GET(tx_pkts, cpu);
++		stats.tx_drop += MIB_G_STATS_GET(tx_drop, cpu);
++	}
++
++	seq_printf(s, "MIB Global Rx/Tx counters\n");
++	seq_printf(s, "rx_rxif_pkts  = %llu\n", stats.rx_rxif_pkts);
++	seq_printf(s, "rx_txif_pkts  = %llu\n", stats.rx_txif_pkts);
++	seq_printf(s, "rx_rxif_clone = %llu\n", stats.rx_rxif_clone);
++	seq_printf(s, "rx_drop       = %llu\n", stats.rx_drop);
++	seq_printf(s, "tx_pkts       = %llu\n", stats.tx_pkts);
++	seq_printf(s, "tx_drop       = %llu\n", stats.tx_drop);
++
++	return -1;
++}
++
++ssize_t proc_dp_mib_g_stats_write(struct file *file, const char *buf,
++			   size_t count, loff_t *ppos)
++{
++	int len, cpu;
++	char str[2];
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	/* only clear action is supported i.e. '0' */
++	if (count > 2)
++		goto usage;
++
++	len = count;
++	len -= copy_from_user(str, buf, count);
++	str[len] = 0;
++
++	if (str[0] != '0')
++		goto usage;
++
++	for_each_online_cpu(cpu) {
++		MIB_G_STATS_RESET(rx_rxif_pkts, cpu);
++		MIB_G_STATS_RESET(rx_txif_pkts, cpu);
++		MIB_G_STATS_RESET(rx_rxif_clone, cpu);
++		MIB_G_STATS_RESET(rx_drop, cpu);
++		MIB_G_STATS_RESET(tx_pkts, cpu);
++		MIB_G_STATS_RESET(tx_drop, cpu);
++	}
++
++	return count;
++
++usage:
++	pr_info("usage: to clear stats\n");
++	pr_info("  echo 0 > %s\n", DBGFS_MIB_GLOBAL);
++	return count;
++}
++
+ int proc_port_init(void)
+ {
+ 	tmp_inst = 0;
+@@ -770,6 +836,8 @@ static struct dp_proc_entry dp_proc_entries[] = {
+ 	{DBGFS_INST, NULL, proc_inst_dump, NULL, NULL},
+ 	{DBGFS_QOS, NULL, qos_dump, qos_dump_start, proc_qos_write},
+ 	{DBGFS_EVENT, NULL, proc_dp_event_list_dump, NULL, NULL},
++	{DBGFS_MIB_GLOBAL, NULL, proc_dp_mib_global_stats, NULL,
++		proc_dp_mib_g_stats_write},
+ 
+ 	/*the last place holder */
+ 	{NULL, NULL, NULL, NULL, NULL}
+diff --git a/drivers/net/datapath/dpm/datapath_tx.c b/drivers/net/datapath/dpm/datapath_tx.c
+index 30bddad87bba..a8d5497df6ef 100644
+--- a/drivers/net/datapath/dpm/datapath_tx.c
++++ b/drivers/net/datapath/dpm/datapath_tx.c
+@@ -199,8 +199,10 @@ int dp_tx_err(struct sk_buff *skb, struct dp_tx_common *cmn, int ret)
+ 			     get_dp_port_info(0, cmn->dpid)->status);
+ 	}
+ 
+-	if (skb)
++	if (skb) {
+ 		dev_kfree_skb_any(skb);
++		MIB_G_STATS_INC(tx_drop);
++	}
+ 	return DP_FAILURE;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_rx.c b/drivers/net/datapath/dpm/gswip30/datapath_rx.c
+index 683c4041f7e8..2fc711e2ae81 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_rx.c
++++ b/drivers/net/datapath/dpm/gswip30/datapath_rx.c
+@@ -95,10 +95,9 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 	if (skb->data[PMAC_SIZE] & 0x1) {
+ 		/* multicast/broadcast */
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "LCT mcast or broadcast\n");
+-		if ((STATS_GET(sif->rx_flag) <= 0)) {
+-			UP_STATS(mib->rx_fn_dropped);
++		if ((STATS_GET(sif->rx_flag) <= 0))
+ 			return 1;
+-		}
++
+ 		lct_skb = skb_clone(skb, GFP_ATOMIC);
+ 		if (!lct_skb) {
+ 			pr_err("LCT mcast/bcast skb clone fail\n");
+@@ -106,6 +105,7 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 		}
+ 		lct_skb->dev = sif->netif;
+ 		UP_STATS(mib->rx_fn_rxif_pkt);
++		MIB_G_STATS_INC(rx_rxif_clone);
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "pkt sent lct(%s)\n",
+ 			 lct_skb->dev->name ? lct_skb->dev->name : "NULL");
+ 		rx_fn(lct_skb->dev, NULL, lct_skb, lct_skb->len);
+@@ -117,11 +117,13 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 			 skb->dev->name ? skb->dev->name : "NULL");
+ 		if ((STATS_GET(sif->rx_flag) <= 0)) {
+ 			UP_STATS(mib->rx_fn_dropped);
++			MIB_G_STATS_INC(rx_drop);
+ 			dev_kfree_skb_any(skb);
+ 			return 0;
+ 		}
+ 		rx_fn(skb->dev, NULL, skb, skb->len);
+ 		UP_STATS(mib->rx_fn_rxif_pkt);
++		MIB_G_STATS_INC(rx_rxif_pkts);
+ 		return 0;
+ 	}
+ 	return 1;
+@@ -223,6 +225,7 @@ int32_t dp_rx_30(struct sk_buff *skb, u32 flags)
+ 		}
+ 		if (!dev && ((dp_port->alloc_flags & DP_F_FAST_DSL) == 0)) {
+ 			UP_STATS(mib->rx_fn_dropped);
++			MIB_G_STATS_INC(rx_drop);
+ 			goto RX_DROP;
+ 		}
+ 
+@@ -269,18 +272,22 @@ int32_t dp_rx_30(struct sk_buff *skb, u32 flags)
+ 			if (ret_lct) {
+ 				if ((STATS_GET(sif->rx_flag) <= 0)) {
+ 					UP_STATS(mib->rx_fn_dropped);
++					MIB_G_STATS_INC(rx_drop);
+ 					goto RX_DROP2;
+ 				}
+ 				rx_fn(dev, NULL, skb, skb->len);
+ 				UP_STATS(mib->rx_fn_rxif_pkt);
++				MIB_G_STATS_INC(rx_rxif_pkts);
+ 			}
+ 		} else {
+ 			if ((STATS_GET(sif->rx_flag) <= 0)) {
+ 				UP_STATS(mib->rx_fn_dropped);
++				MIB_G_STATS_INC(rx_drop);
+ 				goto RX_DROP2;
+ 			}
+ 			rx_fn(NULL, dev, skb, skb->len);
+ 			UP_STATS(mib->rx_fn_txif_pkt);
++			MIB_G_STATS_INC(rx_txif_pkts);
+ 		}
+ 
+ 		return DP_SUCCESS;
+@@ -300,12 +307,14 @@ int32_t dp_rx_30(struct sk_buff *skb, u32 flags)
+ 			 "Drop for subif of port %u not registered yet\n",
+ 			 port_id);
+ 		UP_STATS(mib->rx_fn_dropped);
++		MIB_G_STATS_INC(rx_drop);
+ 		goto RX_DROP2;
+ 	} else {
+ 		pr_info("Unknown issue\n");
+ 	}
+ RX_DROP:
+ 	UP_STATS(dp_port->rx_err_drop);
++	MIB_G_STATS_INC(rx_drop);
+ RX_DROP2:
+ 	if (skb)
+ 		dev_kfree_skb_any(skb);
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_tx.c b/drivers/net/datapath/dpm/gswip30/datapath_tx.c
+index 836b72231d16..26ee7e7b11cf 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_tx.c
++++ b/drivers/net/datapath/dpm/gswip30/datapath_tx.c
+@@ -359,6 +359,7 @@ int32_t dp_xmit_30(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 	if (skb_is_gso(skb)) {
+ 		res = ltq_tso_xmit(skb, &pmac, sizeof(pmac), 0);
+ 		UP_STATS(mib->tx_tso_pkt);
++		MIB_G_STATS_INC(tx_pkts);
+ 		return res;
+ 	}
+ #endif /* CONFIG_LTQ_TOE_DRIVER */
+@@ -382,6 +383,7 @@ int32_t dp_xmit_30(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 	}
+ 	res = cbm_cpu_pkt_tx(skb, &data, 0);
+ 	UP_STATS(mib->tx_cbm_pkt);
++	MIB_G_STATS_INC(tx_pkts);
+ 	return res;
+ 
+ lbl_err_ret:
+@@ -428,8 +430,10 @@ int32_t dp_xmit_30(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 		UP_STATS(mib->tx_pkt_dropped);
+ 		pr_info_once("Why come to here:%x\n", dp_info->status);
+ 	}
+-	if (skb)
++	if (skb) {
+ 		dev_kfree_skb_any(skb);
++		MIB_G_STATS_INC(tx_drop);
++	}
+ 	return DP_FAILURE;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_rx.c b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+index 1400535aa390..f8fd2930f0fd 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_rx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+@@ -93,10 +93,9 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 	if (skb->data[PMAC_SIZE] & 0x1) {
+ 		/* multicast/broadcast */
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "LCT mcast or broadcast\n");
+-		if ((STATS_GET(sif->rx_flag) <= 0)) {
+-			UP_STATS(mib->rx_fn_dropped);
++		if ((STATS_GET(sif->rx_flag) <= 0))
+ 			return 1;
+-		}
++
+ 		lct_skb = skb_clone(skb, GFP_ATOMIC);
+ 		if (!lct_skb) {
+ 			pr_err("LCT mcast/bcast skb clone fail\n");
+@@ -104,6 +103,7 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 		}
+ 		lct_skb->dev = sif->netif;
+ 		UP_STATS(mib->rx_fn_rxif_pkt);
++		MIB_G_STATS_INC(rx_rxif_clone);
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "pkt sent lct(%s)\n",
+ 			 lct_skb->dev->name ? lct_skb->dev->name : "NULL");
+ 		rx_fn(lct_skb->dev, NULL, lct_skb, lct_skb->len);
+@@ -115,11 +115,13 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 			 skb->dev->name ? skb->dev->name : "NULL");
+ 		if ((STATS_GET(sif->rx_flag) <= 0)) {
+ 			UP_STATS(mib->rx_fn_dropped);
++			MIB_G_STATS_INC(rx_drop);
+ 			dev_kfree_skb_any(skb);
+ 			return 0;
+ 		}
+ 		rx_fn(skb->dev, NULL, skb, skb->len);
+ 		UP_STATS(mib->rx_fn_rxif_pkt);
++		MIB_G_STATS_INC(rx_rxif_pkts);
+ 		return 0;
+ 	}
+ 	return 1;
+@@ -251,6 +253,7 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 		if (!dev &&
+ 		    (!(dp_port->alloc_flags & DP_F_FAST_DSL))) {
+ 			UP_STATS(mib->rx_fn_dropped);
++			MIB_G_STATS_INC(rx_drop);
+ 			goto RX_DROP;
+ 		}
+ 
+@@ -296,18 +299,22 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 			if (ret_lct) {
+ 				if (STATS_GET(sif->rx_flag) <= 0) {
+ 					UP_STATS(mib->rx_fn_dropped);
++					MIB_G_STATS_INC(rx_drop);
+ 					goto RX_DROP2;
+ 				}
+ 				rx_fn(dev, NULL, skb, skb->len);
+ 				UP_STATS(mib->rx_fn_rxif_pkt);
++				MIB_G_STATS_INC(rx_rxif_pkts);
+ 			}
+ 		} else {
+ 			if (STATS_GET(sif->rx_flag) <= 0) {
+ 				UP_STATS(mib->rx_fn_dropped);
++				MIB_G_STATS_INC(rx_drop);
+ 				goto RX_DROP2;
+ 			}
+ 			rx_fn(NULL, dev, skb, skb->len);
+ 			UP_STATS(mib->rx_fn_txif_pkt);
++			MIB_G_STATS_INC(rx_txif_pkts);
+ 		}
+ 
+ 		return DP_SUCCESS;
+@@ -327,12 +334,14 @@ int32_t dp_rx_31(struct sk_buff *skb, u32 flags)
+ 			 "Drop for subif of port %u not registered yet\n",
+ 			 port_id);
+ 		UP_STATS(mib->rx_fn_dropped);
++		MIB_G_STATS_INC(rx_drop);
+ 		goto RX_DROP2;
+ 	} else {
+ 		pr_info("Unknown issue\n");
+ 	}
+ RX_DROP:
+ 	UP_STATS(dp_port->rx_err_drop);
++	MIB_G_STATS_INC(rx_drop);
+ RX_DROP2:
+ 	if (skb)
+ 		dev_kfree_skb_any(skb);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_tx.c b/drivers/net/datapath/dpm/gswip31/datapath_tx.c
+index 21dc61c87021..83332d09ad1d 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_tx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_tx.c
+@@ -385,6 +385,7 @@ int32_t dp_xmit_31(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 	if (skb_is_gso(skb)) {
+ 		res = ltq_tso_xmit(skb, &pmac, sizeof(pmac), 0);
+ 		UP_STATS(mib->tx_tso_pkt);
++		MIB_G_STATS_INC(tx_pkts);
+ 		return res;
+ 	}
+ #endif /* CONFIG_LTQ_TOE_DRIVER */
+@@ -410,6 +411,7 @@ int32_t dp_xmit_31(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 	if (flags & DP_TX_INSERT)
+ 		dp_reinsert_pkt_cnt(dp_info, vap, skb);
+ 	UP_STATS(mib->tx_cbm_pkt);
++	MIB_G_STATS_INC(tx_pkts);
+ 	return res;
+ 
+ lbl_err_ret:
+@@ -431,7 +433,9 @@ int32_t dp_xmit_31(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 		UP_STATS(mib->tx_pkt_dropped);
+ 		pr_info_once("Why come to here:%x\n", dp_info->status);
+ 	}
+-	if (skb)
++	if (skb) {
+ 		dev_kfree_skb_any(skb);
++		MIB_G_STATS_INC(tx_drop);
++	}
+ 	return DP_FAILURE;
+ }

@@ -1,0 +1,699 @@
+From 214b61a53d185ff05b98404a3e028fafdcc005c4 Mon Sep 17 00:00:00 2001
+From: Amireddy Mallikarjuna reddy <mallikarjunax.reddy@intel.com>
+Date: Tue, 5 Mar 2019 14:43:30 +0800
+Subject: [PATCH] DRVLIB_SW-1325: Datapath: Implement DMA chan tbl allocation
+ dynamically.
+
+Current DP is using multiple dimension array to manage DMA channels
+Now changed to dynamic way of allocation.
+
+Signed-off-by: Amireddy Mallikarjuna reddy <mallikarjunax.reddy@intel.com>
+---
+ drivers/net/ethernet/lantiq/datapath/datapath.h    |  8 ++-
+ .../net/ethernet/lantiq/datapath/datapath_api.c    | 83 +++++++++++-----------
+ .../ethernet/lantiq/datapath/datapath_instance.c   |  4 ++
+ .../net/ethernet/lantiq/datapath/datapath_misc.c   | 59 +++++++++++++++
+ .../net/ethernet/lantiq/datapath/datapath_proc.c   | 17 ++---
+ .../lantiq/datapath/gswip30/datapath_misc.c        | 70 ++++++++----------
+ .../lantiq/datapath/gswip31/datapath_misc.c        | 81 +++++++++------------
+ 7 files changed, 182 insertions(+), 140 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath.h b/drivers/net/ethernet/lantiq/datapath/datapath.h
+index 4ca343193962..fdbf821a9cc7 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath.h
+@@ -477,6 +477,7 @@ struct pmac_port_info {
+ 			      */
+ 	u32 lct_idx; /* LCT subif register flag */
+ 	u32 num_dma_chan; /*For G.INT it's 8 or 16, for other 1*/
++	u32 dma_ch_base; /*! Base entry index of dp_dma_chan_tbl */
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_PTP1588)
+ 	u32 f_ptp:1; /* PTP1588 support enablement */
+ #endif
+@@ -549,6 +550,7 @@ struct cqm_port_info {
+ 	int q_node; /*first_qid's logical node id*/
+ 	int dp_port; /* dp_port info */
+ 	u32 dma_chan;
++	u32 dma_ch_offset; /*! Offset of dp_dma_chan_tbl */
+ };
+ 
+ struct parser_info {
+@@ -659,8 +661,7 @@ extern struct q_info dp_q_tbl[DP_MAX_INST][DP_MAX_QUEUE_NUM];
+ extern struct sched_info dp_sched_tbl[DP_MAX_INST][DP_MAX_SCHED_NUM];
+ extern struct cqm_port_info dp_deq_port_tbl[DP_MAX_INST][DP_MAX_CQM_DEQ];
+ extern struct bp_pmapper_dev dp_bp_dev_tbl[DP_MAX_INST][DP_MAX_BP_NUM];
+-extern struct dma_chan_info dp_dma_chan_tbl[DP_MAX_INST][DP_DMAMAX]
+-			    [DP_MAX_DMA_PORT][DP_MAX_DMA_CHAN];
++extern struct dma_chan_info *dp_dma_chan_tbl[DP_MAX_INST];
+ 
+ #if IS_ENABLED(CONFIG_LTQ_DATAPATH_DBG)
+ extern u32 dp_dbg_flag;
+@@ -815,6 +816,9 @@ struct dp_subif_cache *dp_subif_lookup_safe(struct hlist_head *head,
+ 					    struct net_device *dev,
+ 					    void *data);
+ int dp_subif_list_init(void);
++u32 get_dma_chan_idx(int inst, int num_dma_chan);
++u32 alloc_dma_chan_tbl(int inst);
++void free_dma_chan_tbl(int inst);
+ u32 dp_subif_hash(struct net_device *dev);
+ int32_t dp_get_netif_subifid_priv(struct net_device *netif,
+ 				  struct sk_buff *skb, void *subif_data,
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+index a4054b88ec61..109d12f5cb20 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -119,8 +119,7 @@ struct sched_info dp_sched_tbl[DP_MAX_INST][DP_MAX_SCHED_NUM];
+ struct cqm_port_info dp_deq_port_tbl[DP_MAX_INST][DP_MAX_CQM_DEQ];
+ 
+ /* DMA TX CH info*/
+-struct dma_chan_info dp_dma_chan_tbl[DP_MAX_INST][DP_DMAMAX][DP_MAX_DMA_PORT]
+-		      [DP_MAX_DMA_CHAN];
++struct dma_chan_info *dp_dma_chan_tbl[DP_MAX_INST];
+ 
+ struct parser_info pinfo[4];
+ static int print_len;
+@@ -355,6 +354,7 @@ static int32_t dp_alloc_port_private(int inst,
+ 				     u32 flags)
+ {
+ 	int i;
++	u16 dma_ch_base;
+ 	struct cbm_dp_alloc_data cbm_data = {0};
+ 
+ 	if (!owner) {
+@@ -442,6 +442,18 @@ static int32_t dp_alloc_port_private(int inst,
+ 	/*save info to port data*/
+ 	data->deq_port_base = dp_port_info[inst][port_id].deq_port_base;
+ 	data->deq_num = dp_port_info[inst][port_id].deq_port_num;
++	if (cbm_data.num_dma_chan) {
++		dma_ch_base = get_dma_chan_idx(inst, cbm_data.num_dma_chan);
++		if (dma_ch_base == DP_FAILURE) {
++			PR_ERR("Failed get_dma_chan_idx!!\n");
++			cbm_dp_port_dealloc(owner, dev_port, port_id, &cbm_data,
++					    flags | DP_F_DEREGISTER);
++			memset(&dp_port_info[inst][port_id], 0,
++			       sizeof(dp_port_info[inst][port_id]));
++			return DP_FAILURE;
++		}
++		dp_port_info[inst][port_id].dma_ch_base = dma_ch_base;
++	}
+ 	DP_DEBUG(DP_DBG_FLAG_REG,
+ 		 "cbm alloc dp_port:%d deq:%d deq_num:%d no_dma_chan:%d\n",
+ 		 cbm_data.dp_port, cbm_data.deq_port, cbm_data.deq_port_num,
+@@ -559,9 +571,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+     /*allocate a free subif */
+ 	for (i = start; i < end; i++) {
+ 		u32 cqm_deq_port;
+-		u32 dma_chan;
+-		u32 cid, pid, nid;
+-		struct dma_chan_info *dp_dma_chan_tbl_info = NULL;
++		u32 dma_ch_offset;
+ 
+ 		if (port_info->subif_info[i].flags) /*used already & not free*/
+ 			continue;
+@@ -584,27 +594,9 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 			PR_ERR("port info status fail for 0\n");
+ 			return res;
+ 		}
+-
+ 		cqm_deq_port = port_info->subif_info[i].cqm_deq_port;
+-		dma_chan = dp_deq_port_tbl[inst][cqm_deq_port].dma_chan;
+-		cid = _DMA_CONTROLLER(dma_chan);
+-		pid = _DMA_PORT(dma_chan);
+-		nid = _DMA_CHANNEL(dma_chan);
+-		/* cid, pid and nid should not greater than DP_DMAMAX,
+-		 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
+-		 */
+-		if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) || nid >=
+-		    DP_MAX_DMA_CHAN) {
+-			PR_ERR("ERROR: cid=%d pid=%d nid=%d\n", cid, pid, nid);
+-			PR_ERR("DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
+-			       DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
+-			return DP_FAILURE;
+-		}
+-
+-		DP_DEBUG(DP_DBG_FLAG_REG, "cid=%d pid=%d nid=%d\n",
+-			 cid, pid, nid);
+-		dp_dma_chan_tbl_info = &dp_dma_chan_tbl[inst][cid][pid][nid];
+-
++		dma_ch_offset =
++			dp_deq_port_tbl[inst][cqm_deq_port].dma_ch_offset;
+ 		port_info->subif_info[i].flags = 1;
+ 		port_info->subif_info[i].netif = dev;
+ 		port_info->port_id = port_id;
+@@ -631,6 +623,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 		port_info->num_subif++;
+ 		if ((port_info->num_subif == 1) ||
+ 		    (platfrm_data.act & TRIGGER_CQE_DP_ENABLE)) {
++			u32 dma_ch_ref;
+ 			cbm_data.dp_inst = inst;
+ 			cbm_data.num_dma_chan = port_info->num_dma_chan;
+ 			cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+@@ -642,18 +635,23 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 				       cbm_data.deq_port);
+ 				return res;
+ 			}
++			if (!dp_dma_chan_tbl[inst]) {
++				PR_ERR("dp_dma_chan_tbl[%d] NULL\n", inst);
++				return res;
++			}
++			dma_ch_ref = atomic_read(&(dp_dma_chan_tbl[inst] +
++						 dma_ch_offset)->ref_cnt);
+ 			/* PPA Directpath/LitePath don't have DMA CH */
+-			if ((atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].
+-			     ref_cnt) == 1) && !(port_info->alloc_flags &
+-			     DP_F_DIRECT) && (cbm_data.num_dma_chan))
++			if (dma_ch_ref == 1 && !(port_info->alloc_flags &
++			    DP_F_DIRECT) && (cbm_data.num_dma_chan))
+ 				cbm_data.dma_chnl_init = 1; /*to enable DMA*/
+ 			DP_DEBUG(DP_DBG_FLAG_REG, "%s:%s%d %s%d %s%d %s%d\n",
+ 				 "cbm_dp_enable",
+ 				 "dp_port=", port_id,
+ 				 "deq_port=", cbm_data.deq_port,
+ 				 "dma_chnl_init=", cbm_data.dma_chnl_init,
+-				 "ref=",
+-				 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++				 "tx_dma_chan: (ref=%d)",
++				 dma_ch_ref);
+ 			if (cbm_dp_enable(owner, port_id, &cbm_data, 0,
+ 					  port_info->alloc_flags)) {
+ 				DP_DEBUG(DP_DBG_FLAG_REG,
+@@ -698,8 +696,6 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	struct pmac_port_info *port_info;
+ 	struct cbm_dp_en_data cbm_data = {0};
+ 	struct subif_platform_data platfrm_data = {0};
+-	u32 dma_chan;
+-	u32 cid, pid, nid;
+ 
+ 	port_id = subif_id->port_id;
+ 	port_info = &dp_port_info[inst][port_id];
+@@ -716,6 +712,10 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 			 subif_name);
+ 		return res;
+ 	}
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("dp_dma_chan_tbl[%d] NULL\n", inst);
++		return res;
++	}
+ 
+ 	for (i = 0; i < port_info->ctp_max; i++) {
+ 		if (port_info->subif_info[i].subif ==
+@@ -762,6 +762,9 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 		port_info->status = PORT_DEV_REGISTERED;
+ 
+ 	if (!dp_deq_port_tbl[inst][cqm_port].ref_cnt) {
++		u32 dma_ch_ref;
++		u32 dma_ch_offset;
++
+ 		/*delete all queues which may created by PPA or other apps*/
+ 		struct dp_node_alloc port_node;
+ 
+@@ -774,14 +777,12 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 		cbm_data.dp_inst = inst;
+ 		cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+ 		cbm_data.deq_port = cqm_port;
+-		dma_chan = dp_deq_port_tbl[inst][cqm_port].dma_chan;
+-		cid = _DMA_CONTROLLER(dma_chan);
+-		pid = _DMA_PORT(dma_chan);
+-		nid = _DMA_CHANNEL(dma_chan);
++		dma_ch_offset = dp_deq_port_tbl[inst][cqm_port].dma_ch_offset;
++		dma_ch_ref = atomic_read(&(dp_dma_chan_tbl[inst] +
++					 dma_ch_offset)->ref_cnt);
+ 		/* PPA Directpath/LitePath don't have DMA CH */
+-		if ((atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].
+-		    ref_cnt) == 0) && !(port_info->alloc_flags & DP_F_DIRECT))
+-				cbm_data.dma_chnl_init = 1; /*to disable DMA */
++		if (dma_ch_ref == 0 && !(port_info->alloc_flags & DP_F_DIRECT))
++			cbm_data.dma_chnl_init = 1; /*to disable DMA */
+ 		if (cbm_dp_enable(owner, port_id, &cbm_data,
+ 				  CBM_PORT_F_DISABLE, port_info->alloc_flags)) {
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+@@ -2902,8 +2903,10 @@ int dp_basic_proc(void)
+ #ifdef CONFIG_LTQ_DATAPATH_MIB
+ 		dp_mib_exit();
+ #endif
+-		for (i = 0; i < dp_inst_num; i++)
++		for (i = 0; i < dp_inst_num; i++) {
+ 			DP_CB(i, dp_platform_set)(i, DP_PLATFORM_DE_INIT);
++			free_dma_chan_tbl(i);
++		}
+ 		dp_init_ok = 0;
+ #ifdef CONFIG_LTQ_DATAPATH_LOOPETH
+ 		dp_loop_eth_dev_exit();
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_instance.c b/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
+index 08b6c8066b2f..cf65738636ec 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_instance.c
+@@ -124,6 +124,10 @@ int dp_request_inst(struct dp_inst_info *info, u32 flag)
+ 		PR_ERR("dp_request_inst fail for dp inst full arealdy\n");
+ 		return -1;
+ 	}
++	if (alloc_dma_chan_tbl(i)) {
++		PR_ERR("FAIL to alloc dma chan tbl\n");
++		return -1;
++	}
+ 	dp_port_prop[i].ops[0] = info->ops[0];
+ 	dp_port_prop[i].ops[1] = info->ops[1];
+ 	dp_port_prop[i].mac_ops[2] = info->mac_ops[2];
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+index a2f2c5f5168c..c137bf52e2a8 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+@@ -1442,3 +1442,62 @@ int dp_cpufreq_notify_init(int inst)
+ 	return 0;
+ }
+ #endif
++/**
++ * get_dma_chan_idx - Get available dma chan index from dp_dma_chan_tbl.
++ * @inst: DP instance.
++ * @num_dma_chan: Number of DMA channels.
++ * Description: Find free dma channel index from dp_dma_chan_tbl.
++ * Return: Base idx on success DP_FAILURE on failure.
++ */
++u32 get_dma_chan_idx(int inst, int num_dma_chan)
++{
++	u32 base, match;
++
++	if (!num_dma_chan)
++		return DP_FAILURE;
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("dp_dma_chan_tbl[%d] NULL !!\n", inst);
++		return DP_FAILURE;
++	}
++
++	for (base = 0; base < DP_MAX_DMA_CHAN; base++) {
++		for (match = 0; (match < num_dma_chan) && ((base + match)
++						< DP_MAX_DMA_CHAN); match++) {
++			if (atomic_read(&(dp_dma_chan_tbl[inst] +
++					(base + match))->ref_cnt))
++				break;
++		}
++		if (match == num_dma_chan)
++			return base;
++	}
++	PR_ERR("No free chan available from chan table!!\n");
++	return DP_FAILURE;
++}
++
++/**
++ * alloc_dma_chan_tbl: Dynamic allocation of dp_dma_chan_tbl.
++ * @inst: DP instance.
++ * Return: DP_SUCCESS on success DP_FAILURE on failure.
++ */
++u32 alloc_dma_chan_tbl(int inst)
++{
++	dp_dma_chan_tbl[inst] = kzalloc((sizeof(struct dma_chan_info) *
++					DP_MAX_DMA_CHAN), GFP_KERNEL);
++
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("Failed for kmalloc: %zu bytes\n",
++		       (sizeof(struct dma_chan_info) * DP_MAX_DMA_CHAN));
++		return DP_FAILURE;
++	}
++	return DP_SUCCESS;
++}
++
++/**
++ * free_dma_chan_tbl: Free dp_dma_chan_tbl.
++ * @inst: DP instance.
++ */
++void free_dma_chan_tbl(int inst)
++{
++	/* free dma chan tbl */
++	kfree(dp_dma_chan_tbl[inst]);
++}
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+index 7674c332b085..d8a7199102da 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+@@ -65,7 +65,7 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 			    int subif_index, u32 flag);
+ 	struct pmac_port_info *port = get_port_info(tmp_inst, pos);
+ 	u16 start = 0;
+-	u32 cid, pid, nid;
++	int dma_ch_offset;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return -1;
+@@ -207,15 +207,12 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 			   dp_deq_port_tbl[tmp_inst][cqm_p].ref_cnt);
+ 		seq_printf(s, "          : mac_learn_dis:    %d\n",
+ 			   port->subif_info[i].mac_learn_dis);
+-		cid = _DMA_CONTROLLER(dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan);
+-		pid = _DMA_PORT(dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan);
+-		nid = _DMA_CHANNEL(dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan);
+-		if (port->num_dma_chan)
+-			seq_printf(s, "          : dma_ch/port:    %d/%d(ref=%d)\n",
+-				   nid, cqm_p,
+-				   atomic_read(&dp_dma_chan_tbl[tmp_inst][cid]
+-						[pid][nid].ref_cnt));
+-
++		dma_ch_offset = dp_deq_port_tbl[tmp_inst][cqm_p].dma_ch_offset;
++		if (port->num_dma_chan && dp_dma_chan_tbl[tmp_inst])
++			seq_printf(s, "          : tx_dma_ch:    0x%x(ref=%d)\n",
++				   dp_deq_port_tbl[tmp_inst][cqm_p].dma_chan,
++				   atomic_read(&(dp_dma_chan_tbl[tmp_inst] +
++					       dma_ch_offset)->ref_cnt));
+ 		if (port->subif_info[i].ctp_dev &&
+ 		    port->subif_info[i].ctp_dev->name)
+ 			seq_printf(s, "          : ctp_dev = %s\n",
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip30/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/gswip30/datapath_misc.c
+index e0cfe39482b5..650b9f037927 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip30/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip30/datapath_misc.c
+@@ -470,20 +470,27 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ {
+ 	int idx, i;
+ 	struct pmac_port_info *port_info = &dp_port_info[inst][ep];
+-	u32 dma_chan;
++	u32 dma_chan, dma_ch_base;
+ 
+ 	dp_port_info[inst][ep].ctp_max = MAX_SUBIF_PER_PORT;
+ 	dp_port_info[inst][ep].vap_offset = 8;
+ 	dp_port_info[inst][ep].vap_mask = 0xF;
+ 	idx = port_info->deq_port_base;
++	dma_chan =  port_info->dma_chan;
++	dma_ch_base = port_info->dma_ch_base;
+ 	for (i = 0; i < port_info->deq_port_num; i++) {
+ 		dp_deq_port_tbl[inst][i + idx].dp_port = ep;
+ 
+ 		/* For G.INT num_dma_chan 8 or 16, for other 1 */
+-		if (port_info->num_dma_chan > 1)
++		if (port_info->num_dma_chan > 1) {
+ 			dp_deq_port_tbl[inst][i + idx].dma_chan = dma_chan++;
+-		else
++			dp_deq_port_tbl[inst][i + idx].dma_ch_offset =
++								dma_ch_base + i;
++		} else if (port_info->num_dma_chan == 1) {
+ 			dp_deq_port_tbl[inst][i + idx].dma_chan = dma_chan;
++			dp_deq_port_tbl[inst][i + idx].dma_ch_offset =
++								dma_ch_base;
++		}
+ 		DP_DEBUG(DP_DBG_FLAG_DBG, "deq_port_tbl[%d][%d].dma_chan=%x\n",
+ 			 inst, (i + idx), dma_chan);
+ 	}
+@@ -509,15 +516,17 @@ static int supported_logic_dev(int inst, struct net_device *dev,
+ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 			struct subif_platform_data *data, u32 flags)
+ {
+-	int deq_port_idx = 0, cqe_deq;
++	int deq_port_idx = 0, cqe_deq, dma_ch_offset = 0;
+ 	struct pmac_port_info *port_info;
+-	int cid, pid, nid;
+-	u32 dma_chan;
+ 
+ 	if (!data || !data->subif_data) {
+ 		PR_ERR("data NULL or subif_data NULL\n");
+ 		return -1;
+ 	}
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("dp_dma_chan_tbl[%d] NULL\n", inst);
++		return DP_FAILURE;
++	}
+ 	port_info = &dp_port_info[inst][portid];
+ 	if (data->subif_data)
+ 		deq_port_idx = data->subif_data->deq_port_idx;
+@@ -528,43 +537,32 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 	}
+ 	cqe_deq = port_info->deq_port_base + deq_port_idx;
+ 	port_info->subif_info[subif_ix].cqm_deq_port = cqe_deq;
+-
+-	dma_chan = dp_deq_port_tbl[inst][cqe_deq].dma_chan;	
+-	cid = _DMA_CONTROLLER(dma_chan);
+-	pid = _DMA_PORT(dma_chan) ;
+-	nid = _DMA_CHANNEL(dma_chan);
+-	/* cid, pid and nid should not greater than DP_DMAMAX,
+-	 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
+-	 */
+-	if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) || nid >=
+-	    DP_MAX_DMA_CHAN) {
+-		PR_ERR("ERROR: cid=%d pid=%d nid=%d\n", cid, pid, nid);
+-		PR_ERR("DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
+-		       DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
+-		return DP_FAILURE;
+-	}
++	dma_ch_offset = dp_deq_port_tbl[inst][cqe_deq].dma_ch_offset;
+ 	dp_deq_port_tbl[inst][cqe_deq].ref_cnt++;
+ 	if (port_info->num_dma_chan)
+-		atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++		atomic_inc(&(dp_dma_chan_tbl[inst] + dma_ch_offset)->ref_cnt);
+ 	DP_DEBUG(DP_DBG_FLAG_REG, "cbm[%d].ref_cnt=%d DMATXCH_Ref.cnt=%d\n",
+ 		 cqe_deq,
+ 		 dp_deq_port_tbl[inst][cqe_deq].ref_cnt,
+-		 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++		 atomic_read(&(dp_dma_chan_tbl[inst] +
++			     dma_ch_offset)->ref_cnt));
+ 	return 0;
+ }
+ 
+ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 			  struct subif_platform_data *data, u32 flags)
+ {
+-	int deq_port_idx = 0, cqe_deq;
++	int deq_port_idx = 0, cqe_deq, dma_ch_offset;
+ 	struct pmac_port_info *port_info;
+-	u32 cid, pid, nid;
+-	u32 dma_chan;
+ 
+ 	if (!data || !data->subif_data) {
+ 		PR_ERR("data NULL or subif_data NULL\n");
+ 		return -1;
+ 	}
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("dp_dma_chan_tbl[%d] NULL\n", inst);
++		return DP_FAILURE;
++	}
+ 	port_info = &dp_port_info[inst][portid];
+ 	if (data->subif_data)
+ 		deq_port_idx = data->subif_data->deq_port_idx;
+@@ -574,34 +572,22 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 		return -1;
+ 	}
+ 	cqe_deq = port_info->deq_port_base + deq_port_idx;
++	dma_ch_offset = dp_deq_port_tbl[inst][cqe_deq].dma_ch_offset;
+ 	if (!dp_deq_port_tbl[inst][cqe_deq].ref_cnt) {
+ 		PR_ERR("Wrong cbm[%d].ref_cnt=%d\n",
+ 		       cqe_deq,
+ 		       dp_deq_port_tbl[inst][cqe_deq].ref_cnt);
+ 		return -1;
+ 	}
+-	dma_chan = dp_deq_port_tbl[inst][cqe_deq].dma_chan;	
+-	cid = _DMA_CONTROLLER(dma_chan);
+-	pid = _DMA_PORT(dma_chan) ;
+-	nid = _DMA_CHANNEL(dma_chan);
+-	/* cid, pid and nid should not greater than DP_DMAMAX,
+-	 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
+-	 */
+-	if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) || nid >=
+-	    DP_MAX_DMA_CHAN) {
+-		PR_ERR("ERROR: cid=%d pid=%d nid=%d\n", cid, pid, nid);
+-		PR_ERR("DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
+-		       DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
+-		return DP_FAILURE;
+-	}
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "cid=%d pid=%d nid=%d\n", cid, pid, nid);
+ 	dp_deq_port_tbl[inst][cqe_deq].ref_cnt--;
+ 	if (port_info->num_dma_chan)
+-		atomic_dec(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++		atomic_dec(&(dp_dma_chan_tbl[inst] + dma_ch_offset)->ref_cnt);
+ 	DP_DEBUG(DP_DBG_FLAG_REG, "cbm[%d].ref_cnt=%d DMATXCH_Ref_cnt=%d\n",
+ 		 cqe_deq,
+ 		 dp_deq_port_tbl[inst][cqe_deq].ref_cnt,
+-		 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++		 atomic_read(&(dp_dma_chan_tbl[inst] +
++			     dma_ch_offset)->ref_cnt));
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c
+index a33b44146941..73f5443f3f8d 100644
+--- a/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/gswip31/datapath_misc.c
+@@ -1376,7 +1376,7 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 	cbm_queue_map_entry_t lookup = {0};
+ 	struct hal_priv *priv = (struct hal_priv *)dp_port_prop[inst].priv_hal;
+ 	struct pmac_port_info *port_info = &dp_port_info[inst][ep];
+-	u32 dma_chan;
++	u32 dma_chan, dma_ch_base;
+ 
+ 	if (!priv) {
+ 		PR_ERR("priv is NULL\n");
+@@ -1395,6 +1395,7 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 	idx = port_info->deq_port_base;
+ 
+ 	dma_chan =  port_info->dma_chan;
++	dma_ch_base = port_info->dma_ch_base;
+ 	for (i = 0; i < port_info->deq_port_num; i++) {
+ 		dp_deq_port_tbl[inst][i + idx].tx_ring_addr =
+ 			port_info->tx_ring_addr +
+@@ -1406,10 +1407,15 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 		dp_deq_port_tbl[inst][i + idx].dp_port = ep;
+ 
+ 		/* For G.INT num_dma_chan 8 or 16, for other 1 */
+-		if (port_info->num_dma_chan > 1)
++		if (port_info->num_dma_chan > 1) {
+ 			dp_deq_port_tbl[inst][i + idx].dma_chan = dma_chan++;
+-		else
++			dp_deq_port_tbl[inst][i + idx].dma_ch_offset =
++								dma_ch_base + i;
++		} else if (port_info->num_dma_chan == 1) {
+ 			dp_deq_port_tbl[inst][i + idx].dma_chan = dma_chan;
++			dp_deq_port_tbl[inst][i + idx].dma_ch_offset =
++								dma_ch_base;
++		}
+ 		DP_DEBUG(DP_DBG_FLAG_DBG, "deq_port_tbl[%d][%d].dma_chan=%x\n",
+ 			 inst, (i + idx), dma_chan);
+ 	}
+@@ -1503,13 +1509,16 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 	struct pmac_port_info *port_info;
+ 	struct hal_priv *priv = HAL(inst);
+ 	int q_flag = 0;
+-	int cid, pid, nid;
+-	u32 dma_chan;
++	int dma_ch_offset = 0;
+ 
+ 	if (!data || !data->subif_data) {
+ 		PR_ERR("data NULL or subif_data NULL\n");
+ 		return -1;
+ 	}
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("dp_dma_chan_tbl[%d] NULL\n", inst);
++		return DP_FAILURE;
++	}
+ 	port_info = &dp_port_info[inst][portid];
+ 	subif = SET_VAP(subif_ix, port_info->vap_offset,
+ 			port_info->vap_mask);
+@@ -1602,21 +1611,7 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 			q_flag = DP_SUBIF_AUTO_NEW_Q; /*no queue created yet*/
+ 	}
+ 
+-	dma_chan = dp_deq_port_tbl[inst][q_port.cqe_deq].dma_chan;	
+-	cid = _DMA_CONTROLLER(dma_chan);
+-	pid = _DMA_PORT(dma_chan);
+-	nid = _DMA_CHANNEL(dma_chan);
+-	/* cid, pid and nid should not greater than DP_DMAMAX,
+-	 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
+-	 */
+-	if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) || nid >=
+-	    DP_MAX_DMA_CHAN) {
+-		PR_ERR("ERROR: cid=%d pid=%d nid=%d dma_chan=%d\n",
+-		       cid, pid, nid, dma_chan);
+-		PR_ERR("DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
+-		       DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
+-		return DP_FAILURE;
+-	}
++	dma_ch_offset = dp_deq_port_tbl[inst][q_port.cqe_deq].dma_ch_offset;
+ 	DP_DEBUG(DP_DBG_FLAG_QOS, "Queue decision:%s\n", q_flag_str(q_flag));
+ 	if (q_flag == DP_SUBIF_AUTO_NEW_Q) {
+ 		int cqe_deq;
+@@ -1649,7 +1644,8 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 		cqe_deq = q_port.cqe_deq;
+ 		dp_deq_port_tbl[inst][cqe_deq].ref_cnt++;
+ 		if (port_info->num_dma_chan)
+-			atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++			atomic_inc(&(dp_dma_chan_tbl[inst] +
++				   dma_ch_offset)->ref_cnt);
+ 
+ 		dp_deq_port_tbl[inst][cqe_deq].qos_port = q_port.port_node;
+ 		if (!dp_deq_port_tbl[inst][cqe_deq].f_first_qid) {
+@@ -1684,15 +1680,15 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 			dp_deq_port_tbl[inst][q_port.cqe_deq].qos_port = -1;
+ 			dp_deq_port_tbl[inst][q_port.cqe_deq].ref_cnt++;
+ 			if (port_info->num_dma_chan)
+-				atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid]
+-				   .ref_cnt);
++				atomic_inc(&(dp_dma_chan_tbl[inst] +
++					   dma_ch_offset)->ref_cnt);
+ 		} else {
+ 			/*note: don't change need_free in this case */
+ 			dp_q_tbl[inst][q_port.cqe_deq].ref_cnt++;
+ 			dp_deq_port_tbl[inst][q_port.cqe_deq].ref_cnt++;
+ 			if (port_info->num_dma_chan)
+-				atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid]
+-				   .ref_cnt);
++				atomic_inc(&(dp_dma_chan_tbl[inst] +
++					   dma_ch_offset)->ref_cnt);
+ 		}
+ 
+ 		/*get already stored q_node_id/qos_port id to q_port
+@@ -1719,7 +1715,8 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 		dp_q_tbl[inst][q_port.qid].ref_cnt++;
+ 		dp_deq_port_tbl[inst][q_port.cqe_deq].ref_cnt++;
+ 		if (port_info->num_dma_chan)
+-			atomic_inc(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++			atomic_inc(&(dp_dma_chan_tbl[inst] +
++				   dma_ch_offset)->ref_cnt);
+ 	}
+ 	DP_DEBUG(DP_DBG_FLAG_QOS,
+ 		 "%s:%s=%d %s=%d q[%d].cnt=%d cqm_p[%d].cnt=%d DMATXCH_Ref.cnt=%d\n",
+@@ -1728,7 +1725,8 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 		 "vap", subif_ix,
+ 		 q_port.qid, dp_q_tbl[inst][q_port.qid].ref_cnt,
+ 		 q_port.cqe_deq, dp_deq_port_tbl[inst][q_port.cqe_deq].ref_cnt,
+-		 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++		 atomic_read(&(dp_dma_chan_tbl[inst] +
++			     dma_ch_offset)->ref_cnt));
+ #ifdef CONFIG_LTQ_DATAPATH_QOS_HAL
+ 	if (dp_deq_port_tbl[inst][q_port.cqe_deq].ref_cnt == 1) /*first CTP*/
+ 		data->act = TRIGGER_CQE_DP_ENABLE;
+@@ -1776,15 +1774,19 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ {
+ 	int qid;
+ 	int cqm_deq_port;
++	int dma_ch_offset;
+ 	struct pmac_port_info *port_info = &dp_port_info[inst][portid];
+ 	struct dp_node_alloc node;
+-	u32 dma_chan;
+ 	int bp = port_info->subif_info[subif_ix].bp;
+-	u32 cid, pid, nid;
+ 
+ 	qid = port_info->subif_info[subif_ix].qid;
+ 	cqm_deq_port = port_info->subif_info[subif_ix].cqm_deq_port;
+ 	bp = port_info->subif_info[subif_ix].bp;
++
++	if (!dp_dma_chan_tbl[inst]) {
++		PR_ERR("dp_dma_chan_tbl[%d] NULL\n", inst);
++		return DP_FAILURE;
++	}
+ 	/* santity check table */
+ 	if (!dp_q_tbl[inst][qid].ref_cnt) {
+ 		PR_ERR("Why dp_q_tbl[%d][%d].ref_cnt Zero: expect > 0\n",
+@@ -1802,27 +1804,13 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 		       inst, bp, dp_bp_dev_tbl[inst][bp].ref_cnt);
+ 		return DP_FAILURE;
+ 	}
+-	dma_chan = dp_deq_port_tbl[inst][cqm_deq_port].dma_chan;	
+-	cid = _DMA_CONTROLLER(dma_chan);
+-	pid = _DMA_PORT(dma_chan) ;
+-	nid = _DMA_CHANNEL(dma_chan);
+-	/* cid, pid and nid should not greater than DP_DMAMAX,
+-	 * DP_MAX_DMA_PORT and DP_MAX_DMA_CHAN respectively.
+-	 */
+-	if ((cid >= DP_DMAMAX) || (pid >= DP_MAX_DMA_PORT) || nid >=
+-	    DP_MAX_DMA_CHAN) {
+-		PR_ERR("ERROR: cid=%d pid=%d nid=%d\n", cid, pid, nid);
+-		PR_ERR("DMAMAX=%d MAX_DMA_PORT=%d MAX_DMA_CHAN=%d\n",
+-		       DP_DMAMAX, DP_MAX_DMA_PORT, DP_MAX_DMA_CHAN);
+-		return DP_FAILURE;
+-	}
+-	DP_DEBUG(DP_DBG_FLAG_DBG, "cid=%d pid=%d nid=%d\n", cid, pid, nid);
++	dma_ch_offset = dp_deq_port_tbl[inst][cqm_deq_port].dma_ch_offset;
+ 
+ 	/* update queue/port/sched/bp_pmapper/dma_tx_ch table's ref_cnt */
+ 	dp_q_tbl[inst][qid].ref_cnt--;
+ 	dp_deq_port_tbl[inst][cqm_deq_port].ref_cnt--;
+ 	if (port_info->num_dma_chan)
+-		atomic_dec(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt);
++		atomic_dec(&(dp_dma_chan_tbl[inst] + dma_ch_offset)->ref_cnt);
+ 	if (port_info->subif_info[subif_ix].ctp_dev) { /* pmapper */
+ 		port_info->subif_info[subif_ix].ctp_dev = NULL;
+ 		dp_bp_dev_tbl[inst][bp].ref_cnt--;
+@@ -1879,7 +1867,8 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 		 "vap", subif_ix,
+ 		 qid, dp_q_tbl[inst][qid].ref_cnt,
+ 		 cqm_deq_port, dp_deq_port_tbl[inst][cqm_deq_port].ref_cnt,
+-		 atomic_read(&dp_dma_chan_tbl[inst][cid][pid][nid].ref_cnt));
++		 atomic_read(&(dp_dma_chan_tbl[inst] +
++			     dma_ch_offset)->ref_cnt));
+ #else
+ 	qos_queue_flush(priv->qdev, port_info->subif_info[subif_ix].q_node);
+ 	qos_queue_remove(priv->qdev, port_info->subif_info[subif_ix].q_node);

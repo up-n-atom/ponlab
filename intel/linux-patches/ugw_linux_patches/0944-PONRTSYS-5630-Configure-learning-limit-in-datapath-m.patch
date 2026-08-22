@@ -1,0 +1,202 @@
+From db43548c527851d16beb53369d0a247e7ed60408 Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke.mehrtens@intel.com>
+Date: Fri, 3 Jan 2020 17:59:02 +0100
+Subject: [PATCH] PONRTSYS-5630: Configure learning_limit in datapath manager
+
+This allows to configure the MacLearningLimit attribute per port in the
+GSWIP 3.1 over the switchdev API. The call is forwarded to the
+switch_api.
+Configuration values bigger than what the hardware supports are
+rejected.
+
+Define the max learning limit as a capability on the port.
+---
+ drivers/net/datapath/dpm/datapath_swdev.c          | 40 +++++++++++++++++++++
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   |  2 ++
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h   |  4 +++
+ .../net/datapath/dpm/gswip31/datapath_switchdev.c  | 41 ++++++++++++++++++++++
+ .../net/datapath/dpm/gswip31/datapath_switchdev.h  |  1 +
+ include/net/datapath_api.h                         |  1 +
+ include/net/datapath_inst.h                        |  2 ++
+ 7 files changed, 91 insertions(+)
+
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index 16b698aad082..aefa09ddc56f 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -772,6 +772,42 @@ static int dp_swdev_port_attr_bridge_flags_get(struct net_device *dev,
+ 	return err;
+ }
+ 
++static int dp_swdev_port_attr_learning_limit_set(struct net_device *dev,
++						 int learning_limit,
++						 struct switchdev_trans *trans)
++{
++	dp_subif_t subif = {0};
++	struct inst_info *i_info;
++	int err = 0;
++
++	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
++		DP_DEBUG(DP_DBG_FLAG_SWDEV,
++			 "dp_get_netif_subifid failed for %s\n",
++			 dev->name);
++			return -EINVAL;
++	}
++
++	i_info = &dp_port_prop[subif.inst].info;
++	if (!i_info->swdev_port_learning_limit_set)
++		return -EOPNOTSUPP;
++
++	/* The maximum limited supported by the GSWIP 3.1 is 254 entries */
++	if (learning_limit > i_info->cap.max_num_learn_limit_port) {
++		netdev_err(dev, "mac learning limit (%i) too high, max: %i\n",
++			   learning_limit, i_info->cap.max_num_learn_limit_port);
++		return -EINVAL;
++	}
++
++	/* If we are in preperation do not execute the command */
++	if (switchdev_trans_ph_prepare(trans))
++		return 0;
++
++	err = i_info->swdev_port_learning_limit_set(subif.inst,
++						    subif.bport,
++						    learning_limit);
++	return err;
++}
++
+ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 				  const struct switchdev_attr *attr,
+ 				  struct switchdev_trans *trans)
+@@ -840,6 +876,10 @@ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 		/*err = dp_swdev_port_attr_bridge_br_vlan_set(dev,
+ 		 *attr->orig_dev,trans);
+ 		 */
++	case SWITCHDEV_ATTR_ID_PORT_LEARNING_LIMIT:
++		err = dp_swdev_port_attr_learning_limit_set(dev,
++							attr->u.learning_limit,
++							trans);
+ 	default:
+ 		err = -EOPNOTSUPP;
+ 		break;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 5811f5a28759..7ae918d0ed9c 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -2165,6 +2165,7 @@ int register_dp_cap_gswip31(int flag)
+ 	cap.info.swdev_bridge_port_cfg_set = dp_swdev_bridge_port_cfg_set;
+ 	cap.info.swdev_bridge_port_flags_set = dp_swdev_bridge_port_flags_set;
+ 	cap.info.swdev_bridge_port_flags_get = dp_swdev_bridge_port_flags_get;
++	cap.info.swdev_port_learning_limit_set = dp_swdev_port_learning_limit_set;
+ 	cap.info.dp_mac_set = dp_gswip_mac_entry_add;
+ 	cap.info.dp_mac_reset = dp_gswip_mac_entry_del;
+ 	cap.info.dp_cfg_vlan = dp_gswip_ext_vlan; /*for symmetric VLAN */
+@@ -2187,6 +2188,7 @@ int register_dp_cap_gswip31(int flag)
+ 	cap.info.cap.max_num_subif_per_port = MAX_SUBIF_PER_PORT;
+ 	cap.info.cap.max_num_subif = 288;
+ 	cap.info.cap.max_num_bridge_port = 128;
++	cap.info.cap.max_num_learn_limit_port = GSWIP_LEARN_LIMIT_PORT_MAX;
+ 
+ 	if (register_dp_hw_cap(&cap, flag)) {
+ 		pr_err("Why register_dp_hw_cap fail\n");
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 459ed41eb984..302876b85409 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -39,6 +39,10 @@
+ #define SET_BP_MAP(x, ix) (x[(ix) / 16] |= 1 << ((ix) % 16))
+ #define GET_BP_MAP(x, ix) ((x[(ix) / 16] >> ((ix) % 16)) & 1)
+ #define UNSET_BP_MAP(x, ix) (x[(ix) / 16] &= ~(1 << ((ix) % 16)))
++/* Max value for the limit of MAC addresses per bridge port. */
++#define GSWIP_LEARN_LIMIT_PORT_MAX		254
++/* Allow learning unlimited MAC addresses on port. */
++#define GSWIP_LEARN_LIMIT_PORT_UNLIMITED	254
+ 
+ enum CQE_LOOKUP_MODE {
+ 	CQE_LU_MODE0 = 0,
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+index 4acac6eaa644..d7f567585f3a 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.c
+@@ -346,6 +346,47 @@ int dp_swdev_bridge_port_flags_get(int inst, int bport, unsigned long *flags)
+ 	return 0;
+ }
+ 
++int dp_swdev_port_learning_limit_set(int inst, int bport, int learning_limit)
++{
++	GSW_return_t ret;
++	GSW_BRIDGE_portConfig_t bpcfg = {0};
++	struct core_ops *gsw_handle;
++	struct brdgport_ops *gsw_bp;
++
++	gsw_handle = dp_port_prop[inst].ops[0];
++	gsw_bp = &gsw_handle->gsw_brdgport_ops;
++
++	bpcfg.nBridgePortId = bport;
++	bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MAC_LEARNING_LIMIT;
++	ret = gsw_bp->BridgePort_ConfigGet(gsw_handle, &bpcfg);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: bridge port configi get failed\r\n", __func__);
++		return -1;
++	}
++
++	bpcfg.eMask |= GSW_BRIDGE_PORT_CONFIG_MASK_MAC_LEARNING_LIMIT;
++	if (learning_limit == BRPORT_LEARNING_LIMIT_UNLIMITED) {
++		bpcfg.nMacLearningLimit = GSWIP_LEARN_LIMIT_PORT_UNLIMITED;
++		bpcfg.bMacLearningLimitEnable = 0;
++	} else {
++		/* only possible to configure values between 0 and 255
++		 * 256 == unlimited in the HW.
++		 */
++		if (learning_limit > GSWIP_LEARN_LIMIT_PORT_MAX)
++			learning_limit = GSWIP_LEARN_LIMIT_PORT_UNLIMITED;
++		bpcfg.nMacLearningLimit = learning_limit;
++		bpcfg.bMacLearningLimitEnable = 1;
++	}
++
++	ret = gsw_bp->BridgePort_ConfigSet(gsw_handle, &bpcfg);
++	if (ret != GSW_statusOk) {
++		pr_err("%s: config bridge port failed\r\n", __func__);
++		return -1;
++	}
++
++	return GSW_statusOk;
++}
++
+ int dp_swdev_free_brcfg(int inst, u16 fid)
+ {
+ 	GSW_return_t ret;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
+index 8b65ce9a4115..e14b44551dea 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_switchdev.h
+@@ -19,4 +19,5 @@ int dp_swdev_free_brcfg(int inst, u16 fid);
+ int dp_gswip_ext_vlan(int inst, int vap, int ep);
+ int dp_swdev_bridge_port_flags_set(int inst, int bport, unsigned long flags);
+ int dp_swdev_bridge_port_flags_get(int inst, int bport, unsigned long *flags);
++int dp_swdev_port_learning_limit_set(int inst, int bport, int learning_limit);
+ #endif
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index d012f6deefe3..a1b9c9e594a8 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -1647,6 +1647,7 @@ struct dp_cap {
+ 	int max_num_subif; /*!< max number of subif supported. Maybe no meaning?
+ 			    */
+ 	int max_num_bridge_port; /*!< max number of bridge port */
++	int max_num_learn_limit_port;  /*!< max limit of mac addr per port */
+ 	struct dp_umt_cap umt; /*!< UMT cap */
+ };
+ 
+diff --git a/include/net/datapath_inst.h b/include/net/datapath_inst.h
+index 7b27c22efa46..b5fb0492ec64 100644
+--- a/include/net/datapath_inst.h
++++ b/include/net/datapath_inst.h
+@@ -154,6 +154,8 @@ struct inst_info {
+ 					  unsigned long flags);
+ 	int (*swdev_bridge_port_flags_get)(int inst, int bport,
+ 					  unsigned long *flags);
++	int (*swdev_port_learning_limit_set)(int inst, int bport,
++					     int learning_limit);
+ 	int (*dp_mac_set)(int bport, int fid, int inst, u8 *addr);
+ 	int (*dp_mac_reset)(int bport, int fid, int inst, u8 *addr);
+ 	int (*dp_cfg_vlan)(int inst, int vap, int ep);

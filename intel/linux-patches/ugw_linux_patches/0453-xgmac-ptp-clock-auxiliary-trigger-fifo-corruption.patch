@@ -1,0 +1,139 @@
+From 57c7563f2aa4e0c4b3961356011e83e3170254d1 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Fri, 25 Jan 2019 15:30:36 +0800
+Subject: [PATCH] xgmac ptp clock auxiliary trigger fifo corruption
+
+---
+ .../ethernet/lantiq/switch-api/mac/xgmac_common.h  |  5 +-
+ .../net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c | 67 +++++++++++-----------
+ 2 files changed, 37 insertions(+), 35 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+index 0d846e756b69..a667af289935 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+@@ -142,6 +142,8 @@ extern int pc_uart_datawrite_32(u32 Offset, u32 value);
+ 		   reg##_##field##_POS, 			\
+ 		   reg##_##field##_WIDTH, (val))
+ 
++#define N_EXT_TS 2
++
+ #if defined(PC_UTILITY) && PC_UTILITY
+ 
+ /* UART inetrface suppot function */
+@@ -585,8 +587,7 @@ struct mac_prv_data {
+ 	struct tasklet_struct mac_tasklet;
+ 	struct clk *ker_ptp_clk;
+ #endif
+-	u32 exts0_enabled;
+-	u32 exts1_enabled;
++	u32 exts_enabled[N_EXT_TS];
+ 	u32 snaptype;
+ 	u32 tsmstrena;
+ 	u32 tsevntena;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+index af92101e3d9f..834a72cccb85 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+@@ -45,7 +45,6 @@
+ 
+ #define AUX_TRIG_0 1
+ #define AUX_TRIG_1 2
+-#define N_EXT_TS 2
+ 
+ static int xgmac_adj_freq(struct ptp_clock_info *ptp, s32 ppb);
+ static int xgmac_adj_time(struct ptp_clock_info *ptp, s64 delta);
+@@ -574,29 +573,27 @@ static int xgmac_extts_enable(struct ptp_clock_info *ptp,
+ {
+ 	struct mac_prv_data *pdata =
+ 		container_of(ptp, struct mac_prv_data, ptp_clk_info);
++	int i;
++	u32 aux_ctrl;
+ 
+ 	switch (rq->type) {
+ 	case PTP_CLK_REQ_EXTTS:
+-		switch (rq->extts.index) {
+-		case 0:
+-			mac_dbg("ATSEN0 enabled\n");
+-			pdata->exts0_enabled = on ? 1 : 0;
+-			XGMAC_RGWR_BITS(pdata, MAC_AUX_CTRL, ATSEN0, 1);
+-			break;
+-
+-		case 1:
+-			mac_dbg("ATSEN1 enabled\n");
+-			pdata->exts1_enabled = on ? 1 : 0;
+-			XGMAC_RGWR_BITS(pdata, MAC_AUX_CTRL, ATSEN1, 1);
+-			break;
+-
+-		default:
++		i = rq->extts.index;
++		if (i < N_EXT_TS) {
++			mac_dbg("ATSEN%d enabled %u\n", i, on);
++			pdata->exts_enabled[i] = on ? 1 : 0;
++
++			aux_ctrl = XGMAC_RGRD(pdata, MAC_AUX_CTRL);
++			SET_N_BITS(aux_ctrl,
++				   MAC_AUX_CTRL_ATSEN0_POS + i,
++				   1,
++				   on ? 1 : 0);
++			XGMAC_RGWR(pdata, MAC_AUX_CTRL, aux_ctrl);
++		} else {
+ 			mac_dbg("Invalid request\n");
+ 			return -EINVAL;
+ 		}
+-
+ 		return 0;
+-
+ 	default:
+ 		break;
+ 	}
+@@ -621,29 +618,33 @@ static u64 xgmac_get_auxtimestamp(struct mac_prv_data *pdata)
+ static void xgmac_extts_isr_handler(struct mac_prv_data *pdata,
+ 				    u32 tstamp_sts)
+ {
+-	u8 val = MAC_GET_VAL(tstamp_sts, MAC_TSTAMP_STSR, ATSSTN);
+ #ifdef CONFIG_PTP_1588_CLOCK
++	u8 val, i;
+ 	struct ptp_clock_event event;
+-
+-	if (val)
+-		event.timestamp = xgmac_get_auxtimestamp(pdata);
+-
+-	if (val & AUX_TRIG_0) {
+-		if (pdata->exts0_enabled) {
+-			event.type = PTP_CLOCK_EXTTS;
+-			event.index = 0;
+-			ptp_clock_event(pdata->ptp_clock, &event);
++	u64 ts[N_EXT_TS];
++	u8 ts_valid[N_EXT_TS] = {0};
++	u8 cnt = MAC_GET_VAL(tstamp_sts, MAC_TSTAMP_STSR, ATSNS);
++
++	while (cnt--) {
++		val = MAC_GET_VAL(tstamp_sts, MAC_TSTAMP_STSR, ATSSTN);
++		if (val && val <= N_EXT_TS) {
++			ts[val - 1] = xgmac_get_auxtimestamp(pdata);
++			ts_valid[val - 1] = 1;
++		} else if (val > N_EXT_TS) {
++			xgmac_get_auxtimestamp(pdata);
+ 		}
+ 	}
+ 
+-	if (val & AUX_TRIG_1) {
+-		if (pdata->exts1_enabled) {
+-			event.type = PTP_CLOCK_EXTTS;
+-			event.index = 1;
+-			ptp_clock_event(pdata->ptp_clock, &event);
++	for (i = 0; i < N_EXT_TS; i++) {
++		if (ts_valid[i]) {
++			if (pdata->exts_enabled[i]) {
++				event.timestamp = ts[i];
++				event.type = PTP_CLOCK_EXTTS;
++				event.index = i;
++				ptp_clock_event(pdata->ptp_clock, &event);
++			}
+ 		}
+ 	}
+-
+ #endif
+ }
+ 

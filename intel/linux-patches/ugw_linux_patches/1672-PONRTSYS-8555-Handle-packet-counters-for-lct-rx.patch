@@ -1,0 +1,313 @@
+From 2dfbcf3ee658121235fffebf212f29987465caa0 Mon Sep 17 00:00:00 2001
+From: "Langer, Thomas" <tlanger@maxlinear.com>
+Date: Mon, 19 Apr 2021 18:43:33 +0200
+Subject: [PATCH] PONRTSYS-8555: Handle packet counters for lct rx
+
+As the lct interface has no physical port for receiving packets (CTP),
+the packets needs to be counted in the rx handler and corrected for lct
+and the physical interface.
+As broadcast/multicast packets are multiplied, we have to differentiate
+them from the unicast packets.
+---
+ drivers/net/datapath/dpm/datapath.h                | 30 ++++++++++++
+ drivers/net/datapath/dpm/datapath_api.c            | 19 ++++++--
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   | 21 ++++++++
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h   |  2 +
+ drivers/net/datapath/dpm/gswip31/datapath_rx.c     | 57 +++++++++++++++++++++-
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 42 ++++++++++++++++
+ 6 files changed, 166 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 045445928499..353608df1d54 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -439,6 +439,33 @@ struct dp_reinsert_count {
+ 	u64 dp_GoodBytes;
+ };
+ 
++/**
++ * struct dp_lct_rx_cnt - datapath lct counters in RX
++ */
++struct dp_lct_rx_cnt {
++	/* Size 64 Bytes Packet Count. */
++	u64 dp_64BytePkts;
++	/* Size 65-127 Bytes Packet Count. */
++	u64 dp_127BytePkts;
++	/* Size 128-255 Bytes Packet Count. */
++	u64 dp_255BytePkts;
++	/* Size 256-511 Bytes Packet Count. */
++	u64 dp_511BytePkts;
++	/* Size 512-1023 Bytes Packet Count. */
++	u64 dp_1023BytePkts;
++	/* Size 1024-1522 Bytes (or more, if configured) Packet Count. */
++	u64 dp_MaxBytePkts;
++	/* DP Unicast Packet Count. */
++	u64 dp_UnicastPkts;
++	/* DP Multicast Packet Count. */
++	u64 dp_MulticastPkts;
++	/* DP Broadcast Packet Count. */
++	u64 dp_BroadcastPkts;
++	/* DP Good Packet Count. */
++	u64 dp_GoodPkts;
++	/* DP Good Bytes Count. */
++	u64 dp_GoodBytes;
++};
+ struct logic_dev {
+ 	struct list_head list;
+ 	struct net_device *dev;
+@@ -642,6 +669,9 @@ struct pmac_port_info {
+ 	u8 spl_rx_policy_map;   /* RX policy map    for spl GPID */
+ 	u32 num_dma_chan; /*For G.INT it's 8 or 16, for other 1*/
+ 	u32 lct_idx; /* LCT subif register flag */
++	struct dp_lct_rx_cnt *lct_rx_cnt; /* For lct counter corrections,
++					   * only allocated in case of lct subif
++					   */
+ 	u32 dma_chan_tbl_idx; /*! Base entry index of dp_dma_chan_tbl */
+ 	u32 res_qid_base; /* Base entry for the device's reserved Q */
+ 	u32 num_resv_q; /* Num of reserved Q per device */
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 3b387fd76587..6f99626fddd8 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -793,8 +793,15 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 	subif_id->subif = sif->subif;
+ 	sif->subif_groupid = i;
+ 	/* set port as LCT port */
+-	if (data->flag_ops & DP_F_DATA_LCT_SUBIF)
++	if (data->flag_ops & DP_F_DATA_LCT_SUBIF) {
+ 		port_info->lct_idx = i;
++		/* ignore a failure here, this will only result in missing
++		 * counter corrections, but is not a critical problem
++		 * we allocate two buffers for unicast/multicast counters
++		 */
++		port_info->lct_rx_cnt =
++			kzalloc(2 * sizeof(*port_info->lct_rx_cnt), GFP_ATOMIC);
++	}
+ 	port_info->num_subif++;
+ 
+ 	if (get_dp_bp_info(inst, sif->bp)->ref_cnt > 1)
+@@ -858,9 +865,15 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	if (sif->netif != dev)
+ 		return del_logic_dev(inst, &sif->logic_dev, dev, flags);
+ 
+-	/* reset LCT port */
+-	if (data->flag_ops & DP_F_DATA_LCT_SUBIF)
++	/* reset LCT port and free counter corrections */
++	if (data->flag_ops & DP_F_DATA_LCT_SUBIF) {
+ 		port_info->lct_idx = 0;
++		/* take mib_cnt_lock to avoid access to freed memory */
++		spin_lock_bh(&port_info->mib_cnt_lock);
++		kfree(port_info->lct_rx_cnt);
++		port_info->lct_rx_cnt = NULL;
++		spin_unlock_bh(&port_info->mib_cnt_lock);
++	}
+ 	if (!list_empty(&sif->logic_dev)) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+ 			 "Unregister fail: logic_dev of %s not empty yet!\n",
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 2b8ab4d4e2e5..02eb6666571c 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -2685,6 +2685,27 @@ int dp_get_reinsert_cnt(int inst, int dp_port, int vap, int flag,
+ 	return DP_SUCCESS;
+ }
+ 
++int dp_get_lct_cnt(int inst, int dp_port, int flag,
++		   u32 *lct_idx, struct dp_lct_rx_cnt *dp_lct_rx_count)
++{
++	struct pmac_port_info *port_info = get_dp_port_info(inst, dp_port);
++	struct dp_lct_rx_cnt *stats;
++
++	spin_lock_bh(&port_info->mib_cnt_lock);
++	stats = port_info->lct_rx_cnt;
++
++	if (!stats) {
++		spin_unlock_bh(&port_info->mib_cnt_lock);
++		return DP_ERR_NULL_DATA;
++	}
++	*lct_idx = port_info->lct_idx;
++	memcpy(dp_lct_rx_count, stats, 2 * sizeof(*dp_lct_rx_count));
++	DP_DEBUG(DP_DBG_FLAG_DBG, "LCT rx counters\n");
++	spin_unlock_bh(&port_info->mib_cnt_lock);
++
++	return DP_SUCCESS;
++}
++
+ static int not_valid_rx_ep(int ep)
+ {
+ 	return (((ep >= 3) && (ep <= 6)) || (ep == 2) || (ep > 15));
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 90136be490f7..9d5161f81d31 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -431,6 +431,8 @@ int tc_vlan_set(struct core_ops *ops, struct dp_tc_vlan *vlan,
+ 		   int flag);
+ int dp_get_reinsert_cnt(int inst, int dp_port, int vap, int flag,
+ 			struct dp_reinsert_count *dp_reins_count);
++int dp_get_lct_cnt(int inst, int dp_port, int flag,
++		   u32 *lct_idx, struct dp_lct_rx_cnt *dp_lct_rx_count);
+ int dp_queue_block_flush(struct dp_qos_blk_flush_queue *cfg, int flag);
+ int dp_port_block_flush(struct dp_qos_blk_flush_port *cfg, int flag);
+ int dp_get_queue_qocc(struct dp_qos_queue_info *info, int flag);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_rx.c b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+index 897866a10ef2..1abfd9929a9d 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_rx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_rx.c
+@@ -218,6 +218,55 @@ static int create_dflt_egress_session(int inst, struct sk_buff *skb, int gpid,
+ }
+ #endif
+ 
++static int dp_lct_pkt_cnt(struct pmac_port_info *dp_port, bool unicast,
++			  const struct sk_buff *skb, int offset)
++{
++	struct dp_lct_rx_cnt *stats;
++	int len = skb->len + ETH_FCS_LEN - offset;
++
++	spin_lock_bh(&dp_port->mib_cnt_lock);
++
++	stats = dp_port->lct_rx_cnt;
++	if (!stats) {
++		spin_unlock_bh(&dp_port->mib_cnt_lock);
++		return DP_SUCCESS;
++	}
++	/* update pointer to multicast/broadcast counter storage */
++	if (!unicast)
++		stats++;
++
++	DP_DEBUG(DP_DBG_FLAG_DBG, "dp_lct_pkt_cnt: len=%d\n", len);
++
++	if (len <= 64)
++		stats->dp_64BytePkts++;
++	else if ((len <= 127) && (len >= 65))
++		stats->dp_127BytePkts++;
++	else if ((len <= 255) && (len >= 128))
++		stats->dp_255BytePkts++;
++	else if ((len <= 511) && (len >= 256))
++		stats->dp_511BytePkts++;
++	else if ((len <= 1023) && (len >= 512))
++		stats->dp_1023BytePkts++;
++	else
++		stats->dp_MaxBytePkts++;
++
++	if (unicast) {
++		stats->dp_UnicastPkts++;
++	} else {
++		if (is_broadcast_ether_addr(skb->data + offset))
++			stats->dp_BroadcastPkts++;
++		else
++			stats->dp_MulticastPkts++;
++	}
++
++	stats->dp_GoodPkts++;
++	stats->dp_GoodBytes += len;
++
++	spin_unlock_bh(&dp_port->mib_cnt_lock);
++
++	return DP_SUCCESS;
++}
++
+ /* For multicast/broadcast pkt, clone and send skb to LCT dev
+  * For unicast pkt, send to LCT dev if addr matched
+  * Return: 0 for unicast pkt if addr matched and skb is consumed otherwise
+@@ -243,7 +292,9 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 	/* For PRX, skb->data contains pmac header */
+ 	offset = sizeof(struct pmac_rx_hdr);
+ #endif
+-	if (skb->data[offset] & 0x1) {
++
++	/* "multicast" includes the broadcast packets */
++	if (is_multicast_ether_addr(&skb->data[offset])) {
+ 		DP_DEBUG(DP_DBG_FLAG_PAE, "LCT mcast or broadcast\n");
+ 		if ((STATS_GET(sif->rx_flag) <= 0)) {
+ 			DP_DEBUG(DP_DBG_FLAG_DUMP_RX,
+@@ -255,6 +306,7 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 			} else {
+ 				UP_STATS(mib->rx_fn_rxif_pkt);
+ 				MIB_G_STATS_INC(rx_rxif_clone);
++				dp_lct_pkt_cnt(dp_port, false, lct_skb, offset);
+ 				DP_DEBUG(DP_DBG_FLAG_PAE, "pkt sent lct(%s)\n",
+ 					 lct_skb->dev->name);
+ 				rx_fn(lct_skb->dev, NULL, lct_skb,
+@@ -272,9 +324,10 @@ static int dp_handle_lct(struct pmac_port_info *dp_port,
+ 			MIB_G_STATS_INC(rx_drop);
+ 			dev_kfree_skb_any(skb);
+ 		} else {
+-			rx_fn(skb->dev, NULL, skb, skb->len);
++			dp_lct_pkt_cnt(dp_port, true, skb, offset);
+ 			UP_STATS(mib->rx_fn_rxif_pkt);
+ 			MIB_G_STATS_INC(rx_rxif_pkts);
++			rx_fn(skb->dev, NULL, skb, skb->len);
+ 		}
+ 		res = 0;
+ 	}
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+index 0f053b528b4d..a189ab80774c 100644
+--- a/drivers/net/datapath/mib_counters/dp_mib_counters.c
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -675,6 +675,27 @@ s32 subif_register_cb(struct dp_event_info *info)
+ 	return 0;
+ }
+ 
++static int update_lct_cnt(struct mib_counters_u64 *counters,
++			  const struct dp_lct_rx_cnt *lct_rx_cnt,
++			  bool add)
++{
++	int modifier = add ? 1 : -1;
++
++	counters->nRx64BytePkts += (modifier * lct_rx_cnt->dp_64BytePkts);
++	counters->nRx127BytePkts += (modifier * lct_rx_cnt->dp_127BytePkts);
++	counters->nRx255BytePkts += (modifier * lct_rx_cnt->dp_255BytePkts);
++	counters->nRx511BytePkts += (modifier * lct_rx_cnt->dp_511BytePkts);
++	counters->nRx1023BytePkts += (modifier * lct_rx_cnt->dp_1023BytePkts);
++	counters->nRxMaxBytePkts += (modifier * lct_rx_cnt->dp_MaxBytePkts);
++	counters->nRxUnicastPkts += (modifier * lct_rx_cnt->dp_UnicastPkts);
++	counters->nRxGoodPkts += (modifier * lct_rx_cnt->dp_GoodPkts);
++	counters->nRxGoodBytes += (modifier * lct_rx_cnt->dp_GoodBytes);
++	counters->nRxBroadcastPkts += (modifier * lct_rx_cnt->dp_BroadcastPkts);
++	counters->nRxMulticastPkts += (modifier * lct_rx_cnt->dp_MulticastPkts);
++
++	return 0;
++}
++
+ /************************* ETHTOOL SUPPORT ************************/
+ 
+ void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
+@@ -684,10 +705,12 @@ void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
+ 	struct mib_counters *mib_cnt;
+ 	struct mib_counters_u64 wide_cnt_mod;
+ 	struct dp_reinsert_count dp_reins_count;
++	struct dp_lct_rx_cnt lct_rx_cnt[2];
+ 	dp_subif_t *ps_subif;
+ 	u32 sub_if_id_grp;
+ 	u64 *data_dst;
+ 	u32 flags = 0;
++	u32 lct_idx = 0;
+ 	int ret;
+ 
+ 	ps_subif = devm_kzalloc(&g_dp_dev->dev, (sizeof(dp_subif_t)),
+@@ -750,6 +773,25 @@ void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
+ 	wide_cnt_mod.nRxGoodPkts -= dp_reins_count.dp_GoodPkts;
+ 	wide_cnt_mod.nRxGoodBytes -= dp_reins_count.dp_GoodBytes;
+ 
++	/* For LCT the rx packets are redirected in DP from a base interface
++	 * to the "lct" sub-interface, so correct the hardware counters with
++	 * the things happened in software.
++	 * For interfaces without registered lct we will not get the counters
++	 * and just ignore that.
++	 */
++	ret = dp_get_lct_cnt(mib_cnt->inst, mib_cnt->port_id, 0,
++			     &lct_idx, lct_rx_cnt);
++	if (ret == DP_SUCCESS) {
++		/* base interfaces, remove unicast counters */
++		if (mib_cnt->sub_if_id_grp == 0)
++			update_lct_cnt(&wide_cnt_mod, &lct_rx_cnt[0], false);
++		/* this is the lct, add unicast and multicast counters */
++		if (lct_idx == mib_cnt->sub_if_id_grp) {
++			update_lct_cnt(&wide_cnt_mod, &lct_rx_cnt[0], true);
++			update_lct_cnt(&wide_cnt_mod, &lct_rx_cnt[1], true);
++		}
++	}
++
+ 	/* Copy counters values to ethtool buffer */
+ 	data_dst = data;
+ 

@@ -1,0 +1,140 @@
+From e4004c305a2c90ac0b1c0a3fb403ecad4528ec5f Mon Sep 17 00:00:00 2001
+From: Robert Dabrowski <robertx.dabrowski@intel.com>
+Date: Thu, 15 Oct 2020 17:18:26 +0200
+Subject: [PATCH] PONRTSYS-8029: Rework update all mib counters timer
+
+  The implementation separates the refreshing of the counters,
+  which makes it possible to use lock for updating counters
+  for each network device separately, which should not take more
+  than a few milliseconds.
+---
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 89 +++++++++++++++++++---
+ 1 file changed, 80 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+index ce56ca51ece6..b3f2388693cb 100644
+--- a/drivers/net/datapath/mib_counters/dp_mib_counters.c
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -136,6 +136,15 @@ struct mib_counters {
+ 	struct mib_counters_u64 wide_cntrs;
+ };
+ 
++struct work_list_el {
++	/** work list element handle */
++	struct list_head work_list_handle;
++	/** device name */
++	char name[IFNAMSIZ];
++	/** device pointer */
++	struct net_device *dev;
++};
++
+ /* Ethtool statistics strings */
+ static const char dp_ethtool_gstrings[][ETH_GSTRING_LEN] = {
+ #define _DP_ETHTOOL(x, y)	# x,
+@@ -332,19 +341,83 @@ static void update_dev_counters(struct mib_counters *cnt, u8 initial_update)
+ 		devm_kfree(&g_dp_dev->dev, rmon);
+ }
+ 
++/* check if is it the one that is search for */
++static bool check_match(struct work_list_el *wle, struct mib_counters *mib_cnt)
++{
++	if (!wle || !mib_cnt)
++		return false;
++
++	if ((wle->dev == mib_cnt->dev) &&
++	    !strcmp(wle->name, mib_cnt->dev->name))
++		return true;
++	else
++		return false;
++}
++
+ /* update counters for all registered devices */
+ static void update_all_devs_counters(void)
+ {
+-	struct mib_counters *mib_cnt;
+-	struct list_head *p;
++	struct mib_counters *mib_cnt, *mib_cnt_match;
++	struct list_head *p, *q, *r;
++	struct work_list_el *wle;
++	/* local list of registered net devices */
++	struct list_head work_list;
++
++	INIT_LIST_HEAD(&work_list);
+ 
++	/* Fill work_list as a snapshot of the registered_devices_list
++	 * with crucial identifiers only
++	 */
+ 	read_lock_bh(&dev_list_lock);
+-	list_for_each(p, &registered_devices_list)
+-	{
++	list_for_each(p, &registered_devices_list) {
+ 		mib_cnt = list_entry(p, struct mib_counters, dev_list);
+-		update_dev_counters(mib_cnt, !INITIAL_UPDATE);
++		wle = kzalloc(sizeof(struct work_list_el), GFP_ATOMIC);
++		if (!wle) {
++			read_unlock_bh(&dev_list_lock);
++			return;
++		}
++		wle->dev = mib_cnt->dev;
++		memcpy(wle->name, mib_cnt->dev->name,
++		       sizeof(mib_cnt->dev->name));
++
++		list_add_tail(&wle->work_list_handle, &work_list);
+ 	}
+ 	read_unlock_bh(&dev_list_lock);
++
++	/* Iterate over the work_list, check if the device from work_list still
++	 * exists in registered_devices_list and do counters updated for it.
++	 */
++	list_for_each_safe(p, q, &work_list) {
++		wle = list_entry(p, struct work_list_el, work_list_handle);
++		mib_cnt_match = NULL;
++		read_lock_bh(&dev_list_lock);
++		/* The dev can not exist anymore in registered_devices_list
++		 * because it could have been removed by dp in meantime.
++		 */
++		list_for_each(r, &registered_devices_list) {
++			mib_cnt = list_entry(r, struct mib_counters, dev_list);
++			if (check_match(wle, mib_cnt)) {
++				mib_cnt_match = mib_cnt;
++				/* Do update counters for the device */
++				update_dev_counters(mib_cnt_match,
++						    !INITIAL_UPDATE);
++				break;
++			}
++		}
++		read_unlock_bh(&dev_list_lock);
++
++		if (mib_cnt_match)
++			DP_DEBUG(DP_DBG_FLAG_MIB,
++				 "MIB CNT - %s - counters updated\n",
++				 wle->name);
++		else
++			DP_DEBUG(DP_DBG_FLAG_MIB,
++				 "MIB CNT - %s not found\n", wle->name);
++
++		/* Remove processed work_list entry */
++		list_del(p);
++		kfree(wle);
++	}
+ }
+ 
+ /* Adds new net device to counter update list */
+@@ -390,15 +463,13 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 
+ 	write_lock_bh(&dev_list_lock);
+ 	list_add_tail(&dev_cnt->dev_list, &registered_devices_list);
++	/* read counters for just added dev to save initial value */
++	update_dev_counters(dev_cnt, INITIAL_UPDATE);
+ 	write_unlock_bh(&dev_list_lock);
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_MIB,
+ 		 "MIB CNT - added device: %s port_id = %d, sub_if_id_grp = %d\n",
+ 		 dev->name, port_id, dev_cnt->sub_if_id_grp);
+-
+-	/* read counters for just added dev to save initial value */
+-	update_dev_counters(dev_cnt, INITIAL_UPDATE);
+-
+ 	return 0;
+ }
+ 

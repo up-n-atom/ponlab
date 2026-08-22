@@ -1,0 +1,1109 @@
+From 0fc43b7e5a2c596270bde091fc03f74545f9ab15 Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Wed, 4 Mar 2020 15:57:11 +0200
+Subject: [PATCH] PONRTSYS-6084: Support PPv4 QoS WSP Helper
+
+---
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h |   4 +-
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c    | 119 +++++++++++
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c     | 102 ++++++++-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h     |   5 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c   |  59 +++--
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h    |  98 ++++++++-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  | 237 ++++++++++++++++++++-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h  |  42 +++-
+ drivers/net/ppv4/pp-dev/pp_dts.c                   |   1 +
+ include/linux/pp_qos_api.h                         |   3 +
+ 10 files changed, 630 insertions(+), 40 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
+index 5c176d9c00e1..f518c0ad7f7a 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
+@@ -55,8 +55,8 @@
+ #define PPV4_QOS_UC_GUARD_MAGIC        (0xCAFECAFE)
+ #define PPV4_QOS_CMD_BUF_GUARD_OFFSET                     \
+ 	(PPV4_QOS_CMD_BUF_OFFSET + PPV4_QOS_CMD_BUF_SIZE)
+-
+-/* DCCM free memory: 0x1004 - 0x7F00 */
++#define PPV4_QOS_UC_WSP_DB_OFFSET  (PPV4_QOS_CMD_BUF_GUARD_OFFSET + 4)
++#define PPV4_QOS_UC_WSP_DB_SIZE    (sizeof(struct wsp_db_t))
+ 
+ #define PPV4_QOS_UC_INTERNALS_OFFSET   (0x7F00)
+ #define PPV4_QOS_UC_INTERNALS_SIZE     (0xC0)
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+index 473edf0e9e50..9771770baac3 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+@@ -435,6 +435,9 @@ static u16 create_port_props(struct dbg_prop *props, u16 size,
+ 	dbg_add_prop(props, &num, size, "yellow_threshold",
+ 		     "Egress bytes yellow threshold",
+ 		     &pconf->yellow_threshold);
++	dbg_add_prop(props, &num, size, "enhanced_wsp",
++		     "Enhanced WSP",
++		     &pconf->enhanced_wsp);
+ 
+ 	return num;
+ }
+@@ -1770,6 +1773,120 @@ void mcdma_copy_help(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(mcdma_copy, mcdma_copy_help, mcdma_copy);
+ 
++/**
++ * @brief wsp helper, set enhanced WSP parameters
++ */
++void ewsp_helper(char *cmd_buf, void *data)
++{
++	struct pp_qos_dev *qdev;
++	u32 enable, timeout, threshold;
++	s32 ret;
++
++	qdev = pp_qos_dev_open((unsigned long)data);
++	if (unlikely(!qdev)) {
++		QOS_LOG_ERR("Error: qdev NULL\n");
++		return;
++	}
++
++	if (sscanf(cmd_buf, "%u %u %u",
++		   &enable, &timeout, &threshold) != 3) {
++		QOS_LOG_ERR("sscanf err\n");
++		goto ewsp_helper_done;
++	}
++
++	if (timeout > 255) {
++		QOS_LOG_ERR("Timeout value is up to 255 uS\n");
++		goto ewsp_helper_done;
++	}
++
++	qdev->ewsp_cfg.enable = enable;
++	qdev->ewsp_cfg.timeout_microseconds = timeout;
++	qdev->ewsp_cfg.byte_threshold = threshold;
++
++	create_set_wsp_helper_cmd(qdev, enable, timeout, threshold);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret))
++		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++
++ewsp_helper_done:
++	return;
++}
++
++void ewsp_helper_help(struct seq_file *f)
++{
++	seq_puts(f, "<enable> <microseconds timeout> <byte threshold>\n");
++}
++
++PP_DEFINE_DEBUGFS(ewsp_helper, ewsp_helper_help, ewsp_helper);
++
++/**
++ * @brief wsp helper reset, reset Enhanced WSP statistics
++ */
++void ewsp_helper_reset(char *cmd_buf, void *data)
++{
++	struct pp_qos_dev *qdev;
++	struct wsp_stats_t stats;
++	s32 ret;
++
++	qdev = pp_qos_dev_open((unsigned long)data);
++	if (unlikely(!qdev)) {
++		QOS_LOG_ERR("Error: qdev NULL\n");
++		return;
++	}
++
++	create_get_wsp_helper_stats_cmd(qdev, qdev->hwconf.fw_stats_ddr_phys,
++					true, &stats);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret))
++		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++
++	return;
++}
++
++/**
++ * @brief wsp helper stats, dump Enhanced WSP statistics
++ */
++void ewsp_helper_stats(struct seq_file *f)
++{
++	struct pp_qos_dev *qdev;
++	struct wsp_stats_t stats;
++	s32 ret;
++
++	qdev = pp_qos_dev_open(PP_QOS_INSTANCE_ID);
++	if (unlikely(!qdev)) {
++		QOS_LOG_ERR("Error: qdev NULL\n");
++		return;
++	}
++
++	create_get_wsp_helper_stats_cmd(qdev, qdev->hwconf.fw_stats_ddr_phys,
++					false, &stats);
++	update_cmd_id(&qdev->drvcmds);
++	ret = transmit_cmds(qdev);
++	if (unlikely(ret))
++		QOS_LOG_ERR("transmit_cmds failed (%d)\n", ret);
++
++	seq_puts(f, "Wsp helper cfg:\n");
++	seq_puts(f, "===========================\n");
++	seq_printf(f, "enable: %u\n", qdev->ewsp_cfg.enable);
++	seq_printf(f, "timeout_microseconds: %u\n",
++		   qdev->ewsp_cfg.timeout_microseconds);
++	seq_printf(f, "byte_threshold: %u\n", qdev->ewsp_cfg.byte_threshold);
++	seq_printf(f, "num_queues: %u\n", qdev->ewsp_cfg.num_queues);
++
++	seq_puts(f, "\n--------------------------\n");
++
++	seq_puts(f, "Wsp helper stats:\n");
++	seq_puts(f, "===========================\n");
++	seq_printf(f, "num_timeouts: %u\n", stats.num_timeouts);
++	seq_printf(f, "num_toggles: %u\n", stats.num_toggles_wm);
++	seq_printf(f, "num_iterations: %u\n", stats.num_iterations_wm);
++	seq_printf(f, "num_queues: %u\n", stats.num_queues);
++}
++
++PP_DEFINE_DEBUGFS(ewsp_helper_stats, ewsp_helper_stats, ewsp_helper_reset);
++
+ /**
+  * @brief add sf
+  */
+@@ -2182,6 +2299,8 @@ static struct debugfs_file qos_debugfs_files[] = {
+ 	{"remove", &PP_DEBUGFS_FOPS(remove)},
+ 	{"flush", &PP_DEBUGFS_FOPS(flush)},
+ 	{"quanta", &PP_DEBUGFS_FOPS(quanta)},
++	{"ewsp_helper", &PP_DEBUGFS_FOPS(ewsp_helper)},
++	{"ewsp_helper_stats", &PP_DEBUGFS_FOPS(ewsp_helper_stats)},
+ 	{"system_stats", &PP_DEBUGFS_FOPS(system_stats)},
+ #ifndef PP_QOS_DISABLE_CMDQ
+ 	{"cmd", &PP_DEBUGFS_FOPS(cmd)},
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+index 94a5e708979b..5c11918a8997 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+@@ -19,10 +19,12 @@
+ #include "pp_regs.h"
+ #include "elf_parser.h"
+ 
+-#define FW_DCCM_START            (0xF0000000)
+-#define FW_CMD_BUFFER_DCCM_START (0xF0004000)
+-#define MAX_FW_CMD_SIZE          (sizeof(union uc_qos_cmd_s))
+-#define ELF_MAX_SECTIONS         (64)
++#define FW_DCCM_START                   0xF0000000
++#define FW_CMD_BUFFER_DCCM_START        0xF0004000
++#define MAX_FW_CMD_SIZE                 (sizeof(union uc_qos_cmd_s))
++#define ELF_MAX_SECTIONS                64
++#define QOS_EWSP_DEFAULT_BYTE_THRESHOLD 8000
++#define QOS_EWSP_DEFAULT_TIMEOUT_US     128
+ 
+ static bool qos_fw_log;
+ 
+@@ -385,6 +387,8 @@ enum cmd_type {
+ 	CMD_TYPE_UPDATE_PORT_TREE,
+ 	CMD_TYPE_SUSPEND_PORT_TREE,
+ 	CMD_TYPE_GET_QUANTA,
++	CMD_TYPE_SET_WSP_HELPER,
++	CMD_TYPE_GET_WSP_HELPER_STATS,
+ 	CMD_TYPE_INTERNAL,
+ 	CMD_TYPE_LAST
+ };
+@@ -424,6 +428,8 @@ static const char *const cmd_str[] = {
+ 	[CMD_TYPE_UPDATE_PORT_TREE] = "CMD_TYPE_UPDATE_PORT_TREE",
+ 	[CMD_TYPE_SUSPEND_PORT_TREE] = "CMD_TYPE_SUSPEND_PORT_TREE",
+ 	[CMD_TYPE_GET_QUANTA] = "CMD_TYPE_GET_QUANTA",
++	[CMD_TYPE_SET_WSP_HELPER] = "CMD_TYPE_SET_WSP_HELPER",
++	[CMD_TYPE_GET_WSP_HELPER_STATS] = "CMD_TYPE_GET_WSP_HELPER_STATS",
+ 	[CMD_TYPE_INTERNAL] = "CMD_TYPE_INTERNAL"
+ };
+ 
+@@ -622,6 +628,16 @@ struct cmd_get_quanta {
+ 	struct fw_cmd_get_quanta fw;
+ } __attribute__((packed));
+ 
++struct cmd_set_wsp_helper {
++	struct cmd base;
++	struct fw_cmd_wsp_helper fw;
++} __attribute__((packed));
++
++struct cmd_get_wsp_helper_stats {
++	struct cmd base;
++	struct fw_cmd_wsp_helper_stats fw;
++} __attribute__((packed));
++
+ union driver_cmd {
+ 	struct cmd                     cmd;
+ 	struct stub_cmd                stub;
+@@ -656,6 +672,9 @@ union driver_cmd {
+ 	struct cmd_get_system_info     sys_info;
+ 	struct cmd_update_port_tree    update_port_tree;
+ 	struct cmd_suspend_port_tree   suspend_port_tree;
++	struct cmd_get_quanta          get_quanta;
++	struct cmd_set_wsp_helper      set_wsp_helper;
++	struct cmd_get_wsp_helper_stats get_wsp_helper_stats;
+ 	struct cmd_internal            internal;
+ } __attribute__((packed));
+ 
+@@ -991,6 +1010,7 @@ early_param("qosFwLog", qos_fw_log_en);
+ 
+ s32 qos_fw_start(struct pp_qos_dev *qdev)
+ {
++	struct wsp_helper_cfg *ewsp_cfg;
+ 	s32 ret;
+ 
+ 	if (qos_fw_log) {
+@@ -1002,6 +1022,15 @@ s32 qos_fw_start(struct pp_qos_dev *qdev)
+ 	}
+ 
+ 	create_init_qos_cmd(qdev);
++
++	ewsp_cfg = &qdev->ewsp_cfg;
++	ewsp_cfg->enable = qdev->init_params.enhanced_wsp;
++	ewsp_cfg->timeout_microseconds = QOS_EWSP_DEFAULT_TIMEOUT_US;
++	ewsp_cfg->byte_threshold = QOS_EWSP_DEFAULT_BYTE_THRESHOLD;
++	create_set_wsp_helper_cmd(qdev, ewsp_cfg->enable,
++				  ewsp_cfg->timeout_microseconds,
++				  ewsp_cfg->byte_threshold);
++
+ 	update_cmd_id(&qdev->drvcmds);
+ 	ret = transmit_cmds(qdev);
+ 	if (unlikely(ret))
+@@ -1126,6 +1155,7 @@ void create_init_qos_cmd(struct pp_qos_dev *qdev)
+ 	cmd.fw.soc_rev = __fw_soc_rev_get();
+ 	cmd.fw.bwl_ddr_base = qdev->hwconf.bwl_ddr_phys;
+ 	cmd.fw.sbwl_ddr_base = qdev->hwconf.sbwl_ddr_phys;
++	cmd.fw.wsp_queues_ddr_base = qdev->hwconf.wsp_queues_ddr_phys;
+ 	QOS_LOG_DEBUG("cmd %u: CMD_TYPE_INIT_QOS\n", qdev->drvcmds.cmd_id);
+ 	cmd_queue_put(qdev->drvcmds.cmdq, (u8 *)&cmd, sizeof(cmd));
+ }
+@@ -1835,6 +1865,8 @@ static void create_update_port_tree_cmd(struct pp_qos_dev *qdev, u32 phy)
+ 	pp_cache_writeback(qdev->hwconf.rlms_container,
+ 			   QOS_MAX_NUM_QUEUES * sizeof(u16));
+ 
++	update_wsp_info(qdev);
++
+ 	/* Update BWL buffer before tree update */
+ 	update_bwl_buffer(qdev, phy);
+ 
+@@ -1863,6 +1895,52 @@ static void create_suspend_port_tree_cmd(struct pp_qos_dev *qdev, u32 phy)
+ 	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ }
+ 
++void create_set_wsp_helper_cmd(struct pp_qos_dev *qdev, bool enable,
++			       u32 us_timeout, u32 byte_threshold)
++{
++	struct cmd_set_wsp_helper cmd;
++
++	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
++		return;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd_init(qdev, &cmd.base, CMD_TYPE_SET_WSP_HELPER,
++		 sizeof(cmd), 0, NULL, 0, 0);
++	cmd.fw.base.type = UC_QOS_CMD_WSP_HELPER_SET;
++	cmd.fw.db_address = FW_DCCM_START + PPV4_QOS_UC_WSP_DB_OFFSET;
++	cmd.fw.enable = enable;
++	cmd.fw.timeout_microseconds = us_timeout;
++	cmd.fw.byte_threshold = byte_threshold;
++
++	QOS_LOG_DEBUG("cmd %u: UC_QOS_CMD_WSP_HELPER_SET\n",
++		      qdev->drvcmds.cmd_id);
++
++	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
++	update_wsp_info(qdev);
++}
++
++void create_get_wsp_helper_stats_cmd(struct pp_qos_dev *qdev, u32 addr,
++				     bool reset, struct wsp_stats_t *stats)
++{
++	struct cmd_get_wsp_helper_stats cmd;
++
++	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
++		return;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_WSP_HELPER_STATS, sizeof(cmd),
++		 CMD_FLAGS_POST_PROCESS_EXT, (void *)stats, 0,
++		 sizeof(struct wsp_stats_t));
++	cmd.fw.base.type = UC_QOS_CMD_WSP_HELPER_STATS_GET;
++	cmd.fw.reset = reset;
++	cmd.fw.addr = addr;
++
++	QOS_LOG_DEBUG("cmd %u: UC_QOS_CMD_WSP_HELPER_STATS_GET\n",
++		      qdev->drvcmds.cmd_id);
++
++	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
++}
++
+ void update_parent(struct pp_qos_dev *qdev, u32 phy)
+ {
+ 	struct fw_set_common common;
+@@ -2069,8 +2147,8 @@ void create_aqm_sf_set_cmd(struct pp_qos_dev *qdev, u8 sf_id, u8 enable,
+ 	cmd.fw.peak_rate = sf_cfg->peak_rate;
+ 	cmd.fw.msr = sf_cfg->msr;
+ 	cmd.fw.buffer_size = sf_cfg->buffer_size;
+-	cmd.fw.msrtokens_addr_offset = PPV4_QOS_AQM_BUF_OFFSET +
+-		(sizeof(u32) * sf_id);
++	cmd.fw.msrtokens_addr_offset =
++		FW_DCCM_START + PPV4_QOS_AQM_BUF_OFFSET + (sizeof(u32) * sf_id);
+ 	cmd.fw.num_rlms = sf_cfg->num_queues;
+ 
+ 	for (queue_idx = 0; queue_idx < sf_cfg->num_queues; queue_idx++)
+@@ -2772,6 +2850,7 @@ static s32 post_process_external(struct pp_qos_dev *qdev,
+ 	struct pp_qos_port_stat *pstat;
+ 	struct system_stats_s *sys_stats, *sys_stats_ptr;
+ 	struct qm_info *qminfo, *qminfo_ptr;
++	struct wsp_stats_t *wsp_stats_resp, *wsp_stats_ptr;
+ 	u32 stats_poll = 0;
+ 	u32 fw_signal = FW_OK_CODE;
+ 	volatile u32 *fw_signal_addr;
+@@ -2918,11 +2997,18 @@ static s32 post_process_external(struct pp_qos_dev *qdev,
+ 		break;
+ 
+ 	case CMD_TYPE_GET_NODE_INFO:
+-		ret = post_process_get_node_info(qdev,
+-						 &dcmd->node_info,
++		ret = post_process_get_node_info(qdev, &dcmd->node_info,
+ 						 response);
+ 		break;
+ 
++	case CMD_TYPE_GET_WSP_HELPER_STATS:
++		wsp_stats_resp = (struct wsp_stats_t *)response;
++		wsp_stats_ptr =
++			(struct wsp_stats_t *)qdev->hwconf.fw_stats_ddr_virt;
++		memcpy(wsp_stats_resp, wsp_stats_ptr,
++		       sizeof(struct wsp_stats_t));
++		break;
++
+ 	default:
+ 		QOS_ASSERT(0, "Unexpected cmd %d for post process\n", type);
+ 		return -EINVAL;
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h
+index 3edccc9cb19a..7a1a0f3b41b8 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.h
+@@ -108,7 +108,10 @@ void create_get_table_entry_cmd(struct pp_qos_dev *qdev, u32 phy,
+ 				u32 addr, u32 table_type);
+ 
+ void create_flush_queue_cmd(struct pp_qos_dev *qdev, u32 rlm);
+-
++void create_set_wsp_helper_cmd(struct pp_qos_dev *qdev, bool enable,
++			       u32 us_timeout, u32 byte_threshold);
++void create_get_wsp_helper_stats_cmd(struct pp_qos_dev *qdev, u32 addr,
++				     bool reset, struct wsp_stats_t *stats);
+ void suspend_node(struct pp_qos_dev *qdev, u32 phy, u32 suspend);
+ 
+ void add_suspend_port(struct pp_qos_dev *qdev, u32 port);
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+index 9727fb7d8e27..76e08c95f14a 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+@@ -121,6 +121,15 @@ static s32 set_port_specific_prop(struct pp_qos_dev *qdev,
+ 		QOS_BITS_SET(*modified, QOS_MODIFIED_PORT_YELLOW_THRESHOLD);
+ 	}
+ 
++	if (!!conf->enhanced_wsp !=
++	    QOS_BITS_IS_SET(node->flags, NODE_FLAGS_ENHANCED_WSP)) {
++		QOS_BITS_SET(*modified, QOS_MODIFIED_PORT_ENHANCED_WSP);
++		if (conf->enhanced_wsp)
++			QOS_BITS_SET(node->flags, NODE_FLAGS_ENHANCED_WSP);
++		else
++			QOS_BITS_CLEAR(node->flags, NODE_FLAGS_ENHANCED_WSP);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -165,26 +174,6 @@ static bool is_tree_replica_exists(struct pp_qos_dev *qdev, u32 id)
+ 	return is_port_wsp(qdev->nodes, get_phy_from_id(qdev->mapping, id));
+ }
+ 
+-/**
+- * get_dr_sched_id() - Retrieves the port's dual rate scheduler.
+- * @qdev: handle to qos device instance obtained previously from qos_dev_init
+- * @id:   Node id. Can be any id in the tree
+- *
+- * Return: dual rate scheduler ID
+- */
+-static u32 get_dr_sched_id(const struct pp_qos_dev *qdev, u32 id)
+-{
+-	struct qos_node *node;
+-	u32 phy = get_phy_from_id(qdev->mapping, id);
+-	u32 port;
+-
+-	port = get_port(qdev->nodes, phy);
+-
+-	node = get_node_from_phy(qdev->nodes, port);
+-
+-	return node->dr_sched_id;
+-}
+-
+ /**
+  * attach_dr_sched() - Binds a dual rate scheduler to a port
+  * @qdev: handle to qos device instance obtained previously from qos_dev_init
+@@ -229,6 +218,7 @@ void pp_qos_port_conf_set_default(struct pp_qos_port_conf *conf)
+ 	conf->packet_credit_enable = 1;
+ 	conf->green_threshold = 0xFFFFFFFF;
+ 	conf->yellow_threshold = 0xFFFFFFFF;
++	conf->enhanced_wsp = 1;
+ }
+ EXPORT_SYMBOL(pp_qos_port_conf_set_default);
+ 
+@@ -517,6 +507,8 @@ static s32 _pp_qos_port_conf_get(struct pp_qos_dev *qdev,
+ 	conf->disable = node->data.port.disable;
+ 	conf->green_threshold = node->data.port.green_threshold;
+ 	conf->yellow_threshold = node->data.port.yellow_threshold;
++	conf->enhanced_wsp =
++		!!QOS_BITS_IS_SET(node->flags, NODE_FLAGS_ENHANCED_WSP);
+ 
+ 	return  get_node_prop(qdev,
+ 			      node,
+@@ -754,7 +746,8 @@ static s32 _pp_qos_port_set(struct pp_qos_dev *qdev,
+ 
+ 	if (!new_port &&
+ 	    (modified & (QOS_MODIFIED_BANDWIDTH_LIMIT |
+-			 QOS_MODIFIED_SHARED_GROUP_ID)))
++			 QOS_MODIFIED_SHARED_GROUP_ID |
++			 QOS_MODIFIED_PORT_ENHANCED_WSP)))
+ 		add_suspend_port(qdev, get_port(qdev->nodes, phy));
+ 
+ 	return 0;
+@@ -3942,6 +3935,17 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 		goto max_allowed_alloc_err;
+ 	}
+ 
++	/* Allocate wsp queue list buffer + num queues placeholder */
++	cfg->wsp_queues_sz = PAGE_ALIGN((QOS_ENHANCED_WSP_MAX_QUEUES *
++					sizeof(struct wsp_queue_t)) + 4);
++	cfg->wsp_queues_ddr_virt = pp_dma_alloc(cfg->wsp_queues_sz, GFP_KERNEL,
++						&cfg->wsp_queues_ddr_phys);
++	if (unlikely(!cfg->wsp_queues_ddr_virt)) {
++		pr_err("Could not allocate %u bytes for wsp list buffer\n",
++		       (u32)cfg->wsp_queues_sz);
++		goto wsp_alloc_err;
++	}
++
+ 	cfg->api_str_buf = kzalloc(QOS_LOG_API_STR_MAX, GFP_KERNEL);
+ 	if (unlikely(!cfg->api_str_buf)) {
+ 		pr_err("Could not allocate %u bytes for api string buffer\n",
+@@ -3989,6 +3993,12 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 	kfree(cfg->api_str_buf);
+ 
+ api_str_alloc_err:
++	/* Free wsp queue list buffer */
++	pp_dma_free(cfg->wsp_queues_sz,
++		    cfg->wsp_queues_ddr_virt,
++		    &cfg->wsp_queues_ddr_phys);
++
++wsp_alloc_err:
+ 	/* Free max allowed buffer */
+ 	pp_dma_free(cfg->max_allow_sz,
+ 		    cfg->max_allow_ddr_virt,
+@@ -4037,6 +4047,13 @@ void __qos_ddr_free(struct pp_qos_dev *qdev)
+ 			    &qdev->hwconf.fw_stats_ddr_phys);
+ 	}
+ 
++	/* Free wsp queue list buffer */
++	if (qdev->hwconf.wsp_queues_ddr_virt) {
++		pp_dma_free(qdev->hwconf.wsp_queues_sz,
++			    qdev->hwconf.wsp_queues_ddr_virt,
++			    &qdev->hwconf.wsp_queues_ddr_phys);
++	}
++
+ 	/* Free max allow buffer */
+ 	if (qdev->hwconf.max_allow_ddr_virt) {
+ 		pp_dma_free(qdev->hwconf.max_allow_sz,
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
+index eab98f8a883c..ffadc99b521c 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
+@@ -3,7 +3,7 @@
+  * Description: Packet Processor QoS Driver
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2017-2019 Intel Corporation
++ * Copyright (C) 2017-2020 Intel Corporation
+  */
+ 
+ #ifndef SRC_UC_HOST_DEFS_H_
+@@ -11,12 +11,13 @@
+ 
+ /* UC version */
+ #define UC_VERSION_MAJOR (1)
+-#define UC_VERSION_MINOR (10)
+-#define UC_VERSION_BUILD (2)
++#define UC_VERSION_MINOR (11)
++#define UC_VERSION_BUILD (0)
+ 
+-#define QOS_MAX_PREDECESSORS       (6)
+-#define QOS_AQM_CONTEXT_MAX_QUEUES (8)
+-#define QOS_MAX_NUM_QUEUES         (512)
++#define QOS_MAX_PREDECESSORS        (6)
++#define QOS_AQM_CONTEXT_MAX_QUEUES  (8)
++#define QOS_ENHANCED_WSP_MAX_QUEUES (12)
++#define QOS_MAX_NUM_QUEUES          (512)
+ 
+ /**************************************************************************
+  *! @enum UC_STATUS
+@@ -587,6 +588,72 @@ struct used_nodes_s {
+ 	u32 nodes_bmap[64];
+ } __attribute__((packed));
+ 
++/**************************************************************************
++ *! \struct	wsp_queue_t
++ **************************************************************************
++ *
++ * \brief wsp queue helper in db
++ *
++ **************************************************************************/
++struct wsp_queue_t {
++#if defined(__BIG_ENDIAN_BITFIELD)
++	u32 reserved : 11,
++	    suspended : 1,
++	    rlm : 9,
++	    node_id : 11;
++#else /* Consider LE as default */
++	u32 node_id:11,
++	    rlm:9,
++	    suspended:1,
++	    reserved :11;
++#endif
++} __attribute__((packed));
++
++/**************************************************************************
++ *! \struct	wsp_stats_t
++ **************************************************************************
++ *
++ * \brief wsp helper stats
++ *
++ **************************************************************************/
++struct wsp_stats_t {
++	u32 num_timeouts;
++	u32 num_toggles;
++	u32 num_toggles_wm;
++	u32 num_iterations;
++	u32 num_iterations_wm;
++	u32 num_queues;
++} __attribute__((packed));
++
++/**************************************************************************
++ *! \struct	wsp_db_t
++ **************************************************************************
++ *
++ * \brief wsp helper db
++ *
++ **************************************************************************/
++struct wsp_db_t {
++	u32 enable:1,
++	    timeout_microseconds:8,
++	    byte_threshold:14,
++	    num_queues:9;
++	u32 timestamp;
++	struct wsp_queue_t queue[QOS_ENHANCED_WSP_MAX_QUEUES];
++	struct wsp_stats_t stats;
++} __attribute__((packed));
++
++/**************************************************************************
++ *! \struct	wsp_queues_t
++ **************************************************************************
++ *
++ * \brief wsp helper queues structure in host DB
++ *
++ **************************************************************************/
++struct wsp_queues_t {
++	u32                num_queues;
++	struct wsp_queue_t queue[QOS_ENHANCED_WSP_MAX_QUEUES];
++} __attribute__((packed));
++
+ /**************************************************************************
+  *! @enum UC_QOS_CMD
+  **************************************************************************
+@@ -634,6 +701,8 @@ enum uc_qos_command {
+ 	UC_QOS_CMD_GET_USED_NODES,
+ 	UC_QOS_CMD_SUSPEND_PORT_TREE,
+ 	UC_QOS_CMD_GET_QUANTA,
++	UC_QOS_CMD_WSP_HELPER_SET,
++	UC_QOS_CMD_WSP_HELPER_STATS_GET,
+ };
+ 
+ /**************************************************************************
+@@ -698,6 +767,7 @@ struct fw_cmd_init_qos {
+ 	u32 soc_rev; /*! SOC revision (0 - A Step, 1 - B Step) */
+ 	u32 bwl_ddr_base; /*! BWL temporary DDR base address */
+ 	u32 sbwl_ddr_base; /*! SBWL temporary DDR base address */
++	u32 wsp_queues_ddr_base; /*! WSP queues list */
+ } __attribute__((packed));
+ 
+ struct fw_cmd_port_params {
+@@ -1021,6 +1091,20 @@ struct fw_cmd_mcdma_copy {
+ 	u32 size; /*! Size in bytes */
+ } __attribute__((packed));
+ 
++struct fw_cmd_wsp_helper {
++	struct uc_qos_cmd_base base;
++	u32 db_address; /* WSP helper DB Address */
++	u32 enable; /*! Enable helper */
++	u32 timeout_microseconds; /*! timeout */
++	u32 byte_threshold; /*! threshold */
++} __attribute__((packed));
++
++struct fw_cmd_wsp_helper_stats {
++	struct uc_qos_cmd_base base;
++	u32 reset; /* Reset statistics */
++	u32 addr; /* Statistics address */
++} __attribute__((packed));
++
+ union uc_qos_cmd_s {
+ 	struct uc_qos_cmd_base           base;
+ 	struct fw_cmd_multiple_cmds      multiple_cmds;
+@@ -1061,6 +1145,8 @@ union uc_qos_cmd_s {
+ 	struct fw_cmd_suspend_port_tree  suspend_port_tree;
+ 	struct fw_cmd_add_credit_to_port add_credit_to_port;
+ 	struct fw_cmd_get_used_nodes     get_used_nodes;
++	struct fw_cmd_wsp_helper         set_wsp_helper;
++	struct fw_cmd_wsp_helper_stats   get_wsp_helper_stats;
+ } __attribute__((packed));
+ 
+ #endif /* SRC_UC_HOST_DEFS_H_ */
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index 0804bcad86a0..9b91b5759857 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -2210,6 +2210,12 @@ struct ids_container_metadata {
+ 	u32 size;
+ };
+ 
++struct wsp_container_metadata {
++	u32 next;
++	struct wsp_queue_t *info;
++	u32 size;
++};
++
+ static s32 update_ids_container(struct pp_qos_dev *qdev,
+ 				struct qos_node *node, void *data)
+ {
+@@ -2229,6 +2235,43 @@ static s32 update_ids_container(struct pp_qos_dev *qdev,
+ 	return 1;
+ }
+ 
++bool is_q_ewsp(struct pp_qos_dev *qdev, u32 id)
++{
++	struct wsp_queue_t *wsp_info;
++	u32 num_queues, idx, rlm;
++
++	num_queues = *(u32 *)qdev->hwconf.wsp_queues_ddr_virt;
++	wsp_info = (struct wsp_queue_t *)(qdev->hwconf.wsp_queues_ddr_virt + 4);
++	rlm = get_phy_from_id(qdev->rlm_mapping, id);
++
++	for (idx = 0; idx < num_queues; idx++, wsp_info++) {
++		if (rlm == wsp_info->rlm)
++			return true;
++	}
++
++	return false;
++}
++
++static s32 update_wsp_container(struct pp_qos_dev *qdev, struct qos_node *node,
++				void *data)
++{
++	struct wsp_container_metadata *wsp_info;
++	u32 phy, rlm;
++
++	wsp_info = (struct wsp_container_metadata *)data;
++	phy = get_phy_from_node(qdev->nodes, node);
++	rlm = node->data.queue.rlm;
++
++	if (wsp_info->next < wsp_info->size) {
++		wsp_info->info[wsp_info->next].node_id = phy;
++		wsp_info->info[wsp_info->next].rlm = rlm;
++		wsp_info->next++;
++		return 1;
++	} else {
++		return 0;
++	}
++}
++
+ static s32 update_bwl_buffer_node(struct pp_qos_dev *qdev,
+ 				  struct qos_node *node, void *data)
+ {
+@@ -2318,6 +2361,70 @@ void get_node_queues(struct pp_qos_dev *qdev, u32 phy, u16 *queue_ids, u32 size,
+ 					NULL, update_ids_container, &data);
+ }
+ 
++u32 get_dr_sched_id(const struct pp_qos_dev *qdev, u32 id)
++{
++	struct qos_node *node;
++	u32 phy = get_phy_from_id(qdev->mapping, id);
++	u32 port;
++
++	port = get_port(qdev->nodes, phy);
++
++	node = get_node_from_phy(qdev->nodes, port);
++
++	return node->dr_sched_id;
++}
++
++/**
++ * get_node_direct_queues() - Retrieves the node's direct queues
++ * @qdev: handle to qos device instance obtained previously from qos_dev_init
++ * @node: Parent node id
++ * @queue: Physical queue node id list
++ * @queues_num: Number of direct queus under node
++ */
++static void get_node_direct_queues(const struct pp_qos_dev *qdev,
++				   struct qos_node *node, u32 *queue,
++				   u32 *queues_num)
++{
++	u32 child_idx, child_phy, child_id;
++	u32 dr_sched_id, dr_sched_child_phy;
++	struct qos_node *child, *dr_child;
++	struct parent_node_properties *pprop;
++
++	*queues_num = 0;
++
++	pprop = &node->parent_prop;
++	for (child_idx = 0; child_idx < pprop->num_of_children; child_idx++) {
++		child_phy = pprop->first_child_phy + child_idx;
++		child = get_node_from_phy(qdev->nodes, child_phy);
++
++		/* Count direct queues + priority 7 queue under dr sced */
++		if (node_queue(child)) {
++			*queue = child_phy;
++			*queues_num = *queues_num + 1;
++			queue++;
++		} else if (node_rep(child)) {
++			/* Verify if this is dr sched */
++			child_id = get_id_from_phy(qdev->mapping, child_phy);
++			dr_sched_id = get_dr_sched_id(qdev, child_id);
++
++			/* Do not check non dr sched replica */
++			if (child_id != dr_sched_id)
++				continue;
++
++			/* Fetch queue under DR Sched if exist */
++			dr_sched_child_phy = child->parent_prop.first_child_phy;
++			dr_child = get_node_from_phy(qdev->nodes,
++						     dr_sched_child_phy);
++
++			if (node_queue(dr_child)) {
++				*queue = dr_sched_child_phy;
++				*queues_num = *queues_num + 1;
++				queue++;
++			}
++		}
++	}
++}
++
+ static s32 node_bw_limited_wrapper(const struct pp_qos_dev *qdev,
+ 				   const struct qos_node *node, void *data)
+ {
+@@ -2333,6 +2440,76 @@ static s32 queue_node_nonblocked_wrapper(const struct pp_qos_dev *qdev,
+ 		!QOS_BITS_IS_SET(node->flags, NODE_FLAGS_QUEUE_BLOCKED);
+ }
+ 
++static u32 get_wsp_position(u32 *wsp_queue_list, u32 wsp_queue_phy)
++{
++	u32 idx;
++
++	for (idx = 0; idx < MAX_WSP_CHILDREN; idx++) {
++		if (wsp_queue_list[idx] == wsp_queue_phy)
++			return idx;
++	}
++
++	return MAX_WSP_CHILDREN;
++}
++
++static bool node_dr_sched(const struct pp_qos_dev *qdev,
++			  const struct qos_node *node)
++{
++	struct qos_node *parent;
++
++	if (node_port(node))
++		return false;
++
++	parent = get_node_from_phy(qdev->nodes, node->child_prop.parent_phy);
++	if (node_rep(node) && node_port(parent))
++		return true;
++
++	return false;
++}
++
++/**
++ * @brief Check whether node should be considered as ewsp
++ */
++static s32 queue_node_wsp_wrapper(const struct pp_qos_dev *qdev,
++				  const struct qos_node *node, void *data)
++{
++	u32 phy, wsp_priority, num_high_prio_queues;
++	u32 num_wsp_children, wsp_queue_list[MAX_WSP_CHILDREN];
++	bool wsp_queue, high_prio_q = false;
++	struct qos_node *parent;
++
++	if (node_port(node))
++		return 0;
++
++	/* If replica, Accept only DR Sched since it might contain a valid q */
++	if (node_rep(node) && !node_dr_sched(qdev, node))
++		return 0;
++
++	parent = get_node_from_phy(qdev->nodes, node->child_prop.parent_phy);
++	wsp_queue = node_queue(node) &&
++		    (parent->parent_prop.arbitration == PP_QOS_ARBITRATION_WSP);
++
++	if (wsp_queue) {
++		get_node_direct_queues(qdev, parent, wsp_queue_list,
++				       &num_wsp_children);
++
++		/* Do not consider 2 lowest WSP queues as high priority since
++		 * EWSP algorithm can perform well without monitoring them
++		 */
++		if (num_wsp_children > 2) {
++			phy = get_phy_from_node(qdev->nodes, node);
++			num_high_prio_queues = num_wsp_children - 2;
++			wsp_priority = get_wsp_position(wsp_queue_list, phy);
++
++			if ((wsp_priority != MAX_WSP_CHILDREN) &&
++			    (wsp_priority < num_high_prio_queues))
++				high_prio_q = true;
++		}
++	}
++
++	return wsp_queue && high_prio_q;
++}
++
+ void update_bwl_buffer(struct pp_qos_dev *qdev, u32 phy)
+ {
+ 	volatile u32 bwl_val, sbwl_val;
+@@ -2365,6 +2542,63 @@ void get_active_port_rlms(struct pp_qos_dev *qdev, u32 phy,
+ 					      update_rlm_container, &data);
+ }
+ 
++/**
++ * @define Use only 6 high priority queues
++ */
++#define QOS_ENHANCED_WSP_MAX_QUEUES_PER_PORT 6
++
++/**
++ * @brief Traverse all enhanced WSP ports and compose a WSP queue list
++ */
++static void get_wsp_info(struct pp_qos_dev *qdev, struct wsp_queue_t *wsp_info,
++			 u32 size, u32 *queues_num)
++{
++	struct wsp_container_metadata data;
++	struct qos_node *node;
++	u32 phy;
++
++	if (unlikely(!wsp_info))
++		data.size = 0;
++
++	*queues_num = 0;
++
++	/* Iterate all ports */
++	for (phy = 0; phy < qdev->init_params.max_ports; phy++) {
++		node = get_node_from_phy(qdev->nodes, phy);
++		if (!node_enhanced_wsp_port(node))
++			continue;
++
++		if (*queues_num == size)
++			return;
++
++		data.next = 0;
++		data.info = wsp_info + *queues_num;
++		data.size = min_t(u32, QOS_ENHANCED_WSP_MAX_QUEUES_PER_PORT,
++				  size - *queues_num);
++		*queues_num +=
++			post_order_travers_tree(qdev, phy,
++						queue_node_wsp_wrapper, NULL,
++						update_wsp_container, &data);
++	}
++}
++
++void update_wsp_info(struct pp_qos_dev *qdev)
++{
++	struct wsp_queue_t *wsp_info;
++	u32 num_enahnced_wsp_queues;
++
++	wsp_info = qdev->hwconf.wsp_queues_ddr_virt + 4;
++	memset(wsp_info, 0, qdev->hwconf.wsp_queues_sz);
++	get_wsp_info(qdev, wsp_info, QOS_ENHANCED_WSP_MAX_QUEUES,
++		     &num_enahnced_wsp_queues);
++
++	qdev->ewsp_cfg.num_queues = num_enahnced_wsp_queues;
++	*(u32 *)qdev->hwconf.wsp_queues_ddr_virt = num_enahnced_wsp_queues;
++
++	pp_cache_writeback(qdev->hwconf.wsp_queues_ddr_virt,
++			   qdev->hwconf.wsp_queues_sz);
++}
++
+ static s32 update_nonblocked_count(struct pp_qos_dev *qdev,
+ 				   struct qos_node *node, void *data)
+ {
+@@ -4045,13 +4279,14 @@ static void qos_dbg_dump_subtree(struct pp_qos_dev *qdev, struct qos_node *node,
+ 					 child->child_prop.bw_weight,
+ 					 child->child_prop.virt_bw_share);
+ 
+-			QOS_DBG_PRINT(s, "%s%sQueue%s-%u(%u%s%s)-rlm-%u%s\n",
++			QOS_DBG_PRINT(s, "%s%sQueue%s-%u(%u%s%s)-rlm-%u%s%s\n",
+ 				      indent_str,
+ 				      node_syncq(child) ? "Sync-" : "",
+ 				      node_rep(child) ? "'" : "",
+ 				      node_id, child_phy,
+ 				      bw_str, weight_str,
+ 				      child->data.queue.rlm,
++				      is_q_ewsp(qdev, node_id) ? "-ewsp" : "",
+ 				      (aqm_queue || codel_queue) ?
+ 				      aqm_codel_str : "");
+ 		}
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+index b8912ef7cf1c..40ca560ab9a4 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+@@ -3,7 +3,7 @@
+  * Description: Packet Processor QoS Driver
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2017-2019 Intel Corporation
++ * Copyright (C) 2017-2020 Intel Corporation
+  */
+ #ifndef PP_QOS_UTILS_H
+ #define PP_QOS_UTILS_H
+@@ -101,8 +101,10 @@
+ #define QOS_MODIFIED_CODEL                       BIT(28)
+ #define QOS_MODIFIED_PORT_GREEN_THRESHOLD        BIT(29)
+ #define QOS_MODIFIED_PORT_YELLOW_THRESHOLD       BIT(30)
++#define QOS_MODIFIED_PORT_ENHANCED_WSP           BIT(31)
+ 
+ #define MAX_MOVING_NODES 8
++#define MAX_WSP_CHILDREN 8
+ 
+ /******************************************************************************/
+ /*                              TYPES                                         */
+@@ -134,6 +136,7 @@ struct fw_sec_info {
+  * @max_ports             Maximum supported ports
+  * @max_queues            Maximum supported queues
+  * @num_syncqs            Maximum supported sync queues (user)
++ * @enhanced_wsp          When set enhanced WSP feature is enabled
+  * @wred_prioritize_pop   set to 1 to prioritize pop
+  * @wred_total_avail_resources upper bound for the sum of bytes on all queues
+  * @wred_p_const          WRED algorithm p, used for calculating
+@@ -167,6 +170,7 @@ struct pp_qos_init_param {
+ 	u32                max_ports;
+ 	u32                max_queues;
+ 	u32                num_syncqs;
++	u32                enhanced_wsp;
+ 	u32                wred_prioritize_pop;
+ 	u32                wred_total_avail_resources;
+ 	u32                wred_p_const;
+@@ -351,6 +355,7 @@ struct qos_node {
+ 		} queue;
+ 	} data;
+ 
++<<<<<<< HEAD
+ #define NODE_FLAGS_USED                  BIT(0) /* Active node */
+ #define NODE_FLAGS_INTERNAL              BIT(1) /* Internal node */
+ #define NODE_FLAGS_QUEUE_NEW_SYNCQ       BIT(2) /* SQ allocated */
+@@ -364,6 +369,7 @@ struct qos_node {
+ #define NODE_FLAGS_QUEUE_BLOCKED         BIT(11) /* Queue is blocked */
+ #define NODE_FLAGS_QUEUE_WRED_FIXED_DROP_PROB_EN BIT(12) /* Fixed drop prob */
+ #define NODE_FLAGS_QUEUE_AQM             BIT(13) /* Connected to AQM context */
++#define NODE_FLAGS_ENHANCED_WSP          BIT(14) /* Enhanced WSP Port */
+ 	u16 flags;
+ };
+ 
+@@ -405,6 +411,9 @@ struct hw_conf {
+ 	void         *sbwl_ddr_virt;
+ 	dma_addr_t   sbwl_ddr_phys;
+ 	size_t       sbwl_sz;
++	void         *wsp_queues_ddr_virt;
++	dma_addr_t   wsp_queues_ddr_phys;
++	size_t       wsp_queues_sz;
+ 	void         *api_str_buf;
+ 	u16          *rlms_container;
+ 	u32          max_bw_limit_kbps; /* @todo remove this workaround */
+@@ -437,11 +446,18 @@ enum rlm_range {
+ 	RLM_RANGES_MAX,
+ };
+ 
++struct wsp_helper_cfg {
++	bool enable;
++	u32 timeout_microseconds;
++	u32 byte_threshold;
++	u32 num_queues;
++};
+ struct pp_qos_dev {
+ 	LOCK                           lock;
+ 	u32                            id;
+ 	bool                           initialized;
+ 	struct qos_aqm_sf_entry        sf_entry[PP_QOS_AQM_MAX_SERVICE_FLOWS];
++	struct wsp_helper_cfg          ewsp_cfg;
+ 	struct pp_qos_init_param       init_params;
+ 	struct shared_bw_group         groups[QOS_MAX_SHARED_BW_GRP + 1];
+ 	struct pp_pool                 *ids;
+@@ -664,6 +680,14 @@ static inline bool node_port(const void *_node)
+ 	return node_used(node) && (node->type == TYPE_PORT);
+ }
+ 
++static inline bool node_enhanced_wsp_port(const void *_node)
++{
++	const struct qos_node *node = (const struct qos_node *)_node;
++
++	return node_used(node) && (node->type == TYPE_PORT) &&
++	       QOS_BITS_IS_SET(node->flags, NODE_FLAGS_ENHANCED_WSP);
++}
++
+ static inline bool node_sched(const void *_node)
+ {
+ 	const struct qos_node *node = (const struct qos_node *)_node;
+@@ -1016,6 +1040,16 @@ void get_user_queues(struct pp_qos_dev *qdev, u32 phy, u16 *queue_ids, u32 size,
+  */
+ void get_node_queues(struct pp_qos_dev *qdev, u32 phy, u16 *queue_ids, u32 size,
+ 		     u32 *queues_num);
++
++/**
++ * get_dr_sched_id() - Retrieves the port's dual rate scheduler.
++ * @qdev: handle to qos device instance obtained previously from qos_dev_init
++ * @id:   Node id. Can be any id in the tree
++ *
++ * Return: dual rate scheduler ID
++ */
++u32 get_dr_sched_id(const struct pp_qos_dev *qdev, u32 id);
++
+ /**
+  * update_bwl_buffer() - Update all bw limit node values in temp
+  *        buffer
+@@ -1035,6 +1069,12 @@ void update_bwl_buffer(struct pp_qos_dev *qdev, u32 phy);
+ void get_active_port_rlms(struct pp_qos_dev *qdev, u32 phy, u16 *rlms, u32 size,
+ 			  u32 *queues_num);
+ 
++/**
++ * update_wsp_info() - Update enhanced WSP buffer
++ * @qdev:
++ */
++void update_wsp_info(struct pp_qos_dev *qdev);
++
+ /**
+  * get_num_blocked_queues() - Return ammount of non-blocked
+  * queue on subtree
+diff --git a/drivers/net/ppv4/pp-dev/pp_dts.c b/drivers/net/ppv4/pp-dev/pp_dts.c
+index a4f1b256d989..171b3ed98a44 100644
+--- a/drivers/net/ppv4/pp-dev/pp_dts.c
++++ b/drivers/net/ppv4/pp-dev/pp_dts.c
+@@ -558,6 +558,7 @@ static s32 __dts_qos_cfg(struct pp_dts_cfg *dts_cfg)
+ 
+ 	ret |= __dts_u32_param_get(pdev, np, "max-ports", &p->max_ports);
+ 	ret |= __dts_u32_param_get(pdev, np, "max-queues", &p->max_queues);
++	ret |= __dts_u32_param_get(pdev, np, "enhanced-wsp", &p->enhanced_wsp);
+ 	ret |= __dts_u32_param_get(pdev, np, "wred-prioritize-pop",
+ 				   &p->wred_prioritize_pop);
+ 	ret |= __dts_u32_param_get(pdev, np, "wred-total-resources",
+diff --git a/include/linux/pp_qos_api.h b/include/linux/pp_qos_api.h
+index b0803dd8bbc7..281160689d8d 100644
+--- a/include/linux/pp_qos_api.h
++++ b/include/linux/pp_qos_api.h
+@@ -221,6 +221,9 @@ struct pp_qos_port_conf {
+ 
+ 	/*! Egress yellow bytes threshold */
+ 	u32 yellow_threshold;
++
++	/*! Enhanced WSP operation */
++	u32 enhanced_wsp;
+ };
+ 
+ /**

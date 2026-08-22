@@ -1,0 +1,1685 @@
+From 98e63a59b5c412af2c5ffe48057cd4870d93a10d Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Sun, 29 Dec 2019 11:16:22 +0200
+Subject: [PATCH] PONRTSYS-6245: added fragmentation support
+
+---
+ drivers/net/ppv4/Makefile                          |   3 +
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |  70 +++--
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.h          |   7 +
+ drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c  |  37 +++
+ drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h  |   8 +
+ .../ppv4/pp-api/pp-port-mgr/pp_port_mgr_debugfs.c  | 108 ++++++-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 344 ++++++++++++++++-----
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.h    |  62 +++-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c | 120 ++++---
+ .../pp-session-mgr/pp_session_mgr_internal.h       |  60 +++-
+ drivers/net/ppv4/pp-dev/pp_dts.c                   |   8 +
+ drivers/net/ppv4/pp-dev/pp_fpga.c                  |   1 +
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      |   3 +-
+ drivers/net/ppv4/pp-hal/micro-controller/uc.h      |   5 +-
+ .../net/ppv4/pp-hal/micro-controller/uc_internal.h |   2 +-
+ .../net/ppv4/pp-tools/debugfs/pp_debugfs_common.c  | 196 ++++++++++++
+ .../debugfs}/pp_debugfs_common.h                   |  76 ++++-
+ 17 files changed, 948 insertions(+), 162 deletions(-)
+
+diff --git a/drivers/net/ppv4/Makefile b/drivers/net/ppv4/Makefile
+index cc06a8514db1..ea1a400568d4 100644
+--- a/drivers/net/ppv4/Makefile
++++ b/drivers/net/ppv4/Makefile
+@@ -20,6 +20,7 @@ ccflags-y += -I$(src)/pp-dev
+ ccflags-y += -I$(src)/pp-tools/logger
+ ccflags-y += -I$(src)/pp-tools/unit-test
+ ccflags-y += -I$(src)/pp-tools/elf-parser
++ccflags-y += -I$(src)/pp-tools/debugfs
+ # HAL
+ ccflags-y += -I$(src)/pp-hal/infra
+ ccflags-y += -I$(src)/pp-hal/session-info
+@@ -65,6 +66,8 @@ $(TARGET)-$(CONFIG_DEBUG_FS) += pp-tools/init/pp_init_sequence_debugfs.o
+ endif
+ # PP elf parser
+ $(TARGET)-y += pp-tools/elf-parser/elf_parser.o
++# PP common debugfs
++$(TARGET)-y += pp-tools/debugfs/pp_debugfs_common.o
+ 
+ ### HAL ###
+ # PP infra
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 493f7716d881..7a6609fbc3d8 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -40,6 +40,9 @@ struct pp_misc_db {
+ 	/*! misc driver stats */
+ 	struct misc_stats  stats;
+ 
++	/*! network functions enabled bitmap */
++	ulong              nf_en;
++
+ 	/*! network functions */
+ 	struct pp_nf_info  nf[PP_NF_NUM];
+ 
+@@ -251,16 +254,8 @@ s32 pp_nf_set(enum pp_nf_type type, struct pp_nf_info *nf)
+ 		goto out;
+ 	}
+ 
+-	if (type == PP_NF_REASSEMBLY) {
+-		ret = smgr_reassembly_en_set(true);
+-		if (unlikely(ret)) {
+-			pr_err("Failed to enable reassembly sessions, ret %d\n",
+-			       ret);
+-			return ret;
+-		}
+-	}
+-
+ 	/* store nf info */
++	set_bit(type, &db->nf_en);
+ 	memcpy(&db->nf[type], nf, sizeof(*nf));
+ 
+ out:
+@@ -287,6 +282,11 @@ s32 pp_nf_get(enum pp_nf_type type, struct pp_nf_info *nf)
+ }
+ EXPORT_SYMBOL(pp_nf_get);
+ 
++bool pp_misc_is_nf_en(enum pp_nf_type nf)
++{
++	return test_bit(nf, &db->nf_en);
++}
++
+ struct pp_desc *pp_pkt_desc_get(struct sk_buff *skb)
+ {
+ 	if (unlikely(!pp_is_ready()))
+@@ -529,6 +529,8 @@ s32 pp_global_stats_diff(void *pre, u32 num_pre, void *post, u32 num_post,
+ 			&__delta->mcast_stats);
+ 	U64_STRUCT_DIFF(&__pre->reass_stats, &__post->reass_stats,
+ 			&__delta->reass_stats);
++	U64_STRUCT_DIFF(&__pre->frag_stats, &__post->frag_stats,
++			&__delta->frag_stats);
+ 
+ 	return 0;
+ }
+@@ -595,6 +597,12 @@ s32 pp_global_stats_get(void *stats, u32 num_stats, void *data)
+ 		return ret;
+ 	}
+ 
++	ret = pp_smgr_frag_stats_get(&__stats->frag_stats);
++	if (unlikely(ret)) {
++		pr_err("pp_smgr_frag_stats_get failed\n");
++		return ret;
++	}
++
+ 	ret = smgr_sq_dbg_stats_get(&__stats->syncq_stats, false);
+ 	if (unlikely(ret)) {
+ 		pr_err("smgr_sq_dbg_stats_get failed\n");
+@@ -792,6 +800,7 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	struct pp_qos_stats         *qos;
+ 	struct smgr_mcast_pkt_stats *mcast;
+ 	struct smgr_reass_stats     *reass;
++	struct smgr_frag_stats      *frag;
+ 
+ 	if (unlikely(ptr_is_null(buf) || ptr_is_null(n) || ptr_is_null(stats)))
+ 		return -EINVAL;
+@@ -806,6 +815,7 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	qos       = &st->qos_stats;
+ 	mcast     = &st->mcast_stats;
+ 	reass     = &st->reass_stats;
++	frag      = &st->frag_stats;
+ 
+ 	/* prints all statistics */
+ 	pr_buf(buf, sz, *n,
+@@ -861,37 +871,37 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		   "+---------------------------+-------------------------+----------------------+------------------------+\n");
+ 
+ 	pr_buf_cat(buf, sz, *n,
+-		   "+---------------------------+-------------------------+\n");
++		   "+---------------------------+-------------------------+-------------------------+\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "| Multicast                 | Reassembly              |\n");
++		   "| Multicast                 | Reassembly              | Fragmentation           |\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "+---------------------------+-------------------------+\n");
++		   "+---------------------------+-------------------------+-------------------------+\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "| Rx            %10llu  | Rx          %10llu  |\n",
+-		   mcast->rx, reass->rx_pkts);
++		   "| Rx            %10llu  | Rx          %10llu  | Rx          %10llu  |\n",
++		   mcast->rx, reass->rx_pkts, frag->rx_pkt);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "| Tx            %10llu  | Tx          %10llu  |\n",
+-		   mcast->tx, reass->tx_pkts);
++		   "| Tx            %10llu  | Tx          %10llu  | Tx          %10llu  |\n",
++		   mcast->tx, reass->tx_pkts, frag->tx_pkt);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "| Drop          %10llu  | Drop        %10llu  |\n",
+-		   mcast->drop, reass->dropped_pkts);
++		   "| Drop          %10llu  | Drop        %10llu  | Drop        %10llu  |\n",
++		   mcast->drop, reass->dropped_pkts, frag->total_drops);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Reassembled %10llu  |\n",
+-		   reass->reassembled_pkts);
++		   "|                           | Reassembled %10llu  | bmgr drops  %10llu  |\n",
++		   reass->reassembled_pkts, frag->bmgr_drops);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Accelerated %10llu  |\n",
+-		   reass->accelerated_pkts);
++		   "|                           | Accelerated %10llu  | df drops    %10llu  |\n",
++		   reass->accelerated_pkts, frag->df_drops);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Diverted    %10llu  |\n",
+-		   reass->diverted_pkts);
++		   "|                           | Diverted    %10llu  | max frags dr%10llu  |\n",
++		   reass->diverted_pkts, frag->max_frags_drops);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Starvation  %10llu  |\n",
++		   "|                           | Starvation  %10llu  |                         |\n",
+ 		   reass->starvation_pkts);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Errors      %10llu  |\n",
++		   "|                           | Errors      %10llu  |                         |\n",
+ 		   reass->errors);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "+---------------------------+-------------------------+\n\n");
++		   "+---------------------------+-------------------------+-------------------------+\n\n");
+ 
+ 	return 0;
+ }
+@@ -910,6 +920,7 @@ s32 pp_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	struct pp_qos_stats         *qos;
+ 	struct smgr_mcast_pkt_stats *mcast;
+ 	struct smgr_sq_stats        *syncq;
++	struct smgr_frag_stats      *frag;
+ 
+ 	if (unlikely(ptr_is_null(buf) || ptr_is_null(n) || ptr_is_null(stats)))
+ 		return -EINVAL;
+@@ -924,6 +935,7 @@ s32 pp_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	qos       = &st->qos_stats;
+ 	mcast     = &st->mcast_stats;
+ 	syncq     = &st->syncq_stats;
++	frag      = &st->frag_stats;
+ 
+ 	/* prints all statistics */
+ 	pr_buf(buf, sz, *n,
+@@ -951,9 +963,9 @@ s32 pp_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "+---------------------------+----------------------+---------------------------+----------------------+\n");
+-	pr_buf_cat(buf, sz, *n, "| %-25s | %-20u | %-25s | %-20s |\n",
++	pr_buf_cat(buf, sz, *n, "| %-25s | %-20u | %-25s | %-20llu |\n",
+ 		   "Accelerated Packets", chk->accelerated_pkts,
+-		   "Fragmented Packets", "TBD");
++		   "TX Fragmented Packets", frag->tx_pkt);
+ 	pr_buf_cat(buf, sz, *n, "| %-25s | %-20u | %-25s | %-20u |\n",
+ 		   "Non-Accelerated Packets",
+ 		   chk->pkts_rcvd_from_cls - chk->accelerated_pkts,
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+index d9282d73a706..5f8608c1753f 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+@@ -76,6 +76,7 @@ struct pp_global_stats {
+ 	struct smgr_mcast_pkt_stats mcast_stats;
+ 	struct smgr_sq_stats        syncq_stats;
+ 	struct smgr_reass_stats     reass_stats;
++	struct smgr_frag_stats      frag_stats;
+ };
+ 
+ /**
+@@ -188,6 +189,12 @@ s32 pp_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ s32 pp_driver_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 			 u32 num_stats, void *data);
+ 
++/**
++ * @brief Is nf enabled
++ * @return True if nf is enabled, False otherwise
++ */
++bool pp_misc_is_nf_en(enum pp_nf_type nf);
++
+ #endif /* CONFIG_PHY_INTEL_COMBO_LGM */
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c
+index c1ef9ff4c7e8..a9278b46d75c 100644
+--- a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.c
+@@ -320,6 +320,36 @@ s32 pp_port_tx_policy_info_get(u16 pid, u8 *base_policy, u8 *policies_map)
+ 	return ret;
+ }
+ 
++s32 pp_port_tx_max_pkt_size_get(u16 pid, u16 *max_size)
++{
++	s32 ret = 0;
++
++	if (unlikely(ptr_is_null(max_size)))
++		return -EINVAL;
++
++	/* Check if port is valid */
++	if (unlikely(!__pp_is_port_valid(pid))) {
++		db->stats.port_invalid_err++;
++		return -ECHRNG;
++	}
++
++	spin_lock_bh(&db->port_lock);
++	/* Check if requested port is active */
++	if (unlikely(!__pmgr_port_is_active(pid))) {
++		/* Port is not active */
++		pr_err("PP Port is not active, %hu\n", pid);
++		db->stats.port_inact_err++;
++		ret = -ENODEV;
++		goto unlock_out;
++	}
++
++	*max_size = db->port[pid].cfg.tx.max_pkt_size;
++
++unlock_out:
++	spin_unlock_bh(&db->port_lock);
++	return ret;
++}
++
+ s32 pp_port_rx_policy_info_get(u16 pid, u8 *policies_map)
+ {
+ 	s32 ret = 0;
+@@ -1088,6 +1118,13 @@ static s32 __pmgr_port_tx_cfg_set(u16 pid, struct pp_port_tx_info *tx)
+ 		db->stats.port_tx_cfg_err++;
+ 	}
+ 
++	ret = chk_mtu_set(pid, tx->max_pkt_size);
++	if (unlikely(ret)) {
++		pr_err("PP Port mtu set failed, port %hu\n", pid);
++		db->stats.hal_err++;
++		db->stats.port_tx_cfg_err++;
++	}
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h
+index bd9ef8cd9609..0f0bfc4531ed 100644
+--- a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr.h
+@@ -114,6 +114,14 @@ s32 pmgr_hostif_dflt_set(struct pp_hif_datapath *dp, bool dbg_en);
+  */
+ s32 pp_port_tx_policy_info_get(u16 pid, u8 *base_policy, u8 *policies_map);
+ 
++/**
++ * @brief get port's max packet size
++ * @param pid pp port index (GPID)
++ * @param max_size buffer to save the max packet size
++ * @return s32 0 on success, error code otherwise
++ */
++s32 pp_port_tx_max_pkt_size_get(u16 pid, u16 *max_size);
++
+ /**
+  * @brief get port rx policies info
+  * @param pid pp port index (GPID)
+diff --git a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_debugfs.c
+index 064653082ed0..4816b91b4947 100644
+--- a/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-port-mgr/pp_port_mgr_debugfs.c
+@@ -332,6 +332,111 @@ void __pmgr_dbg_port_cfg_show(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(port_cfg, __pmgr_dbg_port_cfg_show, NULL);
+ 
++static u16 create_port_props(struct pp_dbg_prop *props, u16 size,
++			     u32 *id, struct pp_port_cfg *pconf)
++{
++	u16 num = 0;
++
++	pp_dbg_add_prop(props, &num, size, "id",
++			"id. Must exist as the first property!", id,
++			sizeof(*id));
++	pp_dbg_add_prop(props, &num, size, "max_pkt", "Max packet size",
++			&pconf->tx.max_pkt_size,
++			sizeof(pconf->tx.max_pkt_size));
++	pp_dbg_add_prop(props, &num, size, "hr", "Headroom size",
++			&pconf->tx.headroom_size,
++			sizeof(pconf->tx.headroom_size));
++	pp_dbg_add_prop(props, &num, size, "tr", "Tailroom size",
++			&pconf->tx.tailroom_size,
++			sizeof(pconf->tx.tailroom_size));
++	pp_dbg_add_prop(props, &num, size, "min_pkt",
++			"min pkt len (0 - None, 1 - 60B , 2 - 64B, 3 - 128B)",
++			&pconf->tx.min_pkt_len,
++			sizeof(pconf->tx.min_pkt_len));
++	pp_dbg_add_prop(props, &num, size, "base_policy", "Base policy",
++			&pconf->tx.base_policy,
++			sizeof(pconf->tx.base_policy));
++	pp_dbg_add_prop(props, &num, size, "policies_map", "Policies map",
++			&pconf->tx.policies_map,
++			sizeof(pconf->tx.policies_map));
++	pp_dbg_add_prop(props, &num, size, "pkt_only_en", "Pkt only en",
++			&pconf->tx.pkt_only_en,
++			sizeof(pconf->tx.pkt_only_en));
++	pp_dbg_add_prop(props, &num, size, "seg_en", "Segmentation en",
++			&pconf->tx.seg_en,
++			sizeof(pconf->tx.seg_en));
++	pp_dbg_add_prop(props, &num, size, "prel2_en", "Prel2 en",
++			&pconf->tx.prel2_en,
++			sizeof(pconf->tx.prel2_en));
++
++	return num;
++}
++
++static s32 port_first_prop_cb(char *field, u32 val, void *user_data)
++{
++	/* Make sure first property is the port id */
++	if (strncmp(field, "id", strlen("id"))) {
++		pr_err("First prop (%s) must be id\n", field);
++		return -EINVAL;
++	}
++
++	if (pp_port_get(val, (struct pp_port_cfg *)user_data) != 0) {
++		pr_err("pp_port_get failed (id %u)", val);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++static s32 port_done_props_cb(u32 val, void *user_data)
++{
++	if (pp_port_update(val, (struct pp_port_cfg *)user_data) != 0) {
++		pr_err("pp_port_update failed (id %u)", val);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++void ports_cfg_set(char *cmd_buf, void *data)
++{
++	struct pp_port_cfg conf;
++	struct pp_dbg_props_cbs cbs = {port_first_prop_cb, port_done_props_cb};
++	u32 id = UINT_MAX;
++	u16 num_props;
++	struct pp_dbg_prop *props;
++
++	props = kmalloc_array(DBG_MAX_PROPS, sizeof(struct pp_dbg_prop),
++			      GFP_KERNEL | __GFP_ZERO);
++	if (!props)
++		return;
++
++	num_props = create_port_props(props, DBG_MAX_PROPS, &id, &conf);
++	pp_dbg_props_set(cmd_buf, &cbs, props, num_props, &conf);
++	kfree(props);
++}
++
++void ports_cfg_help(struct seq_file *f)
++{
++	struct pp_port_cfg conf;
++	const char *name = "set port cfg";
++	const char *format = "echo id=[port_id] [field]=[value]... > config";
++	struct pp_dbg_prop *props;
++	u16 num_props;
++	u32 id = UINT_MAX;
++
++	props = kmalloc_array(DBG_MAX_PROPS, sizeof(struct pp_dbg_prop),
++			      GFP_KERNEL);
++	if (!props)
++		return;
++
++	num_props = create_port_props(props, DBG_MAX_PROPS, &id, &conf);
++	pp_dbg_props_help(f, name, format, props, num_props);
++	kfree(props);
++}
++
++PP_DEFINE_DEBUGFS(ports_cfg, ports_cfg_help, ports_cfg_set);
++
+ /**
+  * @brief Debugfs port stat show API, prints port stats
+  */
+@@ -455,7 +560,8 @@ static struct debugfs_file port_debugfs_files[] = {
+ static struct debugfs_file ports_debugfs_files[] = {
+ 	{ "stats", &PP_DEBUGFS_FOPS(ports_stats) },
+ 	{ "pps", &PP_DEBUGFS_FOPS(ports_pps) },
+-	{ "add", &PP_DEBUGFS_FOPS(port_add) }
++	{ "add", &PP_DEBUGFS_FOPS(port_add) },
++	{ "config", &PP_DEBUGFS_FOPS(ports_cfg) },
+ };
+ 
+ static struct debugfs_file dp_debugfs_files[] = {
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 37d9fc6d1f00..2f423a7f4325 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -39,6 +39,7 @@
+ #include "pp_port_mgr.h"
+ #include "pp_session_mgr.h"
+ #include "pp_session_mgr_internal.h"
++#include "pp_misc.h"
+ 
+ /**
+  * @struct base_args
+@@ -244,7 +245,6 @@ enum inact_scan_state {
+  * @inact_map_sz inactive bitmap size in bytes
+  * @scan_state inactive sessions scan state
+  * @state session manager state, disable/enable
+- * @reassembly_en specify if reassembly and fragments acceleration is enabled
+  * @free_list free session list head
+  * @sessions sessions array
+  * @stats session manager statistics
+@@ -266,7 +266,6 @@ struct smgr_database {
+ 	size_t      inact_bmap_sz;
+ 	enum inact_scan_state    scan_state;
+ 	enum smgr_state          state;
+-	bool                     reassembly_en;
+ 	struct list_head         free_list;
+ 	struct sess_db_entry    *sessions;
+ 	struct smgr_stats        stats;
+@@ -275,6 +274,7 @@ struct smgr_database {
+ 	struct kmem_cache       *work_args_cache;
+ 	struct workqueue_struct *workq;
+ 	struct workqueue_struct *workq_hi;
++	enum smgr_frag_mode     frag_mode;
+ };
+ 
+ /* functions declarations */
+@@ -631,6 +631,46 @@ static inline bool __smgr_is_ipv6_opt_outer_changed(struct sess_info *sess)
+ 	return false;
+ }
+ 
++/**
++ * @brief Check whether a session is pppoe encapsulation or not
++ * @param sess the session to test
++ * @return bool true if it is, false otherwise
++ */
++static inline bool __smgr_is_pppoe_encap(struct sess_info *sess)
++{
++	/* is pppoe header was added on the outer packet */
++	if (!(SESS_INGRS_OUTER_BMAP(sess) & FV_L2_PPPOE) &&
++	    (SESS_EGRS_OUTER_BMAP(sess) & FV_L2_PPPOE))
++		return true;
++
++	if (!(SESS_INGRS_INNER_BMAP(sess) & FV_L2_PPPOE) &&
++	    (SESS_EGRS_INNER_BMAP(sess) & FV_L2_PPPOE))
++		return true;
++
++	return false;
++}
++
++/**
++ * @brief Check whether a session inner pppoe has been
++ *        added/removed/changed
++ * @param sess the session to test
++ * @return bool true if it is, false otherwise
++ */
++static inline bool __smgr_is_inner_pppoe_changed(struct sess_info *sess)
++{
++	/* pppoe header was added or removed? */
++	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L2_PPPOE) !=
++	    (SESS_EGRS_INNER_BMAP(sess)  & FV_L2_PPPOE))
++		return true;
++
++	/* pppoe session id changed? */
++	if (SESS_INGRS_INNER_L2(sess).pppoe_id !=
++	    SESS_EGRS_INNER_L2(sess).pppoe_id)
++		return true;
++
++	return false;
++}
++
+ /**
+  * @brief Test whether fragments can be supported for the session
+  * @param sess the session
+@@ -651,17 +691,43 @@ static inline bool __smgr_is_frag_supported(struct sess_info *sess)
+ 	if ((SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+ 	    !(SESS_EGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST)) {
+ 		/* supported only if reassembly NF is enabled */
+-		return db->reassembly_en;
++		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+ 	}
+ 
+ 	/* inner reassembly */
+ 	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+ 	    !(SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)) {
+ 		/* supported only if reassembly NF is enabled */
+-		return db->reassembly_en;
++		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+ 	}
+ 
+-	/* @todo add fragmentation cases here */
++	/* outer fragmentation with tunnel encapsulation */
++	if (!(SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST) &&
++	    (SESS_EGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST)) {
++		/* Tunnel encapsulation */
++		if (!SESS_INGRS_TUNN_BMAP(sess) && SESS_EGRS_TUNN_BMAP(sess))
++			/* supported only if frag NF is enabled */
++			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
++
++		/* PPPoE encapsulation */
++		if (__smgr_is_pppoe_encap(sess))
++			/* supported only if frag NF is enabled */
++			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
++	}
++
++	/* inner fragmentation with tunnel encapsulation */
++	if (!(SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) &&
++	    (SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)) {
++		/* Tunnel encapsulation */
++		if (!SESS_INGRS_TUNN_BMAP(sess) && SESS_EGRS_TUNN_BMAP(sess))
++			/* supported only if frag NF is enabled */
++			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
++
++		/* PPPoE encapsulation */
++		if (__smgr_is_pppoe_encap(sess))
++			/* supported only if frag NF is enabled */
++			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
++	}
+ 
+ 	return false;
+ }
+@@ -972,45 +1038,6 @@ static inline bool __smgr_is_outer_l2_changed(struct sess_info *sess)
+ 	       __smgr_is_outer_pppoe_changed(sess);
+ }
+ 
+-/**
+- * @brief Check whether a session is pppoe encapsulation or not
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_pppoe_encap(struct sess_info *sess)
+-{
+-	/* is pppoe header was added on the outer packet */
+-	if (!(SESS_INGRS_OUTER_BMAP(sess) & FV_L2_PPPOE) &&
+-	    (SESS_EGRS_OUTER_BMAP(sess) & FV_L2_PPPOE))
+-		return true;
+-
+-	if (!(SESS_INGRS_INNER_BMAP(sess) & FV_L2_PPPOE) &&
+-	    (SESS_EGRS_INNER_BMAP(sess) & FV_L2_PPPOE))
+-		return true;
+-
+-	return false;
+-}
+-
+-/**
+- * @brief Check whether a session inner pppoe has been
+- *        added/removed/changed
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_inner_pppoe_changed(struct sess_info *sess)
+-{
+-	/* pppoe header was added or removed? */
+-	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L2_PPPOE) !=
+-	    (SESS_EGRS_INNER_BMAP(sess)  & FV_L2_PPPOE))
+-		return true;
+-	/* pppoe session id changed? */
+-	if (SESS_INGRS_INNER_L2(sess).pppoe_id !=
+-	    SESS_EGRS_INNER_L2(sess).pppoe_id)
+-		return true;
+-
+-	return false;
+-}
+-
+ /**
+  * @brief Check whether a session nat packets are ipv4, the nat
+  *        packets are the packets that needs to compare for doing the
+@@ -1707,34 +1734,49 @@ s32 pp_smgr_reassembly_stats_get(struct smgr_reass_stats *stats)
+ 	return 0;
+ }
+ 
+-s32 smgr_reassembly_en_get(bool *en)
++s32 smgr_frag_uc_cpu_stats_get(u32 cid, struct smgr_frag_uc_cpu_stats *stats)
+ {
+-	if (unlikely(!pp_is_ready()))
+-		return -EPERM;
+-
+-	if (unlikely(ptr_is_null(en)))
++	if (unlikely(ptr_is_null(stats)))
+ 		return -EINVAL;
+ 
+-	*en = db->reassembly_en;
+-	return 0;
+-}
++	if (unlikely(!uc_is_cpu_active(UC_IS_EGR, cid)))
++		return -EPERM;
+ 
+-#endif
++	/* send command */
++	return uc_egr_mbox_cmd_send(UC_CMD_FRAG_STATS, cid, stats,
++				    sizeof(*stats));
++}
+ 
+-s32 smgr_reassembly_en_set(bool en)
++s32 pp_smgr_frag_stats_get(struct smgr_frag_stats *stats)
+ {
+-	if (unlikely(!pp_is_ready()))
+-		return -EPERM;
++	struct smgr_frag_uc_cpu_stats cpu_stats;
++	s32 ret;
++	u32 i;
+ 
+-	__smgr_lock();
+-	db->reassembly_en = en;
+-	__smgr_unlock();
+-	pr_debug("PP Session Manager fragments acceleration %s\n",
+-		 BOOL2STR(en));
++	for (i = 0; i < UC_CPUS_MAX; i++) {
++		if (!uc_is_cpu_active(UC_IS_EGR, i))
++			continue;
++
++		ret = smgr_frag_uc_cpu_stats_get(i, &cpu_stats);
++		if (unlikely(ret)) {
++			pr_err("failed to get frag uc cpu %u counters\n", i);
++			return ret;
++		}
++		stats->rx_pkt            += cpu_stats.rx_pkt;
++		stats->tx_pkt            += cpu_stats.tx_pkt;
++		stats->total_drops       += cpu_stats.total_drops;
++		stats->bmgr_drops        += cpu_stats.bmgr_drops;
++		stats->df_drops          += cpu_stats.df_drops;
++		stats->max_frags_drops   += cpu_stats.max_frags_drops;
++		stats->reserved1         += cpu_stats.reserved1;
++		stats->reserved2         += cpu_stats.reserved2;
++	}
+ 
+ 	return 0;
+ }
+ 
++#endif
++
+ /* ========================================================================== */
+ /*                               Session Create                               */
+ /* ========================================================================== */
+@@ -2231,8 +2273,15 @@ static void __smgr_sess_flags_set(struct sess_info *sess)
+ 	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_SYNCQ_BIT))
+ 		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_SYNCQ);
+ 
+-	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_MTU_CHCK_BIT))
+-		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_MTU_CHCK);
++	/* Fragmentation should be potentialy done when adding a tunnel */
++	if (pp_misc_is_nf_en(PP_NF_FRAGMENTER)) {
++		if ((!SESS_INGRS_TUNN_BMAP(sess) &&
++		     SESS_EGRS_TUNN_BMAP(sess)) ||
++		    (__smgr_is_pppoe_encap(sess))) {
++			SESS_FLAG_SET(sess->db_ent, SESS_FLAG_MTU_CHCK);
++			pr_debug("SESS_FLAG_MTU_CHCK is set\n");
++		}
++	}
+ 
+ 	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_MCAST_GRP_BIT))
+ 		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_MCAST_GRP);
+@@ -2520,11 +2569,107 @@ static void __smgr_si_newhdr_set(struct sess_info *sess)
+ 		__smgr_newhdr_ipv4_update(sess);
+ }
+ 
++/**
++ * @brief Checks if the fragmentation was added to the inner egress packet
++ * @param sess the session
++ */
++static bool __smgr_is_inner_frag_egress(struct sess_info *sess)
++{
++	if (SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)
++		return true;
++
++	return false;
++}
++
++/**
++ * @brief Set the frag info in SI UD
++ * @param sess the session
++ */
++static s32 __smgr_frag_si_ud_set(struct sess_info *sess)
++{
++	struct si_ud_frag_info    frag_info = {0};
++	struct pp_nf_info         nf_info;
++	u16                       phys_q;
++	s32                       ret = 0;
++
++	/* No need to set frag info */
++	if (!test_bit(SESS_FLAG_MTU_CHCK, &sess->db_ent->info.flags))
++		return 0;
++
++	if (sess->args->ud_sz) {
++		pr_err("Non zero UD size is not supported\n");
++		return -EINVAL;
++	}
++
++	sess->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
++
++	/* Set relevant flag bits for the uc */
++	if (test_bit(PP_SESS_FLAG_IGNORE_INT_DFRAG_BIT, &sess->args->flags))
++		frag_info.flags = FRAG_INFO_FLAG_IGNORE_INT_DF;
++	if (test_bit(PP_SESS_FLAG_IGNORE_EXT_DFRAG_BIT, &sess->args->flags))
++		frag_info.flags |= FRAG_INFO_FLAG_IGNORE_EXT_DF;
++	if (!__smgr_is_inner_frag_egress(sess))
++		frag_info.flags |= FRAG_INFO_FLAG_FRAG_EXT;
++
++	frag_info.dst_q = sess->si.dst_q;
++
++	if (db->frag_mode == SMGR_FRAG_MODE_CHECK_MTU_IN_UC) {
++		ret = pp_nf_get(PP_NF_FRAGMENTER, &nf_info);
++		if (unlikely(ret)) {
++			pr_err("pp_nf_get err %d\n", ret);
++			return ret;
++		}
++
++		ret = __smgr_get_queue_phy_id(nf_info.q, &phys_q);
++		if (unlikely(ret)) {
++			pr_err("__smgr_get_queue_phy_id err %d\n", ret);
++			return ret;
++		}
++
++		sess->si.dst_q = phys_q;
++	}
++
++	/* Update l3 offset.
++	 * In case of inner frag, take the offset from the learning
++	 */
++	if (frag_info.flags & FRAG_INFO_FLAG_FRAG_EXT) {
++		frag_info.l3_off = sess->si.dpu.nhdr_l3_off;
++		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess))) {
++			frag_info.flags |= FRAG_INFO_FLAG_IPV4;
++			if (SESS_EGRS_OUTER_L3(sess).v4.frag_off & htons(IP_DF))
++				frag_info.flags |= FRAG_INFO_FLAG_EXT_DF;
++		}
++	} else {
++		frag_info.l3_off = SESS_EGRS_INNER_OFFSETS(sess).l3;
++		if (__smgr_is_ipv4_pkt(SESS_EGRS_INNER_BMAP(sess))) {
++			frag_info.flags |= FRAG_INFO_FLAG_IPV4;
++			if (SESS_EGRS_INNER_L3(sess).v4.frag_off & htons(IP_DF))
++				frag_info.flags |= FRAG_INFO_FLAG_INT_DF;
++		}
++	}
++
++	ret = pp_port_tx_max_pkt_size_get(sess->args->eg_port,
++					  &frag_info.max_pkt_size);
++	if (unlikely(ret)) {
++		pr_err("pp_port_tx_max_pkt_size_get err %d\n", ret);
++		return ret;
++	}
++
++	pr_debug("flags %#x, q %d (%d), max_pkt_size %d, l3_off %d\n",
++		 frag_info.flags, frag_info.dst_q, sess->si.dst_q,
++		 frag_info.max_pkt_size, frag_info.l3_off);
++
++	memcpy(sess->si.ud + PP_PS_REGION_SZ, &frag_info, sizeof(frag_info));
++	sess->si.si_ud_sz = PP_PS_REGION_SZ + sizeof(frag_info);
++
++	return ret;
++}
++
+ /**
+  * @brief Set the UD info into the session si
+  * @param sess the session
+  */
+-static void __smgr_si_ud_set(struct sess_info *sess)
++static s32 __smgr_si_ud_set(struct sess_info *sess)
+ {
+ 	if (sess->args->ps_off < PP_INVALID_PS_OFF)
+ 		sess->si.ps_off = sess->args->ps_off;
+@@ -2539,10 +2684,12 @@ static void __smgr_si_ud_set(struct sess_info *sess)
+ 	/* if this is a session for fragments, make sure UD will be copied
+ 	 * for the egress UC
+ 	 */
+-	if (SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST ||
+-	    SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) {
+-		sess->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
+-		sess->si.ps_copy = true;
++	if (SESS_INGRS_PKT(sess)) {
++		if (SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST ||
++		    SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) {
++			sess->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
++			sess->si.ps_copy = true;
++		}
+ 	} else {
+ 		sess->si.tmpl_ud_sz = sess->args->tmp_ud_sz;
+ 		sess->si.ps_copy =
+@@ -2555,6 +2702,8 @@ static void __smgr_si_ud_set(struct sess_info *sess)
+ 	if (sess->args->ud_sz)
+ 		memcpy(sess->si.ud + sess->args->ps_sz, sess->args->ud,
+ 		       sess->args->ud_sz);
++
++	return 0;
+ }
+ 
+ /**
+@@ -2612,6 +2761,14 @@ static void __smgr_si_flags_set(struct sess_info *sess)
+ 		pr_info("Session mtu check flag is not supported\n");
+ //		set_bit(SI_CHCK_FLAG_DVRT_MTU_OVFL, &chck_flags);
+ 
++	if (!SESS_INGRS_PKT(sess) || !SESS_EGRS_PKT(sess))
++		goto set_checker_flags;
++
++	if (test_bit(SESS_FLAG_MTU_CHCK, &sess->db_ent->info.flags)) {
++		if (db->frag_mode == SMGR_FRAG_MODE_CHECK_MTU_IN_CHECKER)
++			set_bit(SI_CHCK_FLAG_DVRT_MTU_OVFL, &chck_flags);
++	}
++
+ 	/* set reassembly flags */
+ 	if (SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST ||
+ 	    SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)
+@@ -2635,6 +2792,7 @@ static void __smgr_si_flags_set(struct sess_info *sess)
+ 		sess->si.int_reassembly = true;
+ 	}
+ 
++set_checker_flags:
+ 	/* save flags in the si */
+ 	sess->si.chck_flags = (u16)chck_flags;
+ }
+@@ -2742,6 +2900,36 @@ static s32 __smgr_si_mod_info_set(struct sess_info *sess)
+ 	return ret;
+ }
+ 
++/**
++* __smgr_si_df_mask_set() - Sets dont frag mask info
++* @si: Session information
++* @flags: User flags
++*
++* The function configures the DF mask bits according to the user input.
++* In frag mode checker, we want to mask the internal DF,
++* so that the checker will divert the packets to the uc anyway.
++* In that case, fragmenter uc can check where to fragment based on
++* the learning output.
++* The real value from the user is copied to the SI UD in both modes
++*
++* Return: 0 on Success.
++*/
++static s32 __smgr_si_df_mask_set(struct pp_si *si, unsigned long flags)
++{
++	u32 int_df_mask = 1;
++
++	si->ext_df_mask = test_bit(PP_SESS_FLAG_IGNORE_EXT_DFRAG_BIT, &flags);
++
++	if (db->frag_mode == SMGR_FRAG_MODE_CHECK_MTU_IN_UC) {
++		int_df_mask = test_bit(PP_SESS_FLAG_IGNORE_INT_DFRAG_BIT,
++				       &flags);
++	}
++
++	si->int_df_mask = int_df_mask;
++
++	return 0;
++}
++
+ /**
+  * @brief Create an si structure for the HW based on the specified
+  *        session
+@@ -2773,14 +2961,13 @@ static s32 __smgr_si_create(struct sess_info *sess)
+ 	if (unlikely(ret))
+ 		goto done;
+ 	ret = __smgr_si_mod_info_set(sess);
++	if (unlikely(ret))
++		goto done;
++	ret = __smgr_si_df_mask_set(si, args->flags);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+ 	si->color       = args->color;
+-	si->ext_df_mask = test_bit(PP_SESS_FLAG_IGNORE_EXT_DFRAG_BIT,
+-				   &args->flags);
+-	si->int_df_mask = test_bit(PP_SESS_FLAG_IGNORE_INT_DFRAG_BIT,
+-				   &args->flags);
+ 	si->fsqm_prio   = args->fsqm_prio;
+ 	si->bce_ext     = false; /* not supported in PPv4 */
+ 	si->trim_l3_id  = SI_NO_TRIM_VALUE;
+@@ -2789,7 +2976,15 @@ static s32 __smgr_si_create(struct sess_info *sess)
+ 		si->tdox_flow = args->lro_info;
+ 
+ 	__smgr_si_flags_set(sess);
+-	__smgr_si_ud_set(sess);
++
++	ret = __smgr_si_ud_set(sess);
++	if (unlikely(ret))
++		goto done;
++
++	ret = __smgr_frag_si_ud_set(sess);
++	if (unlikely(ret))
++		goto done;
++
+ 	ret = mod_recipe_select(sess->db_ent->info.mod_flags,
+ 				&sess->si.recipe_idx);
+ 	if (unlikely(ret))
+@@ -4094,8 +4289,7 @@ static s32 __smgr_db_init(struct pp_smgr_init_param *init_param)
+ 	db->n_sessions = init_param->num_sessions;
+ 	/* enable by default */
+ 	db->state = SMGR_ENABLE;
+-	/* enable reassembly and fragments acceleration */
+-	db->reassembly_en = false;
++	db->frag_mode = init_param->frag_mode;
+ 	/* init lock */
+ 	spin_lock_init(&db->lock);
+ 	/* allocate bitmap for HW crawler */
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+index 184c0065af57..a18a08cb8e5e 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+@@ -13,17 +13,33 @@
+ #include <linux/debugfs.h> /* struct dentry */
+ 
+ /**
+- * @brief Session manager initial configuration parameters
+- * @valid params valid
+- * @num_sessions number of session to support
+- * @num_syncqs number of syncq to support (user defined)
+- * @dbgfs debugfs parent folder
++ * enum smgr_frag_mode - Fragmentation mode
++ * @SMGR_FRAG_MODE_CHECK_MTU_IN_UC: MTU check is done in UC
++ * @SMGR_FRAG_MODE_CHECK_MTU_IN_CHECKER: MTU check is done in Checker
++ *
++ * Fragmnetation mode. in case mode is SMGR_FRAG_MODE_CHECK_MTU_IN_CHECKER
++ * only packets exceed the MTU will go through the UC.
++ * The default mode is SMGR_FRAG_MODE_CHECK_MTU_IN_UC
++ */
++enum smgr_frag_mode {
++	SMGR_FRAG_MODE_CHECK_MTU_IN_UC,
++	SMGR_FRAG_MODE_CHECK_MTU_IN_CHECKER
++};
++
++/**
++ * struct pp_smgr_init_param - Session manager initial configuration parameters
++ * @valid: params valid
++ * @num_sessions: number of session to support
++ * @num_syncqs: number of syncq to support (user defined)
++ * @dbgfs: debugfs parent folder
++ * @frag_mode: Defines whether mtu violation is checked in uc or in checker
+  */
+ struct pp_smgr_init_param {
+ 	bool valid;
+ 	u32 num_sessions;
+ 	u32 num_syncqs;
+ 	struct dentry *dbgfs;
++	enum smgr_frag_mode frag_mode;
+ };
+ 
+ #ifdef CONFIG_PHY_INTEL_COMBO_LGM
+@@ -123,8 +139,8 @@ struct smgr_mcast_pkt_stats {
+ };
+ 
+ /**
+- * @struct smgr_mcast_uc_cpu_pkt_stats
+- * @brief multicast packet statistics
++ * @struct smgr_reass_stats
++ * @brief reassembly packet statistics
+  */
+ struct smgr_reass_stats {
+ 	u64 rx_pkts;
+@@ -137,6 +153,21 @@ struct smgr_reass_stats {
+ 	u64 errors;
+ };
+ 
++/**
++ * @struct smgr_frag_stats
++ * @brief fragmentation statistics
++ */
++struct smgr_frag_stats {
++	u64 rx_pkt;
++	u64 tx_pkt;
++	u64 total_drops;
++	u64 bmgr_drops;
++	u64 df_drops;
++	u64 max_frags_drops;
++	u64 reserved1;
++	u64 reserved2;
++};
++
+ /**
+  * @struct smgr_sq_stats
+  * @brief syncq statistics
+@@ -197,6 +228,13 @@ s32 pp_smgr_mcast_stats_get(struct smgr_mcast_pkt_stats *stats);
+  */
+ s32 pp_smgr_reassembly_stats_get(struct smgr_reass_stats *stats);
+ 
++/**
++ * @brief Get frag sessions statistics
++ * @param stats
++ * @return s32 0 on success, error code otherwise
++ */
++s32 pp_smgr_frag_stats_get(struct smgr_frag_stats *stats);
++
+ /**
+  * @brief Reset session manager counters
+  * @return s32 0 on success, error code otherwise
+@@ -229,11 +267,13 @@ void smgr_sq_lspp_rcv(u32 session);
+ s32 smgr_sq_dbg_stats_get(struct smgr_sq_stats *stats, bool reset);
+ 
+ /**
+- * @brief Enable/disable reassembly and fragments acceleration
+- * @param en enable or disable
+- * @return s32 0 on success, error code otherwise
++ * @brief Enable/disable nf acceleration
++ * @param nf network function to set
++ * @param en true to enable, false to disable
++ * @param queue nf physical queue
++ * @return s32 0 on success
+  */
+-s32 smgr_reassembly_en_set(bool en);
++s32 smgr_nf_en_set(enum pp_nf_type nf, bool en, u16 queue);
+ 
+ /**
+  * @brief initialized PP session manager driver
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 68c106c63548..9438b1b7bc69 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -258,6 +258,8 @@ void __smgr_dbg_session_si_dump(struct seq_file *f)
+ 	struct pp_si si;
+ 	char buf[256];
+ 	s32 ret, i;
++	struct sess_db_info info;
++	struct si_ud_frag_info *frag_info;
+ 
+ 	memset(&si, 0, sizeof(si));
+ 
+@@ -326,6 +328,33 @@ void __smgr_dbg_session_si_dump(struct seq_file *f)
+ 				   16, 1, buf, sizeof(buf), false);
+ 		(void)strreplace(buf, '\n', ' ');
+ 		seq_printf(f, " %-20s: %s\n", "UD", buf);
++
++		ret = smgr_session_info_get(dbg_sess_id, &info);
++		if (ret)
++			return;
++		if (test_bit(SESS_FLAG_MTU_CHCK, &info.flags)) {
++			frag_info = (struct si_ud_frag_info *)
++				    &si.ud[PP_PS_REGION_SZ];
++			seq_printf(f, " %-20s: %u (INT_DF %d (IGNORE %d), EXT_DF %d (IGNORE %d), FRAG_EXT %d, IPV4 %d)\n",
++				   "frag.flags", frag_info->flags,
++				   !!(frag_info->flags &
++				      FRAG_INFO_FLAG_INT_DF),
++				   !!(frag_info->flags &
++				      FRAG_INFO_FLAG_IGNORE_INT_DF),
++				   !!(frag_info->flags &
++				      FRAG_INFO_FLAG_EXT_DF),
++				   !!(frag_info->flags &
++				      FRAG_INFO_FLAG_IGNORE_EXT_DF),
++				   !!(frag_info->flags &
++				      FRAG_INFO_FLAG_FRAG_EXT),
++				   !!(frag_info->flags & FRAG_INFO_FLAG_IPV4));
++			seq_printf(f, " %-20s: %u\n", "frag.l3_off",
++				   frag_info->l3_off);
++			seq_printf(f, " %-20s: %u\n", "frag.dst_q",
++				   frag_info->dst_q);
++			seq_printf(f, " %-20s: %u\n", "frag.max_pkt_size",
++				   frag_info->max_pkt_size);
++		}
+ 	}
+ 	for (i = 0; i < (sizeof(si.fv) / sizeof(u32)); i++)
+ 		seq_printf(f, " FV WORD%-13u: %#010x\n",
+@@ -374,6 +403,58 @@ PP_DEFINE_DEBUGFS(exception_session_si,
+ 		  __smgr_dbg_exception_session_si_dump,
+ 		  NULL);
+ 
++/**
++ * @brief Dump fragmentation stats
++ */
++void __smgr_dbg_frag_stats(struct seq_file *f)
++{
++	struct smgr_frag_uc_cpu_stats stats[UC_CPUS_MAX], *it;
++	s32 ret;
++	u32 cid, i;
++	char **str;
++	static const char * const cntrs_str[] = {
++		"rx_pkt",
++		"tx_pkt",
++		"total_drops",
++		"bmgr_drops",
++		"df_drops",
++		"max_frags_drops",
++		"reserved1",
++		"reserved2",
++	};
++
++	for (cid = 0; cid < UC_CPUS_MAX; cid++) {
++		ret = uc_egr_mbox_cmd_send(UC_CMD_FRAG_STATS, cid,
++					   &stats[cid], sizeof(stats[cid]));
++		if (unlikely(ret)) {
++			pr_err("failed to get frag uc cpu %u counters\n", cid);
++			return;
++		}
++	}
++
++	seq_puts(f, "\n");
++	seq_puts(f, "|=====================================================================|\n");
++	seq_puts(f, "|                   Fragmentation UC Statistics                       |\n");
++	seq_puts(f, "|=====================================================================|\n");
++	seq_printf(f, "| %-15s ", "Counter");
++	for (cid = 0; cid < UC_CPUS_MAX; cid++)
++		seq_printf(f, "|  CPU%u      ", cid);
++	seq_puts(f, "|\n");
++	seq_puts(f, "|-----------------+------------+------------+------------+------------|\n");
++
++	i = 0;
++	for_each_arr_entry(str, cntrs_str, ARRAY_SIZE(cntrs_str), i++) {
++		seq_printf(f, "| %-15s ", *str);
++		for_each_arr_entry(it, stats, ARRAY_SIZE(stats)) {
++			seq_printf(f, "| %10u ", *(((u32 *)it) + i));
++		}
++		seq_puts(f, "|\n");
++	}
++	seq_puts(f, "|---------------------------------------------------------------------|\n\n");
++}
++
++PP_DEFINE_DEBUGFS(frag_stats, __smgr_dbg_frag_stats, NULL);
++
+ /**
+  * @brief Dump specific session si and dsi raw data, uses session ID
+  *        that was set by xsession file
+@@ -1150,41 +1231,6 @@ static int __smgr_dbg_enable_set(void *data, u64 val)
+ 
+ PP_DEFINE_DBGFS_ATT(enable, __smgr_dbg_enable_get, __smgr_dbg_enable_set);
+ 
+-/**
+- * @brief Get session manager reassembly support
+- * @param data unused
+- * @param val enable/disable
+- * @return 0 on success, non-zero value otherwise
+- */
+-static int __smgr_dbg_reassembly_en_get(void *data, u64 *val)
+-{
+-	bool en = false;
+-	s32 ret;
+-
+-	*val = 0;
+-	ret = smgr_reassembly_en_get(&en);
+-	if (unlikely(ret))
+-		pr_err("Failed to get fragments acceleration status\n");
+-	else
+-		*val = (u64)en;
+-
+-	return ret;
+-}
+-
+-/**
+- * @brief Enable/Disable session manager reassembly support
+- * @param data not used
+- * @param val 1 to enable, 0 to disable
+- * @return 0 on success, non-zero value otherwise
+- */
+-static int __smgr_dbg_reassembly_en_set(void *data, u64 val)
+-{
+-	return smgr_reassembly_en_set(!!val);
+-}
+-
+-PP_DEFINE_DBGFS_ATT(reassembly_en, __smgr_dbg_reassembly_en_get,
+-		    __smgr_dbg_reassembly_en_set);
+-
+ enum sess_set_dq_opts {
+ 	sess_set_dq_opt_help,
+ 	sess_set_dq_opt_id,
+@@ -2031,7 +2077,7 @@ void __smgr_dbg_reass_stats_show(struct seq_file *f)
+ 	s32 ret;
+ 	u32 cid, i;
+ 	char **str;
+-	char *cntrs_str[] = {
++	static const char * const cntrs_str[] = {
+ 		"rx_pkts",
+ 		"tx_pkts",
+ 		"reassembled",
+@@ -2091,7 +2137,6 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "xsi_raw", &PP_DEBUGFS_FOPS(session_si_raw) },
+ 	{ "stats", &PP_DEBUGFS_FOPS(stats) },
+ 	{ "enable", &PP_DEBUGFS_FOPS(enable) },
+-	{ "reassembly_en", &PP_DEBUGFS_FOPS(reassembly_en) },
+ 	{ "reassembly_stats", &PP_DEBUGFS_FOPS(reass_stats) },
+ 	{ "delete_session", &PP_DEBUGFS_FOPS(sess_del) },
+ 	{ "flush", &PP_DEBUGFS_FOPS(flush) },
+@@ -2099,6 +2144,7 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "session_stats_mod", &PP_DEBUGFS_FOPS(sess_stats_mod) },
+ 	{ "dual_tbm", &PP_DEBUGFS_FOPS(dual_tbm) },
+ 	{ "sgc", &PP_DEBUGFS_FOPS(sgc) },
++	{ "frag_stats", &PP_DEBUGFS_FOPS(frag_stats) },
+ };
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 4f3a773800b0..86988d41c20b 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -226,6 +226,50 @@ struct smgr_reass_uc_cpu_stats {
+ 	u32 dropped;
+ };
+ 
++/**
++ * @define FRAG_INFO_FLAG defines, to be used with struct si_ud_frag_info.flags
++ */
++#define FRAG_INFO_FLAG_INT_DF           (BIT(0))
++#define FRAG_INFO_FLAG_EXT_DF           (BIT(1))
++#define FRAG_INFO_FLAG_IGNORE_INT_DF    (BIT(2))
++#define FRAG_INFO_FLAG_IGNORE_EXT_DF    (BIT(3))
++#define FRAG_INFO_FLAG_FRAG_EXT         (BIT(4))
++#define FRAG_INFO_FLAG_IPV4             (BIT(5))
++
++/**
++ * struct si_ud_frag_info - Fragmentation info
++ * @l3_off: l3 offset. In case of inner fragmentation,
++ * 	    the offset will be to the inner l3 hdr
++ * @flags: Fragmentation flags
++ * @dst_q: Destination queue
++ * @max_pkt_size: Port's max_pkt_size
++ *
++ * This structure defines the fragmentation information saved in the si ud
++ * right after the ps (Starts at si.ud + PP_PS_REGION_SZ).
++ * Used in the fragmenter uc
++ */
++struct si_ud_frag_info {
++	u8	flags;
++	u8	l3_off;
++	u16	dst_q;
++	u16	max_pkt_size;
++} __packed;
++
++/**
++ * @struct smgr_frag_uc_cpu_stats
++ * @brief fragmentation UC cpu statistics
++ */
++struct smgr_frag_uc_cpu_stats {
++	u32 rx_pkt;
++	u32 tx_pkt;
++	u32 total_drops;
++	u32 bmgr_drops;
++	u32 df_drops;
++	u32 max_frags_drops;
++	u32 reserved1;
++	u32 reserved2;
++};
++
+ /**
+  * @brief Test whether a session is routed session.<br>
+  *        Routed session is a session where the ingress destination
+@@ -525,6 +569,14 @@ s32 smgr_mcast_sess_lookup(struct sess_info *sess);
+ s32 smgr_mcast_uc_cpu_stats_get(u32 cid,
+ 				struct smgr_mcast_uc_cpu_pkt_stats *stats);
+ 
++/**
++ * @brief get the nf frag packet counters
++ * @param cid cpu index
++ * @param stats fragmentation statistics
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_frag_uc_cpu_stats_get(u32 cid, struct smgr_frag_uc_cpu_stats *stats);
++
+ /**
+  * @brief Helper function to initialize multicast info
+  * @param invalid_sess_id invalid session index
+@@ -569,11 +621,11 @@ s32 smgr_state_set(enum smgr_state state);
+ enum smgr_state smgr_state_get(void);
+ 
+ /**
+- * @brief Get enable/disable fragments acceleration status
+- * @param en enable or disable
+- * @return s32 0 on success, error code otherwise
++ * @brief Get nf status in smgr
++ * @param nf nf type
++ * @return true if nf enabled
+  */
+-s32 smgr_reassembly_en_get(bool *en);
++bool smgr_is_nf_en(enum pp_nf_type nf);
+ 
+ /**
+  * @brief Session manager debug init
+diff --git a/drivers/net/ppv4/pp-dev/pp_dts.c b/drivers/net/ppv4/pp-dev/pp_dts.c
+index ade3cb025430..b8bf933f4738 100644
+--- a/drivers/net/ppv4/pp-dev/pp_dts.c
++++ b/drivers/net/ppv4/pp-dev/pp_dts.c
+@@ -793,6 +793,7 @@ void pp_dts_cfg_dump(struct pp_dts_cfg *cfg)
+ #ifdef CONFIG_PHY_INTEL_COMBO_LGM
+ 	pr_info("Num sessions %u\n", cfg->cls_param.num_sessions);
+ 	pr_info("Num syncqs   %u\n", cfg->smgr_params.num_syncqs);
++	pr_info("Frag mode    %u\n", cfg->smgr_params.frag_mode);
+ 	pr_info("Bootcfg Base 0x%llx\n",
+ 		pp_virt_to_phys((void *)cfg->infra_params.bootcfg_base));
+ 	pr_info("Clock Ctrl Base 0x%llx\n",
+@@ -936,6 +937,13 @@ s32 pp_dts_cfg_get(struct platform_device *pdev, struct pp_dts_cfg *cfg)
+ 	cfg->chk_param.hw_clk   = val;
+ 	cfg->misc_params.hw_clk = val;
+ 
++	/* Fetch fragmentation mode */
++	ret = __dts_u32_param_get(pdev, pdev->dev.of_node, "frag-mode", &val);
++	if (unlikely(ret))
++		return ret;
++	dev_dbg(&pdev->dev, "frag-mode = %d\n", val);
++	cfg->smgr_params.frag_mode = (enum smgr_frag_mode)val;
++
+ 	/* Fetch PPv4 base address ranges */
+ 	ret = of_property_read_u32_array(pdev->dev.of_node,
+ 					 "ranges", ranges,
+diff --git a/drivers/net/ppv4/pp-dev/pp_fpga.c b/drivers/net/ppv4/pp-dev/pp_fpga.c
+index 5b358e18dfef..2fdd655f0221 100644
+--- a/drivers/net/ppv4/pp-dev/pp_fpga.c
++++ b/drivers/net/ppv4/pp-dev/pp_fpga.c
+@@ -187,6 +187,7 @@ void pp_fpga_cfg_get(struct pp_dts_cfg *cfg)
+ 	cfg->smgr_params.valid = true;
+ 	cfg->smgr_params.num_sessions = PP_NUM_SESSION;
+ 	cfg->smgr_params.num_syncqs   = PP_NUM_SYNCQ;
++	cfg->smgr_params.frag_mode = SMGR_FRAG_MODE_CHECK_MTU_IN_UC;
+ 
+ 	/* Misc config */
+ 	cfg->misc_params.valid = true;
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 632bc13fdb11..428f0f0bb53b 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -1169,8 +1169,7 @@ s32 uc_nf_set(enum pp_nf_type nf, u16 pid, u16 qos_port, u16 tx_queue,
+ 		return -EINVAL;
+ 	case PP_NF_FRAGMENTER:
+ 		uc_port = UC_FRAG_PORT;
+-		pr_err("PP_NF_FRAGMENTER not supported\n");
+-		return -EINVAL;
++		break;
+ 	default:
+ 		pr_err("nf type is not supported\n");
+ 		return -EINVAL;
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.h b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+index f163f0ab7808..93745c5d03ab 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+@@ -106,7 +106,10 @@ enum uc_mbox_cmd_type {
+ 	UC_CMD_REASSEMBLY_STATS,
+ 	UC_CMD_AUX_REG_RD,
+ 	UC_CMD_AUX_REG_WR,
+-	UC_CMD_LAST      = UC_CMD_AUX_REG_WR,
++	/*! get the fragmentation stats */
++	UC_CMD_FRAG_STATS,
++
++	UC_CMD_LAST      = UC_CMD_FRAG_STATS,
+ 	UC_CMD_MAX       = U32_MAX,
+ };
+ 
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+index 1398cf5b2fdb..e3870e62c2d0 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+@@ -17,7 +17,7 @@
+  * the version here
+  */
+ #define EGRESS_VER_MAJOR              (1)
+-#define EGRESS_VER_MINOR              (4)
++#define EGRESS_VER_MINOR              (5)
+ #define INGRESS_VER_MAJOR             (1)
+ #define INGRESS_VER_MINOR             (0)
+ #define UC_VER_MAJOR(t)               (t ## _VER_MAJOR)
+diff --git a/drivers/net/ppv4/pp-tools/debugfs/pp_debugfs_common.c b/drivers/net/ppv4/pp-tools/debugfs/pp_debugfs_common.c
+new file mode 100644
+index 000000000000..15434dfb7bd1
+--- /dev/null
++++ b/drivers/net/ppv4/pp-tools/debugfs/pp_debugfs_common.c
+@@ -0,0 +1,196 @@
++/*
++ * pp_debugfs_common.h
++ * Description: PP debugfs common definitions
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ * Copyright (C) 2018-2019 Intel Corporation
++ */
++
++#include <linux/kernel.h>
++#include <linux/debugfs.h>
++#include <linux/bitops.h>
++#include <linux/bitfield.h>
++#include <linux/ctype.h>
++#include <linux/string.h>
++#include <linux/errno.h>
++#include <linux/capability.h>
++#include "pp_debugfs_common.h"
++#include "pp_common.h"
++
++#define INVALID_ID (UINT_MAX)
++#define MAX_FLD_VAL(sizeof_fld)  (((u64)1 << (BITS_PER_BYTE * sizeof_fld)) - 1)
++
++void pp_dbg_props_set(char *cmd_buf, struct pp_dbg_props_cbs *cbs,
++		      struct pp_dbg_prop props[], u16 num_props,
++		      void *user_data)
++{
++	u8 *field;
++	char *tok, *ptr, *pval;
++	unsigned long res;
++	u16 i, num_changed = 0;
++	u32 id = INVALID_ID;
++	u32 len, first_prop = 1;
++	s32 ret;
++	unsigned long val;
++
++	field = kzalloc(PP_DBGFS_WR_STR_MAX, GFP_KERNEL);
++	if (!field)
++		return;
++
++	ptr = (char *)cmd_buf;
++
++	while ((tok = strsep(&ptr, " \t\n\r")) != NULL) {
++		if (tok[0] == '\0')
++			continue;
++
++		strcpy(field, tok);
++		pval = strchr(field, '=');
++		if (!pval) {
++			pr_err("Wrong format for prop %s\n", tok);
++			goto out;
++		}
++
++		*pval = '\0';
++		pval++;
++
++		ret = kstrtoul(pval, 0, &res);
++		if (ret) {
++			pr_err("kstrtoul failure (%d)\n", ret);
++			goto out;
++		}
++
++		if (first_prop) {
++			first_prop = 0;
++			id = res;
++			if (cbs && cbs->first_prop_cb &&
++			    cbs->first_prop_cb(field, res, user_data)) {
++				pr_err("first_prop_cb failed\n");
++				goto out;
++			}
++		}
++
++		for (i = 0; i < num_props ; i++) {
++			len = max(strlen(props[i].field), strlen(field));
++			if (!strncmp(field, props[i].field, len)) {
++				if (props[i].data_type == 0) {
++					val = MAX_FLD_VAL(props[i].dst_sz);
++					if (res > val) {
++						pr_info("value is too big\n");
++						goto out;
++					} else {
++						memcpy(props[i].dst,
++						       (void *)&res,
++						       props[i].dst_sz);
++					}
++				} else {
++					*(props[i].pdst) = (void *)res;
++				}
++				num_changed++;
++				break;
++			}
++		}
++
++		if (i == num_props)
++			pr_err("Not supported field %s", field);
++	}
++
++	if (id != INVALID_ID) {
++		/* If only id was set, print current configuration */
++		if (num_changed == 1) {
++			pr_info("Current configuration:\n");
++
++			for (i = 0; i < num_props ; i++) {
++				if (props[i].data_type == 0) {
++					val = 0;
++					memcpy((void *)&val, props[i].dst,
++					       props[i].dst_sz);
++					pr_info("%-30s%lu\n",
++						props[i].field, val);
++				} else {
++					pr_info("%-30s%#lx\n",
++						props[i].field,
++						(ulong)(*props[i].pdst));
++				}
++			}
++
++			goto out;
++		}
++
++		if (cbs && cbs->done_props_cb) {
++			if (cbs->done_props_cb(id, user_data)) {
++				pr_err("done_props_cb failed\n");
++				goto out;
++			}
++		}
++	}
++
++out:
++	kfree(field);
++}
++
++void pp_dbg_props_help(struct seq_file *f, const char *name,
++		       const char *format, struct pp_dbg_prop props[],
++		       u16 num_props)
++{
++	u32 idx;
++
++	seq_printf(f, "<---- %s---->\n", name);
++	seq_printf(f, "[FORMAT] %s\n", format);
++	seq_puts(f, "[FORMAT] If only id is set, operation is get conf\n");
++	seq_puts(f, "Supported fields\n");
++
++	for (idx = 0; idx < num_props ; idx++) {
++		seq_printf(f, "%-30s%s\n", props[idx].field, props[idx].desc);
++	}
++}
++
++void pp_dbg_add_prop(struct pp_dbg_prop *props, u16 *pos, u16 size,
++		     const char *name, const char *desc, void *dst, u8 dst_sz)
++{
++	if (*pos >= size) {
++		pr_err("pos %d >= size %d", *pos, size);
++		return;
++	}
++
++	if (strscpy(props[*pos].field, name, sizeof(props[*pos].field)) <= 0) {
++		pr_err("%s copying field %s failed\n", __func__, name);
++		return;
++	}
++
++	if (strscpy(props[*pos].desc, desc, sizeof(props[*pos].desc)) <= 0) {
++		pr_err("%s copying desc %s failed\n", __func__, desc);
++		return;
++	}
++
++	props[*pos].data_type = 0;
++	props[*pos].dst = dst;
++	props[*pos].dst_sz = dst_sz;
++
++	(*pos)++;
++}
++
++void pp_dbg_add_prop_ptr(struct pp_dbg_prop *props, u16 *pos, u16 size,
++			 const char *name, const char *desc,
++			 unsigned long **dst)
++{
++	if (*pos >= size) {
++		pr_err("pos %d >= size %d", *pos, size);
++		return;
++	}
++
++	if (strscpy(props[*pos].field, name, sizeof(props[*pos].field)) <= 0) {
++		pr_err("%s copying field %s failed\n", __func__, name);
++		return;
++	}
++
++	if (strscpy(props[*pos].desc, desc, sizeof(props[*pos].desc)) <= 0) {
++		pr_err("%s copying desc %s failed\n", __func__, desc);
++		return;
++	}
++
++	props[*pos].data_type = 1;
++	props[*pos].pdst = dst;
++	props[*pos].dst_sz = sizeof(dst);
++
++	(*pos)++;
++}
+diff --git a/drivers/net/ppv4/pp-headers/pp_debugfs_common.h b/drivers/net/ppv4/pp-tools/debugfs/pp_debugfs_common.h
+similarity index 76%
+rename from drivers/net/ppv4/pp-headers/pp_debugfs_common.h
+rename to drivers/net/ppv4/pp-tools/debugfs/pp_debugfs_common.h
+index 20c8f0b5fda6..702a39f07797 100644
+--- a/drivers/net/ppv4/pp-headers/pp_debugfs_common.h
++++ b/drivers/net/ppv4/pp-tools/debugfs/pp_debugfs_common.h
+@@ -28,7 +28,7 @@ struct debugfs_file {
+ /**
+  * @define Maximum buffer for read/write functions
+  */
+-#define PP_DBGFS_WR_STR_MAX                                              (1024)
++#define PP_DBGFS_WR_STR_MAX          (1024)
+ 
+ /**
+  * @define Auto generated 'fops' structure name
+@@ -199,6 +199,80 @@ static inline s32 pp_debugfs_create(struct dentry *parent,
+ 	return 0;
+ }
+ 
++#define DBG_MAX_PROPS	(32)
++
++/**
++ * @struct pp_dbg_prop
++ * @brief pp dbg prop configuration
++ */
++struct pp_dbg_prop {
++	char          field[32];
++	char          desc[128];
++	u8            data_type; /* 0 - normal, 1 - pointer */
++	void          *dst;
++	u8            dst_sz;
++	unsigned long **pdst;
++};
++
++/**
++ * @struct pp_dbg_props_cbs
++ * @brief pp dbg prop cbs
++ */
++struct pp_dbg_props_cbs {
++	s32 (*first_prop_cb)(char *field, u32 val, void *user_data);
++	s32 (*done_props_cb)(u32 val, void *user_data);
++};
++
++/**
++ * @brief Add field to the debugfs
++ * @param props    properties array
++ * @param pos      Position to add the new prop
++ * @param size     size of the props array
++ * @param name     Property name
++ * @param desc     description (Will be printed when user is doing 'cat file')
++ * @param dst      Pointer to save the new value of this parameter 
++ * @param dst_sz   Size of the field
++ */
++void pp_dbg_add_prop(struct pp_dbg_prop *props, u16 *pos, u16 size,
++		     const char *name, const char *desc, void *dst, u8 dst_sz);
++
++/**
++ * @brief Add ptr field to the debugfs
++ * @param props    properties array
++ * @param pos      Position to add the new prop
++ * @param size     size of the props array
++ * @param name     Property name
++ * @param desc     description (Will be printed when user is doing 'cat file')
++ * @param dst      Pointer to save the new value of this parameter 
++ */
++void pp_dbg_add_prop_ptr(struct pp_dbg_prop *props, u16 *pos, u16 size,
++			 const char *name, const char *desc,
++			 unsigned long **dst);
++
++/**
++ * @brief Sets all props to the debugfs. Should be called from set debugfs
++ * @param cmd_buf      Command buffer from user
++ * @param cbs          Callbacks structure
++ * @param props        Properties array
++ * @param num_props    Size of the props array
++ * @param user_data    User data sent in the CBs (Typically the conf struct)
++ */
++void pp_dbg_props_set(char *cmd_buf, struct pp_dbg_props_cbs *cbs,
++		      struct pp_dbg_prop props[], u16 num_props,
++		      void *user_data);
++
++/**
++ * @brief Prints props help for the debugfs. Should be called from help debugfs
++ * @param buff         Command buffer from user
++ * @param name         Debugfs name
++ * @param format       Format for this debugfs
++ * @param props        Properties array
++ * @param num_props    Size of the props array
++ */
++void pp_dbg_props_help(struct seq_file *f, const char *name,
++		       const char *format, struct pp_dbg_prop props[],
++		       u16 num_props);
++
+ #endif /* CONFIG_DEBUG_FS */
+ 
+ #endif /* __PP_DEBUGFS_COMMON_H_ */

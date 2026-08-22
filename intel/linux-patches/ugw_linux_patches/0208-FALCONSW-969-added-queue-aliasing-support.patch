@@ -1,0 +1,523 @@
+From 8a73e7aa34ed679347c6f34c454fd25bd460adf1 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Sun, 19 Aug 2018 17:06:30 +0300
+Subject: [PATCH] FALCONSW-969: added queue aliasing support
+
+---
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c   |  88 +++++++++-----
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c | 132 +++++++++++++++++----
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h    |   4 +-
+ 3 files changed, 170 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+index fca0706721d6..339987f67faa 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+@@ -249,6 +249,7 @@ struct cmd_remove_node {
+ 	struct cmd base;
+ 	unsigned int phy;
+ 	unsigned int data; /* rlm in queue, otherwise irrlevant */
++	unsigned int is_alias_slave; /* Relevant in Queue only */
+ };
+ 
+ struct cmd_update_preds {
+@@ -257,6 +258,7 @@ struct cmd_update_preds {
+ 	uint16_t preds[6];
+ 	unsigned int phy;
+ 	unsigned int rlm;
++	unsigned int is_alias_slave;
+ };
+ 
+ struct port_properties {
+@@ -330,6 +332,7 @@ struct cmd_add_queue {
+ 	unsigned int parent;
+ 	unsigned int port;
+ 	uint16_t preds[6];
++	unsigned int is_alias_slave;
+ 	struct queue_properties prop;
+ };
+ 
+@@ -337,6 +340,7 @@ struct cmd_set_queue {
+ 	struct cmd base;
+ 	unsigned int phy;
+ 	struct queue_properties prop;
++	unsigned int is_alias_slave;
+ 	uint32_t modified;
+ };
+ 
+@@ -563,8 +567,9 @@ void create_remove_node_cmd(
+ 		unsigned int phy,
+ 		unsigned int data)
+ {
+-	struct cmd_remove_node cmd;
++	struct cmd_remove_node cmd = {0};
+ 	enum cmd_type ctype;
++	const struct qos_node *node;
+ 
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+@@ -577,7 +582,13 @@ void create_remove_node_cmd(
+ 		ctype = CMD_TYPE_REMOVE_SCHED;
+ 		break;
+ 	case TYPE_QUEUE:
++	{
+ 		ctype = CMD_TYPE_REMOVE_QUEUE;
++		node = get_const_node_from_phy(qdev->nodes, phy);
++		if (node->data.queue.alias_master_id != PP_QOS_INVALID_ID) {
++			cmd.is_alias_slave = 1;
++		}
++	}
+ 		break;
+ 	case TYPE_UNKNOWN:
+ 		QOS_ASSERT(0, "Unexpected unknow type\n");
+@@ -592,10 +603,10 @@ void create_remove_node_cmd(
+ 	cmd.phy = phy;
+ 	cmd.data = data;
+ 
+-	QOS_LOG_DEBUG("cmd %u:%u %s %u rlm %u\n",
++	QOS_LOG_DEBUG("cmd %u:%u %s %u rlm %u alias %u\n",
+ 			qdev->drvcmds.cmd_id,
+ 			qdev->drvcmds.cmd_fw_id,
+-			cmd_str[ctype], phy, data);
++			cmd_str[ctype], phy, data, cmd.is_alias_slave);
+ 	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ 	if (ctype != CMD_TYPE_REMOVE_PORT)
+ 		add_suspend_port(qdev, get_port(qdev->nodes, phy));
+@@ -622,14 +633,17 @@ void create_update_preds_cmd(struct pp_qos_dev *qdev, unsigned int phy)
+ 	node = get_const_node_from_phy(qdev->nodes, phy);
+ 	cmd.node_type = node->type;
+ 	cmd.rlm = node->data.queue.rlm;
++	cmd.is_alias_slave =
++			(node->data.queue.alias_master_id == PP_QOS_INVALID_ID)
++			? 0 : 1;
++
++	QOS_LOG_DEBUG("cmd %u:%u CMD_TYPE_UPDATE_PREDECESSORS %u:%u-->%u-->%u-->%u-->%u-->%u\n",
++		      qdev->drvcmds.cmd_id,
++		      qdev->drvcmds.cmd_fw_id,
++		      phy,
++		      cmd.preds[0], cmd.preds[1], cmd.preds[2],
++		      cmd.preds[3], cmd.preds[4], cmd.preds[5]);
+ 
+-	QOS_LOG_DEBUG(
+-			"cmd %u:%u CMD_TYPE_UPDATE_PREDECESSORS %u:%u-->%u-->%u-->%u-->%u-->%u\n",
+-			qdev->drvcmds.cmd_id,
+-			qdev->drvcmds.cmd_fw_id,
+-			phy,
+-			cmd.preds[0], cmd.preds[1], cmd.preds[2],
+-			cmd.preds[3], cmd.preds[4], cmd.preds[5]);
+ 	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ 	qdev->drvcmds.cmd_fw_id++;
+ }
+@@ -829,21 +843,25 @@ static void create_add_queue_cmd(
+ 		unsigned int rlm)
+ {
+ 	struct cmd_add_queue cmd;
++	const struct qos_node *node;
+ 
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+ 	memset(&cmd, 0, sizeof(cmd));
+-	cmd_init(
+-			qdev,
+-			&(cmd.base),
+-			CMD_TYPE_ADD_QUEUE,
+-			sizeof(cmd),
+-			CMD_FLAGS_WRAP_PARENT_SUSPEND_RESUME);
++	cmd_init(qdev,
++		 &(cmd.base),
++		 CMD_TYPE_ADD_QUEUE,
++		 sizeof(cmd),
++		 CMD_FLAGS_WRAP_PARENT_SUSPEND_RESUME);
+ 	cmd.phy = phy;
+ 	cmd.parent = parent;
+ 
+ 	cmd.port = get_port(qdev->nodes, phy);
++	node = get_const_node_from_phy(qdev->nodes, phy);
++	cmd.is_alias_slave =
++			(node->data.queue.alias_master_id == PP_QOS_INVALID_ID)
++			? 0 : 1;
+ 
+ 	fill_preds(qdev->nodes, phy, cmd.preds, 6);
+ 	set_cmd_queue_properties(&cmd.prop, conf, rlm);
+@@ -855,7 +873,6 @@ static void create_add_queue_cmd(
+ 	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ 	add_suspend_port(qdev, cmd.port);
+ 	qdev->drvcmds.cmd_fw_id++;
+-
+ }
+ 
+ static void _create_set_queue_cmd(
+@@ -867,6 +884,7 @@ static void _create_set_queue_cmd(
+ 		uint32_t modified)
+ {
+ 	struct cmd_set_queue cmd;
++	const struct qos_node *node;
+ 
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+@@ -875,16 +893,20 @@ static void _create_set_queue_cmd(
+ 		create_add_queue_cmd(qdev, conf, phy, parent, rlm);
+ 	} else {
+ 		memset(&cmd, 0, sizeof(cmd));
+-		cmd_init(
+-				qdev,
+-				&(cmd.base),
+-				CMD_TYPE_SET_QUEUE,
+-				sizeof(cmd),
+-				CMD_FLAGS_WRAP_SUSPEND_RESUME |
+-				CMD_FLAGS_WRAP_PARENT_SUSPEND_RESUME);
++		cmd_init(qdev,
++			 &(cmd.base),
++			 CMD_TYPE_SET_QUEUE,
++			 sizeof(cmd),
++			 CMD_FLAGS_WRAP_SUSPEND_RESUME |
++			 CMD_FLAGS_WRAP_PARENT_SUSPEND_RESUME);
+ 		cmd.phy = phy;
+ 		set_cmd_queue_properties(&cmd.prop, conf, rlm);
+ 		cmd.modified = modified;
++		node = get_const_node_from_phy(qdev->nodes, phy);
++		cmd.is_alias_slave =
++				(node->data.queue.alias_master_id == PP_QOS_INVALID_ID)
++				? 0 : 1;
++
+ 		cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
+ 		qdev->drvcmds.cmd_fw_id++;
+ 	}
+@@ -1194,6 +1216,7 @@ struct fw_set_queue {
+ 	unsigned int queue_wred_max_allowed;
+ 	unsigned int queue_wred_fixed_drop_prob_green;
+ 	unsigned int queue_wred_fixed_drop_prob_yellow;
++	unsigned int is_alias_slave;
+ };
+ 
+ struct fw_internal {
+@@ -1459,7 +1482,7 @@ static uint32_t *fw_write_add_queue_cmd(
+ 
+ 	*buf++ = qos_u32_to_uc(UC_QOS_COMMAND_ADD_QUEUE);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(23);
++	*buf++ = qos_u32_to_uc(24);
+ 	*buf++ = qos_u32_to_uc(cmd->phy);
+ 	*buf++ = qos_u32_to_uc(cmd->port);
+ 	*buf++ = qos_u32_to_uc(cmd->prop.rlm);
+@@ -1489,6 +1512,7 @@ static uint32_t *fw_write_add_queue_cmd(
+ 		*buf++ = qos_u32_to_uc(0);
+ 	else
+ 		*buf++ = qos_u32_to_uc(cmd->prop.queue_wred_max_allowed);
++	*buf++ = qos_u32_to_uc(cmd->is_alias_slave);
+ 	return buf;
+ }
+ 
+@@ -1504,7 +1528,7 @@ static uint32_t *fw_write_set_queue_cmd(
+ 
+ 	*buf++ = qos_u32_to_uc(UC_QOS_COMMAND_SET_QUEUE);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(26);
++	*buf++ = qos_u32_to_uc(27);
+ 	*buf++ = qos_u32_to_uc(phy);
+ 	*buf++ = qos_u32_to_uc(queue->rlm);
+ 	*buf++ = qos_u32_to_uc(common->valid | child->valid);
+@@ -1528,6 +1552,7 @@ static uint32_t *fw_write_set_queue_cmd(
+ 	*buf++ = qos_u32_to_uc(queue->queue_wred_slope_green);
+ 	*buf++ = qos_u32_to_uc(queue->queue_wred_min_guaranteed);
+ 	*buf++ = qos_u32_to_uc(queue->queue_wred_max_allowed);
++	*buf++ = qos_u32_to_uc(queue->is_alias_slave);
+ 
+ 	return buf;
+ }
+@@ -1591,9 +1616,10 @@ static uint32_t *fw_write_remove_queue_cmd(
+ {
+ 	*buf++ = qos_u32_to_uc(UC_QOS_COMMAND_REMOVE_QUEUE);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(2);
++	*buf++ = qos_u32_to_uc(3);
+ 	*buf++ = qos_u32_to_uc(cmd->phy);
+ 	*buf++ = qos_u32_to_uc(cmd->data);
++	*buf++ = qos_u32_to_uc(cmd->is_alias_slave);
+ 	return buf;
+ }
+ 
+@@ -1862,6 +1888,10 @@ static uint32_t *restart_node(
+ 	} else if (node_queue(node)) {
+ 		cmd->base.pos = cur;
+ 		queue.rlm = node->data.queue.rlm;
++		queue.is_alias_slave =
++			(node->data.queue.alias_master_id == PP_QOS_INVALID_ID)
++			? 0 : 1;
++
+ 		QOS_LOG_DEBUG("CMD_INTERNAL_RESTART_QUEUE: %u\n", phy);
+ 		cur = fw_write_set_queue_cmd(
+ 				cur,
+@@ -2099,7 +2129,9 @@ static uint32_t *set_queue_cmd_wrapper(
+ 		return buf;
+ 	}
+ 
++	queue->is_alias_slave = cmd->is_alias_slave;
+ 	queue->valid = valid;
++
+ 	return fw_write_set_queue_cmd(
+ 			buf,
+ 			cmd->phy,
+@@ -2182,6 +2214,8 @@ static uint32_t *update_preds_cmd_wrapper(
+ 	} else {
+ 		fwdata->type_data.queue.valid = 0;
+ 		fwdata->type_data.queue.rlm = cmd->rlm;
++		fwdata->type_data.queue.is_alias_slave = cmd->is_alias_slave;
++
+ 		return fw_write_set_queue_cmd(
+ 				buf,
+ 				cmd->phy,
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+index 176911c867f7..d3cc9ae759d0 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+@@ -605,7 +605,8 @@ int pp_qos_port_stat_get(
+ static int _pp_qos_queue_set(
+ 		struct pp_qos_dev *qdev,
+ 		unsigned int id,
+-		const struct pp_qos_queue_conf *conf);
++		const struct pp_qos_queue_conf *conf,
++		struct qos_node *alias_node);
+ static int _pp_qos_queue_conf_get(
+ 		struct pp_qos_dev *qdev,
+ 		unsigned int id,
+@@ -733,7 +734,8 @@ static int check_queue_conf_validity(
+ 		unsigned int id,
+ 		const struct pp_qos_queue_conf *conf,
+ 		struct qos_node *node,
+-		uint32_t *modified)
++		uint32_t *modified,
++		struct qos_node *alias_node)
+ {
+ 	unsigned int phy;
+ 	int rc;
+@@ -756,7 +758,17 @@ static int check_queue_conf_validity(
+ 
+ 		/* New queue which has id, but no phy was allocated for it */
+ 		node_queue_init(qdev, node);
+-		node->data.queue.rlm = pp_pool_get(qdev->rlms);
++
++		if (alias_node == NULL) {
++			node->data.queue.alias_master_id = PP_QOS_INVALID_ID;
++			node->data.queue.alias_slave_id = PP_QOS_INVALID_ID;
++			node->data.queue.rlm = pp_pool_get(qdev->rlms);
++		} else {
++			node->data.queue.alias_master_id = get_id_from_phy(qdev->mapping, get_phy_from_node(qdev->nodes, alias_node));
++			node->data.queue.alias_slave_id = PP_QOS_INVALID_ID;
++			node->data.queue.rlm = alias_node->data.queue.rlm;
++		}
++
+ 		if (node->data.queue.rlm == QOS_INVALID_RLM) {
+ 			QOS_LOG_ERR("Can't get free rlm\n");
+ 			return  -EBUSY;
+@@ -939,7 +951,26 @@ static int _pp_qos_queue_remove(struct pp_qos_dev *qdev, int id)
+ 	if (!node)
+ 		return -EINVAL;
+ 
+-	rc  = node_remove(qdev, node);
++	// Can't delete a master aliased queue, which has active slave
++	if (node->data.queue.alias_slave_id != PP_QOS_INVALID_ID) {
++		QOS_LOG_ERR("Can't remove master aliased queue (slave is %d)\n",
++			node->data.queue.alias_slave_id);
++		return -EINVAL;
++	}
++
++	// In case this is a slave alised queue, update its master
++	if (node->data.queue.alias_master_id != PP_QOS_INVALID_ID) {
++		struct qos_node *master_node;
++
++		master_node = get_conform_node(qdev,
++				node->data.queue.alias_master_id, node_queue);
++		if (!master_node)
++			return -EINVAL;
++
++		master_node->data.queue.alias_slave_id = PP_QOS_INVALID_ID;
++	}
++
++	rc = node_remove(qdev, node);
+ 	return rc;
+ }
+ 
+@@ -984,7 +1015,8 @@ int pp_qos_queue_remove(struct pp_qos_dev *qdev, unsigned int id)
+ static int _pp_qos_queue_set(
+ 		struct pp_qos_dev *qdev,
+ 		unsigned int id,
+-		const struct pp_qos_queue_conf *conf)
++		const struct pp_qos_queue_conf *conf,
++		struct qos_node *alias_node)
+ {
+ 	int rc;
+ 	unsigned int phy;
+@@ -999,19 +1031,18 @@ static int _pp_qos_queue_set(
+ 	modified = 0;
+ 	nodep = NULL;
+ 
+-	rc = check_queue_conf_validity(qdev, id, conf, &node, &modified);
++	rc = check_queue_conf_validity(qdev, id, conf,
++			&node, &modified, alias_node);
+ 	parent_changed = QOS_BITS_IS_SET(modified, QOS_MODIFIED_PARENT);
+ 	if (rc)
+ 		goto out;
+ 
+ 	if (parent_changed) {
+-		parent = get_node_from_phy(
+-				qdev->nodes,
+-				node.child_prop.parent_phy);
+-		phy = phy_alloc_by_parent(
+-				qdev,
+-				parent,
+-				conf->queue_child_prop.priority);
++		parent = get_node_from_phy(qdev->nodes,
++					   node.child_prop.parent_phy);
++		phy = phy_alloc_by_parent(qdev,
++					  parent,
++					  conf->queue_child_prop.priority);
+ 		if (!QOS_PHY_VALID(phy)) {
+ 			rc = -EINVAL;
+ 			goto out;
+@@ -1037,15 +1068,13 @@ static int _pp_qos_queue_set(
+ 			map_id_phy(qdev->mapping, id, phy);
+ 		}
+ 
+-		parent = get_node_from_phy(
+-				qdev->nodes,
+-				nodep->child_prop.parent_phy);
++		parent = get_node_from_phy(qdev->nodes,
++					   nodep->child_prop.parent_phy);
+ 	} else {
+ 		phy = get_phy_from_id(qdev->mapping, id);
+ 		nodep = get_node_from_phy(qdev->nodes, phy);
+-		parent = get_node_from_phy(
+-				qdev->nodes,
+-				nodep->child_prop.parent_phy);
++		parent = get_node_from_phy(qdev->nodes,
++					   nodep->child_prop.parent_phy);
+ 
+ 		/* Child of WSP changes priority i.e. position */
+ 		if ((parent->parent_prop.arbitration ==
+@@ -1081,13 +1110,13 @@ static int _pp_qos_queue_set(
+ 				release_rlm(qdev->rlms, node.data.queue.rlm);
+ 		}
+ 	}
++
+ 	return rc;
+ }
+ 
+-int pp_qos_queue_set(
+-		struct pp_qos_dev *qdev,
+-		unsigned int id,
+-		const struct pp_qos_queue_conf *conf)
++int pp_qos_queue_set(struct pp_qos_dev *qdev,
++		     unsigned int id,
++		     const struct pp_qos_queue_conf *conf)
+ {
+ 	int rc;
+ 
+@@ -1098,7 +1127,7 @@ int pp_qos_queue_set(
+ 		goto out;
+ 	}
+ 
+-	rc = _pp_qos_queue_set(qdev, id, conf);
++	rc = _pp_qos_queue_set(qdev, id, conf, NULL);
+ 	update_cmd_id(&qdev->drvcmds);
+ 	transmit_cmds(qdev);
+ out:
+@@ -1106,6 +1135,57 @@ int pp_qos_queue_set(
+ 	return rc;
+ }
+ 
++int pp_qos_queue_set_aliased_queue(struct pp_qos_dev *qdev,
++				   unsigned int id,
++				   const struct pp_qos_queue_conf *conf,
++				   unsigned int alias_master_id)
++{
++	int rc;
++	unsigned int phy;
++	struct qos_node *node;
++
++	QOS_LOCK(qdev);
++	PP_QOS_ENTER_FUNC();
++	if (!qos_device_ready(qdev)) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	/* Check if node id is valid */
++	phy = get_phy_from_id(qdev->mapping, alias_master_id);
++	if (!QOS_PHY_VALID(phy)) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	node = get_conform_node(qdev, alias_master_id, node_queue);
++	if (!node) {
++		rc = -EINVAL;
++		goto out;
++	}
++
++	rc = _pp_qos_queue_set(qdev, id, conf, node);
++	if (!rc) {
++		// Retrieve the master alias node again since it might have
++		// been relocated in the DB
++		node = get_conform_node(qdev, alias_master_id, node_queue);
++		if (!node) {
++			rc = -EINVAL;
++			goto out;
++		}
++
++		node->data.queue.alias_master_id = PP_QOS_INVALID_ID;
++		node->data.queue.alias_slave_id = id;
++	}
++
++	update_cmd_id(&qdev->drvcmds);
++	transmit_cmds(qdev);
++
++out:
++	QOS_UNLOCK(qdev);
++	return rc;
++}
++
+ int _pp_qos_queue_block(struct pp_qos_dev *qdev, unsigned int id)
+ {
+ 	int rc;
+@@ -1115,7 +1195,7 @@ int _pp_qos_queue_block(struct pp_qos_dev *qdev, unsigned int id)
+ 	if (rc)
+ 		return rc;
+ 	conf.blocked = 1;
+-	return _pp_qos_queue_set(qdev, id, &conf);
++	return _pp_qos_queue_set(qdev, id, &conf, NULL);
+ }
+ 
+ /**
+@@ -1155,7 +1235,7 @@ int _pp_qos_queue_unblock(struct pp_qos_dev *qdev, unsigned int id)
+ 		return rc;
+ 
+ 	conf.blocked = 0;
+-	return _pp_qos_queue_set(qdev, id, &conf);
++	return _pp_qos_queue_set(qdev, id, &conf, NULL);
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+index 77ed8389f6d4..ec47c2ea9206 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+@@ -33,7 +33,7 @@
+ /******************************************************************************/
+ /*                              CONF                                          */
+ /******************************************************************************/
+-#define PPV4_QOS_DRV_VER "1.0.3-fl"
++#define PPV4_QOS_DRV_VER "1.0.4-fl"
+ 
+ #define NUM_OF_NODES	2048U
+ #define NUM_OF_QUEUES	256U
+@@ -155,6 +155,8 @@ struct qos_node {
+ 			uint16_t	rlm;
+ 			uint8_t		green_slope;
+ 			uint8_t		yellow_slope;
++			uint16_t	alias_slave_id;
++			uint16_t	alias_master_id;
+ 		} queue;
+ 	} data;
+ 

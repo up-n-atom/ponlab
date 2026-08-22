@@ -1,0 +1,387 @@
+From e3f0f71caca5397dab57dc1e1149d86290685250 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Wed, 8 Jul 2020 12:22:05 +0300
+Subject: [PATCH] PONRTSYS-7672: OMCI channel stuck in DS if board powered up
+ under user traffic
+
+Add init sequence to block all wred queues and ports
+
+Signed-off-by: Emergi Idan <idan.emergi@intel.com>
+---
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c   |  10 ++
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h    |  39 +++++++-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  | 105 ++++++++++++++++++++-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h  |  16 ++++
+ drivers/net/ppv4/pp-dev/pp_dts.c                   |   9 ++
+ drivers/net/ppv4/pp-dev/pp_regs.c                  |   3 +-
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   |   2 +-
+ drivers/net/ppv4/pp-headers/pp_regs.h              |   1 +
+ 8 files changed, 178 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+index f22040e33d14..2898473475d8 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+@@ -22,6 +22,8 @@
+ 
+ static struct pp_qos_dev *qos_devs[PP_QOS_MAX_INSTANCES];
+ static spinlock_t drv_lock;
++u64 qos_base_addr;
++u64 qos_wred_base_addr;
+ 
+ /* CREDIT_MAX  = BW Limit Credit max value is (2^21) 2097152 */
+ /* NUM_UPDATES = There are ~91 updates per second per Mhz    */
+@@ -4199,6 +4201,9 @@ s32 qos_dev_init(struct pp_qos_dev *qdev,
+ 	s32 rc;
+ 	u32 num_reserved_ports = 0;
+ 
++	qos_base_addr = conf->qos_uc_base;
++	qos_wred_base_addr = conf->qos_wred_base;
++
+ 	rc = qos_dev_init_db(qdev, conf->max_ports, conf->max_queues,
+ 			     conf->reserved_queues, conf->num_syncqs);
+ 	if (unlikely(rc))
+@@ -4209,6 +4214,10 @@ s32 qos_dev_init(struct pp_qos_dev *qdev,
+ 	       conf,
+ 	       sizeof(struct pp_qos_init_param));
+ 
++	rc = qos_init_wred_hw(qdev);
++	if (unlikely(rc))
++		goto err;
++
+ 	/* Calculate maximum bw limit */
+ 	qdev->hwconf.max_bw_limit_kbps =
+ 		QOS_MAX_BW_KBPS_PER_1MHZ_CLK * qdev->init_params.hw_clk;
+@@ -4346,6 +4355,7 @@ void qos_dev_clean(struct pp_qos_dev *qos_dev, bool delete_debugfs)
+ 		return;
+ 
+ 	delete_all_syncq(qos_dev);
++	qos_init_wred_hw(qos_dev);
+ 
+ 	__qos_ddr_free(qos_dev);
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
+index 57a3098749f4..12253ef4aadc 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_uc_defs.h
+@@ -12,13 +12,35 @@
+ /* UC version */
+ #define UC_VERSION_MAJOR (1)
+ #define UC_VERSION_MINOR (14)
+-#define UC_VERSION_BUILD (0)
++#define UC_VERSION_BUILD (1)
+ 
+ #define QOS_MAX_PREDECESSORS        (6)
+ #define QOS_AQM_CONTEXT_MAX_QUEUES  (8)
+ #define QOS_ENHANCED_WSP_MAX_QUEUES (12)
+ #define QOS_MAX_NUM_QUEUES          (512)
+ 
++#define WRED_REG_BASE               (0x20000)
++
++/* WRED FLM Registers */
++#define WRED_PORT_YELLOW_BYTES_COUNTER(p) (WRED_REG_BASE + 0x200 + 4 * (p))
++#define WRED_PORT_GREEN_BYTES_COUNTER(p) (WRED_REG_BASE + 0x400 + 4 * (p))
++#define WRED_PORT_YELLOW_THRESHOLD(p) (WRED_REG_BASE + 0x600 + 4 * (p))
++#define WRED_PORT_GREEN_THRESHOLD(p) (WRED_REG_BASE + 0x800 + 4 * (p))
++#define WRED_QUEUE_TO_PORT_LOOKUP(q) (WRED_REG_BASE + 0xA00 + 4 * (q))
++#define WRED_Q_SIZE_BYTES_DIRECT_READ(q) (WRED_REG_BASE + 0xE00 + 4 * (q))
++
++/* WRED LGM Registers */
++#define WRED_PORT_YELLOW_BYTES_COUNTER_LGM(p) (WRED_REG_BASE + 0x1000 + 4 * (p))
++#define WRED_PORT_GREEN_BYTES_COUNTER_LGM(p) (WRED_REG_BASE + 0x1400 + 4 * (p))
++#define WRED_PORT_YELLOW_THRESHOLD_LGM(p) (WRED_REG_BASE + 0x2000 + 4 * (p))
++#define WRED_PORT_GREEN_THRESHOLD_LGM(p) (WRED_REG_BASE + 0x2400 + 4 * (p))
++#define WRED_QUEUE_TO_PORT_LOOKUP_LGM(q) (WRED_REG_BASE + 0x3000 + 4 * (q))
++#define WRED_Q_SIZE_BYTES_DIRECT_READ_LGM(q) (WRED_REG_BASE + 0x4000 + 4 * (q))
++
++/* WRED LGM B-Step Registers */
++#define WRED_INIT_REG (WRED_REG_BASE + 0x330)
++
++
+ /**************************************************************************
+  *! @enum uc_module
+  **************************************************************************
+@@ -737,6 +759,21 @@ enum uc_qos_command {
+ 	UC_QOS_CMD_MOD_REG_BMAP_GET,
+ };
+ 
++/**************************************************************************
++ *! \enum	WRED_COMMAND_OPERATION
++ **************************************************************************
++ *
++ * \brief WRED commands
++ *
++ **************************************************************************/
++typedef enum {
++	WRED_CMD_OP_READ_Q_COUNTERS, /*! Read Q counters */
++	WRED_CMD_OP_READ_CLR_Q_COUNTERS, /*! Read-Clear Q counters */
++	WRED_CMD_OP_REMOVE_Q, /*! Remove Q */
++	WRED_CMD_OP_ADD_NEW_Q, /*! Add new Q */
++	WRED_CMD_OP_UPDATE_Q, /*! Update Q */
++} WRED_COMMAND_OPERATION;
++
+ /**************************************************************************
+  *
+  * @brief UC commands.
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index f1ba7141d01e..fa8960fca339 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -19,6 +19,7 @@
+ #include "pp_desc.h"
+ #include "pp_qos_utils.h"
+ #include "infra.h"
++#include "qos_wred_regs.h"
+ 
+ #define QOS_INVALID_PRIORITY   0xF
+ 
+@@ -2022,8 +2023,8 @@ s32 qos_pools_init(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues,
+ 	start_q_idx = 0;
+ 	max_q_idx = max_queues - 1 - reserved_queues - synq_queues;
+ 	qdev->rlms = free_rlm_init(max_q_idx,
+-				   max_queues - reserved_queues - synq_queues - 1);
+-	qdev->rlm_ranges[RLM_RANGES_NORMAL].start = 1;
++				   max_queues - reserved_queues - synq_queues);
++	qdev->rlm_ranges[RLM_RANGES_NORMAL].start = start_q_idx;
+ 	qdev->rlm_ranges[RLM_RANGES_NORMAL].end = max_q_idx;
+ 
+ 	if (!qdev->rlms)
+@@ -4355,7 +4356,7 @@ s32 qos_dbg_qm_stat_show(struct pp_qos_dev *qdev, struct seq_file *s)
+ 	if (!qminfo)
+ 		return 0;
+ 
+-	QOS_DBG_PRINT(s, "Queue\t\tQocc(p)\t\tAccept(p)\tDrop(p)"
++	QOS_DBG_PRINT(s, "Queue\t\tQocc(p)\t\tQMGRocc(p)\tAccept(p)\tDrop(p)"
+ 			 "\t\tRed dropped(p)\n");
+ 
+ 	num_rlms = qdev->init_params.max_queues;
+@@ -4380,7 +4381,7 @@ s32 qos_dbg_qm_stat_show(struct pp_qos_dev *qdev, struct seq_file *s)
+ 
+ 		cur_stat = &qminfo->qstat[0];
+ 		for (j = 0; j < qminfo->num_queues; ++j) {
+-			QOS_DBG_PRINT(s, "%u\t\t%u(%u)\t\t%u\t\t%u\t\t%u\n",
++			QOS_DBG_PRINT(s, "%u\t\t%u\t\t%u\t\t%u\t\t%u\t\t%u\n",
+ 				      cur_stat->qid,
+ 				      cur_stat->qstat.queue_size_entries,
+ 				      cur_stat->qstat.qmgr_num_queue_entries,
+@@ -4569,3 +4570,99 @@ void qos_descriptor_pop(struct pp_qos_dev *qdev, u32 queue_id, u32 *descriptor)
+ 	QOS_UNLOCK(qdev);
+ 	pp_dma_free(sz, desc_addr, &desc_addr_phys);
+ }
++
++static void qos_init_wred_ports_flm(struct pp_qos_dev *qdev)
++{
++	u64 base = qos_base_addr;
++	u32 p;
++
++	for (p = 0; p < qdev->init_params.max_ports; p++) {
++		PP_REG_WR32(base + WRED_PORT_YELLOW_BYTES_COUNTER(p), 0);
++		PP_REG_WR32(base + WRED_PORT_GREEN_BYTES_COUNTER(p), 0);
++		PP_REG_WR32(base + WRED_PORT_YELLOW_THRESHOLD(p), 0);
++		PP_REG_WR32(base + WRED_PORT_GREEN_THRESHOLD(p), 0);
++	}
++}
++
++static void qos_init_wred_ports_lgm(struct pp_qos_dev *qdev)
++{
++	u64 base = qos_base_addr;
++	u32 p;
++
++	for (p = 0; p < qdev->init_params.max_ports; p++) {
++		PP_REG_WR32(base + WRED_PORT_YELLOW_BYTES_COUNTER_LGM(p), 0);
++		PP_REG_WR32(base + WRED_PORT_GREEN_BYTES_COUNTER_LGM(p), 0);
++		PP_REG_WR32(base + WRED_PORT_YELLOW_THRESHOLD_LGM(p), 0);
++		PP_REG_WR32(base + WRED_PORT_GREEN_THRESHOLD_LGM(p), 0);
++	}
++}
++
++static void qos_init_wred_ports(struct pp_qos_dev *qdev)
++{
++	pr_info("Init QoS %u ports\n", qdev->init_params.max_ports);
++	if (IS_ENABLED(CONFIG_PPV4_LGM))
++		qos_init_wred_ports_lgm(qdev);
++	else
++		qos_init_wred_ports_flm(qdev);
++}
++
++static int qos_init_wred_queues(struct pp_qos_dev *qdev)
++{
++	u64 base = qos_base_addr;
++	u32 q;
++
++	pr_info("Init QoS %u queues\n", qdev->init_params.max_queues);
++
++	for (q = 0; q < qdev->init_params.max_queues; q++) {
++		if (IS_ENABLED(CONFIG_PPV4_LGM)) {
++			PP_REG_WR32(base + WRED_QUEUE_TO_PORT_LOOKUP_LGM(q), 0);
++			PP_REG_WR32(base + WRED_Q_SIZE_BYTES_DIRECT_READ_LGM(q),
++				    0);
++		} else {
++			PP_REG_WR32(base + WRED_QUEUE_TO_PORT_LOOKUP(q), 0);
++			PP_REG_WR32(base + WRED_Q_SIZE_BYTES_DIRECT_READ(q), 0);
++		}
++
++		if (IS_ENABLED(CONFIG_PPV4_LGM) &&
++		    pp_silicon_step_get() == PP_SSTEP_B)
++			continue;
++
++		/* clear queue counters */
++		PP_REG_WR32(PP_QOS_WRED_Q_ADDR_REG, q);
++		PP_REG_WR32(PP_QOS_WRED_Q_CNTS_CLR_REG, 0x3FF);
++		PP_REG_WR32(PP_QOS_WRED_MEM_CMD_REG,
++			    WRED_CMD_OP_READ_CLR_Q_COUNTERS);
++		if (pp_reg_poll(PP_QOS_WRED_MEM_ACCESS_BUSY_REG, BIT(0), 0)) {
++			pr_err("Q%u reset counters command fails\n", q);
++			return -EIO;
++		}
++
++		PP_REG_WR32(PP_QOS_WRED_Q_ADDR_REG, q);
++		PP_REG_WR32(PP_QOS_WRED_MEM_CMD_REG, WRED_CMD_OP_REMOVE_Q);
++		if (pp_reg_poll(PP_QOS_WRED_MEM_ACCESS_BUSY_REG, BIT(0), 0)) {
++			pr_err("Q%u remove command fails\n", q);
++			return -EIO;
++		}
++	}
++
++	if (IS_ENABLED(CONFIG_PPV4_LGM) &&
++	    pp_silicon_step_get() == PP_SSTEP_B) {
++		/* Initializes all queues (Remove all queues) */
++		PP_REG_WR32(base + WRED_INIT_REG, 1);
++
++		// Wait for init done
++		if (pp_reg_poll(base + WRED_INIT_REG, BIT(31), 1)) {
++			pr_err("WRED init fails\n");
++			return -EIO;
++		}
++	}
++
++	return 0;
++}
++
++int qos_init_wred_hw(struct pp_qos_dev *qdev)
++{
++	qos_init_wred_ports(qdev);
++
++	return qos_init_wred_queues(qdev);
++}
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+index 06eff42d033e..db797a5d1aff 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.h
+@@ -14,6 +14,11 @@
+ #include "pp_qos_uc_defs.h"
+ #include "pp_qos_common.h"
+ 
++extern u64 qos_base_addr;
++extern u64 qos_wred_base_addr;
++#define QOS_BASE_ADDR qos_base_addr
++#define QOS_WRED_BASE_ADDR qos_wred_base_addr
++
+ /******************************************************************************/
+ /*                              CONF                                          */
+ /******************************************************************************/
+@@ -134,6 +139,7 @@ struct fw_sec_info {
+  * @struct pp_qos_init_param - qos subsystem initialization struct
+  * @valid                 params valid
+  * @qos_uc_base           UC base address
++ * @qos_wred_base         WRED base address
+  * @wakeuc                wkae uC register base address
+  * @max_ports             Maximum supported ports
+  * @max_queues            Maximum supported queues
+@@ -168,6 +174,7 @@ struct fw_sec_info {
+ struct pp_qos_init_param {
+ 	bool               valid;
+ 	u64                qos_uc_base;
++	u64                qos_wred_base;
+ 	u64                wakeuc;
+ 	u32                max_ports;
+ 	u32                max_queues;
+@@ -582,6 +589,15 @@ s32 qos_clk_depend_nodes_list_get(struct pp_qos_dev *qdev, ulong *bmap, u32 n);
+  */
+ s32 pp_qos_dev_init(struct pp_qos_dev *qos_dev, struct pp_qos_init_param *conf);
+ 
++/**
++ * @brief Init WRED HW registers to prevent packets
++ *        to queued into the queues before the uC
++ *        was initialized
++ * @param qdev
++ * @return int 0 on success, error code otherwise
++ */
++int qos_init_wred_hw(struct pp_qos_dev *qdev);
++
+ /**
+  * pp_qos_dev_clean() - clean resources.
+  * @qos_dev: handle to qos device instance obtained from pp_qos_dev_open
+diff --git a/drivers/net/ppv4/pp-dev/pp_dts.c b/drivers/net/ppv4/pp-dev/pp_dts.c
+index 72652235de3a..96af488ff237 100644
+--- a/drivers/net/ppv4/pp-dev/pp_dts.c
++++ b/drivers/net/ppv4/pp-dev/pp_dts.c
+@@ -625,6 +625,13 @@ static s32 __dts_qos_cfg(struct pp_dts_cfg *dts_cfg)
+ 	if (unlikely(ret))
+ 		return ret;
+ 
++	/* Fetch qos wred base address */
++	ret = __dts_virt_addr_remap(pdev, "reg-wred",
++				    &dts_cfg->qos_params.qos_wred_base,
++				    HW_MOD_QOS_WRED);
++	if (unlikely(ret))
++		return ret;
++
+ 	/* Configure all qos uc base related addresses */
+ 	dts_cfg->qos_params.fwcom.cmdbuf =
+ 		dts_cfg->qos_params.qos_uc_base +
+@@ -909,6 +916,8 @@ void pp_dts_cfg_dump(struct pp_dts_cfg *cfg)
+ 	pr_info("Bmgr groups %u\n", cfg->bm_params.max_groups);
+ 	pr_info("Qos uC Base 0x%llx\n",
+ 		pp_virt_to_phys((void *)cfg->qos_params.qos_uc_base));
++	pr_info("Qos WRED Base 0x%llx\n",
++		pp_virt_to_phys((void *)cfg->qos_params.qos_wred_base));
+ 	pr_info("Qos CoDel BM Base 0x%llx\n", cfg->qos_params.bm_base);
+ 	pr_info("Qos ports %u\n", cfg->qos_params.max_ports);
+ 	pr_info("Qos queues %u\n", cfg->qos_params.max_queues);
+diff --git a/drivers/net/ppv4/pp-dev/pp_regs.c b/drivers/net/ppv4/pp-dev/pp_regs.c
+index 3852fa5afebb..82e00c7b67c6 100644
+--- a/drivers/net/ppv4/pp-dev/pp_regs.c
++++ b/drivers/net/ppv4/pp-dev/pp_regs.c
+@@ -22,7 +22,7 @@
+ 
+ bool simulation_dbg;
+ ulong mod_reg_log_en[BITS_TO_LONGS(HW_MOD_CNT)];
+-static const char * const mod_str[] = {
++static const char * const mod_str[HW_MOD_CNT + 1] = {
+ 	[HW_MOD_INFRA]     = "Infra    : ",
+ 	[HW_MOD_PARSER]    = "Parser   : ",
+ 	[HW_MOD_RPB]       = "Rpb      : ",
+@@ -33,6 +33,7 @@ static const char * const mod_str[] = {
+ 	[HW_MOD_RXDMA]     = "Rxdma    : ",
+ 	[HW_MOD_BMNGR]     = "Bmngr    : ",
+ 	[HW_MOD_QOS]       = "Qos      : ",
++	[HW_MOD_QOS]       = "Qos WRED : ",
+ 	[HW_MOD_EG_UC]     = "Eg_uc    : ",
+ 	[HW_MOD_IN_UC]     = "In_uc    : ",
+ 	[HW_MOD_CNT]       = ""
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index 291f2a7e5425..3d9e11933805 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -13,7 +13,7 @@
+  * the version here
+  */
+ #define EGRESS_VER_MAJOR  1
+-#define EGRESS_VER_MINOR  14
++#define EGRESS_VER_MINOR  15
+ 
+ #define INGRESS_VER_MAJOR 1
+ #define INGRESS_VER_MINOR 2
+diff --git a/drivers/net/ppv4/pp-headers/pp_regs.h b/drivers/net/ppv4/pp-headers/pp_regs.h
+index e7869e59de1c..a5cd4fb26d89 100644
+--- a/drivers/net/ppv4/pp-headers/pp_regs.h
++++ b/drivers/net/ppv4/pp-headers/pp_regs.h
+@@ -90,6 +90,7 @@ enum pp_hw_module {
+ 	HW_MOD_RXDMA,
+ 	HW_MOD_BMNGR,
+ 	HW_MOD_QOS,
++	HW_MOD_QOS_WRED,
+ 	HW_MOD_EG_UC,
+ 	HW_MOD_IN_UC,
+ 	HW_MOD_CNT

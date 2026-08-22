@@ -1,0 +1,489 @@
+From a8295773e091bd337d6ea6d2642f5029f7095096 Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Wed, 20 Jan 2021 18:17:03 +0800
+Subject: [PATCH] DRV_DPM_SW-438 - DPM enhance de-register dev for DC case,
+ cleanup other files, API's
+
+---
+ drivers/net/datapath/dpm/datapath.h              |   3 -
+ drivers/net/datapath/dpm/datapath_api.c          |  70 ++++---
+ drivers/net/datapath/dpm/gswip30/datapath_misc.c |   7 +-
+ drivers/net/datapath/dpm/gswip30/datapath_misc.h |   3 +
+ drivers/net/datapath/dpm/gswip31/Makefile        |   4 -
+ drivers/net/datapath/dpm/gswip31/datapath_coc.c  | 228 -----------------------
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c |   3 -
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c     |   3 +
+ 8 files changed, 46 insertions(+), 275 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 150310fa0546..0ec8d75bc868 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -936,13 +936,10 @@ struct pmac_port_info *get_port_info_via_dev(struct net_device *dev);
+ void dp_clear_mib(dp_subif_t *subif, uint32_t flag);
+ extern u32 dp_drop_all_tcp_err;
+ extern u32 dp_pkt_size_check;
+-void dp_mib_exit(void);
+ void print_parser_status(struct seq_file *s);
+ void proc_mib_timer_read(struct seq_file *s);
+ int mpe_fh_netfiler_install(void);
+ #ifdef CONFIG_LTQ_DATAPATH_CPUFREQ
+-int dp_coc_cpufreq_exit(void);
+-int dp_coc_cpufreq_init(void);
+ int dp_cpufreq_notify_init(int inst);
+ int dp_cpufreq_notify_exit(void);
+ #endif
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index d937c8445166..c5f0ae8eb3bc 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -1433,13 +1433,26 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 			dp_notifier_invoke(inst, port_info->dev, port_id, 0,
+ 					   DP_EVENT_DE_REGISTER_DEV);
+ 			port_info->status = PORT_ALLOCATED;
+-			DP_CB(inst, dev_platform_set)(inst, port_id, data,
+-						      flags);
+ #if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++			cbm_data = kzalloc(sizeof(*cbm_data), GFP_ATOMIC);
++			if (!cbm_data)
++				goto exit;
++
++			if (dp_build_cqm_data(inst, port_id, cbm_data, data))
++				goto exit;
++
++			/* Free CQM resources allocated during dev register */
++			if (dp_cqm_port_alloc_complete(owner, port_info,
++						       port_id, cbm_data,
++						       DP_F_DEREGISTER))
++				goto exit;
++
+ 			p = get_dp_deqport_info(inst, port_info->deq_port_base);
+ 			if (p->ref_cnt_umt && !(--p->ref_cnt_umt))
+ 				remove_umt(inst, &port_info->umt);
+ #endif
++			DP_CB(inst, dev_platform_set)(inst, port_id, data,
++						      flags);
+ 			res = DP_SUCCESS;
+ 		} else {
+ 			pr_err("(%s)de-register fail for status:%d,%s(%d)\n",
+@@ -1447,57 +1460,42 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 			       port_info->status, "num_subif",
+ 			       port_info->num_subif);
+ 		}
+-		DP_LIB_UNLOCK(&dp_lock);
+-		return res;
++		goto exit;
+ 	}
+ 
+ 	/*register a device */
+ 	if (port_info->status != PORT_ALLOCATED) {
+ 		pr_err("register dev fail for %s for unknown status:%d\n",
+ 		       owner->name, port_info->status);
+-		DP_LIB_UNLOCK(&dp_lock);
+-		return DP_FAILURE;
++		res = DP_FAILURE;
++		goto exit;
+ 	}
+ 
+ 	if (port_info->owner != owner) {
+ 		pr_err("No matched owner(%s):%px->%px\n",
+ 		       owner->name, owner, port_info->owner);
+-		DP_LIB_UNLOCK(&dp_lock);
+-		return res;
++		goto exit;
+ 	}
+ 
+ 	DP_CB(inst, dev_platform_set)(inst, port_id, data, flags);
+ 	port_info->res_qid_base = data->qos_resv_q_base;
+ 	port_info->num_resv_q = data->num_resv_q;
+ 
+-	cbm_data = devm_kzalloc(&g_dp_dev->dev, sizeof(*cbm_data), GFP_ATOMIC);
+-	if (!cbm_data) {
+-		DP_LIB_UNLOCK(&dp_lock);
+-		return res;
+-	}
++	cbm_data = kzalloc(sizeof(*cbm_data), GFP_ATOMIC);
++	if (!cbm_data)
++		goto exit;
+ 
+-	res = dp_build_cqm_data(inst, port_id, cbm_data, data);
+-	if (res == DP_FAILURE) {
+-		devm_kfree(&g_dp_dev->dev, cbm_data);
+-		DP_LIB_UNLOCK(&dp_lock);
+-		return res;
+-	}
++	if (dp_build_cqm_data(inst, port_id, cbm_data, data))
++		goto exit;
+ 
+ 	/* Register device to CQM */
+ 	if (dp_cqm_port_alloc_complete(owner, port_info, port_id, cbm_data,
+-				       flags)) {
+-		devm_kfree(&g_dp_dev->dev, cbm_data);
+-		DP_LIB_UNLOCK(&dp_lock);
+-		return DP_FAILURE;
+-	}
++				       flags))
++		goto exit;
+ 
+ 	if (data->num_rx_ring || data->num_tx_ring) {
+-		res = dp_register_dc(inst, port_id, cbm_data, data, flags);
+-		if (res == DP_FAILURE) {
+-			devm_kfree(&g_dp_dev->dev, cbm_data);
+-			DP_LIB_UNLOCK(&dp_lock);
+-			return res;
+-		}
++		if (dp_register_dc(inst, port_id, cbm_data, data, flags))
++			goto exit;
+ 	}
+ 
+ 	/* TODO: Need a HAL layer API for CQM and DMA Setup for CQM QoS path
+@@ -1510,10 +1508,12 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 	dp_notifier_invoke(inst, port_info->dev, port_id, 0,
+ 			   DP_EVENT_REGISTER_DEV);
+ 
+-	DP_LIB_UNLOCK(&dp_lock);
+-	devm_kfree(&g_dp_dev->dev, cbm_data);
++	res = DP_SUCCESS;
+ 
+-	return DP_SUCCESS;
++exit:
++	kfree(cbm_data);
++	DP_LIB_UNLOCK(&dp_lock);
++	return res;
+ }
+ EXPORT_SYMBOL(dp_register_dev_ext);
+ 
+@@ -2931,15 +2931,13 @@ void dp_cleanup_module(void)
+ 
+ 	if (dp_init_ok) {
+ 		DP_LIB_LOCK(&dp_lock);
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_MIB)
+-		dp_mib_exit();
+-#endif
+ 		for (i = 0; i < dp_inst_num; i++) {
+ 			DP_CB(i, dp_platform_set)(i, DP_PLATFORM_DE_INIT);
+ 			free_dma_chan_tbl(i);
+ 			free_dp_port_subif_info(i);
+ 		}
+ 		dp_init_ok = 0;
++
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_CPUFREQ)
+ 		dp_cpufreq_notify_exit();
+ #endif
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_misc.c b/drivers/net/datapath/dpm/gswip30/datapath_misc.c
+index 2242a60a49fe..7668dc3956fa 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip30/datapath_misc.c
+@@ -443,8 +443,13 @@ static int dp_platform_set(int inst, u32 flag)
+ 	}
+ 		if (!inst)
+ 			dp_sub_proc_install_30();
+-	if (!inst)
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_MIB)
++	if (!inst) {
+ 		mib_init(0);
++		if (flag == DP_PLATFORM_DE_INIT)
++			dp_mib_exit();
++	}
++#endif
+ 	dp_get_gsw_parser_30(NULL, NULL, NULL, NULL);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_CPUFREQ)
+ 	if (!inst) {
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_misc.h b/drivers/net/datapath/dpm/gswip30/datapath_misc.h
+index 7a6001fba3d2..ef32d9859f77 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip30/datapath_misc.h
+@@ -92,6 +92,8 @@ int lookup_start30(void);
+ ssize_t proc_get_qid_via_index30(struct file *file, const char *buf,
+ 				 size_t count, loff_t *ppos);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_CPUFREQ)
++int dp_coc_cpufreq_exit(void);
++int dp_coc_cpufreq_init(void);
+ int dp_handle_cpufreq_event_30(int event_id, void *cfg);
+ void proc_coc_read_30(struct seq_file *s);
+ ssize_t proc_coc_write_30(struct file *file, const char *buf, size_t count,
+@@ -100,6 +102,7 @@ ssize_t proc_coc_write_30(struct file *file, const char *buf, size_t count,
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_MIB)
+ int dp_reset_sys_mib(u32 flag);
+ int dp_mib_init(u32 flag);
++void dp_mib_exit(void);
+ #endif
+ 
+ #endif
+diff --git a/drivers/net/datapath/dpm/gswip31/Makefile b/drivers/net/datapath/dpm/gswip31/Makefile
+index cde8d7420852..bab537b3f495 100644
+--- a/drivers/net/datapath/dpm/gswip31/Makefile
++++ b/drivers/net/datapath/dpm/gswip31/Makefile
+@@ -3,10 +3,6 @@ obj-$(CONFIG_INTEL_DATAPATH) += datapath_ppv4.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_ppv4_api.o
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_rx.o datapath_tx.o
+ 
+-ifneq ($(CONFIG_INTEL_DATAPATH_CPUFREQ),)
+-obj-$(CONFIG_INTEL_DATAPATH) += datapath_coc.o
+-endif
+-
+ ifneq ($(CONFIG_INTEL_DATAPATH_SWITCHDEV),)
+ obj-$(CONFIG_INTEL_DATAPATH) += datapath_switchdev.o datapath_ext_vlan.o datapath_tc_asym_vlan.o
+ endif
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_coc.c b/drivers/net/datapath/dpm/gswip31/datapath_coc.c
+deleted file mode 100644
+index 516554fe1c4c..000000000000
+--- a/drivers/net/datapath/dpm/gswip31/datapath_coc.c
++++ /dev/null
+@@ -1,228 +0,0 @@
+-// SPDX-License-Identifier: GPL-2.0
+-/* Copyright (C) Intel Corporation
+- * Author: Shao Guohua <guohua.shao@intel.com>
+- */
+-
+-#define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
+-
+-#include <linux/module.h>
+-#include <linux/types.h>	/* size_t */
+-#include <linux/timer.h>
+-#include <net/datapath_api.h>
+-#include <net/datapath_proc_api.h>
+-#include "../datapath.h"
+-
+-#define DP_MODULE  LTQ_CPUFREQ_MODULE_DP
+-#define DP_ID 0	 /* this ID should represent the Datapath interface No. */
+-static struct timer_list dp_coc_timer;
+-static u32 polling_period;	/*seconds */
+-static int rmon_timer_en;
+-
+-/* threshold data for D0:D3 */
+-struct ltq_cpufreq_threshold rmon_threshold = { 0, 30, 20, 10 }; /*packets */
+-
+-/* driver is busy and needs highest performance */
+-static int dp_coc_init_stat;	/*DP COC is Initialized or not */
+-static int dp_coc_ena;		/*DP COC is enabled or not */
+-enum ltq_cpufreq_state dp_coc_ps_curr = LTQ_CPUFREQ_PS_UNDEF;/*current state*/
+-/*new statue wanted to switch to */
+-enum ltq_cpufreq_state dp_coc_ps_new = LTQ_CPUFREQ_PS_UNDEF;
+-
+-static GSW_RMON_Port_cnt_t rmon_last[PMAC_MAX_NUM];
+-static u64 last_rmon_rx;
+-
+-/*meter */
+-#define PCE_OVERHD 20
+-static u32 meter_id;
+-/*3 ~ 4 packet size */
+-static u32 meter_ncbs = 0x8000 + (1514 + PCE_OVERHD) * 3 + 200;
+-/*1 ~ 2 packet size */
+-static u32 meter_nebs = 0x8000 + (1514 + PCE_OVERHD) * 1 + 200;
+-/*k bits */
+-static u32 meter_nrate[4] = { 0/*D0 */, 700/*D1*/, 600/*D2*/, 500/*D3*/};
+-
+-static int dp_coc_cpufreq_notifier(struct notifier_block *nb,
+-				   unsigned long val, void *data);
+-static int dp_coc_stateget(enum ltq_cpufreq_state *state);
+-static int dp_coc_fss_ena(int ena);
+-static int apply_meter_rate(u32 rate, enum ltq_cpufreq_state new_state);
+-static int enable_meter_interrupt(void);
+-static int clear_meter_interrupt(void);
+-
+-int dp_set_meter_rate(enum ltq_cpufreq_state stat, u32 rate)
+-{
+-	/*set the rate for upscaling to D0 from specified stat */
+-	if (stat == LTQ_CPUFREQ_PS_D1)
+-		meter_nrate[1] = rate;
+-	else if (stat == LTQ_CPUFREQ_PS_D2)
+-		meter_nrate[2] = rate;
+-	else if (stat == LTQ_CPUFREQ_PS_D3)
+-		meter_nrate[3] = rate;
+-	else
+-		return -1;
+-	if (dp_coc_ps_curr == stat)
+-		apply_meter_rate(-1, stat);
+-	return 0;
+-}
+-EXPORT_SYMBOL(dp_set_meter_rate);
+-
+-static struct notifier_block dp_coc_cpufreq_notifier_block = {
+-	.notifier_call = dp_coc_cpufreq_notifier
+-};
+-
+-struct ltq_cpufreq_module_info dp_coc_feature_fss = {
+-	.name = "Datapath FSS",
+-	.pmcuModule = DP_MODULE,
+-	.pmcuModuleNr = DP_ID,
+-	.powerFeatureStat = 1,
+-	.ltq_cpufreq_state_get = dp_coc_stateget,
+-	.ltq_cpufreq_pwr_feature_switch = dp_coc_fss_ena,
+-};
+-
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
+-static char *get_sub_module_str(uint32_t flag)
+-{
+-	if (flag == DP_COC_REQ_DP)
+-		return "DP";
+-	else if (flag == DP_COC_REQ_ETHERNET)
+-		return "Ethernet";
+-	else if (flag == DP_COC_REQ_VRX318)
+-		return "VRX318";
+-	else
+-		return "Unknown";
+-}
+-#endif
+-
+-static char *get_coc_stat_string(enum ltq_cpufreq_state stat)
+-{
+-	if (stat == LTQ_CPUFREQ_PS_D0)
+-		return "D0";
+-	else if (stat == LTQ_CPUFREQ_PS_D1)
+-		return "D1";
+-	else if (stat == LTQ_CPUFREQ_PS_D2)
+-		return "D2";
+-	else if (stat == LTQ_CPUFREQ_PS_D3)
+-		return "D3";
+-	else if (stat == LTQ_CPUFREQ_PS_D0D3)
+-		return "D0D3-NotCare";
+-	else if (stat == LTQ_CPUFREQ_PS_BOOST)
+-		return "Boost";
+-	else
+-		return "Undef";
+-}
+-
+-static void dp_rmon_polling(unsigned long data)
+-{
+-}
+-
+-static int dp_coc_stateget(enum ltq_cpufreq_state *state)
+-{
+-}
+-
+-static int dp_coc_fss_ena(int ena)
+-{
+-}
+-
+-void update_rmon_last(void)
+-{
+-}
+-
+-int update_coc_rmon_timer(enum ltq_cpufreq_state new_state, uint32_t flag)
+-{
+-	return 0;
+-}
+-
+-static int update_coc_cfg(enum ltq_cpufreq_state new_state,
+-			  enum ltq_cpufreq_state old_state, uint32_t flag)
+-{
+-	return 0;
+-}
+-
+-static int dp_coc_prechange(enum ltq_cpufreq_module module,
+-			    enum ltq_cpufreq_state new_state,
+-			    enum ltq_cpufreq_state old_state, u8 flags)
+-{
+-	return 0;
+-}
+-
+-static int dp_coc_postchange(enum ltq_cpufreq_module module,
+-			     enum ltq_cpufreq_state new_state,
+-			     enum ltq_cpufreq_state old_state, u8 flags)
+-{
+-	return 0;
+-}
+-
+-/* keep track of frequency transitions */
+-static int dp_coc_cpufreq_notifier(struct notifier_block *nb,
+-				   unsigned long val, void *data)
+-{
+-	return 0;
+-}
+-
+-void proc_coc_read(struct seq_file *s)
+-{
+-	if (!capable(CAP_NET_ADMIN))
+-		return;
+-}
+-
+-int dp_set_rmon_threshold(struct ltq_cpufreq_threshold *threshold,
+-			  uint32_t flags)
+-{
+-	return 0;
+-}
+-EXPORT_SYMBOL(dp_set_rmon_threshold);
+-
+-ssize_t proc_coc_write(struct file *file, const char *buf, size_t count,
+-		       loff_t *ppos)
+-{
+-	if (!capable(CAP_NET_ADMIN))
+-		return -EPERM;
+-	return count;
+-}
+-
+-int clear_meter_interrupt(void)
+-{
+-	return 0;
+-}
+-
+-int enable_meter_interrupt(void)
+-{
+-	return 0;
+-}
+-
+-/* rate      0: disable meter
+- * -1: enable meter
+- * others: really change rate.
+- */
+-int apply_meter_rate(u32 rate, enum ltq_cpufreq_state new_state)
+-{
+-	return 0;
+-}
+-
+-int meter_set_default(void)
+-{
+-	return 0;
+-}
+-
+-/* For Datapth's sub-module to request power state change, esp for
+- *  Ethernet/VRX318 driver to call it if there is state change needed.
+- *   The flag can be:
+- *     DP_COC_REQ_DP
+- *     DP_COC_REQ_ETHERNET
+- *     DP_COC_REQ_VRX318
+- */
+-int dp_coc_new_stat_req(enum ltq_cpufreq_state new_state, uint32_t flag)
+-{
+-	return 0;
+-}
+-EXPORT_SYMBOL(dp_coc_new_stat_req);
+-
+-int dp_coc_cpufreq_init(void)
+-{
+-	return 0;
+-}
+-
+-int dp_coc_cpufreq_exit(void)
+-{
+-	return 0;
+-}
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index b1f22b454b08..7af59eb34426 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1416,9 +1416,6 @@ static int dp_platform_set(int inst, u32 flag)
+ 			/*only inst zero need DMA descriptor */
+ 			init_dma_desc_mask();
+ 			dp_sub_proc_install_31();
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_CPUFREQ)
+-			dp_coc_cpufreq_init();
+-#endif
+ 		}
+ 
+ 		sif = get_dp_port_subif(pi, 0);
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index 05b0b4cfe3c6..a99d71f6b21b 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -2601,6 +2601,9 @@ static s32 dp_port_alloc_complete(struct module *owner, struct net_device *dev,
+ 	if (!owner)
+ 		return CBM_FAILURE;
+ 
++	if (flags & DP_F_DEREGISTER)
++                return CBM_SUCCESS;
++
+ 	if (flags & FLAG_ACA) {
+ 		if (fill_rx_ring_data(data) != CBM_SUCCESS)
+ 			return CBM_FAILURE;

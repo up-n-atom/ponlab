@@ -1,0 +1,311 @@
+From 8b1404625c41d64f2343ed2598c8bd5ac7b29456 Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Fri, 20 Mar 2020 14:37:51 +0800
+Subject: [PATCH] DRVLIB_SW-3134: cqm checksum offloading support
+
+---
+ drivers/net/datapath/dpm/datapath.h            |   4 +-
+ drivers/net/datapath/dpm/datapath_misc.c       | 103 ++++++++++++-------------
+ drivers/net/datapath/dpm/gswip30/datapath_tx.c |   7 +-
+ drivers/net/datapath/dpm/gswip31/datapath_tx.c |   7 +-
+ drivers/net/ethernet/lantiq/cqm/grx500/cbm.c   |  13 ++++
+ drivers/net/ethernet/lantiq/ltq_toe_drv.c      |   2 +
+ include/net/lantiq_cbm_api.h                   |   2 +
+ 7 files changed, 80 insertions(+), 58 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 3f9b9959a434..1f7196ef094e 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -955,8 +955,8 @@ int high_10dec(u64 x);
+ 
+ int dp_atoi(unsigned char *str);
+ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+-			    u32 *tcp_h_offset,
+-			    u32 *tcp_type);
++			    u32 *tcp_h_offset, u16 *l3_csum_off,
++			    u16 *l4_csum_off, u32 *tcp_type);
+ int get_vlan_info(struct net_device *dev, struct vlan_info *vinfo);
+ int dp_basic_proc(void);
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_misc.c b/drivers/net/datapath/dpm/datapath_misc.c
+index 1bdbe8820d5a..5e0a8b9cf588 100644
+--- a/drivers/net/datapath/dpm/datapath_misc.c
++++ b/drivers/net/datapath/dpm/datapath_misc.c
+@@ -384,7 +384,8 @@ int ip_offset_hw_adjust = 8;
+  * Note: skb->data points to pmac header, not L2 MAC header;
+  */
+ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+-			    u32 *tcp_h_offset, u32 *tcp_type)
++			    u32 *tcp_h_offset, u16 *l3_csum_off,
++			    u16 *l4_csum_off, u32 *tcp_type)
+ {
+ 	u8 *p_l2_mac = skb->data;
+ 	u8 *p = p_l2_mac + TWO_MAC_SIZE;
+@@ -478,23 +479,23 @@ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+ 
+ 			if (pkt_info[0].proto == PROTOCOL_UDP) {
+ 				*tcp_type = UDP_OVER_IPV4;
+-				/*clear original udp checksum */
++
+ 				if (!pkt_info[0].is_fragment)
+-					*(uint16_t *)(p_l2_mac + *ip_offset +
+-						      *tcp_h_offset +
+-						      UDP_CHKSUM_OFFSET) = 0;
++					*l4_csum_off = *ip_offset +
++						       *tcp_h_offset +
++						       UDP_CHKSUM_OFFSET;
+ 			} else {
+ 				*tcp_type = TCP_OVER_IPV4;
+-				/*clear original TCP checksum */
+-				*(uint16_t *)(p_l2_mac + *ip_offset +
+-					      *tcp_h_offset +
+-					      TCP_CHKSUM_OFFSET) = 0;
++
++				if (!pkt_info[0].is_fragment)
++					*l4_csum_off = *ip_offset +
++						       *tcp_h_offset +
++						       TCP_CHKSUM_OFFSET;
+ 			}
+ 
+ 			if (!pkt_info[0].is_fragment) {
+-				/*clear original ip4 checksum */
+-				*(uint16_t *)(p_l2_mac + *ip_offset +
+-					      IP_CHKSUM_OFFSET_IPV4) = 0;
++				*l3_csum_off =
++					*ip_offset + IP_CHKSUM_OFFSET_IPV4;
+ 			} else {
+ 				return 1;
+ 			}
+@@ -506,26 +507,27 @@ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+ 
+ 			if (pkt_info[0].proto == PROTOCOL_UDP) {
+ 				*tcp_type = UDP_OVER_IPV6;
++
+ 				if (!pkt_info[0].is_fragment)
+-					/*clear original udp checksum */
+-					*(uint16_t *)(p_l2_mac + *ip_offset +
+-						      *tcp_h_offset +
+-						      UDP_CHKSUM_OFFSET) = 0;
++					*l4_csum_off = *ip_offset +
++						       *tcp_h_offset +
++						       UDP_CHKSUM_OFFSET;
++
+ 			} else {
+ 				*tcp_type = TCP_OVER_IPV6;
+-				/*clear original TCP checksum */
+-				if (!pkt_info[0].is_fragment) {
+-					*(uint16_t *)(p_l2_mac + *ip_offset +
+-						      *tcp_h_offset +
+-						      TCP_CHKSUM_OFFSET) = 0;
+-				} else {
++
++				if (!pkt_info[0].is_fragment)
++					*l4_csum_off = *ip_offset +
++						       *tcp_h_offset +
++						       TCP_CHKSUM_OFFSET;
++				else
+ 					return 1;
+-				}
+ 			}
+-
+-			return 0;
+ 		}
++
++		return 0;
+ 	} else if (ip_num == 2) {
++
+ 		/*for tunnels:current for 6rd/dslite only */
+ 		if ((pkt_info[0].ip_ver == DP_IP_VER4) &&
+ 		    (pkt_info[1].ip_ver == DP_IP_VER6)) {
+@@ -537,23 +539,24 @@ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+ 
+ 			if (pkt_info[1].proto == PROTOCOL_UDP) {
+ 				*tcp_type = UDP_OVER_IPV6_IPV4;
+-				/*clear original udp checksum */
++
+ 				if (!pkt_info[0].is_fragment)
+-					*(uint16_t *)(p_l2_mac + *ip_offset +
+-						      *tcp_h_offset +
+-						      UDP_CHKSUM_OFFSET) = 0;
++					*l4_csum_off = *ip_offset +
++						       *tcp_h_offset +
++						       UDP_CHKSUM_OFFSET;
++
+ 			} else {
+ 				*tcp_type = TCP_OVER_IPV6_IPV4;
+-				/*clear original udp checksum */
+-				*(uint16_t *)(p_l2_mac + *ip_offset +
+-					      *tcp_h_offset +
+-					      TCP_CHKSUM_OFFSET) = 0;
++
++				if (!pkt_info[0].is_fragment)
++					*l4_csum_off = *ip_offset +
++						       *tcp_h_offset +
++						       TCP_CHKSUM_OFFSET;
+ 			}
+ 
+ 			if (!pkt_info[0].is_fragment) {
+-				/*clear original ip4 checksum */
+-				*(uint16_t *)(p_l2_mac + *ip_offset +
+-					      IP_CHKSUM_OFFSET_IPV4) = 0;
++				*l3_csum_off =
++					*ip_offset + IP_CHKSUM_OFFSET_IPV4;
+ 			} else {
+ 				return 1;
+ 			}
+@@ -561,7 +564,7 @@ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+ 			return 0;
+ 
+ 		} else if ((pkt_info[0].ip_ver == DP_IP_VER6) &&
+-			   (pkt_info[1].ip_ver == DP_IP_VER4)) {/*dslite */
++			   (pkt_info[1].ip_ver == DP_IP_VER4)) {	/*dslite */
+ 			*ip_offset = pkt_info[0].ip_offset;
+ 			*tcp_h_offset =
+ 				(pkt_info[0].next_ip_hdr_offset +
+@@ -569,26 +572,21 @@ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+ 
+ 			if (pkt_info[1].proto == PROTOCOL_UDP) {
+ 				*tcp_type = UDP_OVER_IPV4_IPV6;
++
+ 				if (!pkt_info[0].is_fragment)
+-					/*clear original udp checksum */
+-					*(uint16_t *)(p_l2_mac +
+-						      pkt_info[1].ip_offset +
+-						      *tcp_h_offset +
+-						      UDP_CHKSUM_OFFSET) = 0;
++					*l4_csum_off = pkt_info[1].ip_offset +
++						       *tcp_h_offset +
++						       UDP_CHKSUM_OFFSET;
+ 			} else {
+ 				*tcp_type = TCP_OVER_IPV4_IPV6;
+-				/*clear original udp checksum */
+-				*(uint16_t *)(p_l2_mac +
+-					      pkt_info[1].ip_offset +
+-					      pkt_info[1].udp_tcp_offset +
+-					      TCP_CHKSUM_OFFSET) = 0;
++				*l4_csum_off = pkt_info[1].ip_offset +
++					       pkt_info[1].udp_tcp_offset +
++					       TCP_CHKSUM_OFFSET;
+ 			}
+ 
+ 			if (!pkt_info[0].is_fragment) {
+-				/*clear original ip4 checksum */
+-				*(uint16_t *)(p_l2_mac +
+-					      pkt_info[1].ip_offset +
+-					      IP_CHKSUM_OFFSET_IPV4) = 0;
++				*l3_csum_off = pkt_info[1].ip_offset +
++						  IP_CHKSUM_OFFSET_IPV4;
+ 			} else {
+ 				return 1;
+ 			}
+@@ -609,7 +607,8 @@ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+ int ip_offset_hw_adjust;
+ 
+ int get_offset_clear_chksum(struct sk_buff *skb, u32 *ip_offset,
+-			    u32 *tcp_h_offset, u32 *tcp_type)
++			    u32 *tcp_h_offset, u16 *l3_csum_off,
++			    u16 *l4_csum_off, u32 *tcp_type)
+ {
+ 	struct iphdr *iph;
+ 	struct tcphdr *tcph;
+diff --git a/drivers/net/datapath/dpm/gswip30/datapath_tx.c b/drivers/net/datapath/dpm/gswip30/datapath_tx.c
+index ab0062908154..836b72231d16 100644
+--- a/drivers/net/datapath/dpm/gswip30/datapath_tx.c
++++ b/drivers/net/datapath/dpm/gswip30/datapath_tx.c
+@@ -116,7 +116,7 @@ int32_t dp_xmit_30(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 	int ep, vap;
+ 	enum dp_xmit_errors err_ret = 0;
+ 	int inst = 0;
+-	struct cbm_tx_data data;
++	struct cbm_tx_data data = {0};
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_PTP1588)
+ 	struct mac_ops *ops;
+ 	int rec_id = 0;
+@@ -186,7 +186,10 @@ int32_t dp_xmit_30(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 			goto lbl_err_ret;
+ 		}
+ 		ret_flg = get_offset_clear_chksum(skb, &ip_offset,
+-						  &tcp_h_offset, &tcp_type);
++						  &tcp_h_offset,
++						  &data.l3_chksum_off,
++						  &data.l4_chksum_off,
++						  &tcp_type);
+ 		if (likely(ret_flg == 0))
+ 			/*HW can support checksum offload*/
+ 			tx_chksum_flag = 1;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_tx.c b/drivers/net/datapath/dpm/gswip31/datapath_tx.c
+index bec1274072a2..559d1303ebfc 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_tx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_tx.c
+@@ -141,7 +141,7 @@ int32_t dp_xmit_31(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 	int ep, vap, num_deq_port, deq_port_idx, class;
+ 	enum dp_xmit_errors err_ret = 0;
+ 	int inst = 0;
+-	struct cbm_tx_data data;
++	struct cbm_tx_data data = {0};
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_PTP1588)
+ 	struct mac_ops *ops;
+ 	int rec_id = 0;
+@@ -211,7 +211,10 @@ int32_t dp_xmit_31(struct net_device *rx_if, dp_subif_t *rx_subif,
+ 			goto lbl_err_ret;
+ 		}
+ 		ret_flg = get_offset_clear_chksum(skb, &ip_offset,
+-						  &tcp_h_offset, &tcp_type);
++						  &tcp_h_offset,
++						  &data.l3_chksum_off,
++						  &data.l4_chksum_off,
++						  &tcp_type);
+ 		if (likely(ret_flg == 0))
+ 			/*HW can support checksum offload*/
+ 			tx_chksum_flag = 1;
+diff --git a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+index 9ef37fcff7d1..e23e260c4549 100644
+--- a/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
++++ b/drivers/net/ethernet/lantiq/cqm/grx500/cbm.c
+@@ -1807,6 +1807,19 @@ cbm_cpu_pkt_tx_grx500(
+ 		/* Detach th skb */
+ 		skb->head = NULL;
+ 	}
++
++	/* If PMAC header present */
++	if ((data) && (data->pmac)) {
++		data->l3_chksum_off += ((data->l3_chksum_off) ? data->pmac_len : 0);
++		data->l4_chksum_off += ((data->l4_chksum_off) ? data->pmac_len : 0);
++	}
++
++	/* IP & TCP/UDP header checksum offloading */
++	if (data->l3_chksum_off)
++		*(uint16_t *)((u8 *)tmp_data_ptr + data->l3_chksum_off) = 0;
++	if (data->l4_chksum_off)
++		*(uint16_t *)((u8 *)tmp_data_ptr + data->l4_chksum_off) = 0;
++
+ 	if (setup_desc((struct cbm_desc *)&desc, tmp_data_ptr,
+ 		       skb->len,
+ 		       skb->DW1, skb->DW0)){
+diff --git a/drivers/net/ethernet/lantiq/ltq_toe_drv.c b/drivers/net/ethernet/lantiq/ltq_toe_drv.c
+index 57b5dc8aab89..cd212e8bc556 100644
+--- a/drivers/net/ethernet/lantiq/ltq_toe_drv.c
++++ b/drivers/net/ethernet/lantiq/ltq_toe_drv.c
+@@ -1949,6 +1949,8 @@ int ltq_tso_xmit(struct sk_buff *skb,
+ 		}
+ 	}
+ 
++	ip_hdr(skb)->check = 0;
++	tcp_hdr(skb)->check = 0;
+ 	/* copy the pmac header to the tx data */
+ 	skb_push(skb, hdr_size);
+ 	memcpy(skb->data, pmac, hdr_size);
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index 0ed55858ee97..06f8f863af49 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -534,6 +534,8 @@ struct cbm_tx_data {
+ 	u8 *pmac; /*NULL: no pmac,
+ 	otherwise with pmac */
+ 	int pmac_len; /*size of the pmac */
++	u16 l3_chksum_off; /* IP header */
++	u16 l4_chksum_off; /* TCP/UDP */
+ };
+ 
+ struct cbm_dp_alloc_data {

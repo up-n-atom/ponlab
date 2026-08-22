@@ -1,0 +1,278 @@
+From 82be7f1f1f4ad8437a56a170f2e821809dfb2891 Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Fri, 17 May 2019 16:49:17 +0800
+Subject: [PATCH] DRVLIB_SW-2284: VCODEC boot fails sporadically on Falcon
+ Mountain Add function in SSO GPIO to allow set required frequency.
+
+---
+ drivers/clocksource/intel-gptc-timer.c |  55 +++++++++++++++++-
+ drivers/gpio/gpio-intel-sso.c          | 102 ++++++++++++++++++++++++++-------
+ 2 files changed, 134 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/clocksource/intel-gptc-timer.c b/drivers/clocksource/intel-gptc-timer.c
+old mode 100755
+new mode 100644
+index f4b73747d178..178f0e3220fb
+--- a/drivers/clocksource/intel-gptc-timer.c
++++ b/drivers/clocksource/intel-gptc-timer.c
+@@ -27,6 +27,8 @@
+ #include <linux/sched_clock.h>
+ #include <linux/cpu.h>
+ #include <linux/debugfs.h>
++#include <linux/platform_device.h>
++#include <linux/module.h>
+ 
+ #include <asm/time.h>
+ 
+@@ -612,7 +614,7 @@ static int gptc_of_parse_timer(struct gptc *gptc)
+ 			timer->cpuid = 0;
+ 			list_add_tail(&timer->ht_yield, &gptc_ht_yield_list);
+ 			break;
+-			default:
++		default:
+ 			break;
+ 		}
+ 	}
+@@ -918,7 +920,7 @@ static int __init gptc_timer_init(struct device_node *np)
+ CLOCKSOURCE_OF_DECLARE(lantiq_gptc_timer, "lantiq,gptc", gptc_timer_init);
+ CLOCKSOURCE_OF_DECLARE(intel_gptc_timer, "intel,gptc", gptc_timer_init);
+ 
+-static int __init gptc_heartbeat_init(void)
++static int heartbeat_init(void)
+ {
+ 	struct gptc_timer *timer;
+ 
+@@ -934,6 +936,11 @@ static int __init gptc_heartbeat_init(void)
+ 	}
+ 	return -EINVAL;
+ }
++
++static int __init gptc_heartbeat_init(void)
++{
++	return heartbeat_init();
++}
+ arch_initcall(gptc_heartbeat_init);
+ 
+ #ifdef CONFIG_LTQ_VMB
+@@ -1185,3 +1192,47 @@ static int gptc_debugfs_init(void)
+ 	return -ENOMEM;
+ }
+ late_initcall(gptc_debugfs_init);
++
++static const struct of_device_id gptc_match[] = {
++	{
++		.compatible = "intel,prx300-gptc",
++	},
++	{}
++};
++
++static int gptc_probe(struct platform_device *pdev)
++{
++	struct device_node *np = pdev->dev.of_node;
++
++	gptc_of_init(np);
++
++	gptc_clocksource_init();
++
++	/* Register immediately the clock event on BSP */
++	gptc_clkevent_init();
++
++	heartbeat_init();
++	return 0;
++}
++
++static int gptc_remove(struct platform_device *pdev)
++{
++	return 0;
++}
++
++/**
++ * GPTC might not be used as clock source in PRX300.
++ * GPTC driver for prx300 has same function scopes as other soc,
++ * but it uses platform device instead of clock source init API
++ * to better support senarios that it is not used as clock source.
++ */
++static struct platform_driver gptc_drv = {
++	.probe = gptc_probe,
++	.remove = gptc_remove,
++	.driver = {
++		.name = "gptc",
++		.of_match_table = gptc_match,
++	}
++};
++
++builtin_platform_driver(gptc_drv);
+diff --git a/drivers/gpio/gpio-intel-sso.c b/drivers/gpio/gpio-intel-sso.c
+index 5f19fa31793b..310d9302f4bc 100644
+--- a/drivers/gpio/gpio-intel-sso.c
++++ b/drivers/gpio/gpio-intel-sso.c
+@@ -15,27 +15,39 @@
+ #include <linux/clk.h>
+ 
+ /* reg definition */
+-#define DUTY_CYCLE(x)	(0x8 + ((x) * 4))
+-#define SSO_CON0	0x2B0
+-#define SSO_CON1	0x2B4
+-#define SSO_CPU		0x2B8
+-#define SSO_CON2	0x2C4
+-#define SSO_CON3	0x2C8
++#define DUTY_CYCLE(x)		(0x8 + ((x) * 4))
++#define SSO_CON0		0x2B0
++#define SSO_CON1		0x2B4
++#define SSO_CPU			0x2B8
++#define SSO_CON2		0x2C4
++#define SSO_CON3		0x2C8
+ 
+ /* CON0 */
+-#define SWU		31
+-#define BLINK_R		30
+-#define RZFL		26
++#define SWU			31
++#define BLINK_R			30
++#define RZFL			26
+ 
+ /* CON1 */
+-#define US		30
+-#define US_MASK		3
++#define US			30
++#define US_MASK			3
+ #define MAX_PIN_NUM_PER_BANK	32
+ #define MAX_GROUP_NUM		4
+ #define PINS_PER_GROUP		8
++#define FPID_FREQ_RANK_MAX	4
++#define SSO_CON1_FPID		23
++#define SSO_CON1_FPID_MASK	3
++#define SSO_CON1_GPTD		25
++#define SSO_CON1_GPTD_MASK	3
+ 
++static const int freq_tbl[] = {2, 4, 8, 10, 50000, 100000, 200000, 250000};
+ static const char * const sso_gpio_drv_name = "intel-sso-gpio";
+ 
++enum {
++	US_SW = 0,
++	US_GPTC = 1,
++	US_FPID = 2
++};
++
+ /**
+  * struct sso_gpio_priv
+  *
+@@ -57,6 +69,7 @@ struct sso_gpio_priv {
+ 	u32 pins;
+ 	int gpio_base;
+ 	int edge;
++	int freq;
+ 	u32 alloc_bitmap;
+ };
+ 
+@@ -118,7 +131,9 @@ sso_gpio_dir_out(struct gpio_chip *chip, unsigned int offset, int value)
+ {
+ 	struct sso_gpio_priv *priv = gpiochip_get_data(chip);
+ 
+-	return sso_gpio_update_bit(priv->mmap, SSO_CPU, offset, value);
++	sso_gpio_update_bit(priv->mmap, SSO_CPU, offset, value);
++	if (!priv->freq)
++		sso_gpio_update_bit(priv->mmap, SSO_CON0, SWU, 1);
+ }
+ 
+ static int sso_gpio_get(struct gpio_chip *chip, unsigned int offset)
+@@ -135,7 +150,46 @@ static void sso_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+ 	struct sso_gpio_priv *priv = gpiochip_get_data(chip);
+ 
+ 	sso_gpio_update_bit(priv->mmap, SSO_CPU, offset, value);
+-	sso_gpio_update_bit(priv->mmap, SSO_CON0, SWU, 1);
++	if (!priv->freq)
++		sso_gpio_update_bit(priv->mmap, SSO_CON0, SWU, 1);
++}
++
++static int sso_gpio_get_freq_idx(int freq)
++{
++	int idx;
++
++	for (idx = 0; idx < ARRAY_SIZE(freq_tbl); idx++) {
++		if (freq <= freq_tbl[idx])
++			return idx;
++	}
++
++	return (idx - 1);
++}
++
++static int sso_gpio_freq_set(struct sso_gpio_priv *priv)
++{
++	u32 mask, freq_idx, val, off, us;
++
++	freq_idx = sso_gpio_get_freq_idx(priv->freq);
++	val = freq_idx % FPID_FREQ_RANK_MAX;
++
++	if (!priv->freq) {
++		us = US_SW;
++	} else if (freq_idx < FPID_FREQ_RANK_MAX) {
++		mask = SSO_CON1_FPID_MASK;
++		off = SSO_CON1_FPID;
++		us = US_FPID;
++	} else {
++		mask = SSO_CON1_GPTD_MASK;
++		off = SSO_CON1_GPTD;
++		us = US_GPTC;
++	}
++
++	/* Update FSC/GPT Divider and US for LED  */
++	sso_gpio_write_mask(priv->mmap, SSO_CON1, US, US_MASK, us);
++	sso_gpio_write_mask(priv->mmap, SSO_CON1, off, mask, val);
++
++	return 0;
+ }
+ 
+ static int sso_gpio_gc_init(struct sso_gpio_priv *priv,
+@@ -199,12 +253,12 @@ static int sso_gpio_hw_init(struct sso_gpio_priv *priv)
+ 	if (sso_gpio_update_bit(priv->mmap, SSO_CON0, RZFL, priv->edge))
+ 		return -ENOTSUPP;
+ 
+-	/* SW mode by default */
+-	if (sso_gpio_update_bit(priv->mmap, SSO_CON0, BLINK_R, 0))
+-		return -ENOTSUPP;
+-	if (sso_gpio_write_mask(priv->mmap, SSO_CON0, US, US_MASK, 0))
++	if (sso_gpio_update_bit(priv->mmap, SSO_CON0, BLINK_R, 1))
+ 		return -ENOTSUPP;
+ 
++	/* Set GPIO update rate */
++	sso_gpio_freq_set(priv);
++
+ 	return 0;
+ }
+ 
+@@ -220,6 +274,10 @@ static int intel_sso_gpio_probe(struct platform_device *pdev)
+ 	if (!priv)
+ 		return -ENOMEM;
+ 
++	priv->dev = dev;
++	priv->pdev = pdev;
++	platform_set_drvdata(pdev, priv);
++
+ 	/* pin base */
+ 	if (device_property_read_u32(dev, "intel,sso-gpio-base", &prop))
+ 		priv->gpio_base = -1;
+@@ -257,6 +315,12 @@ static int intel_sso_gpio_probe(struct platform_device *pdev)
+ 	else
+ 		priv->edge = 1;
+ 
++	/* update frequency */
++	if (device_property_read_u32(dev, "intel,sso-update-rate", &prop))
++		priv->freq = 0;
++	else
++		priv->freq = prop;
++
+ 	/* gpio mem */
+ 	priv->mmap = syscon_node_to_regmap(dev->of_node);
+ 	if (IS_ERR(priv->mmap)) {
+@@ -272,10 +336,6 @@ static int intel_sso_gpio_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto gc_err;
+ 
+-	priv->dev = dev;
+-	priv->pdev = pdev;
+-	platform_set_drvdata(pdev, priv);
+-
+ 	dev_dbg(dev, "sso gpio init success\n");
+ 	return 0;
+ 

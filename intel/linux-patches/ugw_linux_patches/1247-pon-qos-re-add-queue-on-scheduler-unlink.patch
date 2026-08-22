@@ -1,0 +1,129 @@
+From cd9452cc3bccbc155831d347636697f416dd5db9 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Tue, 9 Jun 2020 17:38:26 +0200
+Subject: [PATCH] pon_qos: re-add queue on scheduler unlink
+
+In case of prio qdisc re-add the queue which was remove during scheduler
+linking when the scheduler is removed from its parent. This makes sure to
+have the same behaviour in the software as before. Later this can be optimized
+by using grafting.
+
+Queues connected to a scheduler are also deleted only after all its child
+siblings schedulers are removed.
+
+Signed-off-by: Zahari Doychev <zahari.doychev@intel.com>
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c | 36 +++++++++++++++++----------
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.h |  3 +++
+ 2 files changed, 26 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 41d93e8110c8..4f5dd6afd44e 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -388,6 +388,7 @@ int pon_qos_add_child_qdisc(struct net_device *dev,
+ 
+ 		psch->children[idx] = qdisc;
+ 		psch->num_children++;
++		qdisc->p_w = prio_w;
+ 		/* get port data from parent qdisc */
+ 		qdisc->dev = dev;
+ 		qdisc->port = psch->port;
+@@ -398,6 +399,7 @@ int pon_qos_add_child_qdisc(struct net_device *dev,
+ 	} else {
+ 		qdisc = psch;
+ 		qdisc->dev = dev;
++		qdisc->p_w = PON_QOS_UNUSED;
+ 		ret = pon_qos_fill_port_data(qdisc);
+ 		if (ret < 0) {
+ 			netdev_err(dev,
+@@ -656,6 +658,7 @@ int pon_qos_tc_qdisc_unlink(struct pon_qos_port *p, struct pon_qos_qdisc *sch)
+ {
+ 	int idx = TC_H_MIN(sch->parent) - 1;
+ 	struct pon_qos_qdisc *psch = NULL;
++	int ret = 0;
+ 
+ 	if (!p || !sch)
+ 		return -EINVAL;
+@@ -670,6 +673,13 @@ int pon_qos_tc_qdisc_unlink(struct pon_qos_port *p, struct pon_qos_qdisc *sch)
+ 	psch->children[idx] = NULL;
+ 	psch->num_children--;
+ 
++	/* We have a parent e.g. prio then re-add missing queue/band. */
++	ret = pon_qos_queue_add(psch, psch->type, sch->p_w, idx);
++	if (ret < 0) {
++		netdev_err(psch->dev, "re-add queue fail\n");
++		return -ECANCELED;
++	}
++
+ 	return 0;
+ }
+ 
+@@ -677,17 +687,6 @@ int pon_qos_qdisc_tree_del(struct pon_qos_port *p, struct pon_qos_qdisc *root)
+ {
+ 	int i, ret;
+ 
+-	/* try removing the queues */
+-	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
+-		if (root->qids[i].qid) {
+-			netdev_dbg(root->dev, "%s: deleting qid: %d\n",
+-				   __func__, root->qids[i].qid);
+-			ret = pon_qos_queue_del(root, i);
+-			if (ret < 0)
+-				return -1;
+-		}
+-	}
+-
+ 	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
+ 		struct pon_qos_qdisc *sch = root->children[i];
+ 
+@@ -707,6 +706,17 @@ int pon_qos_qdisc_tree_del(struct pon_qos_port *p, struct pon_qos_qdisc *root)
+ 	if (!root->use_cnt)
+ 		return 0;
+ 
++	/* try removing the queues */
++	for (i = 0; i < PON_QOS_TC_MAX_Q; i++) {
++		if (root->qids[i].qid) {
++			netdev_dbg(root->dev, "%s: deleting qid: %d\n",
++				   __func__, root->qids[i].qid);
++			ret = pon_qos_queue_del(root, i);
++			if (ret < 0)
++				return -1;
++		}
++	}
++
+ 	ret = pon_qos_sched_del(root);
+ 	if (ret < 0)
+ 		return -1;
+@@ -881,8 +891,8 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 
+ 	ret = pon_qos_get_queue_by_handle(dev, q_tc->handle, &qid);
+ 	if (ret < 0 || !qid) {
+-		netdev_err(dev, "%s: handle not found err %d\n",
+-			   __func__, ret);
++		netdev_err(dev, "%s: en=%d, handle %#x not found err %d\n",
++			   __func__, en, q_tc->handle, ret);
+ 		return -1;
+ 	}
+ 
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+index 80cc0175ce0a..979d7762192e 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.h
+@@ -16,6 +16,7 @@
+ #define PON_QOS_DOT1P_SZ 8
+ #define PON_QOS_SCH_MAX_LEVEL 3
+ #define PON_QOS_8021P_HIGHEST_PRIO 7
++#define PON_QOS_UNUSED -1
+ 
+ enum pon_qos_qdisc_type {
+ 	PON_QOS_QDISC_NONE,
+@@ -83,6 +84,8 @@ struct pon_qos_qdisc {
+ 	/* TODO: for multi-stage schedulers */
+ 	unsigned int num_children;
+ 	struct pon_qos_qdisc *children[PON_QOS_TC_MAX_Q];
++	/* Used for sibling qdiscs */
++	int p_w;
+ 
+ 	union {
+ 		struct {

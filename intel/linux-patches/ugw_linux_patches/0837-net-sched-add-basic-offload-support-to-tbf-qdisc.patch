@@ -1,0 +1,145 @@
+From e82df6540b47701448a242f2b175e7e0d2c9e215 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Thu, 8 Aug 2019 13:35:49 +0200
+Subject: [PATCH] net: sched: add basic offload support to tbf qdisc
+
+The tbf qdisc can be used to offload shapers to hardware. The necessary
+offload hooks are added to support basic offloads. Grafting and statistics
+are left out for now. The functionality provides shaper configuration on
+scheduler and queues.
+
+Signed-off-by: Zahari Doychev <zahari.doychev@intel.com>
+---
+ include/linux/netdevice.h |  2 ++
+ include/net/pkt_cls.h     | 30 ++++++++++++++++++++++++++++++
+ net/sched/sch_tbf.c       | 37 ++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 68 insertions(+), 1 deletion(-)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 8b9f712c684b..a9b5a831263d 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -793,6 +793,7 @@ enum {
+ 	TC_SETUP_QDISC_RED,
+ 	TC_SETUP_QDISC_PRIO,
+ 	TC_SETUP_DRR,
++	TC_SETUP_TBF,
+ };
+ 
+ struct tc_cls_u32_offload;
+@@ -808,6 +809,7 @@ struct tc_to_netdev {
+ 		struct tc_red_qopt_offload *sch_red;
+ 		struct tc_prio_qopt_offload *sch_prio;
+ 		struct tc_drr_qopt_offload *sch_drr;
++		struct tc_tbf_qopt_offload *sch_tbf;
+ 	};
+ };
+ 
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index 294c23393fee..36901ebf61c3 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -629,4 +629,34 @@ struct tc_cookie {
+ 	u8  *data;
+ 	u32 len;
+ };
++
++enum tc_tbf_command {
++	TC_TBF_REPLACE,
++	TC_TBF_DESTROY,
++	TC_TBF_STATS,
++};
++
++struct tc_tbf_qopt_offload_params {
++	u64 rate;
++	u64 prate;
++	u32 burst;
++	u32 pburst;
++	struct gnet_stats_queue *qstats;
++};
++
++struct tc_tbf_qopt_offload_stats {
++	struct gnet_stats_basic_packed *bstats;
++	struct gnet_stats_queue *qstats;
++};
++
++struct tc_tbf_qopt_offload {
++	enum tc_tbf_command command;
++	u32 handle;
++	u32 parent;
++	union {
++		struct tc_tbf_qopt_offload_params set_params;
++		struct tc_tbf_qopt_offload_stats stats;
++	};
++};
++
+ #endif
+diff --git a/net/sched/sch_tbf.c b/net/sched/sch_tbf.c
+index d646aa770ac8..c4aff581764e 100644
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -21,7 +21,7 @@
+ #include <net/netlink.h>
+ #include <net/sch_generic.h>
+ #include <net/pkt_sched.h>
+-
++#include <net/pkt_cls.h>
+ 
+ /*	Simple Token Bucket Filter.
+ 	=======================================
+@@ -292,6 +292,33 @@ static const struct nla_policy tbf_policy[TCA_TBF_MAX + 1] = {
+ 	[TCA_TBF_PBURST] = { .type = NLA_U32 },
+ };
+ 
++static int tbf_offload(struct Qdisc *sch, u32 burst, u32 pburst, bool enable)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tbf_sched_data *q = qdisc_priv(sch);
++	struct tc_tbf_qopt_offload opt = {
++		.parent = sch->parent,
++		.handle = sch->handle,
++	};
++	struct tc_to_netdev tc = {.type = TC_SETUP_TBF,
++				  { .sch_tbf = &opt } };
++
++	if (!(dev->features & NETIF_F_HW_TC) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	if (enable) {
++		opt.command = TC_TBF_REPLACE;
++		opt.set_params.rate = q->rate.rate_bytes_ps;
++		opt.set_params.prate = q->peak.rate_bytes_ps;
++		opt.set_params.burst = burst;
++		opt.set_params.pburst = pburst;
++	} else
++		opt.command = TC_TBF_DESTROY;
++
++	return dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0, &tc);
++}
++
++
+ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
+ {
+ 	int err;
+@@ -404,6 +431,13 @@ static int tbf_change(struct Qdisc *sch, struct nlattr *opt)
+ 	memcpy(&q->peak, &peak, sizeof(struct psched_ratecfg));
+ 
+ 	sch_tree_unlock(sch);
++
++	if (tb[TCA_TBF_BURST]) {
++		tbf_offload(sch, nla_get_u32(tb[TCA_TBF_BURST]),
++		     tb[TCA_TBF_PBURST] ? nla_get_u32(tb[TCA_TBF_PBURST]) : 0,
++		     true);
++	}
++
+ 	err = 0;
+ done:
+ 	return err;
+@@ -428,6 +462,7 @@ static void tbf_destroy(struct Qdisc *sch)
+ {
+ 	struct tbf_sched_data *q = qdisc_priv(sch);
+ 
++	tbf_offload(sch, 0, 0, false);
+ 	qdisc_watchdog_cancel(&q->watchdog);
+ 	qdisc_destroy(q->qdisc);
+ }

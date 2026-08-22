@@ -1,0 +1,305 @@
+From 1161a8fb873cfff32f274c6c63a1576cfb715df6 Mon Sep 17 00:00:00 2001
+From: Shahed Shaikh <shahedx.shaikh@intel.com>
+Date: Tue, 8 Sep 2020 21:31:06 +0800
+Subject: [PATCH] DRV_DPM_SW-356: DPM enhance port debugfs
+
+- existing o/p of implementation of write to port debugfs
+  node is not in sync with cat /sys/.../port
+- This patch changes the behaviour or echo port <portid> > /sys/.../port
+  by caching the port value and then user need to do cat /sys/.../port
+  which will print only requested port id info.
+
+Signed-off-by: Shahed Shaikh <shahedx.shaikh@intel.com>
+---
+ drivers/net/datapath/dpm/datapath_proc.c | 168 ++++++++++++-------------------
+ 1 file changed, 65 insertions(+), 103 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index 6de0e1ab4b46..855eaf191619 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -43,14 +43,20 @@ typedef int (*print_ctp_bp_t)(struct seq_file *s, int inst,
+ 			      int subif_index, u32 flag);
+ 
+ static int tmp_inst;
+-static ssize_t proc_port_write(struct file *file, const char *buf,
+-			       size_t count, loff_t *ppos);
+ #if defined(CONFIG_INTEL_DATAPATH_DBG) && CONFIG_INTEL_DATAPATH_DBG
+ static void proc_dbg_read(struct seq_file *s);
+ static ssize_t proc_dbg_write(struct file *, const char *, size_t, loff_t *);
+ #endif
++
++#define PROC_WRITE_PORT_DEF -1
++static int proc_write_port = PROC_WRITE_PORT_DEF;
++static int proc_write_vap = PROC_WRITE_PORT_DEF;
++static bool dump_one_port = false;
++static bool dump_one_vap = false;
+ static int proc_port_dump(struct seq_file *s, int pos);
+ static int proc_port_init(void);
++static ssize_t proc_port_write(struct file *file, const char *buf,
++			       size_t count, loff_t *ppos);
+ int proc_dp_event_list_dump(struct seq_file *s, int pos);
+ 
+ #if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
+@@ -219,6 +225,18 @@ ssize_t proc_dp_mib_g_stats_write(struct file *file, const char *buf,
+ int proc_port_init(void)
+ {
+ 	tmp_inst = 0;
++
++	dump_one_port = false;
++	dump_one_vap = false;
++
++	/* check if we have been requsted to dump only specific port */
++	if (proc_write_port != PROC_WRITE_PORT_DEF) {
++		dump_one_port = true;
++		if (proc_write_vap != PROC_WRITE_PORT_DEF)
++			dump_one_vap = true;
++		return proc_write_port; /* change to requested port id */
++	}
++
+ 	return 0;
+ }
+ 
+@@ -332,6 +350,8 @@ void dump_subif_info(struct seq_file *s, struct pmac_port_info *port, int n)
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ 	seq_printf(s, "           swdev:	   %d\n", sif->swdev_en);
+ #endif
++	seq_printf(s, "           subif_groupid:  %d\n",
++		   sif->subif_groupid);
+ 	if (print_ctp_bp)
+ 		print_ctp_bp(s, tmp_inst, port, n, 0);
+ 	seq_printf(s, "           subif_qid:      %d\n", sif->num_qid);
+@@ -356,7 +376,9 @@ void dump_subif_info(struct seq_file *s, struct pmac_port_info *port, int n)
+ 	seq_printf(s, "           mac_learn_dis:  %d\n",
+ 		   sif->mac_learn_dis);
+ 	seq_printf(s, "           gpid:           %d\n", sif->gpid);
+-	seq_printf(s, "           cpu_port_en:    %d\n", sif->cpu_port_en);
++	seq_printf(s, "           cpu_port_en:    %d (%s)\n",
++		   sif->cpu_port_en,
++		   sif->cpu_port_en ? "Enabled" : "Disabled");
+ 	seq_printf(s, "           ctp_dev:        ");
+ 	if (sif->ctp_dev && sif->ctp_dev->name)
+ 		seq_puts(s, sif->ctp_dev->name);
+@@ -371,28 +393,27 @@ void dump_subif_info(struct seq_file *s, struct pmac_port_info *port, int n)
+ 
+ int proc_port_dump(struct seq_file *s, int pos)
+ {
+-	int i, j;
+-	int cqm_p;
+ 	int (*print_ctp_bp)(struct seq_file *s, int inst,
+ 			    struct pmac_port_info *port,
+ 			    int subif_index, u32 flag);
+ 	struct dp_subif_info *sif;
+-	struct pmac_port_info *port = get_dp_port_info(tmp_inst, pos);
++	struct pmac_port_info *port;
+ 	u16 start = 0;
+ 	u8 cid, pid;
+ 	u16 nid;
+-	int loop;
++	int i, start_vap, end_vap;
+ 	struct inst_info *info = NULL;
+-	struct dma_chan_info *dma;
+-	struct cqm_port_info *cqm;
+ 	struct cqm_port_info *cqm_info;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return -1;
++
++	port = get_dp_port_info(tmp_inst, pos);
+ 	if (!port) {
+ 		pr_err("Why port is NULL\n");
+ 		return -1;
+ 	}
++
+ 	info = &dp_port_prop[tmp_inst].info;
+ 	print_ctp_bp = DP_CB(tmp_inst, proc_print_ctp_bp_info);
+ 	DP_CB(tmp_inst, get_itf_start_end)(port->itf_info, &start, NULL);
+@@ -470,89 +491,20 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 	if (port->num_rx_ring || port->num_tx_ring)
+ 		dump_dc_info(s, port);
+ 
+-	if (pos == 0)
+-		loop = info->cap.max_num_subif_per_port;
+-	else
+-		loop = port->subif_max;
+-	for (i = 0; i < loop; i++) {
+-		struct dp_subif_info *sif = get_dp_port_subif(port, i);
+-		struct dev_mib *mib = get_dp_port_subif_mib(sif);
+-
+-		if (!sif->flags)
+-			continue;
+-		seq_printf(s, "      [%02d]:%s=0x%04x %s=0x%0lx(%s=%s),%s=%s\n",
+-			   i, "subif", sif->subif,
+-			   "netif", (uintptr_t)sif->netif,
+-			   "netif", sif->netif ? sif->netif->name : "NULL/DSL",
+-			   "device_name", sif->device_name);
+-
+-		seq_puts(s, "           subif_flag:     ");
+-		for (j = 0; j < get_dp_port_type_str_size(); j++) {
+-			if (sif->subif_flag & dp_port_flag[j]) {
+-				seq_puts(s, dp_port_type_str[j]);
+-				seq_puts(s, " ");
+-			}
+-		}
+-		seq_puts(s, "\n");
+-		seq_printf(s, "           rx_fn_rxif_pkt =0x%08x\n",
+-			   STATS_GET(mib->rx_fn_rxif_pkt));
+-		seq_printf(s, "           rx_fn_txif_pkt =0x%08x\n",
+-			   STATS_GET(mib->rx_fn_txif_pkt));
+-		seq_printf(s, "           rx_fn_dropped  =0x%08x\n",
+-			   STATS_GET(mib->rx_fn_dropped));
+-		seq_printf(s, "           tx_cbm_pkt     =0x%08x\n",
+-			   STATS_GET(mib->tx_cbm_pkt));
+-		seq_printf(s, "           tx_tso_pkt     =0x%08x\n",
+-			   STATS_GET(mib->tx_tso_pkt));
+-		seq_printf(s, "           tx_pkt_dropped =0x%08x\n",
+-			   STATS_GET(mib->tx_pkt_dropped));
+-		seq_printf(s, "           tx_clone_pkt   =0x%08x\n",
+-			   STATS_GET(mib->tx_clone_pkt));
+-		seq_printf(s, "           tx_hdr_room_pkt=0x%08x\n",
+-			   STATS_GET(mib->tx_hdr_room_pkt));
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+-		seq_printf(s, "           swdev:	   %d\n",
+-			   sif->swdev_en);
+-#endif
+-		seq_printf(s, "           subif_groupid:  %d\n",
+-			   sif->subif_groupid);
+-		if (print_ctp_bp)
+-			print_ctp_bp(s, tmp_inst, port, i, 0);
+-		seq_printf(s, "           subif_qid:      %d\n", sif->num_qid);
+-		seq_printf(s, "           dqport_idx:     %d\n",
+-			   sif->cqm_port_idx);
+-		for (j = 0; j < sif->num_qid; j++) {
+-			seq_printf(s, "%13s[%02d]:qid/node:    %d/%d\n", "",
+-				   j, sif->qid_list[j], sif->q_node[j]);
+-			cqm_p = sif->cqm_deq_port[j];
+-			cqm = get_dp_deqport_info(tmp_inst, cqm_p);
+-			seq_printf(s, "%18sport/node:   %d/%d(ref=%d)\n", "",
+-				   cqm_p, sif->qos_deq_port[j], cqm->ref_cnt);
+-			dp_dma_parse_id(cqm->dma_chan, &cid, &pid, &nid);
+-			dma = dp_dma_chan_tbl[tmp_inst];
+-			if (port->num_dma_chan && dma) {
+-				dma += cqm->dma_ch_offset;
+-				seq_printf(s, "%18stx_dma_ch:   0x%x(ref=%d,dma-ctrl=%d,port=%d,channel=%d)\n",
+-					   "", cqm->dma_chan,
+-					   atomic_read(&dma->ref_cnt),
+-					   cid, pid, nid);
+-			}
+-		}
+-		seq_printf(s, "           mac_learn_dis:  %d\n",
+-			   sif->mac_learn_dis);
+-		seq_printf(s, "           gpid:           %d\n", sif->gpid);
+-		seq_printf(s, "           cpu_port_en:    %d (%s)\n",
+-			   sif->cpu_port_en,
+-			   sif->cpu_port_en ? "Enabled" : "Disabled");
+-		seq_puts(s, "           ctp_dev:        ");
+-		if (sif->ctp_dev && sif->ctp_dev->name)
+-			seq_puts(s, sif->ctp_dev->name);
++	/* check if there is a request to dump only specific subif info */
++	if (dump_one_vap) {
++		start_vap = proc_write_vap;
++		end_vap = proc_write_vap + 1;
++	} else {
++		start_vap = 0;
++		if (pos == 0)
++			end_vap = info->cap.max_num_subif_per_port;
+ 		else
+-			seq_puts(s, "NULL");
+-		seq_puts(s, "\n");
+-		seq_printf(s, "           rx_en_flag:     %d\n",
+-			   STATS_GET(sif->rx_flag));
++			end_vap = port->subif_max;
+ 	}
++	for (i = start_vap; i < end_vap; i++)
++		dump_subif_info(s, port, i);
++
+ 	seq_printf(s, "    rx_err_drop=0x%08x  tx_err_drop=0x%08x\n",
+ 		   STATS_GET(port->rx_err_drop),
+ 		   STATS_GET(port->tx_err_drop));
+@@ -569,12 +521,13 @@ int proc_port_dump(struct seq_file *s, int pos)
+ 
+ 	if (!seq_has_overflowed(s))
+ 		pos++;
+-	if (pos >= MAX_DP_PORTS) {
++	if ((pos >= MAX_DP_PORTS) || dump_one_port) {
+ 		tmp_inst++;
+ 		pos = 0;
+ 	}
+ 	if (tmp_inst >= dp_inst_num)
+ 		pos = -1;	/*end of the loop */
++
+ 	return pos;
+ }
+ 
+@@ -737,24 +690,22 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ ssize_t proc_port_write(struct file *file, const char *buf, size_t count,
+ 			loff_t *ppos)
+ {
+-	int len;
+ 	char str[64];
+-	int num, i;
+ 	/*later need to put real inst value */
+ 	struct inst_info *info = &dp_port_prop[0].info;
+ 	struct pmac_port_info *port;
+-	u16 index_start = 0;
+-	u16 index_end = MAX_DP_PORTS;
+-	u16 vap_start = 0;
+-	u16 vap_end = info->cap.max_num_subif_per_port;
++	int index_start = 0, index_end = MAX_DP_PORTS;
++	int vap_start = 0, vap_end = info->cap.max_num_subif_per_port;
+ 	char *param_list[10];
+-	int inst, swdev_en;
++	int swdev_en, len, num, inst, i;
+ 
+ 	if (!capable(CAP_SYS_PACCT))
+ 		return count;
+ 	len = (sizeof(str) > count) ? count : sizeof(str) - 1;
+ 	len -= copy_from_user(str, buf, len);
+ 	str[len] = 0;
++
++	memset(param_list, 0, sizeof(param_list));
+ 	num = dp_split_buffer(str, param_list, ARRAY_SIZE(param_list));
+ 
+ 	if (num <= 1)
+@@ -781,18 +732,28 @@ ssize_t proc_port_write(struct file *file, const char *buf, size_t count,
+ 		return count;
+ 	}
+ 
+-	if (strcasecmp(param_list[0], "mib") == 0) {
++	if (strcasecmp(param_list[0], "help") == 0) {
++		goto help;
++	 } else if (strcasecmp(param_list[0], "mib") == 0) {
+ 		for (inst = 0; inst < dp_inst_num; inst++)
+ 			for (i = index_start; i < index_end; i++)
+ 				display_port_info(inst, i, vap_start, vap_end,
+ 						  1);
+ 
+ 	} else if (strcasecmp(param_list[0], "port") == 0) {
+-		for (inst = 0; inst < dp_inst_num; inst++)
+-			for (i = index_start; i < index_end; i++)
+-				display_port_info(inst, i, vap_start, vap_end,
+-						  0);
++		if (proc_write_port != index_start) {
++			pr_info("%s: changed port id to be dumped to %d\n",
++			   __func__, index_start);
++			proc_write_port = index_start;
++		}
++
++		if (param_list[2] && (proc_write_vap != vap_start)) {
++			pr_info("%s: changed sif id to be dumped to %d\n",
++			   __func__, vap_start);
++			proc_write_vap = vap_start;
++		}
+ 
++		pr_info("%s: run 'cat %s' to dump requested port info\n", __func__, DEBUGFS_DBG);
+ 	} else if (strcasecmp(param_list[0], "swdev") == 0) {
+ 		if (num != 4)
+ 			goto help;
+@@ -821,6 +782,7 @@ ssize_t proc_port_write(struct file *file, const char *buf, size_t count,
+ 	pr_info("usage:\n");
+ 	pr_info("  echo mib   [ep][vap] > %s\n", DBG_PORT);
+ 	pr_info("  echo port  [ep][vap] > %s\n", DBG_PORT);
++	pr_info("    to print all port info- echo port -1 > %s\n", DBG_PORT);
+ 	pr_info("  echo swdev [ep][vap][swdev_en] > %s\n", DBG_PORT);
+ 	return count;
+ }

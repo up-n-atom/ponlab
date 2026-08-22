@@ -1,0 +1,244 @@
+From 81a06463395e008c2821af095d6a255af57d0bb1 Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Thu, 19 Dec 2019 16:33:53 +0800
+Subject: [PATCH] PONRTSYS-4157: ETH and GSW API - add ethtool pause parameter
+ support
+
+---
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c   | 88 ++++++++++++++++++++++
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.c   | 56 +++++++-------
+ .../ethernet/lantiq/switch-api/mac/xgmac_common.h  |  7 ++
+ 3 files changed, 123 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index d08f5eef41dc..399846813335 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -248,6 +248,90 @@ static int set_link_ksettings(struct net_device *dev,
+ 	return phy_ethtool_set_link_ksettings(dev, cmd);
+ }
+ 
++static inline struct core_ops *get_swcore_ops(struct net_device *dev)
++{
++	struct ltq_eth_priv *priv = netdev_priv(dev);
++	u32 devid = g_eth_switch_mode > 1 && priv->wan ? 1 : 0;
++
++	return gsw_get_swcore_ops(devid);
++}
++
++static void get_pauseparam(struct net_device *dev,
++			   struct ethtool_pauseparam *epause)
++{
++	int ret;
++	struct core_ops *ops;
++	GSW_portCfg_t cfg = {0};
++
++	ops = get_swcore_ops(dev);
++	if (!ops) {
++		dev_err(&dev->dev, "failed in getting SW Core Ops\n");
++		return;
++	}
++
++	cfg.nPortId = dev->dev_id;
++	ret = ops->gsw_common_ops.PortCfgGet(ops, &cfg);
++	if (ret != GSW_statusOk) {
++		dev_err(&dev->dev, "failed in getting Port Cfg: %d\n", ret);
++		return;
++	}
++
++	switch (cfg.eFlowCtrl) {
++	case GSW_FLOW_AUTO:
++		epause->autoneg = 1;
++	case GSW_FLOW_RXTX:
++		epause->rx_pause = 1;
++		epause->tx_pause = 1;
++		break;
++	case GSW_FLOW_RX:
++		epause->rx_pause = 1;
++		break;
++	case GSW_FLOW_TX:
++		epause->tx_pause = 1;
++		break;
++	case GSW_FLOW_OFF:
++	default:
++		epause->autoneg = 0;
++	}
++}
++
++static int set_pauseparam(struct net_device *dev,
++			  struct ethtool_pauseparam *epause)
++{
++	int ret;
++	struct core_ops *ops;
++	GSW_portCfg_t cfg = {0};
++
++	ops = get_swcore_ops(dev);
++	if (!ops) {
++		dev_err(&dev->dev, "failed in getting SW Core Ops\n");
++		return -EINVAL;
++	}
++
++	cfg.nPortId = dev->dev_id;
++	ret = ops->gsw_common_ops.PortCfgGet(ops, &cfg);
++	if (ret != GSW_statusOk) {
++		dev_err(&dev->dev, "failed in getting Port Cfg: %d\n", ret);
++		return -EIO;
++	}
++
++	if (epause->autoneg)
++		cfg.eFlowCtrl = GSW_FLOW_AUTO;
++	else if (epause->rx_pause)
++		cfg.eFlowCtrl = epause->tx_pause ? GSW_FLOW_RXTX : GSW_FLOW_RX;
++	else if (epause->tx_pause)
++		cfg.eFlowCtrl = GSW_FLOW_TX;
++	else
++		cfg.eFlowCtrl = GSW_FLOW_OFF;
++
++	ret = ops->gsw_common_ops.PortCfgSet(ops, &cfg);
++	if (ret != GSW_statusOk) {
++		dev_err(&dev->dev, "failed in setting Port Cfg: %d\n", ret);
++		return -EIO;
++	} else
++		return 0;
++}
++
+ /* Reset the device */
+ static int nway_reset(struct net_device *dev)
+ {
+@@ -466,6 +550,8 @@ static const struct ethtool_ops ethtool_ops = {
+ 	.get_link		= ethtool_op_get_link,
+ 	.get_link_ksettings	= get_link_ksettings,
+ 	.set_link_ksettings	= set_link_ksettings,
++	.get_pauseparam		= get_pauseparam,
++	.set_pauseparam		= set_pauseparam,
+ 	.get_eee		= ethtool_eee_get,
+ 	.set_eee		= ethtool_eee_set,
+ 	.get_strings		= get_strings,
+@@ -480,6 +566,8 @@ static const struct ethtool_ops serdes_ethtool_ops = {
+ 	.get_drvinfo		= get_drvinfo,
+ 	.get_link_ksettings	= serdes_ethtool_get_link_ksettings,
+ 	.set_link_ksettings	= serdes_ethtool_set_link_ksettings,
++	.get_pauseparam		= get_pauseparam,
++	.set_pauseparam		= set_pauseparam,
+ 	.get_strings		= get_strings,
+ 	.get_sset_count		= get_stringset_count,
+ 	.get_priv_flags		= get_priv_flags,
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+index 056c59c5fbb1..0ac4537315de 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+@@ -33,43 +33,43 @@ int mac_set_flowctrl(void *pdev, u32 val)
+ 	lmac_set_flowcon_mode(pdev, val);
+ 
+ 	switch (val) {
+-	case 0: /* AUTO */
++	case GSW_FLOW_AUTO: /* AUTO */
+ 		xgmac_enable_tx_flow_ctl(pdev, pdata->pause_time);
+ 		xgmac_enable_rx_flow_ctl(pdev);
+-		gswss_set_flowctrl_rx(pdev, 0);
+-		gswss_set_flowctrl_tx(pdev, 0);
++		gswss_set_flowctrl_rx(pdev, PAUSE_AUTO);
++		gswss_set_flowctrl_tx(pdev, PAUSE_AUTO);
+ 		break;
+ 
+-	case 3: /* RXTX */
++	case GSW_FLOW_RXTX: /* RXTX */
+ 		xgmac_enable_tx_flow_ctl(pdev, pdata->pause_time);
+ 		xgmac_enable_rx_flow_ctl(pdev);
+-		gswss_set_flowctrl_rx(pdev, 1);
+-		gswss_set_flowctrl_tx(pdev, 1);
++		gswss_set_flowctrl_rx(pdev, PAUSE_EN);
++		gswss_set_flowctrl_tx(pdev, PAUSE_EN);
+ 		break;
+ 
+-	case 1: /* RX */
+-		/* Disable TX in XGMAC and GSWSS */
+-		xgmac_disable_tx_flow_ctl(pdev);
+-		gswss_set_flowctrl_tx(pdev, 3);
++	case GSW_FLOW_RX: /* RX */
+ 		/* Enable RX in XGMAC and GSWSS */
+ 		xgmac_enable_rx_flow_ctl(pdev);
+-		gswss_set_flowctrl_rx(pdev, 1);
++		gswss_set_flowctrl_rx(pdev, PAUSE_EN);
++		/* Disable TX in XGMAC and GSWSS */
++		xgmac_disable_tx_flow_ctl(pdev);
++		gswss_set_flowctrl_tx(pdev, PAUSE_DIS);
+ 		break;
+ 
+-	case 2: /* TX */
++	case GSW_FLOW_TX: /* TX */
+ 		/* Disable RX in XGMAC and GSWSS */
+ 		xgmac_disable_rx_flow_ctl(pdev);
+-		gswss_set_flowctrl_rx(pdev, 3);
++		gswss_set_flowctrl_rx(pdev, PAUSE_DIS);
+ 		/* Enable TX in XGMAC and GSWSS */
+ 		xgmac_enable_tx_flow_ctl(pdev, pdata->pause_time);
+-		gswss_set_flowctrl_tx(pdev, 1);
++		gswss_set_flowctrl_tx(pdev, PAUSE_EN);
+ 		break;
+ 
+-	case 4: /* Disabled */
++	case GSW_FLOW_OFF: /* Disabled */
+ 		xgmac_disable_tx_flow_ctl(pdev);
+ 		xgmac_disable_rx_flow_ctl(pdev);
+-		gswss_set_flowctrl_rx(pdev, 3);
+-		gswss_set_flowctrl_tx(pdev, 3);
++		gswss_set_flowctrl_rx(pdev, PAUSE_DIS);
++		gswss_set_flowctrl_tx(pdev, PAUSE_DIS);
+ 		break;
+ 
+ 	default:
+@@ -87,7 +87,7 @@ int mac_get_flowctrl(void *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 
+-	u32 flow_ctrl_tx = 0, flow_ctrl_rx = 0, flow_ctrl = 0;
++	u32 flow_ctrl_tx, flow_ctrl_rx, flow_ctrl = GSW_FLOW_AUTO;
+ 
+ #ifdef __KERNEL__
+ 	spin_lock_bh(&pdata->mac_lock);
+@@ -96,16 +96,16 @@ int mac_get_flowctrl(void *pdev)
+ 	flow_ctrl_tx = gswss_get_flowctrl_tx(pdev);
+ 	flow_ctrl_rx = gswss_get_flowctrl_rx(pdev);
+ 
+-	if (flow_ctrl_tx == 1 && flow_ctrl_rx == 1)
+-		flow_ctrl = 3; /* RXTX */
+-	else if (flow_ctrl_tx == 1 && flow_ctrl_rx == 0)
+-		flow_ctrl = 2; /* TX */
+-	else if (flow_ctrl_tx == 0 && flow_ctrl_rx == 1)
+-		flow_ctrl = 1; /* RX */
+-	else if (flow_ctrl_tx == 3 && flow_ctrl_rx == 3)
+-		flow_ctrl = 4; /* Disabled */
+-	else if (flow_ctrl_tx == 0 && flow_ctrl_rx == 0)
+-		flow_ctrl = 0; /* Auto */
++	if (flow_ctrl_tx == PAUSE_EN && flow_ctrl_rx == PAUSE_EN)
++		flow_ctrl = GSW_FLOW_RXTX;	/* RXTX */
++	else if (flow_ctrl_tx == PAUSE_EN && flow_ctrl_rx == PAUSE_DIS)
++		flow_ctrl = GSW_FLOW_TX;	/* TX */
++	else if (flow_ctrl_tx == PAUSE_DIS && flow_ctrl_rx == PAUSE_EN)
++		flow_ctrl = GSW_FLOW_RX;	/* RX */
++	else if (flow_ctrl_tx == PAUSE_DIS && flow_ctrl_rx == PAUSE_DIS)
++		flow_ctrl = GSW_FLOW_OFF;	/* Disabled */
++	else if (flow_ctrl_tx == PAUSE_AUTO && flow_ctrl_rx == PAUSE_AUTO)
++		flow_ctrl = GSW_FLOW_AUTO;	/* Auto */
+ 
+ #ifdef __KERNEL__
+ 	spin_unlock_bh(&pdata->mac_lock);
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+index 94b989e74bbf..b86c5576f85e 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+@@ -203,6 +203,13 @@ FILE *get_fp(void);
+ #endif
+ 
+ 
++enum {
++	PAUSE_AUTO = 0,
++	PAUSE_EN,
++	PAUSE_RES,
++	PAUSE_DIS
++};
++
+ enum {
+ 	MAC_AUTO_DPLX = 0,
+ 	MAC_FULL_DPLX,

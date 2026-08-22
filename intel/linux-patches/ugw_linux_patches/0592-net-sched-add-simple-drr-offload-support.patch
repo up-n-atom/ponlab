@@ -1,0 +1,187 @@
+From 46edfbc2a0932f9828700993bed899a5ff9e2393 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Wed, 24 Apr 2019 15:45:38 +0200
+Subject: [PATCH] net: sched: add simple drr offload support
+
+The commit adds simple offload support to the tc-drr. The offload can
+be used to support scheduler and its attached queues configuration.
+
+Example configuration commands are shown beloW:
+
+  tc qdisc add dev eth0_0 root handle 8001: drr
+  tc class add dev eth0_0 parent 8001: classid 8001:1 drr quantum 4096
+  tc class add dev eth0_0 parent 8001: classid 8001:2 drr quantum 8192
+  tc class add dev eth0_0 parent 8001: classid 8000:3 drr quantum 8192
+
+The first command passes the parent id and the handle to the
+offload hook. These are the root(0xffffffff) and the qdisc handle id.
+The driver offloading the drr has to allocate and configure a scheduler
+resource in this case. The same is valid even if the drr is not the root
+qdisc like below:
+
+Use case 1:                   Use case 2:
+
+  root = drr                      root
+   / |  \                            \
+  q1 q2 q3                           drr
+                                    / | \
+                                   q1 q2 q3
+
+The commands creating the classes are passing the necessary parameters
+to offload hook for the queue resource allocations and configuration.
+The parent id in this case for each class is equal to 8001. In this way
+the driver can recognize that it has to configure a queue.
+
+Signed-off-by: Zahari Doychev <zahari.doychev@intel.com>
+---
+ include/linux/netdevice.h |  2 ++
+ include/net/pkt_cls.h     | 33 +++++++++++++++++++++++++++++++++
+ net/sched/sch_drr.c       | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 80 insertions(+)
+
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 084da3fe7751..6cb17975d311 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -791,6 +791,7 @@ enum {
+ 	TC_SETUP_MATCHALL,
+ 	TC_SETUP_CLSBPF,
+ 	TC_SETUP_QDISC_RED,
++	TC_SETUP_DRR,
+ };
+ 
+ struct tc_cls_u32_offload;
+@@ -804,6 +805,7 @@ struct tc_to_netdev {
+ 		struct tc_cls_bpf_offload *cls_bpf;
+ 		struct tc_mqprio_qopt *mqprio;
+ 		struct tc_red_qopt_offload *sch_red;
++		struct tc_drr_qopt_offload *sch_drr;
+ 	};
+ };
+ 
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index bf8dae8da262..3d44984c0c0b 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -550,4 +550,37 @@ struct tc_red_qopt_offload {
+ 	};
+ };
+ 
++enum tc_drr_command {
++	TC_DRR_REPLACE,
++	TC_DRR_DESTROY,
++	TC_DRR_STATS,
++	TC_DRR_GRAFT,
++};
++
++struct tc_drr_qopt_offload_params {
++	int quantum;
++	struct gnet_stats_queue *qstats;
++};
++
++struct tc_drr_qopt_offload_stats {
++	struct gnet_stats_basic_packed *bstats;
++	struct gnet_stats_queue *qstats;
++};
++
++struct tc_drr_qopt_offload_graft_params {
++	u8 id;
++	u32 child_handle;
++};
++
++struct tc_drr_qopt_offload {
++	enum tc_drr_command command;
++	u32 handle;
++	u32 parent;
++	union {
++		struct tc_drr_qopt_offload_params set_params;
++		struct tc_drr_qopt_offload_stats stats;
++		struct tc_drr_qopt_offload_graft_params graft_params;
++	};
++};
++
+ #endif
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index 7395a2b5f03e..357a4d67e424 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -39,6 +39,43 @@ struct drr_sched {
+ 	struct Qdisc_class_hash		clhash;
+ };
+ 
++static int drr_offload(struct Qdisc *sch, enum tc_drr_command cmd)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_drr_qopt_offload opt = {
++		.command = cmd,
++		.parent = sch->parent,
++		.handle = sch->handle,
++	};
++	struct tc_to_netdev tc = {.type = TC_SETUP_DRR,
++				  { .sch_drr = &opt } };
++
++	if (!(dev->features & NETIF_F_HW_TC) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	return dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0, &tc);
++}
++
++static int drr_cl_offload(struct Qdisc *sch, struct drr_class *cl,
++			  enum tc_drr_command cmd)
++{
++	struct net_device *dev = qdisc_dev(sch);
++	struct tc_drr_qopt_offload opt = {
++		.command = cmd,
++		.parent = sch->handle,
++		.handle = cl->common.classid,
++	};
++	struct tc_to_netdev tc = {.type = TC_SETUP_DRR,
++				  { .sch_drr = &opt } };
++
++	if (!(dev->features & NETIF_F_HW_TC) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	opt.set_params.quantum = cl->quantum;
++
++	return dev->netdev_ops->ndo_setup_tc(dev, cl->common.classid, 0, &tc);
++}
++
+ static struct drr_class *drr_find_class(struct Qdisc *sch, u32 classid)
+ {
+ 	struct drr_sched *q = qdisc_priv(sch);
+@@ -136,6 +173,8 @@ static int drr_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
+ 
+ 	qdisc_class_hash_grow(sch, &q->clhash);
+ 
++	drr_cl_offload(sch, cl, TC_DRR_REPLACE);
++
+ 	*arg = (unsigned long)cl;
+ 	return 0;
+ }
+@@ -144,6 +183,7 @@ static void drr_destroy_class(struct Qdisc *sch, struct drr_class *cl)
+ {
+ 	gen_kill_estimator(&cl->bstats, &cl->rate_est);
+ 	qdisc_destroy(cl->qdisc);
++	drr_cl_offload(sch, cl, TC_DRR_DESTROY);
+ 	kfree(cl);
+ }
+ 
+@@ -432,6 +472,9 @@ static int drr_init_qdisc(struct Qdisc *sch, struct nlattr *opt)
+ 	if (err < 0)
+ 		return err;
+ 	INIT_LIST_HEAD(&q->active);
++
++	drr_offload(sch, TC_DRR_REPLACE);
++
+ 	return 0;
+ }
+ 
+@@ -467,6 +510,8 @@ static void drr_destroy_qdisc(struct Qdisc *sch)
+ 			drr_destroy_class(sch, cl);
+ 	}
+ 	qdisc_class_hash_destroy(&q->clhash);
++
++	drr_offload(sch, TC_DRR_DESTROY);
+ }
+ 
+ static const struct Qdisc_class_ops drr_class_ops = {

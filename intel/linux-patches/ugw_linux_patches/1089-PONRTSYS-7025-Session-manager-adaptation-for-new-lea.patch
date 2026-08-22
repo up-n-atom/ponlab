@@ -1,0 +1,4285 @@
+From a63eb28fd5a16c14c7d6a44e53a626122a598de8 Mon Sep 17 00:00:00 2001
+From: Elad Fernandes <elad.fernandes@intel.com>
+Date: Sun, 1 Mar 2020 16:39:10 +0200
+Subject: [PATCH] PONRTSYS-7025: Session manager adaptation for new learning
+
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |   20 +-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 1601 +++++++++-----------
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.h    |    8 +-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c |  397 ++---
+ .../pp-session-mgr/pp_session_mgr_internal.h       |  254 ++--
+ .../pp-api/pp-session-mgr/pp_session_mgr_tdox.c    |   18 +-
+ drivers/net/ppv4/pp-hal/field-vector/pp_fv.c       |  318 ++--
+ drivers/net/ppv4/pp-hal/field-vector/pp_fv.h       |   26 +-
+ drivers/net/ppv4/pp-hal/parser/parser_debugfs.c    |    4 +-
+ include/linux/pp_api.h                             |   15 +-
+ 10 files changed, 1338 insertions(+), 1323 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 22fa991463b0..253228079eaa 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -14,8 +14,8 @@
+ #include <linux/slab.h>
+ #ifdef CONFIG_PPV4_LGM
+ #include <linux/skb_extension.h>
+-#include <linux/learning_layer_api.h>
+ #include <linux/platform_data/intel_epu.h>
++#include <linux/pktprs.h>
+ #endif
+ #include <linux/pp_qos_api.h>
+ #include <linux/pp_api.h>
+@@ -718,9 +718,9 @@ s32 pp_brief_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 				}
+ 
+ 	pr_buf(buf, sz, *n,
+-	       " +--------+--------+--------+---------+----------+---------+---------+\n");
++	       " +--------+----------+--------+---------+----------+---------+---------+\n");
+ 	pr_buf_cat(buf, sz, *n,
+-	       " | id     | PPS    | Mbps   | In GPID | Out GPID | L3 Type | L4 Prot |\n");
++	       " | id     |  PPS     | Mbps   | In GPID | Out GPID | L3 Type | L4 Prot |\n");
+ 
+ 	/* Print only active sessions */
+ 	j = min(db->dbg_print_cnt, num_stats);
+@@ -731,9 +731,9 @@ s32 pp_brief_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		if (smgr_session_info_get(sess_stats[i].id, &info))
+ 			continue;
+ #ifdef CONFIG_DEBUG_FS
+-		if (info.ingress.fv_outer_bitmap & FV_L3_IPV4)
++		if (PKTPRS_IS_IPV4(&info.rx, PKTPRS_HDR_LEVEL0))
+ 			strcpy(l3Type, "IPv4");
+-		else if (info.ingress.fv_outer_bitmap & FV_L3_IPV6)
++		else if (PKTPRS_IS_IPV6(&info.rx, PKTPRS_HDR_LEVEL0))
+ 			strcpy(l3Type, "IPv6");
+ 		else
+ #endif
+@@ -742,9 +742,9 @@ s32 pp_brief_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		}
+ 
+ #ifdef CONFIG_DEBUG_FS
+-		if (info.ingress.fv_outer_bitmap & FV_L4_TCP)
++		if (PKTPRS_IS_TCP(&info.rx, PKTPRS_HDR_LEVEL0))
+ 			strcpy(l4Prot, "TCP");
+-		else if (info.ingress.fv_outer_bitmap & FV_L4_UDP)
++		else if (PKTPRS_IS_UDP(&info.rx, PKTPRS_HDR_LEVEL0))
+ 			strcpy(l4Prot, "UDP");
+ 		else
+ #endif
+@@ -753,16 +753,16 @@ s32 pp_brief_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		}
+ 
+ 		pr_buf_cat(buf, sz, *n,
+-	       		" +--------+--------+--------+---------+----------+---------+---------+\n");
++	       		" +--------+----------+--------+---------+----------+---------+---------+\n");
+ 		pr_buf_cat(buf, sz, *n,
+-		" | %-6u | %-6llu | %-6llu | %-7u | %-8u | %-8s| %-8s|\n",
++		" | %-6u | %-8llu | %-6llu | %-7u | %-8u | %-8s| %-8s|\n",
+ 		   sess_stats[i].id, sess_stats[i].stats.packets,
+ 		   sess_stats[i].stats.bytes*8/1000/1000,
+ 		   info.in_port, info.eg_port, l3Type, l4Prot);
+ 	}
+ 
+ 	pr_buf_cat(buf, sz, *n,
+-	       " +--------+--------+--------+---------+----------+---------+---------+\n");
++	       " +--------+----------+--------+---------+----------+---------+---------+\n");
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 830130e222aa..807079a190cf 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -24,8 +24,9 @@
+ #include <linux/workqueue.h>
+ #include <linux/jiffies.h>
+ #include <net/checksum.h>
+-#include <linux/learning_layer_api.h>
++#include <linux/learning_layer_api.h> /* TBD - remove in phase3 */
+ #include <linux/pp_api.h>
++#include <linux/pktprs.h>
+ 
+ #include "pp_desc.h"
+ #include "pp_si.h"
+@@ -55,9 +56,8 @@ struct base_args {
+ /**
+  * @struct Session create work arguments
+  * @base mandatory basic work argument
+- * @in_pkt ingress packet buffer
+- * @eg_pkt egress packet buffer
+- * @nhdr new header packet buffer
++ * @rx rx packet header
++ * @tx tx packet header
+  * @args session create args reference
+  * @args_buf session create args buffer used in async mode to save
+  *       the user args in order to work in async mode
+@@ -67,9 +67,8 @@ struct base_args {
+  */
+ struct sess_cr_work_args {
+ 	struct base_args              base;
+-	struct fv_pkt_info            in_pkt;
+-	struct fv_pkt_info            eg_pkt;
+-	struct new_hdr                nhdr;
++	struct pktprs_hdr             rx;
++	struct pktprs_hdr             tx;
+ 	struct pp_sess_create_args   *args;
+ 	struct pp_sess_create_args    args_buf;
+ 	struct pp_sess_create_cb_args cb_args;
+@@ -149,30 +148,25 @@ union work_args {
+  *        packets are the packets which the nat changes are based on.
+  * @param s session info pointer (struct sess_info)
+  */
+-#define SESS_NAT_INGRS_BMAP(s)        ((s)->nat.ingrs_bmap)
+-#define SESS_NAT_INGRS_L2(s)          ((struct fv_l2 *)(s)->nat.ingrs_l2)
+-#define SESS_NAT_INGRS_L3(s)          ((union fv_l3 *)(s)->nat.ingrs_l3)
+-#define SESS_NAT_INGRS_L4(s)          ((union fv_l4 *)(s)->nat.ingrs_l4)
+-#define SESS_NAT_EGRS_BMAP(s)         ((s)->nat.egrs_bmap)
+-#define SESS_NAT_EGRS_L2(s)           ((struct fv_l2 *)(s)->nat.egrs_l2)
+-#define SESS_NAT_EGRS_L3(s)           ((union fv_l3 *)(s)->nat.egrs_l3)
+-#define SESS_NAT_EGRS_L4(s)           ((union fv_l4 *)(s)->nat.egrs_l4)
++
++#define SESS_RX_NAT_LVL(s)                                     ((s)->nat.rx_lvl)
++#define SESS_TX_NAT_LVL(s)                                     ((s)->nat.tx_lvl)
+ 
+ /**
+  * @brief Shortcuts for session modification flags operations
+  * @param s session info pointer (struct sess_info)
+  * @param f flag
+  */
+-#define SESS_MOD_FLAG_SET(s, f)       set_bit(f,   (s)->mod_flags)
+-#define SESS_MOD_FLAG_CLR(s, f)       clear_bit(f, (s)->mod_flags)
++#define SESS_MOD_FLAG_SET(s, f)                     set_bit(f,   (s)->mod_flags)
++#define SESS_MOD_FLAG_CLR(s, f)                     clear_bit(f, (s)->mod_flags)
+ 
+ /**
+  * @brief Shortcuts for testing session flags
+  * @param s session info pointer (struct sess_info)
+  * @param f flag
+  */
+-#define __smgr_is_sess_routed(s)      smgr_is_sess_routed(&(s)->db_ent->info)
+-#define __smgr_is_sess_bridged(s)     smgr_is_sess_bridged(&(s)->db_ent->info)
++#define __smgr_is_sess_routed(s)         smgr_is_sess_routed(&(s)->db_ent->info)
++#define __smgr_is_sess_bridged(s)       smgr_is_sess_bridged(&(s)->db_ent->info)
+ 
+ /**
+  * @enum inact_scan_state
+@@ -208,27 +202,27 @@ enum inact_scan_state {
+  * @work_args_cache async work arguments cache
+  */
+ struct smgr_database {
+-	u32         n_sessions;
+-	spinlock_t  lock; /*! locks database and HW accesses */
+-	ulong      *open_bmap;
+-	ulong      *ipv4_bmap;
+-	ulong      *ipv6_bmap;
+-	ulong      *tcp_bmap;
+-	ulong      *udp_bmap;
+-	ulong      *inact_bmap;
+-	dma_addr_t  inact_bmap_phys;
+-	size_t      inact_bmap_sz;
+-	enum inact_scan_state    scan_state;
+-	enum smgr_state          state;
+-	struct list_head         free_list;
+-	struct sess_db_entry    *sessions;
+-	struct smgr_stats        stats;
+-	struct list_head         in_port[PP_MAX_PORT];
+-	struct list_head         eg_port[PP_MAX_PORT];
+-	struct kmem_cache       *work_args_cache;
++	u32 n_sessions;
++	spinlock_t lock; /*! locks database and HW accesses */
++	ulong *open_bmap;
++	ulong *ipv4_bmap;
++	ulong *ipv6_bmap;
++	ulong *tcp_bmap;
++	ulong *udp_bmap;
++	ulong *inact_bmap;
++	dma_addr_t inact_bmap_phys;
++	size_t inact_bmap_sz;
++	enum inact_scan_state scan_state;
++	enum smgr_state state;
++	struct list_head free_list;
++	struct sess_db_entry *sessions;
++	struct smgr_stats stats;
++	struct list_head in_port[PP_MAX_PORT];
++	struct list_head eg_port[PP_MAX_PORT];
++	struct kmem_cache *work_args_cache;
+ 	struct workqueue_struct *workq;
+ 	struct workqueue_struct *workq_hi;
+-	enum smgr_frag_mode     frag_mode;
++	enum smgr_frag_mode frag_mode;
+ };
+ 
+ /* functions declarations */
+@@ -241,11 +235,11 @@ static s32 __smgr_port_flush(u16 pid);
+ 	list_add_tail(&(_ent)->free_node, &(_db)->free_list)
+ #define DB_FREE_LIST_DEL_NODE(_ent) \
+ 	list_del_init(&(_ent)->free_node)
+-#define DB_IN_PORT_LIST_ADD_NODE(_db, _ent)                                    \
+-	list_add_tail(&(_ent)->in_port_node,                                   \
++#define DB_IN_PORT_LIST_ADD_NODE(_db, _ent) \
++	list_add_tail(&(_ent)->in_port_node, \
+ 		      &(_db)->in_port[(_ent)->info.in_port])
+-#define DB_EG_PORT_LIST_ADD_NODE(_db, _ent)                                    \
+-	list_add_tail(&(_ent)->eg_port_node,                                   \
++#define DB_EG_PORT_LIST_ADD_NODE(_db, _ent) \
++	list_add_tail(&(_ent)->eg_port_node, \
+ 		      &(_db)->eg_port[(_ent)->info.eg_port])
+ #define DB_IN_PORT_LIST_DEL_NODE(_ent) \
+ 	list_del_init(&(_ent)->in_port_node)
+@@ -426,127 +420,77 @@ s32 smgr_get_queue_phy_id(u16 logical, u16 *physical)
+ 	return ret;
+ }
+ 
+-/**
+- * @brief Shortcut for testing if a packet has L3 IPv4 header
+- * @param bmap bitmap created by learning driver, describing the
+- *             packet's layers
+- * @return bool true in case ipv4 exist, false otherwise
+- */
+-static inline bool __smgr_is_ipv4_pkt(u32 bmap)
+-{
+-	return !!(bmap & FV_L3_IPV4);
+-}
+-
+-/**
+- * @brief Shortcut for testing if a packet has L3 IPv6 header
+- * @param bmap bitmap created by learning driver, describing the
+- *             packet's layers
+- * @return bool true in case ipv6 exist, false otherwise
+- */
+-static inline bool __smgr_is_ipv6_pkt(u32 bmap)
+-{
+-	return !!(bmap & FV_L3_IPV6);
+-}
+-
+-/**
+- * @brief Shortcut for testing if a packet has L3 IPv6 or IPv4 header
+- * @param bmap bitmap created by learning driver, describing the
+- *             packet's layers
+- * @return bool true in case ipv6 or ipv4 exist, false otherwise
+- */
+-static inline bool __smgr_is_ip_pkt(u32 bmap)
+-{
+-	return __smgr_is_ipv4_pkt(bmap) || __smgr_is_ipv6_pkt(bmap);
+-}
+-
+-/**
+- * @brief Shortcut for testing whether a packet contains supported l3
+- *        header
+- * @param bmap bitmap specifying which layers the packet have
+- * @return bool true if the l3 is supported, false
+- *         otherwise
+- */
+-static inline bool __smgr_is_pkt_l3_supported(u32 bmap)
+-{
+-	return __smgr_is_ip_pkt(bmap);
+-}
+-
+-/**
+- * @brief Shortcut for testing whether a packet contains supported l3
+- *        header
+- * @param bmap bitmap specifying which layers the packet have
+- * @return bool true if the l3 is supported, false
+- *         otherwise
+- */
+-static inline bool __smgr_is_pkt_l4_supported(u32 bmap)
+-{
+-	return bmap & (FV_L4_TCP | FV_L4_UDP | FV_L4_ESP);
+-}
+-
+ /**
+  * @brief Shortcut for testing whether session is a tunnel termination
+  *        or not, USE only in the session create flow
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if the sess is tunnel termination, false
+  *         otherwise
+  */
+-static inline bool __smgr_is_tunn_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_tunn_term_sess(struct sess_info *s)
+ {
+-	return (SESS_INGRS_TUNN_BMAP(sess) || SESS_EGRS_TUNN_BMAP(sess)) &&
+-	       (SESS_INGRS_TUNN_BMAP(sess) != SESS_EGRS_TUNN_BMAP(sess));
++	return (PKTPRS_IS_MULTI_LEVEL(SESS_RX_PKT(s)) !=
++		PKTPRS_IS_MULTI_LEVEL(SESS_TX_PKT(s)));
+ }
+ 
+ /**
+  * @brief Shortcut for testing whether session is a tunnel bypass
+  *        or not, USE only in the session create flow
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if the sess is tunnel bypass, false
+  *         otherwise
+  */
+-static inline bool __smgr_is_tunn_bypass_sess(struct sess_info *sess)
++static inline bool __smgr_is_tunn_bypass_sess(struct sess_info *s)
+ {
+-	return (SESS_INGRS_TUNN_BMAP(sess) && SESS_EGRS_TUNN_BMAP(sess)) &&
+-	       (SESS_INGRS_TUNN_BMAP(sess) == SESS_EGRS_TUNN_BMAP(sess));
++	return (PKTPRS_IS_MULTI_LEVEL(SESS_RX_PKT(s)) &&
++		PKTPRS_IS_MULTI_LEVEL(SESS_TX_PKT(s)));
+ }
+ 
+ /**
+  * @brief Check whether a session includes inner IP layer at
+  *        ingress and missing inner IP layer at egress
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_iptun_decp_sess(struct sess_info *sess)
++static inline bool __smgr_is_iptun_decp_sess(struct sess_info *s)
+ {
+-	return __smgr_is_ip_pkt(SESS_INGRS_INNER_BMAP(sess)) &&
+-	      !__smgr_is_ip_pkt(SESS_EGRS_INNER_BMAP(sess));
++	return (PKTPRS_IS_MULTI_IP(SESS_RX_PKT(s)) &&
++		!PKTPRS_IS_MULTI_IP(SESS_TX_PKT(s)));
+ }
+ 
+ /**
+  * @brief Check whether a session missing inner IP layer at
+  *        ingress and includes inner IP layer at egress
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_iptun_encp_sess(struct sess_info *sess)
++static inline bool __smgr_is_iptun_encp_sess(struct sess_info *s)
+ {
+-	return !__smgr_is_ip_pkt(SESS_INGRS_INNER_BMAP(sess)) &&
+-		__smgr_is_ip_pkt(SESS_EGRS_INNER_BMAP(sess));
++	return (!PKTPRS_IS_MULTI_IP(SESS_RX_PKT(s)) &&
++		PKTPRS_IS_MULTI_IP(SESS_TX_PKT(s)));
++}
++
++static inline bool __smgr_is_first_frag_bypass(struct sess_info *s, u8 lvl)
++{
++	if (pktprs_first_frag(SESS_RX_PKT(s), lvl) &&
++	    pktprs_first_frag(SESS_TX_PKT(s), lvl))
++		return true;
++
++	return false;
+ }
+ 
+ /**
+  * @brief Check whether a session support fragments acceleration
+- * @param sess the session
++ * @param s the session
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_frag_accl_sess(struct sess_info *sess)
++static inline bool __smgr_is_frag_accl_sess(struct sess_info *s)
+ {
+-	if (SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST &&
+-	    SESS_EGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST)
++	if (__smgr_is_first_frag_bypass(s, HDR_OUTER))
+ 		return true;
+ 
+-	if (SESS_INGRS_TUNN_BMAP(sess) &&
+-	    SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST &&
+-	    SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)
++	if (PKTPRS_IS_MULTI_LEVEL(SESS_RX_PKT(s)) &&
++	    __smgr_is_first_frag_bypass(s, HDR_INNER))
+ 		return true;
+ 
+ 	return false;
+@@ -554,67 +498,70 @@ static inline bool __smgr_is_frag_accl_sess(struct sess_info *sess)
+ 
+ /**
+  * @brief Test whether the inner ipv6 extension header has changed
+- * @param sess the session to test
++ * @param s the session to test
++ * @param lvl header level (inner/outer)
+  * @return bool true if changed
+  */
+-static inline bool __smgr_is_ipv6_opt_inner_changed(struct sess_info *sess)
++static inline bool
++__smgr_is_ipv6_opt_changed(struct sess_info *s, u8 rx_lvl, u8 tx_lvl)
+ {
+-	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L3_IPV6_EXTENSION) !=
+-	    (SESS_EGRS_INNER_BMAP(sess) & FV_L3_IPV6_EXTENSION))
++	if (!PKTPRS_IS_IPV6(SESS_RX_PKT(s), rx_lvl) ||
++	    !PKTPRS_IS_IPV6(SESS_TX_PKT(s), tx_lvl))
++		return false;
++
++	if (PKTPRS_IS_HOP_OPT(SESS_RX_PKT(s), rx_lvl) !=
++	    PKTPRS_IS_HOP_OPT(SESS_TX_PKT(s), tx_lvl))
++		return true;
++	if (PKTPRS_IS_DEST_OPT(SESS_RX_PKT(s), rx_lvl) !=
++	    PKTPRS_IS_DEST_OPT(SESS_TX_PKT(s), tx_lvl))
++		return true;
++	if (PKTPRS_IS_ROUT_OPT(SESS_RX_PKT(s), rx_lvl) !=
++	    PKTPRS_IS_ROUT_OPT(SESS_TX_PKT(s), tx_lvl))
+ 		return true;
+ 
+ 	return false;
+ }
+ 
+ /**
+- * @brief Test whether the outer ipv6 extension header has changed
+- * @param sess the session to test
+- * @return bool true if changed
++ * @brief Check whether a session is pppoe inner encapsulation or not
++ * @param s the session to test
++ * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_ipv6_opt_outer_changed(struct sess_info *sess)
++static inline bool __smgr_is_pppoe_inner_encap(struct sess_info *s)
+ {
+-	if ((SESS_INGRS_OUTER_BMAP(sess) & FV_L3_IPV6_EXTENSION) !=
+-	    (SESS_EGRS_OUTER_BMAP(sess) & FV_L3_IPV6_EXTENSION))
++	/* is pppoe header was added on the inner packet */
++	if (!SESS_RX_IS_INNER_PPPOE(s) && SESS_TX_IS_INNER_PPPOE(s))
+ 		return true;
+ 
+ 	return false;
+ }
+ 
+ /**
+- * @brief Check whether a session is pppoe encapsulation or not
+- * @param sess the session to test
++ * @brief Check whether a session is pppoe outer encapsulation or not
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_pppoe_encap(struct sess_info *sess)
++static inline bool __smgr_is_pppoe_outer_encap(struct sess_info *s)
+ {
+ 	/* is pppoe header was added on the outer packet */
+-	if (!(SESS_INGRS_OUTER_BMAP(sess) & FV_L2_PPPOE) &&
+-	    (SESS_EGRS_OUTER_BMAP(sess) & FV_L2_PPPOE))
+-		return true;
+-
+-	if (!(SESS_INGRS_INNER_BMAP(sess) & FV_L2_PPPOE) &&
+-	    (SESS_EGRS_INNER_BMAP(sess) & FV_L2_PPPOE))
++	if (!SESS_RX_IS_OUTER_PPPOE(s) && SESS_TX_IS_OUTER_PPPOE(s))
+ 		return true;
+ 
+ 	return false;
+ }
+ 
+ /**
+- * @brief Check whether a session inner pppoe has been
+- *        added/removed/changed
+- * @param sess the session to test
++ * @brief Check whether a session is pppoe encapsulation or not
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_inner_pppoe_changed(struct sess_info *sess)
++static inline bool __smgr_is_pppoe_encap(struct sess_info *s)
+ {
+-	/* pppoe header was added or removed? */
+-	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L2_PPPOE) !=
+-	    (SESS_EGRS_INNER_BMAP(sess)  & FV_L2_PPPOE))
++	/* is pppoe header was added on the outer packet */
++	if (__smgr_is_pppoe_outer_encap(s))
+ 		return true;
+-
+-	/* pppoe session id changed? */
+-	if (SESS_INGRS_INNER_L2(sess).pppoe_id !=
+-	    SESS_EGRS_INNER_L2(sess).pppoe_id)
++	/* is pppoe header was added on the inner packet */
++	if (__smgr_is_pppoe_inner_encap(s))
+ 		return true;
+ 
+ 	return false;
+@@ -622,58 +569,56 @@ static inline bool __smgr_is_inner_pppoe_changed(struct sess_info *sess)
+ 
+ /**
+  * @brief Test whether fragments can be supported for the session
+- * @param sess the session
++ * @param s the session
+  * @return bool true if it is supported, false otherwise
+  */
+-static inline bool __smgr_is_frag_supported(struct sess_info *sess)
++static inline bool __smgr_is_frag_supported(struct sess_info *s)
+ {
+-	u32 frags_flags = FV_L3_FRAG_1ST | FV_L3_FRAG_2ND;
+-
+ 	/* no frags, supported */
+-	if (!(SESS_INGRS_OUTER_BMAP(sess) & frags_flags) &&
+-	    !(SESS_INGRS_INNER_BMAP(sess) & frags_flags) &&
+-	    !(SESS_EGRS_OUTER_BMAP(sess) & frags_flags) &&
+-	    !(SESS_EGRS_INNER_BMAP(sess) & frags_flags))
++	if (!pktprs_is_ip_frag(SESS_RX_PKT(s), HDR_OUTER) &&
++	    !pktprs_is_ip_frag(SESS_RX_PKT(s), HDR_INNER) &&
++	    !pktprs_is_ip_frag(SESS_TX_PKT(s), HDR_OUTER) &&
++	    !pktprs_is_ip_frag(SESS_TX_PKT(s), HDR_INNER))
+ 		return true;
+ 
+ 	/* outer reassembly */
+-	if ((SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+-	    !(SESS_EGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST)) {
++	if (pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER) &&
++	    !pktprs_first_frag(SESS_TX_PKT(s), HDR_OUTER)) {
+ 		/* supported only if reassembly NF is enabled */
+ 		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+ 	}
+ 
+ 	/* inner reassembly */
+-	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+-	    !(SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)) {
++	if (pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER) &&
++	    !pktprs_first_frag(SESS_TX_PKT(s), HDR_INNER)) {
+ 		/* supported only if reassembly NF is enabled */
+ 		return pp_misc_is_nf_en(PP_NF_REASSEMBLY);
+ 	}
+ 
+ 	/* outer fragmentation with tunnel encapsulation */
+-	if (!(SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+-	    (SESS_EGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST)) {
++	if (!pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER) &&
++	    pktprs_first_frag(SESS_TX_PKT(s), HDR_OUTER)) {
+ 		/* Tunnel encapsulation */
+-		if (!SESS_INGRS_TUNN_BMAP(sess) && SESS_EGRS_TUNN_BMAP(sess))
++		if (__smgr_is_iptun_encp_sess(s))
+ 			/* supported only if frag NF is enabled */
+ 			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+ 
+ 		/* PPPoE encapsulation */
+-		if (__smgr_is_pppoe_encap(sess))
++		if (__smgr_is_pppoe_encap(s))
+ 			/* supported only if frag NF is enabled */
+ 			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+ 	}
+ 
+ 	/* inner fragmentation with tunnel encapsulation */
+-	if (!(SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+-	    (SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)) {
++	if (!pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER) &&
++	    pktprs_first_frag(SESS_TX_PKT(s), HDR_INNER)) {
+ 		/* Tunnel encapsulation */
+-		if (!SESS_INGRS_TUNN_BMAP(sess) && SESS_EGRS_TUNN_BMAP(sess))
++		if (__smgr_is_iptun_encp_sess(s))
+ 			/* supported only if frag NF is enabled */
+ 			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+ 
+ 		/* PPPoE encapsulation */
+-		if (__smgr_is_pppoe_encap(sess))
++		if (__smgr_is_pppoe_encap(s))
+ 			/* supported only if frag NF is enabled */
+ 			return pp_misc_is_nf_en(PP_NF_FRAGMENTER);
+ 	}
+@@ -683,37 +628,27 @@ static inline bool __smgr_is_frag_supported(struct sess_info *sess)
+ 
+ /**
+  * @brief Test whether a changes in the ipv6 extension headers are supported
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if supported
+  */
+-static inline bool __smgr_is_ipv6_ext_supported(struct sess_info *sess)
++static inline bool __smgr_is_ipv6_ext_supported(struct sess_info *s)
+ {
+-	if (__smgr_is_iptun_decp_sess(sess)) {
++	if (__smgr_is_iptun_decp_sess(s)) {
+ 		/* for ip tunnel decapsulation, the interesting case
+ 		 * is only where ipv6 in the ingress inner and egress outer
+ 		 */
+-		if (!__smgr_is_ipv6_pkt(SESS_INGRS_INNER_BMAP(sess)) ||
+-		    !__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			return true;
+-		if ((SESS_INGRS_INNER_BMAP(sess) & FV_L3_IPV6_EXTENSION) ==
+-		    (SESS_EGRS_OUTER_BMAP(sess) & FV_L3_IPV6_EXTENSION))
+-			return true;
+-	} else if (__smgr_is_iptun_encp_sess(sess)) {
++		return !__smgr_is_ipv6_opt_changed(s, HDR_INNER, HDR_OUTER);
++	} else if (__smgr_is_iptun_encp_sess(s)) {
+ 		/* for ip tunnel encapsulation, the interesting case
+ 		 * is only where ipv6 in the ingress outer and egress inner
+ 		 */
+-		if (!__smgr_is_ipv6_pkt(SESS_INGRS_OUTER_BMAP(sess)) ||
+-		    !__smgr_is_ipv6_pkt(SESS_EGRS_INNER_BMAP(sess)))
+-			return true;
+-		if ((SESS_INGRS_OUTER_BMAP(sess) & FV_L3_IPV6_EXTENSION) ==
+-		    (SESS_EGRS_INNER_BMAP(sess) & FV_L3_IPV6_EXTENSION))
+-			return true;
+-	} else {
+-		if (!__smgr_is_ipv6_opt_inner_changed(sess) &&
+-		    !__smgr_is_ipv6_opt_outer_changed(sess))
+-			return true;
++		return !__smgr_is_ipv6_opt_changed(s, HDR_OUTER, HDR_INNER);
+ 	}
+ 
++	if (!__smgr_is_ipv6_opt_changed(s, HDR_OUTER, HDR_OUTER) &&
++	    !__smgr_is_ipv6_opt_changed(s, HDR_INNER, HDR_INNER))
++		return true;
++
+ 	return false;
+ }
+ 
+@@ -722,30 +657,28 @@ static inline bool __smgr_is_ipv6_ext_supported(struct sess_info *sess)
+  *        ONLY w/o any other tunnels
+  * @note this API also set the mod_flags to avoid double
+  *       checking later
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_eogre_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_eogre_term_sess(struct sess_info *s)
+ {
+ 	/* decapsulation */
+-	if ((SESS_INGRS_TUNN_BMAP(sess) == FV_TUNNEL_GRE_ETH)         &&
+-	    (SESS_EGRS_TUNN_BMAP(sess)  == 0)                         &&
+-	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (SESS_INGRS_INNER_BMAP(sess) & FV_L2_BASE)) {
+-		SESS_MOD_FLAG_SET(sess, MOD_EOGRE_DECP_BIT);
++	if (SESS_RX_IS_L2_GRE(s)   &&
++	    !SESS_TX_IS_L2_GRE(s)  &&
++	    SESS_RX_IS_INNER_IP(s) &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_EOGRE_DECP_BIT);
+ 		return true;
+ 	}
+ 	/* encapsulation */
+-	if ((SESS_EGRS_TUNN_BMAP(sess)  == FV_TUNNEL_GRE_ETH)        &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
+-	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (SESS_EGRS_INNER_BMAP(sess) & FV_L2_BASE)) {
+-		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_EOGRE_V4_ENCP_BIT);
+-		else if (__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_EOGRE_V6_ENCP_BIT);
++	if (SESS_TX_IS_L2_GRE(s)   &&
++	    !SESS_RX_IS_L2_GRE(s)  &&
++	    SESS_TX_IS_INNER_IP(s) &&
++	    SESS_TX_IS_INNER_L4(s)) {
++		if (SESS_TX_IS_OUTER_IPV4(s))
++			SESS_MOD_FLAG_SET(s, MOD_EOGRE_V4_ENCP_BIT);
++		else if (SESS_TX_IS_OUTER_IPV6(s))
++			SESS_MOD_FLAG_SET(s, MOD_EOGRE_V6_ENCP_BIT);
+ 		return true;
+ 	}
+ 
+@@ -757,28 +690,26 @@ static inline bool __smgr_is_eogre_term_sess(struct sess_info *sess)
+  *        ONLY w/o any other tunnels
+  * @note this API also set the mod_flags to avoid double
+  *       checking later
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_ipogre_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_ipogre_term_sess(struct sess_info *s)
+ {
+ 	/* decapsulation */
+-	if ((SESS_INGRS_TUNN_BMAP(sess) == FV_TUNNEL_GRE_IP)          &&
+-	    (SESS_EGRS_TUNN_BMAP(sess)  == 0)                         &&
+-	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_IPOGRE_DECP_BIT);
++	if (SESS_RX_IS_IP_GRE(s)  &&
++	    !SESS_TX_IS_IP_GRE(s) &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_IPOGRE_DECP_BIT);
+ 		return true;
+ 	}
+ 	/* encapsulation */
+-	if ((SESS_EGRS_TUNN_BMAP(sess)  == FV_TUNNEL_GRE_IP)         &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
+-	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
+-		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_IPOGRE_V4_ENCP_BIT);
+-		else if (__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_IPOGRE_V6_ENCP_BIT);
++	if (SESS_TX_IS_IP_GRE(s)  &&
++	    !SESS_RX_IS_IP_GRE(s) &&
++	    SESS_TX_IS_INNER_L4(s)) {
++		if (SESS_TX_IS_OUTER_IPV4(s))
++			SESS_MOD_FLAG_SET(s, MOD_IPOGRE_V4_ENCP_BIT);
++		else if (SESS_TX_IS_OUTER_IPV6(s))
++			SESS_MOD_FLAG_SET(s, MOD_IPOGRE_V6_ENCP_BIT);
+ 		return true;
+ 	}
+ 
+@@ -790,25 +721,23 @@ static inline bool __smgr_is_ipogre_term_sess(struct sess_info *sess)
+  *        ONLY w/o any other tunnels
+  * @note this API also set the mod_flags to avoid double
+  *       checking later
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_dslite_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_dslite_term_sess(struct sess_info *s)
+ {
+ 	/* decapsulation */
+-	if ((SESS_INGRS_TUNN_BMAP(sess) == FV_TUNNEL_DSLITE)          &&
+-	    (SESS_EGRS_TUNN_BMAP(sess)  == 0)                         &&
+-	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_DSLITE_DECP_BIT);
++	if (SESS_RX_IS_DSLITE(s)  &&
++	    !SESS_TX_IS_DSLITE(s) &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_DSLITE_DECP_BIT);
+ 		return true;
+ 	}
+ 	/* encapsulation */
+-	if ((SESS_EGRS_TUNN_BMAP(sess)  == FV_TUNNEL_DSLITE)         &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
+-	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_DSLITE_ENCP_BIT);
++	if (SESS_TX_IS_DSLITE(s)  &&
++	    !SESS_RX_IS_DSLITE(s) &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_DSLITE_ENCP_BIT);
+ 		return true;
+ 	}
+ 
+@@ -820,25 +749,23 @@ static inline bool __smgr_is_dslite_term_sess(struct sess_info *sess)
+  *        ONLY w/o any other tunnels
+  * @note this API also set the mod_flags to avoid double
+  *       checking later
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_6rd_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_6rd_term_sess(struct sess_info *s)
+ {
+ 	/* decapsulation */
+-	if ((SESS_INGRS_TUNN_BMAP(sess) == FV_TUNNEL_6RD)             &&
+-	    (SESS_EGRS_TUNN_BMAP(sess)  == 0)                         &&
+-	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_6RD_DECP_BIT);
++	if (SESS_RX_IS_SIXRD(s)  &&
++	    !SESS_TX_IS_SIXRD(s) &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_6RD_DECP_BIT);
+ 		return true;
+ 	}
+ 	/* encapsulation */
+-	if ((SESS_EGRS_TUNN_BMAP(sess)  == FV_TUNNEL_6RD)            &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
+-	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_6RD_ENCP_BIT);
++	if (SESS_TX_IS_SIXRD(s)  &&
++	    !SESS_RX_IS_SIXRD(s) &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		SESS_MOD_FLAG_SET(s, MOD_6RD_ENCP_BIT);
+ 		return true;
+ 	}
+ 
+@@ -850,37 +777,36 @@ static inline bool __smgr_is_6rd_term_sess(struct sess_info *sess)
+  *        ONLY w/o any other tunnels
+  * @note this API also set the mod_flags to avoid double
+  *       checking later
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_l2tpudp_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_l2tpudp_term_sess(struct sess_info *s)
+ {
+-	__u32 tunnel_bitmap = SESS_INGRS_TUNN_BMAP(sess) &
+-			      ~FV_TUNNEL_L2TP_FLAGS;
++	union l2tphdr *l2tp;
+ 
+ 	/* decapsulation v2/v3 */
+-	if ((tunnel_bitmap == FV_TUNNEL_L2TPV2_UDP                    ||
+-	     tunnel_bitmap == FV_TUNNEL_L2TPV3_UDP)                   &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) & FV_TUNNEL_L2TP_PPP)         &&
+-	     !(SESS_INGRS_TUNN_BMAP(sess) & FV_TUNNEL_L2TP_O)         &&
+-	     !(SESS_INGRS_TUNN_BMAP(sess) & FV_TUNNEL_L2TP_CK)        &&
+-	    (SESS_EGRS_TUNN_BMAP(sess)  == 0)                         &&
+-	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_L2TPUDP_DECP_BIT);
+-		return true;
++	if (SESS_RX_IS_L2TP_OUDP(s)                &&
++	    SESS_RX_IS_PPP(s)                      &&
++	    !PKTPRS_IS_MULTI_LEVEL(SESS_TX_PKT(s)) &&
++	    SESS_RX_IS_INNER_IP(s)                 &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		l2tp = pktprs_l2tp_oudp_hdr(SESS_RX_PKT(s), HDR_OUTER);
++		if (l2tp && !(l2tp->v3_oudp.flags & L2TP_HDRFLAG_O)) {
++			/* TBD - check for cookie */
++			SESS_MOD_FLAG_SET(s, MOD_L2TPUDP_DECP_BIT);
++			return true;
++		}
++		return false;
+ 	}
+ 	/* encapsulation v2/v3 */
+-	tunnel_bitmap = SESS_EGRS_TUNN_BMAP(sess) & ~FV_TUNNEL_L2TP_FLAGS;
+-	if ((tunnel_bitmap == FV_TUNNEL_L2TPV2_UDP                   ||
+-	     tunnel_bitmap == FV_TUNNEL_L2TPV3_UDP)                  &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
+-	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
+-		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_L2TPUDP_IPV4_ENCP_BIT);
+-		else if (__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_L2TPUDP_IPV6_ENCP_BIT);
++	if (SESS_TX_IS_L2TP_OUDP(s)                &&
++	    !PKTPRS_IS_MULTI_LEVEL(SESS_RX_PKT(s)) &&
++	    SESS_TX_IS_INNER_IP(s)                 &&
++	    SESS_TX_IS_INNER_L4(s)) {
++		if (SESS_TX_IS_OUTER_IPV4(s))
++			SESS_MOD_FLAG_SET(s, MOD_L2TPUDP_IPV4_ENCP_BIT);
++		else if (SESS_TX_IS_OUTER_IPV6(s))
++			SESS_MOD_FLAG_SET(s, MOD_L2TPUDP_IPV6_ENCP_BIT);
+ 		return true;
+ 	}
+ 
+@@ -892,152 +818,99 @@ static inline bool __smgr_is_l2tpudp_term_sess(struct sess_info *sess)
+  *        ONLY w/o any other tunnels
+  * @note this API also set the mod_flags to avoid double
+  *       checking later
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_l2tpip_term_sess(struct sess_info *sess)
++static inline bool __smgr_is_l2tpip_term_sess(struct sess_info *s)
+ {
+-	__u32 tunnel_bitmap = SESS_INGRS_TUNN_BMAP(sess) &
+-				      ~FV_TUNNEL_L2TP_FLAGS;
++	union l2tphdr *l2tp;
+ 
+ 	/* decapsulation */
+ 	/* Do not support cookie or session_id == 0 (control message) */
+-	if (tunnel_bitmap == FV_TUNNEL_L2TPV3_IP                      &&
+-	    (SESS_EGRS_TUNN_BMAP(sess) == 0)                          &&
+-	    !(SESS_INGRS_TUNN_BMAP(sess) & FV_TUNNEL_L2TP_CK)         &&
+-	    (SESS_INGRS_OUTER_L4(sess).l2tpoip.session_id != 0)       &&
+-	    (__smgr_is_pkt_l3_supported(SESS_INGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_INGRS_INNER_BMAP(sess)))) {
+-		SESS_MOD_FLAG_SET(sess, MOD_L2TPIP_DECP_BIT);
+-		return true;
++	if (PKTPRS_IS_L2TP_OIP(SESS_RX_PKT(s), HDR_OUTER)  &&
++	    !PKTPRS_IS_L2TP_OIP(SESS_TX_PKT(s), HDR_OUTER) &&
++	    SESS_RX_IS_INNER_IP(s)                 &&
++	    SESS_RX_IS_INNER_L4(s)) {
++		l2tp = pktprs_l2tp_oip_hdr(SESS_RX_PKT(s), HDR_OUTER);
++		if (l2tp && l2tp->v3_oip.sess_id) {
++			/* TBD - check for cookie */
++			SESS_MOD_FLAG_SET(s, MOD_L2TPIP_DECP_BIT);
++			return true;
++		}
++		return false;
+ 	}
+ 	/* encapsulation */
+-	tunnel_bitmap = SESS_EGRS_TUNN_BMAP(sess) & ~FV_TUNNEL_L2TP_FLAGS;
+-	if (tunnel_bitmap == FV_TUNNEL_L2TPV3_IP                     &&
+-	    (SESS_INGRS_TUNN_BMAP(sess) == 0)                        &&
+-	    (__smgr_is_pkt_l3_supported(SESS_EGRS_INNER_BMAP(sess))) &&
+-	    (__smgr_is_pkt_l4_supported(SESS_EGRS_INNER_BMAP(sess)))) {
+-		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_L2TPIP_IPV4_ENCP_BIT);
+-		else if (__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			SESS_MOD_FLAG_SET(sess, MOD_L2TPIP_IPV6_ENCP_BIT);
++	if (PKTPRS_IS_L2TP_OIP(SESS_TX_PKT(s), HDR_OUTER)  &&
++	    !PKTPRS_IS_L2TP_OIP(SESS_RX_PKT(s), HDR_OUTER) &&
++	    SESS_TX_IS_INNER_IP(s)                 &&
++	    SESS_TX_IS_INNER_L4(s)) {
++		if (SESS_TX_IS_OUTER_IPV4(s))
++			SESS_MOD_FLAG_SET(s, MOD_L2TPIP_IPV4_ENCP_BIT);
++		else if (SESS_TX_IS_OUTER_IPV6(s))
++			SESS_MOD_FLAG_SET(s, MOD_L2TPIP_IPV6_ENCP_BIT);
+ 		return true;
+ 	}
+ 
+ 	return false;
+ }
+ 
+-/**
+- * @brief Check whether a session is ESP at ingress
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_esp_ingress_sess(struct sess_info *sess)
+-{
+-	if ((SESS_INGRS_OUTER_BMAP(sess)   & FV_L4_ESP) ||
+-	     ((SESS_INGRS_OUTER_BMAP(sess) & FV_L4_UDP) &&
+-	      (SESS_INGRS_INNER_BMAP(sess) & FV_L4_ESP)))
+-		return true;
+-
+-	return false;
+-}
+-
+-/**
+- * @brief Check whether a session is ESP at egress
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_esp_egress_sess(struct sess_info *sess)
+-{
+-	if ((SESS_EGRS_OUTER_BMAP(sess)   & FV_L4_ESP) ||
+-	     ((SESS_EGRS_OUTER_BMAP(sess) & FV_L4_UDP) &&
+-	      (SESS_EGRS_INNER_BMAP(sess) & FV_L4_ESP)))
+-		return true;
+-
+-	return false;
+-}
+-
+ /**
+  * @brief Check whether a session is ESP encapsulation
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_esp_encp_sess(struct sess_info *sess)
+-{
+-	return !__smgr_is_esp_ingress_sess(sess) &&
+-	       __smgr_is_esp_egress_sess(sess);
+-}
+-
+-/**
+- * @brief Check whether a session outer mac addresses has changed
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_outer_mac_changed(struct sess_info *sess)
++static inline bool __smgr_is_esp_encp_sess(struct sess_info *s)
+ {
+-	return !!memcmp(&SESS_INGRS_OUTER_L2(sess).h_dest,
+-			&SESS_EGRS_OUTER_L2(sess).h_dest, ETH_ALEN);
++	return !PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_OUTER) &&
++	       PKTPRS_IS_ESP(SESS_TX_PKT(s), HDR_OUTER);
+ }
+ 
+ /**
+- * @brief Check whether a session inner mac addresses has changed
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_inner_mac_changed(struct sess_info *sess)
+-{
+-	return !!memcmp(&SESS_INGRS_INNER_L2(sess).h_dest,
+-			&SESS_EGRS_INNER_L2(sess).h_dest, ETH_ALEN);
+-}
+-
+-/**
+- * @brief Check whether a session outer vlans has been
+- *        added/removed/changed
+- * @param sess the session to test
++ * @brief Check whether a session mac addresses has changed
++ * @param s the session to test
++ * @param lvl header level (inner/outer)
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_outer_vlan_changed(struct sess_info *sess)
++static inline bool __smgr_is_mac_changed(struct sess_info *s, u8 lvl)
+ {
+-	u32 vlans = (FV_L2_INT_VLAN | FV_L2_EXT_VLAN | FV_L2_SKB_VLAN_TAG);
++	/* dst mac changed? */
++	if (PKTPRS_IS_MAC(SESS_RX_PKT(s), lvl) &&
++	    PKTPRS_IS_MAC(SESS_TX_PKT(s), lvl)) {
++		return !!memcmp(&pktprs_eth_hdr(SESS_RX_PKT(s), lvl)->h_dest,
++				&pktprs_eth_hdr(SESS_TX_PKT(s), lvl)->h_dest,
++				ETH_ALEN);
++	}
+ 
+-	/* vlan was added or removed? */
+-	if ((SESS_INGRS_OUTER_BMAP(sess) & vlans) !=
+-	    (SESS_EGRS_OUTER_BMAP(sess)  & vlans))
+-		return true;
+-	/* external vlan value changed? */
+-	if (SESS_INGRS_OUTER_L2(sess).ext_vlan !=
+-	    SESS_EGRS_OUTER_L2(sess).ext_vlan)
+-		return true;
+-	/* internal vlan value changed? */
+-	if (SESS_INGRS_OUTER_L2(sess).int_vlan !=
+-	    SESS_EGRS_OUTER_L2(sess).int_vlan)
++	/* mac added or removed? */
++	if (PKTPRS_IS_MAC(SESS_RX_PKT(s), lvl) !=
++	    PKTPRS_IS_MAC(SESS_TX_PKT(s), lvl))
+ 		return true;
+ 
++	/* no changes */
+ 	return false;
+ }
+ 
+-/**
+- * @brief Check whether a session inner vlans has been
+- *        added/removed/changed
+- * @param sess the session to test
+- * @return bool true if it is, false otherwise
+- */
+-static inline bool __smgr_is_inner_vlan_changed(struct sess_info *sess)
++static inline bool __smgr_is_vlan_changed(struct sess_info *s, u8 lvl)
+ {
+-	u32 vlans = (FV_L2_INT_VLAN | FV_L2_EXT_VLAN);
++	u8 i;
+ 
+-	/* vlan was added or removed? */
+-	if ((SESS_INGRS_INNER_BMAP(sess) & vlans) !=
+-	    (SESS_EGRS_INNER_BMAP(sess)  & vlans))
+-		return true;
+-	/* external vlan value changed? */
+-	if (SESS_INGRS_INNER_L2(sess).ext_vlan !=
+-	    SESS_EGRS_INNER_L2(sess).ext_vlan)
+-		return true;
+-	/* internal vlan value changed? */
+-	if (SESS_INGRS_INNER_L2(sess).int_vlan !=
+-	    SESS_EGRS_INNER_L2(sess).int_vlan)
+-		return true;
++	if (!PKTPRS_VLAN_EXIST(SESS_RX_PKT(s), lvl) &&
++	    !PKTPRS_VLAN_EXIST(SESS_TX_PKT(s), lvl))
++		return false;
++
++	for (i = 0; i < MAX_VLAN_HDRS_SUPPORTED; i++) {
++		if (!PKTPRS_IS_VLAN(SESS_RX_PKT(s), lvl, i) &&
++		    !PKTPRS_IS_VLAN(SESS_TX_PKT(s), lvl, i))
++			return false;
++		/* vlan was added or removed? */
++		if (PKTPRS_IS_VLAN(SESS_RX_PKT(s), lvl, i) !=
++		    PKTPRS_IS_VLAN(SESS_TX_PKT(s), lvl, i))
++			return true;
++		/* vlan value changed? */
++		if (pktprs_vlan_hdr(SESS_RX_PKT(s), lvl, i)->h_vlan_TCI !=
++		    pktprs_vlan_hdr(SESS_TX_PKT(s), lvl, i)->h_vlan_TCI)
++			return true;
++	}
+ 
+ 	return false;
+ }
+@@ -1045,70 +918,74 @@ static inline bool __smgr_is_inner_vlan_changed(struct sess_info *sess)
+ /**
+  * @brief Check whether a session outer pppoe has been
+  *        added/removed/changed
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_outer_pppoe_changed(struct sess_info *sess)
++static inline bool __smgr_is_pppoe_changed(struct sess_info *s, u8 lvl)
+ {
+-	/* pppoe header was added or removed? */
+-	if ((SESS_INGRS_OUTER_BMAP(sess) & FV_L2_PPPOE) !=
+-	    (SESS_EGRS_OUTER_BMAP(sess)  & FV_L2_PPPOE))
+-		return true;
++	/* no pppoe? */
++	if (!PKTPRS_IS_PPPOE(SESS_RX_PKT(s), lvl) &&
++	    !PKTPRS_IS_PPPOE(SESS_TX_PKT(s), lvl))
++		return false;
++
+ 	/* pppoe session id changed? */
+-	if (SESS_INGRS_OUTER_L2(sess).pppoe_id !=
+-	    SESS_EGRS_OUTER_L2(sess).pppoe_id)
+-		return true;
++	if (PKTPRS_IS_PPPOE(SESS_RX_PKT(s), lvl) &&
++	    PKTPRS_IS_PPPOE(SESS_TX_PKT(s), lvl)) {
++		return pktprs_pppoe_hdr(SESS_RX_PKT(s), lvl)->sid !=
++		       pktprs_pppoe_hdr(SESS_TX_PKT(s), lvl)->sid;
++	}
+ 
+-	return false;
++	/* pppoe header was added or removed? */
++	return true;
+ }
+ 
+-static inline bool __smgr_is_outer_l2_changed(struct sess_info *sess)
++static inline bool __smgr_is_outer_l2_changed(struct sess_info *s)
+ {
+-	return __smgr_is_outer_mac_changed(sess)  ||
+-	       __smgr_is_outer_vlan_changed(sess) ||
+-	       __smgr_is_outer_pppoe_changed(sess);
++	return __smgr_is_mac_changed(s, HDR_OUTER)  ||
++	       __smgr_is_vlan_changed(s, HDR_OUTER) ||
++	       __smgr_is_pppoe_changed(s, HDR_OUTER);
+ }
+ 
+ /**
+  * @brief Check whether a session nat packets are ipv4, the nat
+  *        packets are the packets that needs to compare for doing the
+  *        nat
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_ipv4_nat(struct sess_info *sess)
++static inline bool __smgr_is_ipv4_nat(struct sess_info *s)
+ {
+-	return __smgr_is_ipv4_pkt(SESS_NAT_EGRS_BMAP(sess)) &&
+-	       __smgr_is_ipv4_pkt(SESS_NAT_INGRS_BMAP(sess));
++	return PKTPRS_IS_IPV4(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s)) &&
++	       PKTPRS_IS_IPV4(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s));
+ }
+ 
+ /**
+  * @brief Check whether the session's nat packets are ipv6, the nat
+  *        packets are the packets that needs to compare for doing the
+  *        nat
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if it is, false otherwise
+  */
+-static inline bool __smgr_is_ipv6_nat(struct sess_info *sess)
++static inline bool __smgr_is_ipv6_nat(struct sess_info *s)
+ {
+-	return __smgr_is_ipv6_pkt(SESS_NAT_EGRS_BMAP(sess)) &&
+-	       __smgr_is_ipv6_pkt(SESS_NAT_INGRS_BMAP(sess));
++	return PKTPRS_IS_IPV6(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s)) &&
++	       PKTPRS_IS_IPV6(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s));
+ }
+ 
+ /**
+  * @brief Check whether a nat ipv4 session ip addresses has changed
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if they did, false otherwise
+  */
+-static inline bool __smgr_is_ipv4_nat_addr_changed(struct sess_info *sess)
++static inline bool __smgr_is_ipv4_nat_addr_changed(struct sess_info *s)
+ {
+ 	/* source address changed? */
+-	if (SESS_NAT_INGRS_L3(sess)->v4.saddr !=
+-	    SESS_NAT_EGRS_L3(sess)->v4.saddr)
++	if (pktprs_ipv4_hdr(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s))->saddr !=
++	    pktprs_ipv4_hdr(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))->saddr)
+ 		return true;
+ 	/* dest address changed? */
+-	if (SESS_NAT_INGRS_L3(sess)->v4.daddr !=
+-	    SESS_NAT_EGRS_L3(sess)->v4.daddr)
++	if (pktprs_ipv4_hdr(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s))->daddr !=
++	    pktprs_ipv4_hdr(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))->daddr)
+ 		return true;
+ 
+ 	return false;
+@@ -1116,19 +993,19 @@ static inline bool __smgr_is_ipv4_nat_addr_changed(struct sess_info *sess)
+ 
+ /**
+  * @brief Check whether a nat ipv6 session ip addresses has changed
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if they did, false otherwise
+  */
+-static inline bool __smgr_is_ipv6_nat_addr_changed(struct sess_info *sess)
++static inline bool __smgr_is_ipv6_nat_addr_changed(struct sess_info *s)
+ {
+ 	/* source address changed? */
+-	if (memcmp(&SESS_NAT_INGRS_L3(sess)->v6.saddr,
+-		   &SESS_NAT_EGRS_L3(sess)->v6.saddr,
++	if (memcmp(&pktprs_ipv6_hdr(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s))->saddr,
++		   &pktprs_ipv6_hdr(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))->saddr,
+ 		   sizeof(struct in6_addr)))
+ 		return true;
+ 	/* dest address changed? */
+-	if (memcmp(&SESS_NAT_INGRS_L3(sess)->v6.daddr,
+-		   &SESS_NAT_EGRS_L3(sess)->v6.daddr,
++	if (memcmp(&pktprs_ipv6_hdr(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s))->daddr,
++		   &pktprs_ipv6_hdr(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))->daddr,
+ 		   sizeof(struct in6_addr)))
+ 		return true;
+ 
+@@ -1137,17 +1014,17 @@ static inline bool __smgr_is_ipv6_nat_addr_changed(struct sess_info *sess)
+ 
+ /**
+  * @brief Check whether the session's nat ip addresses has changed
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if they did, false otherwise
+  */
+-static inline bool __smgr_is_ip_nat_addr_changed(struct sess_info *sess)
++static inline bool __smgr_is_ip_nat_addr_changed(struct sess_info *s)
+ {
+ 	/* IPv4 */
+-	if (__smgr_is_ipv4_nat(sess))
+-		return __smgr_is_ipv4_nat_addr_changed(sess);
++	if (__smgr_is_ipv4_nat(s))
++		return __smgr_is_ipv4_nat_addr_changed(s);
+ 	/* IPv6 */
+-	else if (__smgr_is_ipv6_nat(sess))
+-		return __smgr_is_ipv6_nat_addr_changed(sess);
++	if (__smgr_is_ipv6_nat(s))
++		return __smgr_is_ipv6_nat_addr_changed(s);
+ 
+ 	return false;
+ }
+@@ -1238,7 +1115,7 @@ static inline void __smgr_stats_inactive_req(void)
+ /**
+  * @brief Update stats upon session created
+  */
+-static inline void __smgr_stats_sess_created(struct sess_info *sess)
++static inline void __smgr_stats_sess_created(struct sess_info *s)
+ {
+ 	struct smgr_stats *stats = &db->stats;
+ 
+@@ -1247,9 +1124,10 @@ static inline void __smgr_stats_sess_created(struct sess_info *sess)
+ 	atomic_dec(&stats->sess_free);
+ 
+ 	if (atomic_read(&stats->sess_open_hi_wm) <
+-	    atomic_read(&stats->sess_open))
++	    atomic_read(&stats->sess_open)) {
+ 		atomic_set(&stats->sess_open_hi_wm,
+ 			   atomic_read(&stats->sess_open));
++	}
+ 
+ 	/* TBD: update session type based stats: IPv4, IPv6, TCP, UDP */
+ }
+@@ -1350,7 +1228,7 @@ static inline void __smgr_stats_inactive_failed(void)
+ /**
+  * @brief Update stats upon session lookup failure
+  */
+-static inline void __smgr_stats_sess_lu_fail(struct sess_info *sess)
++static inline void __smgr_stats_sess_lu_fail(struct sess_info *s)
+ {
+ 	atomic_inc(&db->stats.sess_lu_fail);
+ }
+@@ -1358,7 +1236,7 @@ static inline void __smgr_stats_sess_lu_fail(struct sess_info *sess)
+ /**
+  * @brief Update stats upon successful session lookup
+  */
+-static inline void __smgr_stats_sess_lu_succ(struct sess_info *sess)
++static inline void __smgr_stats_sess_lu_succ(struct sess_info *s)
+ {
+ 	atomic_inc(&db->stats.sess_lu_succ);
+ }
+@@ -1366,7 +1244,7 @@ static inline void __smgr_stats_sess_lu_succ(struct sess_info *sess)
+ /**
+  * @brief Update stats upon session lookup error
+  */
+-static inline void __smgr_stats_sess_lu_err(struct sess_info *sess)
++static inline void __smgr_stats_sess_lu_err(struct sess_info *s)
+ {
+ 	atomic_inc(&db->stats.sess_lookup_err);
+ }
+@@ -1375,7 +1253,7 @@ static inline void __smgr_stats_sess_lu_err(struct sess_info *sess)
+  * @brief Update stats upon a request to create session for
+  *        unsupported packet
+  */
+-static inline void __smgr_stats_sess_no_supported(struct sess_info *sess)
++static inline void __smgr_stats_sess_no_supported(struct sess_info *s)
+ {
+ 	atomic_inc(&db->stats.sess_not_supported);
+ }
+@@ -1383,7 +1261,7 @@ static inline void __smgr_stats_sess_no_supported(struct sess_info *sess)
+ /**
+  * @brief Update stats upon si create error
+  */
+-static inline void __smgr_stats_sess_si_create_err(struct sess_info *sess)
++static inline void __smgr_stats_sess_si_create_err(struct sess_info *s)
+ {
+ 	atomic_inc(&db->stats.sess_si_create_err);
+ }
+@@ -1744,21 +1622,19 @@ enum smgr_state smgr_state_get(void)
+ 
+ /**
+  * @brief Save some extra stuff in the database for better debugging
+- * @param sess the session
++ * @param s the session
+  */
+-static inline void __smgr_sess_debug(struct sess_info *sess)
++static inline void __smgr_sess_debug(struct sess_info *s)
+ {
+ #ifdef CONFIG_DEBUG_FS
+-	struct sess_db_info *info = &sess->db_ent->info;
++	struct sess_db_info *info = &s->db_ent->info;
+ 
+ 	/* save ingress packet info */
+-	if (SESS_INGRS_PKT(sess))
+-		memcpy(&info->ingress, SESS_INGRS_PKT(sess),
+-		       sizeof(info->ingress));
++	if (SESS_RX_PKT(s))
++		memcpy(&info->rx, SESS_RX_PKT(s), sizeof(info->rx));
+ 	/* save egress packet info */
+-	if (SESS_EGRS_PKT(sess))
+-		memcpy(&info->egress, SESS_EGRS_PKT(sess),
+-		       sizeof(info->egress));
++	if (SESS_TX_PKT(s))
++		memcpy(&info->tx, SESS_TX_PKT(s), sizeof(info->tx));
+ #endif
+ }
+ 
+@@ -1776,12 +1652,12 @@ static bool __smgr_is_sess_args_ptrs_valid(struct pp_sess_create_args *args)
+ 	if (unlikely(ptr_is_null(args)))
+ 		return false;
+ 
+-	if (unlikely(args->in_pkt && !args->eg_pkt)) {
++	if (unlikely(args->rx && !args->tx)) {
+ 		pr_err("ingress packet without egress packet\n");
+ 		res = false;
+ 	}
+ 
+-	if (unlikely(!args->in_pkt && args->eg_pkt)) {
++	if (unlikely(!args->rx && args->tx)) {
+ 		pr_err("egress packet without ingress packet\n");
+ 		res = false;
+ 	}
+@@ -1926,37 +1802,39 @@ static bool __smgr_is_sess_args_valid(struct pp_sess_create_args *args)
+  *        the calculation is pretty simple, if a layer exist we set
+  *        the size to be everything from the start of the field vector
+  *        up to that layer including the layer itself
+- * @param sess session info to save the real fv size
++ * @param s session info to save the real fv size
+  * @return 0 always
+  */
+-static s32 __smgr_calc_fv_real_sz(struct sess_info *sess)
++static s32 __smgr_calc_fv_real_sz(struct sess_info *s)
+ {
+ 	/* oob always exist */
+-	sess->si.fv_sz = sizeof(sess->si.fv.oob);
+-	if (!SESS_INGRS_PKT(sess))
++	s->si.fv_sz = sizeof(s->si.fv.oob);
++	if (!SESS_RX_PKT(s))
+ 		return 0;
+ 
+ 	/* outer l2 */
+-	if (SESS_INGRS_OUTER_BMAP(sess) & LEARN_FV_L2_FLAGS)
+-		sess->si.fv_sz = offsetof(struct pp_fv, first.l3);
++	if (PKTPRS_IS_MAC(SESS_RX_PKT(s), HDR_OUTER))
++		s->si.fv_sz = offsetof(struct pp_fv, first.l3);
+ 	/* outer l3 */
+-	if (SESS_INGRS_OUTER_BMAP(sess) & LEARN_FV_L3_FLAGS)
+-		sess->si.fv_sz = offsetof(struct pp_fv, first.l4);
++	if (SESS_RX_IS_OUTER_IP(s))
++		s->si.fv_sz = offsetof(struct pp_fv, first.l4);
+ 	/* outer l4 */
+-	if (SESS_INGRS_OUTER_BMAP(sess) & LEARN_FV_L4_FLAGS)
+-		sess->si.fv_sz = offsetof(struct pp_fv, tunn);
++	if (SESS_RX_IS_OUTER_L4(s))
++		s->si.fv_sz = offsetof(struct pp_fv, tunn);
+ 	/* tunnel */
+-	if (SESS_INGRS_TUNN_BMAP(sess) & LEARN_FV_TUNN_FLAGS)
+-		sess->si.fv_sz = offsetof(struct pp_fv, second);
++	if (PKTPRS_IS_VXLAN(SESS_RX_PKT(s), HDR_OUTER)  ||
++	    PKTPRS_IS_GENEVE(SESS_RX_PKT(s), HDR_OUTER) ||
++	    PKTPRS_IS_L2TP_OUDP(SESS_RX_PKT(s), HDR_OUTER))
++		s->si.fv_sz = offsetof(struct pp_fv, second);
+ 	/* inner l2 */
+-	if (SESS_INGRS_INNER_BMAP(sess) & LEARN_FV_L2_FLAGS)
+-		sess->si.fv_sz = offsetof(struct pp_fv, second.l3);
++	if (PKTPRS_IS_MAC(SESS_RX_PKT(s), HDR_INNER))
++		s->si.fv_sz = offsetof(struct pp_fv, second.l3);
+ 	/* inner l3 */
+-	if (SESS_INGRS_INNER_BMAP(sess) & LEARN_FV_L3_FLAGS)
+-		sess->si.fv_sz = offsetof(struct pp_fv, second.l4);
++	if (SESS_RX_IS_INNER_IP(s))
++		s->si.fv_sz = offsetof(struct pp_fv, second.l4);
+ 	/* inner l4 */
+-	if (SESS_INGRS_INNER_BMAP(sess) & LEARN_FV_L4_FLAGS)
+-		sess->si.fv_sz = sizeof(sess->si.fv);
++	if (SESS_RX_IS_INNER_L4(s))
++		s->si.fv_sz = sizeof(s->si.fv);
+ 
+ 	return 0;
+ }
+@@ -1964,21 +1842,21 @@ static s32 __smgr_calc_fv_real_sz(struct sess_info *sess)
+ /**
+  * @brief Helper function for building the pp field vector out of band
+  *        info for the ingress packet
+- * @param sess session info
++ * @param s session info
+  */
+-static void __smgr_fv_oob_set(struct sess_info *sess)
++static void __smgr_fv_oob_set(struct sess_info *s)
+ {
+-	struct pp_fv_oob        *oob = &sess->si.fv.oob;
++	struct pp_fv_oob *oob = &s->si.fv.oob;
+ 	struct pp_port_cls_data *dcls;
+ 	struct pp_port_cls_info port_cls;
+ 	u8 ext_proto, int_proto, i;
+ 	unsigned long mask, start, end;
+ 
+ 	/* set ingress port */
+-	oob->in_pid = sess->args->in_port;
++	oob->in_pid = s->args->in_port;
+ 	/* set classification data */
+ 	pp_port_cls_info_get(oob->in_pid, &port_cls);
+-	dcls = &sess->args->cls;
++	dcls = &s->args->cls;
+ 	for (start = 0, i = 0; i < dcls->n_flds; i++) {
+ 		end    = start + port_cls.cp[i].copy_size - 1;
+ 		mask   = GENMASK(end, start);
+@@ -1992,17 +1870,15 @@ static void __smgr_fv_oob_set(struct sess_info *sess)
+ 	 * oob info) we need to set external and internal exactly as
+ 	 * the parser will do, PRSR_PROTO_NO_PARSE
+ 	 */
+-	if (!SESS_INGRS_PKT(sess)) {
++	if (!SESS_RX_PKT(s)) {
+ 		ext_proto = PP_FV_OTHER_L3_UNKNOWN_L4;
+ 		int_proto = PP_FV_UNKNOWN_L3;
+ 		goto done;
+ 	}
+ 
+ 	/* set proto info */
+-	ext_proto = pp_learn_pkt_to_pp_fv_proto(SESS_INGRS_OUTER_BMAP(sess),
+-						SESS_INGRS_TUNN_BMAP(sess));
+-	int_proto = pp_learn_pkt_to_pp_fv_proto(SESS_INGRS_INNER_BMAP(sess),
+-						0);
++	ext_proto = pp_fv_proto_set(SESS_RX_PKT(s), HDR_OUTER);
++	int_proto = pp_fv_proto_set(SESS_RX_PKT(s), HDR_INNER);
+ 
+ done:
+ 	if (ext_proto != PP_FV_UNKNOWN_L3 &&
+@@ -2031,48 +1907,45 @@ static s32 hash_calc(struct sess_info *sess, void *fv, u32 fv_sz,
+ 
+ /**
+  * @brief Preform session lookup based on the ingress packet
+- * @param sess session info
++ * @param s session info
+  * @return s32 -EEXIST in case session was found, 0 if session wasn't
+  *         found, error code otherwise
+  */
+-static s32 __smgr_sess_lookup(struct sess_info *sess)
++static s32 __smgr_sess_lookup(struct sess_info *s)
+ {
+-	struct pp_sess_create_args *args = sess->args;
++	struct pp_sess_create_args *args = s->args;
+ 	struct pp_fv lu_fv;
+ 	s32 ret = 0;
+ 	u32 id;
+ 
+ 	/* check if the group/dst exist for multicast sessions */
+-	ret = smgr_mcast_sess_lookup(sess);
++	ret = smgr_mcast_sess_lookup(s);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+ 	/* convert the learning ingress fv to pp fv */
+-	if (SESS_INGRS_PKT(sess)) {
+-		ret = pp_learn_pkt_to_pp_fv(SESS_INGRS_PKT(sess), &sess->si.fv);
+-		if (unlikely(ret))
+-			goto done;
+-	}
+-
+-	__smgr_fv_oob_set(sess);
++	ret = pp_fv_build(SESS_RX_PKT(s), &s->si.fv);
++	if (unlikely(ret))
++		goto done;
+ 
++	__smgr_fv_oob_set(s);
+ 	/* calculate the real size of the field vector */
+-	ret = __smgr_calc_fv_real_sz(sess);
++	ret = __smgr_calc_fv_real_sz(s);
+ 	if (unlikely(ret))
+ 		goto done;
+-	pr_debug("fv sz set to %u\n", sess->si.fv_sz);
++	pr_debug("fv sz set to %u\n", s->si.fv_sz);
+ 
+ 	/* prepare field vector for the lookup, the field vector is
+ 	 * swapped in the SI so we swap it before we lookup
+ 	 */
+-	__buf_swap(&lu_fv, sizeof(lu_fv), &sess->si.fv, sess->si.fv_sz);
++	__buf_swap(&lu_fv, sizeof(lu_fv), &s->si.fv, s->si.fv_sz);
+ 
+-	ret = hash_calc(sess, &lu_fv, sess->si.fv_sz, &args->hash);
++	ret = hash_calc(s, &lu_fv, s->si.fv_sz, &args->hash);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+ 	/* lookup */
+-	ret = cls_session_lookup(&lu_fv, sess->si.fv_sz, &args->hash, &id);
++	ret = cls_session_lookup(&lu_fv, s->si.fv_sz, &args->hash, &id);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+@@ -2089,68 +1962,68 @@ static s32 __smgr_sess_lookup(struct sess_info *sess)
+ 	}
+ 
+ 	/* get the reference to the session entry */
+-	sess->db_ent = __smgr_get_sess_db_ent(id);
++	s->db_ent = __smgr_get_sess_db_ent(id);
+ 	ret = -EEXIST;
+ 
+ done:
+ 	if (ret == (-EEXIST))
+-		__smgr_stats_sess_lu_succ(sess);
++		__smgr_stats_sess_lu_succ(s);
+ 	else if (unlikely(ret))
+-		__smgr_stats_sess_lu_err(sess);
++		__smgr_stats_sess_lu_err(s);
+ 	else
+-		__smgr_stats_sess_lu_fail(sess);
++		__smgr_stats_sess_lu_fail(s);
+ 
+ 	return ret;
+ }
+ 
+ /**
+  * @brief Test if a session is supported for acceleration
+- * @param sess the session
++ * @param s the session
+  * @return bool true in case the can be accelerated, false otherwise
+  */
+-static bool __smgr_is_sess_supported(struct sess_info *sess)
++static bool __smgr_is_sess_supported(struct sess_info *s)
+ {
+ 	/* support no packets based sessions */
+-	if (!SESS_INGRS_PKT(sess) || !SESS_EGRS_PKT(sess))
++	if (!SESS_RX_PKT(s) || !SESS_TX_PKT(s))
+ 		return true;
+ 
+-	pr_debug("ingress: outer bmap %#x, inner bmap %#x, tunnel bmap %#x\n",
+-		 SESS_INGRS_OUTER_BMAP(sess), SESS_INGRS_INNER_BMAP(sess),
+-		 SESS_INGRS_TUNN_BMAP(sess));
+-	pr_debug("egress: outer bmap %#x, inner bmap %#x, tunnel bmap %#x\n",
+-		 SESS_EGRS_OUTER_BMAP(sess), SESS_EGRS_INNER_BMAP(sess),
+-		 SESS_EGRS_TUNN_BMAP(sess));
++	pr_debug("rx: outer bmap %#lx, inner bmap %#lx\n",
++		 SESS_RX_PKT(s)->proto_bmap[HDR_OUTER],
++		 SESS_RX_PKT(s)->proto_bmap[HDR_INNER]);
++	pr_debug("tx: outer bmap %#lx, inner bmap %#lx\n",
++		 SESS_TX_PKT(s)->proto_bmap[HDR_OUTER],
++		 SESS_TX_PKT(s)->proto_bmap[HDR_INNER]);
+ 
+-	if (!__smgr_is_pkt_l3_supported(SESS_INGRS_OUTER_BMAP(sess))) {
+-		pr_debug("ingrss outer packet unsupported l3\n");
++	if (!SESS_RX_IS_OUTER_IP(s)) {
++		pr_debug("rx outer packet unsupported l3\n");
+ 		goto not_supported;
+ 	}
+-	if (!__smgr_is_pkt_l3_supported(SESS_EGRS_OUTER_BMAP(sess))) {
+-		pr_debug("egress outer packet unsupported l3\n");
++	if (!SESS_TX_IS_OUTER_IP(s)) {
++		pr_debug("tx outer packet unsupported l3\n");
+ 		goto not_supported;
+ 	}
+ 
+-	if (!__smgr_is_frag_supported(sess))
++	if (!__smgr_is_frag_supported(s))
+ 		goto not_supported;
+ 
+-	if (!__smgr_is_ipv6_ext_supported(sess)) {
++	if (!__smgr_is_ipv6_ext_supported(s)) {
+ 		pr_debug("unsupported modifications in the ipv6 extension header\n");
+ 		goto not_supported;
+ 	}
+ 
+ 	/* tunnel bypass? supported */
+-	if (__smgr_is_tunn_bypass_sess(sess)) {
++	if (__smgr_is_tunn_bypass_sess(s)) {
+ 		pr_debug("tunnel bypass session\n");
+ 		return true;
+ 	}
+ 
+ 	/* no tunnel termination? check l4 */
+-	if (!__smgr_is_tunn_term_sess(sess)) {
+-		if (!__smgr_is_pkt_l4_supported(SESS_INGRS_OUTER_BMAP(sess))) {
++	if (!__smgr_is_tunn_term_sess(s)) {
++		if (!SESS_RX_IS_OUTER_L4(s)) {
+ 			pr_debug("non tunnel termination ingrss outer packet unsupported l4\n");
+ 			goto not_supported;
+ 		}
+-		if (!__smgr_is_pkt_l4_supported(SESS_EGRS_OUTER_BMAP(sess))) {
++		if (!SESS_TX_IS_OUTER_L4(s)) {
+ 			pr_debug("non tunnel termination egress outer packet unsupported l4\n");
+ 			goto not_supported;
+ 		}
+@@ -2160,37 +2033,37 @@ static bool __smgr_is_sess_supported(struct sess_info *sess)
+ 
+ 	/* tunnel termination */
+ 	/* DSLITE */
+-	if (__smgr_is_dslite_term_sess(sess)) {
++	if (__smgr_is_dslite_term_sess(s)) {
+ 		pr_debug("dslite termination session\n");
+ 		return true;
+ 	}
+ 
+ 	/* 6RD */
+-	if (__smgr_is_6rd_term_sess(sess)) {
++	if (__smgr_is_6rd_term_sess(s)) {
+ 		pr_debug("6rd termination session\n");
+ 		return true;
+ 	}
+ 
+ 	/* EoGRE */
+-	if (__smgr_is_eogre_term_sess(sess)) {
++	if (__smgr_is_eogre_term_sess(s)) {
+ 		pr_debug("eogre termination session\n");
+ 		return true;
+ 	}
+ 
+ 	/* IPoGRE */
+-	if (__smgr_is_ipogre_term_sess(sess)) {
++	if (__smgr_is_ipogre_term_sess(s)) {
+ 		pr_debug("ipogre termination session\n");
+ 		return true;
+ 	}
+ 
+ 	/* L2TPUDP */
+-	if (__smgr_is_l2tpudp_term_sess(sess)) {
++	if (__smgr_is_l2tpudp_term_sess(s)) {
+ 		pr_debug("l2tpudp termination session\n");
+ 		return true;
+ 	}
+ 
+ 	/* L2TPIP */
+-	if (__smgr_is_l2tpip_term_sess(sess)) {
++	if (__smgr_is_l2tpip_term_sess(s)) {
+ 		pr_debug("l2tpip termination session\n");
+ 		return true;
+ 	}
+@@ -2203,14 +2076,14 @@ static bool __smgr_is_sess_supported(struct sess_info *sess)
+ 
+ /**
+  * @brief Prepare a session database entry for a newly created session
+- * @param sess session info to save the session db entry
++ * @param s session info to save the session db entry
+  * @return s32 0 on successful session entry allocation, error
+  *        code otherwise
+  * @note Caller MUST acquire database lock
+  */
+-static inline s32 __smgr_sess_ent_prepare(struct sess_info *sess)
++static inline s32 __smgr_sess_ent_prepare(struct sess_info *s)
+ {
+-	struct pp_sess_create_args *args = sess->args;
++	struct pp_sess_create_args *args = s->args;
+ 	struct sess_db_entry *sess_ent;
+ 	u32 sess_id;
+ 
+@@ -2231,13 +2104,13 @@ static inline s32 __smgr_sess_ent_prepare(struct sess_info *sess)
+ 	sess_ent->info.sess_id   = sess_id;
+ 	sess_ent->info.in_port   = args->in_port;
+ 	sess_ent->info.eg_port   = args->eg_port;
+-	sess_ent->info.fv_sz     = sess->si.fv_sz;
+-	sess_ent->info.mod_flags = *sess->mod_flags;
+-	sess->mod_flags     = &sess_ent->info.mod_flags;
+-	sess->db_ent        = sess_ent;
++	sess_ent->info.fv_sz     = s->si.fv_sz;
++	sess_ent->info.mod_flags = *s->mod_flags;
++	s->mod_flags             = &sess_ent->info.mod_flags;
++	s->db_ent                = sess_ent;
+ 
+-	smgr_mcast_sess_ent_prepare(sess);
+-	return smgr_tdox_sess_ent_prepare(sess);
++	smgr_mcast_sess_ent_prepare(s);
++	return smgr_tdox_sess_ent_prepare(s);
+ }
+ 
+ /**
+@@ -2264,146 +2137,138 @@ static s32 __smgr_sess_ent_free(struct sess_db_entry *ent)
+ /**
+  * @brief Set session's flags, the flags will be saved in the session
+  *        db entry
+- * @param sess session info
++ * @param s session info
+  * @return s32 0 on success, error code otherwise
+  */
+-static void __smgr_sess_flags_set(struct sess_info *sess)
++static void __smgr_sess_flags_set(struct sess_info *s)
+ {
+-	if (!SESS_INGRS_PKT(sess) || !SESS_EGRS_PKT(sess))
++	if (!SESS_RX_PKT(s) || !SESS_TX_PKT(s))
+ 		return;
+ 
+-	if (memcmp(&SESS_NAT_INGRS_L2(sess)->h_dest,
+-		   &SESS_NAT_EGRS_L2(sess)->h_dest, ETH_ALEN))
+-		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_ROUTED);
++	if (__smgr_is_mac_changed(s, HDR_OUTER))
++		SESS_FLAG_SET(s->db_ent, SESS_FLAG_ROUTED);
+ 
+-	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_SYNCQ_BIT))
+-		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_SYNCQ);
++	if (SESS_ARGS_IS_FLAG_ON(s, PP_SESS_FLAG_SYNCQ_BIT))
++		SESS_FLAG_SET(s->db_ent, SESS_FLAG_SYNCQ);
+ 
+ 	/* Fragmentation should be potentialy done when adding a tunnel */
+ 	if (pp_misc_is_nf_en(PP_NF_FRAGMENTER)) {
+-		if ((!SESS_INGRS_TUNN_BMAP(sess) &&
+-		     SESS_EGRS_TUNN_BMAP(sess)) ||
+-		    (__smgr_is_pppoe_encap(sess))) {
+-			SESS_FLAG_SET(sess->db_ent, SESS_FLAG_MTU_CHCK);
++		if (__smgr_is_iptun_encp_sess(s) || __smgr_is_pppoe_encap(s)) {
++			SESS_FLAG_SET(s->db_ent, SESS_FLAG_MTU_CHCK);
+ 			pr_debug("SESS_FLAG_MTU_CHCK is set\n");
+ 		}
+ 	}
+ 
+-	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_MCAST_GRP_BIT))
+-		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_MCAST_GRP);
+-	else if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_MCAST_DST_BIT))
+-		SESS_FLAG_SET(sess->db_ent, SESS_FLAG_MCAST_DST);
++	if (SESS_ARGS_IS_FLAG_ON(s, PP_SESS_FLAG_MCAST_GRP_BIT))
++		SESS_FLAG_SET(s->db_ent, SESS_FLAG_MCAST_GRP);
++	else if (SESS_ARGS_IS_FLAG_ON(s, PP_SESS_FLAG_MCAST_DST_BIT))
++		SESS_FLAG_SET(s->db_ent, SESS_FLAG_MCAST_DST);
+ }
+ 
+ /**
+  * @brief Set the bitmaps and headers to use for NAT modifications
+- * @param sess the session
++ * @param s the session
+  */
+-static inline void __smgr_nat_info_init(struct sess_info *sess)
++static inline void __smgr_nat_info_init(struct sess_info *s)
+ {
+-	if (!SESS_INGRS_PKT(sess) || !SESS_EGRS_PKT(sess))
++	if (!SESS_RX_PKT(s) || !SESS_TX_PKT(s))
+ 		return;
+ 
+ 	/* start by setting outer packets */
+ 	pr_debug("set both nat packets to outer\n");
+-	sess->nat.ingrs_bmap =  SESS_INGRS_OUTER_BMAP(sess);
+-	sess->nat.ingrs_l2   = &SESS_INGRS_OUTER_L2(sess);
+-	sess->nat.ingrs_l3   = &SESS_INGRS_OUTER_L3(sess);
+-	sess->nat.ingrs_l4   = &SESS_INGRS_OUTER_L4(sess);
+-	sess->nat.egrs_bmap  =  SESS_EGRS_OUTER_BMAP(sess);
+-	sess->nat.egrs_l2    = &SESS_EGRS_OUTER_L2(sess);
+-	sess->nat.egrs_l3    = &SESS_EGRS_OUTER_L3(sess);
+-	sess->nat.egrs_l4    = &SESS_EGRS_OUTER_L4(sess);
+-
+-	if (__smgr_is_iptun_decp_sess(sess)) {
++	s->nat.rx_lvl = HDR_OUTER;
++	s->nat.tx_lvl = HDR_OUTER;
++
++	if (__smgr_is_iptun_decp_sess(s)) {
+ 		pr_debug("iptun decap: set nat ingress to inner\n");
+-		sess->nat.ingrs_bmap =  SESS_INGRS_INNER_BMAP(sess);
+-		sess->nat.ingrs_l2   = &SESS_INGRS_INNER_L2(sess);
+-		sess->nat.ingrs_l3   = &SESS_INGRS_INNER_L3(sess);
+-		sess->nat.ingrs_l4   = &SESS_INGRS_INNER_L4(sess);
+-	} else if (__smgr_is_iptun_encp_sess(sess)) {
++		s->nat.rx_lvl = HDR_INNER;
++	} else if (__smgr_is_iptun_encp_sess(s)) {
+ 		pr_debug("iptun encap: set nat egress to inner\n");
+-		sess->nat.egrs_bmap =  SESS_EGRS_INNER_BMAP(sess);
+-		sess->nat.egrs_l2   = &SESS_EGRS_INNER_L2(sess);
+-		sess->nat.egrs_l3   = &SESS_EGRS_INNER_L3(sess);
+-		sess->nat.egrs_l4   = &SESS_EGRS_INNER_L4(sess);
++		s->nat.tx_lvl = HDR_INNER;
+ 	}
+ }
+ 
+ /**
+  * @brief Set all si l4 related info, in general, we "always" do l4
+  *        nat to spare recipes
+- * @param sess session info
++ * @param s session info
+  */
+-static void __smgr_si_napt_set(struct sess_info *sess, __sum16 l3_csum)
++static void __smgr_si_napt_set(struct sess_info *s, __sum16 l3_csum)
+ {
+-	struct fv_l4_ports *in_ports;
+-	struct fv_l4_ports *eg_ports;
+-	struct pp_si_sce   *sce     = &sess->si.sce;
+-	struct pp_si_dpu   *dpu     = &sess->si.dpu;
+-	__sum16             l4_csum = l3_csum;
++	struct pp_si_sce *sce = &s->si.sce;
++	struct pp_si_dpu *dpu = &s->si.dpu;
++	__sum16 l4_csum = l3_csum;
++	struct udphdr *rx_l4;
++	struct udphdr *tx_l4;
+ 
+ 	/* do napt only for TCP and UDP, TBD: ICMP */
+-	if (!(SESS_NAT_EGRS_BMAP(sess) & (FV_L4_UDP | FV_L4_TCP)))
++	if (!(PKTPRS_IS_UDP(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s)) &&
++	     PKTPRS_IS_UDP(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))) &&
++	    !(PKTPRS_IS_TCP(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s)) &&
++	     PKTPRS_IS_TCP(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))))
+ 		return;
+ 
+ 	sce->valid = true;
+ 	/* set napt flag */
+-	SESS_MOD_FLAG_SET(sess, MOD_L4_NAPT_BIT);
++	SESS_MOD_FLAG_SET(s, MOD_L4_NAPT_BIT);
+ 	/* set the offset to the checksum field */
+-	if (SESS_NAT_EGRS_BMAP(sess) & FV_L4_UDP) {
++	if (PKTPRS_IS_UDP(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s))) {
+ 		/* UDP */
+-		in_ports = &SESS_NAT_INGRS_L4(sess)->udp;
+-		eg_ports = &SESS_NAT_EGRS_L4(sess)->udp;
++		rx_l4 = pktprs_udp_hdr(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s));
++		tx_l4 = pktprs_udp_hdr(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s));
+ 		dpu->lyr_fld_off = offsetof(struct udphdr, check);
+ 	} else {
+ 		/* TCP */
+-		in_ports = &SESS_NAT_INGRS_L4(sess)->tcp;
+-		eg_ports = &SESS_NAT_EGRS_L4(sess)->tcp;
++		rx_l4 = (struct udphdr *)pktprs_tcp_hdr(SESS_RX_PKT(s),
++							SESS_RX_NAT_LVL(s));
++		tx_l4 = (struct udphdr *)pktprs_tcp_hdr(SESS_TX_PKT(s),
++							SESS_TX_NAT_LVL(s));
+ 		dpu->lyr_fld_off = offsetof(struct tcphdr, check);
+ 	}
+ 
+ 	/* calc checksum for the ports */
+-	if (in_ports->source != eg_ports->source)
+-		csum_replace2(&l4_csum, in_ports->source, eg_ports->source);
+-	if (in_ports->dest != eg_ports->dest)
+-		csum_replace2(&l4_csum, in_ports->dest, eg_ports->dest);
++	if (rx_l4->source != tx_l4->source)
++		csum_replace2(&l4_csum, rx_l4->source, tx_l4->source);
++	if (rx_l4->dest != tx_l4->dest)
++		csum_replace2(&l4_csum, rx_l4->dest, tx_l4->dest);
+ 	sce->l4_csum_delta = ntohs(l4_csum);
+ 	/* for udp we save the csum zero value so the recipe will
+ 	 * not calculate the csum in case it is disabled (set to zero)
+ 	 */
+-	if (SESS_NAT_EGRS_BMAP(sess) & FV_L4_UDP)
++	if (PKTPRS_IS_UDP(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s)))
+ 		sce->l4_csum_zero = sce->l4_csum_delta;
+ 
+ 	/* save ports */
+-	sce->new_dst_port = ntohs(eg_ports->dest);
+-	sce->new_src_port = ntohs(eg_ports->source);
++	sce->new_dst_port = ntohs(tx_l4->dest);
++	sce->new_src_port = ntohs(tx_l4->source);
+ }
+ 
+ /**
+  * @brief Set all si ipv4 related info
+- * @param sess session info
++ * @param s session info
+  */
+-static s32 __smgr_si_ipv4_nat_set(struct sess_info *sess)
++static s32 __smgr_si_ipv4_nat_set(struct sess_info *s)
+ {
+-	struct fv_ipv4 *in_v4   = &SESS_NAT_INGRS_L3(sess)->v4;
+-	struct fv_ipv4 *eg_v4   = &SESS_NAT_EGRS_L3(sess)->v4;
+-	struct pp_si   *si      = &sess->si;
+-	__sum16         l3_csum = 0;
++	struct pp_si *si = &s->si;
++	__sum16 l3_csum = 0;
++	struct iphdr *rx_ip, *tx_ip;
+ 
+-	SESS_MOD_FLAG_SET(sess, MOD_IPV4_NAT_BIT);
++	rx_ip = pktprs_ipv4_hdr(SESS_RX_PKT(s), SESS_RX_NAT_LVL(s));
++	tx_ip = pktprs_ipv4_hdr(SESS_TX_PKT(s), SESS_TX_NAT_LVL(s));
++
++	SESS_MOD_FLAG_SET(s, MOD_IPV4_NAT_BIT);
+ 	si->sce.valid = true;
+ 
+ 	/* set l3 csum delta */
+-	if (in_v4->saddr != eg_v4->saddr)
+-		csum_replace4(&l3_csum, in_v4->saddr, eg_v4->saddr);
+-	if (in_v4->daddr != eg_v4->daddr)
+-		csum_replace4(&l3_csum, in_v4->daddr, eg_v4->daddr);
++	if (rx_ip->saddr != tx_ip->saddr)
++		csum_replace4(&l3_csum, rx_ip->saddr, tx_ip->saddr);
++	if (rx_ip->daddr != tx_ip->daddr)
++		csum_replace4(&l3_csum, rx_ip->daddr, tx_ip->daddr);
+ 	/* do l4 nat */
+-	__smgr_si_napt_set(sess, l3_csum);
++	__smgr_si_napt_set(s, l3_csum);
+ 	/* ttl */
+-	if (__smgr_is_sess_routed(sess)) {
+-		si->sce.ttl_diff = in_v4->ttl - eg_v4->ttl;
++	if (__smgr_is_sess_routed(s)) {
++		si->sce.ttl_diff = rx_ip->ttl - tx_ip->ttl;
+ 		/* set IPv4 routed session ttl flag and update the l3 csum
+ 		 * the checksum is calculated on both ttl and protocol fields
+ 		 * and ttl is the MSB on the combined u16 word so every change
+@@ -2418,13 +2283,13 @@ static s32 __smgr_si_ipv4_nat_set(struct sess_info *sess)
+ 	 */
+ 	si->dpu.nat_sz = FIELD_SIZEOF(struct fv_ipv4, saddr) +
+ 			 FIELD_SIZEOF(struct fv_ipv4, daddr);
+-	si->bce.nat.v4.saddr = eg_v4->saddr;
+-	si->bce.nat.v4.daddr = eg_v4->daddr;
++	si->bce.nat.v4.saddr = tx_ip->saddr;
++	si->bce.nat.v4.daddr = tx_ip->daddr;
+ 
+ 	/* dscp/tos */
+-	si->sce.dscp  = eg_v4->tos;
+-	if (in_v4->tos != eg_v4->tos)
+-		csum_replace2(&l3_csum, htons(in_v4->tos), htons(eg_v4->tos));
++	si->sce.dscp  = tx_ip->tos;
++	if (rx_ip->tos != tx_ip->tos)
++		csum_replace2(&l3_csum, htons(rx_ip->tos), htons(tx_ip->tos));
+ 
+ 	si->sce.l3_csum_delta = ntohs(l3_csum);
+ 	return 0;
+@@ -2433,22 +2298,22 @@ static s32 __smgr_si_ipv4_nat_set(struct sess_info *sess)
+ /**
+  * @brief Set all si ipv6 related info
+  * @note Not fully implemented
+- * @param sess session info
++ * @param s session info
+  */
+-static s32 __smgr_si_ipv6_nat_set(struct sess_info *sess)
++static s32 __smgr_si_ipv6_nat_set(struct sess_info *s)
+ {
+-	struct pp_si   *si      = &sess->si;
++	struct pp_si *si = &s->si;
+ 
+ 	/* set IPv6 routed session hop list flag */
+-	SESS_MOD_FLAG_SET(sess, MOD_IPV6_HOPL_BIT);
++	SESS_MOD_FLAG_SET(s, MOD_IPV6_HOPL_BIT);
+ 	si->sce.valid = true;
+-	if (__smgr_is_sess_routed(sess))
++	if (__smgr_is_sess_routed(s))
+ 		si->sce.ttl_diff = 1;
+ 	else
+ 		si->sce.ttl_diff = 0;
+ 
+ 	/* if the source or dest address didn't changed, do nothing */
+-	if (!__smgr_is_ipv6_nat_addr_changed(sess))
++	if (!__smgr_is_ipv6_nat_addr_changed(s))
+ 		return 0;
+ 
+ 	pr_debug("IPv6 NAT isn't supported\n");
+@@ -2459,20 +2324,20 @@ static s32 __smgr_si_ipv6_nat_set(struct sess_info *sess)
+  * @brief Add NAT info to the session SI, only L3 and L4 NAT is
+  *        handled here, L2 NAT is already handled by the new header
+  *        To save HW recipes, we always do NAT for IPv4
+- * @param sess the session
++ * @param s the session
+  */
+-static s32 __smgr_si_nat_set(struct sess_info *sess)
++static s32 __smgr_si_nat_set(struct sess_info *s)
+ {
+ 	/* if the session is bridged and not tunnel termination,
+ 	 * or if the session is esp encapsulation (TBD: adding esp NAT support)
+ 	 * no nat/napt is needed
+ 	 */
+-	if ((__smgr_is_sess_bridged(sess) && !__smgr_is_tunn_term_sess(sess)) ||
+-	    __smgr_is_esp_encp_sess(sess))
++	if ((__smgr_is_sess_bridged(s) && !__smgr_is_tunn_term_sess(s)) ||
++	    __smgr_is_esp_encp_sess(s))
+ 		return 0;
+ 
+-	if (__smgr_is_sess_bridged(sess) &&
+-	    __smgr_is_ip_nat_addr_changed(sess)) {
++	if (__smgr_is_sess_bridged(s) &&
++	    __smgr_is_ip_nat_addr_changed(s)) {
+ 		pr_debug("Nat on bridge session isn't supported\n");
+ 		return -EPROTONOSUPPORT;
+ 	}
+@@ -2480,13 +2345,13 @@ static s32 __smgr_si_nat_set(struct sess_info *sess)
+ 	/* clear header replacement flag as all modifications from that point
+ 	 * on includes header replacement
+ 	 */
+-	SESS_MOD_FLAG_CLR(sess, MOD_HDR_RPLC_BIT);
++	SESS_MOD_FLAG_CLR(s, MOD_HDR_RPLC_BIT);
+ 	/* IPv4 */
+-	if (__smgr_is_ipv4_nat(sess))
+-		return __smgr_si_ipv4_nat_set(sess);
++	if (__smgr_is_ipv4_nat(s))
++		return __smgr_si_ipv4_nat_set(s);
+ 	/* IPv6 */
+-	else if (__smgr_is_ipv6_nat(sess))
+-		return __smgr_si_ipv6_nat_set(sess);
++	else if (__smgr_is_ipv6_nat(s))
++		return __smgr_si_ipv6_nat_set(s);
+ 
+ 	pr_err("unsupported l3 protocol ?\n");
+ 	return -EPROTONOSUPPORT;
+@@ -2496,9 +2361,9 @@ static s32 __smgr_si_nat_set(struct sess_info *sess)
+  * @brief Update the ipv4 header template
+  * @param sess session
+  */
+-static void __smgr_newhdr_ipv4_update(struct sess_info *sess)
++static void __smgr_newhdr_ipv4_update(struct sess_info *s)
+ {
+-	struct pp_si *si = &sess->si;
++	struct pp_si *si = &s->si;
+ 	struct iphdr *iphdr;
+ 
+ 	iphdr = (struct iphdr *)(si->bce.nhdr + si->dpu.nhdr_l3_off);
+@@ -2514,44 +2379,58 @@ static void __smgr_newhdr_ipv4_update(struct sess_info *sess)
+ 
+ /**
+  * @brief Set the new header info in the session si
+- * @param sess the session
++ * @param s the session
+  */
+-static void __smgr_si_newhdr_set(struct sess_info *sess)
++static void __smgr_si_newhdr_set(struct sess_info *s)
+ {
+-	struct pp_si_bce *bce = &sess->si.bce;
+-	struct pp_si_dpu *dpu = &sess->si.dpu;
+-	struct new_hdr *nhdr =  sess->args->nhdr;
++	struct pp_si_bce *bce = &s->si.bce;
++	struct pp_si_dpu *dpu = &s->si.dpu;
++	struct pp_si_sce *sce = &s->si.sce;
++	u8 inner_ip, outer_ip;
+ 
+-	/* if we don't have new header, done */
+-	if (!(nhdr && nhdr->len))
+-		return;
++	if (PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_OUTER))
++		outer_ip = PKTPRS_PROTO_IPV4;
++	else
++		outer_ip = PKTPRS_PROTO_IPV6;
++	if (PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_INNER))
++		inner_ip = PKTPRS_PROTO_IPV4;
++	else
++		inner_ip = PKTPRS_PROTO_IPV6;
+ 
+-	dpu->nhdr_sz = 0;
++	dpu->nhdr_l3_off = pktprs_hdr_off(SESS_TX_PKT(s), outer_ip, HDR_OUTER);
+ 
+-	if (__smgr_is_iptun_encp_sess(sess)) {
+-		/* tunnel encapsulation ip in ip, the new header
+-		 * including the L2 & L3 & tunnel(optional) & inner L2(optional)
+-		 */
+-		dpu->nhdr_sz     = nhdr->len;
+-		dpu->nhdr_l3_off = nhdr->outer_len.l2_len;
+-	} else if (__smgr_is_outer_l2_changed(sess)) {
+-		/* add the L2 */
+-		dpu->nhdr_sz     = nhdr->outer_len.l2_len;
+-		dpu->nhdr_l3_off = nhdr->outer_len.l2_len;
+-		if (__smgr_is_esp_encp_sess(sess)) {
+-			/* ESP encapsulation,
+-			 * add the L3/UDP(optional)/ESP to new header
+-			 */
+-			dpu->nhdr_sz += nhdr->outer_len.l3_len + /* IP */
+-					nhdr->outer_len.l4_len + /* UDP/ESP */
+-					nhdr->inner_len.l4_len;  /* ESP */
+-			if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-				SESS_MOD_FLAG_SET(sess,
+-						  MOD_ESP_V4_TUNNL_ENCP_BIT);
+-			else
+-				SESS_MOD_FLAG_SET(sess,
+-						  MOD_ESP_V6_TUNNL_ENCP_BIT);
+-		}
++	if (__smgr_is_iptun_encp_sess(s)) {
++		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s), inner_ip,
++					      HDR_INNER);
++		sce->tot_len_diff = dpu->nhdr_sz - dpu->nhdr_l3_off;
++		if (outer_ip == PKTPRS_PROTO_IPV6 &&
++		    inner_ip == PKTPRS_PROTO_IPV4)
++			sce->tot_len_diff -= sizeof(struct ipv6hdr);
++		s->si.pkt_len_diff =
++			dpu->nhdr_sz -
++			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
++
++	} else if (__smgr_is_esp_encp_sess(s)) {
++		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s),
++					      PKTPRS_PROTO_NEXT(SESS_TX_PKT(s),
++					      PKTPRS_PROTO_ESP, HDR_OUTER),
++					      HDR_OUTER);
++		s->si.pkt_len_diff =
++			dpu->nhdr_sz -
++			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
++		if (SESS_TX_IS_OUTER_IPV4(s))
++			SESS_MOD_FLAG_SET(s, MOD_ESP_V4_TUNNL_ENCP_BIT);
++		else
++			SESS_MOD_FLAG_SET(s, MOD_ESP_V6_TUNNL_ENCP_BIT);
++	} else if (__smgr_is_outer_l2_changed(s)) {
++		dpu->nhdr_sz = pktprs_hdr_off(SESS_TX_PKT(s), outer_ip,
++					      HDR_OUTER);
++		s->si.pkt_len_diff =
++			dpu->nhdr_sz -
++			pktprs_hdr_off(SESS_RX_PKT(s), outer_ip, HDR_OUTER);
++	} else {
++		dpu->nhdr_sz = 0;
++		dpu->nhdr_l3_off = 0;
+ 	}
+ 
+ 	/* if no new header, done. */
+@@ -2559,59 +2438,46 @@ static void __smgr_si_newhdr_set(struct sess_info *sess)
+ 		return;
+ 
+ 	/* copy the new header to SI bce region */
+-	dpu->nhdr_sz = min3((size_t)dpu->nhdr_sz, sizeof(nhdr->buf),
+-			    sizeof(bce->nhdr));
+-	memcpy(bce->nhdr, nhdr->buf, dpu->nhdr_sz);
++	dpu->nhdr_sz = min3(dpu->nhdr_sz, SESS_TX_PKT(s)->buf_sz,
++			    (u8)sizeof(bce->nhdr));
++	memcpy(bce->nhdr, SESS_TX_PKT(s)->buf, dpu->nhdr_sz);
+ 
+ 	/* if new header including ipv4, update the ip layer */
+-	if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess)) &&
+-	    (dpu->nhdr_sz > dpu->nhdr_l3_off))
+-		__smgr_newhdr_ipv4_update(sess);
+-}
+-
+-/**
+- * @brief Checks if the fragmentation was added to the inner egress packet
+- * @param sess the session
+- */
+-static bool __smgr_is_inner_frag_egress(struct sess_info *sess)
+-{
+-	if (SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)
+-		return true;
+-
+-	return false;
++	if (SESS_TX_IS_OUTER_IPV4(s) && (dpu->nhdr_sz > dpu->nhdr_l3_off))
++		__smgr_newhdr_ipv4_update(s);
+ }
+ 
+ /**
+  * @brief Set the frag info in SI UD
+- * @param sess the session
++ * @param s the session
+  */
+-static s32 __smgr_frag_si_ud_set(struct sess_info *sess)
++static s32 __smgr_frag_si_ud_set(struct sess_info *s)
+ {
+-	struct si_ud_frag_info    frag_info = {0};
+-	struct pp_nf_info         nf_info;
+-	u16                       phys_q;
+-	s32                       ret = 0;
++	struct si_ud_frag_info frag_info = {0};
++	struct pp_nf_info nf_info;
++	u16 phys_q;
++	s32 ret = 0;
+ 
+ 	/* No need to set frag info */
+-	if (!test_bit(SESS_FLAG_MTU_CHCK, &sess->db_ent->info.flags))
++	if (!test_bit(SESS_FLAG_MTU_CHCK, &s->db_ent->info.flags))
+ 		return 0;
+ 
+-	if (sess->args->ud_sz) {
++	if (s->args->ud_sz) {
+ 		pr_err("Non zero UD size is not supported\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	sess->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
++	s->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
+ 
+ 	/* Set relevant flag bits for the uc */
+-	if (test_bit(PP_SESS_FLAG_IGNORE_INT_DFRAG_BIT, &sess->args->flags))
++	if (test_bit(PP_SESS_FLAG_IGNORE_INT_DFRAG_BIT, &s->args->flags))
+ 		frag_info.flags = FRAG_INFO_FLAG_IGNORE_INT_DF;
+-	if (test_bit(PP_SESS_FLAG_IGNORE_EXT_DFRAG_BIT, &sess->args->flags))
++	if (test_bit(PP_SESS_FLAG_IGNORE_EXT_DFRAG_BIT, &s->args->flags))
+ 		frag_info.flags |= FRAG_INFO_FLAG_IGNORE_EXT_DF;
+-	if (!__smgr_is_inner_frag_egress(sess))
++	if (!pktprs_first_frag(SESS_TX_PKT(s), HDR_INNER))
+ 		frag_info.flags |= FRAG_INFO_FLAG_FRAG_EXT;
+ 
+-	frag_info.dst_q = sess->si.dst_q;
++	frag_info.dst_q = s->si.dst_q;
+ 
+ 	if (db->frag_mode == SMGR_FRAG_MODE_CHECK_MTU_IN_UC) {
+ 		ret = pp_nf_get(PP_NF_FRAGMENTER, &nf_info);
+@@ -2626,32 +2492,42 @@ static s32 __smgr_frag_si_ud_set(struct sess_info *sess)
+ 			return ret;
+ 		}
+ 
+-		sess->si.dst_q = phys_q;
++		s->si.dst_q = phys_q;
+ 	}
+ 
+ 	/* Update l3 offset.
+ 	 * In case of inner frag, take the offset from the learning
+ 	 */
+ 	if (frag_info.flags & FRAG_INFO_FLAG_FRAG_EXT) {
+-		frag_info.l3_off = sess->si.dpu.nhdr_l3_off;
+-		if (__smgr_is_ipv4_pkt(SESS_EGRS_OUTER_BMAP(sess))) {
++		frag_info.l3_off = s->si.dpu.nhdr_l3_off;
++		if (SESS_TX_IS_OUTER_IPV4(s)) {
+ 			frag_info.flags |= FRAG_INFO_FLAG_IPV4;
+-			if (SESS_EGRS_OUTER_L3(sess).v4.frag_off & htons(IP_DF))
++			if (pktprs_ipv4_hdr(SESS_TX_PKT(s),
++					    HDR_OUTER)->frag_off &
++					    htons(IP_DF))
+ 				frag_info.flags |= FRAG_INFO_FLAG_EXT_DF;
+ 		}
+ 	} else {
+-		frag_info.l3_off = SESS_EGRS_INNER_OFFSETS(sess).l3;
+-		if (__smgr_is_ipv4_pkt(SESS_EGRS_INNER_BMAP(sess))) {
++		if (SESS_TX_IS_INNER_IPV4(s)) {
++			frag_info.l3_off = pktprs_hdr_off(SESS_TX_PKT(s),
++							  PKTPRS_PROTO_IPV4,
++							  HDR_INNER);
+ 			frag_info.flags |= FRAG_INFO_FLAG_IPV4;
+-			if (SESS_EGRS_INNER_L3(sess).v4.frag_off & htons(IP_DF))
++			if (pktprs_ipv4_hdr(SESS_TX_PKT(s),
++					    HDR_INNER)->frag_off &
++					    htons(IP_DF))
+ 				frag_info.flags |= FRAG_INFO_FLAG_INT_DF;
++		} else {
++			frag_info.l3_off = pktprs_hdr_off(SESS_TX_PKT(s),
++							  PKTPRS_PROTO_IPV6,
++							  HDR_INNER);
+ 		}
+ 	}
+ 
+-	if (__smgr_is_pppoe_encap(sess))
++	if (__smgr_is_pppoe_encap(s))
+ 		frag_info.flags |= FRAG_INFO_FLAG_PPPOE;
+ 
+-	ret = pp_port_tx_max_pkt_size_get(sess->args->eg_port,
++	ret = pp_port_tx_max_pkt_size_get(s->args->eg_port,
+ 					  &frag_info.max_pkt_size);
+ 	if (unlikely(ret)) {
+ 		pr_err("pp_port_tx_max_pkt_size_get err %d\n", ret);
+@@ -2659,185 +2535,138 @@ static s32 __smgr_frag_si_ud_set(struct sess_info *sess)
+ 	}
+ 
+ 	pr_debug("flags %#x, q %d (%d), max_pkt_size %d, l3_off %d\n",
+-		 frag_info.flags, frag_info.dst_q, sess->si.dst_q,
++		 frag_info.flags, frag_info.dst_q, s->si.dst_q,
+ 		 frag_info.max_pkt_size, frag_info.l3_off);
+ 
+-	memcpy(sess->si.ud + PP_PS_REGION_SZ, &frag_info, sizeof(frag_info));
+-	sess->si.si_ud_sz = PP_PS_REGION_SZ + sizeof(frag_info);
++	memcpy(s->si.ud + PP_PS_REGION_SZ, &frag_info, sizeof(frag_info));
++	s->si.si_ud_sz = PP_PS_REGION_SZ + sizeof(frag_info);
+ 
+ 	return ret;
+ }
+ 
+ /**
+  * @brief Set the UD info into the session si
+- * @param sess the session
++ * @param s the session
+  */
+-static s32 __smgr_si_ud_set(struct sess_info *sess)
++static s32 __smgr_si_ud_set(struct sess_info *s)
+ {
+-	if (sess->args->ps_off < PP_INVALID_PS_OFF)
+-		sess->si.ps_off = sess->args->ps_off;
++	if (s->args->ps_off < PP_INVALID_PS_OFF)
++		s->si.ps_off = s->args->ps_off;
+ 	else
+-		sess->si.ps_off = PP_INVALID_PS_OFF;
++		s->si.ps_off = PP_INVALID_PS_OFF;
+ 
+-	sess->si.si_ps_sz = sess->args->ps_sz;
++	s->si.si_ps_sz = s->args->ps_sz;
+ 
+-	if (sess->args->ud_sz)
+-		sess->si.si_ud_sz = sess->args->ps_sz + sess->args->ud_sz;
++	if (s->args->ud_sz)
++		s->si.si_ud_sz = s->args->ps_sz + s->args->ud_sz;
+ 
+ 	/* if this is a session for fragments, make sure UD will be copied
+ 	 * for the egress UC, otherwise, use the user arguments
+ 	 */
+-	if (SESS_INGRS_PKT(sess) &&
+-	    (SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST ||
+-	     SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)) {
+-		sess->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
+-		sess->si.ps_copy = true;
++	if (SESS_RX_PKT(s) &&
++	    (pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER) ||
++	     pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER))) {
++		s->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
++		s->si.ps_copy = true;
+ 	} else {
+-		sess->si.tmpl_ud_sz = sess->args->tmp_ud_sz;
+-		sess->si.ps_copy =
+-			test_bit(PP_SESS_FLAG_PS_COPY_BIT, &sess->args->flags);
++		s->si.tmpl_ud_sz = s->args->tmp_ud_sz;
++		s->si.ps_copy =
++			test_bit(PP_SESS_FLAG_PS_COPY_BIT, &s->args->flags);
+ 	}
+ 
+-	if (sess->args->ps_sz)
+-		memcpy(sess->si.ud, sess->args->ps, sess->args->ps_sz);
++	if (s->args->ps_sz)
++		memcpy(s->si.ud, s->args->ps, s->args->ps_sz);
+ 
+-	if (sess->args->ud_sz)
+-		memcpy(sess->si.ud + sess->args->ps_sz, sess->args->ud,
+-		       sess->args->ud_sz);
++	if (s->args->ud_sz)
++		memcpy(s->si.ud + s->args->ps_sz, s->args->ud, s->args->ud_sz);
+ 
+ 	return 0;
+ }
+ 
+-/**
+- * @brief Set ingress and egress packet length diff to the session si
+- * @note Need to be called after __smgr_si_newhdr_set for using
+- *       the updated dpu values
+- * @param sess the session
+- */
+-static void __smgr_si_pkt_len_diff_set(struct sess_info *sess)
+-{
+-	struct pp_si_dpu *dpu = &sess->si.dpu;
+-	struct pp_si_sce *sce = &sess->si.sce;
+-
+-	/* Calculate the ip layer tot_len/payload_len diff */
+-	if (__smgr_is_iptun_encp_sess(sess) || __smgr_is_esp_encp_sess(sess)) {
+-		/* to calculate the len diff, we use the new header values
+-		 * as they doesn't contains any extensions headers for v6
+-		 */
+-		sce->tot_len_diff = dpu->nhdr_sz - dpu->nhdr_l3_off;
+-
+-		if (__smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			/* remove the raw ipv6 header length as it should not
+-			 * be included in the ipv6 payload length field
+-			 */
+-			sce->tot_len_diff -= sizeof(struct ipv6hdr);
+-	}
+-
+-	/* Calculate the packet length diff */
+-	if (__smgr_is_esp_encp_sess(sess)) {
+-		/* for ESP encapsulation the egress header
+-		 * len excluded any inner headers
+-		 */
+-		sess->si.pkt_len_diff = SESS_EGRS_HDR_LEN(sess) -
+-					SESS_INGRS_OUTER_OFFSETS(sess).l3;
+-	} else {
+-		sess->si.pkt_len_diff = SESS_EGRS_HDR_LEN(sess) -
+-					SESS_INGRS_HDR_LEN(sess);
+-	}
+-
+-	/* in case the ingress included skb vlan, add to calculation */
+-	if (SESS_INGRS_OUTER_BMAP(sess) & FV_L2_SKB_VLAN_TAG)
+-		sess->si.pkt_len_diff -= VLAN_HLEN;
+-}
+-
+ /**
+  * @brief Set flags in the session si
+- * @param sess the session
++ * @param s the session
+  */
+-static void __smgr_si_flags_set(struct sess_info *sess)
++static void __smgr_si_flags_set(struct sess_info *s)
+ {
+ 	ulong chck_flags = SESS_CHCK_DFLT_FLAGS;
+ 	u8 ext_proto, int_proto;
+ 
+-	if (test_bit(PP_SESS_FLAG_MTU_CHCK_BIT, &sess->args->flags))
++	if (test_bit(PP_SESS_FLAG_MTU_CHCK_BIT, &s->args->flags))
+ 		pr_info("Session mtu check flag is not supported\n");
+ //		set_bit(SI_CHCK_FLAG_DVRT_MTU_OVFL, &chck_flags);
+ 
+-	if (!SESS_INGRS_PKT(sess) || !SESS_EGRS_PKT(sess))
++	if (!SESS_RX_PKT(s) || !SESS_TX_PKT(s))
+ 		goto set_checker_flags;
+ 
+-	if (test_bit(SESS_FLAG_MTU_CHCK, &sess->db_ent->info.flags)) {
++	if (test_bit(SESS_FLAG_MTU_CHCK, &s->db_ent->info.flags)) {
+ 		if (db->frag_mode == SMGR_FRAG_MODE_CHECK_MTU_IN_CHECKER)
+ 			set_bit(SI_CHCK_FLAG_DVRT_MTU_OVFL, &chck_flags);
+ 	}
+ 
+ 	/* set reassembly flags */
+-	if (SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST ||
+-	    SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST)
++	if (pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER) ||
++	    pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER))
+ 		set_bit(SI_CHCK_FLAG_DVRT_FRAG, &chck_flags);
+ 
+-	if ((SESS_INGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+-	    !(SESS_EGRS_OUTER_BMAP(sess) & FV_L3_FRAG_1ST))
+-		sess->si.ext_reassembly = true;
+-	if ((SESS_INGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST) &&
+-	    !(SESS_EGRS_INNER_BMAP(sess) & FV_L3_FRAG_1ST))
+-		sess->si.int_reassembly = true;
++	if ((pktprs_first_frag(SESS_RX_PKT(s), HDR_OUTER)) &&
++	    !(pktprs_first_frag(SESS_TX_PKT(s), HDR_OUTER)))
++		s->si.ext_reassembly = true;
++	if ((pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER)) &&
++	    !(pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER)))
++		s->si.int_reassembly = true;
+ 
+ 	/* align the reassembly flags to the ones set by the parser in the UD
+ 	 * reminder: the parser first set the inner flags
+ 	 */
+-	ext_proto = PP_FV_OOB_EXT_PROTO_INFO_GET(sess->si.fv.oob.proto_info);
+-	int_proto = PP_FV_OOB_INT_PROTO_INFO_GET(sess->si.fv.oob.proto_info);
++	ext_proto = PP_FV_OOB_EXT_PROTO_INFO_GET(s->si.fv.oob.proto_info);
++	int_proto = PP_FV_OOB_INT_PROTO_INFO_GET(s->si.fv.oob.proto_info);
+ 
+-	if (ext_proto == PP_FV_UNKNOWN_L3 && sess->si.ext_reassembly) {
+-		sess->si.ext_reassembly = false;
+-		sess->si.int_reassembly = true;
++	if (ext_proto == PP_FV_UNKNOWN_L3 && s->si.ext_reassembly) {
++		s->si.ext_reassembly = false;
++		s->si.int_reassembly = true;
+ 	}
+ 
+ set_checker_flags:
+ 	/* save flags in the si */
+-	sess->si.chck_flags = (u16)chck_flags;
++	s->si.chck_flags = (u16)chck_flags;
+ }
+ 
+ /**
+  * @brief Set session's PPPoE header modification info
+- * @param sess the session
++ * @param s the session
+  */
+-static void __smgr_pppoe_mod_set(struct sess_info *sess)
++static void __smgr_pppoe_mod_set(struct sess_info *s)
+ {
+-	struct pp_si_sce *sce = &sess->si.sce;
+-	struct pp_si_dpu *dpu = &sess->si.dpu;
+-	struct new_hdr *nhdr  = sess->args->nhdr;
++	struct pp_si_sce *sce = &s->si.sce;
++	struct pp_si_dpu *dpu = &s->si.dpu;
+ 
+ 	sce->valid = true;
+ 
+-	if (__smgr_is_pppoe_encap(sess)) {
++	if (__smgr_is_pppoe_encap(s)) {
+ 		/* pppoe encapsulation, set the sce parameters so that
+ 		 * the recipe will calculate the pppoe header length and
+ 		 * will update the new header accordingly
+ 		 */
+ 		sce->pppoe_diff = 2 /* for the eth last protocol */;
+-		/* in case we have new header with ipv6 we must add
+-		 * must add the ipv6 header length also to the pppoe_diff
+-		 * cause its length field doesn't include it
+-		 */
+-		if (__smgr_is_iptun_encp_sess(sess) &&
+-		    __smgr_is_ipv6_pkt(SESS_EGRS_OUTER_BMAP(sess)))
+-			sce->pppoe_diff += sizeof(struct ipv6hdr);
+-
+ 		sce->l2_org_val = 0;
+ 		/* calculate the pppoe header offset */
+-		/* start with outer l3 */
+-		dpu->pppoe_off = nhdr->outer_len.l2_len;
+-		/* if the pppoe is inner, goto the inner l3 */
+-		if ((SESS_EGRS_INNER_BMAP(sess) & FV_L2_PPPOE)) {
+-			dpu->pppoe_off += nhdr->outer_len.l3_len  +
+-					  nhdr->outer_len.l4_len  +
+-					  nhdr->tunnel_header_len +
+-					  nhdr->inner_len.l2_len;
++		if (__smgr_is_pppoe_outer_encap(s)) {
++			/* in case we have new header with ipv6 we must add
++			 * the ipv6 header length also to the pppoe_diff
++			 * cause its length field doesn't include it
++			 */
++			if (__smgr_is_iptun_encp_sess(s) &&
++			    SESS_TX_IS_OUTER_IPV6(s))
++				sce->pppoe_diff += sizeof(struct ipv6hdr);
++			dpu->pppoe_off = pktprs_hdr_off(SESS_TX_PKT(s),
++							PKTPRS_PROTO_PPPOE,
++							HDR_OUTER);
++		} else {
++			dpu->pppoe_off = pktprs_hdr_off(SESS_TX_PKT(s),
++							PKTPRS_PROTO_PPPOE,
++							HDR_INNER);
+ 		}
+-		/* go back to the start of the pppoe header */
+-		dpu->pppoe_off -= PPPOE_SES_HLEN;
+ 		return;
+ 	}
+ 
+@@ -2851,53 +2680,52 @@ static void __smgr_pppoe_mod_set(struct sess_info *sess)
+ 	dpu->pppoe_off  = 0;
+ 	sce->pppoe_diff = 0;
+ 	sce->l2_org_val =
+-		be16_to_cpup((__be16 *)(nhdr->buf + dpu->pppoe_off +
++		be16_to_cpup((__be16 *)(SESS_TX_PKT(s)->buf + dpu->pppoe_off +
+ 					offsetof(struct pppoe_hdr, length)));
+ }
+ 
+ /**
+  * @brief Set session's L2 modification info
+- * @param sess the session
++ * @param s the session
+  */
+-static void __smgr_si_l2_mod_set(struct sess_info *sess)
++static void __smgr_si_l2_mod_set(struct sess_info *s)
+ {
+-	if (__smgr_is_outer_l2_changed(sess))
+-		SESS_MOD_FLAG_SET(sess, MOD_HDR_RPLC_BIT);
++	if (__smgr_is_outer_l2_changed(s))
++		SESS_MOD_FLAG_SET(s, MOD_HDR_RPLC_BIT);
+ 
+-	if (__smgr_is_inner_pppoe_changed(sess))
+-		SESS_MOD_FLAG_SET(sess, MOD_INNER_PPPOE_BIT);
++	if (__smgr_is_pppoe_changed(s, HDR_INNER))
++		SESS_MOD_FLAG_SET(s, MOD_INNER_PPPOE_BIT);
+ 
+-	__smgr_pppoe_mod_set(sess);
++	__smgr_pppoe_mod_set(s);
+ }
+ 
+ /**
+  * @brief Set SI's modification info
+- * @param sess the session
++ * @param s the session
+  */
+-static s32 __smgr_si_mod_info_set(struct sess_info *sess)
++static s32 __smgr_si_mod_info_set(struct sess_info *s)
+ {
+ 	s32 ret;
+ 
+-	if (!(SESS_INGRS_PKT(sess) && SESS_EGRS_PKT(sess)))
++	if (!(SESS_RX_PKT(s) && SESS_TX_PKT(s)))
+ 		return 0;
+ 
+-	if (!__smgr_is_sess_bridged(sess) && __smgr_is_frag_accl_sess(sess)) {
++	if (!__smgr_is_sess_bridged(s) && __smgr_is_frag_accl_sess(s)) {
+ 		pr_debug("Fragments acceleration supported only for bridge sessions\n");
+ 		return -EPROTONOSUPPORT;
+ 	}
+ 
+ 	/* @todo remove to enable fragments acceleration */
+-	if (__smgr_is_sess_bridged(sess) && __smgr_is_frag_accl_sess(sess)) {
++	if (__smgr_is_sess_bridged(s) && __smgr_is_frag_accl_sess(s)) {
+ 		pr_debug("Fragments acceleration isn't implemented yet\n");
+ 		return -EPROTONOSUPPORT;
+ 	}
+ 
+-	__smgr_si_l2_mod_set(sess);
+-	ret = __smgr_si_nat_set(sess);
++	__smgr_si_l2_mod_set(s);
++	ret = __smgr_si_nat_set(s);
+ 	if (unlikely(ret))
+ 		return ret;
+-	__smgr_si_newhdr_set(sess);
+-	__smgr_si_pkt_len_diff_set(sess);
++	__smgr_si_newhdr_set(s);
+ 
+ 	return ret;
+ }
+@@ -2935,22 +2763,22 @@ static s32 __smgr_si_df_mask_set(struct pp_si *si, unsigned long flags)
+ /**
+  * @brief Create an si structure for the HW based on the specified
+  *        session
+- * @param sess_info the session
++ * @param s the session
+  * @return s32 0 on success, error code otherwise
+  */
+-static s32 __smgr_si_create(struct sess_info *sess)
++static s32 __smgr_si_create(struct sess_info *s)
+ {
+ 	struct pp_sess_create_args *args;
+-	struct pp_si               *si;
++	struct pp_si *si;
+ 	s32 ret;
+ 
+-	args = sess->args;
+-	si   = &sess->si;
++	args = s->args;
++	si   = &s->si;
+ 
+ 	/* set session id first, cause some of the below APIs use it */
+-	si->sess_id = sess->db_ent->info.sess_id;
++	si->sess_id = s->db_ent->info.sess_id;
+ 
+-	ret = smgr_get_queue_phy_id(sess->args->dst_q, &sess->si.dst_q);
++	ret = smgr_get_queue_phy_id(s->args->dst_q, &s->si.dst_q);
+ 	if (unlikely(ret))
+ 		goto done;
+ 	ret = pp_si_sgc_info_set(args->sgc, ARRAY_SIZE(args->sgc), si);
+@@ -2959,10 +2787,10 @@ static s32 __smgr_si_create(struct sess_info *sess)
+ 	ret = pp_si_tbm_info_set(args->tbm, ARRAY_SIZE(args->tbm), si);
+ 	if (unlikely(ret))
+ 		goto done;
+-	ret = pp_si_port_info_set(args->in_port, args->eg_port, &sess->si);
++	ret = pp_si_port_info_set(args->in_port, args->eg_port, &s->si);
+ 	if (unlikely(ret))
+ 		goto done;
+-	ret = __smgr_si_mod_info_set(sess);
++	ret = __smgr_si_mod_info_set(s);
+ 	if (unlikely(ret))
+ 		goto done;
+ 	ret = __smgr_si_df_mask_set(si, args->flags);
+@@ -2974,136 +2802,135 @@ static s32 __smgr_si_create(struct sess_info *sess)
+ 	si->bce_ext     = false; /* not supported in PPv4 */
+ 	si->trim_l3_id  = SI_NO_TRIM_VALUE;
+ 
+-	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_LRO_INFO_BIT)) {
++	if (SESS_ARGS_IS_FLAG_ON(s, PP_SESS_FLAG_LRO_INFO_BIT)) {
+ 		si->tdox_flow = args->lro_info;
+-	} else if (SESS_IS_FLAG_ON(sess->db_ent, SESS_FLAG_TDOX)) {
+-		if (unlikely(ptr_is_null(sess->db_ent->info.tdox_ent))) {
++	} else if (SESS_IS_FLAG_ON(s->db_ent, SESS_FLAG_TDOX)) {
++		if (unlikely(ptr_is_null(s->db_ent->info.tdox_ent))) {
+ 			pr_err("Session %u is missing Tdox entry in db\n",
+-			       sess->db_ent->info.sess_id);
++			       s->db_ent->info.sess_id);
+ 			ret = -EINVAL;
+ 			goto done;
+ 		}
+-		si->tdox_flow = sess->db_ent->info.tdox_ent->tdox_id;
++		si->tdox_flow = s->db_ent->info.tdox_ent->tdox_id;
+ 	} else {
+ 		si->tdox_flow = SMGR_INVALID_TDOX_SESS_ID;
+ 	}
+ 
+-	__smgr_si_flags_set(sess);
++	__smgr_si_flags_set(s);
+ 
+-	ret = __smgr_si_ud_set(sess);
++	ret = __smgr_si_ud_set(s);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+-	ret = __smgr_frag_si_ud_set(sess);
++	ret = __smgr_frag_si_ud_set(s);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+-	ret = mod_recipe_select(sess->db_ent->info.mod_flags,
+-				&sess->si.recipe_idx);
++	ret = mod_recipe_select(s->db_ent->info.mod_flags, &s->si.recipe_idx);
+ 	if (unlikely(ret))
+ 		goto done;
+ 
+-	ret = pp_si_encode(&sess->hw_si, &sess->si);
++	ret = pp_si_encode(&s->hw_si, &s->si);
+ 
+ 	/* si encoding might change the field vector size so we must save
+ 	 * the latest one
+ 	 */
+-	sess->db_ent->info.fv_sz = si->fv_sz;
++	s->db_ent->info.fv_sz = si->fv_sz;
+ done:
+ 	if (unlikely(ret)) {
+ 		pr_err("failed to create si\n");
+-		__smgr_stats_sess_si_create_err(sess);
++		__smgr_stats_sess_si_create_err(s);
+ 	}
+ 	return ret;
+ }
+ 
+ /**
+  * @brief Track session in relevant bitmaps and lists
+- * @param sess session to track
++ * @param s session to track
+  */
+-static inline void __smgr_sess_track(struct sess_info *sess)
++static inline void __smgr_sess_track(struct sess_info *s)
+ {
+-	set_bit(sess->db_ent->info.sess_id, db->open_bmap);
+-	DB_IN_PORT_LIST_ADD_NODE(db, sess->db_ent);
+-	DB_EG_PORT_LIST_ADD_NODE(db, sess->db_ent);
+-	smgr_mcast_sess_track(sess);
++	set_bit(s->db_ent->info.sess_id, db->open_bmap);
++	DB_IN_PORT_LIST_ADD_NODE(db, s->db_ent);
++	DB_EG_PORT_LIST_ADD_NODE(db, s->db_ent);
++	smgr_mcast_sess_track(s);
+ }
+ 
+ /**
+  * @brief Create a PP session, in case the session will be created,
+  *        'sess' structure will be filled with all the session
+  *        information like session id, db entry, si and so on.
+- * @param sess session info
++ * @param s session info
+  * @return s32 -EEXIST in case session already exist, 0 on success
+  *         creation, error code otherwise
+  */
+-static s32 __smgr_sess_create(struct sess_info *sess)
++static s32 __smgr_sess_create(struct sess_info *s)
+ {
+ 	s32 ret = 0;
+ 
+-	if (unlikely(ptr_is_null(sess)))
++	if (unlikely(ptr_is_null(s)))
+ 		return -EINVAL;
+ 
+-	if (unlikely(!__smgr_is_sess_args_valid(sess->args))) {
++	if (unlikely(!__smgr_is_sess_args_valid(s->args))) {
+ 		ret = -EINVAL;
+ 		goto err;
+ 	}
+ 
+-	if (unlikely(!__smgr_is_sess_supported(sess))) {
++	if (unlikely(!__smgr_is_sess_supported(s))) {
+ 		ret = -EPROTONOSUPPORT;
+ 		goto err;
+ 	}
+ 
+ 	__smgr_lock();
+-	ret = __smgr_sess_lookup(sess);
++	ret = __smgr_sess_lookup(s);
+ 	if (ret == -EEXIST)
+ 		goto unlock;
+ 	else if (unlikely(ret))
+ 		goto err_unlock;
+ 
+-	ret = __smgr_sess_ent_prepare(sess);
++	ret = __smgr_sess_ent_prepare(s);
+ 	if (unlikely(ret))
+ 		goto err_unlock;
+ 
+-	__smgr_nat_info_init(sess);
+-	__smgr_sess_flags_set(sess);
++	__smgr_nat_info_init(s);
++	__smgr_sess_flags_set(s);
+ 
+-	ret = __smgr_si_create(sess);
++	ret = __smgr_si_create(s);
+ 	if (unlikely(ret))
+ 		goto err_unlock;
+ 
+-	smgr_sq_alloc(sess);
+-	ret = cls_session_add(&sess->hw_si, &sess->args->hash);
++	smgr_sq_alloc(s);
++	ret = cls_session_add(&s->hw_si, &s->args->hash);
+ 	if (unlikely(ret)) {
+ 		pr_err("failed to create session in HW\n");
+ 		__smgr_stats_hw_err();
+ 		goto err_unlock;
+ 	}
+-	smgr_sq_start(sess);
+-	smgr_tdox_record_create(sess->db_ent);
++	smgr_sq_start(s);
++	smgr_tdox_record_create(s->db_ent);
+ 
+-	pr_debug("session %u created\n", sess->db_ent->info.sess_id);
+-	__smgr_stats_sess_created(sess);
++	pr_debug("session %u created\n", s->db_ent->info.sess_id);
++	__smgr_stats_sess_created(s);
+ 
+-	__smgr_sess_track(sess);
++	__smgr_sess_track(s);
+ 
+-	__smgr_sess_debug(sess);
++	__smgr_sess_debug(s);
+ unlock:
+ 	__smgr_unlock();
+ 	return ret;
+ 
+ err_unlock:
+ 	/* if we already allocated a session entry, free it */
+-	if (sess->db_ent) {
+-		__smgr_sess_ent_free(sess->db_ent);
+-		sess->db_ent = NULL;
++	if (s->db_ent) {
++		__smgr_sess_ent_free(s->db_ent);
++		s->db_ent = NULL;
+ 	}
+ 	__smgr_unlock();
+ err:
+ 	pr_debug("session create failed, ret = %d\n", ret);
+ 	if (ret == -EPROTONOSUPPORT)
+-		__smgr_stats_sess_no_supported(sess);
+-	__smgr_stats_sess_cr_failed(sess);
++		__smgr_stats_sess_no_supported(s);
++	__smgr_stats_sess_cr_failed(s);
+ 	return ret;
+ }
+ 
+@@ -3227,6 +3054,15 @@ __smgr_sess_cr_args_prepare(struct pp_request *req,
+ 	/* set arguments */
+ 	if (PP_IS_SYNC_REQUEST(req)) {
+ 		work_args->args = sess_args;
++		/* TBD - after phase3, replace this with sess_args->rx/tx */
++		if (sess_args->in_pkt)
++			work_args->args->rx = sess_args->in_pkt->h;
++		else
++			work_args->args->rx = NULL;
++		if (sess_args->eg_pkt)
++			work_args->args->tx = sess_args->eg_pkt->h;
++		else
++			work_args->args->tx = NULL;
+ 		return work_args;
+ 	}
+ 
+@@ -3234,20 +3070,15 @@ __smgr_sess_cr_args_prepare(struct pp_request *req,
+ 	memcpy(&work_args->args_buf, sess_args, sizeof(*sess_args));
+ 	work_args->args = &work_args->args_buf;
+ 
+-	if (sess_args->nhdr) {
+-		memcpy(&work_args->nhdr, sess_args->nhdr,
+-		       sizeof(*sess_args->nhdr));
+-		work_args->args->nhdr = &work_args->nhdr;
+-	}
+-	if (sess_args->in_pkt) {
+-		memcpy(&work_args->in_pkt, sess_args->in_pkt,
+-		       sizeof(*sess_args->in_pkt));
+-		work_args->args->in_pkt = &work_args->in_pkt;
++	if (sess_args->in_pkt && sess_args->in_pkt->h) {
++		memcpy(&work_args->rx, sess_args->in_pkt->h,
++		       sizeof(work_args->rx));
++		work_args->args->rx = &work_args->rx;
+ 	}
+-	if (sess_args->eg_pkt) {
+-		memcpy(&work_args->eg_pkt, sess_args->eg_pkt,
+-		       sizeof(*sess_args->eg_pkt));
+-		work_args->args->eg_pkt = &work_args->eg_pkt;
++	if (sess_args->eg_pkt && sess_args->eg_pkt->h) {
++		memcpy(&work_args->tx, sess_args->eg_pkt->h,
++		       sizeof(work_args->tx));
++		work_args->args->tx = &work_args->tx;
+ 	}
+ 
+ 	return work_args;
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+index f143085724d1..051527aab131 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+@@ -207,8 +207,8 @@ struct smgr_tdox_stats {
+  * @hash session hash results calculated by the HW
+  * @mcast session mcast info
+  * @tdox_ent Link to turbodox entry
+- * @ingress session ingress packet, needed for debug printing
+- * @egress session egress packet, needed for debug printing
++ * @rx session ingress packet, needed for debug printing
++ * @tx session egress packet, needed for debug printing
+  */
+ struct sess_db_info {
+ 	ulong flags;
+@@ -221,8 +221,8 @@ struct sess_db_info {
+ 	struct pp_mcast mcast;
+ 	struct tdox_db_entry *tdox_ent;
+ #ifdef CONFIG_DEBUG_FS
+-	struct fv_pkt_info ingress;
+-	struct fv_pkt_info egress;
++	struct pktprs_hdr rx;
++	struct pktprs_hdr tx;
+ #endif
+ };
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index a930358aacca..cd980b5cc55e 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -259,14 +259,13 @@ void __smgr_dbg_session_si_dump(struct seq_file *f)
+ 	struct pp_dsi dsi;
+ 	struct pp_si si;
+ 	char buf[256];
+-	s32 ret, i;
+-	struct sess_db_info info;
++	s32 i;
++	struct sess_db_info *info;
+ 	struct si_ud_frag_info *frag_info;
+ 
+ 	memset(&si, 0, sizeof(si));
+ 
+-	ret = smgr_session_si_get(dbg_sess_id, &si);
+-	if (ret)
++	if (smgr_session_si_get(dbg_sess_id, &si))
+ 		return;
+ 
+ 	/* Dump SI */
+@@ -347,10 +346,15 @@ void __smgr_dbg_session_si_dump(struct seq_file *f)
+ 		(void)strreplace(buf, '\n', ' ');
+ 		seq_printf(f, " %-20s: %s\n", "UD", buf);
+ 
+-		ret = smgr_session_info_get(dbg_sess_id, &info);
+-		if (ret)
++		info = kzalloc(sizeof(*info), GFP_KERNEL);
++		if (!info)
++			return;
++
++		if (smgr_session_info_get(dbg_sess_id, info)) {
++			kfree(info);
+ 			return;
+-		if (test_bit(SESS_FLAG_MTU_CHCK, &info.flags)) {
++		}
++		if (test_bit(SESS_FLAG_MTU_CHCK, &info->flags)) {
+ 			frag_info = (struct si_ud_frag_info *)
+ 				    &si.ud[PP_PS_REGION_SZ];
+ 			seq_printf(f, " %-20s: %u (INT_DF %d (IGNORE %d), EXT_DF %d (IGNORE %d), FRAG_EXT %d, IPV4 %d, PPPOE %d)\n",
+@@ -374,14 +378,14 @@ void __smgr_dbg_session_si_dump(struct seq_file *f)
+ 				   frag_info->dst_q);
+ 			seq_printf(f, " %-20s: %u\n", "frag.max_pkt_size",
+ 				   frag_info->max_pkt_size);
++			kfree(info);
+ 		}
+ 	}
+ 	for (i = 0; i < (sizeof(si.fv) / sizeof(u32)); i++)
+ 		seq_printf(f, " FV WORD%-13u: %#010x\n",
+ 			   i, ((u32 *)(&si.fv))[i]);
+ 
+-	ret = smgr_session_dsi_get(dbg_sess_id, &dsi);
+-	if (ret)
++	if (smgr_session_dsi_get(dbg_sess_id, &dsi))
+ 		return;
+ 
+ 	seq_printf(f, "\n Session %u DSI Info\n", dbg_sess_id);
+@@ -626,39 +630,55 @@ static void __smgr_pr_si_chck_flags(struct seq_file *f, ulong flags)
+ 	seq_puts(f, "\n");
+ }
+ 
+-static void __smgr_pr_learn_mac(struct seq_file *f, struct fv_l2 *l2,
+-				u32 flags)
++static void __smgr_pr_mac(struct seq_file *f, struct pktprs_hdr *h, u8 lvl)
+ {
+-	if (unlikely(!l2))
++	if (unlikely(!h))
+ 		return;
+ 
+-	if (FV_L2_BASE & flags) {
+-		seq_printf(f, " %-20s = %pM\n", "Source MAC",   l2->h_source);
+-		seq_printf(f, " %-20s = %pM\n", "Dest MAC",     l2->h_dest);
++	if (PKTPRS_IS_MAC(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "ETH header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_MAC, lvl));
++		seq_printf(f, " %-20s = %pM\n", "Source MAC",
++			   pktprs_eth_hdr(h, lvl)->h_source);
++		seq_printf(f, " %-20s = %pM\n", "Dest MAC",
++			   pktprs_eth_hdr(h, lvl)->h_dest);
+ 		seq_printf(f, " %-20s = %s %u[%#x]\n", "Ether Type",
+-			   PP_FV_L2_ETHERTYPE_STR(l2->h_proto),
+-			   ntohs(l2->h_proto), ntohs(l2->h_proto));
++			   PP_FV_ETHTYPE_STR(pktprs_eth_hdr(h, lvl)->h_proto),
++			   ntohs(pktprs_eth_hdr(h, lvl)->h_proto),
++			   ntohs(pktprs_eth_hdr(h, lvl)->h_proto));
+ 	}
+-	if (FV_L2_EXT_VLAN & flags)
++	if (PKTPRS_IS_VLAN0(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "VLAN header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_VLAN0, lvl));
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "External VLAN",
+-			   ntohs(l2->ext_vlan),
+-			   ntohs(l2->ext_vlan));
+-	if (FV_L2_INT_VLAN & flags)
++			   ntohs(pktprs_vlan_hdr(h, lvl, 0)->h_vlan_TCI),
++			   ntohs(pktprs_vlan_hdr(h, lvl, 0)->h_vlan_TCI));
++	}
++	if (PKTPRS_IS_VLAN1(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "VLAN header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_VLAN1, lvl));
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "Internal VLAN",
+-			   ntohs(l2->int_vlan),
+-			   ntohs(l2->int_vlan));
+-	if (FV_L2_PPPOE & flags)
++			   ntohs(pktprs_vlan_hdr(h, lvl, 1)->h_vlan_TCI),
++			   ntohs(pktprs_vlan_hdr(h, lvl, 1)->h_vlan_TCI));
++	}
++	if (PKTPRS_IS_PPPOE(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "PPPOE header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_PPPOE, lvl));
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "PPPoE ID",
+-			   ntohs(l2->pppoe_id),
+-			   ntohs(l2->pppoe_id));
++			   ntohs(pktprs_pppoe_hdr(h, lvl)->sid),
++			   ntohs(pktprs_pppoe_hdr(h, lvl)->sid));
++	}
+ }
+ 
+-static void __smgr_pr_learn_ipv4(struct seq_file *f, struct fv_ipv4 *v4,
+-				 u32 flags)
++static void __smgr_pr_ipv4(struct seq_file *f, struct pktprs_hdr *h, u8 lvl)
+ {
++	struct iphdr *v4 = pktprs_ipv4_hdr(h, lvl);
++
+ 	if (unlikely(!v4))
+ 		return;
+ 
++	seq_printf(f, " %-20s = %u\n", "IPV4 header Off",
++		   pktprs_hdr_off(h, PKTPRS_PROTO_IPV4, lvl));
+ 	seq_printf(f, " %-20s = %pI4b[%#x]\n", "Source IP",
+ 		   &v4->saddr, ntohl(v4->saddr));
+ 	seq_printf(f, " %-20s = %pI4b[%#x]\n", "Dest IP",
+@@ -668,15 +688,16 @@ static void __smgr_pr_learn_ipv4(struct seq_file *f, struct fv_ipv4 *v4,
+ 		   v4->protocol, v4->protocol);
+ 	seq_printf(f, " %-20s = %u[%#x]\n", "TOS",
+ 		   v4->tos, v4->tos);
+-	if (FV_L3_FRAG_1ST & flags)
++	if (pktprs_ipv4_first_frag(h, lvl))
+ 		seq_printf(f, " %-20s = %s\n", "Frag", "First");
+-	if (FV_L3_FRAG_2ND & flags)
+-		seq_printf(f, " %-20s = %s\n", "Frag", "Second");
++	else if (ip_is_fragment(v4))
++		seq_printf(f, " %-20s = %s\n", "Frag", "None-First");
+ }
+ 
+-static void __smgr_pr_learn_ipv6(struct seq_file *f, struct fv_ipv6 *v6,
+-				 u32 flags)
++static void __smgr_pr_ipv6(struct seq_file *f, struct pktprs_hdr *h, u8 lvl)
+ {
++	struct ipv6hdr *v6 = pktprs_ipv6_hdr(h, lvl);
++
+ 	u32 flow = 0;
+ 	u8  tc   = 0;
+ 
+@@ -688,158 +709,188 @@ static void __smgr_pr_learn_ipv6(struct seq_file *f, struct fv_ipv6 *v6,
+ 	flow = PP_FIELD_MOD(GENMASK(19, 16), v6->flow_lbl[0] & 0x0f, flow);
+ 	flow = PP_FIELD_MOD(GENMASK(15, 8),  v6->flow_lbl[1],        flow);
+ 	flow = PP_FIELD_MOD(GENMASK(7, 0),   v6->flow_lbl[2],        flow);
+-
+-	if (flags > FV_L4_TCP)
+-		seq_printf(f, " %-20s = ", "Next Header");
+-	if (FV_L4_TCP & flags)
+-		seq_puts(f, "TCP\n");
+-	if (FV_L4_UDP & flags)
+-		seq_puts(f, "UDP\n");
+-	if (FV_L4_ESP & flags)
+-		seq_puts(f, "ESP\n");
+-	if (FV_L4_SCTP & flags)
+-		seq_puts(f, "SCTP\n");
+-	if (FV_L4_ICMP6 & flags)
+-		seq_puts(f, "ICMP\n");
+-
++	seq_printf(f, " %-20s = %u\n", "IPV6 header Off",
++		   pktprs_hdr_off(h, PKTPRS_PROTO_IPV6, lvl));
+ 	seq_printf(f, " %-20s = %pI6\n",    "Source IP",  &v6->saddr);
+ 	seq_printf(f, " %-20s = %pI6\n",    "Dest IP",    &v6->daddr);
++	seq_printf(f, " %-20s = %s %u[%#x]\n", "Next Header",
++		   PP_FV_L3_PROTOCOL_STR(v6->nexthdr),
++		   v6->nexthdr, v6->nexthdr);
+ 	seq_printf(f, " %-20s = %u[%#x]\n", "TC",         tc, tc);
+ 	seq_printf(f, " %-20s = %u[%#x]\n", "Flow Label", flow, flow);
+-
+-	if (FV_L3_FRAG_1ST & flags)
+-		seq_printf(f, " %-20s = %s\n", "Frag", "First");
+-	if (FV_L3_FRAG_2ND & flags)
+-		seq_printf(f, " %-20s = %s\n", "Frag", "Second");
++	if (PKTPRS_IS_FRAG_OPT(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "IPV6 FRAG header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_FRAG_OPT, lvl));
++		if (pktprs_ipv6_first_frag(h, lvl))
++			seq_printf(f, " %-20s = %s\n", "Frag", "First");
++		else if (pktprs_frag_opt_hdr(h, lvl)->frag_off &
++			 htons(IP6_OFFSET))
++			seq_printf(f, " %-20s = %s\n", "Frag", "None-First");
++	}
+ }
+ 
+-static void __smgr_pr_learn_l3(struct seq_file *f, union fv_l3 *l3,
+-			       __be16 h_proto, u32 flags)
++static void __smgr_pr_l3(struct seq_file *f, struct pktprs_hdr *h, u8 lvl)
+ {
+-	if (unlikely(!l3))
++	if (unlikely(!h))
+ 		return;
+ 
+-	if (FV_L3_IPV4 & flags)
+-		__smgr_pr_learn_ipv4(f, &l3->v4, flags);
+-	else if (FV_L3_IPV6 & flags)
+-		__smgr_pr_learn_ipv6(f, &l3->v6, flags);
++	if (PKTPRS_IS_IPV4(h, lvl))
++		__smgr_pr_ipv4(f, h, lvl);
++	else if (PKTPRS_IS_IPV6(h, lvl))
++		__smgr_pr_ipv6(f, h, lvl);
+ }
+ 
+-static void __smgr_pr_learn_l4(struct seq_file *f, union fv_l4 *l4,
+-			       u32 flags)
++static void __smgr_pr_l4(struct seq_file *f, struct pktprs_hdr *h, u8 lvl)
+ {
+-	if (unlikely(!l4))
++	union proto_ptr p;
++
++	if (unlikely(!h))
+ 		return;
+ 
+-	if ((FV_L4_TCP | FV_L4_UDP | FV_L4_SCTP) & flags) {
+-		seq_printf(f, " %-20s = %u[%#x]\n", "Source Port",
+-			   ntohs(l4->tcp.source),
+-			   ntohs(l4->tcp.source));
+-		seq_printf(f, " %-20s = %u[%#x]\n", "Dest Port",
+-			   ntohs(l4->tcp.dest),
+-			   ntohs(l4->tcp.dest));
+-	} else if ((FV_L4_ICMP4 | FV_L4_ICMP6) & flags) {
++	if (PKTPRS_IS_TCP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "TCP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_TCP, lvl));
++		p.tcp = pktprs_tcp_hdr(h, lvl);
++		seq_printf(f, " %-20s = %u[%#x]\n", "TCP Source Port",
++			   ntohs(p.tcp->source), ntohs(p.tcp->source));
++		seq_printf(f, " %-20s = %u[%#x]\n", "TCP Dest Port",
++			   ntohs(p.tcp->dest), ntohs(p.tcp->dest));
++	} else if (PKTPRS_IS_UDP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "UDP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_UDP, lvl));
++		p.udp = pktprs_udp_hdr(h, lvl);
++		seq_printf(f, " %-20s = %u[%#x]\n", "UDP Source Port",
++			   ntohs(p.udp->source), ntohs(p.udp->source));
++		seq_printf(f, " %-20s = %u[%#x]\n", "UDP Dest Port",
++			   ntohs(p.udp->dest), ntohs(p.udp->dest));
++	} else if (PKTPRS_IS_SCTP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "SCTP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_SCTP, lvl));
++		p.sctp = pktprs_sctp_hdr(h, lvl);
++		seq_printf(f, " %-20s = %u[%#x]\n", "SCTP Source Port",
++			   ntohs(p.sctp->source), ntohs(p.sctp->source));
++		seq_printf(f, " %-20s = %u[%#x]\n", "SCTP Dest Port",
++			   ntohs(p.sctp->dest), ntohs(p.sctp->dest));
++	} else if (PKTPRS_IS_ICMP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "ICMP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_ICMP, lvl));
++		p.icmp = pktprs_icmp_hdr(h, lvl);
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "ICMP ID",
+-			   l4->icmp.id, l4->icmp.id);
++			   ntohs(p.icmp->un.echo.id),
++			   ntohs(p.icmp->un.echo.id));
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "ICMP Type",
+-			   l4->icmp.type, l4->icmp.type);
+-	} else if (FV_L4_ESP & flags) {
++			   p.icmp->type, p.icmp->type);
++	} else if (PKTPRS_IS_ICMP6(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "ICMP6 header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_ICMP6, lvl));
++		p.icmp6 = pktprs_icmp6_hdr(h, lvl);
++		seq_printf(f, " %-20s = %u[%#x]\n", "ICMP6 ID",
++			   ntohs(p.icmp6->icmp6_dataun.u_echo.identifier),
++			   ntohs(p.icmp6->icmp6_dataun.u_echo.identifier));
++		seq_printf(f, " %-20s = %u[%#x]\n", "ICMP6 Type",
++			   pktprs_icmp6_hdr(h, lvl)->icmp6_type,
++			   pktprs_icmp6_hdr(h, lvl)->icmp6_type);
++	} else if (PKTPRS_IS_ESP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "ESP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_ESP, lvl));
++		p.esp = pktprs_esp_hdr(h, lvl);
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "ESP SPI",
+-			   l4->esp.spi, l4->esp.spi);
++			   ntohl(p.esp->spi), ntohl(p.esp->spi));
+ 	}
+ }
+ 
+-static void __smgr_pr_learn_tunn(struct seq_file *f, union fv_tunnel *tunn,
+-				 union fv_l4 *l4, u32 flags, u32 tunn_flags)
++static void __smgr_pr_tunn(struct seq_file *f, struct pktprs_hdr *h, u8 lvl)
+ {
+-	if (!tunn_flags)
++	union proto_ptr p;
++
++	if (unlikely(!h))
+ 		return;
+ 
+ 	seq_printf(f, " %-20s = ", "Tunnel Type");
+-	if (FV_L2_PPPOE   & flags)
++	if (PKTPRS_IS_PPPOE(h, lvl))
+ 		seq_puts(f, "[PPPoE]");
+-	if (FV_TUNNEL_L2TPV2_UDP & tunn_flags)
+-		seq_puts(f, "[UDP][L2TPV2]");
+-	if (FV_TUNNEL_L2TPV3_UDP & tunn_flags)
+-		seq_puts(f, "[UDP][L2TPV3]");
+-	if (FV_TUNNEL_VXLAN   & tunn_flags)
++	if (PKTPRS_IS_L2TP_OUDP(h, lvl))
++		seq_puts(f, "[UDP][L2TP]");
++	if (PKTPRS_IS_VXLAN(h, lvl))
+ 		seq_puts(f, "[UDP][VXLAN]");
+-	if (FV_TUNNEL_GNV     & tunn_flags)
++	if (PKTPRS_IS_GENEVE(h, lvl))
+ 		seq_puts(f, "[UDP][GENEVE]");
+-	if (FV_L4_SCTP    & flags)
++	if (PKTPRS_IS_SCTP(h, lvl))
+ 		seq_puts(f, "[SCTP]");
+-	if (FV_TUNNEL_L2TPV3_IP & tunn_flags)
++	if (PKTPRS_IS_L2TP_OIP(h, lvl))
+ 		seq_puts(f, "[L2TPIP]");
+-	if (FV_TUNNEL_GRE_IP & tunn_flags)
++	if (PKTPRS_IS_IP_GRE(h))
+ 		seq_puts(f, "[IPoGRE]");
+-	if (FV_TUNNEL_GRE_ETH & tunn_flags)
++	if (PKTPRS_IS_L2_GRE(h))
+ 		seq_puts(f, "[EoGRE]");
+-	if (FV_TUNNEL_DSLITE  & tunn_flags)
+-		seq_puts(f, "[DsLITE]");
+-	if (FV_TUNNEL_6RD     & tunn_flags)
+-		seq_puts(f, "[6rd]");
+-	if (FV_TUNNEL_IPSEC   & tunn_flags)
+-		seq_puts(f, "[IPSec]");
++	if (PKTPRS_IS_DSLITE(h))
++		seq_puts(f, "[DSLITE]");
++	if (PKTPRS_IS_SIXRD(h))
++		seq_puts(f, "[SIXRD]");
+ 	seq_puts(f, "\n");
+ 
+-	if (FV_TUNNEL_VXLAN & tunn_flags)
++	if (PKTPRS_IS_VXLAN(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "VXLAN header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_VXLAN, lvl));
++		p.vxlan = pktprs_vxlan_hdr(h, lvl);
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "VNI",
+-			   ntohl(tunn->vxlan.vni),
+-			   ntohl(tunn->vxlan.vni));
+-	if (FV_TUNNEL_GNV & tunn_flags)
++			   ntohl(p.vxlan->vx_flags), ntohl(p.vxlan->vx_flags));
++	} else if (PKTPRS_IS_GENEVE(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "GENEVE header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_GENEVE, lvl));
++		p.geneve = pktprs_geneve_hdr(h, lvl);
+ 		seq_printf(f, " %-20s = %#02x%02x%02x\n", "VNI",
+-			   tunn->geneve.vni[2],
+-			   tunn->geneve.vni[1],
+-			   tunn->geneve.vni[0]);
+-	if (FV_TUNNEL_L2TPV3_IP & tunn_flags)
++			   p.geneve->vni[2],
++			   p.geneve->vni[1],
++			   p.geneve->vni[0]);
++	} else if (PKTPRS_IS_L2TP_OIP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "L2TP_OIP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_L2TP_OIP, lvl));
++		p.l2tp = pktprs_l2tp_oip_hdr(h, lvl);
+ 		seq_printf(f, " %-20s = %u[%#x]\n", "Session ID",
+-			   ntohl(l4->l2tpoip.session_id),
+-			   ntohl(l4->l2tpoip.session_id));
+-	if ((FV_TUNNEL_L2TPV2_UDP | FV_TUNNEL_L2TPV3_UDP) & tunn_flags) {
+-		seq_printf(f, " %-20s = %u[%#x]\n", "Session ID",
+-			   tunn->l2tpoudp.session_id,
+-			   tunn->l2tpoudp.session_id);
+-		seq_printf(f, " %-20s = %u[%#x]\n", "Tunnel ID",
+-			   tunn->l2tpoudp.tunnel_id,
+-			   tunn->l2tpoudp.tunnel_id);
++			   ntohl(p.l2tp->v3_oip.sess_id),
++			   ntohl(p.l2tp->v3_oip.sess_id));
++	} else if (PKTPRS_IS_L2TP_OUDP(h, lvl)) {
++		seq_printf(f, " %-20s = %u\n", "L2TP_OUDP header Off",
++			   pktprs_hdr_off(h, PKTPRS_PROTO_L2TP_OUDP, lvl));
++		p.l2tp = pktprs_l2tp_oudp_hdr(h, lvl);
++		if ((p.l2tp->v2.flags & L2TP_HDR_VER_MASK) == L2TP_HDR_VER_2) {
++			if (p.l2tp->v3_oudp.flags & L2TP_HDRFLAG_L) {
++				seq_printf(f, " %-20s = %u[%#x]\n",
++					   "Session ID", p.l2tp->v2_len.sess_id,
++					   p.l2tp->v2_len.sess_id);
++				seq_printf(f, " %-20s = %u[%#x]\n", "Tunnel ID",
++					   p.l2tp->v2_len.tunnel,
++					   p.l2tp->v2_len.tunnel);
++			} else {
++				seq_printf(f, " %-20s = %u[%#x]\n",
++					   "Session ID", p.l2tp->v2.sess_id,
++					   p.l2tp->v2.sess_id);
++				seq_printf(f, " %-20s = %u[%#x]\n", "Tunnel ID",
++					   p.l2tp->v2.tunnel,
++					   p.l2tp->v2.tunnel);
++			}
++		} else {
++			seq_printf(f, " %-20s = %u[%#x]\n", "Session ID",
++				   p.l2tp->v3_oudp.sess_id,
++				   p.l2tp->v3_oudp.sess_id);
++		}
+ 	}
+-	if (FV_L4_SCTP & flags)
+-		seq_printf(f, " %-20s = %u[%#x]\n", "VTAG",
+-			   ntohl(tunn->sctp.vtag),
+-			   ntohl(tunn->sctp.vtag));
+ }
+ 
+-static void __smgr_pr_learn_pkt(struct seq_file *f, struct fv_pkt_info *pkt)
++static void __smgr_pr_pkt(struct seq_file *f, struct pktprs_hdr *h)
+ {
+-	if (unlikely(!pkt))
++	if (unlikely(!h))
+ 		return;
+ 
+-#if 0
+-{
+-	struct fv_pkt_off *offs;
+-
+-	offs = &pkt->fv_offsets;
+-	seq_printf(f, " %-20s = %u\n", "Header Length", offs->pkt_hdr_len);
+-	seq_printf(f, " %-20s = %u\n", "Outer L2 Off ", offs->outer_offsets.l2);
+-	seq_printf(f, " %-20s = %u\n", "Outer L3 Off ", offs->outer_offsets.l3);
+-	seq_printf(f, " %-20s = %u\n", "Outer L4 Off ", offs->outer_offsets.l4);
+-	seq_printf(f, " %-20s = %u\n", "Tunnel   Off ", offs->tunnel_offset);
+-	seq_printf(f, " %-20s = %u\n", "Inner L2 Off ", offs->inner_offsets.l2);
+-	seq_printf(f, " %-20s = %u\n", "Inner L3 Off ", offs->inner_offsets.l3);
+-	seq_printf(f, " %-20s = %u\n", "Inner L4 Off ", offs->inner_offsets.l4);
+-}
+-#endif
+-
+-	__smgr_pr_learn_mac(f,  &pkt->fv.outer.l2, pkt->fv_outer_bitmap);
+-	__smgr_pr_learn_l3(f,   &pkt->fv.outer.l3, pkt->fv.outer.l2.h_proto,
+-			   pkt->fv_outer_bitmap);
+-	__smgr_pr_learn_l4(f,   &pkt->fv.outer.l4, pkt->fv_outer_bitmap);
+-	__smgr_pr_learn_tunn(f, &pkt->fv.tunnel,   &pkt->fv.outer.l4,
+-			     pkt->fv_outer_bitmap, pkt->fv_tunnel_bitmap);
+-	__smgr_pr_learn_mac(f,  &pkt->fv.inner.l2, pkt->fv_inner_bitmap);
+-	__smgr_pr_learn_l3(f,   &pkt->fv.inner.l3, pkt->fv.inner.l2.h_proto,
+-			   pkt->fv_inner_bitmap);
+-	__smgr_pr_learn_l4(f,   &pkt->fv.inner.l4, pkt->fv_inner_bitmap);
++	seq_printf(f, " %-20s = %u\n", "Header Length", h->buf_sz);
++	__smgr_pr_mac(f,  h, HDR_OUTER);
++	__smgr_pr_l3(f,   h, HDR_OUTER);
++	__smgr_pr_l4(f,   h, HDR_OUTER);
++	__smgr_pr_tunn(f, h, HDR_OUTER);
++	__smgr_pr_mac(f,  h, HDR_INNER);
++	__smgr_pr_l3(f,   h, HDR_INNER);
++	__smgr_pr_l4(f,   h, HDR_INNER);
+ }
+ 
+ static void __smgr_pr_sess_mod(struct seq_file *f, ulong mod_flags,
+@@ -922,27 +973,27 @@ static void __smgr_pr_sess_mod(struct seq_file *f, ulong mod_flags,
+  */
+ void __smgr_dbg_session_dump(struct seq_file *f)
+ {
+-	struct sess_db_info info;
++	struct sess_db_info *info;
+ 	struct pp_dsi dsi;
+ 	struct pp_si si;
+ 	char buf[128];
+-	s32  ret, n;
++	s32 n;
+ 
+-	memset(&info, 0, sizeof(info));
+ 	memset(&si,   0, sizeof(si));
+ 	memset(&dsi,  0, sizeof(dsi));
+ 
+-	ret = smgr_session_info_get(dbg_sess_id, &info);
+-	if (ret)
+-		return;
+-	ret = smgr_session_si_get(dbg_sess_id, &si);
+-	if (ret)
+-		return;
+-	ret = smgr_session_dsi_get(dbg_sess_id, &dsi);
+-	if (ret)
++	info = kzalloc(sizeof(*info), GFP_KERNEL);
++	if (!info)
+ 		return;
+ 
+-	pr_buf(buf, sizeof(buf), n, "Session %u Info", info.sess_id);
++	if (smgr_session_info_get(dbg_sess_id, info))
++		goto done;
++	if (smgr_session_si_get(dbg_sess_id, &si))
++		goto done;
++	if (smgr_session_dsi_get(dbg_sess_id, &dsi))
++		goto done;
++
++	pr_buf(buf, sizeof(buf), n, "Session %u Info", info->sess_id);
+ 	seq_puts(f,   "##############################\n");
+ 	seq_printf(f, "##  %-22s  ##\n", buf);
+ 	seq_puts(f,   "##############################\n");
+@@ -950,9 +1001,9 @@ void __smgr_dbg_session_dump(struct seq_file *f)
+ 	seq_printf(f, " %-20s = %s\n", "Active", BOOL2STR(dsi.active));
+ 	seq_printf(f, " %-20s = %s\n", "Stale", BOOL2STR(dsi.stale));
+ 	seq_printf(f, " %-20s = %s\n", "Type",
+-		   smgr_is_sess_routed(&info) ? "Routed" : "Bridge");
++		   smgr_is_sess_routed(info) ? "Routed" : "Bridge");
+ 	seq_printf(f, " %-20s = %s\n",   "Divert", BOOL2STR(dsi.divert));
+-	__smgr_pr_session_flags(f, info.flags);
++	__smgr_pr_session_flags(f, info->flags);
+ 	seq_printf(f, " %-20s = %u - %s\n", "Recipe", si.recipe_idx,
+ 		   mod_rcp_to_str(si.recipe_idx));
+ 	seq_printf(f, " %-20s = %u - %s\n", "Color", si.color,
+@@ -970,8 +1021,8 @@ void __smgr_dbg_session_dump(struct seq_file *f)
+ 
+ 	seq_puts(f,   " Ingress Packet\n");
+ 	seq_puts(f,   "================\n");
+-	seq_printf(f, " %-20s = %u\n", "Port", info.in_port);
+-	__smgr_pr_learn_pkt(f, &info.ingress);
++	seq_printf(f, " %-20s = %u\n", "Port", info->in_port);
++	__smgr_pr_pkt(f, &info->rx);
+ 	seq_puts(f,   "\n");
+ 
+ 	seq_puts(f,   " Egress Packet\n");
+@@ -979,29 +1030,32 @@ void __smgr_dbg_session_dump(struct seq_file *f)
+ 	seq_printf(f, " %-20s = %u\n", "Port", si.eg_port);
+ 	seq_printf(f, " %-20s = %u\n", "Dest Q", si.dst_q);
+ 	seq_printf(f, " %-20s = %u\n", "Dynamic Dest Q", dsi.dst_q);
+-	__smgr_pr_learn_pkt(f, &info.egress);
++	__smgr_pr_pkt(f, &info->tx);
+ 	seq_puts(f,   "\n");
+ 
+-	__smgr_pr_sess_mod(f, info.mod_flags, &si);
++	__smgr_pr_sess_mod(f, info->mod_flags, &si);
+ 	seq_puts(f,   "\n");
+ 
+ 	seq_puts(f,   " Hash\n");
+ 	seq_puts(f,   "======\n");
+-	seq_printf(f, " %-20s = %#x\n", "H1", info.hash.h1);
+-	seq_printf(f, " %-20s = %#x\n", "H2", info.hash.h2);
+-	seq_printf(f, " %-20s = %#x\n", "Signature", info.hash.sig);
++	seq_printf(f, " %-20s = %#x\n", "H1", info->hash.h1);
++	seq_printf(f, " %-20s = %#x\n", "H2", info->hash.h2);
++	seq_printf(f, " %-20s = %#x\n", "Signature", info->hash.sig);
+ 	seq_puts(f, "\n");
+ 
+-	if (smgr_is_sess_mcast_dst(&info) || smgr_is_sess_mcast_grp(&info)) {
++	if (smgr_is_sess_mcast_dst(info) || smgr_is_sess_mcast_grp(info)) {
+ 		seq_puts(f,   " Multicast\n");
+ 		seq_puts(f,   "==========\n");
+-		seq_printf(f, " %-20s = %#x\n", "Group-ID", info.mcast.grp_idx);
+-		if (smgr_is_sess_mcast_dst(&info)) {
++		seq_printf(f, " %-20s = %#x\n", "Group-ID",
++			   info->mcast.grp_idx);
++		if (smgr_is_sess_mcast_dst(info)) {
+ 			seq_printf(f, " %-20s = %#x\n",
+-				   "Dest-ID", info.mcast.dst_idx);
++				   "Dest-ID", info->mcast.dst_idx);
+ 		}
+ 		seq_puts(f, "\n");
+ 	}
++done:
++	kfree(info);
+ }
+ 
+ PP_DEFINE_DEBUGFS(session, __smgr_dbg_session_dump, __smgr_dbg_session_set);
+@@ -1010,14 +1064,11 @@ void __smgr_dbg_stats_dump(struct seq_file *f)
+ {
+ 	struct smgr_stats stats;
+ 	u32 n_sessions;
+-	s32 ret;
+ 
+-	ret = pp_max_sessions_get(&n_sessions);
+-	if (ret)
++	if (pp_max_sessions_get(&n_sessions))
+ 		return;
+ 	memset(&stats, 0, sizeof(stats));
+-	ret = pp_smgr_stats_get(&stats);
+-	if (ret)
++	if (pp_smgr_stats_get(&stats))
+ 		return;
+ 
+ 	seq_puts(f,   " +---------------------------------------------------------------------------------------+\n");
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 8b82bb462191..6cceb1a13eaa 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -63,103 +63,160 @@ enum smgr_sess_flags {
+ };
+ 
+ /**
+- * @define Defines the learning packet info flags which specify if L2
+- *        exist in a learning field vector
++ * @brief Shortcuts for session entry flags operations
++ * @param e session db entry pointer (struct sess_db_entry)
++ * @param f flag
+  */
+-#define LEARN_FV_L2_FLAGS \
+-	(FV_L2_BASE | FV_L2_PPPOE | FV_L2_EXT_VLAN | FV_L2_INT_VLAN)
++#define SESS_FLAG_SET(e, f)                         set_bit(f, &(e)->info.flags)
++#define SESS_FLAG_CLR(e, f)                       clear_bit(f, &(e)->info.flags)
+ 
+ /**
+- * @define Defines the learning packet info flags which specify if L3
+- *        exist in a learning field vector
++ * @brief Shortcuts for session entry flags testing
++ * @param s session db entry pointer (struct sess_db_entry)
++ * @param f flag
+  */
+-#define LEARN_FV_L3_FLAGS \
+-	(FV_L3_IPV4 | FV_L3_IPV6)
++#define SESS_IS_FLAG_ON(e, f)                      test_bit(f, &(e)->info.flags)
++#define SESS_IS_FLAG_OFF(e, f)                    !test_bit(f, &(e)->info.flags)
+ 
+ /**
+- * @define Defines the learning packet info flags which specify if L4
+- *        exist in a learning field vector
++ * @brief Shortcuts for session args flags testing
++ * @param s session info pointer
++ * @param f flag
+  */
+-#define LEARN_FV_L4_FLAGS \
+-	(FV_L4_TCP | FV_L4_UDP | FV_L4_SCTP | FV_L4_ICMP4 | FV_L4_ICMP6)
++#define SESS_ARGS_IS_FLAG_ON(s, f)                test_bit(f, &(s)->args->flags)
++#define SESS_ARGS_IS_FLAG_OFF(s, f)              !test_bit(f, &(s)->args->flags)
++
++#define HDR_OUTER                                              PKTPRS_HDR_LEVEL0
++#define HDR_INNER                                              PKTPRS_HDR_LEVEL1
+ 
+ /**
+- * @define Defines the learning packet info flags which specify if a
+- *        tunnel exist in a learning field vector
++ * @brief Shortcut for accessing the session's rx packet header
++ * @param s session info pointer
+  */
+-#define LEARN_FV_TUNN_FLAGS \
+-	(FV_TUNNEL_VXLAN | FV_TUNNEL_GNV | \
+-	 FV_TUNNEL_L2TPV2_UDP | FV_TUNNEL_L2TPV3_UDP)
++#define SESS_RX_PKT(s)                      ((struct pktprs_hdr *)(s)->args->rx)
+ 
+ /**
+- * @brief Shortcuts for session entry flags operations
+- * @param e session db entry pointer (struct sess_db_entry)
+- * @param f flag
++ * @brief Shortcut for accessing the session's tx packet header
++ * @param s session info pointer
+  */
+-#define SESS_FLAG_SET(e, f)           set_bit(f, &(e)->info.flags)
+-#define SESS_FLAG_CLR(e, f)           clear_bit(f, &(e)->info.flags)
++#define SESS_TX_PKT(s)                      ((struct pktprs_hdr *)(s)->args->tx)
+ 
+ /**
+- * @brief Shortcuts for session entry flags testing
+- * @param s session db entry pointer (struct sess_db_entry)
+- * @param f flag
++ * @brief Shortcuts for checking if session is pppoe
++ * @param s session info pointer
+  */
+-#define SESS_IS_FLAG_ON(e, f)    test_bit(f, &(e)->info.flags)
+-#define SESS_IS_FLAG_OFF(e, f)   !test_bit(f, &(e)->info.flags)
++#define SESS_RX_IS_OUTER_PPPOE(s)     PKTPRS_IS_PPPOE(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_PPPOE(s)     PKTPRS_IS_PPPOE(SESS_TX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_PPPOE(s)     PKTPRS_IS_PPPOE(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_PPPOE(s)     PKTPRS_IS_PPPOE(SESS_TX_PKT(s), HDR_INNER)
+ 
+ /**
+- * @brief Shortcuts for session args flags testing
++ * @brief Shortcuts for checking if session is ipv4
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_OUTER_IPV4(s)       PKTPRS_IS_IPV4(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_IPV4(s)       PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_IPV4(s)       PKTPRS_IS_IPV4(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_IPV4(s)       PKTPRS_IS_IPV4(SESS_TX_PKT(s), HDR_INNER)
++#define SESS_RX_IS_OUTER_IPV6(s)       PKTPRS_IS_IPV6(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_IPV6(s)       PKTPRS_IS_IPV6(SESS_TX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_IPV6(s)       PKTPRS_IS_IPV6(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_IPV6(s)       PKTPRS_IS_IPV6(SESS_TX_PKT(s), HDR_INNER)
++
++/**
++ * @brief Shortcuts for checking if session is ip
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_OUTER_IP(s) \
++(SESS_RX_IS_OUTER_IPV4(s) || SESS_RX_IS_OUTER_IPV6(s))
++#define SESS_TX_IS_OUTER_IP(s) \
++(SESS_TX_IS_OUTER_IPV4(s) || SESS_TX_IS_OUTER_IPV6(s))
++#define SESS_RX_IS_INNER_IP(s) \
++(SESS_RX_IS_INNER_IPV4(s) || SESS_RX_IS_INNER_IPV6(s))
++#define SESS_TX_IS_INNER_IP(s) \
++(SESS_TX_IS_INNER_IPV4(s) || SESS_TX_IS_INNER_IPV6(s))
++
++/**
++ * @brief Shortcuts for checking if session is udp
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_OUTER_UDP(s)         PKTPRS_IS_UDP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_UDP(s)         PKTPRS_IS_UDP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_UDP(s)         PKTPRS_IS_UDP(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_UDP(s)         PKTPRS_IS_UDP(SESS_RX_PKT(s), HDR_INNER)
++
++/**
++ * @brief Shortcuts for checking if session is tcp
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_OUTER_TCP(s)         PKTPRS_IS_TCP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_TCP(s)         PKTPRS_IS_TCP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_TCP(s)         PKTPRS_IS_TCP(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_TCP(s)         PKTPRS_IS_TCP(SESS_RX_PKT(s), HDR_INNER)
++
++/**
++ * @brief Shortcuts for checking if session is esp
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_OUTER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_OUTER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_RX_IS_INNER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_INNER)
++#define SESS_TX_IS_INNER_ESP(s)         PKTPRS_IS_ESP(SESS_RX_PKT(s), HDR_INNER)
++
++/**
++ * @brief Shortcuts for checking if session is supported L4
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_OUTER_L4(s) \
++(SESS_RX_IS_OUTER_UDP(s) || SESS_RX_IS_OUTER_TCP(s) || SESS_RX_IS_OUTER_ESP(s))
++#define SESS_TX_IS_OUTER_L4(s) \
++(SESS_TX_IS_OUTER_UDP(s) || SESS_TX_IS_OUTER_TCP(s) || SESS_TX_IS_OUTER_ESP(s))
++#define SESS_RX_IS_INNER_L4(s) \
++(SESS_RX_IS_INNER_UDP(s) || SESS_RX_IS_INNER_TCP(s) || SESS_RX_IS_INNER_ESP(s))
++#define SESS_TX_IS_INNER_L4(s) \
++(SESS_TX_IS_INNER_UDP(s) || SESS_TX_IS_INNER_TCP(s) || SESS_TX_IS_INNER_ESP(s))
++
++/**
++ * @brief Shortcuts for checking if session is l2 gre
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_L2_GRE(s)                    PKTPRS_IS_L2_GRE(SESS_RX_PKT(s))
++#define SESS_TX_IS_L2_GRE(s)                    PKTPRS_IS_L2_GRE(SESS_TX_PKT(s))
++
++/**
++ * @brief Shortcuts for checking if session is ip gre
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_IP_GRE(s)                    PKTPRS_IS_IP_GRE(SESS_RX_PKT(s))
++#define SESS_TX_IS_IP_GRE(s)                    PKTPRS_IS_IP_GRE(SESS_TX_PKT(s))
++
++/**
++ * @brief Shortcuts for checking if session is dslite
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_DSLITE(s)                    PKTPRS_IS_DSLITE(SESS_RX_PKT(s))
++#define SESS_TX_IS_DSLITE(s)                    PKTPRS_IS_DSLITE(SESS_TX_PKT(s))
++
++/**
++ * @brief Shortcuts for checking if session is sixrd
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_SIXRD(s)                      PKTPRS_IS_SIXRD(SESS_RX_PKT(s))
++#define SESS_TX_IS_SIXRD(s)                      PKTPRS_IS_SIXRD(SESS_TX_PKT(s))
++
++/**
++ * @brief Shortcuts for checking if session is l2tp over udp
++ * @param s session info pointer
++ */
++#define SESS_RX_IS_L2TP_OUDP(s)   PKTPRS_IS_L2TP_OUDP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_L2TP_OUDP(s)   PKTPRS_IS_L2TP_OUDP(SESS_TX_PKT(s), HDR_OUTER)
++
++/**
++ * @brief Shortcuts for checking if session is ppp
+  * @param s session info pointer
+- * @param f flag
+  */
+-#define SESS_ARGS_IS_FLAG_ON(s, f)    test_bit(f, &(s)->args->flags)
+-#define SESS_ARGS_IS_FLAG_OFF(s, f)   !test_bit(f, &(s)->args->flags)
+-
+-/**
+- * @brief Shortcuts for accessing the session's ingress outer and
+- *        inner packets
+- * @param sess session info pointer
+- */
+-#define SESS_INGRS_PKT(s)              ((struct fv_pkt_info *)(s)->args->in_pkt)
+-#define SESS_INGRS_HDR_LEN(s)          SESS_INGRS_OFFSETS(s).pkt_hdr_len
+-#define SESS_INGRS_OFFSETS(s)          SESS_INGRS_PKT(s)->fv_offsets
+-#define SESS_INGRS_OUTER_HDRS(s)       (&SESS_INGRS_PKT(s)->fv.outer)
+-#define SESS_INGRS_OUTER_L2(s)         SESS_INGRS_OUTER_HDRS(s)->l2
+-#define SESS_INGRS_OUTER_L3(s)         SESS_INGRS_OUTER_HDRS(s)->l3
+-#define SESS_INGRS_OUTER_L4(s)         SESS_INGRS_OUTER_HDRS(s)->l4
+-#define SESS_INGRS_OUTER_BMAP(s)       SESS_INGRS_PKT(s)->fv_outer_bitmap
+-#define SESS_INGRS_OUTER_OFFSETS(s)    SESS_INGRS_OFFSETS(s).outer_offsets
+-#define SESS_INGRS_TUNN(s)             SESS_INGRS_PKT(s)->fv.tunnel
+-#define SESS_INGRS_TUNN_BMAP(s)        SESS_INGRS_PKT(s)->fv_tunnel_bitmap
+-#define SESS_INGRS_INNER_HDRS(s)       (&SESS_INGRS_PKT(s)->fv.inner)
+-#define SESS_INGRS_INNER_L2(s)         SESS_INGRS_INNER_HDRS(s)->l2
+-#define SESS_INGRS_INNER_L3(s)         SESS_INGRS_INNER_HDRS(s)->l3
+-#define SESS_INGRS_INNER_L4(s)         SESS_INGRS_INNER_HDRS(s)->l4
+-#define SESS_INGRS_INNER_BMAP(s)       SESS_INGRS_PKT(s)->fv_inner_bitmap
+-#define SESS_INGRS_INNER_OFFSETS(s)    SESS_INGRS_OFFSETS(s).inner_offsets
+-
+-/**
+- * @brief Shortcuts for accessing the session's egress outer and inner
+- *        packets
+- * @param s session info pointer (struct sess_info)
+- */
+-#define SESS_EGRS_PKT(s)               ((struct fv_pkt_info *)(s)->args->eg_pkt)
+-#define SESS_EGRS_HDR_LEN(s)           SESS_EGRS_OFFSETS(s).pkt_hdr_len
+-#define SESS_EGRS_OFFSETS(s)           SESS_EGRS_PKT(s)->fv_offsets
+-#define SESS_EGRS_OUTER_HDRS(s)        (&SESS_EGRS_PKT(s)->fv.outer)
+-#define SESS_EGRS_OUTER_L2(s)          SESS_EGRS_OUTER_HDRS(s)->l2
+-#define SESS_EGRS_OUTER_L3(s)          SESS_EGRS_OUTER_HDRS(s)->l3
+-#define SESS_EGRS_OUTER_L4(s)          SESS_EGRS_OUTER_HDRS(s)->l4
+-#define SESS_EGRS_OUTER_BMAP(s)        SESS_EGRS_PKT(s)->fv_outer_bitmap
+-#define SESS_EGRS_OUTER_OFFSETS(s)     SESS_EGRS_OFFSETS(s).outer_offsets
+-#define SESS_EGRS_TUNN(s)              SESS_EGRS_PKT(s)->fv.tunnel
+-#define SESS_EGRS_TUNN_BMAP(s)         SESS_EGRS_PKT(s)->fv_tunnel_bitmap
+-#define SESS_EGRS_INNER_HDRS(s)        (&SESS_EGRS_PKT(s)->fv.inner)
+-#define SESS_EGRS_INNER_L2(s)          SESS_EGRS_INNER_HDRS(s)->l2
+-#define SESS_EGRS_INNER_L3(s)          SESS_EGRS_INNER_HDRS(s)->l3
+-#define SESS_EGRS_INNER_L4(s)          SESS_EGRS_INNER_HDRS(s)->l4
+-#define SESS_EGRS_INNER_BMAP(s)        SESS_EGRS_PKT(s)->fv_inner_bitmap
+-#define SESS_EGRS_INNER_OFFSETS(s)     SESS_EGRS_OFFSETS(s).inner_offsets
++#define SESS_RX_IS_PPP(s)               PKTPRS_IS_PPP(SESS_RX_PKT(s), HDR_OUTER)
++#define SESS_TX_IS_PPP(s)               PKTPRS_IS_PPP(SESS_TX_PKT(s), HDR_OUTER)
+ 
+ /**
+  * @enum Session manager mode
+@@ -239,14 +296,9 @@ struct sess_info {
+ 	ulong                      *mod_flags;
+ 	/*! Struct defines the info required for nat modifications */
+ 	struct {
+-		u32 ingrs_bmap;
+-		u32 egrs_bmap;
+-		struct fv_l2 *ingrs_l2;
+-		union fv_l3  *ingrs_l3;
+-		union fv_l4  *ingrs_l4;
+-		struct fv_l2 *egrs_l2;
+-		union fv_l3  *egrs_l3;
+-		union fv_l4  *egrs_l4;
++		u8  rx_lvl;
++		u8  tx_lvl;
++		u16 res;
+ 	} nat;
+ };
+ 
+@@ -284,58 +336,58 @@ struct si_ud_frag_info {
+  * @brief Test whether a session is routed session.<br>
+  *        Routed session is a session where the ingress destination
+  *        mac address is different then the egress one.
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if the session is routed, false otherwise
+  */
+-static inline bool smgr_is_sess_routed(const struct sess_db_info *sess)
++static inline bool smgr_is_sess_routed(const struct sess_db_info *s)
+ {
+-	if (ptr_is_null(sess))
++	if (ptr_is_null(s))
+ 		return false;
+ 
+-	return test_bit(SESS_FLAG_ROUTED, &sess->flags);
++	return test_bit(SESS_FLAG_ROUTED, &s->flags);
+ }
+ 
+ /**
+  * @brief Test whether a session is bridged session.<br>
+  *        Bridged session is a session where the ingress destination
+  *        mac address is equal to the egress one
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if the session is bridged, false otherwise
+  */
+-static inline bool smgr_is_sess_bridged(const struct sess_db_info *sess)
++static inline bool smgr_is_sess_bridged(const struct sess_db_info *s)
+ {
+-	if (ptr_is_null(sess))
++	if (ptr_is_null(s))
+ 		return false;
+ 
+-	return !test_bit(SESS_FLAG_ROUTED, &sess->flags);
++	return !test_bit(SESS_FLAG_ROUTED, &s->flags);
+ }
+ 
+ /**
+  * @brief Test whether a session is multicast group session
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if the session is multicast group, false
+  *         otherwise
+  */
+-static inline bool smgr_is_sess_mcast_grp(const struct sess_db_info *sess)
++static inline bool smgr_is_sess_mcast_grp(const struct sess_db_info *s)
+ {
+-	if (ptr_is_null(sess))
++	if (ptr_is_null(s))
+ 		return false;
+ 
+-	return test_bit(SESS_FLAG_MCAST_GRP, &sess->flags);
++	return test_bit(SESS_FLAG_MCAST_GRP, &s->flags);
+ }
+ 
+ /**
+  * @brief Test whether a session is multicast dst session
+- * @param sess the session to test
++ * @param s the session to test
+  * @return bool true if the session is multicast dst, false
+  *         otherwise
+  */
+-static inline bool smgr_is_sess_mcast_dst(const struct sess_db_info *sess)
++static inline bool smgr_is_sess_mcast_dst(const struct sess_db_info *s)
+ {
+-	if (ptr_is_null(sess))
++	if (ptr_is_null(s))
+ 		return false;
+ 
+-	return test_bit(SESS_FLAG_MCAST_DST, &sess->flags);
++	return test_bit(SESS_FLAG_MCAST_DST, &s->flags);
+ }
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c
+index c0e71a5c6fbd..6a921de665ca 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c
+@@ -17,6 +17,7 @@
+ #include <linux/jiffies.h>    /* For jiffies               */
+ #include <linux/pp_qos_api.h> /* For QoS manager APIs      */
+ #include <linux/learning_layer_api.h>
++#include <linux/pktprs.h>
+ 
+ #include "uc.h"
+ #include "classifier.h"
+@@ -86,20 +87,20 @@ static struct smgr_tdox_db *db;
+  */
+ struct tdox_db_stats {
+ 	/*! Free tdox sessions counter */
+-	atomic_t              tdox_sess_free;
++	atomic_t tdox_sess_free;
+ 	/*! Free tdox session candidates counter */
+-	atomic_t              tdox_free_candidates;
++	atomic_t tdox_free_candidates;
+ 	/*! Tdox full counter */
+-	atomic_t              tdox_sess_full_fail;
++	atomic_t tdox_sess_full_fail;
+ 	/*! Candidate full counter */
+-	atomic_t              tdox_candidate_full_fail;
++	atomic_t tdox_candidate_full_fail;
+ 	/*! Tdox session create args error */
+-	atomic_t              tdox_create_args_err;
++	atomic_t tdox_create_args_err;
+ };
+ 
+ /**
+  * @brief Tdox database definitions
+-*/
++ */
+ struct smgr_tdox_db {
+ 	/*! turbodox enable */
+ 	bool                  enable;
+@@ -217,9 +218,8 @@ static u32 tdox_list_count(struct list_head *list)
+ 	u32 cnt = 0;
+ 	struct tdox_db_entry *ent;
+ 
+-	list_for_each_entry(ent, list, tdox_node) {
++	list_for_each_entry(ent, list, tdox_node)
+ 		cnt++;
+-	}
+ 
+ 	return cnt;
+ }
+@@ -324,7 +324,7 @@ static s32 tdox_set_db_entry(struct tdox_db_entry *tdox_ent,
+ 	tdox_ent->info.supp_enable =
+ 		SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_TDOX_SUPP_BIT);
+ 
+-	if (SESS_INGRS_TUNN_BMAP(sess))
++	if (PKTPRS_IS_MULTI_LEVEL(SESS_RX_PKT(sess)))
+ 		tdox_ent->info.threshold = TDOX_DEFAULT_AVG_PKT_SIZE_TUNN_THR;
+ 	else
+ 		tdox_ent->info.threshold = TDOX_DEFAULT_AVG_PKT_SIZE_THR;
+diff --git a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c
+index 0299927bfc95..80cdf9b372c8 100644
+--- a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c
++++ b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.c
+@@ -2,7 +2,7 @@
+  * Description: PP field vector APIs
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #define pr_fmt(fmt) "[PP_FV]: %s:%d: " fmt, __func__, __LINE__
+@@ -17,174 +17,252 @@
+ #include "pp_fv.h"
+ 
+ /**
+- * @brief Helper function to convert learning field vector l2
+- *        structure to PP field vector l2 structure
++ * @brief Helper function to convert packet parser header to
++ *        PP field vector l4 structure
+  */
+-static void __pp_learn_fv_l2_to_pp_fv_l2(struct fv_l2 *learn,
+-					 struct pp_fv_l2 *pp,
+-					 u32 bmap)
++static void __fv_l4_set(struct pktprs_hdr *pkt, struct pp_fv *fv, u8 lvl)
+ {
+-	memcpy(pp->h_dst, learn->h_dest,   ETH_ALEN);
+-	memcpy(pp->h_src, learn->h_source, ETH_ALEN);
+-	pp->ext_vlan = learn->ext_vlan;
+-	pp->int_vlan = learn->int_vlan;
+-	pp->h_prot   = learn->h_proto;
+-	pp->pppoe_id = learn->pppoe_id;
+-}
++	union pp_fv_l4 *l4;
++	union proto_ptr p;
+ 
+-/**
+- * @brief Helper function to convert learning field vector ipv4
+- *        structure to PP field vector ipv4 structure
+- */
+-static void __pp_learn_fv_ipv4_to_pp_fv_ipv4(struct fv_ipv4 *learn,
+-					     struct pp_fv_ipv4 *pp)
+-{
+-	pp->tos      = learn->tos;
+-	pp->protocol = learn->protocol;
+-	pp->saddr    = learn->saddr;
+-	pp->daddr    = learn->daddr;
+-}
++	if (lvl)
++		l4 = &fv->second.l4;
++	else
++		l4 = &fv->first.l4;
+ 
+-/**
+- * @brief Helper function to convert learning field vector ipv6
+- *        structure to PP field vector ipv6 structure
+- */
+-static void __pp_learn_fv_ipv6_to_pp_fv_ipv6(struct fv_ipv6 *learn,
+-					     struct pp_fv_ipv6 *pp)
+-{
+-	pp->priority = learn->priority;
+-	pp->version  = learn->version;
+-	memcpy(pp->flow_lbl, learn->flow_lbl, sizeof(learn->flow_lbl));
+-	memcpy(&pp->saddr, &learn->saddr, sizeof(pp->saddr));
+-	memcpy(&pp->daddr, &learn->daddr, sizeof(pp->daddr));
++	p.udp = pktprs_udp_hdr(pkt, lvl);
++	if (p.udp) {
++		l4->udp.src = p.udp->source;
++		l4->udp.dst = p.udp->dest;
++		if (PKTPRS_IS_ESP(pkt, lvl)) {
++			l4 = &fv->second.l4;
++			goto esp;
++		}
++		return;
++	}
++
++	p.tcp = pktprs_tcp_hdr(pkt, lvl);
++	if (p.tcp) {
++		l4->tcp.src = p.tcp->source;
++		l4->tcp.dst = p.tcp->dest;
++		return;
++	}
++
++	p.sctp = pktprs_sctp_hdr(pkt, lvl);
++	if (p.sctp) {
++		l4->sctp.src = p.sctp->source;
++		l4->sctp.dst = p.sctp->dest;
++		return;
++	}
++
++	p.icmp = pktprs_icmp_hdr(pkt, lvl);
++	if (p.icmp && p.icmp->code == 0) {
++		l4->icmp.code = p.icmp->un.echo.id;
++		l4->icmp.type = p.icmp->type;
++		return;
++	}
++
++	p.icmp6 = pktprs_icmp6_hdr(pkt, lvl);
++	if (p.icmp6 && p.icmp6->icmp6_code == 0) {
++		l4->icmp.code = p.icmp6->icmp6_dataun.u_echo.identifier;
++		l4->icmp.type = p.icmp6->icmp6_type;
++		return;
++	}
++
++esp:
++	p.esp = pktprs_esp_hdr(pkt, lvl);
++	if (p.esp) {
++		l4->esp.spi = p.esp->spi;
++		return;
++	}
++
++	p.l2tp = pktprs_l2tp_oip_hdr(pkt, lvl);
++	if (p.l2tp) {
++		l4->l2tpoip.sess_id = p.l2tp->v3_oip.sess_id;
++		return;
++	}
+ }
+ 
+ /**
+- * @brief Helper function to convert learning field vector l3
+- *        structure to PP field vector l3 structure
++ * @brief Helper function to convert packet parser header to
++ *        PP field vector l3 structure
+  */
+-static void __pp_learn_fv_l3_to_pp_fv_l3(union fv_l3 *learn,
+-					 union pp_fv_l3 *pp,
+-					 u32 bmap)
++static void __fv_l3_set(struct pktprs_hdr *pkt, struct pp_fv *fv, u8 lvl)
+ {
+-	if (bmap & FV_L3_IPV4)
+-		__pp_learn_fv_ipv4_to_pp_fv_ipv4(&learn->v4, &pp->v4);
+-	else if (bmap & FV_L3_IPV6)
+-		__pp_learn_fv_ipv6_to_pp_fv_ipv6(&learn->v6, &pp->v6);
++	union pp_fv_l3 *l3;
++	union proto_ptr p;
++
++	if (lvl)
++		l3 = &fv->second.l3;
++	else
++		l3 = &fv->first.l3;
++
++	p.ipv4 = pktprs_ipv4_hdr(pkt, lvl);
++	if (p.ipv4) {
++		l3->v4.tos      = p.ipv4->tos;
++		l3->v4.protocol = p.ipv4->protocol;
++		l3->v4.saddr    = p.ipv4->saddr;
++		l3->v4.daddr    = p.ipv4->daddr;
++		return;
++	}
++
++	p.ipv6 = pktprs_ipv6_hdr(pkt, lvl);
++	if (p.ipv6) {
++		l3->v6.priority = p.ipv6->priority;
++		l3->v6.version  = p.ipv6->version;
++		memcpy(l3->v6.flow_lbl, p.ipv6->flow_lbl,
++		       sizeof(l3->v6.flow_lbl));
++		memcpy(&l3->v6.saddr, &p.ipv6->saddr, sizeof(l3->v6.saddr));
++		memcpy(&l3->v6.daddr, &p.ipv6->daddr, sizeof(l3->v6.daddr));
++		return;
++	}
+ }
+ 
+ /**
+- * @brief Helper function to convert learning field vector l4
+- *        structure to PP field vector l4 structure
++ * @brief Helper function to convert packet parser header to
++ *        PP field vector l2 structure
+  */
+-static void __pp_learn_fv_l4_to_pp_fv_l4(union fv_l4 *learn,
+-					 union pp_fv_l4 *pp,
+-					 u32 bmap)
++static void __fv_l2_set(struct pktprs_hdr *pkt, struct pp_fv *fv, u8 lvl)
+ {
+-	if (bmap & (FV_L4_TCP | FV_L4_UDP | FV_L4_SCTP)) {
+-		pp->tcp.src = learn->tcp.source;
+-		pp->tcp.dst = learn->tcp.dest;
+-	} else if (bmap & (FV_L4_ICMP4 | FV_L4_ICMP6)) {
+-		pp->icmp.code = learn->icmp.id;
+-		pp->icmp.type = learn->icmp.type;
+-	} else if (bmap & (FV_L4_ESP)) {
+-		pp->esp.spi = learn->esp.spi;
+-	} else if (bmap & (FV_L4_L2TPIP)) {
+-		pp->l2tpoip.sess_id = learn->l2tpoip.session_id;
++	struct pp_fv_l2 *l2;
++	union proto_ptr p;
++
++	if (lvl)
++		l2 = &fv->second.l2;
++	else
++		l2 = &fv->first.l2;
++
++	p.eth = pktprs_eth_hdr(pkt, lvl);
++	if (p.eth) {
++		memcpy(l2->h_dst, p.eth->h_dest,   ETH_ALEN);
++		memcpy(l2->h_src, p.eth->h_source, ETH_ALEN);
++		l2->h_prot = p.eth->h_proto;
++	}
++
++	p.vlan = pktprs_vlan_hdr(pkt, lvl, 0);
++	if (p.vlan) {
++		l2->ext_vlan = p.vlan->h_vlan_TCI;
++		l2->h_prot = p.vlan->h_vlan_encapsulated_proto;
++	}
++
++	p.vlan = pktprs_vlan_hdr(pkt, lvl, 1);
++	if (p.vlan) {
++		l2->int_vlan = p.vlan->h_vlan_TCI;
++		l2->h_prot = p.vlan->h_vlan_encapsulated_proto;
++	}
++
++	p.pppoe = pktprs_pppoe_hdr(pkt, lvl);
++	if (p.pppoe) {
++		l2->pppoe_id = p.pppoe->sid;
++		l2->h_prot = *((__be16 *)((u8 *)p.pppoe + sizeof(*p.pppoe)));
+ 	}
+ }
+ 
+ /**
+- * @brief Helper function to convert learning field vector headers
+- *        structure to PP field vector headers structure
++ * @brief Helper function to convert packet parser header
++ *        to PP field vector tunnels structure
+  */
+-static void __pp_learn_fv_hdrs_to_pp_fv_hdrs(struct fv_headers *learn,
+-					     struct pp_fv_headers *pp,
+-					     u32 bmap)
++static void __fv_tunn_lvl_set(struct pktprs_hdr *pkt, struct pp_fv *fv, u8 lvl)
+ {
+-	__pp_learn_fv_l2_to_pp_fv_l2(&learn->l2, &pp->l2, bmap);
+-	__pp_learn_fv_l3_to_pp_fv_l3(&learn->l3, &pp->l3, bmap);
+-	__pp_learn_fv_l4_to_pp_fv_l4(&learn->l4, &pp->l4, bmap);
++	union pp_fv_tunnel *tun = &fv->tunn;
++	union proto_ptr p;
++
++	p.vxlan = pktprs_vxlan_hdr(pkt, lvl);
++	if (p.vxlan) {
++		tun->vxlan.vni = p.vxlan->vx_vni;
++		return;
++	}
++
++	p.geneve = pktprs_geneve_hdr(pkt, lvl);
++	if (p.geneve) {
++		memcpy(&tun->geneve.vni, &p.geneve->vni,
++		       sizeof(tun->geneve.vni));
++		return;
++	}
++
++	p.l2tp = pktprs_l2tp_oudp_hdr(pkt, lvl);
++	if (p.l2tp) {
++		if ((p.l2tp->v2.flags & L2TP_HDR_VER_MASK) == L2TP_HDR_VER_2) {
++			if (p.l2tp->v2.flags & L2TP_HDRFLAG_L) {
++				tun->l2tpoudp.sess_id = p.l2tp->v2_len.sess_id;
++				tun->l2tpoudp.tunn_id = p.l2tp->v2_len.tunnel;
++			} else {
++				tun->l2tpoudp.sess_id = p.l2tp->v2.sess_id;
++				tun->l2tpoudp.tunn_id = p.l2tp->v2.tunnel;
++			}
++		} else {
++			tun->l2tpv3oudp.sess_id = p.l2tp->v3_oudp.sess_id;
++		}
++	}
+ }
+ 
+ /**
+- * @brief Helper function to convert learning field vector tunnel
+- *        structure to PP field vector tunnel structure
++ * @brief Helper function to convert packet parser header
++ *        to PP field vector headers structure
+  */
+-static void  __pp_learn_fv_tunn_to_pp_fv_tunn(union fv_tunnel *learn,
+-					      union pp_fv_tunnel *pp,
+-					      u32 bmap)
++static void __fv_hdrs_lvl_set(struct pktprs_hdr *pkt, struct pp_fv *fv, u8 lvl)
+ {
+-	if (bmap & FV_TUNNEL_VXLAN) {
+-		pp->vxlan.vni = learn->vxlan.vni;
+-	} else if (bmap & FV_TUNNEL_GNV) {
+-		memcpy(&pp->geneve.vni, &learn->geneve.vni,
+-		       sizeof(pp->geneve.vni));
+-	} else if (bmap & FV_TUNNEL_L2TPV2_UDP) {
+-		pp->l2tpoudp.sess_id = learn->l2tpoudp.session_id;
+-		pp->l2tpoudp.tunn_id = learn->l2tpoudp.tunnel_id;
+-	} else if (bmap & FV_TUNNEL_L2TPV3_UDP) {
+-		pp->l2tpv3oudp.sess_id = learn->l2tpv3oudp.session_id;
+-	}
++	__fv_l2_set(pkt, fv, lvl);
++	__fv_l3_set(pkt, fv, lvl);
++	__fv_l4_set(pkt, fv, lvl);
+ }
+ 
+-s32 pp_learn_pkt_to_pp_fv(struct fv_pkt_info *pkt, struct pp_fv *pp)
++s32 pp_fv_build(struct pktprs_hdr *pkt, struct pp_fv *fv)
+ {
+-	if (unlikely(!(!ptr_is_null(pkt) &&
+-		       !ptr_is_null(pp))))
++	if (unlikely(ptr_is_null(fv)))
+ 		return -EINVAL;
+ 
+-	__pp_learn_fv_hdrs_to_pp_fv_hdrs(&pkt->fv.outer,  &pp->first,
+-					 pkt->fv_outer_bitmap);
+-	__pp_learn_fv_tunn_to_pp_fv_tunn(&pkt->fv.tunnel, &pp->tunn,
+-					 pkt->fv_tunnel_bitmap);
+-	__pp_learn_fv_hdrs_to_pp_fv_hdrs(&pkt->fv.inner,  &pp->second,
+-					 pkt->fv_inner_bitmap);
++	if (!pkt)
++		return 0; /* no packet FV */
++
++	__fv_hdrs_lvl_set(pkt, fv, PKTPRS_HDR_LEVEL0);
++	__fv_tunn_lvl_set(pkt, fv, PKTPRS_HDR_LEVEL0);
++	__fv_hdrs_lvl_set(pkt, fv, PKTPRS_HDR_LEVEL1);
+ 
+ 	return 0;
++
+ }
+ 
+-u8 pp_learn_pkt_to_pp_fv_proto(u32 pkt_bmap, u32 tunn_bmap)
++u8 pp_fv_proto_set(struct pktprs_hdr *pkt, u8 lvl)
+ {
+ 	u8 proto = PP_FV_UNKNOWN_L3;
+-	u32 other_l4, tunn_other_l4;
+-
+-	/* set other l4 protocols and tunnels */
+-	other_l4 = FV_L4_SCTP  |
+-		   FV_L4_ESP   |
+-		   FV_L4_ICMP4 |
+-		   FV_L4_ICMP6;
+-	tunn_other_l4 = FV_TUNNEL_L2TPV3_IP  |
+-			FV_TUNNEL_GRE_ETH |
+-			FV_TUNNEL_GRE_IP  |
+-			FV_TUNNEL_IPSEC;
+-
+-	if (pkt_bmap & FV_L3_IPV4) {
+-		if (pkt_bmap & FV_L4_TCP)
++	bool other_l4 = false;
++	bool tunn_other_l4 = false;
++
++	/* set other l4 protocols and tunnels for outer proto */
++	if (!lvl) {
++		other_l4 = PKTPRS_IS_SCTP(pkt, lvl) ||
++			   PKTPRS_IS_ESP(pkt, lvl)  ||
++			   PKTPRS_IS_ICMP(pkt, lvl) ||
++			   PKTPRS_IS_ICMP6(pkt, lvl);
++		tunn_other_l4 = PKTPRS_IS_L2TP_OIP(pkt, lvl) ||
++				PKTPRS_IS_GRE(pkt, lvl);
++	}
++
++	if (PKTPRS_IS_IPV4(pkt, lvl)) {
++		if (PKTPRS_IS_TCP(pkt, lvl))
+ 			proto = PP_FV_IPV4_TCP;
+-		else if (pkt_bmap & FV_L4_UDP)
++		else if (PKTPRS_IS_UDP(pkt, lvl))
+ 			proto = PP_FV_IPV4_UDP;
+-		else if (pkt_bmap  & other_l4 || tunn_bmap & tunn_other_l4)
++		else if (other_l4 || tunn_other_l4)
+ 			proto = PP_FV_IPV4_OTHER_L4;
+ 		else
+ 			proto = PP_FV_IPV4_UNKNOWN_L4;
+-	} else if (pkt_bmap & FV_L3_IPV6) {
+-		if (pkt_bmap & FV_L4_TCP)
++	} else if (PKTPRS_IS_IPV6(pkt, lvl)) {
++		if (PKTPRS_IS_TCP(pkt, lvl))
+ 			proto = PP_FV_IPV6_TCP;
+-		else if (pkt_bmap & FV_L4_UDP)
++		else if (PKTPRS_IS_UDP(pkt, lvl))
+ 			proto = PP_FV_IPV6_UDP;
+-		else if (pkt_bmap  & other_l4 ||
+-			 tunn_bmap & tunn_other_l4)
++		else if (other_l4 || tunn_other_l4)
+ 			proto = PP_FV_IPV6_OTHER_L4;
+ 		else
+ 			proto = PP_FV_IPV6_UNKNOWN_L4;
+ 	} else {
+-		if (pkt_bmap & FV_L4_TCP)
++		if (PKTPRS_IS_TCP(pkt, lvl))
+ 			proto = PP_FV_OTHER_L3_TCP;
+-		else if (pkt_bmap & FV_L4_UDP)
++		else if (PKTPRS_IS_UDP(pkt, lvl))
+ 			proto = PP_FV_OTHER_L3_UDP;
+-		else if (pkt_bmap  & other_l4 ||
+-			 tunn_bmap & tunn_other_l4)
++		else if (other_l4 || tunn_other_l4)
+ 			proto = PP_FV_OTHER_L3_OTHER_L4;
+ 		else
+ 			proto = PP_FV_UNKNOWN_L3;
+diff --git a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h
+index ec6690dafb96..38434817c57b 100644
+--- a/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h
++++ b/drivers/net/ppv4/pp-hal/field-vector/pp_fv.h
+@@ -2,7 +2,7 @@
+  * Description: PP field vector definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #ifndef __PP_FV_H__
+@@ -277,7 +277,7 @@ struct __aligned(128) pp_fv {
+ 	 proto_info == PP_FV_IPV6_UDP || \
+ 	 proto_info == PP_FV_OTHER_L3_UDP)
+ 
+-#define PP_FV_L2_ETHERTYPE_STR(h_proto) \
++#define PP_FV_ETHTYPE_STR(h_proto) \
+ 	(ntohs(h_proto) == ETH_P_IP   ? "IPv4" :       \
+ 	(ntohs(h_proto) == ETH_P_IPV6 ? "IPv6" :       \
+ 	(ntohs(h_proto) == PPP_IP     ? "PPPoE IPv4" : \
+@@ -294,7 +294,8 @@ struct __aligned(128) pp_fv {
+ 	(proto == IPPROTO_L2TP   ? "L2TP"   : \
+ 	(proto == IPPROTO_GRE    ? "GRE"    : \
+ 	(proto == IPPROTO_IGMP   ? "IGMP"   : \
+-	("Other"))))))))))
++	(proto == IPPROTO_SCTP   ? "SCTP"   : \
++	("Other")))))))))))
+ 
+ #define PP_FV_PROTOCOL_STR(proto) \
+ 	(proto == PP_FV_UNKNOWN_L3           ? "UNKNOWN_L3"           : \
+@@ -314,23 +315,18 @@ struct __aligned(128) pp_fv {
+ 	("Other")))))))))))))))
+ 
+ /**
+- * @brief Convert learning packet structure to PP field vector
+- *        structure form
+- * @param pkt learning packet
++ * @brief Convert packet parser structure to PP field vector structure
++ * @param pkt packet headers
+  * @param pp pp field vector
+  * @return s32 0 on success, error code otherwise
+  */
+-s32 pp_learn_pkt_to_pp_fv(struct fv_pkt_info *pkt, struct pp_fv *pp);
++s32 pp_fv_build(struct pktprs_hdr *pkt, struct pp_fv *pp);
+ 
+ /**
+- * @brief Convert learning packet layers and tunnels bitmaps to pp
+- *        field vector oob protocol info, usually when using inner
+- *        layers bitmap, tunnels bitmap should be 0
+- * @param pkt_bmap packet's layers bitmap
+- * @param tunn_bmap packet's tunnels bitmap
+- * @note refer to 'struct fv_pkt_info' for more info regarding the
+- *       bitmaps
++ * @brief Convert packet parser to pp field vector oob protocol info
++ * @param pkt packet headers
++ * @param lvl headers level (outer/inner)
+  * @return u8
+  */
+-u8 pp_learn_pkt_to_pp_fv_proto(u32 pkt_bmap, u32 tunn_bmap);
++u8 pp_fv_proto_set(struct pktprs_hdr *pkt, u8 lvl);
+ #endif /* __PP_FV_H__ */
+diff --git a/drivers/net/ppv4/pp-hal/parser/parser_debugfs.c b/drivers/net/ppv4/pp-hal/parser/parser_debugfs.c
+index 0d9a37dc0878..1f811865abe6 100644
+--- a/drivers/net/ppv4/pp-hal/parser/parser_debugfs.c
++++ b/drivers/net/ppv4/pp-hal/parser/parser_debugfs.c
+@@ -2,7 +2,7 @@
+  * Description: PP Infrastructure Driver Debug FS Interface
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #define pr_fmt(fmt) "[PP_PARSER_DBG]: %s:%d: " fmt, __func__, __LINE__
+@@ -2112,7 +2112,7 @@ static void __prsr_fv_l2_show(struct seq_file *f, struct pp_fv_l2 *l2)
+ 	seq_printf(f, "|         | INT VLAN         | %-39u |\n",
+ 		   l2->int_vlan);
+ 	seq_printf(f, "|         | Ether Type       | %-31s(0x%04x) |\n",
+-		   PP_FV_L2_ETHERTYPE_STR(l2->h_prot), ntohs(l2->h_prot));
++		   PP_FV_ETHTYPE_STR(l2->h_prot), ntohs(l2->h_prot));
+ 	seq_printf(f, "|         | PPPoE id         | %-39u |\n", l2->pppoe_id);
+ }
+ 
+diff --git a/include/linux/pp_api.h b/include/linux/pp_api.h
+index 7ed97e15ed96..4e5447981cd1 100755
+--- a/include/linux/pp_api.h
++++ b/include/linux/pp_api.h
+@@ -2,7 +2,7 @@
+  * Description: PP APIs and definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only or BSD-3-Clause
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ 
+ #ifndef __PP_API_H__
+@@ -15,6 +15,7 @@
+ 
+ #ifdef CONFIG_PPV4_LGM
+ #include <linux/learning_layer_api.h>
++#include <linux/pktprs.h>
+ #endif
+ 
+ /**
+@@ -700,13 +701,19 @@ struct pp_sess_create_args {
+ 	struct fv_pkt_info *eg_pkt;
+ 
+ 	/*! new header info as received from the learning driver */
+-	struct new_hdr     *nhdr;
++	struct new_hdr *nhdr;
++
++	/*! rx packet info as received from the packet parse module */
++	struct pktprs_hdr *rx;
++
++	/*! tx packet info as received from the packet parse module */
++	struct pktprs_hdr *tx;
+ 
+ 	/*! hash result to identify the session in HW */
+-	struct pp_hash      hash;
++	struct pp_hash hash;
+ 
+ 	/*! mcast information, for multicast sessions */
+-	struct pp_mcast     mcast;
++	struct pp_mcast mcast;
+ };
+ 
+ /**

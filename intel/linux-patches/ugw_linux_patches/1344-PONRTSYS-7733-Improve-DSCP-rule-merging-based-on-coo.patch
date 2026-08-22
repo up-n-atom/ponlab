@@ -1,0 +1,475 @@
+From 38398dcaec8e88bf8a35f21dd10edb17a1f99c46 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <przemyslawx.czarnota@intel.com>
+Date: Tue, 30 Jun 2020 11:16:31 +0200
+Subject: [PATCH] PONRTSYS-7733: Improve DSCP rule merging based on cookies
+
+- Merge DSCP rules with ethertype 0 into one rule based on the cookie
+- Fix double tagged DSCP rules
+
+This change will result in merging Ext. Vlan DSCP rules with filter ethertype
+set to 0 into one rule. The DSCP merging code has been not modified.
+Instead mergin rules by the cookie, we use the cookie to extract
+information about filter ethertype - from there, and then it will
+be merged by the merging code.
+
+This approach allows DSCP merging to work both: with rules containing
+cookie and with rules that do not contain cookie.
+
+In future this approach can be extended, we can extract more data from
+the cookie (for example the TPID) and then have merging code than merges
+the exact same rules.
+---
+ drivers/net/datapath/pon_qos/Makefile              |   1 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.c  |  72 +++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.h  |   9 ++
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c | 176 ++++++++++++++++++++-
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h |   6 +
+ drivers/net/datapath/pon_qos/pon_qos_tc_main.c     |  11 ++
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.c |  13 --
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.h |  13 ++
+ 8 files changed, 281 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index cc2073622504..3cea80046262 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -7,6 +7,7 @@ pon_qos-objs := \
+ 	pon_qos_tc_qos.o  \
+ 	pon_qos_tc_qmap.o \
+ 	pon_qos_tc_drr.o \
++	pon_qos_tc_debugfs.o \
+ 	pon_qos_tc_red.o \
+ 	pon_qos_tc_prio.o \
+ 	pon_qos_tc_mqprio.o \
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.c b/drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.c
+new file mode 100644
+index 000000000000..7adda0df7c8d
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.c
+@@ -0,0 +1,72 @@
++#include <linux/debugfs.h>
++#include <linux/seq_file.h>
++#include <linux/fs.h>
++#include <linux/module.h>
++#include <linux/printk.h>
++#include <uapi/linux/stat.h> /* S_IRUSR */
++
++#include "pon_qos_tc_ext_vlan.h"
++
++struct pon_qos_debugfs_entry {
++	const char *filename;
++	void (*read)(struct seq_file *file, void *ctx);
++};
++
++static int pon_qos_read(struct seq_file *file, void *unused)
++{
++	const struct pon_qos_debugfs_entry *entry = file->private;
++
++	entry->read(file, NULL);
++	return 0;
++}
++
++static int pon_qos_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, pon_qos_read, inode->i_private);
++}
++
++static const struct file_operations pon_qos_fops = {
++	.llseek = seq_lseek,
++	.open = pon_qos_open,
++	.owner = THIS_MODULE,
++	.read = seq_read,
++	.release = single_release,
++};
++
++static struct pon_qos_debugfs_entry entries[] = {
++	{ .filename = "ext_vlan", .read = pon_qos_tc_ext_vlan_debugfs },
++};
++
++#define DEBUGFS_DIR "pon_qos"
++static struct dentry *dir;
++static struct dentry *debugfs_files[ARRAY_SIZE(entries)];
++
++int pon_qos_tc_debugfs_init(void)
++{
++	unsigned int i = 0;
++
++	dir = debugfs_create_dir(DEBUGFS_DIR, 0);
++	if (!dir)
++		return -1;
++
++	for (i = 0; i < ARRAY_SIZE(entries); ++i) {
++		struct pon_qos_debugfs_entry *entry = &entries[i];
++		struct dentry **file = &debugfs_files[i];
++
++		*file = debugfs_create_file(entry->filename, S_IRUSR, dir,
++					    entry, &pon_qos_fops);
++		if (!*file)
++			goto cleanup;
++	}
++
++	return 0;
++
++cleanup:
++	debugfs_remove_recursive(dir);
++	return -1;
++}
++
++void pon_qos_tc_debugfs_exit(void)
++{
++	debugfs_remove_recursive(dir);
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.h b/drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.h
+new file mode 100644
+index 000000000000..d73f9a372926
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_debugfs.h
+@@ -0,0 +1,9 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++int pon_qos_tc_debugfs_init(void);
++void pon_qos_tc_debugfs_exit(void);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+index 214a0cdab7f7..c48951194b8e 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+@@ -23,6 +23,32 @@
+ 
+ static LIST_HEAD(tc_ext_vlan_storage);
+ 
++static bool has_cookie(struct dp_act_vlan *act)
++{
++	return act->sort_key != 0;
++}
++
++static bool is_dscp(struct dp_act_vlan *act)
++{
++	unsigned int i;
++
++	if (act->push_n == 0)
++		return false;
++
++	for (i = 0; i < act->push_n; i++)
++		if (act->prio[i] != DERIVE_FROM_DSCP)
++			return false;
++
++	return true;
++}
++
++static void dp_pattern_vlan_from_cookie(struct dp_pattern_vlan *patt,
++					u64 cookie)
++{
++	if (FILTER_ETHERTYPE(cookie) == FILTER_ETHERTYPE_ANY)
++		patt->proto = DP_VLAN_PATTERN_NOT_CARE;
++}
++
+ static int dp_pattern_vlan_eq(const struct dp_pattern_vlan *a,
+ 			      const struct dp_pattern_vlan *b)
+ {
+@@ -33,15 +59,22 @@ static int dp_pattern_vlan_eq(const struct dp_pattern_vlan *a,
+ 	       a->proto == b->proto;
+ }
+ 
+-static int dscp_merge(struct dp_pattern_vlan *old_pattern,
++static int dscp_merge(struct dp_pattern_vlan *old_outer,
++		      struct dp_pattern_vlan *old_inner,
+ 		      struct dp_act_vlan *old,
+-		      struct dp_pattern_vlan *new_pattern,
++		      struct dp_pattern_vlan *new_outer,
++		      struct dp_pattern_vlan *new_inner,
+ 		      struct dp_act_vlan *new)
+ {
+ 	int i;
+ 
+-	if (!dp_pattern_vlan_eq(old_pattern, new_pattern))
+-		return -1;
++	if (old_outer && new_outer)
++		if (!dp_pattern_vlan_eq(old_outer, new_outer))
++			return -1;
++
++	if (old_inner && new_inner)
++		if (!dp_pattern_vlan_eq(old_inner, new_inner))
++			return -1;
+ 
+ 	if (old->act != new->act)
+ 		return -1;
+@@ -95,9 +128,13 @@ static int untagged_add(struct net_device *dev,
+ 		return err;
+ 	}
+ 
++	if (has_cookie(&rule->act) && is_dscp(&rule->act))
++		dp_pattern_vlan_from_cookie(&rule->outer, rule->act.sort_key);
++
+ 	/* Attempt to merge new rule into existing one */
+ 	list_for_each_entry(p, &node->rules, list) {
+-		if (!dscp_merge(&p->outer, &p->act, &rule->outer, &rule->act)) {
++		if (!dscp_merge(&p->outer, NULL, &p->act, &rule->outer, NULL,
++				&rule->act)) {
+ 			kfree(rule);
+ 			return 0;
+ 		}
+@@ -136,9 +173,13 @@ static int single_tagged_add(struct net_device *dev,
+ 		return err;
+ 	}
+ 
++	if (has_cookie(&rule->act) && is_dscp(&rule->act))
++		dp_pattern_vlan_from_cookie(&rule->outer, rule->act.sort_key);
++
+ 	/* Attempt to merge new rule into existing one */
+ 	list_for_each_entry(p, &node->rules, list) {
+-		if (!dscp_merge(&p->outer, &p->act, &rule->outer, &rule->act)) {
++		if (!dscp_merge(&p->outer, NULL, &p->act, &rule->outer, NULL,
++				&rule->act)) {
+ 			kfree(rule);
+ 			return 0;
+ 		}
+@@ -177,9 +218,13 @@ static int double_tagged_add(struct net_device *dev,
+ 		return err;
+ 	}
+ 
++	if (has_cookie(&rule->act) && is_dscp(&rule->act))
++		dp_pattern_vlan_from_cookie(&rule->inner, rule->act.sort_key);
++
+ 	/* Attempt to merge new rule into existing one */
+ 	list_for_each_entry(p, &node->rules, list) {
+-		if (!dscp_merge(&p->outer, &p->act, &rule->outer, &rule->act)) {
++		if (!dscp_merge(&p->outer, &p->inner, &p->act, &rule->outer,
++				&rule->inner, &rule->act)) {
+ 			kfree(rule);
+ 			return 0;
+ 		}
+@@ -355,3 +400,120 @@ struct list_head *pon_qos_tc_get_ext_vlan_storage(void)
+ {
+ 	return &tc_ext_vlan_storage;
+ }
++
++static void print_rule(struct seq_file *file, struct dp_pattern_vlan *outer,
++		       struct dp_pattern_vlan *inner, struct dp_act_vlan *act)
++{
++	unsigned int i = 0;
++
++	seq_printf(file, "%016llx filter", act->sort_key);
++
++	if (outer) {
++		seq_printf(file, " outer prio %d tpid 0x%x vid %d dei %d proto %d",
++			   outer->prio, outer->tpid, outer->vid, outer->dei,
++			   outer->proto);
++	}
++
++	if (inner) {
++		seq_printf(file, " inner prio %d tpid 0x%x vid %d dei %d proto %d",
++			   inner->prio, inner->tpid, inner->vid, inner->dei,
++			   inner->proto);
++	}
++
++	seq_printf(file, "\n");
++
++	seq_printf(file, "treatment act %d pop_n %d push_n %d", act->act,
++		   act->pop_n, act->push_n);
++	for (i = 0; i < act->push_n; ++i) {
++		seq_printf(file, " tpid[%d] 0x%x", i, act->tpid[i]);
++		seq_printf(file, " vid[%d] %d", i, act->vid[i]);
++		seq_printf(file, " dei[%d] %d", i, act->dei[i]);
++		seq_printf(file, " prio[%d] %d", i, act->prio[i]);
++	}
++
++	seq_printf(file, "\n");
++	if (is_dscp(act)) {
++		seq_printf(file, "dscp");
++		for (i = 0; i < ARRAY_SIZE(act->dscp_pcp_map); ++i) {
++			if (act->dscp_pcp_map_valid[i])
++				seq_printf(file, " %2x", act->dscp_pcp_map[i]);
++			else
++				seq_printf(file, " ..");
++		}
++		seq_printf(file, "\n");
++	}
++	seq_printf(file, "\n");
++}
++
++static void print_node(struct seq_file *file,
++		       struct pon_qos_vlan_storage_node *p)
++{
++	seq_printf(file, "%s", p->dev->name);
++	if (p->ingress)
++		seq_printf(file, " ingress");
++	else
++		seq_printf(file, " egress");
++
++	switch (p->tag) {
++	case TC_VLAN_UNTAGGED:
++		seq_printf(file, " untagged");
++		break;
++	case TC_VLAN_SINGLE_TAGGED:
++		seq_printf(file, " single");
++		break;
++	case TC_VLAN_DOUBLE_TAGGED:
++		seq_printf(file, " double");
++		break;
++	default:
++		seq_printf(file, " unknown");
++		break;
++	}
++	seq_printf(file, "\n");
++
++	if (p->tag == TC_VLAN_UNTAGGED) {
++		struct dp_vlan0 *i;
++		list_for_each_entry(i, &p->rules, list)
++			print_rule(file, &i->outer, NULL, &i->act);
++	}
++	if (p->tag == TC_VLAN_SINGLE_TAGGED) {
++		struct dp_vlan1 *i;
++		list_for_each_entry(i, &p->rules, list)
++			print_rule(file, &i->outer, NULL, &i->act);
++	}
++	if (p->tag == TC_VLAN_DOUBLE_TAGGED) {
++		struct dp_vlan2 *i;
++		list_for_each_entry(i, &p->rules, list)
++			print_rule(file, &i->outer, &i->inner, &i->act);
++	}
++}
++
++void pon_qos_tc_ext_vlan_debugfs(struct seq_file *file, void *ctx)
++{
++	struct pon_qos_vlan_storage_node *p;
++	unsigned int i = 0;
++
++	static const struct {
++		bool ingress;
++		enum tc_flower_vlan_tag tag;
++	} display_order[] = {
++		/* ingress */
++		{true, TC_VLAN_UNTAGGED},
++		{true, TC_VLAN_SINGLE_TAGGED},
++		{true, TC_VLAN_DOUBLE_TAGGED},
++		/* egress */
++		{false, TC_VLAN_UNTAGGED},
++		{false, TC_VLAN_SINGLE_TAGGED},
++		{false, TC_VLAN_DOUBLE_TAGGED},
++	};
++
++	if (!file) {
++		WARN(1, "file is NULL\n");
++		return;
++	}
++
++	for (i = 0; i < ARRAY_SIZE(display_order); ++i)
++		list_for_each_entry(p, &tc_ext_vlan_storage, list)
++			if (p->ingress == display_order[i].ingress &&
++			    p->tag == display_order[i].tag)
++				print_node(file, p);
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h
+index 8e09077507a3..56c8526b0cd3 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.h
+@@ -8,6 +8,10 @@
+ #ifndef _PON_QOS_TC_EXT_VLAN_
+ #define _PON_QOS_TC_EXT_VLAN_
+ 
++struct tc_cls_flower_offload;
++struct net_device;
++struct seq_file;
++
+ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 			    struct tc_cls_flower_offload *f);
+ 
+@@ -17,4 +21,6 @@ int pon_qos_tc_ext_vlan_del(struct net_device *dev,
+ 
+ struct list_head *pon_qos_tc_get_ext_vlan_storage(void);
+ 
++void pon_qos_tc_ext_vlan_debugfs(struct seq_file *file, void *ctx);
++
+ #endif
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+index f3c4d8755d09..b4f5c7c88640 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_main.c
+@@ -8,6 +8,7 @@
+ #include <net/pon_qos_tc.h>
+ #include "pon_qos_tc_main.h"
+ #include "pon_qos_tc_qos.h"
++#include "pon_qos_tc_debugfs.h"
+ #if IS_ENABLED(CONFIG_QOS_MGR)
+ #include <net/qos_mgr/qos_mgr_tc_hook.h>
+ #endif
+@@ -77,16 +78,26 @@ static int __init pon_qos_init(void)
+ {
+ 	int ret = 0;
+ 
++	ret = pon_qos_tc_debugfs_init();
++	if (ret)
++		return ret;
++
+ 	rtnl_lock();
+ 	pon_qos_setup_tc_fn = pon_qos_setup_tc;
+ 	ret = pon_qos_tc_mappings_init();
+ 	rtnl_unlock();
+ 
++	if (ret) {
++		pon_qos_tc_debugfs_exit();
++		return ret;
++	}
++
+ 	return ret;
+ }
+ 
+ static void __exit pon_qos_destroy(void)
+ {
++	pon_qos_tc_debugfs_exit();
+ 	rtnl_lock();
+ 	pon_qos_ports_cleanup();
+ 	pon_qos_setup_tc_fn = NULL;
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
+index e634ab8c6414..0f6883a90cf6 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
+@@ -66,19 +66,6 @@ void pon_qos_tc_vlan_storage_del(struct net_device *dev,
+ 	kfree(node);
+ }
+ 
+-#define FILTER_OUTER_PRIO(x) (((x) >> 60) & 0xF)
+-#define FILTER_OUTER_VID(x) (((x) >> 47) & 0x1FFF)
+-#define FILTER_OUTER_TPID(x) (((x) >> 44) & 0x7)
+-#define FILTER_INNER_PRIO(x) (((x) >> 28) & 0xF)
+-#define FILTER_INNER_VID(x) (((x) >> 15) & 0x1FFF)
+-#define FILTER_INNER_TPID(x) (((x) >> 12) & 0x7)
+-#define FILTER_ETHERTYPE(x) (((x) >> 0) & 0xF)
+-#define FILTER_PRIO_IGNORE 15
+-#define FILTER_PRIO_DEFAULT 14
+-#define FILTER_ETHERTYPE_ANY 0
+-#define FILTER_VID_ANY 4096
+-#define FILTER_TPID_ANY 0
+-
+ /* This sorting method although not strictly following the OMCI standard
+  * is preferred and enabled by default. When sorting, it will compare by VID
+  * first and then by priority.
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+index a7391ab847a7..162cb9d4dc69 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+@@ -10,6 +10,19 @@
+ 
+ #include "pon_qos_tc_vlan_prepare.h"
+ 
++#define FILTER_OUTER_PRIO(x) (((x) >> 60) & 0xF)
++#define FILTER_OUTER_VID(x) (((x) >> 47) & 0x1FFF)
++#define FILTER_OUTER_TPID(x) (((x) >> 44) & 0x7)
++#define FILTER_INNER_PRIO(x) (((x) >> 28) & 0xF)
++#define FILTER_INNER_VID(x) (((x) >> 15) & 0x1FFF)
++#define FILTER_INNER_TPID(x) (((x) >> 12) & 0x7)
++#define FILTER_ETHERTYPE(x) (((x) >> 0) & 0xF)
++#define FILTER_PRIO_IGNORE 15
++#define FILTER_PRIO_DEFAULT 14
++#define FILTER_ETHERTYPE_ANY 0
++#define FILTER_VID_ANY 4096
++#define FILTER_TPID_ANY 0
++
+ struct pon_qos_vlan_storage_node {
+ 	struct net_device *dev;
+ 	bool ingress;

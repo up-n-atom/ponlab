@@ -1,0 +1,242 @@
+From 7720fe2297bf6ef183198363a0c75e5c9b4c8c60 Mon Sep 17 00:00:00 2001
+From: anishkhx <anishx.khurana@intel.com>
+Date: Thu, 23 Aug 2018 18:02:32 +0800
+Subject: [PATCH] DRVLIB_SW-884 dp proc file update for port alloc and free
+
+---
+ .../net/ethernet/lantiq/datapath/datapath_proc.c   | 190 +++++++++++++++++++++
+ 1 file changed, 190 insertions(+)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+index ab5c78f6db48..875e6731563a 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_proc.c
+@@ -46,10 +46,16 @@
+ #define PROC_QOS  "qos"
+ #define PROC_ASYM_VLAN  "asym_vlan"
+ #define PROC_METER "meter"
++#define PROC_ALLOC_PARAM "-p <port-id> -t <inst> -o <owner>"
++#define PROC_ALLOC_PARAM_FLAGS "-f <flags/(ETH_LAN/ETH_WAN/" \
++			       "FAST_WLAN/DSL/Tunne_loop/" \
++			       "DirectPath/GPON/EPON/GINT/.. >"
++#define PROC_FREE_PARAM "-p <port-id> -t <inst>"
+ 
+ static int tmp_inst;
+ static ssize_t proc_port_write(struct file *file, const char *buf,
+ 			       size_t count, loff_t *ppos);
++static struct module owner[DP_MAX_INST][MAX_DP_PORTS] = {0};
+ #if defined(CONFIG_LTQ_DATAPATH_DBG) && CONFIG_LTQ_DATAPATH_DBG
+ static void proc_dbg_read(struct seq_file *s);
+ static ssize_t proc_dbg_write(struct file *, const char *, size_t, loff_t *);
+@@ -65,6 +71,12 @@ static ssize_t proc_logical_dev_write(struct file *file, const char *buf,
+ static ssize_t proc_meter_write(struct file *file, const char *buf,
+ 				size_t count, loff_t *ppos);
+ static void meter_create_help(void);
++
++static int alloc_port(char *param_list[], int num);
++static int free_port(char *param_list[], int num);
++static int32_t dp_cb_rx(struct net_device *rxif,
++			struct net_device *txif,
++			struct sk_buff *skb, int32_t len);
+ static int proc_port_init(void);
+ 
+ int proc_port_init(void)
+@@ -1437,6 +1449,173 @@ int del_vap(char *param_list[], int num)
+ 	return 0;
+ }
+ 
++static int32_t dp_cb_rx(struct net_device *rxif, struct net_device *txif,
++			struct sk_buff *skb, int32_t len)
++{
++	if (skb)
++		skb_pull(skb, sizeof(struct pmac_rx_hdr));
++	else
++		return -1;
++
++	if (rxif) {
++		if (netif_running(rxif)) {
++			skb->dev = rxif;
++			return netif_rx(skb);
++		}
++	} else {
++		PR_ERR("Tx fails\n");
++		dev_kfree_skb_any(skb);
++	}
++	return 0;
++}
++
++int free_port(char *param_list[], int num)
++{
++	int inst = 0, res, port_id = 1, c;
++	int opt_offset = 1;
++	char *optstring = "p:t:";
++	char *optarg = 0;
++	dp_cb_t cb = {0};
++
++	if (num < 2) {
++		PR_ERR("Not enough parameters\n");
++		goto help;
++	}
++	while ((c = dp_getopt(param_list, num, &opt_offset,
++			      &optarg, optstring)) > 0) {
++		if (optstring)
++			PR_INFO("opt_offset=%d optarg=%s.\n",
++				opt_offset, optarg);
++		switch (c) {
++		case 'p':
++			port_id = dp_atoi(optarg);
++			PR_INFO("port_id=%d\n", port_id);
++			if (port_id < 1 || port_id > MAX_DP_PORTS) {
++				PR_ERR("Invalid Port_id\n");
++				return -1;
++			}
++			break;
++		case 't':
++			inst = dp_atoi(optarg);
++			PR_INFO("inst=%d\n", inst);
++			if (inst < 0) {
++				PR_ERR("wrong inst for  with ep=%d\n",
++				       port_id);
++				return -1;
++			}
++			break;
++		default:
++			PR_INFO("wrong command");
++			goto help;
++		}
++	}
++	if (c < 0) {
++		PR_INFO("Wrong command\n");
++		goto help;
++	}
++	cb.rx_fn = (dp_rx_fn_t)dp_cb_rx;
++	res = dp_register_dev_ext(inst, &owner[inst][port_id], port_id,
++				  &cb, NULL, DP_F_DEREGISTER);
++	if (res < 0) {
++		PR_ERR("dp_register_dev_ext failed\n");
++		return -1;
++	}
++	res = dp_alloc_port_ext(inst, &owner[inst][port_id], NULL, 0,
++				port_id, NULL, NULL, DP_F_DEREGISTER);
++	if (res < 0) {
++		PR_ERR("dp_alloc_port_ext de-reg failed\n");
++		return -1;
++	}
++	PR_INFO("DP port free successfully\n");
++	return 0;
++help:
++	PR_INFO("echo free %s > /sys/kernel/debug/dp/%s\n",
++		PROC_FREE_PARAM, PROC_LOGICAL_DEV);
++	return 0;
++}
++
++int alloc_port(char *param_list[], int num)
++{
++	int inst = 0, res, port_id = 1, flags = 0, c, j;
++	int opt_offset = 1;
++	char *optstring = "p:t:o:f:";
++	char *optarg = 0;
++	dp_cb_t cb = {0};
++
++	if (num < 2) {
++		PR_ERR("Not enough parameters\n");
++		goto help;
++	}
++	while ((c = dp_getopt(param_list, num, &opt_offset,
++			      &optarg, optstring)) > 0) {
++		if (optstring)
++			PR_INFO("opt_offset=%d optarg=%s.\n",
++				opt_offset, optarg);
++		PR_INFO("\ndp_getopt :%c\n", c);
++		switch (c) {
++		case 'p':
++			PR_INFO("port_id=%s\n", optarg);
++			port_id = dp_atoi(optarg);
++			if (port_id < 1 || port_id > MAX_DP_PORTS) {
++				PR_ERR("Invalid Port_id\n");
++				return -1;
++			}
++			break;
++		case 't':
++			inst = dp_atoi(optarg);
++			PR_INFO("inst=%d\n", inst);
++			break;
++		case 'o':
++			strncpy(owner[inst][port_id].name, optarg,
++				sizeof(owner[inst][port_id].name) - 1);
++			PR_INFO("owner name=%s\n", optarg);
++			break;
++		case 'f':
++			for (j = 0; j < get_dp_port_type_str_size(); j++) {
++				if (dp_strncmpi(optarg,
++						dp_port_type_str[j],
++						strlen(dp_port_type_str[j]))
++						== 0) {
++					flags |= dp_port_flag[j];
++					PR_INFO("flag =%d\n", flags);
++					break;
++				}
++			}
++			break;
++		default:
++			PR_INFO("wrong command");
++			goto help;
++		}
++	}
++	if (c < 0) {
++		PR_INFO("Wrong command\n");
++		goto help;
++	}
++	res = dp_alloc_port_ext(inst, &owner[inst][port_id], NULL, 0,
++				port_id, NULL, NULL, flags);
++	if (res < 0) {
++		PR_ERR("dp_alloc_port_ext failed\n");
++		return -1;
++	}
++	cb.rx_fn = (dp_rx_fn_t)dp_cb_rx;
++	res = dp_register_dev_ext(inst, &owner[inst][port_id], port_id,
++				  &cb, NULL, flags);
++	if (res < 0) {
++		dp_alloc_port_ext(inst, &owner[inst][port_id], NULL, 0,
++				  port_id, NULL, NULL, DP_F_DEREGISTER);
++		PR_ERR("dp_register_dev_ext failed\n");
++		return -1;
++	}
++	PR_INFO("DP port allocated successfully\n");
++	return 0;
++
++help:
++	PR_INFO("echo alloc %s %s > /sys/kernel/debug/dp/%s\n",
++		PROC_ALLOC_PARAM, PROC_ALLOC_PARAM_FLAGS,
++		PROC_LOGICAL_DEV);
++	return 0;
++}
++
+ #define DP_PROC_Q_AUTO_SHARE 0
+ #define DP_PROC_Q_NEW_QUEUE  -1
+ /* param_list[]: parameter list
+@@ -1729,6 +1908,12 @@ ssize_t proc_logical_dev_write(struct file *file, const char *buf,
+ 	} else if (dp_strncmpi(param_list[0], "del_v", strlen("del_v")) == 0) {
+ 		del_vap(param_list, num);
+ 		goto EXIT1;
++	} else if (dp_strncmpi(param_list[0], "alloc",
++		   strlen("alloc") + 1) == 0) {
++		alloc_port(param_list, num);
++	} else if (dp_strncmpi(param_list[0], "free",
++		   strlen("free") + 1) == 0) {
++		free_port(param_list, num);
+ 	} else {
+ 		PR_ERR("Wrong cmd:%s\n", param_list[0]);
+ 		goto EXIT1;
+@@ -1759,6 +1944,11 @@ ssize_t proc_logical_dev_write(struct file *file, const char *buf,
+ 	PR_INFO("   Note of ctp_dev: for PON pmapper case\n");
+ 	PR_INFO("Del vap:echo del_v <dp_port> <vap> %s/%s\n",
+ 		DP_PROC_BASE, PROC_LOGICAL_DEV);
++	PR_INFO("echo alloc %s %s > /sys/kernel/debug/dp/%s\n",
++		PROC_ALLOC_PARAM, PROC_ALLOC_PARAM_FLAGS,
++		PROC_LOGICAL_DEV);
++	PR_INFO("echo free %s > /sys/kernel/debug/dp/%s\n",
++		PROC_FREE_PARAM, PROC_LOGICAL_DEV);
+ 	if (dev)
+ 		dev_put(dev);
+ 

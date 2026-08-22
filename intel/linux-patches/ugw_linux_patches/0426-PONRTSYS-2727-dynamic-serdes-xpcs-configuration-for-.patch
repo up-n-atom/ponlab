@@ -1,0 +1,342 @@
+From bccc8334f705e90a819aa6fbf975f742dc4e57d7 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Fri, 14 Dec 2018 17:52:09 +0800
+Subject: [PATCH] PONRTSYS-2727: dynamic-serdes-xpcs-configuration for 10G and
+ 1G
+
+---
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c |  40 ++++++--
+ drivers/net/ethernet/lantiq/xpcs/xpcs.c          | 115 +++++++++++------------
+ drivers/net/ethernet/lantiq/xpcs/xpcs.h          |  10 +-
+ drivers/phy/intel/phy-intel-combo.c              |   4 +-
+ 4 files changed, 97 insertions(+), 72 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index 5dd2e6d1aeb7..00e6948a18b5 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -698,6 +698,29 @@ static int ltq_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 	return -EOPNOTSUPP;
+ }
+ 
++int serdes_ethtool_get_link_ksettings(struct net_device *dev,
++				   struct ethtool_link_ksettings *cmd)
++{
++	struct ltq_eth_priv *priv = netdev_priv(dev);
++
++	/* Speed Get in Ethtool */
++	xpcs_ethtool_ksettings_get(priv->xgmac_id, cmd);
++
++	return 0;
++}
++
++int serdes_ethtool_set_link_ksettings(struct net_device *dev,
++				   const struct ethtool_link_ksettings *cmd)
++{
++	struct ltq_eth_priv *priv = netdev_priv(dev);
++	int ret = 0;
++
++	/* Speed Set in Ethtool */
++	ret = xpcs_ethtool_ksettings_set(priv->xgmac_id, cmd);
++
++	return ret;
++}
++
+ /* init of the network device */
+ static int ltq_eth_init(struct net_device *dev)
+ {
+@@ -716,14 +739,17 @@ static int ltq_eth_init(struct net_device *dev)
+ 		else if (g_soc_data.phy_connect_func(dev, &priv->port[i]))
+ 			pr_warn("connect phy of port %d failed\n",
+ 				priv->port[i].num);
++
++		dev->ethtool_ops = &ethtool_ops;
++	}
++
++	if (!priv->port[i].phy_node) {
++		ethtool_ops.get_link_ksettings =
++			serdes_ethtool_get_link_ksettings;
++		ethtool_ops.set_link_ksettings =
++			serdes_ethtool_set_link_ksettings;
++
+ 		dev->ethtool_ops = &ethtool_ops;
+-		
+-		if (!priv->port[i].phy_node) {
+-			ethtool_ops.get_link_ksettings = 
+-				serdes_ethtool_get_link_ksettings;
+-			ethtool_ops.set_link_ksettings = 
+-				serdes_ethtool_set_link_ksettings;
+-		}
+ 	}
+ 
+ 	if (priv->lct_en == 1) {
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+index a9ec3147c942..b8b319d55739 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+@@ -24,7 +24,6 @@
+ #include "xpcs.h"
+ #include <linux/netdevice.h>
+ #include <net/datapath_api.h>
+-#include "../ltq_eth_drv_xrx500.h"
+ 
+ 
+ #define MAX_BUSY_RETRY	2000
+@@ -46,6 +45,8 @@ static int xpcs_teng_kr_mode(struct xpcs_prv_data *pdata);
+ static int xpcs_2p5g_xaui_mode(struct xpcs_prv_data *pdata);
+ static int xpcs_synphy_reset_sts(struct xpcs_prv_data *pdata);
+ 
++struct xpcs_prv_data *priv_data[MAX_XPCS] = {0};
++
+ struct xpcs_mode_cfg mode_cfg[MAX_XPCS_MODE] = {
+ 	{
+ 		.id = TENG_KR_MODE,
+@@ -191,9 +192,16 @@ static int xpcs_rxtx_stable(struct xpcs_prv_data *pdata)
+ 		pseq_state = XPCS_RGRD_VAL(pdata, PCS_DIG_STS, PSEQ_STATE);
+ 
+ 		if (pseq_state == 4) {
+-			dev_info(pdata->dev,
+-				 "%s: Tx/Rx stable (Power_Good State)\n",
+-				 pdata->name);
++			if (pdata->mode == TENG_KR_MODE)
++				pr_info("%s: Tx/Rx stable (Power_Good State) "
++					"Speed: 10G\n", pdata->name);
++			else if (pdata->mode == ONEG_XAUI_MODE)
++				pr_info("%s: Tx/Rx stable (Power_Good State) "
++					"Speed: 1G\n", pdata->name);
++			else if (pdata->mode == TWOP5G_GMII_MODE)
++				pr_info("%s: Tx/Rx stable (Power_Good State) "
++					"Speed: 2.5G\n", pdata->name);
++
+ 			break;
+ 		}
+ 
+@@ -949,47 +957,17 @@ static int xpcs_parse_dts(struct platform_device *pdev,
+ 
+ static int xpcs_reset(struct device *dev)
+ {
+-	struct reset_control *xpcs_rst;
+-
+-	xpcs_rst = devm_reset_control_get(dev, XPCS_RESET_NAME);
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
+ 
+-	if (IS_ERR(xpcs_rst))
+-		return -1;
+-
+-	reset_control_assert(xpcs_rst);
++	reset_control_assert(pdata->xpcs_rst);
+ 	udelay(1);
+-	reset_control_deassert(xpcs_rst);
+-
+-	return 0;
+-}
+-
+-struct xpcs_prv_data *priv_data[MAX_XPCS] = {0};
+-
+-int serdes_ethtool_get_link_ksettings(struct net_device *dev,
+-				   struct ethtool_link_ksettings *cmd)
+-{
+-	struct ltq_eth_priv *priv = netdev_priv(dev);
+-
+-	serdes_ethtool_ksettings_get(priv->xgmac_id, cmd);
++	reset_control_deassert(pdata->xpcs_rst);
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(serdes_ethtool_get_link_ksettings);
+-
+-int serdes_ethtool_set_link_ksettings(struct net_device *dev,
+-				   const struct ethtool_link_ksettings *cmd)
+-{
+-	struct ltq_eth_priv *priv = netdev_priv(dev);
+-	int ret = 0;
+-
+-	ret = serdes_ethtool_ksettings_set(priv->xgmac_id, cmd);
+-
+-	return ret;
+-}
+-EXPORT_SYMBOL(serdes_ethtool_set_link_ksettings);
+ 
+-void serdes_ethtool_ksettings_get(u32 idx,
+-			       struct ethtool_link_ksettings *cmd)
++void xpcs_ethtool_ksettings_get(u32 idx,
++				struct ethtool_link_ksettings *cmd)
+ {
+ 	struct xpcs_prv_data *pdata = priv_data[idx];
+ 
+@@ -1000,33 +978,30 @@ void serdes_ethtool_ksettings_get(u32 idx,
+ 
+ 	return;
+ }
++EXPORT_SYMBOL(xpcs_ethtool_ksettings_get);
+ 
+-int serdes_ethtool_ksettings_set(u32 idx,
+-			      const struct ethtool_link_ksettings *cmd)
++int xpcs_ethtool_ksettings_set(u32 idx,
++			       const struct ethtool_link_ksettings *cmd)
+ {
+ 	u32 speed = cmd->base.speed;
+ 	u32 mode;
+ 	struct xpcs_prv_data *pdata = priv_data[idx];
+ 
+-	printk("Speed got is %d priv_data[idx].mode\n",speed);
+-	
+ 	if (speed != SPEED_10000 &&
+ 	    speed != SPEED_1000)
+ 		return -EINVAL;
+ 
+-	if (speed == SPEED_10000 && (pdata->mode != TENG_KR_MODE)) {
+-		printk("Mode changing to: %s\n","10G");
++	if (speed == SPEED_10000 && (pdata->mode != TENG_KR_MODE))
+ 		mode = TENG_KR_MODE;
+-	} else if (speed == SPEED_1000 && (pdata->mode != ONEG_XAUI_MODE)) {
+-		printk("Mode changing to: %s\n","1G");
++	else if (speed == SPEED_1000 && (pdata->mode != ONEG_XAUI_MODE))
+ 		mode = ONEG_XAUI_MODE;
+-	}
+ 
+ 	/* Restart Xpcs & PHY */
+ 	xpcs_reinit(idx, mode);
+ 
+ 	return 0;
+ }
++EXPORT_SYMBOL(xpcs_ethtool_ksettings_set);
+ 
+ int xpcs_reinit(int idx, u32 mode)
+ {
+@@ -1035,24 +1010,40 @@ int xpcs_reinit(int idx, u32 mode)
+ 	struct phy *phy = pdata->phy;
+ 	int ret = 0;
+ 
++	if (!dev || !phy) {
++		printk("Cannot get phy or dev\n");
++		return -1;
++	}
++
++	/* Xpcs reset assert */
++	reset_control_assert(pdata->xpcs_rst);
++
+ 	/* RCU reset PHY */
+ 	phy_power_off(phy);
+ 
+-	/* RCU reset XPCS */
+-	ret = xpcs_reset(dev);	
++	/* Exit PHY */
++	phy_exit(phy);
++
++	/* Init PHY */
++	ret = phy_init(phy);
++
+ 	if (ret < 0) {
+-		dev_dbg(dev, "xpcs_reset err %s.\n", pdata->name);
++		dev_dbg(dev, "phy_init err %s.\n", pdata->name);
+ 		return ret;
+ 	}
+ 
+ 	/* Power ON PHY */
+-	phy_power_on(pdata->phy);
++	phy_power_on(phy);
++
++	/* Xpcs reset deassert */
++	reset_control_deassert(pdata->xpcs_rst);
+ 
+ 	/* Change mode to new mode */
+ 	pdata->mode = mode;
+ 
+ 	/* Power ON XPCS */
+ 	ret = xpcs_init(pdata);
++
+ 	if (ret < 0) {
+ 		dev_dbg(dev, "xpcs_init err %s.\n", pdata->name);
+ 		return ret;
+@@ -1068,7 +1059,8 @@ static int xpcs_probe(struct platform_device *pdev)
+ 	int ret = XPCS_SUCCESS;
+ 	struct xpcs_prv_data *pdata;
+ 	int i = 0;
+-	
++	struct reset_control *xpcs_rst;
++
+ 	if (dev->of_node) {
+ 		if (xpcs_parse_dts(pdev, &pdata) != XPCS_SUCCESS) {
+ 			dev_dbg(dev, "xpcs dt parse failed!\n");
+@@ -1084,10 +1076,12 @@ static int xpcs_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
+-	for (i = 0; i < MAX_XPCS; i++) {
+-		if (!priv_data[i])
+-			priv_data[i] = pdata;
+-	}
++	if (!strcmp(pdata->name, "wan_xpcs"))
++		priv_data[0] = pdata;
++	else if (!strcmp(pdata->name, "lan_xpcs0"))
++		priv_data[1] = pdata;
++	else if (!strcmp(pdata->name, "lan_xpcs1"))
++		priv_data[2] = pdata;
+ 
+ 	pdata->id = pdev->id;
+ 	pdata->dev = dev;
+@@ -1131,6 +1125,11 @@ static int xpcs_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
++	pdata->xpcs_rst = devm_reset_control_get(dev, XPCS_RESET_NAME);
++
++	if (IS_ERR(pdata->xpcs_rst))
++		return -1;
++
+ 	if (xpcs_reset(dev)) {
+ 		dev_err(dev, "Failed to do %s reset:\n", pdata->name);
+ 		return -EINVAL;
+@@ -1147,8 +1146,6 @@ static int xpcs_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
+-	dev_info(dev, "%s Initialized!!\n", pdata->name);
+-
+ 	return XPCS_SUCCESS;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.h b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+index e6455d55e9c9..e01e1aa6b9f7 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.h
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+@@ -681,6 +681,8 @@ struct xpcs_prv_data {
+ 	/* Power save mode 0 - Normal Mode, 1 - power save mode */
+ 	u8 power_save;
+ 
++	struct reset_control *xpcs_rst;
++
+ 	/* XPCS Mode Switching */
+ 	struct xpcs_mode_cfg *mode_cfg;
+ };
+@@ -763,10 +765,10 @@ static inline void XPCS_RGWR(struct xpcs_prv_data *pdata, u32 reg, u32 val)
+ 	} while (0)
+ 
+ int xpcs_sysfs_init(struct xpcs_prv_data *priv);
+-int serdes_ethtool_get_link_ksettings(struct net_device *dev, struct ethtool_link_ksettings *cmd);
+-int serdes_ethtool_set_link_ksettings(struct net_device *dev, const struct ethtool_link_ksettings *cmd);
+-void serdes_ethtool_ksettings_get(u32 idx, struct ethtool_link_ksettings *cmd);
+-int serdes_ethtool_ksettings_set(u32 idx, const struct ethtool_link_ksettings *cmd);
++void xpcs_ethtool_ksettings_get(u32 idx,
++				struct ethtool_link_ksettings *cmd);
++int xpcs_ethtool_ksettings_set(u32 idx,
++			       const struct ethtool_link_ksettings *cmd);
+ int xpcs_reinit(int idx, u32 mode);
+ 
+ #endif
+diff --git a/drivers/phy/intel/phy-intel-combo.c b/drivers/phy/intel/phy-intel-combo.c
+index 9041633475e8..317fb08a1883 100644
+--- a/drivers/phy/intel/phy-intel-combo.c
++++ b/drivers/phy/intel/phy-intel-combo.c
+@@ -419,8 +419,8 @@ static int intel_phy_power_off(struct phy_ctx *iphy)
+ 		return ret;
+ 	}
+ 
+-	intel_phy_gate_clk_disable(iphy);
+-	intel_phy_freq_clk_disable(iphy);
++	//intel_phy_gate_clk_disable(iphy);
++	//intel_phy_freq_clk_disable(iphy);
+ 	iphy->power_en = false;
+ 
+ 	return 0;

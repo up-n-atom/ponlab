@@ -1,0 +1,88 @@
+From 4b7c5af0d963b3c3dc4ad9ab71d53435d8132dac Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke.mehrtens@intel.com>
+Date: Tue, 3 Nov 2020 18:48:05 +0100
+Subject: [PATCH] PONRTSYS-8201: dp: mib_counter: Use delayed workqueue instead
+ of timer
+
+Instead of using the Linux timer use a delayed workqueue. The workqueue
+is executed in process context and the timer is executed in soft
+interrupt context. The process context can be preempted by Linux, the
+soft interrupt not. We do not need an atomic context for the counter
+update, so a peemption is no problem.
+
+We do not have to use the _bh locks which also block execution of other
+soft interrupts, this should make it possible for other parts of the
+system to react faster on events.
+---
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 28 ++++++++++++----------
+ 1 file changed, 16 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+index b3f2388693cb..fbecf0263629 100644
+--- a/drivers/net/datapath/mib_counters/dp_mib_counters.c
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -5,7 +5,7 @@
+ #include <linux/module.h> /* Needed by all modules */
+ #include <linux/kernel.h> /* Needed for KERN_INFO */
+ #include <linux/init.h> /* Needed for the macros */
+-#include <linux/timer.h>
++#include <linux/workqueue.h>
+ #include <linux/spinlock.h>
+ #include <linux/list.h>
+ #include <linux/string.h>
+@@ -152,8 +152,8 @@ static const char dp_ethtool_gstrings[][ETH_GSTRING_LEN] = {
+ #undef _DP_ETHTOOL
+ };
+ 
+-/* Timer for update counters for all registered net devices */
+-static struct timer_list cnt_upd_timer;
++/* Delayed work object for update counters for all registered net devices */
++static struct delayed_work cnt_upd_work;
+ 
+ /* List of registered net devices */
+ static struct list_head registered_devices_list;
+@@ -697,12 +697,15 @@ static void dp_dev_get_stat_strings(struct net_device *dev, u8 *data)
+ 	memcpy(data, dp_ethtool_gstrings, sizeof(dp_ethtool_gstrings));
+ }
+ 
+-/********************* TIMER **************************************/
++/********************* workqueue handler ***************************/
+ 
+-void cnt_upd_timer_handler(unsigned long data)
++void cnt_upd_timer_handler(struct work_struct *work)
+ {
+-	/* Restarting the timer...*/
+-	mod_timer(&cnt_upd_timer, jiffies + msecs_to_jiffies(CNT_UPDATE_TIME));
++	/* Add delayed work object again for next run, the old object is not
++	 * changed any more.
++	 */
++	queue_delayed_work(system_long_wq, &cnt_upd_work,
++			   msecs_to_jiffies(CNT_UPDATE_TIME));
+ 
+ 	update_all_devs_counters();
+ }
+@@ -721,9 +724,10 @@ static int __init mib_counters_mod_init(void)
+ 
+ 	rwlock_init(&dev_list_lock);
+ 
+-	/* Starting the timer.*/
+-	setup_timer(&cnt_upd_timer, cnt_upd_timer_handler, 0);
+-	mod_timer(&cnt_upd_timer, jiffies + msecs_to_jiffies(CNT_UPDATE_TIME));
++	/* Initialize and schedule  delayed work */
++	INIT_DELAYED_WORK(&cnt_upd_work, cnt_upd_timer_handler);
++	queue_delayed_work(system_long_wq, &cnt_upd_work,
++			   msecs_to_jiffies(CNT_UPDATE_TIME));
+ 
+ 	/* Registering of net dev register callback */
+ 	event_info.inst = 0;
+@@ -774,8 +778,8 @@ static void __exit mib_counters_mod_exit(void)
+ 		return;
+ 	}
+ 
+-	/* STOP and remove timer */
+-	del_timer(&cnt_upd_timer);
++	/* Stop counter update and wait till current task finished */
++	cancel_delayed_work_sync(&cnt_upd_work);
+ 
+ 	/* Free all list entries for registered net devices */
+ 	write_lock_bh(&dev_list_lock);

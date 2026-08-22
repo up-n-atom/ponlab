@@ -1,0 +1,478 @@
+From 1243793184527ee2f761729b51f59533a5910f7e Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Tue, 28 Jan 2020 11:07:28 +0800
+Subject: [PATCH] DRV_DPM_SW-146 - new API for updating the DP subif
+ information during re-config
+
+---
+ drivers/net/datapath/dpm/datapath.h              |   5 +-
+ drivers/net/datapath/dpm/datapath_api.c          | 172 +++++++++++++++++++++++
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 172 ++++++++++++++++++++++-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h |   1 +
+ include/net/datapath_api.h                       |  13 ++
+ include/net/datapath_inst.h                      |   7 +-
+ 6 files changed, 366 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 5079d4e31d88..3a18a65723f3 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -714,11 +714,14 @@ struct cqm_port_info {
+ 	void *txpush_addr_qos; /* QOS push address without any shift/mask */
+ 	u32 tx_ring_size; /*PP port ring size */
+ 	int qos_port; /*qos port id*/
+-	int first_qid; /*in order to auto sharing queue, 1st queue allocated by
++	union {
++		int first_qid; /*in order to auto sharing queue, 1st queue allocated by
+ 			*dp_register_subif_ext for that cqm_dequeue_port will be
+ 			*stored here. later it will be shared by other subif via
+ 			*dp_register_subif_ext
+ 			*/
++		int qid[DP_MAX_DEQ_PER_SUBIF];
++	};
+ 	int q_node; /*first_qid's logical node id*/
+ 	int dp_port; /* dp_port info */
+ 	u32 dma_chan;
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 0f593be70a7f..e5650af908d6 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -908,6 +908,175 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	return res;
+ }
+ 
++int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
++{
++	struct pmac_port_info *port_info;
++	struct dp_subif_info *sif;
++	struct dp_dev *dp_dev;
++	u32 idx;
++	int subif, bp = 0, fid = 0;
++	int f_new_subif = -1, f_old_subif = -1;
++	struct net_device *old_dev, *old_ctp_dev;
++	struct inst_info *dp_info;
++	struct dp_evt_notif_data notif_data;
++	struct bp_pmapper_dev *bp_info;
++	dp_subif_t *new_subif_id_sync, *old_subif_id_sync;
++	dp_get_netif_subifid_fn_t subifid_fn_t = NULL;
++	struct dp_subif_data old_data = {0}, new_data = {0};
++
++	if (!info)
++		return DP_FAILURE;
++
++	if (info->inst < 0) {
++		pr_err("dp_update_subif failed\n");
++		return DP_FAILURE;
++	}
++	notif_data.inst = info->inst;
++	notif_data.dpid = info->dp_port;
++	notif_data.subif = info->subif;
++
++	DP_LIB_LOCK(&dp_lock);
++	dp_info = get_dp_prop_info(info->inst);
++	port_info = get_dp_port_info(info->inst, info->dp_port);
++	subif = GET_VAP(info->subif, port_info->vap_offset,
++			port_info->vap_mask);
++	sif = get_dp_port_subif(port_info, subif);
++	subifid_fn_t = port_info->cb.get_subifid_fn;
++	old_dev = port_info->dev;
++	old_ctp_dev = sif->ctp_dev;
++	/* update the master device info to subif */
++	if (info->new_dev != old_dev) {
++		/* check if exists in dev_list */
++		idx = dp_dev_hash(info->new_dev, NULL);
++		dp_dev = dp_dev_lookup(&dp_dev_list[idx],
++				       info->new_dev, NULL, 0);
++		if (!dp_dev) {
++			DP_DEBUG(DP_DBG_FLAG_REG,
++				 "new updated dev(%s) not exists\n",
++				 info->new_dev ? info->new_dev->name : "NULL");
++			/* Allocate new bp */
++			if (!dp_info->dp_alloc_bridge_port) {
++				pr_err("dp_alloc_bridge_port not supported\n");
++				return DP_FAILURE;
++			}
++			bp = dp_info->dp_alloc_bridge_port(info->inst,
++							   info->dp_port,
++							   subif, 0, 0);
++			if (bp < 0) {
++				pr_err("Fail to alloc bridge port\n");
++				return DP_FAILURE;
++			}
++			if (info->new_ctp_dev) {
++				/* update bridge port table reference counter */
++				bp_info = get_dp_bp_info(info->inst, bp);
++				bp_info->dev = info->new_dev;
++				bp_info->ref_cnt++;
++				bp_info->flag = 1;
++				sif->ctp_dev = info->new_ctp_dev;
++				if (bp_info->ref_cnt <= 1) {
++					notif_data.dev = info->new_dev;
++					atomic_notifier_call_chain(
++						&dp_evt_notif_list,
++						DP_EVENT_REGISTER_SUBIF,
++						&notif_data);
++				}
++				notif_data.dev = info->new_ctp_dev;
++				atomic_notifier_call_chain(&dp_evt_notif_list,
++							   DP_EVENT_REGISTER_SUBIF,
++							   &notif_data);
++			}
++			dp_inst_add_dev(info->new_dev, NULL, info->inst,
++					info->dp_port, bp, subif, 0);
++		} else {
++			bp = dp_dev->bp;
++			fid = dp_dev->fid;
++			bp_info = get_dp_bp_info(info->inst, bp);
++			if ((bp_info->flag) && (info->new_ctp_dev)) {
++				bp_info->ref_cnt++;
++				notif_data.dev = info->new_ctp_dev;
++				atomic_notifier_call_chain(&dp_evt_notif_list,
++							   DP_EVENT_REGISTER_SUBIF,
++							   &notif_data);
++			}
++		}
++	}
++	/* update GSWIP CtpPortconfig table */
++	if (!dp_info->dp_set_ctp_bp) {
++		pr_err("dp set ctp config not supported\n");
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_FAILURE;
++	}
++	dp_info->dp_set_ctp_bp(info->inst, subif, info->dp_port, bp, NULL);
++	bp_info = get_dp_bp_info(info->inst, sif->bp);
++	if (old_ctp_dev) {
++		bp_info->ref_cnt--;
++		if (!bp_info->ref_cnt) {
++			bp_info->dev = NULL;
++			bp_info->flag = 0;
++		}
++		notif_data.dev = old_ctp_dev;
++		atomic_notifier_call_chain(&dp_evt_notif_list,
++					   DP_EVENT_DE_REGISTER_SUBIF,
++					   &notif_data);
++		old_data.ctp_dev = old_ctp_dev;
++	}
++	/* remove old dev */
++	if (!get_dp_bp_info(info->inst, bp)->dev) {
++		dp_inst_del_dev(old_dev, NULL, info->inst, info->dp_port,
++				subif, 0);
++		notif_data.dev = old_dev;
++		atomic_notifier_call_chain(&dp_evt_notif_list,
++					   DP_EVENT_DE_REGISTER_SUBIF,
++					   &notif_data);
++	}
++	old_subif_id_sync = devm_kzalloc(&g_dp_dev->dev,
++					 sizeof(*old_subif_id_sync) * 2, GFP_ATOMIC);
++	if (!old_subif_id_sync) {
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_FAILURE;
++	}
++	dp_sync_subifid(old_dev, NULL, old_subif_id_sync, &old_data, 0,
++			&f_old_subif);
++	if (!dp_info->dp_deq_update_info) {
++		pr_err("dp_deq_update_info not supported\n");
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_FAILURE;
++	}
++	if (dp_info->dp_deq_update_info(info)) {
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_FAILURE;
++	}
++	/* update new subif info to current subif struct */
++	// port_info dev to update?
++	sif->netif = info->new_dev;
++	sif->bp = bp;
++	sif->fid = fid;
++	if (info->new_ctp_dev) {
++		sif->ctp_dev = info->new_ctp_dev;
++		new_data.ctp_dev = sif->ctp_dev;
++	}
++	new_subif_id_sync = devm_kzalloc(&g_dp_dev->dev,
++					 sizeof(*new_subif_id_sync) * 2, GFP_ATOMIC);
++	if (!new_subif_id_sync) {
++		DP_LIB_UNLOCK(&dp_lock);
++		return DP_FAILURE;
++	}
++	dp_sync_subifid(sif->netif, NULL, new_subif_id_sync, &new_data, 0,
++			&f_new_subif);
++	DP_LIB_UNLOCK(&dp_lock);
++	/* remove old rcu info based on collected subif info */
++	dp_sync_subifid_priv(old_dev, NULL, old_subif_id_sync, &old_data,
++			     0, subifid_fn_t, &f_old_subif);
++	/* update rcu info based on new subif info */
++	dp_sync_subifid_priv(sif->netif, NULL, new_subif_id_sync, &new_data,
++			     0, subifid_fn_t, &f_new_subif);
++	devm_kfree(&g_dp_dev->dev, new_subif_id_sync);
++	devm_kfree(&g_dp_dev->dev, old_subif_id_sync);
++	return DP_SUCCESS;
++}
++EXPORT_SYMBOL(dp_update_subif_info);
++
++
+ /*Note: For same owner, it should be in the same HW instance
+  *          since dp_register_dev/subif no dev_port information at all,
+  *          at the same time, dev is optional and can be NULL
+@@ -1256,8 +1425,11 @@ int32_t dp_register_subif_ext(int inst, struct module *owner,
+ 		DP_LIB_UNLOCK(&dp_lock);
+ 		return DP_FAILURE;
+ 	}
++	/* commented to test */
++#if 0
+ 	memcpy(&subif_id_sync[0], subif_id, sizeof(dp_subif_t));
+ 	memcpy(&subif_id_sync[1], subif_id, sizeof(dp_subif_t));
++#endif
+ 	dp_sync_subifid(dev, subif_name, subif_id_sync, data, flags, &f_subif);
+ 	DP_LIB_UNLOCK(&dp_lock);
+ 	if (!res)
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 4c085f66d3ac..53f33e06284e 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1406,8 +1406,8 @@ static int port_platform_set(int inst, u8 ep, struct dp_port_data *data,
+ 	return 0;
+ }
+ 
+-static int set_ctp_bp(int inst, int ctp, int portid, int bp,
+-		      struct subif_platform_data *data)
++int set_ctp_bp(int inst, int ctp, int portid, int bp,
++	       struct subif_platform_data *data)
+ {
+ 	GSW_CTP_portConfig_t tmp;
+ 	struct core_ops *gsw_handle;
+@@ -1476,6 +1476,170 @@ static int dp_get_subif_share_bp(int inst, int portid)
+ 	return -1;
+ }
+ 
++int deq_update_info(struct dp_subif_upd_info *info)
++{
++	int old_cqm_deq_idx, old_num_cqm_deq, old_def_qid, old_cqm_deq_port;
++	int new_cqm_deq_idx, new_num_cqm_deq, new_def_qid, i;
++	static cbm_queue_map_entry_t lookup = {0};
++	u32 lookup_f;
++	struct cqm_port_info *old_deq_pinfo, *new_deq_pinfo;
++	int inst, subif_ix, f_clear_dq_info = 0;
++	u32 dma_ch_offset, dma_ch_ref;
++	struct dp_node_alloc node;
++	struct ppv4_q_sch_port q_port = {0};
++	struct q_info *q_info;
++	struct cbm_dp_en_data cbm_data = {0};
++	struct dp_subif_info *sif;
++	struct pmac_port_info *port_info;
++
++	port_info = get_dp_port_info(info->inst, info->dp_port);
++	subif_ix = GET_VAP(info->subif, port_info->vap_offset,
++			   port_info->vap_mask);
++	sif = get_dp_port_subif(port_info, subif_ix);
++	old_cqm_deq_idx = sif->cqm_port_idx;
++	old_num_cqm_deq = port_info->deq_port_num; //sif-> num_of qid
++	new_cqm_deq_idx = info->new_cqm_deq_idx;
++	new_num_cqm_deq = info->new_num_cqm_deq;
++	inst = info->inst;
++
++	if ((!info) && (!sif) && (!port_info))
++		return DP_FAILURE;
++	/* no need any queue modification */
++	if (old_cqm_deq_idx == new_cqm_deq_idx)
++		return DP_SUCCESS;
++	/* update new deq info */
++	for (i = 0; i < info->new_num_cqm_deq; i++) {
++		int cqe_deq;
++		lookup_f = CBM_QUEUE_MAP_F_FLOWID_L_DONTCARE |
++			   CBM_QUEUE_MAP_F_FLOWID_H_DONTCARE |
++			   CBM_QUEUE_MAP_F_EN_DONTCARE |
++			   CBM_QUEUE_MAP_F_DE_DONTCARE |
++			   CBM_QUEUE_MAP_F_MPE1_DONTCARE |
++			   CBM_QUEUE_MAP_F_MPE2_DONTCARE |
++			   CBM_QUEUE_MAP_F_TC_DONTCARE;
++		q_port.cqe_deq = port_info->deq_port_base + new_cqm_deq_idx + i;
++		cqe_deq = q_port.cqe_deq;
++
++		new_deq_pinfo = get_dp_deqport_info(inst, cqe_deq);
++		if (new_deq_pinfo->ref_cnt == 0) {
++			q_port.inst = inst;
++			q_port.dp_port = info->dp_port;
++			q_port.ctp = subif_ix;
++			if (alloc_q_to_port(&q_port, 0)) {
++				pr_err("%s fail for dp_port=%d\n",
++				       "alloc_q_to_port", q_port.dp_port);
++				return -1;
++			}
++			q_info = get_dp_q_info(inst, q_port.qid);
++
++			if (q_info->flag) {
++				pr_err("Why dp_q_tbl[%d][%d].flag =%d%s?\n",
++				       inst, q_port.qid,
++				       q_info->flag,
++				       ":expect 0");
++				return -1;
++			}
++			if (q_info->ref_cnt) {
++				pr_err("Why dp_q_tbl[%d][%d].ref_cnt =%d%s?\n",
++				       inst, q_port.qid,
++				       q_info->ref_cnt,
++				       ":expect 0");
++				return -1;
++			}
++			/* update queue table */
++			q_info->flag = 1;
++			q_info->need_free = 1;
++			q_info->ref_cnt = 1;
++			q_info->q_node_id = q_port.q_node;
++			q_info->cqm_dequeue_port = q_port.cqe_deq;
++			new_def_qid = q_port.qid;
++			if (!new_deq_pinfo->f_first_qid) {
++				new_deq_pinfo->first_qid = q_port.qid;
++				new_deq_pinfo->f_first_qid = 1;
++			}
++			/* update port table */
++			new_deq_pinfo->ref_cnt++;
++			f_clear_dq_info = 1;
++		} else {
++			new_def_qid = new_deq_pinfo->first_qid;
++		}
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "%s:%s=%d %s=%d q[%d].cnt=%d cqm_p[%d].cnt=%d\n",
++			 "dp_deq_update_info",
++			 "dp_port", info->dp_port,
++			 "vap", subif_ix,
++			 q_port.qid, get_dp_q_info(inst, q_port.qid)->ref_cnt,
++			 q_port.cqe_deq,
++			 new_deq_pinfo->ref_cnt);
++		/* update subif table with new info*/
++		sif->qid_list[i] = new_def_qid;
++		sif->q_node[i] = q_port.q_node;
++		sif->qos_deq_port[i] = q_port.port_node;
++		sif->cqm_deq_port[i] = q_port.cqe_deq;
++		sif->cqm_port_idx = new_cqm_deq_idx;
++		port_info->subif_info[subif_ix].cqm_port_idx = new_cqm_deq_idx;
++		/* Map this port's lookup to its 1st queue only */
++		lookup.ep = info->dp_port;
++
++		cbm_queue_map_set(dp_port_prop[inst].cbm_inst, q_port.qid,
++				  &lookup, lookup_f);
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "%s %s=%d %s=%d %s=%d %s=%d %s=0x%x %s=0x%x(%d)\n",
++			 "cbm_queue_map_set",
++			 "qid", new_def_qid, "for dp_port", lookup.ep,
++			 "num_subif", port_info->num_subif,
++			 "lu_mode", port_info->cqe_lu_mode, "flag", lookup_f,
++			 "subif", info->subif, subif_ix); //Later check subif,qid print
++	}
++	if (!f_clear_dq_info)
++		return DP_SUCCESS;
++	/* remove old deq port info */
++	for (i = 0; i < old_num_cqm_deq; i++) {
++		old_cqm_deq_port = port_info->deq_port_base + old_cqm_deq_idx + i;
++		old_deq_pinfo = get_dp_deqport_info(inst, old_cqm_deq_port);
++		/* retrieve the qid corresponding to old deq port */
++		old_def_qid = old_deq_pinfo->first_qid;
++		q_info = get_dp_q_info(inst, old_def_qid);
++		q_info->ref_cnt--;
++		old_deq_pinfo->ref_cnt--;
++		if (q_info->flag && !q_info->ref_cnt && q_info->need_free) {
++			DP_DEBUG(DP_DBG_FLAG_QOS, "Free qid %d\n", old_def_qid); //check print
++			node.id.q_id = old_def_qid;
++			/* if no subif using this queue, need to delete it */
++			node.inst = inst;
++			node.dp_port = info->dp_port;
++			node.type = DP_NODE_QUEUE;
++			dp_node_free(&node, 0);
++
++			/* update dp_q_tbl */
++			q_info->flag = 0;
++			q_info->need_free = 0;
++			if (old_deq_pinfo->f_first_qid) {
++				old_deq_pinfo->f_first_qid = 0;
++				old_deq_pinfo->first_qid = 0;
++				DP_DEBUG(DP_DBG_FLAG_QOS, "q_id[%d] is freed\n",
++					 old_def_qid);
++				DP_DEBUG(DP_DBG_FLAG_QOS,
++					 "dp_deq_port_tbl[%d][%d].f_first_qid reset\n",
++					 inst, old_cqm_deq_port);
++			}
++		}
++		dma_ch_offset =	old_deq_pinfo->dma_ch_offset;
++		dma_ch_ref = atomic_read(&(dp_dma_chan_tbl[inst] +
++					   dma_ch_offset)->ref_cnt);
++
++		/* Disable old dq port in CQM */
++		if (!dma_ch_ref)
++			cbm_data.dma_chnl_init = 1;
++		if (cbm_dp_enable(port_info->owner, info->dp_port, &cbm_data,
++				  CBM_PORT_F_DISABLE,
++				  port_info->alloc_flags)) { //Later check owner field
++			return DP_FAILURE;
++		}
++	}
++	return DP_SUCCESS;
++}
++
+ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 			struct subif_platform_data *data, u32 flags)
+ {
+@@ -2156,6 +2320,10 @@ int register_dp_cap_gswip31(int flag)
+ 		dp_net_dev_get_ethtool_stats_31;
+ #endif
+ 
++	cap.info.dp_alloc_bridge_port = alloc_bridge_port;
++	cap.info.dp_free_bridge_port = free_bridge_port;
++	cap.info.dp_deq_update_info = deq_update_info;
++	cap.info.dp_set_ctp_bp = set_ctp_bp;
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP31_MIB)
+ 	cap.info.dp_get_port_vap_mib = dp_get_port_vap_mib_31;
+ 	cap.info.dp_clear_netif_mib = dp_clear_netif_mib_31;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index 8e3e5bd5c91e..fdbf68cf84c5 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -123,6 +123,7 @@ struct datapath_ctrl {
+ 
+ int alloc_bridge_port(int inst, int portid, int subif, int fid, int bp_member);
+ int free_bridge_port(int inst, int bp);
++int deq_update_info(struct dp_subif_upd_info *info);
+ struct gsw_itf *ctp_port_assign(int inst, u8 ep, int bp_default,
+ 				u32 flags, struct dp_dev_data *data);
+ void dp_sys_mib_reset_31(u32 flag);
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index a7fcf63ec93d..72845c7e2eb1 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -1982,6 +1982,19 @@ enum DP_OPS_TYPE {
+ 	DP_OPS_CNT,  /*!< total ops type count */
+ };
+ 
++/*! @brief struct dp_subif_upd_info, which is used for dp_update_subif
++ */
++struct dp_subif_upd_info {
++	int inst;
++	int dp_port;
++	int subif;
++	struct net_device *new_dev;	/*!< master dev */
++	struct net_device *new_ctp_dev;	/*!< slave dev */
++	int new_cqm_deq_idx;
++	int new_num_cqm_deq;	/*!< for GPON, always 1, for EPON, 1-8 */
++};
++int dp_update_subif_info(struct dp_subif_upd_info *info);
++
+ /*!
+  *@brief Datapath Manager ops registration
+  *@param[in] inst: DP instance ID
+diff --git a/include/net/datapath_inst.h b/include/net/datapath_inst.h
+index fcb1cc6bf4a6..af84040ae39b 100644
+--- a/include/net/datapath_inst.h
++++ b/include/net/datapath_inst.h
+@@ -139,7 +139,12 @@ struct inst_info {
+ 	void (*dp_net_dev_get_ethtool_stats)(struct net_device *dev,
+ 					     struct ethtool_stats *stats,
+ 					     u64 *data);
+-
++	int (*dp_alloc_bridge_port)(int inst, int port_id, int subif_ix,
++		      int fid, int bp_member);
++	int (*dp_free_bridge_port)(int inst, int bp);
++	int (*dp_deq_update_info)(struct dp_subif_upd_info *info);
++	int (*dp_set_ctp_bp)(int inst, int ctp, int portid, int bp,
++			     struct subif_platform_data *data);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+ 	int swdev_flag;
+ 	int (*swdev_alloc_bridge_id)(int inst);

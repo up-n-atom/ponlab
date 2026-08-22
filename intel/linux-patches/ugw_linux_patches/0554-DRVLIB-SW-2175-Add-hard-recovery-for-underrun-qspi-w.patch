@@ -1,0 +1,107 @@
+From 4a42210ff189a3935049568310a6515ccce72866 Mon Sep 17 00:00:00 2001
+From: Peter Harliman Liem <peter.harliman.liem@intel.com>
+Date: Thu, 18 Apr 2019 11:42:56 +0800
+Subject: [PATCH] DRVLIB_SW-2175 - Add hard recovery for underrun qspi write
+ issue
+
+QSPI controller hardware does not seem to work well in underrun
+condition (SRAM size is smaller than page size, write transfer
+is always initiated when SRAM is full, before page boundary
+is achieved). This eventually causes issues at high-layer
+e.g. file system corruption, which becomes visible when we use
+a very high SPI frequency or low CPU frequency.
+
+Hard-recovery (re-init) is required to recover from this condition.
+Reset routine is moved to enable the use inside init function.
+---
+ drivers/spi/spi-cadence-qspi-apb.c | 24 +++++++++++++++++++-----
+ drivers/spi/spi-cadence-qspi.c     | 19 +++++++------------
+ 2 files changed, 26 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/spi/spi-cadence-qspi-apb.c b/drivers/spi/spi-cadence-qspi-apb.c
+index 92b56c9bdc29..574f05b8ab6b 100644
+--- a/drivers/spi/spi-cadence-qspi-apb.c
++++ b/drivers/spi/spi-cadence-qspi-apb.c
+@@ -698,19 +698,28 @@ static int cadence_qspi_apb_indirect_write_execute(
+ 		goto failwr;
+ 	}
+ 
+-	/* We observe issues in high frequency in which write transfer fail in
++	/* We observe issues in underrun condition (i.e. in high SPI clock
++	 * or low CPU clock) in which write transfer fail in
+ 	 * between, which eventually causes issues at higher layer (e.g. file
+ 	 * system corruption). To workaround, we check the sram fill level
+-	 * after write. If it is not zero, we assume transfer failure, and
+-	 * return -EAGAIN so that user layer can retry operation in a clean
+-	 * way.
++	 * after write. If it is not zero, we assume transfer failure, do hard
++	 * recovery, and return -EAGAIN so that user layer can retry operation
++	 * in a clean way.
+ 	 */
+ 	fill_level = (((CQSPI_READL(reg_base + CQSPI_REG_SDRAMLEVEL)) >>
+ 		       CQSPI_REG_SDRAMLEVEL_WR_LSB) &
+ 		      CQSPI_REG_SDRAMLEVEL_WR_MASK);
+ 	if (fill_level) {
+ 		pr_debug("%s fill level is %u\n", __func__, fill_level);
+-		ret = -EAGAIN;
++
++		CQSPI_WRITEL(0, reg_base + CQSPI_REG_IRQMASK);
++		CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_DONE_MASK,
++			     reg_base + CQSPI_REG_INDIRECTWR);
++		CQSPI_WRITEL(CQSPI_REG_INDIRECTWR_CANCEL_MASK,
++			     reg_base + CQSPI_REG_INDIRECTWR);
++
++		cadence_qspi_apb_controller_init(cadence_qspi);
++		return -EAGAIN;
+ 	}
+ 
+ failwr:
+@@ -755,6 +764,11 @@ void cadence_qspi_apb_controller_init(struct struct_cqspi *cadence_qspi)
+ 	unsigned int reg;
+ 	int ret;
+ 
++	/* reset */
++	reset_control_assert(cadence_qspi->reset);
++	udelay(1);
++	reset_control_deassert(cadence_qspi->reset);
++
+ 	cadence_qspi_apb_controller_disable(cadence_qspi->iobase);
+ 
+ 	/* phy mode initialization */
+diff --git a/drivers/spi/spi-cadence-qspi.c b/drivers/spi/spi-cadence-qspi.c
+index 14573042638a..5dd60a1c4cf3 100644
+--- a/drivers/spi/spi-cadence-qspi.c
++++ b/drivers/spi/spi-cadence-qspi.c
+@@ -332,17 +332,6 @@ static int cadence_qspi_of_get_pdata(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static void cadence_qspi_rst(struct struct_cqspi *cadence_qspi,
+-	struct platform_device *pdev)
+-{
+-	cadence_qspi->reset = devm_reset_control_get(&pdev->dev, "qspi");
+-	if (IS_ERR(cadence_qspi->reset))
+-		dev_err(&pdev->dev, "qspi get reset fail.\n");
+-
+-	reset_control_assert(cadence_qspi->reset);
+-	reset_control_deassert(cadence_qspi->reset);
+-}
+-
+ static int cadence_qspi_probe(struct platform_device *pdev)
+ {
+ 	struct spi_master *master;
+@@ -424,7 +413,13 @@ static int cadence_qspi_probe(struct platform_device *pdev)
+ 		goto err_ahbremap;
+ 	}
+ 
+-	cadence_qspi_rst(cadence_qspi, pdev);
++	cadence_qspi->reset = devm_reset_control_get(&pdev->dev, "qspi");
++	if (IS_ERR(cadence_qspi->reset)) {
++		dev_err(&pdev->dev, "qspi get reset fail.\n");
++		status = -EINVAL;
++		goto err_ahbremap;
++	}
++
+ 	cadence_qspi->workqueue =
+ 		create_singlethread_workqueue(dev_name(master->dev.parent));
+ 	if (!cadence_qspi->workqueue) {

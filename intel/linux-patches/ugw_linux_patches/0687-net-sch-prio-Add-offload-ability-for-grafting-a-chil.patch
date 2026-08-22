@@ -1,0 +1,104 @@
+From e9f4052122899bee8b7ae485f173ba8c28132884 Mon Sep 17 00:00:00 2001
+From: Nogah Frankel <nogahf@mellanox.com>
+Date: Wed, 28 Feb 2018 10:45:06 +0100
+Subject: [PATCH] net: sch: prio: Add offload ability for grafting a child
+
+Offload sch_prio graft command for capable drivers.
+Warn in case of a failure, unless the graft was done as part of a destroy
+operation (the new qdisc is a noop) or if all the qdiscs (the parent, the
+old child, and the new one) are not offloaded.
+
+Signed-off-by: Nogah Frankel <nogahf@mellanox.com>
+Reviewed-by: Yuval Mintz <yuvalm@mellanox.com>
+Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ include/net/pkt_cls.h |  7 +++++++
+ net/sched/sch_prio.c  | 34 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 41 insertions(+)
+
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index e920848475fe..fce926a1479c 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -560,6 +560,7 @@ enum tc_prio_command {
+ 	TC_PRIO_REPLACE,
+ 	TC_PRIO_DESTROY,
+ 	TC_PRIO_STATS,
++	TC_PRIO_GRAFT,
+ };
+ 
+ struct tc_prio_qopt_offload_params {
+@@ -572,6 +573,11 @@ struct tc_prio_qopt_offload_params {
+ 	struct gnet_stats_queue *qstats;
+ };
+ 
++struct tc_prio_qopt_offload_graft_params {
++	u8 band;
++	u32 child_handle;
++};
++
+ struct tc_prio_qopt_offload {
+ 	enum tc_prio_command command;
+ 	u32 handle;
+@@ -579,6 +585,7 @@ struct tc_prio_qopt_offload {
+ 	union {
+ 		struct tc_prio_qopt_offload_params replace_params;
+ 		struct tc_qopt_offload_stats stats;
++		struct tc_prio_qopt_offload_graft_params graft_params;
+ 	};
+ };
+ 
+diff --git a/net/sched/sch_prio.c b/net/sched/sch_prio.c
+index 0c9a03128346..0460518d64ca 100644
+--- a/net/sched/sch_prio.c
++++ b/net/sched/sch_prio.c
+@@ -297,7 +297,14 @@ static int prio_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
+ 		      struct Qdisc **old)
+ {
+ 	struct prio_sched_data *q = qdisc_priv(sch);
++	struct tc_prio_qopt_offload graft_offload;
++	struct net_device *dev = qdisc_dev(sch);
+ 	unsigned long band = arg - 1;
++	bool any_qdisc_is_offloaded;
++	int err;
++	struct tc_to_netdev tc = {.type = TC_SETUP_QDISC_PRIO,
++				  { .sch_prio = &graft_offload} };
++
+ 
+ 	if (!new) {
+ 		new = qdisc_create_dflt(sch->dev_queue, &pfifo_qdisc_ops,
+@@ -309,6 +316,33 @@ static int prio_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
+ 	}
+ 
+ 	*old = qdisc_replace(sch, new, &q->queues[band]);
++
++	if (!(dev->features & NETIF_F_HW_TC) || !dev->netdev_ops->ndo_setup_tc)
++		return -EOPNOTSUPP;
++
++	graft_offload.handle = sch->handle;
++	graft_offload.parent = sch->parent;
++	graft_offload.graft_params.band = band;
++	graft_offload.graft_params.child_handle = new->handle;
++	graft_offload.command = TC_PRIO_GRAFT;
++
++	err = dev->netdev_ops->ndo_setup_tc(dev, sch->handle, 0, &tc);
++
++	/* Don't report error if the graft is part of destroy operation. */
++	if (err && new != &noop_qdisc) {
++		/* Don't report error if the parent, the old child and the new
++		 * one are not offloaded.
++		 */
++		any_qdisc_is_offloaded = sch->flags & TCQ_F_OFFLOADED;
++		any_qdisc_is_offloaded |= new->flags & TCQ_F_OFFLOADED;
++		if (*old)
++			any_qdisc_is_offloaded |= (*old)->flags &
++						   TCQ_F_OFFLOADED;
++
++		if (any_qdisc_is_offloaded)
++			pr_err("Offloading graft operation failed.");
++	}
++
+ 	return 0;
+ }
+ 

@@ -1,0 +1,1717 @@
+From 4456114ed1420d33504ef2ef43511813baaee7db Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Thu, 1 Aug 2019 09:44:37 +0300
+Subject: [PATCH] PONRTSYS-4829: Unable to move a queue to a port which
+ contains bw limit enabled queues
+
+---
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c  |  83 +++
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c   | 208 +++----
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.h   |   5 +
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c    |  36 ++
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c |  27 +
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h  | 678 ++++++++++++---------
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c    |  36 ++
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h    |  22 +-
+ 8 files changed, 672 insertions(+), 423 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c
+index d9e724f8943e..f34474008501 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_debugfs.c
+@@ -45,6 +45,73 @@ static struct {
+ #define PP_QOS_DEBUGFS_DIR "ppv4_qos"
+ #define PP_QOS_DBG_MAX_BUF	(1024)
+ 
++static ssize_t read_table_entry(struct file *file, const char __user *buf,
++				size_t count, loff_t *pos)
++{
++	char *lbuf;
++	struct pp_qos_dev *qdev;
++	u32 physical_id;
++	u32 table_id;
++	struct platform_device *pdev;
++	struct pp_qos_drv_data *pdata;
++	u32 id = 0;
++	s32 ret;
++
++	pdev = (struct platform_device *)(file->private_data);
++	pdata = platform_get_drvdata(pdev);
++	qdev = pdata->qdev;
++
++	if (count >= PP_QOS_DBG_MAX_INPUT)
++		return count;
++
++	lbuf = kzalloc(count, GFP_KERNEL);
++	if (!lbuf)
++		return -ENOMEM;
++
++	if (copy_from_user(lbuf, buf, count))
++		goto read_table_entry_done;
++
++	lbuf[count - 1] = '\0';
++
++	if (sscanf(lbuf, "%u %u", &physical_id, &table_id) != 2) {
++		QOS_LOG_ERR("sscanf err\n");
++		goto read_table_entry_done;
++	}
++
++	QOS_LOG_INFO("Sending read table entry (%u) from phy (%u)\n",
++		     table_id, physical_id);
++	create_get_table_entry_cmd(qdev, physical_id,
++				   qdev->hwconf.qm_ddr_start,
++				   table_id);
++	update_cmd_id(&qdev->drvcmds);
++	transmit_cmds(qdev);
++
++read_table_entry_done:
++	kfree(lbuf);
++	return count;
++}
++
++static ssize_t read_table_entry_help(struct file *file,
++				     char __user *user_buf,
++				     size_t count,
++				     loff_t *ppos)
++{
++	char *buff;
++	u32  len = 0;
++	ssize_t ret = 0;
++
++	buff = kmalloc(PP_QOS_DBG_MAX_BUF, GFP_KERNEL);
++	if (!buff)
++		return -ENOMEM;
++
++	len = scnprintf(buff, PP_QOS_DBG_MAX_BUF,
++			"<physical node/rlm> <table id>\n");
++	ret = simple_read_from_buffer(user_buf, count, ppos, buff, len);
++	kfree(buff);
++
++	return ret;
++}
++
+ static ssize_t add_shared_bwl_group(struct file *file, const char __user *buf,
+ 				    size_t count, loff_t *pos)
+ {
+@@ -63,6 +130,8 @@ static ssize_t add_shared_bwl_group(struct file *file, const char __user *buf,
+ 		return count;
+ 
+ 	lbuf = kzalloc(count, GFP_KERNEL);
++	if (!lbuf)
++		return -ENOMEM;
+ 
+ 	if (copy_from_user(lbuf, buf, count))
+ 		goto add_shared_bwl_group_done;
+@@ -120,6 +189,8 @@ static ssize_t remove_shared_bwl_group(struct file *file,
+ 		return count;
+ 
+ 	lbuf = kzalloc(count, GFP_KERNEL);
++	if (!lbuf)
++		return -ENOMEM;
+ 
+ 	if (copy_from_user(lbuf, buf, count))
+ 		goto remove_shared_bwl_group_done;
+@@ -176,6 +247,8 @@ static ssize_t remove_node(struct file *file,
+ 		return count;
+ 
+ 	lbuf = kzalloc(count, GFP_KERNEL);
++	if (!lbuf)
++		return -ENOMEM;
+ 
+ 	if (copy_from_user(lbuf, buf, count))
+ 		goto remove_node_done;
+@@ -239,6 +312,8 @@ static ssize_t allocate_node(struct file *file,
+ 		return count;
+ 
+ 	lbuf = kzalloc(count, GFP_KERNEL);
++	if (!lbuf)
++		return -ENOMEM;
+ 
+ 	if (copy_from_user(lbuf, buf, count))
+ 		goto allocate_node_done;
+@@ -917,6 +992,13 @@ static ssize_t resume_run_dbg(struct file *file, char __user *user_buf,
+ 	return 0;
+ }
+ 
++static const struct file_operations debug_read_table_entry_fops = {
++	.open    = simple_open,
++	.read    = read_table_entry_help,
++	.write   = read_table_entry,
++	.llseek  = default_llseek,
++};
++
+ static const struct file_operations debug_add_shared_bwl_group_fops = {
+ 	.open    = simple_open,
+ 	.read    = add_shared_bwl_group_help,
+@@ -1686,6 +1768,7 @@ static struct debugfs_file qos_debugfs_files[] = {
+ 	{"tree", &debug_tree_fops, 0400},
+ 	{"destroy_tree", &debug_tree_remove_fops, 0400},
+ 	{"add_shared_bwl_group", &debug_add_shared_bwl_group_fops, 0400},
++	{"read_table_entry", &debug_read_table_entry_fops, 0400},
+ 	{"remove_shared_bwl_group", &debug_remove_shared_bwl_group_fops, 0400},
+ 	{"allocate", &debug_allocate_node_fops, 0400},
+ 	{"remove", &debug_remove_node_fops, 0400},
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+index d025d543dad4..20b1c3ce1dc1 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+@@ -69,6 +69,7 @@
+ 	OP(CMD_TYPE_ADD_SHARED_GROUP)		\
+ 	OP(CMD_TYPE_PUSH_DESC)			\
+ 	OP(CMD_TYPE_GET_NODE_INFO)		\
++	OP(CMD_TYPE_READ_TABLE_ENTRY)		\
+ 	OP(CMD_TYPE_REMOVE_SHARED_GROUP)	\
+ 	OP(CMD_TYPE_SET_SHARED_GROUP)		\
+ 	OP(CMD_TYPE_FLUSH_QUEUE)		\
+@@ -83,11 +84,6 @@ static const char *const cmd_str[] = {
+ 	FW_CMDS(GEN_STR)
+ };
+ 
+-static void update_moved_nodes(
+-		struct pp_qos_dev *qdev,
+-		unsigned int src,
+-		unsigned int dst);
+-
+ struct ppv4_qos_fw_hdr {
+ 	uint32_t major;
+ 	uint32_t minor;
+@@ -387,6 +383,8 @@ struct cmd_init_qos {
+ 	unsigned int wred_max_q_size;
+ 	unsigned int num_of_ports;
+ 	unsigned int qos_clock;
++	unsigned int bwl_temp_buff;
++	unsigned int sbwl_temp_buff;
+ };
+ 
+ struct cmd_move {
+@@ -546,6 +544,13 @@ struct cmd_get_node_info {
+ 	struct pp_qos_node_info *info;
+ };
+ 
++struct cmd_read_table_entry {
++	struct cmd base;
++	u32    phy;
++	u32    table_type;
++	u32    addr;
++};
++
+ struct stub_cmd {
+ 	struct cmd cmd;
+ 	uint8_t data;
+@@ -592,6 +597,7 @@ union driver_cmd {
+ 	struct cmd_remove_shared_group remove_shared_group;
+ 	struct cmd_push_desc	pushd;
+ 	struct cmd_get_node_info node_info;
++	struct cmd_read_table_entry    read_table_entry;
+ 	struct cmd_flush_queue flush_queue;
+ 	struct cmd_get_system_info sys_info;
+ 	struct cmd_internal	internal;
+@@ -677,6 +683,8 @@ void create_init_qos_cmd(struct pp_qos_dev *qdev)
+ 	cmd.wred_max_q_size = qdev->hwconf.wred_max_q_size;
+ 	cmd.num_of_ports = qdev->max_port + 1;
+ 	cmd.qos_clock = qdev->hwconf.qos_clock;
++	cmd.bwl_temp_buff = qdev->hwconf.bwl_ddr_phys;
++	cmd.sbwl_temp_buff = qdev->hwconf.sbwl_ddr_phys;
+ 	QOS_LOG_DEBUG("cmd %u:%u CMD_TYPE_INIT_QOS\n",
+ 			qdev->drvcmds.cmd_id,
+ 			qdev->drvcmds.cmd_fw_id);
+@@ -696,7 +704,11 @@ void create_move_cmd(
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	node = get_const_node_from_phy(qdev->nodes, dst);
++	/* If moving from tmp node, use the stored information */
++	if (src == PP_QOS_TMP_NODE)
++		node = get_const_node_from_phy(qdev->nodes, src);
++	else
++		node = get_const_node_from_phy(qdev->nodes, dst);
+ 
+ 	cmd_init(qdev, &(cmd.base), CMD_TYPE_MOVE, sizeof(cmd), 0);
+ 	cmd.src = src;
+@@ -718,7 +730,6 @@ void create_move_cmd(
+ 			cmd.rlm,
+ 			dst_port);
+ 
+-	update_moved_nodes(qdev, src, dst);
+ 	cmd_queue_put(qdev->drvcmds.cmdq, (uint8_t *)&cmd, sizeof(cmd));
+ 	add_suspend_port(qdev, dst_port);
+ 	qdev->drvcmds.cmd_fw_id++;
+@@ -1234,6 +1245,30 @@ void create_get_node_info_cmd(
+ 	qdev->drvcmds.cmd_fw_id++;
+ }
+ 
++void create_get_table_entry_cmd(struct pp_qos_dev *qdev, u32 phy,
++				u32 addr, u32 table_type)
++{
++	struct cmd_read_table_entry cmd;
++
++	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
++		return;
++
++	memset(&cmd, 0, sizeof(cmd));
++	cmd_init(qdev, &cmd.base, CMD_TYPE_READ_TABLE_ENTRY, sizeof(cmd), 0);
++
++	cmd.phy = phy;
++	cmd.table_type = table_type;
++	cmd.addr =  addr;
++
++	QOS_LOG_DEBUG("cmd %u:%u CMD_TYPE_READ_TABLE_ENTRY %u from phy %u\n",
++		      qdev->drvcmds.cmd_id,
++		      qdev->drvcmds.cmd_fw_id,
++		      table_type, phy);
++
++	cmd_queue_put(qdev->drvcmds.cmdq, &cmd, sizeof(cmd));
++	qdev->drvcmds.cmd_fw_id++;
++}
++
+ void create_get_sys_info_cmd(struct pp_qos_dev *qdev,
+ 			     unsigned int addr,
+ 			     struct qos_hw_info *info)
+@@ -1409,11 +1444,6 @@ struct fw_internal {
+ 	unsigned int suspend_ports_index;
+ 	unsigned int num_suspend_ports;
+ 	unsigned int suspend_ports[QOS_MAX_PORTS];
+-	unsigned int moved_nodes_index;
+-	unsigned int num_moved_nodes;
+-	struct move_info {
+-		unsigned int phy;
+-	} moved_nodes[16 * MAX_MOVING_NODES];
+ 	unsigned int	pushed;
+ 	int		ongoing;	/* Suspend ports indication */
+ };
+@@ -1446,50 +1476,6 @@ void add_suspend_port(struct pp_qos_dev *qdev, unsigned int port)
+ 	++(internals->num_suspend_ports);
+ }
+ 
+-/*
+- * Maintains a list of destinations for nodes that were moved.
+- * This list is used to instruct firmware to resume suspend this nodes,
+- * to workaround HW inability to maintain the work available signal when node
+- * are moved.
+- * The logic is as follow:
+- * If the src of the new moved node is in that list - node is removed from list
+- * If dst of new moved node is not in that list - node is added to the list
+- */
+-static void update_moved_nodes(
+-		struct pp_qos_dev *qdev,
+-		unsigned int src,
+-		unsigned int dst)
+-{
+-	unsigned int i;
+-	unsigned int j;
+-	struct fw_internal *internals;
+-	struct move_info *info;
+-	int found;
+-
+-	internals = qdev->fwbuf;
+-	j = internals->num_moved_nodes;
+-	found = 0;
+-
+-	for (i = 0; i < j; ++i) {
+-		info = internals->moved_nodes + i;
+-		if (src == info->phy) {
+-			info->phy = internals->moved_nodes[j - 1].phy;
+-			--j;
+-		}
+-		if (dst == info->phy)
+-			found = 1;
+-	}
+-
+-	internals->num_moved_nodes = j;
+-	QOS_ASSERT(internals->num_moved_nodes < 16 * MAX_MOVING_NODES,
+-			"Moved ports buffer is full\n");
+-	if (!found) {
+-		internals->moved_nodes[j].phy = dst;
+-		++(internals->num_moved_nodes);
+-	}
+-}
+-
+-
+ int init_fwdata_internals(struct pp_qos_dev *qdev)
+ {
+ 	qdev->fwbuf = QOS_MALLOC(sizeof(struct fw_internal));
+@@ -1532,7 +1518,7 @@ static uint32_t *fw_write_init_qos_cmd(
+ {
+ 	*buf++ = qos_u32_to_uc(UC_QOS_CMD_INIT_QOS);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(10);
++	*buf++ = qos_u32_to_uc(12);
+ 	*buf++ = qos_u32_to_uc(cmd->qm_ddr_start & 0xFFFFFFFF);
+ 	*buf++ = qos_u32_to_uc(cmd->qm_num_pages);
+ 	*buf++ = qos_u32_to_uc(cmd->wred_total_avail_resources);
+@@ -1543,6 +1529,8 @@ static uint32_t *fw_write_init_qos_cmd(
+ 	*buf++ = qos_u32_to_uc(cmd->qos_clock);
+ 	*buf++ = qos_u32_to_uc(0); /* BM push address for CoDel. LGM ONLY */
+ 	*buf++ = qos_u32_to_uc(ltq_get_soc_rev());
++	*buf++ = qos_u32_to_uc(cmd->bwl_temp_buff);
++	*buf++ = qos_u32_to_uc(cmd->sbwl_temp_buff);
+ 	return buf;
+ }
+ 
+@@ -1967,6 +1955,20 @@ static uint32_t *fw_write_get_node_info(
+ 	return buf;
+ }
+ 
++static uint32_t *fw_read_table_entry(u32 *buf,
++				     const struct cmd_read_table_entry *cmd,
++				     u32 flags)
++{
++	*buf++ = qos_u32_to_uc(UC_QOS_CMD_DEBUG_READ_NODE);
++	*buf++ = qos_u32_to_uc(flags);
++	*buf++ = qos_u32_to_uc(3);
++	*buf++ = qos_u32_to_uc(cmd->phy);
++	*buf++ = qos_u32_to_uc(cmd->table_type);
++	*buf++ = qos_u32_to_uc(cmd->addr);
++
++	return buf;
++}
++
+ static uint32_t *fw_update_tree_cmd(uint32_t* buf, u32 phy, u32 flags,
+ 				    const struct fw_set_common *common,
+ 				    struct fw_set_parent *parent,
+@@ -2010,6 +2012,16 @@ static uint32_t *fw_update_tree_cmd(uint32_t* buf, u32 phy, u32 flags,
+ 	return buf;
+ }
+ 
++static uint32_t *fw_suspend_tree_cmd(u32 *buf, u32 phy, u32 flags)
++{
++	*buf++ = qos_u32_to_uc(UC_QOS_CMD_SUSPEND_PORT_TREE);
++	*buf++ = qos_u32_to_uc(flags);
++	*buf++ = qos_u32_to_uc(1);
++	*buf++ = qos_u32_to_uc(phy);
++
++	return buf;
++}
++
+ /******************************************************************************/
+ /*                                FW wrappers                                 */
+ /******************************************************************************/
+@@ -2863,47 +2875,14 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 	port.valid = 0;
+ 
+ 	if (!internals->ongoing) {
+-		common.suspend = 1;
+-		for (i = internals->moved_nodes_index;
+-		     i < internals->num_moved_nodes; ++i) {
+-			// Verify space for a command (suspend)
+-			if (remain < MAX_FW_CMD_SIZE) {
+-				internals->moved_nodes_index = i;
+-				QOS_LOG_DEBUG("reentry required: remain %d, move ind %u, num moved %u\n",
+-					      remain,
+-					      internals->moved_nodes_index,
+-					      internals->num_moved_nodes);
+-				goto signal_uc;
+-			}
+-
+-			prev = cur;
+-			cur = suspend_node(qdev,
+-					internals->moved_nodes[i].phy,
+-					common.suspend,
+-					cur,
+-					&prev,
+-					&cmd_internal);
+-			if (cur != prev) {
+-				pushed += 1;
+-				remain = cmdbuf_sz - ((uintptr_t)cur - (uintptr_t)start);
+-			}
+-		}
+-
+-		internals->moved_nodes_index = i;
+-
+ 		for (i = 0; i < internals->num_suspend_ports; ++i) {
+ 			prev = cur;
+-			QOS_LOG_DEBUG("CMD_INTERNAL_SUSPEND_PORT port: %u\n",
+-					internals->suspend_ports[i]);
+-
+-			cur = fw_write_set_port_cmd(
+-					prev,
+-					internals->suspend_ports[i],
+-					flags,
+-					&common,
+-					&parent,
+-					&port);
++			QOS_LOG_DEBUG("CMD_INTERNAL_SUSPEND_TREE port: %u\n",
++				      internals->suspend_ports[i]);
+ 
++			cur = fw_suspend_tree_cmd(prev,
++						  internals->suspend_ports[i],
++						  flags);
+ 			if (cur != prev) {
+ 				cmd_internal.base.pos = prev;
+ 				cmd_queue_put(
+@@ -2916,8 +2895,6 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 		}
+ 		if (pushed)
+ 			internals->ongoing = 1;
+-
+-		internals->moved_nodes_index = 0;
+ 	}
+ 
+ 	while ((remain >= MAX_FW_CMD_SIZE) &&
+@@ -3090,6 +3067,11 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 					flags);
+ 			break;
+ 
++		case CMD_TYPE_READ_TABLE_ENTRY:
++			cur = fw_read_table_entry(prev, &dcmd.read_table_entry,
++						  flags);
++			break;
++
+ 		case CMD_TYPE_FLUSH_QUEUE:
+ 			cur = fw_write_flush_queue_cmd(
+ 					prev,
+@@ -3114,33 +3096,6 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 
+ 	if (cmd_queue_is_empty(qdev->drvcmds.cmdq)) {
+ 		common.suspend = 0;
+-		for (i = internals->moved_nodes_index;
+-		     i < internals->num_moved_nodes; ++i) {
+-			// Verify space for a command (resume)
+-			if (remain < MAX_FW_CMD_SIZE) {
+-				internals->moved_nodes_index = i;
+-				QOS_LOG_DEBUG("reentry required: remain %d, move ind %u, num moved %u\n",
+-					      remain,
+-					      internals->moved_nodes_index,
+-					      internals->num_moved_nodes);
+-				goto signal_uc;
+-			}
+-
+-			prev = cur;
+-			cur = suspend_node(qdev,
+-					internals->moved_nodes[i].phy,
+-					common.suspend,
+-					cur,
+-					&prev,
+-					&cmd_internal);
+-			if (cur != prev) {
+-				pushed += 1;
+-				remain = cmdbuf_sz - ((uintptr_t)cur - (uintptr_t)start);
+-			}
+-		}
+-
+-		internals->moved_nodes_index = i;
+-
+ 		for (i = internals->suspend_ports_index;
+ 		     i < internals->num_suspend_ports; ++i) {
+ 			/* In case port was suspended, and it was removed,
+@@ -3161,6 +3116,9 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 				goto signal_uc;
+ 			}
+ 
++			/* Update BWL buffer before tree update */
++			update_bwl_buffer(qdev, internals->suspend_ports[i]);
++
+ 			prev = cur;
+ 			QOS_LOG_DEBUG("CMD_INTERNAL_UPDATE_PORT_TREE port:%u\n",
+ 					internals->suspend_ports[i]);
+@@ -3225,8 +3183,6 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 		/* No pending suspended ports/moving nodes - Reset counters */
+ 		internals->suspend_ports_index = 0;
+ 		internals->num_suspend_ports = 0;
+-		internals->moved_nodes_index = 0;
+-		internals->num_moved_nodes = 0;
+ 		internals->ongoing = 0;
+ 	}
+ 
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.h
+index 0339d34b0a5c..6ba613a6ad94 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.h
+@@ -96,6 +96,9 @@ void create_get_node_info_cmd(
+ 		unsigned int addr,
+ 		struct pp_qos_node_info *info);
+ 
++void create_get_table_entry_cmd(struct pp_qos_dev *qdev, u32 phy,
++				u32 addr, u32 table_type);
++
+ void create_flush_queue_cmd(struct pp_qos_dev *qdev, unsigned int rlm);
+ int do_load_firmware(
+ 		struct pp_qos_dev *qdev,
+@@ -135,6 +138,7 @@ void create_get_sys_info_cmd(struct pp_qos_dev *qdev,
+ #define create_get_queue_stats_cmd(qdev, phy, rlm, addr, qstat)
+ #define create_get_port_stats_cmd(qdev, phy, addr, pstat)
+ #define create_get_node_info_cmd(qdev, phy, addr, info)
++#define create_get_table_entry_cmd(qdev, phy, addr, table_type)
+ #define create_push_desc_cmd(qdev, queue, size, color, addr)
+ #define create_get_sys_info_cmd(qdev, addr, sys_info)
+ #define add_suspend_port(qdev, port)
+@@ -160,6 +164,7 @@ void create_get_sys_info_cmd(struct pp_qos_dev *qdev,
+ #define create_get_queue_stats_cmd(qdev, phy, rlm, addr, qstat)
+ #define create_get_port_stats_cmd(qdev, phy, addr, pstat)
+ #define create_get_node_info_cmd(qdev, phy, addr, info)
++#define create_get_table_entry_cmd(qdev, phy, addr, table_type)
+ #define create_push_desc_cmd(qdev, queue, size, color, addr)
+ #define create_flush_queue_cmd(qdev, rlm)
+ #define create_get_sys_info_cmd(qdev, addr, sys_info)
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
+index b2aa6e7d5fd2..c0f469827402 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
+@@ -400,6 +400,42 @@ static int pp_qos_config_from_of_node(
+ 		 pdata->max_allowed_ddr_phys,
+ 		 pdata->max_allowed_ddr_virt);
+ 
++	pdata->bwl_sz = PAGE_ALIGN(NUM_OF_NODES * sizeof(u32));
++	pdata->bwl_ddr_virt = dmam_alloc_coherent(
++			dev,
++			pdata->bwl_sz,
++			&pdata->bwl_ddr_phys,
++			GFP_KERNEL | __GFP_ZERO);
++
++	if (pdata->bwl_ddr_virt == NULL) {
++		dev_err(dev, "Couldn't alloc %u bytes for bwl buffer\n",
++			pdata->bwl_sz);
++		return -ENOMEM;
++	}
++
++	dev_dbg(dev, "Dma allocated %u bytes for bwl buffer, bus address is 0x%08X, virtual addr is %p\n",
++		pdata->bwl_sz,
++		pdata->bwl_ddr_phys,
++		pdata->bwl_ddr_virt);
++
++	pdata->sbwl_sz = PAGE_ALIGN(NUM_OF_NODES * sizeof(u8));
++	pdata->sbwl_ddr_virt = dmam_alloc_coherent(
++			dev,
++			pdata->sbwl_sz,
++			&pdata->sbwl_ddr_phys,
++			GFP_KERNEL | __GFP_ZERO);
++
++	if (pdata->sbwl_ddr_virt == NULL) {
++		dev_err(dev, "Couldn't alloc %u bytes for sbwl buffer\n",
++			pdata->sbwl_sz);
++		return -ENOMEM;
++	}
++
++	dev_dbg(dev, "Dma allocated %u bytes for sbwl buffer, bus address is 0x%08X, virtual addr is %p\n",
++		pdata->sbwl_sz,
++		pdata->sbwl_ddr_phys,
++		pdata->sbwl_ddr_virt);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+index dc94e3018717..f28cbca38f9a 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+@@ -664,6 +664,7 @@ static int _pp_qos_port_set(
+ 	struct qos_node node;
+ 	struct qos_node *nodep;
+ 	uint16_t phy;
++	bool new_port = false;
+ 
+ 	modified = 0;
+ 
+@@ -686,6 +687,7 @@ static int _pp_qos_port_set(
+ 	if (node.type != TYPE_PORT) {
+ 		node.type = TYPE_PORT;
+ 		QOS_BITS_SET(modified, QOS_MODIFIED_NODE_TYPE);
++		new_port = true;
+ 	}
+ 
+ 	rc = set_node_prop(
+@@ -712,6 +714,11 @@ static int _pp_qos_port_set(
+ 		create_set_port_cmd(qdev, conf, phy, modified);
+ 	}
+ 
++	if (!new_port &&
++	    (modified & (QOS_MODIFIED_BANDWIDTH_LIMIT |
++			 QOS_MODIFIED_SHARED_GROUP_ID)))
++		add_suspend_port(qdev, get_port(qdev->nodes, phy));
++
+ 	return 0;
+ }
+ 
+@@ -1334,6 +1341,10 @@ static int _pp_qos_queue_set(
+ 		}
+ 	}
+ 
++	if (modified & (QOS_MODIFIED_BANDWIDTH_LIMIT |
++			QOS_MODIFIED_SHARED_GROUP_ID))
++		add_suspend_port(qdev, get_port(qdev->nodes, phy));
++
+ 	if (modified != QOS_MODIFIED_PARENT)
+ 		create_set_queue_cmd(
+ 				qdev,
+@@ -1911,6 +1922,10 @@ static int _pp_qos_sched_set(
+ 		}
+ 	}
+ 
++	if (modified & (QOS_MODIFIED_BANDWIDTH_LIMIT |
++			QOS_MODIFIED_SHARED_GROUP_ID))
++		add_suspend_port(qdev, get_port(qdev->nodes, phy));
++
+ 	if (modified != QOS_MODIFIED_PARENT)
+ 		create_set_sched_cmd(
+ 				qdev,
+@@ -2454,10 +2469,22 @@ struct pp_qos_dev *create_qos_dev_desc(struct qos_dev_init_info *initinfo)
+ 			initinfo->pl_data.fw_logger_start;
+ 		qdev->hwconf.fw_stat = initinfo->pl_data.fw_stat;
+ 		qdev->hwconf.qos_clock = initinfo->pl_data.qos_clock;
++
+ 		qdev->hwconf.max_allowed_ddr_virt =
+ 			initinfo->pl_data.max_allowed_ddr_virt;
+ 		qdev->hwconf.max_allowed_ddr_phys =
+ 			initinfo->pl_data.max_allowed_ddr_phys;
++
++		qdev->hwconf.bwl_ddr_virt =
++			(unsigned int *)initinfo->pl_data.bwl_ddr_virt;
++		qdev->hwconf.bwl_ddr_phys =
++			initinfo->pl_data.bwl_ddr_phys;
++
++		qdev->hwconf.sbwl_ddr_virt =
++			(unsigned char *)initinfo->pl_data.sbwl_ddr_virt;
++		qdev->hwconf.sbwl_ddr_phys =
++			initinfo->pl_data.sbwl_ddr_phys;
++
+ 		memcpy(&qdev->fwcom, &initinfo->fwcom, sizeof(struct fw_com));
+ 		rc = init_fwdata_internals(qdev);
+ 		if (rc)
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+index 4161ca839b0b..56c2e095bc20 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+@@ -1,64 +1,39 @@
+ /*
+- * GPL LICENSE SUMMARY
++ * pp_qos_uc_defs.h
++ * Description: Packet Processor QoS Driver
+  *
+- *  Copyright(c) 2017-2019 Intel Corporation.
+- *
+- *  This program is free software; you can redistribute it and/or modify
+- *  it under the terms of version 2 of the GNU General Public License as
+- *  published by the Free Software Foundation.
+- *
+- *  This program is distributed in the hope that it will be useful, but
+- *  WITHOUT ANY WARRANTY; without even the implied warranty of
+- *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+- *  General Public License for more details.
+- *
+- *
+- *  You should have received a copy of the GNU General Public License
+- *  along with this program; if not, write to the Free Software
+- *  Foundation, Inc., 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+- *  The full GNU General Public License is included in this distribution
+- *  in the file called LICENSE.GPL.
+- *
+- *  Contact Information:
+- *  Intel Corporation
+- *  2200 Mission College Blvd.
+- *  Santa Clara, CA  97052
+- */
+-/*
+- * uc_host_defs.h
+- *
+- *  Created on: Dec 17, 2017
+- *      Author: obakshe
++ * SPDX-License-Identifier: GPL-2.0-only
++ * Copyright (C) 2017-2019 Intel Corporation
+  */
+ 
+ #ifndef SRC_UC_HOST_DEFS_H_
+ #define SRC_UC_HOST_DEFS_H_
+ 
+-/* UC version */
+-#define UC_VERSION_MAJOR	(1)
+-#define UC_VERSION_MINOR	(4)
+-#define UC_VERSION_BUILD	(22)
++// UC version
++#define UC_VERSION_MAJOR (1)
++#define UC_VERSION_MINOR (6)
++#define UC_VERSION_BUILD (0)
+ 
+ /**************************************************************************
+- *! @enum	UC_STATUS
++ *! @enum UC_STATUS
+  **************************************************************************
+  *
+  * @brief UC general status enum
+  *
+  **************************************************************************/
+ enum uc_status {
+-	/*!< Status OK */
++	//!< Status OK
+ 	UC_STATUS_OK,
+ 
+-	/*!< General failure */
++	//!< General failure
+ 	UC_STATUS_GENERAL_FAILURE,
+ 
+-	/*!< Invalid user input */
++	//!< Invalid user input
+ 	UC_STATUS_INVALID_INPUT,
+ };
+ 
+ /**************************************************************************
+- *! @enum	UC_LOGGER_LEVEL
++ *! @enum UC_LOGGER_LEVEL
+  **************************************************************************
+  *
+  * @brief UC Logger level enum. It is recommended to use the defines below
+@@ -66,438 +41,494 @@ enum uc_status {
+  *
+  **************************************************************************/
+ enum uc_logger_level {
++	//!< No log level
++	UC_LOGGER_LEVEL_NONE          = 0,
++
+ 	//!< FATAL error occurred. SW will probably fail to proceed
+-	UC_LOGGER_LEVEL_FATAL_ONLY		=	0x01,
++	UC_LOGGER_LEVEL_FATAL_ONLY    = BIT(0),
+ 
+ 	//!< General ERROR occurred.
+-	UC_LOGGER_LEVEL_ERROR_ONLY		=	0x02,
++	UC_LOGGER_LEVEL_ERROR_ONLY    = BIT(1),
+ 
+ 	//!< WARNING
+-	UC_LOGGER_LEVEL_WARNING_ONLY		=	0x04,
++	UC_LOGGER_LEVEL_WARNING_ONLY  = BIT(2),
+ 
+ 	//!< Information print to the user
+-	UC_LOGGER_LEVEL_INFO_ONLY		=	0x08,
++	UC_LOGGER_LEVEL_INFO_ONLY     = BIT(3),
+ 
+ 	//!< Debug purposes level
+-	UC_LOGGER_LEVEL_DEBUG_ONLY		=	0x10,
++	UC_LOGGER_LEVEL_DEBUG_ONLY    = BIT(4),
+ 
+ 	//!< Dump all writings to registers
+-	UC_LOGGER_LEVEL_DUMP_REG_ONLY		=	0x20,
++	UC_LOGGER_LEVEL_DUMP_REG_ONLY = BIT(5),
+ 
+ 	//!< Dump all commands
+-	UC_LOGGER_LEVEL_COMMANDS_ONLY		=	0x40,
++	UC_LOGGER_LEVEL_COMMANDS_ONLY = BIT(6),
+ };
+ 
+ /* Below levels will be normally used from host. */
+ /* Each level includes all higher priorities levels messages */
+ 
+ //!< FATAL level messages
+-#define UC_LOGGER_LEVEL_FATAL	(UC_LOGGER_LEVEL_FATAL_ONLY	|	\
+-				UC_LOGGER_LEVEL_COMMANDS_ONLY)
++#define UC_LOGGER_LEVEL_FATAL           \
++	(UC_LOGGER_LEVEL_FATAL_ONLY |   \
++	 UC_LOGGER_LEVEL_COMMANDS_ONLY)
+ 
+ //!< ERRORS level messages
+-#define UC_LOGGER_LEVEL_ERROR	(UC_LOGGER_LEVEL_FATAL_ONLY	|	\
+-				UC_LOGGER_LEVEL_ERROR_ONLY	|	\
+-				UC_LOGGER_LEVEL_COMMANDS_ONLY)
++#define UC_LOGGER_LEVEL_ERROR           \
++	(UC_LOGGER_LEVEL_FATAL_ONLY |   \
++	 UC_LOGGER_LEVEL_ERROR_ONLY |   \
++	 UC_LOGGER_LEVEL_COMMANDS_ONLY)
+ 
+ //!< WARNING level messages
+-#define UC_LOGGER_LEVEL_WARNING	(UC_LOGGER_LEVEL_FATAL_ONLY	|	\
+-				UC_LOGGER_LEVEL_ERROR_ONLY	|	\
+-				UC_LOGGER_LEVEL_WARNING_ONLY	|	\
+-				UC_LOGGER_LEVEL_COMMANDS_ONLY)
++#define UC_LOGGER_LEVEL_WARNING         \
++	(UC_LOGGER_LEVEL_FATAL_ONLY   | \
++	 UC_LOGGER_LEVEL_ERROR_ONLY   | \
++	 UC_LOGGER_LEVEL_WARNING_ONLY | \
++	 UC_LOGGER_LEVEL_COMMANDS_ONLY)
+ 
+ //!< INFO level messages
+-#define UC_LOGGER_LEVEL_INFO	(UC_LOGGER_LEVEL_FATAL_ONLY	|	\
+-				UC_LOGGER_LEVEL_ERROR_ONLY	|	\
+-				UC_LOGGER_LEVEL_WARNING_ONLY	|	\
+-				UC_LOGGER_LEVEL_INFO_ONLY	|	\
+-				UC_LOGGER_LEVEL_COMMANDS_ONLY)
++#define UC_LOGGER_LEVEL_INFO            \
++	(UC_LOGGER_LEVEL_FATAL_ONLY   | \
++	 UC_LOGGER_LEVEL_ERROR_ONLY   | \
++	 UC_LOGGER_LEVEL_WARNING_ONLY | \
++	 UC_LOGGER_LEVEL_INFO_ONLY    | \
++	 UC_LOGGER_LEVEL_COMMANDS_ONLY)
+ 
+ //!< DEBUG level messages
+-#define UC_LOGGER_LEVEL_DEBUG	(UC_LOGGER_LEVEL_FATAL_ONLY	|	\
+-				UC_LOGGER_LEVEL_ERROR_ONLY	|	\
+-				UC_LOGGER_LEVEL_WARNING_ONLY	|	\
+-				UC_LOGGER_LEVEL_INFO_ONLY	|	\
+-				UC_LOGGER_LEVEL_DEBUG_ONLY	|	\
+-				UC_LOGGER_LEVEL_COMMANDS_ONLY)
++#define UC_LOGGER_LEVEL_DEBUG           \
++	(UC_LOGGER_LEVEL_FATAL_ONLY   | \
++	 UC_LOGGER_LEVEL_ERROR_ONLY   | \
++	 UC_LOGGER_LEVEL_WARNING_ONLY | \
++	 UC_LOGGER_LEVEL_INFO_ONLY    | \
++	 UC_LOGGER_LEVEL_DEBUG_ONLY   | \
++	 UC_LOGGER_LEVEL_COMMANDS_ONLY)
+ 
+ //!< DUMP to registers level messages
+-#define UC_LOGGER_LEVEL_DUMP_REGS	(UC_LOGGER_LEVEL_FATAL_ONLY	| \
+-					UC_LOGGER_LEVEL_ERROR_ONLY	| \
+-					UC_LOGGER_LEVEL_WARNING_ONLY	| \
+-					UC_LOGGER_LEVEL_DUMP_REG_ONLY	| \
+-					UC_LOGGER_LEVEL_COMMANDS_ONLY)
++#define UC_LOGGER_LEVEL_DUMP_REGS        \
++	(UC_LOGGER_LEVEL_FATAL_ONLY    | \
++	 UC_LOGGER_LEVEL_ERROR_ONLY    | \
++	 UC_LOGGER_LEVEL_WARNING_ONLY  | \
++	 UC_LOGGER_LEVEL_DUMP_REG_ONLY | \
++	 UC_LOGGER_LEVEL_COMMANDS_ONLY)
+ 
+ /**************************************************************************
+- *! @enum	UC_LOGGER_MODE
++ *! @enum UC_LOGGER_MODE
+  **************************************************************************
+  *
+  * @brief UC Logger operation mode
+  *
+  **************************************************************************/
+ enum uc_logger_mode {
+-	/*!< Logger is disabled */
++	//!< Logger is disabled
+ 	UC_LOGGER_MODE_NONE,
+ 
+-	/*!< Messages are written to the standard output */
++	//!< Messages are written to the standard output
+ 	UC_LOGGER_MODE_STDOUT,
+ 
+-	/*!< Local file. N/A */
++	//!< Local file. N/A
+ //	UC_LOGGER_MODE_LOCAL_FILE,
+ 
+-	/*!< Messages are written to the host allocated memory */
++	//!< Messages are written to the host allocated memory
+ 	UC_LOGGER_MODE_WRITE_HOST_MEM,
+ };
+ 
+ /**************************************************************************
+- *! \enum	TSCD_NODE_CONF
++ *! \enum TSCD_NODE_CONF
+  **************************************************************************
+  *
+  * \brief TSCD node configuration valid bits. Used in modify existing node
+  *
+  **************************************************************************/
+ enum tscd_node_conf {
+-	/*!< None */
+-	TSCD_NODE_CONF_NONE					=	0x0000,
++	//!< None
++	TSCD_NODE_CONF_NONE               = 0,
+ 
+-	/*!< Suspend/Resume node */
+-	TSCD_NODE_CONF_SUSPEND_RESUME		=	0x0001,
++	//!< Suspend/Resume node
++	TSCD_NODE_CONF_SUSPEND_RESUME     = BIT(0),
+ 
+-	/*!< first child (Not relevant for queue) */
+-	TSCD_NODE_CONF_FIRST_CHILD			=	0x0002,
++	//!< first child (Not relevant for queue)
++	TSCD_NODE_CONF_FIRST_CHILD        = BIT(1),
+ 
+-	/*!< last child (Not relevant for queue) */
+-	TSCD_NODE_CONF_LAST_CHILD			=	0x0004,
++	//!< last child (Not relevant for queue)
++	TSCD_NODE_CONF_LAST_CHILD         = BIT(2),
+ 
+-	/*!< 0 - BW Limit disabled >0 - define BW */
+-	TSCD_NODE_CONF_BW_LIMIT				=	0x0008,
++	//!< 0 - BW Limit disabled >0 - define BW
++	TSCD_NODE_CONF_BW_LIMIT           = BIT(3),
+ 
+-	/*!< Best Effort enable */
+-	TSCD_NODE_CONF_BEST_EFFORT_ENABLE	=	0x0010,
++	//!< Best Effort enable
++	TSCD_NODE_CONF_BEST_EFFORT_ENABLE = BIT(4),
+ 
+-	/*!< First Weighted-Round-Robin node (Not relevant for queue) */
+-	TSCD_NODE_CONF_FIRST_WRR_NODE		=	0x0020,
++	//!< First Weighted-Round-Robin node (Not relevant for queue)
++	TSCD_NODE_CONF_FIRST_WRR_NODE     = BIT(5),
+ 
+-	/*!< Node Weight (Not relevant for ports) */
+-	TSCD_NODE_CONF_NODE_WEIGHT			=	0x0040,
++	//!< Node Weight (Not relevant for ports)
++	TSCD_NODE_CONF_NODE_WEIGHT        = BIT(6),
+ 
+-	/*!< Update predecessor 0 (Not relevant for port) */
+-	TSCD_NODE_CONF_PREDECESSOR_0		=	0x0080,
++	//!< Update predecessor 0 (Not relevant for port)
++	TSCD_NODE_CONF_PREDECESSOR_0      = BIT(7),
+ 
+-	/*!< Update predecessor 1 (Not relevant for port) */
+-	TSCD_NODE_CONF_PREDECESSOR_1		=	0x0100,
++	//!< Update predecessor 1 (Not relevant for port)
++	TSCD_NODE_CONF_PREDECESSOR_1      = BIT(8),
+ 
+-	/*!< Update predecessor 2 (Not relevant for port) */
+-	TSCD_NODE_CONF_PREDECESSOR_2		=	0x0200,
++	//!< Update predecessor 2 (Not relevant for port)
++	TSCD_NODE_CONF_PREDECESSOR_2      = BIT(9),
+ 
+-	/*!< Update predecessor 3 (Not relevant for port) */
+-	TSCD_NODE_CONF_PREDECESSOR_3		=	0x0400,
++	//!< Update predecessor 3 (Not relevant for port)
++	TSCD_NODE_CONF_PREDECESSOR_3      = BIT(10),
+ 
+-	/*!< Update predecessor 4 (Not relevant for port) */
+-	TSCD_NODE_CONF_PREDECESSOR_4		=	0x0800,
++	//!< Update predecessor 4 (Not relevant for port)
++	TSCD_NODE_CONF_PREDECESSOR_4      = BIT(11),
+ 
+-	/*!< Update predecessor 5 (Not relevant for port) */
+-	TSCD_NODE_CONF_PREDECESSOR_5		=	0x1000,
++	//!< Update predecessor 5 (Not relevant for port)
++	TSCD_NODE_CONF_PREDECESSOR_5      = BIT(12),
+ 
+-	/*!< Shared BW limit group (0: no shared BW limit, 1-511: group ID) */
+-	TSCD_NODE_CONF_SHARED_BWL_GROUP		=	0x2000,
++	//!< Shared BW limit group (0: no shared BW limit, 1-511: group ID)
++	TSCD_NODE_CONF_SHARED_BWL_GROUP   = BIT(13),
+ 
+ 	//!< Set if Queue's port was changed (Relevant only for queue)
+-	TSCD_NODE_CONF_SET_PORT_TO_QUEUE	=	0x4000,
++	TSCD_NODE_CONF_SET_PORT_TO_QUEUE  = BIT(14),
+ 
+-	/*!< All flags are set */
+-	TSCD_NODE_CONF_ALL					=	0xFFFF
++	//!< All flags are set
++	TSCD_NODE_CONF_ALL                = 0xFFFF
+ };
+ 
+ /**************************************************************************
+- *! \enum	WRED_QUEUE_CONF
++ *! \enum QUEUE_CONF
+  **************************************************************************
+  *
+- * \brief WRED queue configuration valid bits. Used in modify existing queue
++ * \brief queue configuration valid bits. Used in modify existing queue
+  *
+  **************************************************************************/
+-enum wred_queue_conf {
+-	/*!< None */
+-	WRED_QUEUE_CONF_NONE				=	0x0000,
++enum queue_conf {
++	//!< None
++	QUEUE_CONF_NONE                     = 0,
+ 
+-	/*!< Q is active */
+-	WRED_QUEUE_CONF_ACTIVE_Q			=	0x0001,
++	//!< Q is active
++	WRED_QUEUE_CONF_ACTIVE_Q            = BIT(0),
+ 
+-	/*!< Disable flags valid */
+-	WRED_QUEUE_CONF_DISABLE				=	0x0002,
++	//!< Disable flags valid
++	WRED_QUEUE_CONF_DISABLE             = BIT(1),
+ 
+-	/*!< Use fixed green drop probability */
+-	WRED_QUEUE_CONF_FIXED_GREEN_DROP_P	=	0x0004,
++	//!< Use fixed green drop probability
++	WRED_QUEUE_CONF_FIXED_GREEN_DROP_P  = BIT(2),
+ 
+-	/*!< Use fixed yellow drop probability */
+-	WRED_QUEUE_CONF_FIXED_YELLOW_DROP_P	=	0x0008,
++	//!< Use fixed yellow drop probability
++	WRED_QUEUE_CONF_FIXED_YELLOW_DROP_P = BIT(3),
+ 
+-	/*!< Min average yellow */
+-	WRED_QUEUE_CONF_MIN_AVG_YELLOW		=	0x0010,
++	//!< Min average yellow
++	WRED_QUEUE_CONF_MIN_AVG_YELLOW      = BIT(4),
+ 
+-	/*!< Max average yellow */
+-	WRED_QUEUE_CONF_MAX_AVG_YELLOW		=	0x0020,
++	//!< Max average yellow
++	WRED_QUEUE_CONF_MAX_AVG_YELLOW      = BIT(5),
+ 
+-	/*!< Slope yellow */
+-	WRED_QUEUE_CONF_SLOPE_YELLOW		=	0x0040,
++	//!< Slope yellow
++	WRED_QUEUE_CONF_SLOPE_YELLOW        = BIT(6),
+ 
+-	/*!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST */
+-	WRED_QUEUE_CONF_SHIFT_AVG_YELLOW	=	0x0080,
++	//!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST
++	WRED_QUEUE_CONF_SHIFT_AVG_YELLOW    = BIT(7),
+ 
+-	/*!< Min average green */
+-	WRED_QUEUE_CONF_MIN_AVG_GREEN		=	0x0100,
++	//!< Min average green
++	WRED_QUEUE_CONF_MIN_AVG_GREEN       = BIT(8),
+ 
+-	/*!< Max average green */
+-	WRED_QUEUE_CONF_MAX_AVG_GREEN		=	0x0200,
++	//!< Max average green
++	WRED_QUEUE_CONF_MAX_AVG_GREEN       = BIT(9),
+ 
+-	/*!< Slope green */
+-	WRED_QUEUE_CONF_SLOPE_GREEN			=	0x0400,
++	//!< Slope green
++	WRED_QUEUE_CONF_SLOPE_GREEN         = BIT(10),
+ 
+-	/*!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST */
+-	WRED_QUEUE_CONF_SHIFT_AVG_GREEN		=	0x0800,
++	//!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST
++	WRED_QUEUE_CONF_SHIFT_AVG_GREEN     = BIT(11),
+ 
+-	/*!< Min guaranteed */
+-	WRED_QUEUE_CONF_MIN_GUARANTEED		=	0x1000,
++	//!< Min guaranteed
++	WRED_QUEUE_CONF_MIN_GUARANTEED      = BIT(12),
+ 
+-	/*!< max allowed */
+-	WRED_QUEUE_CONF_MAX_ALLOWED			=	0x2000,
++	//!< max allowed
++	WRED_QUEUE_CONF_MAX_ALLOWED         = BIT(13),
+ 
+-	/*!< All flags are set */
+-	WRED_QUEUE_CONF_ALL					=	0xFFFF
++	//!< CoDel enable
++	TXMGR_QUEUE_CODEL_EN                = BIT(14),
++
++	//!< All flags are set
++	QUEUE_CONF_ALL                      = 0xFFFF
+ };
+ 
+ /**************************************************************************
+- *! \enum	PORT_CONF
++ *! \enum PORT_CONF
+  **************************************************************************
+  *
+  * \brief Port configuration valid bits. Used in modify existing port
+  *
+  **************************************************************************/
+ enum port_conf {
+-	/*!< None */
++	//!< None
+ 	PORT_CONF_NONE              = 0,
+ 
+-	/*!< Ring Size */
++	//!< Ring Size
+ 	PORT_CONF_RING_SIZE         = BIT(0),
+ 
+-	/*!< Ring address high */
++	//!< Ring address high
+ 	PORT_CONF_RING_ADDRESS_HIGH = BIT(1),
+ 
+-	/*!< Ring address low */
++	//!< Ring address low
+ 	PORT_CONF_RING_ADDRESS_LOW  = BIT(2),
+ 
+-	/*!< Enable port */
++	//!< Enable port
+ 	PORT_CONF_ACTIVE            = BIT(3),
+ 
+-	/*!< Green bytes threshold */
++	//!< Green bytes threshold
+ 	PORT_CONF_GREEN_THRESHOLD   = BIT(4),
+ 
+-	/*!< Yellow bytes threshold */
++	//!< Yellow bytes threshold
+ 	PORT_CONF_YELLOW_THRESHOLD  = BIT(5),
+ 
+-	/*!< All flags are set */
++	//!< All flags are set
+ 	PORT_CONF_ALL               = 0xFFFF
+ };
+ 
+ /**************************************************************************
+- *! \struct	port_stats_s
++ *! \struct port_stats_s
+  **************************************************************************
+  *
+  * \brief Port stats
+  *
+  **************************************************************************/
+ struct port_stats_s {
+-	u32	total_green_bytes;
+-	u32	total_yellow_bytes;
++	u32 total_green_bytes;
++	u32 total_yellow_bytes;
+ 
+-	/* Following stats can not be reset */
+-	u32	debug_back_pressure_status;
+-	u32	debug_actual_packet_credit;
+-	u32	debug_actual_byte_credit;
++	// Following stats can not be reset
++	u32 debug_back_pressure_status;
++	u32 debug_actual_packet_credit;
++	u32 debug_actual_byte_credit;
+ };
+ 
+ /**************************************************************************
+- *! \struct	hw_node_info_s
++ *! \struct codel_qstats_s
++ **************************************************************************
++ *
++ * \brief Codel queue stats
++ *
++ **************************************************************************/
++struct codel_qstats_s {
++	u32 drop_pkts;
++	u32 drop_bytes;
++	u32 min_packet_sojourn_time;
++	u32 max_packet_sojourn_time;
++	u32 total_sojourn_time;
++	u32 max_pkt_sz;
++	u32 num_pkts;
++};
++
++/**************************************************************************
++ *! \struct codel_qstate_s
++ **************************************************************************
++ *
++ * \brief Codel queue state
++ *
++ **************************************************************************/
++struct codel_qstate_s {
++	u32 count;
++	u32 last_count;
++	u32 first_above_time;
++	u32 drop_next;
++	u32 drop_rec_inv_sqrt;
++};
++
++/**************************************************************************
++ *! \struct hw_node_info_s
+  **************************************************************************
+  *
+  * \brief HW node info
+  *
+  **************************************************************************/
+ struct hw_node_info_s {
+-	u32	first_child;
+-	u32	last_child;
+-	u32	is_suspended;
+-	u32	bw_limit;
+-	u32	predecessor0;
+-	u32	predecessor1;
+-	u32	predecessor2;
+-	u32	predecessor3;
+-	u32	predecessor4;
+-	u32	predecessor5;
+-	u32	queue_physical_id;
+-	u32	queue_port;
++	u32 first_child;
++	u32 last_child;
++	u32 is_suspended;
++	u32 bw_limit;
++	u32 predecessor0;
++	u32 predecessor1;
++	u32 predecessor2;
++	u32 predecessor3;
++	u32 predecessor4;
++	u32 predecessor5;
++	u32 queue_physical_id;
++	u32 queue_port;
+ };
+ 
+ /**************************************************************************
+- *! \enum	PORT_STATS_CLEAR_FLAGS
++ *! \enum PORT_STATS_CLEAR_FLAGS
+  **************************************************************************
+  *
+- * \brief	port stats clear flags.
+- *			Used in get port stats command to set which stats
+- *			will be reset after read
++ * \brief port stats clear flags.
++ *        Used in get port stats command to set which stats
++ *        will be reset after read
+  *
+  **************************************************************************/
+ enum port_stats_clear_flags {
+-	/*!< None */
+-	PORT_STATS_CLEAR_NONE					=	0x0000,
++	//!< None
++	PORT_STATS_CLEAR_NONE               = 0,
+ 
+-	/*!< Clear port total green bytes stats */
+-	PORT_STATS_CLEAR_TOTAL_GREEN_BYTES		=	0x0001,
++	//!< Clear port total green bytes stats
++	PORT_STATS_CLEAR_TOTAL_GREEN_BYTES  = BIT(0),
+ 
+-	/*!< Clear port total yellow bytes stats */
+-	PORT_STATS_CLEAR_TOTAL_YELLOW_BYTES		=	0x0002,
++	//!< Clear port total yellow bytes stats
++	PORT_STATS_CLEAR_TOTAL_YELLOW_BYTES = BIT(1),
+ 
+-	/*!< All above stats will be cleared */
+-	PORT_STATS_CLEAR_ALL					=	0xFFFF,
++	//!< All above stats will be cleared
++	PORT_STATS_CLEAR_ALL                = 0xFFFF,
+ };
+ 
+ /**************************************************************************
+- *! \struct	queue_stats_s
++ *! \struct queue_stats_s
+  **************************************************************************
+  *
+  * \brief Queue stats
+  *
+  **************************************************************************/
+ struct queue_stats_s {
+-	u32	queue_size_bytes;
+-	u32	queue_average_size_bytes;
+-	u32	queue_size_entries;
+-	u32	drop_p_yellow;
+-	u32	drop_p_green;
+-	u32	total_bytes_added_low;
+-	u32	total_bytes_added_high;
+-	u32	total_accepts;
+-	u32	total_drops;
+-	u32	total_dropped_bytes_low;
+-	u32	total_dropped_bytes_high;
+-	u32	total_red_dropped;
++	/* WRED counters */
++	u32 queue_size_bytes;
++	u32 queue_average_size_bytes;
++	u32 queue_size_entries;
++	u32 drop_p_yellow;
++	u32 drop_p_green;
++	u32 total_bytes_added_low;
++	u32 total_bytes_added_high;
++	u32 total_accepts;
++	u32 total_drops;
++	u32 total_dropped_bytes_low;
++	u32 total_dropped_bytes_high;
++	u32 total_red_dropped;
+ 
+ 	/* Following stats can not be reset */
+-	u32	qmgr_num_queue_entries;
++	u32 qmgr_num_queue_entries;
+ };
+ 
+ /**************************************************************************
+- *! \enum	QUEUE_STATS_CLEAR_FLAGS
++ *! \enum QUEUE_STATS_CLEAR_FLAGS
+  **************************************************************************
+  *
+- * \brief	queue stats clear flags.
+- *			Used in get queue stats command to set which stats
+- *			will be reset after read
++ * \brief queue stats clear flags.
++ *        Used in get queue stats command to set which stats
++ *        will be reset after read
+  *
+  **************************************************************************/
+ enum queue_stats_clear_flags {
+-	/*!< None */
+-	QUEUE_STATS_CLEAR_NONE					=	0x0000,
++	//!< None
++	QUEUE_STATS_CLEAR_NONE                = 0,
+ 
+-	/*!< Clear queue size bytes stats */
+-	QUEUE_STATS_CLEAR_Q_SIZE_BYTES			=	0x0001,
++	//!< Clear queue size bytes stats
++	QUEUE_STATS_CLEAR_Q_SIZE_BYTES        = BIT(0),
+ 
+-	/*!< Clear queue average size bytes stats */
+-	QUEUE_STATS_CLEAR_Q_AVG_SIZE_BYTES		=	0x0002,
++	//!< Clear queue average size bytes stats
++	QUEUE_STATS_CLEAR_Q_AVG_SIZE_BYTES    = BIT(1),
+ 
+-	/*!< Clear queue size entries stats */
+-	QUEUE_STATS_CLEAR_Q_SIZE_ENTRIES		=	0x0004,
++	//!< Clear queue size entries stats
++	QUEUE_STATS_CLEAR_Q_SIZE_ENTRIES      = BIT(2),
+ 
+-	/*!< Clear drop probability yellow stats */
+-	QUEUE_STATS_CLEAR_DROP_P_YELLOW			=	0x0008,
++	//!< Clear drop probability yellow stats
++	QUEUE_STATS_CLEAR_DROP_P_YELLOW       = BIT(3),
+ 
+-	/*!< Clear drop probability green stats */
+-	QUEUE_STATS_CLEAR_DROP_P_GREEN			=	0x0010,
++	//!< Clear drop probability green stats
++	QUEUE_STATS_CLEAR_DROP_P_GREEN        = BIT(4),
+ 
+-	/*!< Clear total bytes added stats */
+-	QUEUE_STATS_CLEAR_TOTAL_BYTES_ADDED		=	0x0020,
++	//!< Clear total bytes added stats
++	QUEUE_STATS_CLEAR_TOTAL_BYTES_ADDED   = BIT(5),
+ 
+-	/*!< Clear total accepts stats */
+-	QUEUE_STATS_CLEAR_TOTAL_ACCEPTS			=	0x0040,
++	//!< Clear total accepts stats
++	QUEUE_STATS_CLEAR_TOTAL_ACCEPTS       = BIT(6),
+ 
+-	/*!< Clear total drops stats */
+-	QUEUE_STATS_CLEAR_TOTAL_DROPS			=	0x0080,
++	//!< Clear total drops stats
++	QUEUE_STATS_CLEAR_TOTAL_DROPS         = BIT(7),
+ 
+-	/*!< Clear total dropped bytes stats */
+-	QUEUE_STATS_CLEAR_TOTAL_DROPPED_BYTES	=	0x0100,
++	//!< Clear total dropped bytes stats
++	QUEUE_STATS_CLEAR_TOTAL_DROPPED_BYTES = BIT(8),
+ 
+-	/*!< Clear total RED drops stats */
+-	QUEUE_STATS_CLEAR_TOTAL_RED_DROPS		=	0x0200,
++	//!< Clear total RED drops stats
++	QUEUE_STATS_CLEAR_TOTAL_RED_DROPS     = BIT(9),
+ 
+-	/*!< All above stats will be cleared */
+-	QUEUE_STATS_CLEAR_ALL					=	0xFFFF,
++	//!< All above stats will be cleared
++	QUEUE_STATS_CLEAR_ALL                 = 0xFFFF,
+ };
+ 
+ /**************************************************************************
+- *! \struct	system_stats_s
++ *! \struct system_stats_s
+  **************************************************************************
+  *
+  * \brief system stats
+  *
+  **************************************************************************/
+ struct system_stats_s {
+-	u32	qmgr_cache_free_pages_counter;
+-	u32	qmgr_sm_current_state;
+-	u32	qmgr_cmd_machine_busy;
+-	u32	qmgr_cmd_machine_pop_busy;
+-	u32	qmgr_null_pop_counter;
+-	u32	qmgr_empty_pop_counter;
+-	u32	qmgr_null_push_counter;
+-	u32	qmgr_ddr_stop_push_low_threshold;
+-	u32	qmgr_fifo_error_register;
+-	u32	qmgr_ocp_error_register;
+-	u32	qmgr_cmd_machine_sm_current_state_0;
+-	u32	qmgr_cmd_machine_sm_current_state_1;
+-	u32	qmgr_cmd_machine_sm_current_state_2;
+-	u32	qmgr_cmd_machine_sm_current_state_3;
+-	u32	qmgr_cmd_machine_sm_current_state_4;
+-	u32	qmgr_cmd_machine_sm_current_state_5;
+-	u32	qmgr_cmd_machine_sm_current_state_6;
+-	u32	qmgr_cmd_machine_sm_current_state_7;
+-	u32	qmgr_cmd_machine_sm_current_state_8;
+-	u32	qmgr_cmd_machine_sm_current_state_9;
+-	u32	qmgr_cmd_machine_sm_current_state_10;
+-	u32	qmgr_cmd_machine_sm_current_state_11;
+-	u32	qmgr_cmd_machine_sm_current_state_12;
+-	u32	qmgr_cmd_machine_sm_current_state_13;
+-	u32	qmgr_cmd_machine_sm_current_state_14;
+-	u32	qmgr_cmd_machine_sm_current_state_15;
+-	u32	qmgr_cmd_machine_queue_0;
+-	u32	qmgr_cmd_machine_queue_1;
+-	u32	qmgr_cmd_machine_queue_2;
+-	u32	qmgr_cmd_machine_queue_3;
+-	u32	qmgr_cmd_machine_queue_4;
+-	u32	qmgr_cmd_machine_queue_5;
+-	u32	qmgr_cmd_machine_queue_6;
+-	u32	qmgr_cmd_machine_queue_7;
+-	u32	qmgr_cmd_machine_queue_8;
+-	u32	qmgr_cmd_machine_queue_9;
+-	u32	qmgr_cmd_machine_queue_10;
+-	u32	qmgr_cmd_machine_queue_11;
+-	u32	qmgr_cmd_machine_queue_12;
+-	u32	qmgr_cmd_machine_queue_13;
+-	u32	qmgr_cmd_machine_queue_14;
+-	u32	qmgr_cmd_machine_queue_15;
+-
+-	u32	tscd_num_of_used_nodes;
++	u32 qmgr_cache_free_pages_counter;
++	u32 qmgr_sm_current_state;
++	u32 qmgr_cmd_machine_busy;
++	u32 qmgr_cmd_machine_pop_busy;
++	u32 qmgr_null_pop_counter;
++	u32 qmgr_empty_pop_counter;
++	u32 qmgr_null_push_counter;
++	u32 qmgr_ddr_stop_push_low_threshold;
++	u32 qmgr_fifo_error_register;
++	u32 qmgr_ocp_error_register;
++	u32 qmgr_cmd_machine_sm_current_state_0;
++	u32 qmgr_cmd_machine_sm_current_state_1;
++	u32 qmgr_cmd_machine_sm_current_state_2;
++	u32 qmgr_cmd_machine_sm_current_state_3;
++	u32 qmgr_cmd_machine_sm_current_state_4;
++	u32 qmgr_cmd_machine_sm_current_state_5;
++	u32 qmgr_cmd_machine_sm_current_state_6;
++	u32 qmgr_cmd_machine_sm_current_state_7;
++	u32 qmgr_cmd_machine_sm_current_state_8;
++	u32 qmgr_cmd_machine_sm_current_state_9;
++	u32 qmgr_cmd_machine_sm_current_state_10;
++	u32 qmgr_cmd_machine_sm_current_state_11;
++	u32 qmgr_cmd_machine_sm_current_state_12;
++	u32 qmgr_cmd_machine_sm_current_state_13;
++	u32 qmgr_cmd_machine_sm_current_state_14;
++	u32 qmgr_cmd_machine_sm_current_state_15;
++	u32 qmgr_cmd_machine_queue_0;
++	u32 qmgr_cmd_machine_queue_1;
++	u32 qmgr_cmd_machine_queue_2;
++	u32 qmgr_cmd_machine_queue_3;
++	u32 qmgr_cmd_machine_queue_4;
++	u32 qmgr_cmd_machine_queue_5;
++	u32 qmgr_cmd_machine_queue_6;
++	u32 qmgr_cmd_machine_queue_7;
++	u32 qmgr_cmd_machine_queue_8;
++	u32 qmgr_cmd_machine_queue_9;
++	u32 qmgr_cmd_machine_queue_10;
++	u32 qmgr_cmd_machine_queue_11;
++	u32 qmgr_cmd_machine_queue_12;
++	u32 qmgr_cmd_machine_queue_13;
++	u32 qmgr_cmd_machine_queue_14;
++	u32 qmgr_cmd_machine_queue_15;
++	u32 tscd_num_of_used_nodes;
+ 
+ 	/* Error in Scheduler tree configuration */
+-	u32	tscd_infinite_loop_error_occurred;
++	u32 tscd_infinite_loop_error_occurred;
+ 
+ 	/* HW failed to complete the bwl credits updates */
+-	u32	tscd_bwl_update_error_occurred;
++	u32 tscd_bwl_update_error_occurred;
+ 
+ 	/* Quanta size in KB */
+-	u32	tscd_quanta;
++	u32 tscd_quanta;
++};
++
++/**************************************************************************
++ *! \struct system_stats_s
++ **************************************************************************
++ *
++ * \brief system stats
++ *
++ **************************************************************************/
++struct used_nodes_s {
++	u32 tscd_num_of_used_nodes;
++	u32 nodes_bmap[64];
+ };
+ 
+ /**************************************************************************
+- *! @enum	UC_QOS_CMD
++ *! @enum UC_QOS_CMD
+  **************************************************************************
+  *
+  * @brief UC QOS command enum. Must be synced with the Host definition
+@@ -536,35 +567,92 @@ enum uc_qos_command {
+ 	UC_QOS_CMD_SET_AQM_SF,
+ 	UC_QOS_CMD_SET_CODEL_CFG,
+ 	UC_QOS_CMD_GET_CODEL_QUEUE_STATS,
++	UC_QOS_CMD_CLK_UPDATE,
++	UC_QOS_CMD_NODES_REFRESH,
++	UC_QOS_CMD_GET_USED_NODES,
++	UC_QOS_CMD_SUSPEND_PORT_TREE,
+ };
+ 
+-#define UC_MAX_PARAMS	(30)
+ /**************************************************************************
+- *! @struct	uc_qos_cmd_s
++ *! @struct uc_qos_cmd_s
+  **************************************************************************
+  *
+  * @brief UC commands.
+  * This structure defines the Host <-->UC interface
+  *
+  **************************************************************************/
++struct uc_qos_cmd_base {
++	//!< Type of command (UC_QOS_CMD)
++	u32 type;
++
++	//!< Commands flags
++	u32 flags;
++
++	//!< Number of 32bit parameters available for this command.
++	// must be synced between the host and uc!
++	u32 num_params;
++};
++
+ struct uc_qos_cmd_s {
+-	/*!< Type of command (UC_QOS_COMMAND) */
+-	u32			type;
+-
+-	/*!< Commands flags */
+-	u32			flags;
+-#define	UC_CMD_FLAG_IMMEDIATE				BIT(0)
+-#define	UC_CMD_FLAG_BATCH_FIRST				BIT(1)
+-#define	UC_CMD_FLAG_BATCH_LAST				BIT(2)
+-#define	UC_CMD_FLAG_MULTIPLE_COMMAND_LAST	BIT(3)
+-#define	UC_CMD_FLAG_UC_DONE					BIT(4)
+-#define	UC_CMD_FLAG_UC_ERROR				BIT(5)
+-
+-	/*!< Number of 32bit parameters available for this command. */
+-	/* must be synced between the host and uc! */
+-	u32			num_params;
+-
+-	u32			param[UC_MAX_PARAMS];
++	//!< Type of command (UC_QOS_CMD)
++	u32 type;
++
++	//!< Commands flags
++	u32 flags;
++#define UC_CMD_FLAG_IMMEDIATE             BIT(0)
++#define UC_CMD_FLAG_BATCH_FIRST           BIT(1)
++#define UC_CMD_FLAG_BATCH_LAST            BIT(2)
++#define UC_CMD_FLAG_MULTIPLE_COMMAND_LAST BIT(3)
++#define UC_CMD_FLAG_UC_DONE               BIT(4)
++#define UC_CMD_FLAG_UC_ERROR              BIT(5)
++
++	//!< Number of 32bit parameters available for this command.
++	// must be synced between the host and uc!
++	u32 num_params;
++
++	u32 param0;
++	u32 param1;
++	u32 param2;
++	u32 param3;
++	u32 param4;
++	u32 param5;
++	u32 param6;
++	u32 param7;
++	u32 param8;
++	u32 param9;
++	u32 param10;
++	u32 param11;
++	u32 param12;
++	u32 param13;
++	u32 param14;
++	u32 param15;
++	u32 param16;
++	u32 param17;
++	u32 param18;
++	u32 param19;
++	u32 param20;
++	u32 param21;
++	u32 param22;
++	u32 param23;
++	u32 param24;
++	u32 param25;
++	u32 param26;
++	u32 param27;
++	u32 param28;
++	u32 param29;
++};
++
++struct fw_cmd_clk_update {
++	struct uc_qos_cmd_base base;
++	u32 clk_MHz;     /*! new clock frequency */
++};
++
++struct fw_cmd_refresh_nodes {
++	struct uc_qos_cmd_base base;
++	u32 base_phy_id;   /*! base physical id */
++	u32 nodes_bmap[4]; /*! bitmap specifying which nodes to update,
++			    *  bit n represent node (base_phy_id +n)
++			    */
+ };
+ 
+ #endif /* SRC_UC_HOST_DEFS_H_ */
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
+index 9cf21447de83..1a09bf4f0de2 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.c
+@@ -1706,6 +1706,18 @@ static int update_ids_container(struct pp_qos_dev *qdev,
+ 	return 1;
+ }
+ 
++static int update_bwl_buffer_node(struct pp_qos_dev *qdev,
++				  struct qos_node *node, void *data)
++{
++	unsigned int phy;
++
++	phy = get_phy_from_node(qdev->nodes, node);
++	qdev->hwconf.bwl_ddr_virt[phy] = node->bandwidth_limit;
++	qdev->hwconf.sbwl_ddr_virt[phy] = node->shared_bandwidth_group;
++
++	return 1;
++}
++
+ struct rlm_container_metadata {
+ 	u32 next;
+ 	u16 *rlm;
+@@ -1755,6 +1767,20 @@ void get_node_queues(struct pp_qos_dev *qdev,
+ 			update_ids_container, &data);
+ }
+ 
++static int node_bw_limited_wrapper(const struct pp_qos_dev *qdev,
++				   const struct qos_node *node, void *data)
++{
++	return node_used(node) &&
++		(node->bandwidth_limit || node->shared_bandwidth_group);
++}
++
++void update_bwl_buffer(struct pp_qos_dev *qdev, unsigned int phy)
++{
++	post_order_travers_tree(qdev, phy,
++				node_bw_limited_wrapper, NULL,
++				update_bwl_buffer_node, NULL);
++}
++
+ void get_active_node_queues(struct pp_qos_dev *qdev,
+ 			    unsigned int phy, uint16_t *queue_ids,
+ 			    unsigned int size, unsigned int *queues_num)
+@@ -2938,6 +2964,12 @@ void update_children_position(
+ 	cnt = parent->parent_prop.num_of_children;
+ 	dst_port = get_port(qdev->nodes, old_phy);
+ 	nodes_modify_used_status(qdev, old_phy, 1, 0);
++
++	/* Store old node info in tmp node */
++	memcpy(get_node_from_phy(qdev->nodes, PP_QOS_TMP_NODE),
++	       get_node_from_phy(qdev->nodes, old_phy),
++	       sizeof(struct qos_node));
++
+ 	create_move_cmd(qdev, PP_QOS_TMP_NODE, old_phy, dst_port);
+ 
+ 	id = get_id_from_phy(qdev->mapping, old_phy);
+@@ -2948,6 +2980,10 @@ void update_children_position(
+ 
+ 	create_move_cmd(qdev, new_phy, PP_QOS_TMP_NODE, dst_port);
+ 
++	/* Reset tmp node */
++	memset(get_node_from_phy(qdev->nodes, PP_QOS_TMP_NODE),
++	       0, sizeof(struct qos_node));
++
+ 	map_id_phy(qdev->mapping, id, new_phy);
+ 
+ 	if (node_parent(node_src))
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+index cbf4e488bac0..8ce04aaa0558 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+@@ -225,6 +225,10 @@ struct hw_conf {
+ 	unsigned int	qos_clock; /* In MHZ. */
+ 	void*		max_allowed_ddr_virt;
+ 	dma_addr_t	max_allowed_ddr_phys;
++	unsigned int	*bwl_ddr_virt;
++	dma_addr_t	bwl_ddr_phys;
++	unsigned char	*sbwl_ddr_virt;
++	dma_addr_t	sbwl_ddr_phys;
+ };
+ 
+ struct fw_ver {
+@@ -266,14 +270,20 @@ struct ppv4_qos_platform_data  {
+ 	unsigned int	max_port;
+ 	unsigned int	wred_prioritize_pop;
+ 	unsigned int	qm_ddr_start;
+-	void*		qm_ddr_start_virt;
++	void		*qm_ddr_start_virt;
+ 	unsigned int	qm_num_pages;
+ 	unsigned int	fw_logger_start;
+ 	unsigned int	fw_stat;
+ 	unsigned int	qos_clock; /* In MHZ. */
+-	void*		max_allowed_ddr_virt;
++	void		*max_allowed_ddr_virt;
+ 	dma_addr_t	max_allowed_ddr_phys;
+ 	size_t		max_allowed_sz;
++	void		*bwl_ddr_virt;
++	dma_addr_t	bwl_ddr_phys;
++	size_t		bwl_sz;
++	void		*sbwl_ddr_virt;
++	dma_addr_t	sbwl_ddr_phys;
++	size_t		sbwl_sz;
+ };
+ 
+ /* Info needed to create descriptor */
+@@ -602,6 +612,14 @@ void get_node_queues(struct pp_qos_dev *qdev, unsigned int phy,
+ 		     uint16_t *queue_ids,
+ 		     unsigned int size, unsigned int *queues_num);
+ 
++/**
++ * update_bwl_buffer() - Update all bw limit node values in temp
++ *        buffer
++ * @qdev:
++ * @phy:       Phy of subtree's node
++ */
++void update_bwl_buffer(struct pp_qos_dev *qdev, unsigned int phy);
++
+ /**
+  * get_node_queues() - Return all active queues on a subtree
+  * @qdev:

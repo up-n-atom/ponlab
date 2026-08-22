@@ -1,0 +1,546 @@
+From 06592977b5bb2aae6a1036cdbca1ceda74f28eae Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Tue, 16 Oct 2018 16:27:04 +0300
+Subject: [PATCH] PONRTSYS-2224: Configure QoS clock from DTS
+
+---
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c   |   5 +-
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c    |  17 ++-
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c |  14 +-
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h  | 157 +++++++++++----------
+ .../net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h    |   2 +
+ 5 files changed, 111 insertions(+), 84 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+index 339987f67faa..0fd36de3d39b 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+@@ -233,6 +233,7 @@ struct cmd_init_qos {
+ 	unsigned int wred_avg_q_size_p;
+ 	unsigned int wred_max_q_size;
+ 	unsigned int num_of_ports;
++	unsigned int qos_clock;
+ };
+ 
+ struct cmd_move {
+@@ -515,6 +516,7 @@ void create_init_qos_cmd(struct pp_qos_dev *qdev)
+ 	cmd.wred_avg_q_size_p = qdev->hwconf.wred_const_p;
+ 	cmd.wred_max_q_size = qdev->hwconf.wred_max_q_size;
+ 	cmd.num_of_ports = qdev->max_port + 1;
++	cmd.qos_clock = qdev->hwconf.qos_clock;
+ 	QOS_LOG_DEBUG("cmd %u:%u CMD_TYPE_INIT_QOS\n",
+ 			qdev->drvcmds.cmd_id,
+ 			qdev->drvcmds.cmd_fw_id);
+@@ -1346,7 +1348,7 @@ static uint32_t *fw_write_init_qos_cmd(
+ {
+ 	*buf++ = qos_u32_to_uc(UC_QOS_COMMAND_INIT_QOS);
+ 	*buf++ = qos_u32_to_uc(flags);
+-	*buf++ = qos_u32_to_uc(7);
++	*buf++ = qos_u32_to_uc(8);
+ 	*buf++ = qos_u32_to_uc(cmd->qm_ddr_start & 0xFFFFFFFF);
+ 	*buf++ = qos_u32_to_uc(cmd->qm_num_pages);
+ 	*buf++ = qos_u32_to_uc(cmd->wred_total_avail_resources);
+@@ -1354,6 +1356,7 @@ static uint32_t *fw_write_init_qos_cmd(
+ 	*buf++ = qos_u32_to_uc(cmd->wred_avg_q_size_p);
+ 	*buf++ = qos_u32_to_uc(cmd->wred_max_q_size);
+ 	*buf++ = qos_u32_to_uc(cmd->num_of_ports);
++	*buf++ = qos_u32_to_uc(cmd->qos_clock);
+ 	return buf;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
+index 680cf46fd97f..0fcdb2dfbd8d 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_linux.c
+@@ -357,6 +357,17 @@ static int pp_qos_config_from_of_node(
+ 	}
+ 	pdata->wred_prioritize_pop = val;
+ 
++	err = of_property_read_u32(node,
++				   "intel,clock-frequency-mhz",
++				   &val);
++	if (err) {
++		dev_err(dev,
++			"Could not get qos clock from DT, error is %d\n",
++			err);
++		return -ENODEV;
++	}
++	pdata->qos_clock = val;
++
+ 	/* Get reserved memory region */
+ 	node = of_parse_phandle(node, "memory-region", 0);
+ 	if (!node) {
+@@ -480,11 +491,11 @@ static int pp_qos_probe(struct platform_device *pdev)
+ 		return -ENODEV;
+ 	}
+ 
+-	dev_dbg(dev, "id(%d), max_port(%u), pop_prioritize(%u)\n",
++	dev_dbg(dev, "id(%d), max_port(%u), pop_prioritize(%u), clock(%u)\n",
+ 			init_info.pl_data.id,
+ 			init_info.pl_data.max_port,
+-			init_info.pl_data.wred_prioritize_pop
+-			);
++			init_info.pl_data.wred_prioritize_pop,
++			init_info.pl_data.qos_clock);
+ 
+ 	pdata->id = init_info.pl_data.id;
+ 	err = pp_qos_get_resources(pdev, &init_info);
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+index d3cc9ae759d0..3bb691d32d69 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_main.c
+@@ -764,7 +764,9 @@ static int check_queue_conf_validity(
+ 			node->data.queue.alias_slave_id = PP_QOS_INVALID_ID;
+ 			node->data.queue.rlm = pp_pool_get(qdev->rlms);
+ 		} else {
+-			node->data.queue.alias_master_id = get_id_from_phy(qdev->mapping, get_phy_from_node(qdev->nodes, alias_node));
++			node->data.queue.alias_master_id = get_id_from_phy(
++					qdev->mapping,
++					get_phy_from_node(qdev->nodes, alias_node));
+ 			node->data.queue.alias_slave_id = PP_QOS_INVALID_ID;
+ 			node->data.queue.rlm = alias_node->data.queue.rlm;
+ 		}
+@@ -2024,8 +2026,7 @@ int pp_qos_dev_init(struct pp_qos_dev *qdev, struct pp_qos_init_param *conf)
+ 	QOS_LOCK(qdev);
+ 	PP_QOS_ENTER_FUNC();
+ 	if (qdev->initialized) {
+-		QOS_LOG_ERR(
+-				"Device already initialized, can't initialize again\n");
++		QOS_LOG_ERR("Device already initialized, can't initialize again\n");
+ 		rc = -EINVAL;
+ 		goto out;
+ 	}
+@@ -2055,7 +2056,8 @@ int pp_qos_dev_init(struct pp_qos_dev *qdev, struct pp_qos_init_param *conf)
+ 	QOS_LOG_INFO("wred total resources\t%u\n",
+ 			qdev->hwconf.wred_total_avail_resources);
+ 	QOS_LOG_INFO("qm_ddr_start\t\t0x%08X\n", qdev->hwconf.qm_ddr_start);
+-	QOS_LOG_INFO("qm_num_of_pages\t%u\n", qdev->hwconf.qm_num_pages);
++	QOS_LOG_INFO("qm_num_of_pages\t\t%u\n", qdev->hwconf.qm_num_pages);
++	QOS_LOG_INFO("clock\t\t\t%u\n", qdev->hwconf.qos_clock);
+ 
+ 	if (conf->wred_p_const > 1023) {
+ 		QOS_LOG_ERR("wred_p_const should be not greater than 1023\n");
+@@ -2067,7 +2069,7 @@ int pp_qos_dev_init(struct pp_qos_dev *qdev, struct pp_qos_init_param *conf)
+ 	qdev->hwconf.wred_max_q_size = conf->wred_max_q_size;
+ 
+ 	QOS_LOG_INFO("wred p const\t\t%u\n", qdev->hwconf.wred_const_p);
+-	QOS_LOG_INFO("wred max q size\t%u\n", qdev->hwconf.wred_max_q_size);
++	QOS_LOG_INFO("wred max q size\t\t%u\n", qdev->hwconf.wred_max_q_size);
+ 
+ 	rc = load_firmware(qdev, FIRMWARE_FILE);
+ 	if (rc)
+@@ -2086,7 +2088,6 @@ int pp_qos_dev_init(struct pp_qos_dev *qdev, struct pp_qos_init_param *conf)
+ 	return rc;
+ }
+ 
+-
+ struct pp_qos_dev *create_qos_dev_desc(struct qos_dev_init_info *initinfo)
+ {
+ 	struct pp_qos_dev *qdev;
+@@ -2111,6 +2112,7 @@ struct pp_qos_dev *create_qos_dev_desc(struct qos_dev_init_info *initinfo)
+ 		qdev->hwconf.fw_logger_start =
+ 			initinfo->pl_data.fw_logger_start;
+ 		qdev->hwconf.fw_stat = initinfo->pl_data.fw_stat;
++		qdev->hwconf.qos_clock = initinfo->pl_data.qos_clock;
+ 		memcpy(&qdev->fwcom, &initinfo->fwcom, sizeof(struct fw_com));
+ 		rc = init_fwdata_internals(qdev);
+ 		if (rc)
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+index 64ccff9f639d..ee97859be5a0 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_uc_defs.h
+@@ -34,10 +34,10 @@
+ #ifndef SRC_UC_HOST_DEFS_H_
+ #define SRC_UC_HOST_DEFS_H_
+ 
+-// UC version
++/* UC version */
+ #define UC_VERSION_MAJOR	(1)
+ #define UC_VERSION_MINOR	(0)
+-#define UC_VERSION_BUILD	(5)
++#define UC_VERSION_BUILD	(8)
+ 
+ /**************************************************************************
+  *! @enum	UC_STATUS
+@@ -47,13 +47,13 @@
+  *
+  **************************************************************************/
+ enum uc_status {
+-	//!< Status OK
++	/*!< Status OK */
+ 	UC_STATUS_OK,
+ 
+-	//!< General failure
++	/*!< General failure */
+ 	UC_STATUS_GENERAL_FAILURE,
+ 
+-	//!< Invalid user input
++	/*!< Invalid user input */
+ 	UC_STATUS_INVALID_INPUT,
+ };
+ 
+@@ -65,19 +65,19 @@ enum uc_status {
+  *
+  **************************************************************************/
+ enum uc_logger_level {
+-	//!< FATAL error occurred. SW will probably fail to proceed
++	/*!< FATAL error occurred. SW will probably fail to proceed */
+ 	UC_LOGGER_LEVEL_FATAL,
+ 
+-	//!< General ERROR occurred.
++	/*!< General ERROR occurred. */
+ 	UC_LOGGER_LEVEL_ERROR,
+ 
+-	//!< WARNING
++	/*!< WARNING */
+ 	UC_LOGGER_LEVEL_WARNING,
+ 
+-	//!< Information print to the user
++	/*!< Information print to the user */
+ 	UC_LOGGER_LEVEL_INFO,
+ 
+-	//!< Debug purposes level
++	/*!< Debug purposes level */
+ 	UC_LOGGER_LEVEL_DEBUG,
+ };
+ 
+@@ -89,16 +89,16 @@ enum uc_logger_level {
+  *
+  **************************************************************************/
+ enum uc_logger_mode {
+-	//!< Logger is disabled
++	/*!< Logger is disabled */
+ 	UC_LOGGER_MODE_NONE,
+ 
+-	//!< Messages are written to the standard output
++	/*!< Messages are written to the standard output */
+ 	UC_LOGGER_MODE_STDOUT,
+ 
+-	//!< Local file. N/A
++	/*!< Local file. N/A */
+ //	UC_LOGGER_MODE_LOCAL_FILE,
+ 
+-	//!< Messages are written to the host allocated memory
++	/*!< Messages are written to the host allocated memory */
+ 	UC_LOGGER_MODE_WRITE_HOST_MEM,
+ };
+ 
+@@ -110,52 +110,52 @@ enum uc_logger_mode {
+  *
+  **************************************************************************/
+ enum tscd_node_conf {
+-	//!< None
++	/*!< None */
+ 	TSCD_NODE_CONF_NONE					=	0x0000,
+ 
+-	//!< Suspend/Resume node
++	/*!< Suspend/Resume node */
+ 	TSCD_NODE_CONF_SUSPEND_RESUME		=	0x0001,
+ 
+-	//!< first child (Not relevant for queue)
++	/*!< first child (Not relevant for queue) */
+ 	TSCD_NODE_CONF_FIRST_CHILD			=	0x0002,
+ 
+-	//!< last child (Not relevant for queue)
++	/*!< last child (Not relevant for queue) */
+ 	TSCD_NODE_CONF_LAST_CHILD			=	0x0004,
+ 
+-	//!< 0 - BW Limit disabled >0 - define BW
++	/*!< 0 - BW Limit disabled >0 - define BW */
+ 	TSCD_NODE_CONF_BW_LIMIT				=	0x0008,
+ 
+-	//!< Best Effort enable
++	/*!< Best Effort enable */
+ 	TSCD_NODE_CONF_BEST_EFFORT_ENABLE	=	0x0010,
+ 
+-	//!< First Weighted-Round-Robin node (Not relevant for queue)
++	/*!< First Weighted-Round-Robin node (Not relevant for queue) */
+ 	TSCD_NODE_CONF_FIRST_WRR_NODE		=	0x0020,
+ 
+-	//!< Node Weight (Not relevant for ports)
++	/*!< Node Weight (Not relevant for ports) */
+ 	TSCD_NODE_CONF_NODE_WEIGHT			=	0x0040,
+ 
+-	//!< Update predecessor 0 (Not relevant for port)
++	/*!< Update predecessor 0 (Not relevant for port) */
+ 	TSCD_NODE_CONF_PREDECESSOR_0		=	0x0080,
+ 
+-	//!< Update predecessor 1 (Not relevant for port)
++	/*!< Update predecessor 1 (Not relevant for port) */
+ 	TSCD_NODE_CONF_PREDECESSOR_1		=	0x0100,
+ 
+-	//!< Update predecessor 2 (Not relevant for port)
++	/*!< Update predecessor 2 (Not relevant for port) */
+ 	TSCD_NODE_CONF_PREDECESSOR_2		=	0x0200,
+ 
+-	//!< Update predecessor 3 (Not relevant for port)
++	/*!< Update predecessor 3 (Not relevant for port) */
+ 	TSCD_NODE_CONF_PREDECESSOR_3		=	0x0400,
+ 
+-	//!< Update predecessor 4 (Not relevant for port)
++	/*!< Update predecessor 4 (Not relevant for port) */
+ 	TSCD_NODE_CONF_PREDECESSOR_4		=	0x0800,
+ 
+-	//!< Update predecessor 5 (Not relevant for port)
++	/*!< Update predecessor 5 (Not relevant for port) */
+ 	TSCD_NODE_CONF_PREDECESSOR_5		=	0x1000,
+ 
+-	//!< Shared BW limit group (0: no shared BW limit, 1-511: group ID)
++	/*!< Shared BW limit group (0: no shared BW limit, 1-511: group ID) */
+ 	TSCD_NODE_CONF_SHARED_BWL_GROUP		=	0x2000,
+ 
+-	//!< All flags are set
++	/*!< All flags are set */
+ 	TSCD_NODE_CONF_ALL					=	0xFFFF
+ };
+ 
+@@ -167,52 +167,52 @@ enum tscd_node_conf {
+  *
+  **************************************************************************/
+ enum wred_queue_conf {
+-	//!< None
++	/*!< None */
+ 	WRED_QUEUE_CONF_NONE				=	0x0000,
+ 
+-	//!< Q is active
++	/*!< Q is active */
+ 	WRED_QUEUE_CONF_ACTIVE_Q			=	0x0001,
+ 
+-	//!< Disable flags valid
++	/*!< Disable flags valid */
+ 	WRED_QUEUE_CONF_DISABLE				=	0x0002,
+ 
+-	//!< Use fixed green drop probability
++	/*!< Use fixed green drop probability */
+ 	WRED_QUEUE_CONF_FIXED_GREEN_DROP_P	=	0x0004,
+ 
+-	//!< Use fixed yellow drop probability
++	/*!< Use fixed yellow drop probability */
+ 	WRED_QUEUE_CONF_FIXED_YELLOW_DROP_P	=	0x0008,
+ 
+-	//!< Min average yellow
++	/*!< Min average yellow */
+ 	WRED_QUEUE_CONF_MIN_AVG_YELLOW		=	0x0010,
+ 
+-	//!< Max average yellow
++	/*!< Max average yellow */
+ 	WRED_QUEUE_CONF_MAX_AVG_YELLOW		=	0x0020,
+ 
+-	//!< Slope yellow
++	/*!< Slope yellow */
+ 	WRED_QUEUE_CONF_SLOPE_YELLOW		=	0x0040,
+ 
+-	//!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST
++	/*!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST */
+ 	WRED_QUEUE_CONF_SHIFT_AVG_YELLOW	=	0x0080,
+ 
+-	//!< Min average green
++	/*!< Min average green */
+ 	WRED_QUEUE_CONF_MIN_AVG_GREEN		=	0x0100,
+ 
+-	//!< Max average green
++	/*!< Max average green */
+ 	WRED_QUEUE_CONF_MAX_AVG_GREEN		=	0x0200,
+ 
+-	//!< Slope green
++	/*!< Slope green */
+ 	WRED_QUEUE_CONF_SLOPE_GREEN			=	0x0400,
+ 
+-	//!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST
++	/*!< INTERNAL CONFIGURATION. SHOULD NOT BE SET BY HOST */
+ 	WRED_QUEUE_CONF_SHIFT_AVG_GREEN		=	0x0800,
+ 
+-	//!< Min guaranteed
++	/*!< Min guaranteed */
+ 	WRED_QUEUE_CONF_MIN_GUARANTEED		=	0x1000,
+ 
+-	//!< max allowed
++	/*!< max allowed */
+ 	WRED_QUEUE_CONF_MAX_ALLOWED			=	0x2000,
+ 
+-	//!< All flags are set
++	/*!< All flags are set */
+ 	WRED_QUEUE_CONF_ALL					=	0xFFFF
+ };
+ 
+@@ -224,22 +224,22 @@ enum wred_queue_conf {
+  *
+  **************************************************************************/
+ enum port_conf {
+-	//!< None
++	/*!< None */
+ 	PORT_CONF_NONE					=	0x0000,
+ 
+-	//!< Ring Size
++	/*!< Ring Size */
+ 	PORT_CONF_RING_SIZE				=	0x0001,
+ 
+-	//!< Ring address high
++	/*!< Ring address high */
+ 	PORT_CONF_RING_ADDRESS_HIGH		=	0x0002,
+ 
+-	//!< Ring address low
++	/*!< Ring address low */
+ 	PORT_CONF_RING_ADDRESS_LOW		=	0x0004,
+ 
+-	//!< Enable port
++	/*!< Enable port */
+ 	PORT_CONF_ACTIVE				=	0x0008,
+ 
+-	//!< All flags are set
++	/*!< All flags are set */
+ 	PORT_CONF_ALL					=	0xFFFF
+ };
+ 
+@@ -254,7 +254,7 @@ struct port_stats_s {
+ 	u32	total_green_bytes;
+ 	u32	total_yellow_bytes;
+ 
+-	// Following stats can not be reset
++	/* Following stats can not be reset */
+ 	u32	debug_back_pressure_status;
+ };
+ 
+@@ -290,16 +290,16 @@ struct hw_node_info_s {
+  *
+  **************************************************************************/
+ enum port_stats_clear_flags {
+-	//!< None
++	/*!< None */
+ 	PORT_STATS_CLEAR_NONE					=	0x0000,
+ 
+-	//!< Clear port total green bytes stats
++	/*!< Clear port total green bytes stats */
+ 	PORT_STATS_CLEAR_TOTAL_GREEN_BYTES		=	0x0001,
+ 
+-	//!< Clear port total yellow bytes stats
++	/*!< Clear port total yellow bytes stats */
+ 	PORT_STATS_CLEAR_TOTAL_YELLOW_BYTES		=	0x0002,
+ 
+-	//!< All above stats will be cleared
++	/*!< All above stats will be cleared */
+ 	PORT_STATS_CLEAR_ALL					=	0xFFFF,
+ };
+ 
+@@ -324,7 +324,7 @@ struct queue_stats_s {
+ 	u32	total_dropped_bytes_high;
+ 	u32	total_red_dropped;
+ 
+-	// Following stats can not be reset
++	/* Following stats can not be reset */
+ 	u32	qmgr_num_queue_entries;
+ 	u32	qmgr_null_pop_queue_counter;
+ 	u32	qmgr_empty_pop_queue_counter;
+@@ -341,40 +341,40 @@ struct queue_stats_s {
+  *
+  **************************************************************************/
+ enum queue_stats_clear_flags {
+-	//!< None
++	/*!< None */
+ 	QUEUE_STATS_CLEAR_NONE					=	0x0000,
+ 
+-	//!< Clear queue size bytes stats
++	/*!< Clear queue size bytes stats */
+ 	QUEUE_STATS_CLEAR_Q_SIZE_BYTES			=	0x0001,
+ 
+-	//!< Clear queue average size bytes stats
++	/*!< Clear queue average size bytes stats */
+ 	QUEUE_STATS_CLEAR_Q_AVG_SIZE_BYTES		=	0x0002,
+ 
+-	//!< Clear queue size entries stats
++	/*!< Clear queue size entries stats */
+ 	QUEUE_STATS_CLEAR_Q_SIZE_ENTRIES		=	0x0004,
+ 
+-	//!< Clear drop probability yellow stats
++	/*!< Clear drop probability yellow stats */
+ 	QUEUE_STATS_CLEAR_DROP_P_YELLOW			=	0x0008,
+ 
+-	//!< Clear drop probability green stats
++	/*!< Clear drop probability green stats */
+ 	QUEUE_STATS_CLEAR_DROP_P_GREEN			=	0x0010,
+ 
+-	//!< Clear total bytes added stats
++	/*!< Clear total bytes added stats */
+ 	QUEUE_STATS_CLEAR_TOTAL_BYTES_ADDED		=	0x0020,
+ 
+-	//!< Clear total accepts stats
++	/*!< Clear total accepts stats */
+ 	QUEUE_STATS_CLEAR_TOTAL_ACCEPTS			=	0x0040,
+ 
+-	//!< Clear total drops stats
++	/*!< Clear total drops stats */
+ 	QUEUE_STATS_CLEAR_TOTAL_DROPS			=	0x0080,
+ 
+-	//!< Clear total dropped bytes stats
++	/*!< Clear total dropped bytes stats */
+ 	QUEUE_STATS_CLEAR_TOTAL_DROPPED_BYTES	=	0x0100,
+ 
+-	//!< Clear total RED drops stats
++	/*!< Clear total RED drops stats */
+ 	QUEUE_STATS_CLEAR_TOTAL_RED_DROPS		=	0x0200,
+ 
+-	//!< All above stats will be cleared
++	/*!< All above stats will be cleared */
+ 	QUEUE_STATS_CLEAR_ALL					=	0xFFFF,
+ };
+ 
+@@ -430,6 +430,15 @@ struct system_stats_s {
+ 	u32	qmgr_cmd_machine_queue_15;
+ 
+ 	u32	tscd_num_of_used_nodes;
++
++	/* Error in Scheduler tree configuration */
++	u32	tscd_infinite_loop_error_occurred;
++
++	/* HW failed to complete the bwl credits updates */
++	u32	tscd_bwl_update_error_occurred;
++
++	/* Quanta size in KB */
++	u32	tscd_quanta;
+ };
+ 
+ /**************************************************************************
+@@ -478,10 +487,10 @@ enum uc_qos_command {
+  *
+  **************************************************************************/
+ struct uc_qos_cmd_s {
+-	//!< Type of command (UC_QOS_COMMAND)
++	/*!< Type of command (UC_QOS_COMMAND) */
+ 	u32			type;
+ 
+-	//!< Commands flags
++	/*!< Commands flags */
+ 	u32			flags;
+ #define	UC_CMD_FLAG_IMMEDIATE				BIT(0)
+ #define	UC_CMD_FLAG_BATCH_FIRST				BIT(1)
+@@ -490,8 +499,8 @@ struct uc_qos_cmd_s {
+ #define	UC_CMD_FLAG_UC_DONE					BIT(4)
+ #define	UC_CMD_FLAG_UC_ERROR				BIT(5)
+ 
+-	//!< Number of 32bit parameters available for this command.
+-	// must be synced between the host and uc!
++	/*!< Number of 32bit parameters available for this command. */
++	/* must be synced between the host and uc! */
+ 	u32			num_params;
+ 
+ 	u32			param0;
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+index ec47c2ea9206..4dfb9fa05bc0 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_utils.h
+@@ -206,6 +206,7 @@ struct hw_conf {
+ 	unsigned int	qm_num_pages;
+ 	unsigned int	fw_logger_start;
+ 	unsigned int	fw_stat;
++	unsigned int	qos_clock; /* In MHZ. */
+ };
+ 
+ struct fw_ver {
+@@ -250,6 +251,7 @@ struct ppv4_qos_platform_data  {
+ 	unsigned int	qm_num_pages;
+ 	unsigned int	fw_logger_start;
+ 	unsigned int	fw_stat;
++	unsigned int	qos_clock; /* In MHZ. */
+ };
+ 
+ /* Info needed to create descriptor */

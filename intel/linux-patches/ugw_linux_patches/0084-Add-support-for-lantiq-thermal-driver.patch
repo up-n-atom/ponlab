@@ -1,0 +1,337 @@
+From 29692f521087a80fde07fbabab7c0bb9135abbc6 Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:28 +0800
+Subject: [PATCH] Add support for lantiq thermal driver
+
+---
+ drivers/thermal/Kconfig       |  10 ++
+ drivers/thermal/Makefile      |   1 +
+ drivers/thermal/ltq_thermal.c | 290 ++++++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 301 insertions(+)
+
+diff --git a/drivers/thermal/Kconfig b/drivers/thermal/Kconfig
+index 6356295672cb..bb49f2792ff0 100644
+--- a/drivers/thermal/Kconfig
++++ b/drivers/thermal/Kconfig
+@@ -381,6 +381,16 @@ config MTK_THERMAL
+ 	  Enable this option if you want to have support for thermal management
+ 	  controller present in Mediatek SoCs
+ 
++config LTQ_THERMAL
++	tristate "Temperature sensor driver for Lantiq SoCs"
++	depends on HAS_IOMEM
++	depends on MIPS || COMPILE_TEST
++	depends on OF
++	depends on THERMAL_OF
++	help
++	  Enable this option if you want to have support for thermal management
++	  present in Lantiq SoCs
++
+ menu "Texas Instruments thermal drivers"
+ depends on ARCH_HAS_BANDGAP || COMPILE_TEST
+ depends on HAS_IOMEM
+diff --git a/drivers/thermal/Makefile b/drivers/thermal/Makefile
+index c92eb22a41ff..dd352e5b89fc 100644
+--- a/drivers/thermal/Makefile
++++ b/drivers/thermal/Makefile
+@@ -55,3 +55,4 @@ obj-$(CONFIG_TEGRA_SOCTHERM)	+= tegra/
+ obj-$(CONFIG_HISI_THERMAL)     += hisi_thermal.o
+ obj-$(CONFIG_MTK_THERMAL)	+= mtk_thermal.o
+ obj-$(CONFIG_GENERIC_ADC_THERMAL)	+= thermal-generic-adc.o
++obj-$(CONFIG_LTQ_THERMAL)	+= ltq_thermal.o
+diff --git a/drivers/thermal/ltq_thermal.c b/drivers/thermal/ltq_thermal.c
+new file mode 100644
+index 000000000000..c8b7e459518f
+--- /dev/null
++++ b/drivers/thermal/ltq_thermal.c
+@@ -0,0 +1,290 @@
++/*
++ * Lantiq GRX550 SoC Thermal driver
++ *
++ * Copyright (c) 2017, Intel Corporation.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2, as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope it will be useful, but WITHOUT
++ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
++ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
++ * more details.
++ *
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/interrupt.h>
++#include <linux/delay.h>
++#include <linux/cpu_cooling.h>
++#include <linux/of.h>
++#include <linux/of_device.h>
++#include <linux/of_address.h>
++#include <linux/of_irq.h>
++#include <linux/thermal.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
++
++#include  "thermal_core.h"
++
++enum ltq_soc {
++	LTQ_SOC_GRX500
++};
++
++struct ltq_thermal;
++
++struct ltq_thermal_tsens_data {
++	enum ltq_soc	soc;
++	char		*name;
++
++	void (*init)(struct platform_device *pdev, struct ltq_thermal *p);
++	int (*get_temp)(struct ltq_thermal *p);
++};
++
++struct ltq_thermal {
++	struct regmap	*chiptop;
++
++	struct device *dev;
++	struct ltq_thermal_tsens_data *tdata;
++	struct thermal_zone_device *tzd;
++
++	int temp;
++	int last_temp;
++
++	int emul_temp;
++};
++
++#define CTRL_REG  0x100
++#define DATA_REG  0x104
++
++/* Temp sensor control register */
++
++#define SOC_MASK		0x1
++#define SOC_START		1
++#define SOC_NC			0
++
++#define AVG_SEL_MASK		0x6
++
++#define TSOVH_INT_EN_MASK	0x8
++#define TSOVH_INT_EN		0x8
++#define TSOVH_INT_DIS		0
++
++#define CH_SEL_MASK		0x700
++
++#define TS_EN_MASK		0x800
++#define TS_EN_WORKING		0
++#define TS_EN_SHUNT		0x800
++
++#define INT_LVL			0xFFFF0000
++
++/* Temp sensor data (read out) register */
++#define	TS_CODE		0x00000FFF
++#define	TS_DV		0x80000000
++
++void  ltq_grx500_init(struct platform_device *pdev, struct ltq_thermal *priv)
++{
++	dev_dbg(priv->dev, "%s\n", __func__);
++
++	/* Stop data conversion, disable overheat IRQ, power down sensor */
++	regmap_update_bits(priv->chiptop, CTRL_REG,
++			   SOC_MASK | TSOVH_INT_EN_MASK | TS_EN_MASK,
++			   SOC_NC | TSOVH_INT_DIS | TS_EN_SHUNT);
++	usleep_range(20, 50);  /* wait 1 TS_clk cycles to ensure TS is down */
++
++	/* Power on the sensor */
++	regmap_update_bits(priv->chiptop, CTRL_REG, TS_EN_MASK,
++				 TS_EN_WORKING);
++	usleep_range(160, 300);  /* required by TS spec */
++
++	/* Start data conversion */
++	regmap_update_bits(priv->chiptop, CTRL_REG, SOC_MASK, SOC_START);
++	usleep_range(100, 200);  /* 5 TS_clk cycles before we put TS down */
++
++	/* Stop data conversion and power down the sensor*/
++	regmap_update_bits(priv->chiptop, CTRL_REG, SOC_MASK | TS_EN_MASK,
++			   SOC_NC|TS_EN_SHUNT);
++}
++
++int ltq_grx500_get_temp(struct ltq_thermal *priv)
++{
++	u32 reg;
++	bool ready = false;
++	int T, v;
++	int a0 = -40;
++	int v1 = 3800;
++	int v2 = 3421;
++
++
++	/* Select a channel */
++	regmap_update_bits(priv->chiptop, CTRL_REG, CH_SEL_MASK, 0x100);
++
++	/* Enable the temp sensor */
++	regmap_update_bits(priv->chiptop, CTRL_REG, SOC_MASK|TS_EN_MASK,
++				SOC_START | TS_EN_WORKING);
++
++
++	/* Wait for and read out the measurement */
++	while (!ready) {
++		regmap_read(priv->chiptop, DATA_REG, &reg);
++		if ((reg & TS_DV) > 0)
++			ready = true;
++	}
++
++	v = reg & TS_CODE;
++
++	/* Disable the temp sensor */
++	regmap_update_bits(priv->chiptop, CTRL_REG, SOC_MASK|TS_EN_MASK,
++				SOC_NC|TS_EN_SHUNT);
++
++	/* Temperature interpolation */
++	T = (int)(a0 * 1000000 + (-435356 * (v - v1)) +
++		  (-360 * (v - v1) * (v - v2)) + 1);
++
++	return T/1000;  /* returns °mC */
++}
++
++/* Temperature sensor specific data */
++static struct ltq_thermal_tsens_data ltq_grx500_data = {
++	.soc		= LTQ_SOC_GRX500,
++	.name		= "TempSensor for GRX500",
++	.init		= ltq_grx500_init,
++	.get_temp	= ltq_grx500_get_temp,
++};
++
++static int ltq_thermal_get_temp(void *data, int *temp)
++{
++	struct ltq_thermal *priv = data;
++
++	if (!priv)
++		return -EINVAL;
++
++	if (!priv->emul_temp)
++		*temp = priv->tdata->get_temp(priv);
++	else
++		*temp = priv->emul_temp;
++
++	priv->last_temp = priv->temp;
++	priv->temp = *temp;
++
++	return 0;
++}
++
++static int ltq_thermal_get_trend(void *data, int trip,
++				 enum thermal_trend *trend)
++{
++	struct ltq_thermal *priv = data;
++	int trip_temp, trip_hyst, temp, last_temp;
++	const struct thermal_trip *trips;
++
++	if (!priv || !priv->tzd)
++		return -EINVAL;
++
++	trips = of_thermal_get_trip_points(priv->tzd);
++	if (!trips)
++		return -EINVAL;
++
++	if (!of_thermal_is_trip_valid(priv->tzd, trip))
++		return -EINVAL;
++
++	temp = priv->temp;
++	last_temp = priv->last_temp;
++
++	trip_temp = trips[trip].temperature;
++	trip_hyst = trips[trip].hysteresis;
++
++	if (temp > last_temp)
++		*trend = THERMAL_TREND_RAISING;
++	else if (temp < last_temp && temp <= (trip_temp - trip_hyst))
++		*trend = THERMAL_TREND_DROPPING;
++	else
++		*trend = THERMAL_TREND_STABLE;
++
++	return 0;
++}
++static int ltq_thermal_set_emul_temp(void *data, int temp)
++{
++	struct ltq_thermal *priv = data;
++
++	if (!priv || !priv->tzd)
++		return -EINVAL;
++
++	priv->emul_temp = temp;
++
++	return 0;
++}
++
++static struct thermal_zone_of_device_ops ops = {
++	.get_temp = ltq_thermal_get_temp,
++	.get_trend = ltq_thermal_get_trend,
++	.set_emul_temp = ltq_thermal_set_emul_temp,
++};
++
++static const struct of_device_id ltq_thermal_match[] = {
++	{
++		.compatible = "lantiq,ts-xrx500",
++		.data       = &ltq_grx500_data,
++	},
++	{ /* sentinel */ },
++};
++
++static int ltq_thermal_probe(struct platform_device *pdev)
++{
++
++	struct ltq_thermal *priv;
++	struct device_node *node = pdev->dev.of_node;
++
++	dev_dbg(&pdev->dev, "%s\n", __func__);
++
++	priv = devm_kzalloc(&pdev->dev, sizeof(struct ltq_thermal), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->tdata = (struct ltq_thermal_tsens_data *)
++			of_device_get_match_data(&pdev->dev);
++
++	priv->dev = &pdev->dev;
++	platform_set_drvdata(pdev, priv);
++
++	priv->chiptop = syscon_regmap_lookup_by_phandle(node, "lantiq,chiptop");
++	if (IS_ERR(priv->chiptop)) {
++		dev_err(&pdev->dev, "Failed to find lantiq,chiptop regmap\n");
++		return PTR_ERR(priv->chiptop);
++	}
++
++	/* Init sensor */
++	priv->tdata->init(pdev, priv);
++
++	priv->tzd = devm_thermal_zone_of_sensor_register(&pdev->dev, 0, priv,
++							 &ops);
++	if (IS_ERR(priv->tzd)) {
++		dev_err(&pdev->dev, "Failed to register thermal zone device\n");
++		return PTR_ERR(priv->tzd);
++	}
++
++	dev_dbg(&pdev->dev, "%s: tzd registered\n", __func__);
++
++	return 0;
++}
++
++static int ltq_thermal_remove(struct platform_device *pdev)
++{
++	dev_dbg(&pdev->dev, "%s:\n", __func__);
++	return 0;
++}
++
++static struct platform_driver ltq_thermal_driver = {
++	.probe = ltq_thermal_probe,
++	.remove = ltq_thermal_remove,
++	.driver = {
++		.name = "ltq_thermal",
++		.of_match_table = ltq_thermal_match,
++	}
++};
++
++module_platform_driver(ltq_thermal_driver);
++
++MODULE_DESCRIPTION("Lantiq SoC Thermal Driver");
++MODULE_AUTHOR("Waldemar Rymarkiewicz <waldemarx.rymarkiewicz@intel.com>");
++MODULE_LICENSE("GPL v2");

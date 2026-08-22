@@ -1,0 +1,182 @@
+From 546b3bff51295b7612303d9fe7fb1b1a0a31d092 Mon Sep 17 00:00:00 2001
+From: Jamal Hadi Salim <jhs@mojatatu.com>
+Date: Tue, 24 Jan 2017 07:02:41 -0500
+Subject: [PATCH] net sched actions: Add support for user cookies
+
+Introduce optional 128-bit action cookie.
+Like all other cookie schemes in the networking world (eg in protocols
+like http or existing kernel fib protocol field, etc) the idea is to save
+user state that when retrieved serves as a correlator. The kernel
+_should not_ intepret it.  The user can store whatever they wish in the
+128 bits.
+
+Sample exercise(showing variable length use of cookie)
+
+.. create an accept action with cookie a1b2c3d4
+sudo $TC actions add action ok index 1 cookie a1b2c3d4
+
+.. dump all gact actions..
+sudo $TC -s actions ls action gact
+
+    action order 0: gact action pass
+     random type none pass val 0
+     index 1 ref 1 bind 0 installed 5 sec used 5 sec
+    Action statistics:
+    Sent 0 bytes 0 pkt (dropped 0, overlimits 0 requeues 0)
+    backlog 0b 0p requeues 0
+    cookie a1b2c3d4
+
+.. bind the accept action to a filter..
+sudo $TC filter add dev lo parent ffff: protocol ip prio 1 \
+u32 match ip dst 127.0.0.1/32 flowid 1:1 action gact index 1
+
+... send some traffic..
+$ ping 127.0.0.1 -c 3
+PING 127.0.0.1 (127.0.0.1) 56(84) bytes of data.
+64 bytes from 127.0.0.1: icmp_seq=1 ttl=64 time=0.020 ms
+64 bytes from 127.0.0.1: icmp_seq=2 ttl=64 time=0.027 ms
+64 bytes from 127.0.0.1: icmp_seq=3 ttl=64 time=0.038 ms
+
+Signed-off-by: David S. Miller <davem@davemloft.net>
+---
+ include/net/act_api.h        |  1 +
+ include/net/pkt_cls.h        |  7 +++++++
+ include/uapi/linux/pkt_cls.h |  3 +++
+ net/sched/act_api.c          | 47 ++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 58 insertions(+)
+
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index 051b90779708..c5c1df1a6c24 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -41,6 +41,7 @@ struct tc_action {
+ 	struct rcu_head			tcfa_rcu;
+ 	struct gnet_stats_basic_cpu __percpu *cpu_bstats;
+ 	struct gnet_stats_queue __percpu *cpu_qstats;
++	struct tc_cookie	*act_cookie;
+ };
+ #define tcf_act		common.tcfa_act
+ #define tcf_head	common.tcfa_head
+diff --git a/include/net/pkt_cls.h b/include/net/pkt_cls.h
+index fce926a1479c..294c23393fee 100644
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@ -622,4 +622,11 @@ struct tc_drr_qopt_offload {
+ 	};
+ };
+ 
++/* This structure holds cookie structure that is passed from user
++ * to the kernel for actions and classifiers
++ */
++struct tc_cookie {
++	u8  *data;
++	u32 len;
++};
+ #endif
+diff --git a/include/uapi/linux/pkt_cls.h b/include/uapi/linux/pkt_cls.h
+index b3f34f345e7d..2c361cc1cf9b 100644
+--- a/include/uapi/linux/pkt_cls.h
++++ b/include/uapi/linux/pkt_cls.h
+@@ -59,6 +59,8 @@ bits 9,10,11: redirect counter -  redirect TTL. Loop avoidance
+ #define MAX_RED_LOOP 4
+ #endif
+ 
++#define TC_COOKIE_MAX_SIZE 16
++
+ /* Action attributes */
+ enum {
+ 	TCA_ACT_UNSPEC,
+@@ -67,6 +69,7 @@ enum {
+ 	TCA_ACT_INDEX,
+ 	TCA_ACT_STATS,
+ 	TCA_ACT_PAD,
++	TCA_ACT_COOKIE,
+ 	__TCA_ACT_MAX
+ };
+ 
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index 5b8f8b382a2e..c0ead34bacd9 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -24,6 +24,7 @@
+ #include <net/net_namespace.h>
+ #include <net/sock.h>
+ #include <net/sch_generic.h>
++#include <net/pkt_cls.h>
+ #include <net/act_api.h>
+ #include <net/netlink.h>
+ 
+@@ -33,6 +34,12 @@ static void free_tcf(struct rcu_head *head)
+ 
+ 	free_percpu(p->cpu_bstats);
+ 	free_percpu(p->cpu_qstats);
++
++	if (p->act_cookie) {
++		kfree(p->act_cookie->data);
++		kfree(p->act_cookie);
++	}
++
+ 	kfree(p);
+ }
+ 
+@@ -484,6 +491,12 @@ tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
+ 		goto nla_put_failure;
+ 	if (tcf_action_copy_stats(skb, a, 0))
+ 		goto nla_put_failure;
++	if (a->act_cookie) {
++		if (nla_put(skb, TCA_ACT_COOKIE, a->act_cookie->len,
++			    a->act_cookie->data))
++			goto nla_put_failure;
++	}
++
+ 	nest = nla_nest_start(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+@@ -525,6 +538,24 @@ int tcf_action_dump(struct sk_buff *skb, struct list_head *actions,
+ 	return err;
+ }
+ 
++int nla_memdup_cookie(struct tc_action *a, struct nlattr **tb)
++{
++	a->act_cookie = kzalloc(sizeof(*a->act_cookie), GFP_KERNEL);
++	if (!a->act_cookie)
++		return -ENOMEM;
++
++	a->act_cookie->data = kmemdup(nla_data(tb[TCA_ACT_COOKIE]),
++				      nla_len(tb[TCA_ACT_COOKIE]),
++				      GFP_KERNEL);
++	if (!a->act_cookie->data) {
++		kfree(a->act_cookie);
++		return -ENOMEM;
++	}
++	a->act_cookie->len = nla_len(tb[TCA_ACT_COOKIE]);
++
++	return 0;
++}
++
+ struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
+ 				    struct nlattr *est, char *name, int ovr,
+ 				    int bind)
+@@ -584,6 +615,22 @@ struct tc_action *tcf_action_init_1(struct net *net, struct nlattr *nla,
+ 	if (err < 0)
+ 		goto err_mod;
+ 
++	if (tb[TCA_ACT_COOKIE]) {
++		int cklen = nla_len(tb[TCA_ACT_COOKIE]);
++
++		if (cklen > TC_COOKIE_MAX_SIZE) {
++			err = -EINVAL;
++			tcf_hash_release(a, bind);
++			goto err_mod;
++		}
++
++		err = nla_memdup_cookie(a, tb);
++		if (err < 0) {
++			tcf_hash_release(a, bind);
++			goto err_mod;
++		}
++	}
++
+ 	/* module count goes up only when brand new policy is created
+ 	 * if it exists and is only bound to in a_o->init() then
+ 	 * ACT_P_CREATED is not returned (a zero is).

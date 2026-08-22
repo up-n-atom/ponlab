@@ -1,0 +1,123 @@
+From 575f0db514374cc771d4e9d50edee76580460ce1 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <pczarnota@maxlinear.com>
+Date: Fri, 25 Jun 2021 09:34:48 +0200
+Subject: [PATCH] PONRTSYS-9155: Create downstream queue mappings for the
+ additional uni netdevs
+
+- Create attidional subif + tc queue mappings for all subifs of port for which
+  we create tc to queue mappings
+
+After PONRTSYS-8192 bbf 6.2.25 does not work, because traffic on
+eth0_0_2 is not prioritized correctly. This is because queue mappings
+are missing. This change adds missing queue mappings
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c | 71 +++++++++++++++++++++++++--
+ 1 file changed, 68 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 69b0155a3bfc..e34b23df8a97 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -937,6 +937,56 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 	return ret;
+ }
+ 
++/* 
++ * We need this increment to calculate "next" subif
++ * For example, if a subif is 0x200, then the next
++ * subif will be 0x300, and next 0x400 and so on
++ */
++#define SUBIF_INCREMENT 0x100
++
++/* We need this function so that the command:
++ *
++ *    tc filter add dev eth0_0 ingress pref 1 protocol 802.1q flower \
++ *        skip_sw vlan_prio 0 classid 8002:1 acion ok
++ *
++ * would trigger mappings for each subif:
++ *
++ *    subif=1 tc=tc
++ *    subif=2 tc=tc
++ *    subif=3 tc=tc
++ *
++ * which effectively means that it will "replicate" the mappings for
++ * eth0_0 subinterfaces (like: eth0_0_1, eth0_0_2, ...)
++ */
++static int pon_qos_replicate_mappings_for_subifs(struct net_device *dev,
++						 struct pon_qos_q_data *qid,
++						 struct pon_qos_qdisc *sch,
++						 int tc, bool en)
++{
++	struct dp_port_prop prop;
++	int i;
++	int ret;
++	dp_subif_t subif = {0};
++
++	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0))
++		return -EINVAL;
++
++	/* Read the number of available sub interfaces */
++	if (dp_get_port_prop(sch->inst, sch->port, &prop))
++		return -EINVAL;
++
++	/* Perform (subif, tc) -> (queue) mappings for each sub interface */
++	for (i = 1; i < prop.num_subif; ++i) {
++		int subif_id = subif.subif + i * SUBIF_INCREMENT;
++
++		ret = pon_qos_set_qmap(qid, sch->port, subif_id, tc, en);
++		if (ret)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /* classid option identifies the queue id.
+  *
+  * Queue mapping scenarios PON upstream:
+@@ -970,10 +1020,12 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 
+ int pon_qos_update_ds_qmap(struct net_device *dev,
+ 			   struct pon_qos_qdisc *sch,
++			   struct pon_qos_q_data *qid,
+ 			   struct pon_qos_qmap_tc *q_tc,
+ 			   bool en)
+ {
+ 	int pqn;
++	int ret;
+ 
+ 	if (q_tc->indev) {
+ 		/* Get the queue id from the handle. In PON pq = 1 is
+@@ -984,7 +1036,17 @@ int pon_qos_update_ds_qmap(struct net_device *dev,
+ 		return pon_qos_force_tc(q_tc->indev, pqn, en);
+ 	}
+ 
+-	return pon_qos_reassign_tc(sch, q_tc->tc, en);
++	ret = pon_qos_reassign_tc(sch, q_tc->tc, en);
++	if (ret)
++		return ret;
++
++	/* Perform the mapping also for all subinterfaces */
++	ret = pon_qos_replicate_mappings_for_subifs(dev, qid, sch, q_tc->tc,
++						    en);
++	if (ret)
++		return ret;
++
++	return 0;
+ }
+ 
+ int pon_qos_update_qmap(struct net_device *dev,
+@@ -1033,8 +1095,11 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 		return -EFAULT;
+ 	}
+ 
+-	if (sch->ds)
+-		ret = pon_qos_update_ds_qmap(dev, sch, q_tc, en);
++	if (sch->ds) {
++		ret = pon_qos_update_ds_qmap(dev, sch, qid, q_tc, en);
++		if (ret)
++			return ret;
++	}
+ 
+ 	trace_pon_qos_update_qmap_exit(dev, sch, qid, q_tc, en);
+ 

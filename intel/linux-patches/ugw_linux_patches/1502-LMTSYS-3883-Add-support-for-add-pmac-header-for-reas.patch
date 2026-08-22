@@ -1,0 +1,276 @@
+From 404f553cb7207235c3294cfdc634c3e6830c02ec Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Thu, 24 Sep 2020 00:41:43 +0300
+Subject: [PATCH] LMTSYS-3883: Add support for add pmac header for reassembled
+ packets in LGM PPv4
+
+Add port memory flag to reassembly session info
+Aligned reassembly counters with uC
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          | 17 ++++-----
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |  2 +
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c | 17 +++++----
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      | 21 ++++-------
+ drivers/net/ppv4/pp-hal/micro-controller/uc.h      |  6 ---
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   | 43 +++++++++++++---------
+ 6 files changed, 51 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 833dd86fc9ed..f4add1bd0936 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -947,13 +947,6 @@ s32 pp_driver_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	return 0;
+ }
+ 
+-#define UC_REASS_STATS_ERRORS(stats) ((stats)->cntx_overflow + \
+-				      (stats)->duplicates + \
+-				      (stats)->unsupported + \
+-				      (stats)->invalid_len + \
+-				      (stats)->timedout + \
+-				      (stats)->bm_null_buff)
+-
+ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 			     u32 num_stats, void *data)
+ {
+@@ -969,6 +962,7 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	struct mcast_stats          *mcast;
+ 	struct reassembly_stats     *reass;
+ 	struct frag_stats           *frag;
++	u64 reass_err = 0, *it;
+ 
+ 	if (unlikely(ptr_is_null(buf) || ptr_is_null(n) || ptr_is_null(stats)))
+ 		return -EINVAL;
+@@ -985,6 +979,9 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	reass     = &st->reass_stats;
+ 	frag      = &st->frag_stats;
+ 
++	for_each_struct_mem(&reass->err, it)
++		reass_err += *it;
++
+ 	/* prints all statistics */
+ 	pr_buf(buf, sz, *n,
+ 	       "+---------------------------+-------------------------+----------------------+------------------------+\n");
+@@ -1072,7 +1069,7 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		   mcast->tx_pkt, reass->tx_pkts, frag->tx_pkt);
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "| Drop          %10llu  | Drop        %10llu  | Drop        %10llu  |\n",
+-		   mcast->drop_pkt, reass->dropped, frag->total_drops);
++		   mcast->drop_pkt, reass->err.dropped, frag->total_drops);
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "|                           | Reassembled %10llu  | bmgr drops  %10llu  |\n",
+ 		   reass->reassembled, frag->bmgr_drops);
+@@ -1084,10 +1081,10 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		   reass->diverted, frag->max_frags_drops);
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "|                           | Starvation  %10llu  |                         |\n",
+-		   reass->frags_starv);
++		   reass->err.frags_starv);
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "|                           | Errors      %10llu  |                         |\n",
+-		   UC_REASS_STATS_ERRORS(reass));
++		   reass_err);
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "+---------------------------+-------------------------+-------------------------+\n\n");
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 164716aea92f..929f948826b7 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -2762,6 +2762,8 @@ static s32 __smgr_si_ud_set(struct sess_info *s)
+ 			reass_info.flags |= REASS_INFO_FLAG_WR_DESC;
+ 		if (cfg.tx.prel2_en)
+ 			reass_info.flags |= REASS_INFO_FLAG_PREL2_EN;
++		if (cfg.rx.mem_port_en)
++			reass_info.flags |= REASS_INFO_FLAG_MEMORY_PORT;
+ 
+ 		memcpy(s->si.ud + PP_PS_REGION_SZ,
+ 		       &reass_info,
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 6b9b837d1c51..15c963e53d11 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -2300,8 +2300,9 @@ s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
+ 		"unsupported_frag",
+ 		"unsupported_ext",
+ 		"unsupported_proto",
++		"unsupported_pmac",
++		"unsupported_pre_l2",
+ 		"ext_overflow",
+-		"unsupported",
+ 		"invalid_len",
+ 		"dropped",
+ 		"bm_null_buff",
+@@ -2309,24 +2310,24 @@ s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
+ 
+ 	pr_buf(buf, sz, *n, "\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|====================================================================================|\n");
++		   "|=====================================================================================|\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                Reassembly UC Statistics                                            |\n");
++		   "|                 Reassembly UC Statistics                                            |\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|====================================================================================|\n");
++		   "|=====================================================================================|\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "| %-17s ", "Counter");
++		   "| %-18s ", "Counter");
+ 	for (cid = 0; cid < num; cid++)
+ 		pr_buf_cat(buf, sz, *n, "|  CPU%u      ", cid);
+ 	pr_buf_cat(buf, sz, *n, "|  Total     |\n");
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|-------------------+------------+------------+------------+------------+------------|\n");
++		   "|--------------------+------------+------------+------------+------------+------------|\n");
+ 
+ 	cid = 0;
+ 	stats = (struct reassembly_stats *)s;
+ 	for_each_arr_entry(str, cntrs_str, ARRAY_SIZE(cntrs_str), cid++) {
+ 		total = 0;
+-		pr_buf_cat(buf, sz, *n, "| %-17s ", *str);
++		pr_buf_cat(buf, sz, *n, "| %-18s ", *str);
+ 		for_each_arr_entry(it, stats, num) {
+ 			pr_buf_cat(buf, sz, *n, "| %10llu ",
+ 				   *(((u64 *)it) + cid));
+@@ -2335,7 +2336,7 @@ s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
+ 		pr_buf_cat(buf, sz, *n, "| %10llu |\n", total);
+ 	}
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|------------------------------------------------------------------------------------|\n\n");
++		   "|-------------------------------------------------------------------------------------|\n\n");
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 4312f1391bd9..51e3a5986f8b 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -393,6 +393,7 @@ s32 uc_reass_stats_get(struct reassembly_stats *stats)
+ 	struct reassembly_stats cpu_stats;
+ 	s32 ret;
+ 	u32 i;
++	u64 *it1, *it2;
+ 
+ 	for (i = 0; i < UC_CPUS_MAX; i++) {
+ 		if (!uc_is_cpu_active(UC_IS_EGR, i))
+@@ -404,22 +405,14 @@ s32 uc_reass_stats_get(struct reassembly_stats *stats)
+ 			       i);
+ 			return ret;
+ 		}
+-		stats->rx_pkts          += cpu_stats.rx_pkts;
+-		stats->tx_pkts          += cpu_stats.tx_pkts;
+-		stats->reassembled      += cpu_stats.reassembled;
+-		stats->accelerated      += cpu_stats.accelerated;
+-		stats->diverted         += cpu_stats.diverted;
+-		stats->cntxs_starv      += cpu_stats.cntxs_starv;
+-		stats->frags_starv      += cpu_stats.frags_starv;
+-		stats->dropped          += cpu_stats.dropped;
+-		stats->cntx_overflow    += cpu_stats.cntx_overflow;
+-		stats->duplicates       += cpu_stats.duplicates;
+-		stats->unsupported      += cpu_stats.unsupported;
+-		stats->invalid_len      += cpu_stats.invalid_len;
+-		stats->timedout         += cpu_stats.timedout;
+-		stats->bm_null_buff     += cpu_stats.bm_null_buff;
++
++		/* add all counters to stats */
++		it2 = (u64 *)(&cpu_stats);
++		for_each_struct_mem(stats, it1, it2++)
++			*it1 += *it2;
+ 	}
+ 
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.h b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+index 21181cd9b9b4..d4f0d7e020b5 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+@@ -30,12 +30,6 @@
+  */
+ #define UC_CPUS_MAX      (4)
+ 
+-/**
+- * @define REASS_INFO_FLAG, to be used with struct si_ud_reass_info.flags
+- */
+-#define REASS_INFO_FLAG_WR_DESC           (BIT(0))
+-#define REASS_INFO_FLAG_PREL2_EN          (BIT(1))
+-
+ /**
+  * @struct uc_cpu_params
+  */
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index 038d03737682..2fabffe08943 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -13,7 +13,7 @@
+  * the version here
+  */
+ #define EGRESS_VER_MAJOR  1
+-#define EGRESS_VER_MINOR  18
++#define EGRESS_VER_MINOR  19
+ 
+ #define INGRESS_VER_MAJOR 1
+ #define INGRESS_VER_MINOR 2
+@@ -31,6 +31,13 @@
+  */
+ #define CLS_LOCK_REG_IDX  7
+ 
++/**
++ * @define REASS_INFO_FLAG, to be used with struct si_ud_reass_info.flags
++ */
++#define REASS_INFO_FLAG_WR_DESC           (BIT(0))
++#define REASS_INFO_FLAG_PREL2_EN          (BIT(1))
++#define REASS_INFO_FLAG_MEMORY_PORT       (BIT(2))
++
+ /**
+  * @enum uc_mbox_cmd_type
+  * @brief mailbox command type
+@@ -225,21 +232,24 @@ struct reassembly_stats {
+ 	u64 early_diverted;
+ 	u64 matched;
+ 	u64 not_matched;
+-	u64 cntxs_starv;
+-	u64 cntxs_busy;
+-	u64 cntx_overflow;
+-	u64 timedout;
+-	u64 timeout_err;
+-	u64 frags_starv;
+-	u64 duplicates;
+-	u64 unsupported_frag;
+-	u64 unsupported_ext;
+-	u64 unsupported_proto;
+-	u64 ext_overflow;
+-	u64 unsupported;
+-	u64 invalid_len;
+-	u64 dropped;
+-	u64 bm_null_buff;
++	struct {
++		u64 cntxs_starv;
++		u64 cntxs_busy;
++		u64 cntx_overflow;
++		u64 timedout;
++		u64 timeout_err;
++		u64 frags_starv;
++		u64 duplicates;
++		u64 unsupported_frag;
++		u64 unsupported_ext;
++		u64 unsupported_proto;
++		u64 unsupported_pmac;
++		u64 unsupported_pre_l2;
++		u64 ext_overflow;
++		u64 invalid_len;
++		u64 dropped;
++		u64 bm_null_buff;
++	} err;
+ };
+ 
+ /**
+@@ -270,7 +280,6 @@ struct egress_stats {
+ 	struct frag_stats frag;
+ };
+ 
+-/* @todo: use the same define in uc */
+ #define _RX_DMA_MAX_POOLS (5)
+ 
+ /**

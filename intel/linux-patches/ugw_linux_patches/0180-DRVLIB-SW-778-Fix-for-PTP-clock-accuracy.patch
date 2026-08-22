@@ -1,0 +1,137 @@
+From fcdb0d98722709fe0299bb9243acf3b5bc92b24b Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Thu, 2 Aug 2018 11:06:20 +0800
+Subject: [PATCH] DRVLIB_SW-778: Fix for PTP clock accuracy
+
+---
+ .../ethernet/lantiq/switch-api/mac/xgmac_mac_api.c |  3 ++-
+ .../ethernet/lantiq/switch-api/mac/xgmac_main.c    |  6 ++---
+ .../net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c | 27 +++++++++++-----------
+ .../net/ethernet/lantiq/switch-api/mac/xgmac_ptp.h | 12 ++++++++++
+ 4 files changed, 31 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+index 3d3748d893c6..112243e29027 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+@@ -1384,7 +1384,7 @@ int xgmac_config_subsec_inc(void *pdev, u32 ptp_clk)
+ 	u32 val;
+ 
+ 	if (XGMAC_RGRD_BITS(pdata, MAC_TSTAMP_CR, TSCFUPDT) == 1)
+-		val = ((1 * NSEC_TO_SEC) / MHZ_TO_HZ(50));
++		val = ((1 * NSEC_TO_SEC) / MHZ_TO_HZ(CLOCK_UPDATE_FREQ));
+ 	else
+ 		val = ((1 * NSEC_TO_SEC) / ptp_clk);
+ 
+@@ -1392,6 +1392,7 @@ int xgmac_config_subsec_inc(void *pdev, u32 ptp_clk)
+ 	if (XGMAC_RGRD_BITS(pdata, MAC_TSTAMP_CR, TSCTRLSSR) == 0)
+ 		val = (val * 1000) / 465;
+ 
++	printk("Value in xgmac_config_subsec_inc %d\n", val);
+ 	XGMAC_RGWR_BITS(pdata, MAC_SUBSEC_INCR, SSINC, val);
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_main.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_main.c
+index 8d0bf93c5c9d..42bc324b6915 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_main.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_main.c
+@@ -708,12 +708,12 @@ void xgmac_init_pdata(struct mac_prv_data *pdata, int idx)
+ 	pdata->enable_mtl_int		= MASK(MTL_Q_IER, TXUIE) |
+ 					  MASK(MTL_Q_IER, ABPSIE) |
+ 					  MASK(MTL_Q_IER, RXOIE);
+-	/* Calc as (2^32 * 50Mhz)/ 500Mhz */
+-	pdata->def_addend		= 0x19999999;
++	/* Calc as (2^32 * 250Mhz)/ 500Mhz */
++	pdata->def_addend		= 0x80000000;
+ 	pdata->sec			= 0;
+ 	pdata->nsec			= 0;
+ 	pdata->ptp_clk			= PTP_CLK;
+-	pdata->one_nsec_accuracy	= 0;
++	pdata->one_nsec_accuracy	= 1;
+ 	pdata->ss_addr_base		= adap_priv_data.ss_addr_base;
+ 	pdata->lmac_addr_base		= LEGACY_MAC_BASE;
+ #if defined(PC_UTILITY) || defined(CHIPTEST)
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+index b9a34c83c943..29b891a574a0 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+@@ -73,10 +73,10 @@ void xgmac_config_timer_reg(void *pdev)
+ 	hw_if->config_subsec_inc(pdev, pdata->ptp_clk);
+ 
+ 	/* Calculate the def addend:
+-	 * addend = 2^32 / (PTP ref clock / 50Mhz)
+-	 *        = (2^32 * 50Mhz) / PTP ref clock
++	 * addend = 2^32 / (PTP ref clock / CLOCK_UPDATE_FREQ)
++	 *        = (2^32 * CLOCK_UPDATE_FREQ) / PTP ref clock
+ 	 */
+-	temp = (u64)(50000000ULL << 32);
++	temp = (u64)((CLOCK_UPDATE_FREQ * 1000000ULL) << 32);
+ 	pdata->def_addend = div_u64(temp, pdata->ptp_clk);
+ 
+ 	hw_if->config_addend(pdev, pdata->def_addend);
+@@ -94,8 +94,8 @@ static int xgmac_adj_freq(struct ptp_clock_info *ptp, s32 ppb)
+ 	struct mac_prv_data *pdata =
+ 		container_of(ptp, struct mac_prv_data, ptp_clk_info);
+ 	struct mac_ops *hw_if = &pdata->ops;
+-	u64 adj;
+-	u32 diff, addend;
++	u64 adj, diff;
++	u32 addend;
+ 	int neg_adj = 0;
+ 
+ 	pr_debug("Calling adjust_freq: %d\n", ppb);
+@@ -105,14 +105,15 @@ static int xgmac_adj_freq(struct ptp_clock_info *ptp, s32 ppb)
+ 		ppb = -ppb;
+ 	}
+ 
+-	addend = pdata->def_addend;
+-	adj = addend;
+-	adj *= ppb;
+-	/* div_u64 will divided the "adj" by "NSEC_TO_SEC"
+-	 * and return the quotient.
++	/* Frequency adjustment is feq_delta = ppb / 1.000.000.000
++	 * addend = def_addend / ( 1 - ppb/1.000.000.000)
++	 * So addend in integer arithmetic becomes
++	 * addend = (def_addend * 1.000.000.000) / (1.000.000.000 - ppb)
+ 	 */
+-	diff = div_u64(adj, NSEC_TO_SEC);
+-	addend = neg_adj ? (addend - diff) : (addend + diff);
++	adj = (pdata->def_addend * NSEC_TO_SEC);
++	diff = (NSEC_TO_SEC - ppb);
++
++	addend = div_u64(adj, diff);
+ 
+ 	spin_lock_bh(&pdata->ptp_lock);
+ 
+@@ -747,7 +748,7 @@ static int xgmac_ptp_register(void *pdev)
+ 		 "%s", "xgmac_clk");
+ 
+ 	info->owner = THIS_MODULE;
+-	info->max_adj = pdata->ptp_clk;
++	info->max_adj = MAX_FREQ_ADJUSTMENT;
+ 	info->n_ext_ts = N_EXT_TS;
+ 	info->adjfreq = xgmac_adj_freq;
+ 	info->adjtime = xgmac_adj_time;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.h
+index 12d20ab58e9c..8a873afa311b 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.h
+@@ -61,6 +61,18 @@ enum {
+ #define PTP_OFFS_MSG_TYPE		0
+ #define PTP_OFFS_FLAGS			6
+ 
++/* To achieve 20 ns accuracy need 50 MHz clock update frequency
++ * To achieve 4 ns 50 * (20/4) Mhz
++ * Xgmac cannot have same clock update frequency and ptp clock frequency
++ */
++
++#define CLOCK_PRECISION_NS		4
++#define CLOCK_UPDATE_FREQ		(50 * (20/CLOCK_PRECISION_NS))
++
++/* Linux PTP driver cannot handle bigger values and erroneously
++ * converts any value > +32767999 to -32768000.
++ */
++#define MAX_FREQ_ADJUSTMENT		32767999
+ 
+ #define IS_2STEP(pdata)	(pdata->tstamp_config.tx_type == HWTSTAMP_TX_ON)
+ #define IS_1STEP(pdata)	(pdata->tstamp_config.tx_type == HWTSTAMP_TX_ONESTEP_SYNC)

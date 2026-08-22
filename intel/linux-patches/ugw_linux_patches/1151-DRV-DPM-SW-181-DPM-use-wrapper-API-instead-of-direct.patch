@@ -1,0 +1,239 @@
+From 7be18dc7c47397e7f0bf0a6da14f878487c0576e Mon Sep 17 00:00:00 2001
+From: Shahed Shaikh <shahedx.shaikh@intel.com>
+Date: Wed, 6 May 2020 09:52:00 +0800
+Subject: [PATCH] DRV_DPM_SW-181: DPM use wrapper API instead of directly
+ spin_lock API call
+
+- use wrapper to declare, define and hold locks
+- remove unused locks
+
+Signed-off-by: Shahed Shaikh <shahedx.shaikh@intel.com>
+---
+ drivers/net/datapath/dpm/datapath.h              |  8 ++++++--
+ drivers/net/datapath/dpm/datapath_tx.c           | 20 ++++++++++++++------
+ drivers/net/datapath/dpm/gswip31/datapath_coc.c  | 10 ----------
+ drivers/net/datapath/dpm/gswip31/datapath_mib.c  |  2 --
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c |  6 +++---
+ drivers/net/datapath/dpm/gswip31/datapath_misc.h |  6 +++++-
+ drivers/net/datapath/dpm/gswip31/datapath_tx.c   |  4 ++--
+ 7 files changed, 30 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index a4ac7dc239e7..6e8620b6ec0f 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -120,17 +120,21 @@ static inline bool is_invalid_inst(unsigned int inst)
+ #define DP_SPIN_LOCK
+ #endif
+ #ifdef DP_SPIN_LOCK
++#define DP_LOCK_T spinlock_t
++#define DP_LOCK_INIT(lock) spin_lock_init(lock)
+ #define DP_DEFINE_LOCK(lock) DEFINE_SPINLOCK(lock)
+ #define DP_LIB_LOCK    spin_lock_bh
+ #define DP_LIB_UNLOCK  spin_unlock_bh
+-extern spinlock_t dp_lock;
+ #else
++#define DP_LOCK_T struct mutex
++#define DP_LOCK_INIT(lock) mutex_init(lock)
+ #define DP_DEFINE_LOCK(lock) DEFINE_MUTEX(lock)
+ #define DP_LIB_LOCK    mutex_lock
+ #define DP_LIB_UNLOCK  mutex_unlock
+-extern struct mutex dp_lock;
+ #endif
+ 
++extern DP_LOCK_T dp_lock;
++
+ #define PARSER_FLAG_SIZE   40
+ #define PARSER_OFFSET_SIZE 8
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_tx.c b/drivers/net/datapath/dpm/datapath_tx.c
+index b4b2c8adeb01..30bddad87bba 100644
+--- a/drivers/net/datapath/dpm/datapath_tx.c
++++ b/drivers/net/datapath/dpm/datapath_tx.c
+@@ -36,6 +36,10 @@ struct tx_hook_list {
+ 	u8 cnt;
+ };
+ 
++#define DP_TX_CTX_LOCK_T	spinlock_t
++#define DP_TX_CTX_LOCK		spin_lock_bh
++#define DP_TX_CTX_UNLOCK	spin_unlock_bh
++#define DP_TX_CTX_LOCK_INIT	spin_lock_init
+ /**
+  * struct dp_tx_context - datapath TX runtime
+  * @lock: Lock to pretect concurrent update
+@@ -43,7 +47,7 @@ struct tx_hook_list {
+  * @stored: TX lists for updater
+  */
+ struct dp_tx_context {
+-	spinlock_t lock;
++	DP_TX_CTX_LOCK_T lock;
+ 	struct tx_hook_list __rcu *en;
+ 	struct tx_stored stored[DP_TX_CNT];
+ };
+@@ -213,8 +217,6 @@ int dp_tx_update_list(void)
+ 				GFP_ATOMIC);
+ 	if (!new_data)
+ 		return -ENOMEM;
+-	/* add spin lock to protect modules update TX list concurrently */
+-	spin_lock(&ctx->lock);
+ 	for (i = 0; i < DP_TX_CNT; i++) {
+ 		const struct tx_stored *s = &ctx->stored[i];
+ 		bool en = s->preprocess_always_enabled || s->process.cb;
+@@ -231,7 +233,6 @@ int dp_tx_update_list(void)
+ 	new_data->cnt = cnt;
+ 	old_data = rcu_access_pointer(ctx->en);
+ 	rcu_assign_pointer(ctx->en, new_data);
+-	spin_unlock(&ctx->lock);
+ 
+ 	if (old_data)
+ 		kfree_rcu(old_data, rcu_head);
+@@ -292,12 +293,14 @@ int dp_tx_init(int inst)
+ 				 GFP_ATOMIC);
+ 	if (!dp_tx_ctx)
+ 		return -ENOMEM;
+-	spin_lock_init(&dp_tx_ctx->lock);
++	DP_TX_CTX_LOCK_INIT(&dp_tx_ctx->lock);
+ 	return 0;
+ }
+ 
+ int dp_register_tx(enum DP_TX_PRIORITY priority, tx_fn fn, void *priv)
+ {
++	int ret;
++
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("%s failed: datapath not initialized yet\n", __func__);
+ 		return DP_FAILURE;
+@@ -305,7 +308,12 @@ int dp_register_tx(enum DP_TX_PRIORITY priority, tx_fn fn, void *priv)
+ 
+ 	if (!dp_tx_ctx)
+ 		return -ENOMEM;
++	/* add spin lock to protect modules update TX list concurrently */
++	DP_TX_CTX_LOCK(&dp_tx_ctx->lock);
+ 	dp_tx_register_process(priority, fn, priv);
+-	return dp_tx_update_list();
++	ret = dp_tx_update_list();
++	DP_TX_CTX_UNLOCK(&dp_tx_ctx->lock);
++
++	return ret;
+ }
+ EXPORT_SYMBOL(dp_register_tx);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_coc.c b/drivers/net/datapath/dpm/gswip31/datapath_coc.c
+index 2bd46ddebee8..516554fe1c4c 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_coc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_coc.c
+@@ -17,7 +17,6 @@
+ static struct timer_list dp_coc_timer;
+ static u32 polling_period;	/*seconds */
+ static int rmon_timer_en;
+-static spinlock_t dp_coc_lock;
+ 
+ /* threshold data for D0:D3 */
+ struct ltq_cpufreq_threshold rmon_threshold = { 0, 30, 20, 10 }; /*packets */
+@@ -71,15 +70,6 @@ static struct notifier_block dp_coc_cpufreq_notifier_block = {
+ 	.notifier_call = dp_coc_cpufreq_notifier
+ };
+ 
+-static inline void coc_lock(void)
+-{
+-}
+-
+-static inline void coc_unlock(void)
+-{
+-	spin_unlock_bh(&dp_coc_lock);
+-}
+-
+ struct ltq_cpufreq_module_info dp_coc_feature_fss = {
+ 	.name = "Datapath FSS",
+ 	.pmcuModule = DP_MODULE,
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_mib.c b/drivers/net/datapath/dpm/gswip31/datapath_mib.c
+index 2b4dad7dded0..35523c761cc3 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_mib.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_mib.c
+@@ -99,7 +99,6 @@ struct mibs_low_lvl_vap {
+ 
+ static u32 proc_mib_vap_start_id = 1;
+ static u32 proc_mib_vap_end_id = PMAC_MAX_NUM - 1;
+-static spinlock_t dp_mib_lock;
+ static unsigned long poll_interval = POLL_INTERVAL;
+ 
+ /*save port based lower level last mib counter
+@@ -335,7 +334,6 @@ int reset_gsw_itf(u8 ep)
+ 
+ int dp_mib_init(u32 flag)
+ {
+-	spin_lock_init(&dp_mib_lock);
+ 	memset(&aggregate_mib, 0, sizeof(aggregate_mib));
+ 	memset(&last, 0, sizeof(last));
+ 	memset(&last_vap, 0, sizeof(last_vap));
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 297f102a126b..f5d481a138fb 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -374,7 +374,7 @@ static void mib_init(u32 flag, int inst)
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_MIB)
+ 	dp_mib_init(0);
+ #endif
+-	spin_lock_init(&priv->dp_sw_tx_lock);
++	DP_TX_CB_LOCK_INIT(&priv->cb_lock);
+ 	gsw_mib_reset_31(0, 0); /* GSW O */
+ }
+ 
+@@ -2178,10 +2178,10 @@ int dp_get_reinsert_cnt_31(int inst, int dp_port, int vap, int flag,
+ 	struct dp_subif_info *sif = get_dp_port_subif(port_info, vap);
+ 	struct hal_priv *priv = HAL(inst);
+ 
+-	spin_lock_bh(&priv->dp_sw_tx_lock);
++	DP_TX_CB_LOCK(&priv->cb_lock);
+ 	memcpy(dp_reins_count, &sif->reins_cnt,	sizeof(*dp_reins_count));
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "Reinsert counters\n");
+-	spin_unlock_bh(&priv->dp_sw_tx_lock);
++	DP_TX_CB_UNLOCK(&priv->cb_lock);
+ 	return DP_SUCCESS;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.h b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+index b4a361cf1cac..b068079779a3 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.h
+@@ -93,6 +93,10 @@ struct ppv4_port_map_table {
+ };
+ 
+ struct pp_qos_dev;
++#define DP_TX_CB_LOCK_T		spinlock_t
++#define DP_TX_CB_LOCK		spin_lock_bh
++#define DP_TX_CB_UNLOCK		spin_unlock_bh
++#define DP_TX_CB_LOCK_INIT	spin_lock_init
+ struct hal_priv {
+ 	struct cqm_deq_stat deq_port_stat[MAX_CQM_DEQ];
+ 	struct pp_queue_stat qos_queue_stat[MAX_QUEUE];
+@@ -110,7 +114,7 @@ struct hal_priv {
+ 			 * to get physical queue id
+ 			 */
+ 	struct ppv4_port_map_table ppv4_port_map;/* PPV4 Ports table map */
+-	spinlock_t dp_sw_tx_lock;
++	DP_TX_CB_LOCK_T cb_lock;
+ };
+ 
+ static inline bool is_qid_valid(int q_id)
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_tx.c b/drivers/net/datapath/dpm/gswip31/datapath_tx.c
+index 559d1303ebfc..c9e74170f683 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_tx.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_tx.c
+@@ -105,7 +105,7 @@ static int dp_reinsert_pkt_cnt(struct pmac_port_info *dp_info, int vap, struct s
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "len=%d vap=%d\n", len, vap);
+ 	stats = &get_dp_port_subif(dp_info, vap)->reins_cnt;
+-	spin_lock_bh(&priv->dp_sw_tx_lock);
++	DP_TX_CB_LOCK(&priv->cb_lock);
+ 	if (len <= 64) {
+ 		stats->dp_64BytePkts++;
+ 	} else if ((len <= 127) && (len >= 65)) {
+@@ -121,7 +121,7 @@ static int dp_reinsert_pkt_cnt(struct pmac_port_info *dp_info, int vap, struct s
+ 	} else if (len >= 1519) {
+ 		stats->dp_OversizeGoodPkts++;
+ 	}
+-	spin_unlock_bh(&priv->dp_sw_tx_lock);
++	DP_TX_CB_UNLOCK(&priv->cb_lock);
+ 	return DP_SUCCESS;
+ }
+ 

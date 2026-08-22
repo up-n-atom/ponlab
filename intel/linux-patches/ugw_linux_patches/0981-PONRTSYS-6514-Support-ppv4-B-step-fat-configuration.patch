@@ -1,0 +1,803 @@
+From 3485ee14cb512302cdff0da626d970fde826248e Mon Sep 17 00:00:00 2001
+From: Elad Fernandes <elad.fernandes@intel.com>
+Date: Thu, 2 Jan 2020 11:52:50 +0200
+Subject: [PATCH] PONRTSYS-6514: Support ppv4 B-step fat configuration
+
+---
+ drivers/net/ppv4/pp-dev/pp_fpga.c                  |   4 +-
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      | 240 ++++++++++++++-------
+ .../net/ppv4/pp-hal/micro-controller/uc_debugfs.c  |  81 +++----
+ .../net/ppv4/pp-hal/micro-controller/uc_egr_mbox.c |   8 +-
+ .../net/ppv4/pp-hal/micro-controller/uc_internal.h |  15 +-
+ drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h |  49 ++++-
+ .../pp-hal/micro-controller/uc_shared_engines.h    |  14 +-
+ .../ppv4/pp-tools/init/pp_init_sequence_debugfs.c  |   4 +-
+ 8 files changed, 267 insertions(+), 148 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-dev/pp_fpga.c b/drivers/net/ppv4/pp-dev/pp_fpga.c
+index eefb21e7b708..fad56224e553 100644
+--- a/drivers/net/ppv4/pp-dev/pp_fpga.c
++++ b/drivers/net/ppv4/pp-dev/pp_fpga.c
+@@ -2,7 +2,7 @@
+  * Description: PP Device Driver (FPGA Config)
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018-2019 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #define pr_fmt(fmt) "[PP_FPGA]:%s:%d: " fmt, __func__, __LINE__
+ 
+@@ -167,7 +167,7 @@ void pp_fpga_cfg_get(struct pp_dts_cfg *cfg)
+ 	cfg->uc_params.egr.cpus.cpu_prof[0] = 1;
+ 	cfg->uc_params.egr.cpus.cpu_prof[1] = 2;
+ 	cfg->uc_params.egr.cpus.cpu_prof[2] = 3;
+-	cfg->uc_params.egr.cpus.cpu_prof[3] = 5;
++	cfg->uc_params.egr.cpus.cpu_prof[3] = 4;
+ 	cfg->uc_params.egr.bm_base          = PP_BMGR_POP_PUSH_ADDR;
+ 	cfg->uc_params.egr.qm_base          = PP_QMGR_PUSH_ADDR;
+ 	cfg->uc_params.egr.wred_base        = PP_WRED_QUERY_ADDR;
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 8745f8bd53bb..236fa00fe84f 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -2,7 +2,7 @@
+  * Description: PP micro-controllers
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2019 Intel Corporation
++ * Copyright (C) 2019-2020 Intel Corporation
+  */
+ 
+ #define pr_fmt(fmt) "[PP_UC]:%s:%d: " fmt, __func__, __LINE__
+@@ -12,7 +12,6 @@
+ #include <linux/device.h>
+ #include <linux/types.h>
+ #include <linux/bitops.h>
+-#include <linux/log2.h> /* is_power_of_2 */
+ #include <linux/pp_api.h>
+ 
+ #include "elf_parser.h"
+@@ -28,67 +27,78 @@
+ /**
+  * @define egress elf file name
+  */
+-#define UC_A_EGR_ELF           "egress_uc_v1.elf"
+-#define UC_B_EGR_ELF           "egress_uc_v2.elf"
++#define UC_A_EGR_ELF       "egress_uc_v1.elf"
++#define UC_B_EGR_ELF       "egress_uc_v2.elf"
+ /**
+  * @define ingress elf file name
+  */
+-#define UC_A_ING_ELF           "ingress_uc_v1.elf"
+-#define UC_B_ING_ELF           "ingress_uc_v2.elf"
++#define UC_A_ING_ELF       "ingress_uc_v1.elf"
++#define UC_B_ING_ELF       "ingress_uc_v2.elf"
+ /**
+  * @define maximum number of elf sections
+  */
+-#define UC_ELF_SEC_MAX             32
++#define UC_ELF_SEC_MAX     32
+ /**
+  * @define convert elf section address to offset
+  */
+-#define UC_ELF_ADDR2OFF(a)         ((a) & 0xFFFF)
++#define UC_ELF_ADDR2OFF(a) ((a) & 0xFFFF)
+ /**
+  * @define boot done value is written by the uc
+  */
+-#define UC_BOOT_DONE_VAL           0x20
++#define UC_BOOT_DONE_VAL   0x20
+ /**
+  * @define ccu done value is written by the uc
+  */
+-#define UC_CCU_DONE_VAL            1
++#define UC_CCU_DONE_VAL    1
+ /**
+  * @define turn on value
+  */
+-#define UC_TURN_ON_VAL             1
++#define UC_TURN_ON_VAL     1
+ /**
+  * @define MSB nibble of the PP mem-space when accessing from uc
+  */
+-#define UC_PP_ADDR_MSB             0xA
++#define UC_PP_ADDR_MSB     UC_A_PP_FAT_ENT
+ /**
+  * @define convert the phy-address from host perspective to uc
+  *         perspective
+  */
+-#define UC_PP_ADDR(a)              ((UC_PP_ADDR_MSB << 28) | (0x0FFFFFFF & (a)))
++#define UC_PP_ADDR(a)      ((UC_PP_ADDR_MSB << 28) | (0x0FFFFFFF & (a)))
+ 
+-#define UC_LOGGER_BUFF_SZ          (sizeof(struct uc_log_msg) * 512)
++#define UC_LOGGER_BUFF_SZ  (sizeof(struct uc_log_msg) * 512)
+ 
+ /**
+  * @brief UC init info
+  */
+ struct eg_uc_init_info {
+-	u32 logger_buff;    /* logger buffer base address  */
+-	u32 logger_buff_sz; /* logger buffer size in bytes */
+-	u32 chk_base;       /* checker base address */
++	/*! logger buffer base address  */
++	u32 logger_buff;
++	/*! logger buffer size in bytes */
++	u32 logger_buff_sz;
++	/* checker base address */
++	u32 chk_base;
+ };
+ 
+ /**
+  * @brief Reassembly network function parameters for the FW
+  */
+ struct reassembly_info {
+-	u8  host_base_policy;   /*! host base policy */
+-	u8  host_policies_bmap; /*! host policies bitmap */
+-	u8  host_pid;           /*! host pid */
++	/*! host base policy */
++	u8  host_base_policy;
++	/*! host policies bitmap */
++	u8  host_policies_bmap;
++	/*! host pid */
++	u8  host_pid;
+ 	u8  reserved;
+-	u16 host_q;       /*! host queue to send packets to host upon failure */
+-	u16 pp_rx_q;      /*! 2nd round queue                                 */
+-	u32 excp_si_base; /*! exception si base address                       */
+-	u32 rxdma_base;   /*! rxdma regs base for calculating buffer size     */
+-	u32 si_base;      /*! si base address                                 */
++	/*! host queue to send packets to host upon failure */
++	u16 host_q;
++	/*! 2nd round queue */
++	u16 pp_rx_q;
++	/*! exception si base address */
++	u32 excp_si_base;
++	/*! rxdma regs base for calculating buffer size */
++	u32 rxdma_base;
++	/*! si base address */
++	u32 si_base;
+ };
+ 
+ /**
+@@ -139,7 +149,7 @@ static u32 tdox_state_arr_offset;
+  * @define base address for the tx manager add packet credit
+  *         register per port.
+  */
+-#define UC_TXMGR_CRED_INC_ADDR(p)  (txm_cred_base + 8 + ((p) << 4))
++#define UC_TXMGR_CRED_INC_ADDR(p) (txm_cred_base + 8 + ((p) << 4))
+ 
+ /**
+  * @brief valid bitmap for the egress cluster, pit per cpu
+@@ -157,24 +167,6 @@ static u8 in_cpu_valid_bmap;
+  * @brief active bitmap for the ingress cluster, pit per cpu
+  */
+ static u8 in_cpu_act_bmap;
+-/**
+- * @brief this array described egress cluster bridge fat
+- *        configuration
+- */
+-struct uc_fat_ent eg_fat[UC_CLUSTERBRIDGE_FAT_MAX_ENT] = {
+-	{true, 0x0}, {true, 0x1}, {true, 0x2}, {true, 0x3}, {true, 0x4},
+-	{true, 0x5}, {true, 0x6}, {true, 0x7}, {true, 0x8}, {true, 0x9},
+-	{true, 0xF}, {false, 0x0}, {false, 0x0}, {false, 0x0}, {false, 0x0},
+-	{false, 0x0} };
+-/**
+- * @brief this array described ingress cluster bridge fat
+- *        configuration
+- */
+-struct uc_fat_ent in_fat[UC_CLUSTERBRIDGE_FAT_MAX_ENT] = {
+-	{false, 0x0}, {false, 0x0}, {false, 0x0}, {false, 0x0}, {false, 0x0},
+-	{false, 0x0}, {false, 0x0}, {false, 0x0}, {false, 0x0}, {false, 0x0},
+-	{true, 0xF}, {false, 0x0}, {false, 0x0}, {false, 0x0}, {false, 0x0},
+-	{false, 0x0} };
+ 
+ static inline void __uc_cpu_active_set(bool uc_is_egr, u32 cid, bool enable);
+ 
+@@ -203,7 +195,7 @@ bool uc_is_cpu_valid(bool uc_is_egr, u32 cid)
+ 	if (likely(valid_bmap & BIT(cid)))
+ 		return true;
+ 
+-	pr_err("invalid uc %s cpu %u\n", uc_is_egr ? "EGRESS" : "INGRESS", cid);
++	pr_err("invalid %s cpu %u\n", uc_is_egr ? "EGRESS" : "INGRESS", cid);
+ 	return false;
+ }
+ 
+@@ -217,8 +209,7 @@ bool uc_is_cpu_active(bool uc_is_egr, u32 cid)
+ 	if (likely(act_bmap & BIT(cid)))
+ 		return true;
+ 
+-	pr_err("inactive uc %s cpu %u\n", uc_is_egr ? "EGRESS" : "INGRESS",
+-	       cid);
++	pr_err("inactive %s cpu %u\n", uc_is_egr ? "EGRESS" : "INGRESS", cid);
+ 	return false;
+ }
+ 
+@@ -465,61 +456,113 @@ s32 uc_reader_irr_get(bool uc_is_egr, u32 *irr_bitmap)
+ 	return 0;
+ }
+ 
+-s32 uc_cluster_bridge_fat_get(bool uc_is_egr, u32 ent, u32 *val)
++s32 uc_fat_get(bool uc_is_egr, u32 ent, u32 *val, bool *enable)
+ {
+ 	u64 reg;
++	u32 max_ent;
+ 
+-	if (unlikely(ptr_is_null(val)))
++	if (unlikely(ptr_is_null(val) || ptr_is_null(enable)))
+ 		return -EINVAL;
+ 
+ 	if (unlikely(!uc_is_cluster_valid(uc_is_egr)))
+ 		return -EPERM;
+ 
+-	if (unlikely(ent >= UC_CLUSTERBRIDGE_FAT_MAX_ENT))
++	if (pp_silicon_step_get() == PP_SSTEP_A)
++		max_ent = UC_A_FAT_MAX_ENT;
++	else
++		max_ent = UC_B_FAT_ALL_MAX_ENT;
++
++	if (unlikely(ent >= max_ent)) {
++		pr_err("invalid %s cluster fat entry %u\n",
++		       uc_is_egr ? "EGRESS" : "INGRESS", ent);
+ 		return -EINVAL;
++	}
+ 
+ 	if (pp_silicon_step_get() == PP_SSTEP_A) {
+ 		if (uc_is_egr)
+ 			reg = UC_A_CLUSTERBRIDGE_FAT(EGRESS, ent);
+ 		else
+ 			reg = UC_A_CLUSTERBRIDGE_FAT(INGRESS, ent);
++		*val = PP_FIELD_GET(UC_A_FAT_VAL_MSK, PP_REG_RD32(reg));
++		*enable = PP_FIELD_GET(UC_A_FAT_EN_MSK, PP_REG_RD32(reg));
+ 	} else {
+-		/* TBD */
+-		return 0;
++		if (uc_is_egr) {
++			reg = UC_B_CLUSTERBRIDGE_VALID(EGRESS, ent);
++			*enable = PP_FIELD_GET(UC_B_FAT_EN_MSK,
++					       PP_REG_RD32(reg));
++			if (ent < UC_B_FAT_MAX_ENT ) {
++				reg = UC_B_CLUSTERBRIDGE_FAT(EGRESS, ent);
++				*val = PP_FIELD_GET(UC_B_FAT_VAL_MSK,
++						    PP_REG_RD32(reg));
++			} else {
++				ent -= UC_B_FAT_MAX_ENT;
++				reg = UC_B_CLUSTERBRIDGE_BASE(EGRESS, ent);
++				*val = PP_REG_RD32(reg);
++			}
++		} else {
++			reg = UC_B_CLUSTERBRIDGE_VALID(INGRESS, ent);
++			*enable = PP_FIELD_GET(UC_B_FAT_EN_MSK,
++					       PP_REG_RD32(reg));
++			if (ent < UC_B_FAT_MAX_ENT ) {
++				reg = UC_B_CLUSTERBRIDGE_FAT(INGRESS, ent);
++				*val = PP_FIELD_GET(UC_B_FAT_VAL_MSK,
++						    PP_REG_RD32(reg));
++			} else {
++				ent -= UC_B_FAT_MAX_ENT;
++				reg = UC_B_CLUSTERBRIDGE_BASE(INGRESS, ent);
++				*val = PP_REG_RD32(reg);
++			}
++		}
+ 	}
+ 
+-	*val = PP_FIELD_GET(UC_CLUSTERBRIDGE_FAT_MSK, PP_REG_RD32(reg));
+-
+ 	return 0;
+ }
+ 
+-s32 uc_cluster_bridge_fat_set(bool uc_is_egr, u32 ent, u8 val, bool enable)
++s32 uc_fat_set(bool uc_is_egr, u8 ent, u32 val, bool enable)
+ {
+-	u32 reg;
++	u32 max_ent;
+ 
+ 	if (unlikely(!uc_is_cluster_valid(uc_is_egr)))
+ 		return -EPERM;
+ 
+-	if (unlikely(ent >= UC_CLUSTERBRIDGE_FAT_MAX_ENT)) {
++	if (pp_silicon_step_get() == PP_SSTEP_A) {
++		max_ent = UC_A_FAT_MAX_ENT;
++		val &= UC_A_FAT_VAL_MSK;
++	} else {
++		max_ent = UC_B_FAT_ALL_MAX_ENT;
++	}
++
++	if (unlikely(ent >= max_ent)) {
+ 		pr_err("invalid %s cluster fat entry %u\n",
+ 		       uc_is_egr ? "EGRESS" : "INGRESS", ent);
+ 		return -EINVAL;
+ 	}
+ 
+-	if (enable)
+-		reg = PP_FIELD_PREP(UC_CLUSTERBRIDGE_FAT_MSK, 0x100 + val);
+-	else
+-		reg = PP_FIELD_PREP(UC_CLUSTERBRIDGE_FAT_MSK, 0);
+-
+-	/* enable/disable the bridge fat */
++	/* enable/disable the cluster bridge fat */
+ 	if (pp_silicon_step_get() == PP_SSTEP_A) {
++		val |= enable << UC_A_FAT_EN_BIT_SHIFT;
+ 		if (uc_is_egr)
+-			PP_REG_WR32(UC_A_CLUSTERBRIDGE_FAT(EGRESS, ent), reg);
++			PP_REG_WR32(UC_A_CLUSTERBRIDGE_FAT(EGRESS, ent), val);
+ 		else
+-			PP_REG_WR32(UC_A_CLUSTERBRIDGE_FAT(INGRESS, ent), reg);
++			PP_REG_WR32(UC_A_CLUSTERBRIDGE_FAT(INGRESS, ent), val);
+ 	} else {
+-		/* TBD */
+-		return 0;
++		if (uc_is_egr) {
++			PP_REG_WR32(UC_B_CLUSTERBRIDGE_VALID(EGRESS, ent), enable);
++			if (ent < UC_B_FAT_MAX_ENT ) {
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_FAT(EGRESS, ent), val);
++			} else {
++				ent -= UC_B_FAT_MAX_ENT;
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_BASE(EGRESS, ent), val);
++			}
++		} else {
++			PP_REG_WR32(UC_B_CLUSTERBRIDGE_VALID(INGRESS, ent), enable);
++			if (ent < UC_B_FAT_MAX_ENT ) {
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_FAT(INGRESS, ent), val);
++			} else {
++				ent -= UC_B_FAT_MAX_ENT;
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_BASE(INGRESS, ent), val);
++			}
++		}
+ 	}
+ 
+ 	return 0;
+@@ -737,24 +780,63 @@ static s32 __uc_cluster_verify(bool uc_is_egr, u32 max_cpu)
+ }
+ 
+ /**
+- * @brief set the uc cluster memory access by configuring the
+- *        bridge fat
++ * @brief set the default uc cluster bridge fat configuration
++ *        for A-step
+  * @param uc_is_egr select the uc cluster
+  * @return s32 0 on success, error code otherwise
+  */
+-static s32 __uc_cluster_mem_access_set(bool uc_is_egr)
++static s32 __uc_cluster_bridge_a_default_set(bool uc_is_egr)
++{
++	s32 ret;
++	u32 i;
++
++	if (unlikely(!uc_is_cluster_valid(uc_is_egr)))
++		return -EPERM;
++
++	/* open all entries for 32bit access */
++	for (i = 0; i < UC_A_FAT_MAX_ENT; i++) {
++		if (i == UC_A_PP_FAT_ENT)
++			ret = uc_fat_set(uc_is_egr, i, UC_A_PP_FAT_VAL, 1);
++		else
++			ret = uc_fat_set(uc_is_egr, i, i, 1);
++		if (unlikely(ret))
++			return ret;
++	}
++
++	return 0;
++}
++
++/**
++ * @brief set the default uc cluster bridge fat configuration
++ *        for B-step
++ * @param uc_is_egr select the uc cluster
++ * @return s32 0 on success, error code otherwise
++ */
++static s32 __uc_cluster_bridge_b_default_set(bool uc_is_egr)
+ {
+ 	s32 ret;
+ 	u32 i;
+-	struct uc_fat_ent *fat_e = uc_is_egr ? eg_fat : in_fat;
+ 
+ 	if (unlikely(!uc_is_cluster_valid(uc_is_egr)))
+ 		return -EPERM;
+ 
+-	/* enable access for DDR */
+-	for (i = 0; i < UC_CLUSTERBRIDGE_FAT_MAX_ENT; i++) {
+-		ret = uc_cluster_bridge_fat_set(uc_is_egr, i, fat_e[i].val,
+-						fat_e[i].enable);
++	/* open all fat entries for 32bit access */
++	for (i = 0; i < UC_B_FAT_MAX_ENT; i++) {
++		if (i >= UC_B_PP_FAT_ENT_BASE && i <
++		    UC_B_PP_FAT_ENT_BASE + UC_B_PP_FAT_NUM_ENT) {
++			/* open the ppv4 access */
++			ret = uc_fat_set(uc_is_egr, i, UC_B_PP_FAT_VAL_BASE +
++					 i - UC_B_PP_FAT_ENT_BASE, 1);
++		} else {
++			ret = uc_fat_set(uc_is_egr, i, i, 1);
++		}
++		if (unlikely(ret))
++			return ret;
++	}
++
++	/* open all spacial fat entries for 32bit access */
++	for (; i < UC_B_FAT_ALL_MAX_ENT; i++) {
++		ret = uc_fat_set(uc_is_egr, i, i << 22, 1);
+ 		if (unlikely(ret))
+ 			return ret;
+ 	}
+@@ -762,6 +844,14 @@ static s32 __uc_cluster_mem_access_set(bool uc_is_egr)
+ 	return 0;
+ }
+ 
++static s32 __uc_cluster_mem_access_set(bool uc_is_egr)
++{
++	if (pp_silicon_step_get() == PP_SSTEP_A)
++		return __uc_cluster_bridge_a_default_set(uc_is_egr);
++	else
++		return __uc_cluster_bridge_b_default_set(uc_is_egr);
++}
++
+ /**
+  * @brief set the uc shared accelerators
+  * @param cfg uc init parameters
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c b/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c
+index 98a9f0710306..6c1adf4d1fa4 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c
+@@ -2,7 +2,7 @@
+  * Description: PP micro-controllers Debug FS Interface
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2019 Intel Corporation
++ * Copyright (C) 2019-2020 Intel Corporation
+  */
+ 
+ #define pr_fmt(fmt) "[PP_UC_DBG]:%s:%d: " fmt, __func__, __LINE__
+@@ -20,6 +20,7 @@
+ #include "pp_common.h"
+ #include "pp_regs.h"
+ #include "pp_debugfs_common.h"
++#include "infra.h"
+ #include "uc.h"
+ #include "uc_regs.h"
+ #include "uc_internal.h"
+@@ -168,7 +169,7 @@ static void uc_dbg_fat_set(char *cmd_buf, void *data)
+ 		return;
+ 	}
+ 
+-	ret = uc_cluster_bridge_fat_set(!!uc_type, ent, val, !!en);
++	ret = uc_fat_set(!!uc_type, ent, val, !!en);
+ 	if (unlikely(ret)) {
+ 		pr_err("failed to set the cluster bridge fat\n");
+ 		return;
+@@ -181,47 +182,47 @@ static void uc_dbg_fat_set(char *cmd_buf, void *data)
+ 
+ static void uc_dbg_fat_show(struct seq_file *f)
+ {
+-	u32 i, fat_ent[UC_CLUSTERBRIDGE_FAT_MAX_ENT] = { 0 };
+-	bool print_title;
+-	u8 uc_types = 2;
+-
+-	if (unlikely(!uc_is_cluster_valid(UC_IS_EGR) &&
+-		     !uc_is_cluster_valid(UC_IS_ING))) {
+-		seq_puts(f, "uc clusters are disabled\n");
+-		return;
+-	}
+-
+-	while (uc_types--) {
+-		print_title = true;
+-
+-		if (unlikely(!uc_is_cluster_valid(!!uc_types)))
+-			continue;
+-
+-		seq_puts(f, "\n");
+-		for (i = 0; i < ARRAY_SIZE(fat_ent); i++) {
+-			if (uc_cluster_bridge_fat_get(!!uc_types, i,
+-						      &fat_ent[i])) {
+-				seq_printf(f, "failed to get the %s fat entry %u\n",
+-					   uc_types ? "EGRESS" : "INGRESS", i);
++	u32 i, max_ent, val;
++	bool enable;
++
++	if (pp_silicon_step_get() == PP_SSTEP_A)
++		max_ent = UC_A_FAT_MAX_ENT;
++	else
++		max_ent = UC_B_FAT_ALL_MAX_ENT;
++
++	if (uc_is_cluster_valid(UC_IS_EGR)) {
++		seq_puts(f, " +-------------------------------+\n");
++		seq_puts(f, " | EGRESS CLUSTER BRIDGE FAT     |\n");
++		seq_puts(f, " +-------------------------------+\n");
++		seq_puts(f, " | ENTRY | IS_ENABLE |   VALUE   |\n");
++		seq_puts(f, " +-------+-----------+-----------+\n");
++
++		for (i = 0; i < max_ent; i++) {
++			if (uc_fat_get(UC_IS_EGR, i, &val, &enable)) {
++				seq_printf(f, "failed to get fat ent %u\n", i);
+ 				break;
+ 			}
+-
+-			if (!(fat_ent[i] & 0x100))
+-				continue;
+-
+-			if (print_title) {
+-				seq_puts(f, " +--------------------------------------------+\n");
+-				seq_printf(f, " |         %-7s CLUSTER BRIDGE FAT         |\n",
+-					   uc_types ? "EGRESS" : "INGRESS");
+-				seq_puts(f, " +--------------------------------------------+\n");
+-				seq_puts(f, " | ENTRY |         MEM-RANGE          | VALUE |\n");
+-				seq_puts(f, " +-------+----------------------------+-------+\n");
+-				print_title = false;
++			seq_printf(f, " | 0x%-2X  | %-9s | 0x%-8X|\n",
++				   i, BOOL2EN(enable), val);
++			seq_puts(f, " +-------+-----------+-----------+\n");
++		}
++	}
++	seq_puts(f, "\n");
++	if (uc_is_cluster_valid(UC_IS_ING)) {
++		seq_puts(f, " +-------------------------------+\n");
++		seq_puts(f, " | INGRESS CLUSTER BRIDGE FAT    |\n");
++		seq_puts(f, " +-------------------------------+\n");
++		seq_puts(f, " | ENTRY | IS_ENABLE |   VALUE   |\n");
++		seq_puts(f, " +-------+-----------+-----------+\n");
++
++		for (i = 0; i < max_ent; i++) {
++			if (uc_fat_get(UC_IS_ING, i, &val, &enable)) {
++				seq_printf(f, "failed to get fat ent %u\n", i);
++				break;
+ 			}
+-			seq_printf(f, " | 0x%-3X |  0x%08X : 0x%08X   | 0x%-3X |\n",
+-				   i, i << 28, (i << 28) | 0xFFFFFFF,
+-				   fat_ent[i] & 0xFF);
+-			seq_puts(f, " +-------+----------------------------+-------+\n");
++			seq_printf(f, " | 0x%-2X  | %-9s | 0x%-8X|\n",
++				   i, BOOL2EN(enable), val);
++			seq_puts(f, " +-------+-----------+-----------+\n");
+ 		}
+ 	}
+ 	seq_puts(f, "\n");
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_egr_mbox.c b/drivers/net/ppv4/pp-hal/micro-controller/uc_egr_mbox.c
+index 724718c73931..b3796266a5c1 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_egr_mbox.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_egr_mbox.c
+@@ -194,7 +194,7 @@ s32 uc_egr_mbox_cmd_send_buff(enum uc_mbox_cmd_type type, const u32 *buff,
+ 			      u16 len)
+ {
+ 	u32 flags = UC_MBOX_MSG_FLAG_DATA_MSK;
+-	s32 ret;
++	s32 i, ret;
+ 
+ 	pr_debug("uc mbox cmd %u, buff %ps, len %hu\n", (u32)type, buff, len);
+ 
+@@ -206,7 +206,8 @@ s32 uc_egr_mbox_cmd_send_buff(enum uc_mbox_cmd_type type, const u32 *buff,
+ 
+ 	__mbox_lock();
+ 	/* copy data to FW buffer */
+-	DDR_RD_REP(buff, mbox_buf_virt, len);
++	for (i = 0; i < (len >> 2); i++, buff++)
++		DDR_WR32(mbox_buf_virt + i * 4, *buff);
+ 	/* cache flush/evict */
+ 	if (IS_ENABLED(CONFIG_OF))
+ 		dma_map_single(pp_dev_get(), mbox_buf_virt, len, DMA_TO_DEVICE);
+@@ -270,6 +271,9 @@ s32 uc_egr_mbox_init(void)
+ 	/* init lock */
+ 	spin_lock_init(&mbox_lock);
+ 
++	if (pp_silicon_step_get() != PP_SSTEP_A)
++		PP_REG_WR32(UC_EGR_B_WRITER_PORT_ENABLE(UC_MBOX_PORT), 1);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+index a821b240fa59..7822adadfe91 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+@@ -2,7 +2,7 @@
+  * Description: PP micro-comtroller internal definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2019 Intel Corporation
++ * Copyright (C) 2019-2020 Intel Corporation
+  */
+ 
+ #ifndef __PP_UC_INTERNAL_H__
+@@ -58,14 +58,6 @@ struct uc_log_msg {
+ 	char func[16];
+ };
+ 
+-/**
+- * @struct uc_fat_ent
+- */
+-struct uc_fat_ent {
+-	bool enable; /*! if entry is enabled */
+-	u8   val;    /*! value to replace    */
+-};
+-
+ /**
+  * @enum uc_egr_port
+  * @brief uc egress port type
+@@ -155,9 +147,10 @@ s32 uc_ccu_maxcpus_get(bool uc_is_egr, u8 *max_cpus);
+  * @param uc_is_egr select the uc cluster
+  * @param ent fat entry index
+  * @param val fat entry value
++ * @param enable fat entry state
+  * @return s32 0 on success, error code otherwise
+  */
+-s32 uc_cluster_bridge_fat_get(bool uc_is_egr, u32 ent, u32 *val);
++s32 uc_fat_get(bool uc_is_egr, u32 ent, u32 *val, bool *enable);
+ 
+ /**
+  * @brief set the cluster bridge fat entry value
+@@ -167,7 +160,7 @@ s32 uc_cluster_bridge_fat_get(bool uc_is_egr, u32 ent, u32 *val);
+  * @param enable enable/disable the entry
+  * @return s32 0 on success, error code otherwise
+  */
+-s32 uc_cluster_bridge_fat_set(bool uc_is_egr, u32 ent, u8 val, bool enable);
++s32 uc_fat_set(bool uc_is_egr, u8 ent, u32 val, bool enable);
+ 
+ /**
+  * @brief get the cluster reader interrupt request register
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h
+index 316268ae1b7e..015013af67fa 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h
+@@ -2,7 +2,7 @@
+  * Description: PP micro-comtroller definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2019 Intel Corporation
++ * Copyright (C) 2019-2020 Intel Corporation
+  */
+ 
+ #ifndef __PP_UC_REGS_H__
+@@ -265,12 +265,15 @@ extern u64 uc_ing_base_addr;
+ #define UC_A_READER_MB_BUSY(t, n)      UC_SHRD_REG_IDX(t, READER_A, MB_BUSY, n)
+ #define UC_B_READER_MB_BUSY(t, n)      UC_SHRD_REG_IDX(t, READER_B, MB_BUSY, n)
+ 
++#define UC_B_WRITER_PORT_SPEC(t, x, y)\
++	(UC_SHRD_REG(t, WRITER_B, PORT_SPEC) | (((x) * 12) + ((y) << 2)))
++
+ /***** WRITER EGRESS REGISTERS *****/
+ /* WRITER_TX_PORT */
+ #define UC_EGR_A_WRITER_TX_PORT(p)  \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, TX_PORT, p)
+ #define UC_EGR_B_WRITER_TX_PORT(p)     \
+-	UC_SHRD_REG_IDX_IDX(EGRESS, WRITER_B, PORT_SPEC, p, 1)
++	UC_B_WRITER_PORT_SPEC(EGRESS, p, 1)
+ 
+ /* WRITER_PORT_ENABLE */
+ #define UC_EGR_A_WRITER_PORT_ENABLE(p) \
+@@ -282,29 +285,29 @@ extern u64 uc_ing_base_addr;
+ #define UC_EGR_A_WRITER_PORT_ADDR(p)  \
+ 	(UC_SHRD_REG(EGRESS, WRITER_A, PORT) | ((p) << 4))
+ #define UC_EGR_B_WRITER_PORT_ADDR(p)   \
+-	UC_SHRD_REG_IDX_IDX(EGRESS, WRITER_B, PORT_SPEC, p, 4)
++	UC_B_WRITER_PORT_SPEC(EGRESS, p, 4)
+ 
+ /***** WRITER MB EGRESS REGISTERS *****/
+ /* WRITER_MB_MESSAGE */
+ #define UC_EGR_MBOX_MSG0_WR_ADDRESS    \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, MB_MESSAGE, 0)
+ #define UC_EGR_B_MBOX_PORT_WR_ADDRESS(p)\
+-	UC_SHRD_REG_IDX_IDX(EGRESS, WRITER_B, PORT_SPEC, p, 2)
++	UC_B_WRITER_PORT_SPEC(EGRESS, p, 2)
+ 
+ #define UC_EGR_MBOX_MSG0_WR_LENGTH     \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, MB_MESSAGE, 1)
+ #define UC_EGR_B_MBOX_PORT_WR_LENGTH_FLAGS(p)\
+-	UC_SHRD_REG_IDX_IDX(EGRESS, WRITER_B, PORT_SPEC, p, 3)
++	UC_B_WRITER_PORT_SPEC(EGRESS, p, 3)
+ 
+ #define UC_EGR_MBOX_MSG0_WR_DATA0      \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, MB_MESSAGE, 2)
+ #define UC_EGR_B_MBOX_PORT_WR_DATA0(p) \
+-	UC_SHRD_REG_IDX_IDX(EGRESS, WRITER_B, PORT_SPEC, p, 0)
++	UC_B_WRITER_PORT_SPEC(EGRESS, p, 0)
+ 
+ #define UC_EGR_MBOX_MSG0_WR_DATA1      \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, MB_MESSAGE, 3)
+ #define UC_EGR_B_MBOX_PORT_WR_DATA1(p) \
+-	UC_SHRD_REG_IDX_IDX(EGRESS, WRITER_B, PORT_SPEC, p, 1)
++	UC_B_WRITER_PORT_SPEC(EGRESS, p, 1)
+ 
+ #define UC_EGR_MBOX_MSG0_WR_FLAGS      \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, MB_FLAGS,   0)
+@@ -316,7 +319,6 @@ extern u64 uc_ing_base_addr;
+ #define UC_EGR_B_MBOX_PORT_WR_STATUS(p)\
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_B, STATUS_SPEC, p)
+ 
+-
+ #define UC_EGR_MBOX_MSG1_WR_ADDRESS    \
+ 	UC_SHRD_REG_IDX(EGRESS, WRITER_A, MB_MESSAGE, 4)
+ #define UC_EGR_MBOX_MSG1_WR_LENGTH     \
+@@ -359,11 +361,36 @@ extern u64 uc_ing_base_addr;
+ #define UC_B_CCU_UC_CLK_EN_REG(t, c)   UC_SHRD_REG_IDX(t, CCU_B, UC_CLK_EN, c)
+ 
+ /**
+- * CLUSTER BRIDGE FAT
++ * CLUSTER BRIDGE FAT A-step
+  */
+-#define UC_CLUSTERBRIDGE_FAT_MAX_ENT   16
+-#define UC_CLUSTERBRIDGE_FAT_MSK       GENMASK(8, 0)
++#define UC_A_FAT_MAX_ENT               14
++#define UC_A_FAT_EN_BIT_SHIFT          8
++#define UC_A_PP_FAT_ENT                0xA
++#define UC_A_PP_FAT_VAL                0xF
++#define UC_A_FAT_VAL_MSK               GENMASK(7, 0)
++#define UC_A_FAT_EN_MSK                BIT(8)
+ #define UC_A_CLUSTERBRIDGE_FAT(t, x)   \
+ 	UC_SHRD_REG_IDX(t, CLUSTERBRIDGE_A, FAT, x)
+ 
++/**
++ * CLUSTER BRIDGE FAT B-step
++ */
++#define UC_B_FAT_MAX_ENT               48
++#define UC_B_FAT_BASE_MAX_ENT          8
++#define UC_B_FAT_ALL_MAX_ENT           (UC_B_FAT_BASE_MAX_ENT+UC_B_FAT_MAX_ENT)
++#define UC_B_PP_FAT_ENT_BASE           0x28
++#define UC_B_PP_FAT_VAL_BASE           0x3C
++#define UC_B_PP_FAT_NUM_ENT            4
++#define UC_B_FAT_VAL_MSK               GENMASK(9, 0)
++#define UC_B_FAT_EN_MSK                BIT(0)
++
++#define UC_B_CLUSTERBRIDGE_FAT(t, x)   \
++	UC_SHRD_REG_IDX(t, CLUSTERBRIDGE_B, FAT, x)
++
++#define UC_B_CLUSTERBRIDGE_VALID(t, x) \
++	UC_SHRD_REG_IDX(t, CLUSTERBRIDGE_B, VALID, x)
++
++#define UC_B_CLUSTERBRIDGE_BASE(t, x)  \
++	UC_SHRD_REG_IDX(t, CLUSTERBRIDGE_B, BASE, x)
++
+ #endif /* __PP_UC_REGS_H__ */
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_shared_engines.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_shared_engines.h
+index 2b4704e63a41..8dce141032ee 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_shared_engines.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_shared_engines.h
+@@ -2,7 +2,7 @@
+  * Description: PP micro-comtrollers shared accelerators definitions
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2019 Intel Corporation
++ * Copyright (C) 2019-2020 Intel Corporation
+  */
+ 
+ #ifndef __PP_UC_SHARED_ENGINES_H__
+@@ -150,13 +150,17 @@
+  * @define filter and address translation table[16]
+  */
+ #define CLUSTERBRIDGE_A_FAT       1
+-/**
+- * @define enable the access violation interrupt
+- */
+-#define CLUSTERBRIDGE_A_IER       2
+ /**
+  * @define interrupt request
+  */
+ #define CLUSTERBRIDGE_A_IRR       3
+ 
++/**
++ * @define filter and address translation table[48]
++ */
++#define CLUSTERBRIDGE_B_FAT       1
++#define CLUSTERBRIDGE_B_IRR       3
++#define CLUSTERBRIDGE_B_VALID     6
++#define CLUSTERBRIDGE_B_BASE      7
++
+ #endif /* __PP_UC_SHARED_ENGINES_H__ */
+diff --git a/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c b/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c
+index 7da09aa0df0b..38f935cbbfc0 100644
+--- a/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c
++++ b/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c
+@@ -4,7 +4,7 @@
+  * Debug Init sequence for PPv4
+  *
+  * SPDX-License-Identifier: GPL-2.0-only
+- * Copyright (C) 2018 Intel Corporation
++ * Copyright (C) 2018-2020 Intel Corporation
+  */
+ #include <linux/types.h>
+ #include <linux/init.h>
+@@ -150,7 +150,7 @@ static s32 __port_mng_init(void)
+ 	cfg.tx.pkt_only_en = false; /* packet+descriptor */
+ 	cfg.tx.seg_en = true;       /* segmentation enabled */
+ 	cfg.tx.prel2_en = false;    /* prel2 disabled */
+-	cfg.tx.wr_desc = true;      /* write descriptor */
++	cfg.tx.wr_desc = false;     /* write descriptor */
+ 
+ 	if (unlikely(pp_port_add(32, &cfg))) {
+ 		pr_err("pp_port_add failed, port%u\n", 32);

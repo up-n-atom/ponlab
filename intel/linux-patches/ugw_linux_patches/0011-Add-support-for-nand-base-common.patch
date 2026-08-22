@@ -1,0 +1,429 @@
+From 505601355cc34c9b85c7ddcc438d487da41c01d6 Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:37:45 +0800
+Subject: [PATCH] Add support for nand base common
+
+---
+ drivers/mtd/nand/Kconfig            |  48 ++++++++-
+ drivers/mtd/nand/Makefile           |   1 +
+ drivers/mtd/nand/nand_base.c        |  38 +++++++
+ drivers/mtd/nand/nand_on_die_ecc.c  | 203 ++++++++++++++++++++++++++++++++++++
+ include/linux/mtd/nand.h            |   1 +
+ include/linux/mtd/nand_ecc_on_die.h |  26 +++++
+ 6 files changed, 316 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/mtd/nand/Kconfig b/drivers/mtd/nand/Kconfig
+index b254090b8a1b..5023d1510291 100644
+--- a/drivers/mtd/nand/Kconfig
++++ b/drivers/mtd/nand/Kconfig
+@@ -37,6 +37,53 @@ config MTD_NAND_ECC_BCH
+ 	  ECC codes. They are used with NAND devices requiring more than 1 bit
+ 	  of error correction.
+ 
++config MTD_NAND_ON_DIE_ECC
++	bool "Support for On-Die-ECC Class of NAND Flashes"
++	default n
++	help
++		This enables the support for a class of NAND flashes with
++		on-die ECC capabilities (detection & correction)
++
++if MTD_NAND_ON_DIE_ECC
++
++config MTD_NAND_BENAND
++	bool "Support BENAND (embedded ECC NAND)"
++	default n
++	help
++		This enables support for BENAND, which is an SLC NAND flash
++		solution with embedded error correction code (ECC).
++		currently supports only 128bytes OOB type.
++		In the read sequence, "status read command" is executed to check
++		the ECC status after read data.
++		The write sequence is the same as raw write.
++
++config MTD_NAND_BENAND_ENABLE
++	bool "Support for Toshiba BENAND (Built-in ECC NAND)"
++	default y
++	depends on MTD_NAND_BENAND
++	help
++	  This enables support for Toshiba BENAND.
++	  Toshiba BENAND is a SLC NAND solution that automatically
++	  generates ECC inside NAND chip.
++
++config MTD_NAND_BENAND_ECC_STATUS
++	bool "Enable ECC Status Read Command(0x7A)"
++	depends on MTD_NAND_BENAND_ENABLE
++	help
++	  This enables support for ECC Status Read Command(0x7A) of BENAND.
++	  When this enables, report the real number of bitflips.
++	  In other cases, report the assumud number.
++
++config MTD_NAND_MXIC_ECC_FREE
++        bool "Support for MXIC ECC-Free NAND (Built-in ECC NAND)"
++        default n
++        help
++          This enables support for MXIC ECC-Free NAND.
++          MXIC ECC-free NAND is a SLC NAND solution that automatically
++          generates ECC inside NAND chip.
++
++endif #MTD_NAND_ON_DIE_ECC
++
+ config MTD_SM_COMMON
+ 	tristate
+ 	default n
+@@ -538,7 +585,6 @@ config MTD_NAND_FSMC
+ 
+ config MTD_NAND_XWAY
+ 	bool "Support for NAND on Lantiq XWAY SoC"
+-	depends on LANTIQ && SOC_TYPE_XWAY
+ 	help
+ 	  Enables support for NAND Flash chips on Lantiq XWAY SoCs. NAND is attached
+ 	  to the External Bus Unit (EBU).
+diff --git a/drivers/mtd/nand/Makefile b/drivers/mtd/nand/Makefile
+index cafde6f3d957..b5b7460aee3f 100644
+--- a/drivers/mtd/nand/Makefile
++++ b/drivers/mtd/nand/Makefile
+@@ -8,6 +8,7 @@ obj-$(CONFIG_MTD_NAND_BCH)		+= nand_bch.o
+ obj-$(CONFIG_MTD_NAND_IDS)		+= nand_ids.o
+ obj-$(CONFIG_MTD_SM_COMMON) 		+= sm_common.o
+ 
++obj-$(CONFIG_MTD_NAND_ON_DIE_ECC)       += nand_on_die_ecc.o
+ obj-$(CONFIG_MTD_NAND_CAFE)		+= cafe_nand.o
+ obj-$(CONFIG_MTD_NAND_AMS_DELTA)	+= ams-delta.o
+ obj-$(CONFIG_MTD_NAND_DENALI)		+= denali.o
+diff --git a/drivers/mtd/nand/nand_base.c b/drivers/mtd/nand/nand_base.c
+index bdf40c090acd..60d4956d6aa3 100644
+--- a/drivers/mtd/nand/nand_base.c
++++ b/drivers/mtd/nand/nand_base.c
+@@ -46,6 +46,11 @@
+ #include <linux/io.h>
+ #include <linux/mtd/partitions.h>
+ #include <linux/of.h>
++#include <linux/mtd/nand_ecc_on_die.h>
++
++#ifdef CONFIG_MTD_LTQ_SPINAND
++int spinand_flash_detect(struct mtd_info *mtd, struct nand_chip *chip);
++#endif /* CONFIG_MTD_LTQ_SPINAND */
+ 
+ static int nand_get_device(struct mtd_info *mtd, int new_state);
+ 
+@@ -3679,6 +3684,10 @@ static int nand_flash_detect_onfi(struct mtd_info *mtd, struct nand_chip *chip,
+ 		pr_warn("Could not retrieve ONFI ECC requirements\n");
+ 	}
+ 
++	/* On-die ECC ecc_bits will be zero */
++	if (!chip->ecc_strength_ds)
++		nand_on_die_ecc_init(mtd, p->manufacturer[0]);
++
+ 	if (p->jedec_id == NAND_MFR_MICRON)
+ 		nand_onfi_detect_micron(chip, p);
+ 
+@@ -3965,6 +3974,10 @@ static void nand_decode_ext_id(struct mtd_info *mtd, struct nand_chip *chip,
+ 			mtd->oobsize = 32 * mtd->writesize >> 9;
+ 		}
+ 
++		/* Check for on-chip ECC for Toshiba & MXIC flash. */
++		if (id_len >= 6 && (id_data[4] & 0x80) != 0)
++			nand_on_die_ecc_init(mtd, id_data[0]);
++
+ 	}
+ }
+ 
+@@ -4138,6 +4151,13 @@ static struct nand_flash_dev *nand_get_flash_type(struct mtd_info *mtd,
+ 		if (nand_flash_detect_jedec(mtd, chip, &busw))
+ 			goto ident_done;
+ 	}
++	#ifdef CONFIG_MTD_LTQ_SPINAND
++	type = spinand_flash_detect(mtd, chip);
++	if (type->name) {
++		busw = type->options & NAND_BUSWIDTH_16;
++		goto ident_done;
++	}
++	#endif /* CONFIG_MTD_LTQ_SPINAND */
+ 
+ 	if (!type->name)
+ 		return ERR_PTR(-ENODEV);
+@@ -4236,6 +4256,7 @@ static const char * const nand_ecc_modes[] = {
+ 	[NAND_ECC_HW]		= "hw",
+ 	[NAND_ECC_HW_SYNDROME]	= "hw_syndrome",
+ 	[NAND_ECC_HW_OOB_FIRST]	= "hw_oob_first",
++	[NAND_ECC_ON_DIE]	= "on-die",
+ };
+ 
+ static int of_get_nand_ecc_mode(struct device_node *np)
+@@ -4745,6 +4766,23 @@ int nand_scan_tail(struct mtd_info *mtd)
+ 		}
+ 		break;
+ 
++	case NAND_ECC_ON_DIE:
++		if (!IS_ENABLED(CONFIG_MTD_NAND_ON_DIE_ECC)) {
++			WARN(1, "Enable CONFIG_MTD_NAND_ON_DIE_ECC in Kernel to support this flash.\n");
++			return -EINVAL;
++		}
++		ecc->calculate = NULL;
++		if (!ecc->read_page)
++			ecc->read_page = nand_read_page_raw;
++		ecc->write_page = nand_write_page_raw;
++		ecc->read_page_raw = nand_read_page_raw;
++		ecc->write_page_raw = nand_write_page_raw;
++		ecc->read_oob = nand_read_oob_std;
++		ecc->write_oob = nand_write_oob_std;
++		ecc->bytes = 0;
++
++		break;
++
+ 	case NAND_ECC_NONE:
+ 		pr_warn("NAND_ECC_NONE selected by board driver. This is not recommended!\n");
+ 		ecc->read_page = nand_read_page_raw;
+diff --git a/drivers/mtd/nand/nand_on_die_ecc.c b/drivers/mtd/nand/nand_on_die_ecc.c
+new file mode 100644
+index 000000000000..ce9305f3fc05
+--- /dev/null
++++ b/drivers/mtd/nand/nand_on_die_ecc.c
+@@ -0,0 +1,203 @@
++/*
++ * This file provides functions for On-die ECC NAND flash support.
++ * This is tested on both Toshiba BENAND and MXIC ECC-Free NAND flashes
++ *
++ * (C) Copyright TOSHIBA CORPORATION 2013
++ * All Rights Reserved.
++ *
++ * (C) Copyright Intel Corporation  2017
++ * All Rights Reserved.
++ * Author: Brandon.yang@intel.com
++ * Authir: m.aliasthani@intel.com
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation; either version 2 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ */
++
++#include <linux/types.h>
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/slab.h>
++#include <linux/bitops.h>
++#include <linux/mtd/mtd.h>
++#include <linux/mtd/nand.h>
++#include <linux/mtd/nand_ecc_on_die.h>
++
++/* The ECC Bits Status for MXIC_MX30LF1GE8AB */
++#define NAND_ECC_STATUS_0_1_BIT_ERR	0x00
++#define NAND_ECC_STATUS_2_BIT_ERR	0x10
++#define NAND_ECC_STATUS_3_BIT_ERR	0x08
++#define NAND_ECC_STATUS_4_BIT_ERR	0x18
++
++/* Recommended to rewrite for BENAND */
++#define NAND_STATUS_RECOM_REWRT	0x08
++/* ECC Status Read Command */
++#define NAND_CMD_ECC_STATUS	0x7A
++
++static int nand_benand_status_chk(struct mtd_info *mtd, u8 *data,
++				u8 *rd_ecc, u8 *cal_ecc)
++{
++	unsigned int max_bitflips = 0;
++	struct nand_chip *chip = mtd_to_nand(mtd);
++	u8 status;
++
++	/* Check Read Status */
++	chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
++	status = chip->read_byte(mtd);
++
++	/* timeout */
++	if (!(status & NAND_STATUS_READY)) {
++		pr_debug("BENAND : Time Out!\n");
++		return -EIO;
++	}
++
++	/* uncorrectable */
++	else if (status & NAND_STATUS_FAIL)
++		mtd->ecc_stats.failed++;
++
++	/* correctable */
++	else if (status & NAND_STATUS_RECOM_REWRT) {
++		if (chip->cmd_ctrl &&
++			IS_ENABLED(CONFIG_MTD_NAND_BENAND_ECC_STATUS)) {
++
++			int i;
++			u8 ecc_status;
++			unsigned int bitflips;
++
++			/* Check Read ECC Status */
++			chip->cmd_ctrl(mtd, NAND_CMD_ECC_STATUS,
++				NAND_NCE | NAND_CLE | NAND_CTRL_CHANGE);
++			/* Get bitflips info per 512Byte */
++			for (i = 0; i < mtd->writesize >> 9; i++) {
++				ecc_status = chip->read_byte(mtd);
++				bitflips = ecc_status & 0x0f;
++				max_bitflips = max_t(unsigned int,
++						max_bitflips, bitflips);
++			}
++			mtd->ecc_stats.corrected += max_bitflips;
++		} else {
++			/*
++			 * If can't use chip->cmd_ctrl,
++			 * we can't get real number of bitflips.
++			 * So, we set max_bitflips mtd->bitflip_threshold.
++			 */
++			max_bitflips = mtd->bitflip_threshold;
++			mtd->ecc_stats.corrected += max_bitflips;
++		}
++	}
++
++	return max_bitflips;
++
++}
++
++static int nand_mxic_status_chk(struct mtd_info *mtd, u8 *data,
++				u8 *rd_ecc, u8 *cal_ecc)
++{
++	unsigned int max_bitflips = 0;
++	struct nand_chip *chip = mtd_to_nand(mtd);
++	u8 status;
++
++	/* Check Read Status */
++	chip->cmdfunc(mtd, NAND_CMD_STATUS, -1, -1);
++	status = chip->read_byte(mtd);
++
++	/* timeout */
++	if (!(status & NAND_STATUS_READY)) {
++		pr_debug("BENAND : Time Out!\n");
++		return -EIO;
++	}
++
++	/* uncorrectable */
++	else if (status & NAND_STATUS_FAIL)
++		mtd->ecc_stats.failed++;
++
++	/* correctable: MXIC recommends to rewrite when
++	 * 3~4 bits error been corrected
++	 */
++	else if (status & NAND_ECC_STATUS_3_BIT_ERR) {
++		max_bitflips = 3;
++		mtd->ecc_stats.corrected += max_bitflips;
++	} else if ((status & NAND_ECC_STATUS_4_BIT_ERR) ==
++			NAND_ECC_STATUS_4_BIT_ERR) {
++		max_bitflips = 4;
++		mtd->ecc_stats.corrected += max_bitflips;
++	}
++
++	return max_bitflips;
++}
++
++/**
++ * nand_read_page_raw - [Intern] read raw page data with mxic.
++ * @mtd: mtd info structure
++ * @chip: nand chip info structure
++ * @buf: buffer to store read data
++ * @oob_required: caller requires OOB data read to chip->oob_poi
++ * @page: page number to read
++ *
++ * Not for syndrome calculating ECC controllers,
++ * which use a special oob layout.
++ */
++
++static int nand_read_page_ecc_on_die(struct mtd_info *mtd,
++					struct nand_chip *chip, u8 *buf,
++					int oob_required, int page)
++{
++	unsigned int max_bitflips = 0;
++
++	chip->ecc.read_page_raw(mtd, chip, buf, oob_required, page);
++
++	/* Check Read Status */
++	max_bitflips = chip->ecc.correct(mtd, NULL, NULL, NULL);
++
++	return max_bitflips;
++}
++
++static int nand_read_subpage_ecc_on_die(struct mtd_info *mtd,
++				struct nand_chip *chip, u32 data_offs,
++				u32 readlen, u8 *bufpoi, int page)
++{
++	u8 *p;
++	unsigned int max_bitflips = 0;
++
++	if (data_offs != 0)
++		chip->cmdfunc(mtd, NAND_CMD_RNDOUT, data_offs, -1);
++
++	p = bufpoi + data_offs;
++	chip->read_buf(mtd, p, readlen);
++
++	max_bitflips = chip->ecc.correct(mtd, NULL, NULL, NULL);
++
++	return max_bitflips;
++}
++
++void nand_on_die_ecc_init(struct mtd_info *mtd, u8 id)
++{
++	struct nand_chip *chip = mtd_to_nand(mtd);
++
++	if (id == NAND_MFR_TOSHIBA)
++		chip->ecc.correct = nand_benand_status_chk;
++	else if (id == NAND_MFR_MACRONIX)
++		chip->ecc.correct = nand_mxic_status_chk;
++	else
++		WARN(1, "This flash is not supported in this mode!\n");
++
++	chip->options |= NAND_SUBPAGE_READ;
++	chip->ecc.read_page = nand_read_page_ecc_on_die;
++	chip->ecc.read_subpage = nand_read_subpage_ecc_on_die;
++
++	return;
++
++}
++EXPORT_SYMBOL(nand_on_die_ecc_init);
++
++MODULE_AUTHOR("INTEL Corporation");
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("On-die ECC NAND Flash support");
+diff --git a/include/linux/mtd/nand.h b/include/linux/mtd/nand.h
+index 573e744223a2..dd03ed460eec 100644
+--- a/include/linux/mtd/nand.h
++++ b/include/linux/mtd/nand.h
+@@ -117,6 +117,7 @@ typedef enum {
+ 	NAND_ECC_HW,
+ 	NAND_ECC_HW_SYNDROME,
+ 	NAND_ECC_HW_OOB_FIRST,
++	NAND_ECC_ON_DIE,
+ } nand_ecc_modes_t;
+ 
+ enum nand_ecc_algo {
+diff --git a/include/linux/mtd/nand_ecc_on_die.h b/include/linux/mtd/nand_ecc_on_die.h
+new file mode 100644
+index 000000000000..ec6b4c0332b9
+--- /dev/null
++++ b/include/linux/mtd/nand_ecc_on_die.h
+@@ -0,0 +1,26 @@
++/*
++ * (C) Copyright TOSHIBA CORPORATION 2013
++ * All Rights Reserved.
++ *
++ * This program is free software; you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License version 2 as
++ * published by the Free Software Foundation.
++ *
++ * This file is the header for the NAND BENAND implementation.
++ */
++
++#ifndef __MTD_NAND_ON_DIE_ECC_H__
++#define __MTD_NAND_ON_DIE_ECC_H__
++
++#if defined(CONFIG_MTD_NAND_ON_DIE_ECC)
++
++/* init on-die-ecc nand_chip specific functions */
++void nand_on_die_ecc_init(struct mtd_info *mtd, u8 id);
++
++#else
++
++static inline void nand_on_die_ecc_init(struct mtd_info *mtd,
++					u8 id) {}
++
++#endif /* CONFIG_MTD_NAND_ON_DIE_ECC */
++#endif /* __MTD_NAND_ON_DIE_ECC_H__ */

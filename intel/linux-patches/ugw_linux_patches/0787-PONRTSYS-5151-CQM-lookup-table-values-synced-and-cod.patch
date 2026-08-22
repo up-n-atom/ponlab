@@ -1,0 +1,189 @@
+From d187a54c10d24378bc98ae50971b34e26d44a275 Mon Sep 17 00:00:00 2001
+From: kavitha3 <k.subramanian@intel.com>
+Date: Mon, 9 Sep 2019 18:25:42 +0800
+Subject: [PATCH] PONRTSYS-5151: CQM lookup table values synced and code
+ cleanup
+
+HW and SW lookup table values are synced by a common API to program the table.
+Queue flush API has to check the internal as well as external FIFO for valid
+descriptors.
+---
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c | 108 ++++++++++++---------------
+ 1 file changed, 46 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index d4f30c5498cb..6bbe45a7519b 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -38,7 +38,6 @@ static bool touched[FSQM_FRM_NUM];
+  */
+ static struct cbm_qidt_shadow g_cbm_qidt_mirror[CQM_QIDT_DW_NUM];
+ static u32 g_qidt_help[0x4000];
+-static struct cbm_q_info  cbm_qtable[MAX_QOS_QUEUES] = { {0} };
+ static spinlock_t cqm_qidt_lock;
+ static spinlock_t cqm_port_map;
+ static spinlock_t cpu_pool_enq;
+@@ -580,35 +579,6 @@ static s32 pib_program_overshoot(u32 overshoot_bytes)
+ 	return CBM_SUCCESS;
+ }
+ 
+-static void set_lookup_qid_via_index_prx300(u32 index, u32 qid)
+-{
+-	u32 offset = (index / 4) * 4;
+-	u32 shift = (index % 4) * 8;
+-	unsigned long sys_flag;
+-	u32 tmp;
+-	void *qidt = cqm_ctrl->qidt;
+-
+-	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
+-	tmp = cbm_r32(qidt + offset);
+-	tmp = (tmp & (~(PRX300_CQM_Q_MASK << shift))) | (qid << shift);
+-	cbm_w32(qidt + offset, tmp);
+-	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
+-}
+-
+-static u8 get_lookup_qid_via_idx_prx300(u32 index)
+-{
+-	u32 offset = (index / 4) * 4;
+-	u32 shift = (index % 4) * 8;
+-	unsigned long sys_flag;
+-	u8 value = 0;
+-	void *qidt = cqm_ctrl->qidt;
+-
+-	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
+-	value = ((cbm_r32(qidt + offset)) >> shift) & PRX300_CQM_Q_MASK;
+-	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
+-	return value;
+-}
+-
+ static s32 enable_backpressure(s32 port_id, bool flag)
+ {
+ 	void *deq = cqm_ctrl->deq;
+@@ -735,48 +705,62 @@ static s32 mode_table_set(int cbm_inst, cbm_queue_map_entry_t *entry,
+ 	return CBM_SUCCESS;
+ }
+ 
+-static void cqm_qid_reg_set(struct cqm_qidt_elm *qidt_elm, u8 qid_val,
+-			    u8 sel_field)
++static void cqm_qid_program(u8 qid_val, u32 qidt)
+ {
+-	u32 qidt;
+ 	u32 qidt_idx;
+-	u32 qidt_offset, shadow;
++	u32 qidt_offset;
+ 	u32 offset_factor, value_mask;
+-	u32 value;
+-	u8 prev_qid;
++	u32 value, shadow;
+ 	void *qidt_base = cqm_ctrl->qidt;
+ 
+-	qidt = ((((sel_field & 0xf0) >> 0x4) << PRX300_SEL7TO4_POS)
+-		| ((qidt_elm->mpe2 & 0x1) << PRX300_MPE2_POS)
+-		| ((qidt_elm->mpe1 & 0x1) << PRX300_MPE1_POS)
+-		| ((qidt_elm->ep & 0xf) << PRX300_EP_POS)
+-		| ((sel_field & 0x0f) << PRX300_SEL3TO0_POS));
+ 	qidt_idx = qidt >> 2;
+ 	qidt_offset = qidt % 4;
+ 	offset_factor = qidt_offset << 3;
+ 	value_mask = PRX300_CQM_Q_MASK << offset_factor;
+ 
+-	prev_qid = (g_cbm_qidt_mirror[qidt_idx].qidt_shadow & value_mask) >>
+-		    offset_factor;
+ 	shadow = g_cbm_qidt_mirror[qidt_idx].qidt_shadow;
+-	if (qid_val == PRX300_CQM_DROP_Q) {
+-		if (cbm_qtable[prev_qid].refcnt &&
+-		    (prev_qid != PRX300_CQM_DROP_Q))
+-			cbm_qtable[prev_qid].refcnt--;
+-	} else {
+-		if (cbm_qtable[prev_qid].refcnt &&
+-		    (prev_qid != PRX300_CQM_DROP_Q))
+-			cbm_qtable[prev_qid].refcnt--;
+-			g_cbm_qidt_mirror[qidt_idx].qidt_shadow = (shadow &
+-			~value_mask) |
+-			((qid_val & PRX300_CQM_Q_MASK) << ((qidt_offset) * 8));
+-		cbm_qtable[qid_val].refcnt++;
+-	}
+-	value = (cbm_r32(qidt_base + qidt_idx * 4) & ~value_mask) |
++	value = (shadow & ~value_mask) |
+ 		((qid_val & PRX300_CQM_Q_MASK) << offset_factor);
++	g_cbm_qidt_mirror[qidt_idx].qidt_shadow = value;
+ 	cbm_w32((qidt_base + qidt_idx * 4), value);
+ }
+ 
++static void cqm_qid_reg_set(struct cqm_qidt_elm *qidt_elm, u8 qid_val,
++			    u8 sel_field)
++{
++	u32 qidt;
++
++	qidt = ((((sel_field & 0xf0) >> 0x4) << PRX300_SEL7TO4_POS)
++		| ((qidt_elm->mpe2 & 0x1) << PRX300_MPE2_POS)
++		| ((qidt_elm->mpe1 & 0x1) << PRX300_MPE1_POS)
++		| ((qidt_elm->ep & 0xf) << PRX300_EP_POS)
++		| ((sel_field & 0x0f) << PRX300_SEL3TO0_POS));
++	cqm_qid_program(qid_val, qidt);
++}
++
++static void set_lookup_qid_via_index_prx300(u32 index, u32 qid)
++{
++	unsigned long sys_flag;
++
++	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
++	cqm_qid_program(qid, index);
++	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
++}
++
++static u8 get_lookup_qid_via_idx_prx300(u32 index)
++{
++	u32 offset = (index / 4) * 4;
++	u32 shift = (index % 4) * 8;
++	unsigned long sys_flag;
++	u8 value = 0;
++	void *qidt = cqm_ctrl->qidt;
++
++	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
++	value = ((cbm_r32(qidt + offset)) >> shift) & PRX300_CQM_Q_MASK;
++	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
++	return value;
++}
++
+ static void cqm_qidt_set_mode0(const struct cqm_qidt_elm *qid_set,
+ 			       const struct cqm_qidt_mask *qid_mask,
+ 			       u8 qid_val)
+@@ -868,7 +852,7 @@ static void cqm_qidt_set_mode1(const struct cqm_qidt_elm *qid_set,
+ 	struct cqm_qidt_elm qidt_elm = {0};
+ 	int state;
+ 	struct qidt_flag_done flag_done = {0};
+-	u8 sel_field;
++	u8 sel_field = 0;
+ 
+ 	dev_dbg(cqm_ctrl->dev, "%u\n", qid_val);
+ 	dev_dbg(cqm_ctrl->dev, "%u %u %u %u\n", qid_set->clsid,
+@@ -1110,8 +1094,7 @@ static s32 queue_map_get(int cbm_inst, s32 queue_id, s32 *num_entries,
+ 	void *c_base = cqm_ctrl->cqm;
+ 
+ 	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
+-	if (((queue_id >= 0) && (queue_id <= 255)) &&
+-	    (cbm_qtable[queue_id].refcnt)) {
++	if ((queue_id >= 0) && (queue_id <= 255)) {
+ 		for (i = 0, k = i; i < 0x1000; i += 1, k += 4) {
+ 			/*unrolling the loop*/
+ 			ptr = (u8 *)&g_cbm_qidt_mirror[i].qidt_shadow;
+@@ -2644,7 +2627,7 @@ s32 qos_q_flush(s32 cqm_inst, s32 cqm_drop_port, s32 qid)
+ 	/*Port Enable*/
+ 	cqm_dma_port_enable(port, CBM_PORT_F_DEQUEUE_PORT, 0);
+ 
+-	while (no_packet < desc_num) {
++	while (no_packet < (3 * desc_num)) {
+ 		reg = cbm_r32(dma_desc +
+ 				CQM_DEQ_DMA_DESC(DMA_PORT_FOR_FLUSH, i) + 0xc);
+ 		/*read before write*/
+@@ -2667,7 +2650,8 @@ s32 qos_q_flush(s32 cqm_inst, s32 cqm_drop_port, s32 qid)
+ 	cqm_dma_port_enable(port, CBM_PORT_F_DEQUEUE_PORT |
+ 					    CBM_PORT_F_DISABLE, 0);
+ 	cbm_w32((cqm_ctrl->deq + DQ_DMA_PORT(DMA_PORT_FOR_FLUSH, dqpc)), 0);
+-	cbm_w32((cqm_ctrl->deq + DQ_DMA_PORT(DMA_PORT_FOR_FLUSH, dptr)), 0);
++	set_val((cqm_ctrl->deq + DQ_DMA_PORT(DMA_PORT_FOR_FLUSH, dptr)), 0,
++                DPTR_DMA_EGP_25_DPTR_MASK, DPTR_DMA_EGP_25_DPTR_POS);
+ 	return CBM_SUCCESS;
+ }
+ 

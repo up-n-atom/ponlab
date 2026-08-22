@@ -1,0 +1,329 @@
+From e351493f4e822dec634288341d606cc4ca652d3a Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Mon, 12 Oct 2020 18:47:19 +0800
+Subject: [PATCH] DRVLIB_SW-3755: GSW API - get reference time source, aux
+ trigger source, and external reference time flag from device tree
+
+---
+ .../ethernet/lantiq/switch-api/gswip_dev/gsw_dev.c | 51 +++++++++++++++++++++-
+ .../net/ethernet/lantiq/switch-api/mac/gswss_api.c |  2 +
+ .../net/ethernet/lantiq/switch-api/mac/mac_drv.c   |  1 +
+ .../ethernet/lantiq/switch-api/mac/xgmac_common.h  |  1 +
+ .../ethernet/lantiq/switch-api/mac/xgmac_mac_api.c |  6 ++-
+ .../net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c | 48 ++++++++++++++++----
+ include/dt-bindings/net/intel,gswss.h              | 27 ++++++++++++
+ include/net/switch_api/adap_ops.h                  | 35 ++++++++++++++-
+ 8 files changed, 159 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gswip_dev/gsw_dev.c b/drivers/net/ethernet/lantiq/switch-api/gswip_dev/gsw_dev.c
+index ef4c5dfdf6ae..a5d025897aa7 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gswip_dev/gsw_dev.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gswip_dev/gsw_dev.c
+@@ -28,7 +28,11 @@
+ #define GSW_DPU					"intel,gsw-dpu"
+ #define GSW_GLOBAL_PCE_RULE_NUM			"intel,gsw-globalpce-rules"
+ #define GSW_AGING_TIMEOUT			"intel,gsw-aging-timeout"
+-#define GSW_EXTERNAL_OR_INTERNAL        "intel,gsw_ext-switch"
++#define GSW_EXTERNAL_OR_INTERNAL		"intel,gsw_ext-switch"
++#define AUX0_TRIGGER				"intel,aux0-trigger"
++#define AUX1_TRIGGER				"intel,aux1-trigger"
++#define REF_TIME				"intel,ref-time"
++#define PPS_SEL					"intel,pps-sel"
+ 
+ /* Structure for GSWIP Subsystem operations
+  * used to start Sub-Functional Drivers
+@@ -233,7 +237,10 @@ static int gsw_add_macdev(struct gsw_cell *gsw_dev_cell, u32 devid)
+ {
+ 	struct mac_prv_data *mac_pdata;
+ 	int ret = 0;
++#ifdef CONFIG_OF
+ 	struct resource irqres;
++	u32 val;
++#endif
+ 
+ 	/* Allocate the private data for MAC */
+ 	mac_pdata = kzalloc(sizeof(struct mac_prv_data), GFP_KERNEL);
+@@ -249,6 +256,12 @@ static int gsw_add_macdev(struct gsw_cell *gsw_dev_cell, u32 devid)
+ 		mac_pdata->mac_en = MAC_DIS;
+ 
+ #ifdef CONFIG_OF
++	/* Retrieve external reference time flag */
++	val = 0;
++	of_property_read_u32(gsw_dev_cell->of_node, "ext-ref-time", &val);
++	if (val)
++		mac_pdata->ext_ref_time = true;
++
+ 	/* Retrieve the phymode */
+ 	ret = of_property_read_string(gsw_dev_cell->of_node, "phy-mode",
+ 				      &mac_pdata->phy_mode);
+@@ -541,6 +554,37 @@ static int init_adapt_prvdata(int devid)
+ 	return 0;
+ }
+ 
++static void cfg_ptp_mux(struct platform_device *pdev, int devid)
++{
++	struct adap_ops *ops = gsw_dev[devid].adap_ops;
++	struct device_node *np = pdev->dev.of_node;
++	u32 ref, dig, bin, pps;
++	u32 aux0, aux1, dummy;
++	int ret;
++
++	if (!ops->ss_get_cfg0_1588 || !ops->ss_set_cfg0_1588
++	    || !ops->ss_get_cfg1_1588 || !ops->ss_set_cfg1_1588) {
++		dev_err(&pdev->dev, "GSWSS does not PTP/1588 APIs.\n");
++		return;
++	}
++	
++	if (!ops->ss_get_cfg1_1588(ops, &aux0, &aux1, &dummy)) {
++		ret = !of_property_read_u32(np, AUX0_TRIGGER, &aux0);
++		ret |= !of_property_read_u32(np, AUX1_TRIGGER, &aux1);
++		if (ret)
++			ops->ss_set_cfg1_1588(ops, aux1, aux0, dummy);
++	}
++
++	if (!ops->ss_get_cfg0_1588(ops, &ref, &dig, &bin, &pps)) {
++		ret = !of_property_read_u32(np, REF_TIME, &ref);
++		if (ret)
++			dig = bin = ref;
++		ret |= !of_property_read_u32(np, PPS_SEL, &pps);
++		if (ret)
++			ops->ss_set_cfg0_1588(ops, ref, dig, bin, pps);
++	}
++}
++
+ static int gsw_remove_devices(struct device *parent)
+ {
+ 	struct gswss *gswdev = dev_get_drvdata(parent);
+@@ -733,6 +777,11 @@ static int gsw_dev_probe(struct platform_device *pdev)
+ 	ret = gsw_add_devices(dev, PLATFORM_DEVID_AUTO, gsw_dev_cells,
+ 			      gsw_dev[devid].num_devs,
+ 			      NULL, 0);
++
++	/* Config PTP/1588 Mux */
++	if (ret == 0 && prod_id == PRX300)
++		cfg_ptp_mux(pdev, devid);
++
+ 	return ret;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c
+index 74f65c601a80..61bf2f41d2c9 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/gswss_api.c
+@@ -564,6 +564,8 @@ void gswss_init_fn_ptrs(struct adap_ops *adap_ops)
+ 
+ 	adap_ops->ss_set_cfg0_1588 = gswss_cfg0_1588;
+ 	adap_ops->ss_get_cfg0_1588 = gswss_get_cfg0_1588;
++	adap_ops->ss_set_cfg1_1588 = gswss_cfg1_1588;
++	adap_ops->ss_get_cfg1_1588 = gswss_get_cfg1_1588;
+ 
+ 	adap_ops->ss_set_clkmode = gswss_set_clkmode;
+ 	adap_ops->ss_get_clkmode = gswss_get_clkmode;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
+index d1a89819dc21..5243a43e79de 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_drv.c
+@@ -207,6 +207,7 @@ static int mac_probe(struct platform_device *pdev)
+ 	if (ret < 0)
+ 		dev_dbg(dev, "Default RX  direction Special tag mode\n");
+ 
++	pdata->pdev = pdev;
+ 	pdata->dev = dev;
+ 
+ 	/* Init function fointers */
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+index 932e6153a206..8ee830615df7 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+@@ -409,6 +409,7 @@ struct mac_prv_data {
+ 	u32 rec_id;
+ 	bool systime_initialized;
+ 	struct mac_fifo_entry ts_fifo[MAX_FIFO_ENTRY];
++	bool ext_ref_time;
+ 
+ #ifdef __KERNEL__
+ 	/* will be pointing to skb which is
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+index 037fe999cac8..49e4427fd76c 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mac_api.c
+@@ -1646,10 +1646,14 @@ int xgmac_set_hwtstamp_settings(void *pdev,
+ 		mac_disable_ts(pdev);
+ 	}
+ 
++	if (pdata->ext_ref_time)
++		MAC_SET_VAL(mac_tscr, MAC_TSTAMP_CR, ESTI, 1);
++
+ 	xgmac_config_tstamp(pdev, mac_tscr);
+ 
+ #ifdef __KERNEL__
+-	xgmac_config_timer_reg(pdev, mac_tscr);
++	if (!pdata->ext_ref_time)
++		xgmac_config_timer_reg(pdev, mac_tscr);
+ #endif
+ 
+ 	return 0;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+index 52c11875f6b9..c4ecddd23cb1 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_ptp.c
+@@ -699,6 +699,10 @@ int xgmac_ptp_init(void *pdev)
+ 	 */
+ 	INIT_WORK(&pdata->ptp_tx_work, (work_func_t)xgmac_ptp_tx_work);
+ 
++	/* Start internal clock */
++	xgmac_config_tstamp(&pdata->ops, BIT(MAC_TSTAMP_CR_TSENA_POS));
++	xgmac_config_timer_reg(&pdata->ops, BIT(MAC_TSTAMP_CR_TSENA_POS));
++
+ 	ret = xgmac_ptp_register(pdev);
+ 
+ 	if (ret == -1)
+@@ -707,11 +711,46 @@ int xgmac_ptp_init(void *pdev)
+ 	return ret;
+ }
+ 
++#ifdef CONFIG_PTP_1588_CLOCK
++static int get_ext_ref_time(struct mac_prv_data *pdata)
++{
++	struct gswss *gswss;
++	struct adap_ops *ops;
++	struct platform_device *mac_pdev;
++	struct mac_ops *mac_ops;
++	struct mac_prv_data *ext_pdata;
++	u32 ref, dig, bin, pps;
++
++	gswss = dev_get_drvdata(pdata->pdev->dev.parent);
++	ops = gswss->adap_ops;
++
++	ops->ss_get_cfg0_1588(ops, &ref, &dig, &bin, &pps);
++	if (ref < 3 || ref > 5 || ref >= 3 + gswss->mac_subdevs_cnt)
++		return -1;
++
++	mac_pdev = gswss->mac_dev[ref - 3];
++	mac_ops = platform_get_drvdata(mac_pdev);
++	ext_pdata = GET_MAC_PDATA(mac_ops);
++	if (ext_pdata->ptp_clock)
++		return ptp_clock_index(ext_pdata->ptp_clock);
++	else
++		return -1;
++}
++#endif
++
+ int xgmac_get_ts_info(void *pdev,
+ 		      struct ethtool_ts_info *ts_info)
+ {
+ #ifdef CONFIG_PTP_1588_CLOCK
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++
++	if (pdata->ext_ref_time)
++		ts_info->phc_index = get_ext_ref_time(pdata);
++	else if (pdata->ptp_clock)
++		ts_info->phc_index = ptp_clock_index(pdata->ptp_clock);
++	else
++		ts_info->phc_index = -1;
++
+ #endif
+ 
+ 	ts_info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
+@@ -721,15 +760,6 @@ int xgmac_get_ts_info(void *pdev,
+ 				   SOF_TIMESTAMPING_RX_HARDWARE |
+ 				   SOF_TIMESTAMPING_RAW_HARDWARE;
+ 
+-#ifdef CONFIG_PTP_1588_CLOCK
+-
+-	if (pdata->ptp_clock)
+-		ts_info->phc_index = ptp_clock_index(pdata->ptp_clock);
+-	else
+-		ts_info->phc_index = -1;
+-
+-#endif
+-
+ 	ts_info->tx_types = (1 << HWTSTAMP_TX_OFF) | (1 << HWTSTAMP_TX_ON);
+ 	ts_info->rx_filters = (1 << HWTSTAMP_FILTER_NONE) |
+ 			      (1 << HWTSTAMP_FILTER_PTP_V1_L4_EVENT) |
+diff --git a/include/dt-bindings/net/intel,gswss.h b/include/dt-bindings/net/intel,gswss.h
+new file mode 100644
+index 000000000000..404027aa3728
+--- /dev/null
++++ b/include/dt-bindings/net/intel,gswss.h
+@@ -0,0 +1,27 @@
++#ifndef __INTEL_GSWSS_H__
++#define __INTEL_GSWSS_H__
++
++/* Auxiliary Timestamp Trigger */
++#define INTEL_GSWSS_AUX_TRIG_PONPPS		0
++#define INTEL_GSWSS_AUX_TRIG_XGMAC2PPS		3
++#define INTEL_GSWSS_AUX_TRIG_XGMAC3PPS		4
++#define INTEL_GSWSS_AUX_TRIG_XGMAC4PPS		5
++#define INTEL_GSWSS_AUX_TRIG_PONPP100US		6
++#define INTEL_GSWSS_AUX_TRIG_EXTPPS0		8
++#define INTEL_GSWSS_AUX_TRIG_EXTPPS1		9
++#define INTEL_GSWSS_AUX_TRIG_SW			10
++
++/* Reference Time */
++#define INTEL_GSWSS_REFTIME_XGMAC2		3
++#define INTEL_GSWSS_REFTIME_XGMAC3		4
++#define INTEL_GSWSS_REFTIME_XGMAC4		5
++
++/* PPS Master */
++#define INTEL_GSWSS_PPS_PON			0
++#define INTEL_GSWSS_PPS_XGMAC2			3
++#define INTEL_GSWSS_PPS_XGMAC3			4
++#define INTEL_GSWSS_PPS_XGMAC4			5
++#define INTEL_GSWSS_PPS_SW			7
++
++#endif	/* __INTEL_GSWSS_H__ */
++
+diff --git a/include/net/switch_api/adap_ops.h b/include/net/switch_api/adap_ops.h
+index e98ef4dfba91..a940e319d91e 100644
+--- a/include/net/switch_api/adap_ops.h
++++ b/include/net/switch_api/adap_ops.h
+@@ -67,7 +67,7 @@ struct adap_ops {
+ 	 * return		OUT  !0:Error in Setting Master Time Source
+ 	 */
+ 	int(*ss_set_cfg0_1588)(void *, u32, u32, u32, u32);
+-	/* This function Sets the Master Time Source for REF_TIME, DIG_TIME,
++	/* This function Gets the Master Time Source for REF_TIME, DIG_TIME,
+ 	 * BIN_TIME, PPS_SEL.
+ 	 * param[in/out]	IN:	ops Adaption ops Struct registered.
+ 	 * param[in/out]  OUT:	ref_time	Gets the Master for REF_TIME.
+@@ -90,6 +90,39 @@ struct adap_ops {
+ 	 * return		OUT  !0:Error in Getting Master Time Source
+ 	 */
+ 	int(*ss_get_cfg0_1588)(void *, u32 *, u32 *, u32 *, u32 *);
++
++	/* This function Sets the Auxiliary Timestamp Trigger.
++	 * param[in/out]	IN:	ops Adaption ops Struct registered.
++	 * param[in/out]	IN:	trig1_sel	Aux1
++	 *  0 -	PON PPS,    3 - XGMAC2 PPS, 4 - XGMAC3 PPS, 5 - XGMAC4 PPS,
++	 *  6 - PON PP10US, 8 - EXT PPS0,   9 - EXT PPS1,   A - Software
++	 * param[in/out]	IN:	trig0_sel	Aux0
++	 *  0 -	PON PPS,    3 - XGMAC2 PPS, 4 - XGMAC3 PPS, 5 - XGMAC4 PPS,
++	 *  6 - PON PP10US, 8 - EXT PPS0,   9 - EXT PPS1,   A - Software
++	 * param[in/out]	IN:	sw_trigger	SW Trigger
++	 *  0 -	drive low, 1 - drive high
++	 * return		0:	Master Set Succesfully
++	 * 			!0:	Error in Setting Aux Trigger
++	 */
++	int(*ss_set_cfg1_1588)(void *ops, u32 trig1_sel, u32 trig0_sel,
++			       u32 sw_trigger);
++
++	/* This function Gets the Auxiliary Timestamp Trigger.
++	 * param[in/out]	IN:	ops Adaption ops Struct registered.
++	 * param[in/out]	OUT:	trig1_sel	Aux1
++	 *  0 -	PON PPS,    3 - XGMAC2 PPS, 4 - XGMAC3 PPS, 5 - XGMAC4 PPS,
++	 *  6 - PON PP10US, 8 - EXT PPS0,   9 - EXT PPS1,   A - Software
++	 * param[in/out]	OUT:	trig0_sel	Aux0
++	 *  0 -	PON PPS,    3 - XGMAC2 PPS, 4 - XGMAC3 PPS, 5 - XGMAC4 PPS,
++	 *  6 - PON PP10US, 8 - EXT PPS0,   9 - EXT PPS1,   A - Software
++	 * param[in/out]	IN:	sw_trigger	SW Trigger
++	 *  0 -	drive low, 1 - drive high
++	 * return		0:	Master Got Succesfully
++	 * 			!0:	Error in Getting Aux Trigger
++	 */
++	int(*ss_get_cfg1_1588)(void *ops, u32 *trig1_sel, u32 *trig0_sel,
++			       u32 *sw_trigger);
++
+ 	/* This function Sets the GSWIP Clock Mode to NC01, NCO2 or Auto Mode.
+ 	 * param[in/out]	IN:	ops Adaption ops Struct registered.
+ 	 * param[in/out]  IN:	Clk Mode	Selects the Clock Mode.

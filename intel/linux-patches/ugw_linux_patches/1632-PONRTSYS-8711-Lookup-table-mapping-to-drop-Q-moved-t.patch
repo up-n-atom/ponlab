@@ -1,0 +1,226 @@
+From 928cbb9261a4375f543eb9082a0a470df843cef5 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Fri, 19 Mar 2021 05:45:24 +0800
+Subject: [PATCH] PONRTSYS-8711: Lookup table mapping to drop Q moved to CQM to
+ avoid multiple spinlock_irqsave/restore
+
+---
+ drivers/net/datapath/dpm/gswip31/datapath_ppv4.h   |  8 -----
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   | 42 +++++++++-------------
+ drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c      |  7 ++++
+ drivers/net/ethernet/lantiq/cqm/cqm_common.h       |  1 +
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c       | 24 +++++++++++++
+ include/net/lantiq_cbm_api.h                       | 10 ++++++
+ 6 files changed, 58 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4.h b/drivers/net/datapath/dpm/gswip31/datapath_ppv4.h
+index be7f6b19fa35..f94e8fbd8f8f 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4.h
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4.h
+@@ -12,12 +12,10 @@
+ #define MAX_PPV4_PORT 	256
+ #define MAX_QUEUE   	512
+ #define MAX_CQM_DEQ   	256
+-#define MAX_LOOKUP_TBL_SIZE 	(8 * 1024) /* lookup table size:12bits + 1bit */
+ #elif IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP31)
+ #define MAX_PPV4_PORT 	128
+ #define MAX_QUEUE   	256
+ #define MAX_CQM_DEQ   	90
+-#define MAX_LOOKUP_TBL_SIZE (16 * 1024) /* lookup table size */
+ #endif
+ #define MAX_PP_CHILD_PER_NODE   8 /* Maximum queue per scheduler */
+ #define MAX_Q_PER_PORT          32 /* Maximum queue per port */
+@@ -157,11 +155,6 @@ struct arbi_map {
+ 	int dp_arbi; /* dp arbitrate */
+ };
+ 
+-struct dp_lookup_entry {
+-	int entry[MAX_LOOKUP_TBL_SIZE];
+-	int num; /* num of valid lookup entries save in entry[] array */
+-};
+-
+ void init_qos_fn_32(void);
+ 
+ int dp_qos_queue_remove(struct pp_qos_dev *qdev, u32 id);
+@@ -215,7 +208,6 @@ int dp_qos_port_conf_get(struct pp_qos_dev *qdev, u32 id,
+ 
+ struct pp_qos_dev *dp_qos_dev_open(u32 id);
+ 
+-void dp_map_to_drop_q(int inst, int q_id, struct dp_lookup_entry *lookup);
+ int dp_pp_alloc_port(struct ppv4_port *info);
+ int dp_pp_alloc_sched(struct ppv4_scheduler *info);
+ int dp_pp_alloc_queue(struct ppv4_queue *info);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index d710061ee5fd..aaed5df740c0 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -275,6 +275,20 @@ static int dp_qos_queue_set_spl(int inst, u32 node_id, u32 qid,
+ 	return DP_SUCCESS;
+ }
+ 
++/* Check index in lookup table for qid, set to drop_q
++ */
++static
++void dp_map_to_drop_q(int inst, int qid, struct cbm_lookup_entry *lu)
++{
++	struct hal_priv *priv = HAL(inst);
++
++	lu->num = 0;
++	lu->ppv4_drop_q = priv->ppv4_drop_q;
++	lu->qid = qid;
++
++	cqm_map_to_drop_q(lu);
++}
++
+ #ifdef DP_FLUSH_VIA_AUTO
+ static void cqm_queue_flush(int cqm_inst, int drop_port, int qid, u32 node_id)
+ {}
+@@ -300,7 +314,7 @@ static int queue_flush(int inst, int node_id, int flag)
+ 	struct pp_qos_queue_conf q_cfg = {0}, q_cfg_tmp = {0};
+ 	struct hal_priv *priv = HAL(inst);
+ 	struct cbm_lookup cbm_lu = {0};
+-	struct dp_lookup_entry *lu;
++	struct cbm_lookup_entry *lu;
+ 
+ 	qid = get_qid_by_node(inst, node_id);
+ 	if (qid == DP_FAILURE) {
+@@ -345,7 +359,7 @@ static int queue_flush(int inst, int node_id, int flag)
+ 
+ 		cqm_queue_flush(cbm_inst, priv->cqm_drop_p, qid, node_id);
+ 	} else {
+-		DP_DEBUG(DP_DBG_FLAG_QOS, "Q movement before flush");
++		DP_DEBUG(DP_DBG_FLAG_QOS, "Q movement before flush\n");
+ 
+ 		/* Move to drop port, set block and resume the queue */
+ 		dp_qos_queue_conf_set_default(&q_cfg_tmp);
+@@ -1157,30 +1171,6 @@ int _dp_node_alloc(struct dp_node_alloc *node, int flag)
+ 		return DP_SUCCESS;
+ }
+ 
+-/* Check index in lookup table for qid, set to drop_q
+- */
+-void dp_map_to_drop_q(int inst, int qid, struct dp_lookup_entry *lu)
+-{
+-	struct hal_priv *priv = HAL(inst);
+-	struct cbm_lookup cbm_lu = {0};
+-	u32 i;
+-
+-	if (lu)
+-		lu->num = 0;
+-
+-	for (i = 0; i < MAX_LOOKUP_TBL_SIZE; i++) {
+-		cbm_lu.index = i;
+-		if (qid == dp_get_lookup_qid_via_index(&cbm_lu)) {
+-			if (lu)
+-				lu->entry[lu->num++] = i;
+-
+-			cbm_lu.index = i;
+-			cbm_lu.qid = priv->ppv4_drop_q;
+-			dp_set_lookup_qid_via_index(&cbm_lu);
+-		}
+-	}
+-}
+-
+ /* Flush and unlink queue from its parent.
+  * Check parent's child list if empty free parent recursively
+  */
+diff --git a/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c b/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c
+index bf18509bc2e8..17cafcaa4499 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c
++++ b/drivers/net/ethernet/lantiq/cqm/cbm_wrapper.c
+@@ -427,6 +427,13 @@ uint8_t get_lookup_qid_via_index(u32 index)
+ }
+ EXPORT_SYMBOL(get_lookup_qid_via_index);
+ 
++void cqm_map_to_drop_q(struct cbm_lookup_entry *lu_info)
++{
++	if (g_cbm_ops && g_cbm_ops->cqm_map_to_drop_q)
++		g_cbm_ops->cqm_map_to_drop_q(lu_info);
++}
++EXPORT_SYMBOL(cqm_map_to_drop_q);
++
+ int cbm_q_thres_get(u32 *length)
+ {
+ 	if (g_cbm_ops && g_cbm_ops->cbm_q_thres_get)
+diff --git a/drivers/net/ethernet/lantiq/cqm/cqm_common.h b/drivers/net/ethernet/lantiq/cqm/cqm_common.h
+index 640ada535251..1684492aa52a 100644
+--- a/drivers/net/ethernet/lantiq/cqm/cqm_common.h
++++ b/drivers/net/ethernet/lantiq/cqm/cqm_common.h
+@@ -177,6 +177,7 @@ struct cbm_ops {
+ 					      u32 flags);
+ 	void (*set_lookup_qid_via_index)(struct cbm_lookup *info);
+ 	uint8_t (*get_lookup_qid_via_index)(u32 index);
++	void (*cqm_map_to_drop_q)(struct cbm_lookup_entry *lu_info);
+ 	u8 (*get_lookup_qid_via_bits)(
+ 	u32 ep,
+ 	u32 classid,
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index e239dd60c60f..79bd7d3ae6e0 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -772,6 +772,29 @@ static u8 get_lookup_qid_via_idx_prx300(u32 index)
+ 	return value;
+ }
+ 
++static void map_to_drop_q(struct cbm_lookup_entry *lu_entry)
++{
++	unsigned long sys_flag;
++	u8 value = 0;
++	u8 *ptr;
++	int i = 0;
++
++	spin_lock_irqsave(&cqm_qidt_lock, sys_flag);
++
++	for (i = 0; i < MAX_LOOKUP_TBL_SIZE; i++) {
++		ptr = (u8 *)&g_cbm_qidt_mirror[i / 4].qidt_shadow;
++		value = ptr[i % 4];
++
++		/* if match, set the index to drop q */
++		if (lu_entry->qid == value) {
++			lu_entry->entry[lu_entry->num++] = i;
++			cqm_qid_program(lu_entry->ppv4_drop_q, i);
++		}
++	}
++
++	spin_unlock_irqrestore(&cqm_qidt_lock, sys_flag);
++}
++
+ static inline void find_next_sub_if_id(u32 *idx_p, u32 mask, u32 mask_all,
+ 				       u32 limit_v, u32 start_v)
+ {
+@@ -4561,6 +4584,7 @@ static const struct cbm_ops cqm_ops = {
+ 	.pon_deq_cntr_get = pon_deq_cntr_get,
+ 	.set_lookup_qid_via_index = set_lookup_qid_via_index_prx300,
+ 	.get_lookup_qid_via_index = get_lookup_qid_via_idx_prx300,
++	.cqm_map_to_drop_q = map_to_drop_q,
+ 	.cbm_enable_backpressure = enable_backpressure,
+ 	.cbm_get_mtu_size = cqm_get_mtu_size,
+ 	.cbm_dp_get_dc_config = cqm_get_dc_config,
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index b1adac905397..6c046b16ac75 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -1176,6 +1176,15 @@ struct cbm_lookup {
+ 	uint32_t qid;
+ };
+ 
++#define MAX_LOOKUP_TBL_SIZE (16 * 1024)
++
++struct cbm_lookup_entry {
++	int entry[MAX_LOOKUP_TBL_SIZE];
++	int num; /* num of valid lookup entries save in entry[] array */
++	uint32_t qid;
++	s32 ppv4_drop_q;
++};
++
+ /**
+  * \flags : STD Buffer or Jumbo buffer using existing defines
+  * \Caller must have checked the parameter validity etc before
+@@ -1208,6 +1217,7 @@ uint32_t cbm_get_dptr_scpu_egp_count(uint32_t cbm_port_id, uint32_t flags);
+ uint32_t cbm_get_std_free_count(void);
+ void set_lookup_qid_via_index(struct cbm_lookup *info);
+ uint8_t get_lookup_qid_via_index(uint32_t index);
++void cqm_map_to_drop_q(struct cbm_lookup_entry *lu_info);
+ int check_ptr_validation(uint32_t buf);
+ void cbm_setup_DMA_p2p(void);
+ int cbm_turn_on_DMA_p2p(void);

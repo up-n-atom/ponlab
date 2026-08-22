@@ -1,0 +1,372 @@
+From 5cb48e76f45bf7988026b1d436c19aef3802bdd3 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Wed, 2 Dec 2020 18:18:07 +0800
+Subject: [PATCH] DRV_DPM_SW-369 - Fix for call original netdevops if not vlan
+ aware
+
+---
+ drivers/net/datapath/dpm/datapath_api.c      |   8 +-
+ drivers/net/datapath/dpm/datapath_br_vlan.c  | 121 ++++++++++++++++++++-------
+ drivers/net/datapath/dpm/datapath_instance.c |   4 +-
+ drivers/net/datapath/dpm/datapath_pce.c      |  22 +++--
+ drivers/net/datapath/dpm/datapath_pce.h      |   3 +
+ drivers/net/datapath/dpm/datapath_swdev.h    |   3 +
+ 6 files changed, 112 insertions(+), 49 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 2c70522ddf7d..a7ca85e59d1b 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -1121,7 +1121,9 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 		res = dp_config_ctp(info->inst, vap, info->dp_port, bp,
+ 				    &platfrm_data);
+ 		if (res) {
+-			ctp_dev_list_del(&bp_info->ctp_dev, info->new_ctp_dev);
++			if (info->new_ctp_dev)
++				ctp_dev_list_del(&bp_info->ctp_dev,
++						 info->new_ctp_dev);
+ 			goto exit;
+ 		}
+ 	}
+@@ -1175,10 +1177,6 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 	old_subif_id_sync->inst = info->inst;
+ 	res = dp_sync_subifid(old_dev, NULL, old_subif_id_sync, &old_data,
+ 			      DP_F_DEREGISTER, &f_old_subif);
+-	if (res) {
+-		devm_kfree(&g_dp_dev->dev, old_subif_id_sync);
+-		goto exit;
+-	}
+ 	/* no need any DQ port modification if prev & new tcont are same */
+ 	if (sif->cqm_port_idx == info->new_cqm_deq_idx) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+diff --git a/drivers/net/datapath/dpm/datapath_br_vlan.c b/drivers/net/datapath/dpm/datapath_br_vlan.c
+index 23707a4130d3..979ce5f67f10 100644
+--- a/drivers/net/datapath/dpm/datapath_br_vlan.c
++++ b/drivers/net/datapath/dpm/datapath_br_vlan.c
+@@ -15,13 +15,6 @@
+ 
+ #define MAX_FID		64 /* Only 6 bits for FiD */
+ 
+-struct br_vlan_cap {
+-	u32 maxvlanid;
+-	u32 maxbridgeid;
+-};
+-
+-struct br_vlan_cap g_br_vlan_cap = {0};
+-
+ enum BR_VLAN_FLAG {
+ 	BR_VLAN_LIST_TOP_ENTRY = BIT(0),
+ 	BR_VLAN_DEREGISTER = BIT(1)
+@@ -218,9 +211,10 @@ int dp_register_br_vlan(struct br_info *br_info, int flags)
+ 	if (!br_info)
+ 		return DP_FAILURE;
+ 
+-	/* TODO: This cap should be per bridge in Br_Info */
+-	if (!g_br_vlan_cap.maxbridgeid && !g_br_vlan_cap.maxvlanid)
+-		return DP_FAILURE;
++	if (!br_info->max_vlan_limit) {
++		br_info->max_vlan_limit = DP_DEF_MAX_VLAN_LIMIT;
++		br_info->max_brid_limit = DP_DEF_MAX_VLAN_LIMIT;
++	}
+ 
+ 	br_dev = br_info->dev;
+ 
+@@ -291,9 +285,10 @@ int dp_register_bport_vlan(struct br_info *br_info,
+ 	if (!dev || !br_info)
+ 		return DP_FAILURE;
+ 
+-	/* TODO: This cap should be per bridge in Br_Info */
+-	if (!g_br_vlan_cap.maxbridgeid && !g_br_vlan_cap.maxvlanid)
+-		return DP_FAILURE;
++	if (!br_info->max_vlan_limit) {
++		br_info->max_vlan_limit = DP_DEF_MAX_VLAN_LIMIT;
++		br_info->max_brid_limit = DP_DEF_MAX_VLAN_LIMIT;
++	}
+ 
+ 	if (!netif_is_bridge_port(dev)) {
+ 		pr_err("%s: dev %s is not bridge port\n", __func__, dev->name);
+@@ -404,15 +399,15 @@ static int allocate_br_vlan_fid(struct br_info *br_info, u16 vlanid)
+ 		 __func__, br_info->dev->name, br_info->fid, vlanid,
+ 		 br_info->num_vlan, br_info->num_fid);
+ 
+-	if (br_info->num_vlan > g_br_vlan_cap.maxvlanid) {
++	if (br_info->num_vlan > br_info->max_vlan_limit) {
+ 		pr_err("%s: Cannot Support more than %d VLAN ID's \n",
+-		       __func__, g_br_vlan_cap.maxvlanid);
++		       __func__, br_info->max_vlan_limit);
+ 		return DP_FAILURE;
+ 	}
+ 
+-	if (br_info->num_fid > g_br_vlan_cap.maxbridgeid) {
++	if (br_info->num_fid > br_info->max_brid_limit) {
+ 		pr_err("%s: Cannot Support more than %d Bridge ID's \n",
+-		       __func__, g_br_vlan_cap.maxbridgeid);
++		       __func__, br_info->max_brid_limit);
+ 		return DP_FAILURE;
+ 	}
+ 
+@@ -462,7 +457,7 @@ int dp_gsw_copy_ctp_cfg(int inst, int bp, struct dp_subblk_info *subblk_info,
+ 
+ 	/* Retrieve the CTP dev list for the pmapper bridge port */
+ 	list_for_each_entry(ctp_entry, &bp_info->ctp_dev, list) {
+-		if ((!ctp_entry) || (!ctp_entry->dev))
++		if (!ctp_entry->dev)
+ 			continue;
+ 		ctpcfg.nLogicalPortId = portid;
+ 		ctpcfg.nSubIfIdGroup = ctp_entry->ctp;
+@@ -1129,10 +1124,6 @@ static int parse_netlink_msg(struct nlmsghdr *nlh, u16 *vid,
+ 		}
+ 	}
+ 
+-	if (!vinfo) {
+-		pr_err("Vlan ID is not passed for VLAN Aware bridge\n");
+-		return -EINVAL;
+-	}
+ 	return DP_SUCCESS;
+ }
+ 
+@@ -1142,11 +1133,12 @@ static int parse_netlink_msg(struct nlmsghdr *nlh, u16 *vid,
+ int dp_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+ 			  u16 flags)
+ {
+-	u16 vid;
++	u16 vid = 0;
+ 	u16 br_flags = 0;
+ 	struct net_device *br_dev;
+ 	struct br_info *br_info;
+ 	int ret = 0;
++	struct dp_dev *dp_dev = NULL;
+ 
+ 	if (!dev || !nlh)
+ 		return -EINVAL;
+@@ -1166,6 +1158,23 @@ int dp_ndo_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
+ 	}
+ 
+ 	DP_LIB_LOCK(&dp_lock);
++	dp_dev = dp_dev_lookup(br_dev);
++	if (!dp_dev) {
++		pr_err("%s: dp_dev NULL\n", __func__);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	/* if Vland ID and Bridge Flags are not set return the original ops */
++	if (!vid && !br_flags) {
++		if (dp_dev->old_dev_ops->ndo_bridge_setlink)
++			ret = dp_dev->old_dev_ops->ndo_bridge_setlink(br_dev,
++					nlh, flags);
++		else
++			ret = -EFAULT;
++		goto EXIT;
++	}
++
+ 	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 	if (!br_info) {
+ 		pr_err("%s: dev %s is not registered to DPM\n", __func__,
+@@ -1203,13 +1212,15 @@ int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+ 			  u16 flags)
+ {
+ 	int ret = DP_SUCCESS;
+-	u16 vid;
++	u16 vid = 0;
+ 	u16 br_flags = 0;
+ 	struct net_device *br_dev;
+ 	struct br_info *br_info;
++	struct dp_dev *dp_dev = NULL;
+ 
+ 	if (!dev || !nlh)
+ 		return -EINVAL;
++
+ 	DP_DEBUG(DP_DBG_FLAG_BR_VLAN, "%s: dev=%s\n", __func__,
+ 		 dev ? dev->name : "NULL");
+ 
+@@ -1226,6 +1237,23 @@ int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+ 	}
+ 
+ 	DP_LIB_LOCK(&dp_lock);
++	dp_dev = dp_dev_lookup(br_dev);
++	if (!dp_dev) {
++		pr_err("%s: dp_dev NULL\n", __func__);
++		ret = -EINVAL;
++		goto EXIT;
++	}
++
++	/* if Vland ID and Bridge Flags are not set return the original ops */
++	if (!vid && !br_flags) {
++		if (dp_dev->old_dev_ops->ndo_bridge_dellink)
++			ret = dp_dev->old_dev_ops->ndo_bridge_dellink(br_dev,
++					nlh, flags);
++		else
++			ret = -EFAULT;
++		goto EXIT;
++	}
++
+ 	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
+ 	if (!br_info) {
+ 		pr_err("%s: dev %s is not registered to DPM\n", __func__,
+@@ -1260,16 +1288,49 @@ int dp_ndo_bridge_dellink(struct net_device *dev, struct nlmsghdr *nlh,
+ 
+ /* FiD for VLAN can be only 6 bits, Here we need to know
+  * maxvlanid - Max VLAN ID supported per Bridge
++ * br_dev: bridge device
+  */
+-int init_br_vlan(u32 maxvlanid)
++int dp_set_br_vlan_limit(struct net_device *br_dev, u32 maxvlanid)
+ {
+-	if (maxvlanid > MAX_FID || maxvlanid < 1) {
++	int ret = DP_FAILURE;
++	struct br_info *br_info;
++
++	if (unlikely(!dp_init_ok)) {
++		pr_err("%s failed: datapath not initialized yet\n", __func__);
++		return DP_FAILURE;
++	}
++
++	if ((maxvlanid > MAX_FID) || (maxvlanid == 0)) {
+ 		pr_err("VLAN Aware support max 64 FiD (VlanID + BriID)\n");
+ 		return DP_FAILURE;
+ 	}
+ 
+-	g_br_vlan_cap.maxvlanid = maxvlanid;
+-	g_br_vlan_cap.maxbridgeid = MAX_FID - maxvlanid;
+-	return DP_SUCCESS;
++	if (!netif_is_bridge_master(br_dev)) {
++		pr_err("%s: br vlan limit set for wrong dev %s\n",
++		       __func__, br_dev->name);
++		return DP_FAILURE;
++	}
++
++	DP_LIB_LOCK(&dp_lock);
++	br_info = dp_swdev_bridge_entry_lookup_rcu(br_dev);
++	if (!br_info) {
++		pr_err("%s: dev %s is not registered to DPM\n", __func__,
++		       br_dev->name);
++		goto EXIT;
++	}
++
++	br_info->max_vlan_limit = maxvlanid;
++	br_info->max_brid_limit =
++			1 << ((ilog2(MAX_FID) - ilog2(maxvlanid)) - 1);
++
++	DP_DEBUG(DP_DBG_FLAG_BR_VLAN,
++		 "%s: max_vlan_limit=%d max_brid_limit=%d\n",
++		 __func__, br_info->max_vlan_limit, br_info->max_vlan_limit);
++
++	ret = 0;
++EXIT:
++	DP_LIB_UNLOCK(&dp_lock);
++	return ret;
++
+ }
+-EXPORT_SYMBOL(init_br_vlan);
++EXPORT_SYMBOL(dp_set_br_vlan_limit);
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index 9e51a11b252a..eae22895e13b 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -263,7 +263,7 @@ int ctp_dev_list_add(struct list_head *head, struct net_device *dev, int bp,
+ 		list_add(&ctp_dev_list->list, head);
+ 	} else {
+ 		DP_DEBUG(DP_DBG_FLAG_DBG, "Device already exist: %s\n",
+-			 ctp_dev_list->dev->name);
++			 ctp_dev_list->dev ? ctp_dev_list->dev->name : "NULL");
+ 	}
+ 	return 0;
+ }
+@@ -275,7 +275,7 @@ int ctp_dev_list_del(struct list_head *head, struct net_device *dev)
+ 	ctp_dev_list = ctp_dev_list_lookup(head, dev);
+ 	if (!ctp_dev_list) {
+ 		DP_DEBUG(DP_DBG_FLAG_DBG, "Device not found: %s\n",
+-			 ctp_dev_list->dev->name);
++			 dev ? dev->name : "NULL");
+ 		return -1;
+ 	}
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "del ctp dev list\n");
+diff --git a/drivers/net/datapath/dpm/datapath_pce.c b/drivers/net/datapath/dpm/datapath_pce.c
+index 482ef128113a..c33876b5cb96 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.c
++++ b/drivers/net/datapath/dpm/datapath_pce.c
+@@ -307,7 +307,7 @@ static int reset_ctp_pce_flow_index(struct dp_blk_entry *blk_entry)
+ 	}
+ 	bp_info = get_dp_bp_info(0, ctp.nBridgePortId);
+ 	if ((!bp_info) || (!bp_info->ref_cnt)) {
+-		ctp.nFirstFlowEntryIndex = 0xFFFFFFFF;
++		ctp.nFirstFlowEntryIndex = CTP_FLOW_ENTRY_IDX_RESET;
+ 		ctp.eMask = GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
+ 
+ 		if (ops->gsw_ctp_ops.CTP_PortConfigSet(ops, &ctp)) {
+@@ -317,16 +317,17 @@ static int reset_ctp_pce_flow_index(struct dp_blk_entry *blk_entry)
+ 			return -1;
+ 		}
+ 		DP_DEBUG(DP_DBG_FLAG_PCE,
+-			 "%s: CTP_PortCfgSet for nSubifIdGroup:%u Bp:%u\n",
+-			 __func__, ctp.nSubIfIdGroup, ctp.nBridgePortId);
+-		goto EXIT;
++			 "%s: CTPPortCfgSet Succ nSubifIdGroup:%u Bp:%u %s%u\n",
++			 __func__, ctp.nSubIfIdGroup, ctp.nBridgePortId,
++			 "Lpid:", ctp.nLogicalPortId);
++		return 0;
+ 	}
+ 	/* Retrieve the CTP dev list for the pmapper bridge port */
+ 	list_for_each_entry(ctp_entry, &bp_info->ctp_dev, list) {
+-		if ((!ctp_entry) || (!ctp_entry->dev))
++		if (!ctp_entry->dev)
+ 			continue;
+ 		ctp.nSubIfIdGroup = ctp_entry->ctp;
+-		ctp.nFirstFlowEntryIndex = 0xFFFFFFFF;
++		ctp.nFirstFlowEntryIndex = CTP_FLOW_ENTRY_IDX_RESET;
+ 		ctp.eMask = GSW_CTP_PORT_CONFIG_FLOW_ENTRY;
+ 
+ 		if (ops->gsw_ctp_ops.CTP_PortConfigSet(ops, &ctp)) {
+@@ -336,13 +337,10 @@ static int reset_ctp_pce_flow_index(struct dp_blk_entry *blk_entry)
+ 			return -1;
+ 		}
+ 		DP_DEBUG(DP_DBG_FLAG_PCE,
+-			 "%s: CTP_PortCfgSet for nSubifIdGroup: %u BP_pmap:%u\n",
+-			 __func__, ctp.nSubIfIdGroup, ctp.nBridgePortId);
++			 "%s: CTPPortCfgSet Succ nSubifIdGroup:%u BP:%u %s%u\n",
++			 __func__, ctp.nSubIfIdGroup, ctp.nBridgePortId,
++			 "Lpid:", ctp.nLogicalPortId);
+ 	}
+-EXIT:
+-	DP_DEBUG(DP_DBG_FLAG_PCE,
+-		 "%s: CTP_PortCfgSet succ, Lpid: %u\n",
+-		 __func__, ctp.nLogicalPortId);
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_pce.h b/drivers/net/datapath/dpm/datapath_pce.h
+index 61a9a23a0788..e0cd9319e559 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.h
++++ b/drivers/net/datapath/dpm/datapath_pce.h
+@@ -12,6 +12,9 @@
+ /* Max Sub-Block Size for CTP VLAN aware feature */
+ #define VLAN_PCE_MAX_SUBBLK_SIZE 8
+ 
++/* CTP flow entry index used during reset in GSWIP CTP_PortCfgSet */
++#define CTP_FLOW_ENTRY_IDX_RESET 0xFFFFFFFF
++
+ /* Main PCE rule entry struct */
+ struct dp_pce_rule {
+ 	u32 hw_rules_max;
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.h b/drivers/net/datapath/dpm/datapath_swdev.h
+index d1de50d53417..b61219fa283e 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.h
++++ b/drivers/net/datapath/dpm/datapath_swdev.h
+@@ -22,6 +22,7 @@
+ #define CPU_PORT_DISABLE	BIT(4)
+ 
+ #define DP_SWDEV_BRIDGE_ITEM 1
++#define DP_DEF_MAX_VLAN_LIMIT 8
+ 
+ struct bridge_id_entry_item {
+ 	struct net_device *dev;
+@@ -43,6 +44,8 @@ struct br_info {
+ 	u32 dp_port;
+ 	struct list_head bp_list;
+ 	bool br_vlan_en; 		/* VLAN Enabled for this bridge */
++	u32 max_vlan_limit;		/* Max Vlan allowed for this bridge */
++	u32 max_brid_limit;		/* Max Brid allowed for this bridge */
+ 	u32 num_vlan;			/* Num of vlans supported in br */
+ 	u32 num_fid;			/* Num of vlan aware fid in br */
+ 	struct list_head br_vlan_list;  /* List pointing to the vlan entry */

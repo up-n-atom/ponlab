@@ -1,0 +1,1266 @@
+From cdfbabb5c1e90bcecf9b4931706cdc74ea66ca50 Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Fri, 6 Dec 2019 12:04:41 +0800
+Subject: [PATCH] PONRTSYS-5001: Create Regmap driver which uses TEP mailbox
+
+Integrated the regmap driver from lgm and hooked the read/write functions with PRX300 ICC driver
+---
+ arch/mips/lantiq/grx500/prom.c        |   7 -
+ drivers/Makefile                      |   4 +
+ drivers/base/Makefile                 |   1 +
+ drivers/base/regmap/Kconfig           |   4 +
+ drivers/base/regmap/Makefile          |   1 +
+ drivers/base/regmap/regmap-icc.c      | 404 ++++++++++++++++++++++++++++++++++
+ drivers/base/tep-sec.c                |  95 ++++++++
+ drivers/char/Makefile                 |   2 -
+ drivers/char/ltq_icc/Makefile         |   4 +-
+ drivers/char/ltq_icc/drv_icc.c        | 111 +++++++++-
+ drivers/char/ltq_mps2/Makefile        |   2 +-
+ drivers/char/ltq_mps2/drv_mps_linux.c |  13 +-
+ drivers/clk/intel/clk-cgu-pll.c       |  13 ++
+ drivers/clk/intel/clk-prx300.c        |   2 +-
+ drivers/dma/intel/cdma.c              |   2 +-
+ drivers/dma/intel/hdma.c              |   2 +-
+ drivers/mfd/syscon.c                  |  86 +++++++-
+ include/linux/regmap.h                |  75 ++++++-
+ include/uapi/linux/icc/drv_icc.h      |  38 ++--
+ 19 files changed, 816 insertions(+), 50 deletions(-)
+
+diff --git a/arch/mips/lantiq/grx500/prom.c b/arch/mips/lantiq/grx500/prom.c
+index 0cd94a99b2fb..3bda4d64d2d0 100755
+--- a/arch/mips/lantiq/grx500/prom.c
++++ b/arch/mips/lantiq/grx500/prom.c
+@@ -274,13 +274,9 @@ static int __init plat_publish_devices(void)
+ }
+ arch_initcall(plat_publish_devices);
+ 
+-#define CHIPTOP_IFMUX_CFG	0x120
+-#define SPI_DEBUG_EN		BIT(18)
+-
+ /* Disable WLAN SPI debug which existed in pinctrl before */
+ static int __init chiptop_default_setup(void)
+ {
+-	unsigned int val = 0;
+ 	struct regmap *chiptop_base;
+ 
+ 	chiptop_base =
+@@ -290,9 +286,6 @@ static int __init chiptop_default_setup(void)
+ 		return -EINVAL;
+ 	}
+ 
+-	regmap_read(chiptop_base, CHIPTOP_IFMUX_CFG, &val);
+-	val &= ~SPI_DEBUG_EN;
+-	regmap_write(chiptop_base, CHIPTOP_IFMUX_CFG, val);
+ 	return 0;
+ }
+ postcore_initcall(chiptop_default_setup);
+diff --git a/drivers/Makefile b/drivers/Makefile
+index 7c3d58dcf6b3..2689ddf2c497 100644
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -30,6 +30,10 @@ obj-$(CONFIG_SFI)		+= sfi/
+ obj-$(CONFIG_PNP)		+= pnp/
+ obj-y				+= amba/
+ 
++# ICC support required in clk driver if we use regmap over icc
++obj-y				+= char/ltq_mps2/
++obj-y				+= char/ltq_icc/
++
+ obj-y				+= clk/
+ # Many drivers will want to use DMA so this has to be made available
+ # really early.
+diff --git a/drivers/base/Makefile b/drivers/base/Makefile
+index 2609ba20b396..86cd4f7eaf79 100644
+--- a/drivers/base/Makefile
++++ b/drivers/base/Makefile
+@@ -23,6 +23,7 @@ obj-$(CONFIG_SOC_BUS) += soc.o
+ obj-$(CONFIG_PINCTRL) += pinctrl.o
+ obj-$(CONFIG_DEV_COREDUMP) += devcoredump.o
+ obj-$(CONFIG_GENERIC_MSI_IRQ_DOMAIN) += platform-msi.o
++obj-$(CONFIG_SOC_PRX300_BOOTCORE) += tep-sec.o
+ 
+ ccflags-$(CONFIG_DEBUG_DRIVER) := -DDEBUG
+ 
+diff --git a/drivers/base/regmap/Kconfig b/drivers/base/regmap/Kconfig
+index db9d00c36a3e..905257759206 100644
+--- a/drivers/base/regmap/Kconfig
++++ b/drivers/base/regmap/Kconfig
+@@ -29,3 +29,7 @@ config REGMAP_MMIO
+ 
+ config REGMAP_IRQ
+ 	bool
++
++config REGMAP_ICC
++	tristate "regmap over ICC"
++	depends on LTQ_ICC
+diff --git a/drivers/base/regmap/Makefile b/drivers/base/regmap/Makefile
+index 609e4c84f485..fac83a506b3e 100644
+--- a/drivers/base/regmap/Makefile
++++ b/drivers/base/regmap/Makefile
+@@ -6,6 +6,7 @@ obj-$(CONFIG_REGMAP) += regcache-rbtree.o regcache-lzo.o regcache-flat.o
+ obj-$(CONFIG_DEBUG_FS) += regmap-debugfs.o
+ obj-$(CONFIG_REGMAP_AC97) += regmap-ac97.o
+ obj-$(CONFIG_REGMAP_I2C) += regmap-i2c.o
++obj-$(CONFIG_REGMAP_ICC) += regmap-icc.o
+ obj-$(CONFIG_REGMAP_SPI) += regmap-spi.o
+ obj-$(CONFIG_REGMAP_SPMI) += regmap-spmi.o
+ obj-$(CONFIG_REGMAP_MMIO) += regmap-mmio.o
+diff --git a/drivers/base/regmap/regmap-icc.c b/drivers/base/regmap/regmap-icc.c
+new file mode 100644
+index 000000000000..f3ae8e8e132c
+--- /dev/null
++++ b/drivers/base/regmap/regmap-icc.c
+@@ -0,0 +1,404 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2018 Intel Corporation.
++ * Zhu Yixin <yixin.zhu@intel.com>
++ */
++#include <linux/clk.h>
++#include <linux/debugfs.h>
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/uaccess.h>
++#include <uapi/linux/icc/drv_icc.h>
++
++#include "internal.h"
++
++enum{
++	REGMAP_DBG_READ,
++	REGMAP_DBG_WRITE,
++};
++
++struct regmap_icc_context {
++	void __iomem *regs;
++	phys_addr_t  paddr;
++	unsigned int val_bytes;
++	bool         attached_clk;
++	const char   *name;
++	struct clk   *clk;
++	struct dentry *debugfs;
++	int (*reg_write)(struct regmap_icc_context *ctx,
++			 unsigned int reg, unsigned int val);
++	int (*reg_read)(struct regmap_icc_context *ctx,
++			unsigned int reg, unsigned int *val);
++};
++
++static struct dentry *debugfs;
++
++static int regmap_icc_regbits_check(size_t reg_bits)
++{
++	switch (reg_bits) {
++	case 32:
++		return 0;
++	case 8:
++	case 16:
++	case 64:
++	default:
++		pr_err("regbits %zu not supported by regmap icc\n", reg_bits);
++		return -EINVAL;
++	}
++}
++
++static int regmap_icc_get_min_stride(size_t val_bits)
++{
++	int min_stride;
++
++	switch (val_bits) {
++	case 32:
++		min_stride = 4;
++		break;
++	case 8:
++	case 16:
++	case 64:
++	default:
++		return -EINVAL;
++	}
++
++	return min_stride;
++}
++
++static int
++regmap_icc_write32le(struct regmap_icc_context *ctx, unsigned int reg,
++		     unsigned int val)
++{
++	pr_debug("===%s: icc regmap write: reg: 0x%x, val: 0x%x===\n",
++		 ctx->name, reg, val);
++	return icc_regmap_sync_write(ctx->paddr + reg, val);
++}
++
++static int regmap_icc_write(void *context, unsigned int reg, unsigned int val)
++{
++	struct regmap_icc_context *ctx = context;
++	int ret;
++
++	if (!IS_ERR(ctx->clk)) {
++		ret = clk_enable(ctx->clk);
++		if (ret < 0)
++			return ret;
++	}
++
++	ret = ctx->reg_write(ctx, reg, val);
++	if (ret)
++		pr_err("icc write err %d: addr: %p, val: 0x%x\n",
++		       ret, ctx->regs + reg, val);
++
++	if (!IS_ERR(ctx->clk))
++		clk_disable(ctx->clk);
++
++	return ret;
++}
++
++static int
++regmap_icc_read32le(struct regmap_icc_context *ctx, unsigned int reg,
++		    unsigned int *val)
++{
++	pr_debug("===%s: icc regmap read: reg: 0x%x===\n", ctx->name, reg);
++	return icc_regmap_sync_read(ctx->paddr + reg, val);
++}
++
++static int regmap_icc_read(void *context, unsigned int reg, unsigned int *val)
++{
++	struct regmap_icc_context *ctx = context;
++	int ret;
++
++	if (!IS_ERR(ctx->clk)) {
++		ret = clk_enable(ctx->clk);
++		if (ret < 0)
++			return ret;
++	}
++
++	ret = ctx->reg_read(ctx, reg, val);
++	if (ret)
++		pr_err("icc read err %d: addr: %p\n", ret, ctx->regs + reg);
++
++	if (!IS_ERR(ctx->clk))
++		clk_disable(ctx->clk);
++
++	return 0;
++}
++
++static void regmap_icc_free_context(void *context)
++{
++	struct regmap_icc_context *ctx = context;
++
++	if (!IS_ERR(ctx->clk)) {
++		clk_unprepare(ctx->clk);
++		if (!ctx->attached_clk)
++			clk_put(ctx->clk);
++	}
++	kfree(context);
++}
++
++static const struct regmap_bus regmap_icc = {
++	.fast_io                   = 1,
++	.reg_write                 = regmap_icc_write,
++	.reg_read                  = regmap_icc_read,
++	.free_context              = regmap_icc_free_context,
++	.val_format_endian_default = REGMAP_ENDIAN_LITTLE,
++};
++
++static struct regmap_icc_context
++*regmap_icc_gen_context(struct device *dev, const char *clk_id,
++			void __iomem *regs, phys_addr_t paddr,
++			const struct regmap_config *config)
++{
++	struct regmap_icc_context *ctx;
++	int min_stride;
++	int ret;
++
++	ret = regmap_icc_regbits_check(config->reg_bits);
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (config->pad_bits)
++		return ERR_PTR(-EINVAL);
++
++	min_stride = regmap_icc_get_min_stride(config->val_bits);
++	if (min_stride < 0)
++		return ERR_PTR(min_stride);
++
++	if (config->reg_stride < min_stride)
++		return ERR_PTR(-EINVAL);
++
++	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
++	if (!ctx)
++		return ERR_PTR(-ENOMEM);
++
++	ctx->regs = regs;
++	ctx->paddr = paddr;
++	ctx->val_bytes = config->val_bits / 8;
++	ctx->clk = ERR_PTR(-ENODEV);
++	ctx->name = config->name;
++
++	switch (regmap_get_val_endian(dev, &regmap_icc, config)) {
++	case REGMAP_ENDIAN_DEFAULT:
++	case REGMAP_ENDIAN_LITTLE:
++	case REGMAP_ENDIAN_BIG:
++#ifdef __LITTLE_ENDIAN
++	case REGMAP_ENDIAN_NATIVE:
++#endif
++		ctx->reg_read = regmap_icc_read32le;
++		ctx->reg_write = regmap_icc_write32le;
++		break;
++	default:
++		ret = -EINVAL;
++		goto err_free;
++	}
++
++	if (!clk_id)
++		return ctx;
++
++	ctx->clk = clk_get(dev, clk_id);
++	if (IS_ERR(ctx->clk)) {
++		ret = PTR_ERR(ctx->clk);
++		goto err_free;
++	}
++
++	ret = clk_prepare(ctx->clk);
++	if (ret < 0) {
++		clk_put(ctx->clk);
++		goto err_free;
++	}
++
++	return ctx;
++
++err_free:
++	kfree(ctx);
++
++	return ERR_PTR(ret);
++}
++
++struct regmap *__regmap_init_icc_clk(struct device *dev, const char *clk_id,
++				     void __iomem *regs, phys_addr_t paddr,
++				     const struct regmap_config *config,
++				     struct lock_class_key *lock_key,
++				     const char *lock_name)
++{
++	struct regmap_icc_context *ctx;
++
++	ctx = regmap_icc_gen_context(dev, clk_id, regs, paddr, config);
++	if (IS_ERR(ctx))
++		return ERR_CAST(ctx);
++
++	return __regmap_init(dev, &regmap_icc, ctx, config,
++			     lock_key, lock_name);
++}
++EXPORT_SYMBOL_GPL(__regmap_init_icc_clk);
++
++struct regmap *__devm_regmap_init_icc_clk(struct device *dev,
++					  const char *clk_id,
++					  void __iomem *regs, phys_addr_t paddr,
++					  const struct regmap_config *config,
++					  struct lock_class_key *lock_key,
++					  const char *lock_name)
++{
++	struct regmap_icc_context *ctx;
++
++	ctx = regmap_icc_gen_context(dev, clk_id, regs, paddr, config);
++	if (IS_ERR(ctx))
++		return ERR_CAST(ctx);
++
++	return __devm_regmap_init(dev, &regmap_icc, ctx, config,
++				  lock_key, lock_name);
++}
++EXPORT_SYMBOL_GPL(__devm_regmap_init_icc_clk);
++
++int regmap_icc_attach_clk(struct regmap *map, struct clk *clk)
++{
++	struct regmap_icc_context *ctx = map->bus_context;
++
++	ctx->clk = clk;
++	ctx->attached_clk = true;
++
++	return clk_prepare(ctx->clk);
++}
++EXPORT_SYMBOL_GPL(regmap_icc_attach_clk);
++
++void regmap_icc_detach_clk(struct regmap *map)
++{
++	struct regmap_icc_context *ctx = map->bus_context;
++
++	clk_unprepare(ctx->clk);
++
++	ctx->attached_clk = false;
++	ctx->clk = NULL;
++}
++EXPORT_SYMBOL_GPL(regmap_icc_detach_clk);
++
++static ssize_t
++regmap_reg_dbg(struct file *s, const char __user *buffer,
++	       size_t count, loff_t *pos)
++{
++	char buf[128] = {0};
++	char *cact, *caddr, *cval, *cmask;
++	u32 reg_addr, reg_val, action;
++	int i, len;
++
++	if (!capable(CAP_SYS_ADMIN))
++		return -EPERM;
++
++	len = count < sizeof(buf) ? count : sizeof(buf) - 1;
++	if (copy_from_user(buf, buffer, len))
++		return -EFAULT;
++
++	if (strcmp(buf, "help") == 0)
++		goto __err_help;
++
++	pr_info("buf: %s\n", buf);
++
++	caddr = NULL;
++	cval  = NULL;
++	cmask = NULL;
++	cact = buf;
++	for (i = 0; buf[i] != ' ' && buf[i] != 0; i++)
++		;
++
++	if (buf[i] == 0)
++		goto __err_help;
++
++	buf[i++] = 0;
++
++	pr_info("cact: %s\n", cact);
++	if (!strcmp(cact, "r"))
++		action = REGMAP_DBG_READ;
++	else if (!strcmp(cact, "w"))
++		action = REGMAP_DBG_WRITE;
++	else
++		goto __err_help;
++
++	caddr = &buf[i];
++	for (; buf[i] != ' ' && buf[i] != 0; i++)
++		;
++
++	if (buf[i] == 0)
++		goto __action;
++	buf[i++] = 0;
++
++	pr_info("addr: %s\n", caddr);
++
++	cval = &buf[i];
++	for (; buf[i] != ' ' && buf[i] != 0; i++)
++		;
++	if (buf[i] == 0)
++		goto __action;
++	buf[i++] = 0;
++	pr_info("cval: %s\n", cval);
++
++	cmask = &buf[i];
++	for (; buf[i] != ' ' && buf[i] != 0; i++)
++		;
++	buf[i++] = 0;
++	pr_info("cmask: %s\n", cmask);
++
++__action:
++	switch (action) {
++	case REGMAP_DBG_WRITE:
++		if (!cval || kstrtou32(cval, 0, &reg_val)) {
++			pr_err("Failed to parse reg value!\n");
++			goto __err_help;
++		}
++	case REGMAP_DBG_READ:
++		if (!caddr || kstrtou32(caddr, 0, &reg_addr)) {
++			pr_err("Failed to parse reg address!\n");
++			goto __err_help;
++		}
++		break;
++	default:
++		break;
++	}
++
++	switch (action) {
++	case REGMAP_DBG_WRITE:
++		pr_info("write: regaddr: 0x%08x, regval: 0x%08x\n",
++			reg_addr, reg_val);
++		if (icc_regmap_sync_write(reg_addr, reg_val) != 0)
++			pr_err("icc_regmap_sync_write Failed\n");
++		break;
++	case REGMAP_DBG_READ:
++		pr_info("icc read addr: 0x%08x\n", reg_addr);
++		if (icc_regmap_sync_read(reg_addr, &reg_val) != 0)
++			pr_err("icc_regmap_sync_read Failed\n");
++
++		pr_info("read addr: 0x%08x, val: 0x%08x\n",
++			reg_addr, reg_val);
++		break;
++	}
++
++	return count;
++
++__err_help:
++	pr_info("echo r <addr> > dbg\n");
++	pr_info("echo w <addr> <value> > dbg\n");
++	return count;
++}
++
++static const struct file_operations regmap_icc_dbg_fops = {
++	.write = regmap_reg_dbg,
++	.llseek = noop_llseek,
++};
++
++static int __init regmap_icc_debugfs_init(void)
++{
++	debugfs = debugfs_create_dir("regmap-icc", NULL);
++	if (IS_ERR_OR_NULL(debugfs))
++		return -ENOMEM;
++
++	if (!debugfs_create_file("dbg", 0200, debugfs, NULL,
++				 &regmap_icc_dbg_fops))
++		return -ENOMEM;
++
++	return 0;
++}
++device_initcall(regmap_icc_debugfs_init);
++
++MODULE_LICENSE("GPL v2");
+diff --git a/drivers/base/tep-sec.c b/drivers/base/tep-sec.c
+new file mode 100644
+index 000000000000..02bbcafc8d32
+--- /dev/null
++++ b/drivers/base/tep-sec.c
+@@ -0,0 +1,95 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2018 Intel Corporation.
++ * Zhu Yixin <yixin.zhu@intel.com>
++ */
++#include <linux/err.h>
++#include <linux/io.h>
++#include <linux/module.h>
++#include <uapi/linux/icc/drv_icc.h>
++
++#define RCU_RST_REQ 0x16100010
++#define CPU_CLUSTER_RST_MASK 0x4
++
++static int tep_sec_readl(phys_addr_t paddr, unsigned int *val)
++{
++	*val = readl((void *)KSEG1ADDR(paddr));
++	pr_debug("===%s: PA: 0x%x, KSEG1: 0x%x val 0x%x===\n",
++		 __func__, paddr, KSEG1ADDR(paddr), *val);
++	return 0;
++}
++
++static int tep_sec_writel(phys_addr_t paddr, unsigned int val)
++{
++	pr_debug("===%s: PA: 0x%x, KSEG1: 0x%x val 0x%x===\n",
++		 __func__, paddr, KSEG1ADDR(paddr), val);
++
++	writel(val, (void *)KSEG1ADDR(paddr));
++	return 0;
++}
++
++void pfn_icc_regmap_callback(icc_wake_type wake_type)
++{
++	int ret;
++	icc_msg_t rw;
++	icc_msg_t icc_reply_msg;
++	u32 addr, val;
++
++	if ((wake_type & ICC_READ)) {
++		memset(&rw, 0, sizeof(icc_msg_t));
++		ret = icc_read(RM, &rw);
++
++		if (ret > 0) {
++			memset(&icc_reply_msg, 0, sizeof(icc_msg_t));
++			icc_reply_msg.src_client_id = rw.dst_client_id;
++			icc_reply_msg.dst_client_id = rw.src_client_id;
++			icc_reply_msg.param[0] = rw.param[0];
++			icc_reply_msg.param[1] = rw.param[1];
++			addr = icc_reply_msg.param[0];
++			val = icc_reply_msg.param[1];
++
++			switch (rw.msg_id) {
++			case REGMAP_WR_MSGID:
++				tep_sec_writel((phys_addr_t)addr, val);
++				break;
++
++			case REGMAP_RD_MSGID:
++				val = 0;
++				tep_sec_readl((phys_addr_t)addr, &val);
++				icc_reply_msg.param[1] = val;
++				break;
++
++			case REGMAP_CF_MSGID:
++				/* For clock frequency table from IAP */
++				break;
++
++			default:
++				icc_reply_msg.param_attr = 1;
++				break;
++			}
++			icc_write(RM, &icc_reply_msg);
++		} else {
++			pr_err("Read from ICC REGMAP failed\n");
++		}
++	}
++}
++
++int __init init_icc_regmap(void)
++{
++	int result = 0;
++
++	result = icc_open((struct inode *)RM, NULL);
++	if (result < 0) {
++		pr_err("%s: icc_open failed\n", __func__);
++		return result;
++	}
++
++	result = icc_register_callback(RM, &pfn_icc_regmap_callback);
++	if (result < 0) {
++		pr_err("%s: icc_register_callback failed\n", __func__);
++		return result;
++	}
++	return 0;
++}
++module_init(init_icc_regmap);
++MODULE_LICENSE("GPL v2");
++
+diff --git a/drivers/char/Makefile b/drivers/char/Makefile
+index 9d2e18c100fa..800497f9828e 100644
+--- a/drivers/char/Makefile
++++ b/drivers/char/Makefile
+@@ -61,6 +61,4 @@ obj-$(CONFIG_TILE_SROM)		+= tile-srom.o
+ obj-$(CONFIG_XILLYBUS)		+= xillybus/
+ obj-$(CONFIG_POWERNV_OP_PANEL)	+= powernv-op-panel.o
+ 
+-obj-$(CONFIG_LTQ_MPS2)+= ltq_mps2/
+-obj-$(CONFIG_LTQ_ICC)+= ltq_icc/
+ obj-$(CONFIG_LTQ_SYSTEM_RESET)		+= ltq_reset/
+diff --git a/drivers/char/ltq_icc/Makefile b/drivers/char/ltq_icc/Makefile
+index cc6b9f15af76..07b92c8b1f4b 100644
+--- a/drivers/char/ltq_icc/Makefile
++++ b/drivers/char/ltq_icc/Makefile
+@@ -5,9 +5,9 @@
+ #
+ # Makefile for the Lantiq icc driver
+ #
+-obj-y += drv_icc.o icc_client.o
++obj-$(CONFIG_LTQ_ICC) += drv_icc.o icc_client.o
+ 
+-obj-$(CONFIG_SOC_TYPE_GRX500_TEP) += proc_redirect_bootcore.o
++#obj-$(CONFIG_SOC_TYPE_GRX500_TEP) += proc_redirect_bootcore.o
+ # !<WW: FIXME!
+ # this is broken due to changes in proc function to use rb tree for search and
+ # traverse
+diff --git a/drivers/char/ltq_icc/drv_icc.c b/drivers/char/ltq_icc/drv_icc.c
+index b4907d0a2d95..7e001811ec39 100644
+--- a/drivers/char/ltq_icc/drv_icc.c
++++ b/drivers/char/ltq_icc/drv_icc.c
+@@ -110,9 +110,9 @@ uint32_t BLOCK_MSG[MAX_CLIENT];
+ mmap_addr_t mmap_address[MAX_CLIENT];
+ icc_fifo_t ICC_BUFFER[MAX_CLIENT];
+ #ifdef KTHREAD
+-struct semaphore icc_callback_sem;
++static struct semaphore icc_callback_sem;
+ #endif
+-
++static struct semaphore icc_sync_sem;
+ /* the driver callbacks */
+ static struct file_operations icc_fops = {
+  owner:THIS_MODULE,
+@@ -370,6 +370,33 @@ int icc_read(icc_devices icdev,icc_msg_t *rw)
+ 	return sizeof(icc_msg_t);
+ }
+ 
++/* regmap read function */
++int icc_regmap_sync_read(phys_addr_t paddr, unsigned int *val)
++{
++	icc_msg_t *retmsg, msg = {0};
++	int ret;
++
++	if (!val)
++		return -1;
++
++	msg.src_client_id = RM;
++	msg.dst_client_id = RM;
++	msg.msg_id = REGMAP_RD_MSGID;
++	msg.param[0] = (uint32_t)paddr;
++
++	retmsg = icc_sync_write(RM, &msg);
++	if (!retmsg || retmsg->dst_client_id != RM)
++		return -EINVAL;
++
++	ret = retmsg->param_attr;
++	if (!ret)
++		*val = retmsg->param[1];
++
++	kfree(retmsg);
++
++	return ret;
++}
++EXPORT_SYMBOL(icc_regmap_sync_read);
+ 
+ /*ioctl functions supported by icc*/
+ long icc_ioctl (struct file *file_p,uint32_t nCmd, unsigned long arg){
+@@ -509,7 +536,79 @@ int icc_write(icc_devices icdev, icc_msg_t *buf)
+   	return sizeof(icc_msg_t);
+ }
+ 
++/* regmap write function */
++int icc_regmap_sync_write(phys_addr_t paddr, unsigned int val)
++{
++	icc_msg_t *retmsg, msg = {0};
++	int ret;
++
++	msg.src_client_id = RM;
++	msg.dst_client_id = RM;
++	msg.msg_id = REGMAP_WR_MSGID;
++	msg.param[0] = (uint32_t)paddr;
++	msg.param[1] = val;
++
++	retmsg = icc_sync_write(RM, &msg);
++	if (!retmsg || retmsg->dst_client_id != RM)
++		return -EINVAL;
++
++	ret = retmsg->param_attr;
++	kfree(retmsg);
++
++	return ret;
++}
++EXPORT_SYMBOL(icc_regmap_sync_write);
++
+ #ifndef __LIBRARY__
++/*******************************************************************************
++Description:
++Arguments:
++Note:
++*******************************************************************************/
++icc_msg_t *icc_sync_write(icc_devices icdev, icc_msg_t *buf)
++{
++	int ret;
++	int i = 0;
++	icc_msg_t *rx_icc;
++	
++	if(icdev < MAX_CLIENT && icdev > ICC_Client && iccdev[icdev].Installed == 0) {
++		icc_open((struct inode *)icdev,NULL);
++	}
++	
++	if(down_interruptible(&icc_sync_sem))
++		return NULL;
++	ret = icc_write(icdev,buf);
++	if(ret < 0){
++		TRACE(ICC, DBG_LEVEL_HIGH, ("icc write failed\n"));
++		up(&icc_sync_sem);
++		return NULL;
++	}
++	ret = wait_event_interruptible_timeout(
++			 iccdev[icdev].wakeuplist,
++			(icc_excpt[icdev] != 0),HZ);
++	if (ret == 0 || ret == -ERESTARTSYS) {
++		TRACE(ICC, DBG_LEVEL_HIGH, ("Peer side not responding\n"));
++		up(&icc_sync_sem);
++		return NULL;
++	}
++	icc_excpt[icdev] = 0;
++	rx_icc = kzalloc(sizeof(icc_msg_t), GFP_KERNEL);
++	if (rx_icc == NULL) {
++		printk("alloc failed\n");
++		up(&icc_sync_sem);
++		return NULL;
++	}
++        ret = icc_read(icdev, rx_icc);
++	up(&icc_sync_sem);
++	if (ret < 0) {
++		printk("Read from ICC failed\n");
++		kfree(rx_icc);
++		return NULL;
++	}
++	return rx_icc;
++}
++EXPORT_SYMBOL(icc_sync_write);
++
+ /*write call back function of the driver*/
+ int icc_write_d(struct file *file_p, char *buf, size_t count, loff_t *ppos)
+ {
+@@ -604,7 +703,7 @@ int icc_os_register(void)
+ 	}
+ 	TRACE(ICC, DBG_LEVEL_HIGH, ("Major Id is %d\n", icc_major_id));
+    	TRACE(ICC, DBG_LEVEL_HIGH, ("ICC driver registered\n"));
+-	return ret;
++	return 0;
+ }
+ 
+ /**
+@@ -816,7 +915,11 @@ int __init icc_init_module (void){
+ #ifdef KTHREAD
+ 	sema_init(&icc_callback_sem,1);
+ #endif
++	sema_init(&icc_sync_sem,1);
++	return 0;
+ finish:
++	mps_unregister_callback();
++	mps_close((struct inode *)1, NULL);
+ 	return result;
+ }
+ 
+@@ -1009,7 +1112,7 @@ MODULE_AUTHOR("Swaroop Sarma");
+ MODULE_PARM_DESC (icc_major_id, "Major ID of device");
+ module_param (icc_major_id, short, 0);
+ /*module functions of ICC driver*/
+-module_init (icc_init_module);
++arch_initcall(icc_init_module);
+ module_exit (icc_cleanup_module);
+ /*exported symbols from ICC driver*/
+ EXPORT_SYMBOL(icc_open);
+diff --git a/drivers/char/ltq_mps2/Makefile b/drivers/char/ltq_mps2/Makefile
+index 98088e2e1d71..33ee2748c3fc 100644
+--- a/drivers/char/ltq_mps2/Makefile
++++ b/drivers/char/ltq_mps2/Makefile
+@@ -5,4 +5,4 @@
+ #
+ # Makefile for the Lantiq mps2 driver
+ #
+-obj-y += drv_mps_common.o drv_mps_linux.o
++obj-$(CONFIG_LTQ_MPS2) += drv_mps_common.o drv_mps_linux.o
+diff --git a/drivers/char/ltq_mps2/drv_mps_linux.c b/drivers/char/ltq_mps2/drv_mps_linux.c
+index 41307cd275a9..22cbf1bd413e 100644
+--- a/drivers/char/ltq_mps2/drv_mps_linux.c
++++ b/drivers/char/ltq_mps2/drv_mps_linux.c
+@@ -993,6 +993,7 @@ static struct irqaction mps_irqaction = {
+ 			.dev_id					= &mps_dev,
+ };
+ #endif
++
+ /**
+    This function initializes the module.
+ \param
+@@ -1016,11 +1017,10 @@ mps_init_module (void)
+            mps_device_version));
+ 
+    sprintf (mps_dev_name, MPS_DEV_NAME);
+-
+ #ifdef FEAT_LINUX_PLATFORM_DRIVER
+-	 result = platform_driver_probe(&ltqmps_driver, ltq_mps_probe);
+-	 if(result)
+-			return result;
++   result = platform_driver_probe(&ltqmps_driver, ltq_mps_probe);
++   if (result)
++	return result;
+ #endif
+    mps_bufman_init ();
+ 
+@@ -1031,6 +1031,7 @@ mps_init_module (void)
+    result = lq_mps_os_register (&mps_dev);
+    if (result)
+       return result;
++
+ #if defined(SYSTEM_VR9)
+ #ifdef VPE0
+    /* Set handler for interrupt generated by voice-FW AD0 status register. */
+@@ -1127,10 +1128,8 @@ mps_cleanup_module (void)
+ 
+    TRACE (MPS2, DBG_LEVEL_HIGH, (KERN_INFO "Lantiq MPS2 driver: cleanup done\n"));
+ }
+-
+-module_init (mps_init_module);
++arch_initcall(mps_init_module);
+ module_exit (mps_cleanup_module);
+-
+ EXPORT_SYMBOL (mps_write_mailbox);
+ EXPORT_SYMBOL (mps_read_mailbox);
+ EXPORT_SYMBOL (mps_open);
+diff --git a/drivers/clk/intel/clk-cgu-pll.c b/drivers/clk/intel/clk-cgu-pll.c
+index 1309580ee13a..9a63d035877d 100644
+--- a/drivers/clk/intel/clk-cgu-pll.c
++++ b/drivers/clk/intel/clk-cgu-pll.c
+@@ -19,6 +19,9 @@
+ 
+ #define to_intel_clk_pll(_hw)   container_of(_hw, struct intel_clk_pll, hw)
+ #define to_intel_clk_early(_hw) container_of(_hw, struct intel_clk_early, hw)
++#define DEFAULT_EARLY_CLK_FREQ	600000000UL
++
++static ulong __read_mostly cpu_clk;
+ 
+ /*
+  * Calculate formula:
+@@ -100,6 +103,7 @@ static const struct clk_ops grx500_clk_early_ops = {
+ static unsigned long
+ prx300_early_recalc_rate(struct clk_hw *hw, unsigned long prate)
+ {
++#ifndef CONFIG_REGMAP_ICC
+ 	struct intel_clk_early *early = to_intel_clk_early(hw);
+ 	unsigned int i, div1 = 0, mult, div, frac, val;
+ 
+@@ -124,6 +128,9 @@ prx300_early_recalc_rate(struct clk_hw *hw, unsigned long prate)
+ 	div = div * div1;
+ 
+ 	return intel_pll_calc_rate(prate, mult, div, frac, BIT(24));
++#else
++	return ((cpu_clk > 0) ? cpu_clk : DEFAULT_EARLY_CLK_FREQ);
++#endif
+ }
+ 
+ static const struct clk_ops prx300_clk_early_ops = {
+@@ -495,3 +502,9 @@ void intel_clk_plls_parse_vco_config(struct intel_clk_provider *ctx,
+ 	}
+ }
+ 
++static int __init early_clk_freq_setup(char *str)
++{
++	return ((!*str) || (kstrtoul(str, 0, &cpu_clk)));
++}
++__setup("cpuclk=", early_clk_freq_setup);
++
+diff --git a/drivers/clk/intel/clk-prx300.c b/drivers/clk/intel/clk-prx300.c
+index e72a34cfa497..14d44f2760b7 100644
+--- a/drivers/clk/intel/clk-prx300.c
++++ b/drivers/clk/intel/clk-prx300.c
+@@ -347,5 +347,5 @@ static int __init intel_prx300_cgu_init(void)
+ {
+ 	return platform_driver_register(&intel_prx300_cgu_driver);
+ }
+-core_initcall(intel_prx300_cgu_init);
++arch_initcall(intel_prx300_cgu_init);
+ 
+diff --git a/drivers/dma/intel/cdma.c b/drivers/dma/intel/cdma.c
+index a9764efce427..fa8d3904b0aa 100755
+--- a/drivers/dma/intel/cdma.c
++++ b/drivers/dma/intel/cdma.c
+@@ -1944,4 +1944,4 @@ static int __init dma_init(void)
+ {
+ 	return platform_driver_register(&dma_driver);
+ }
+-postcore_initcall(dma_init);
++arch_initcall(dma_init);
+diff --git a/drivers/dma/intel/hdma.c b/drivers/dma/intel/hdma.c
+index 247e84e815a8..725970431c88 100755
+--- a/drivers/dma/intel/hdma.c
++++ b/drivers/dma/intel/hdma.c
+@@ -4427,4 +4427,4 @@ static int __init ltq_dma_init(void)
+ {
+ 	return platform_driver_register(&ltq_dma_driver);
+ }
+-postcore_initcall(ltq_dma_init);
++arch_initcall(ltq_dma_init);
+diff --git a/drivers/mfd/syscon.c b/drivers/mfd/syscon.c
+index b93fe4c4957a..980e43e84bcf 100644
+--- a/drivers/mfd/syscon.c
++++ b/drivers/mfd/syscon.c
+@@ -30,6 +30,12 @@ static struct platform_driver syscon_driver;
+ static DEFINE_SPINLOCK(syscon_list_slock);
+ static LIST_HEAD(syscon_list);
+ 
++enum {
++	REGMAP_ICC_BUS,
++	REGMAP_MMIO_BUS,
++	REGMAP_MAX_BUS
++};
++
+ struct syscon {
+ 	struct device_node *np;
+ 	struct regmap *regmap;
+@@ -42,17 +48,40 @@ static const struct regmap_config syscon_regmap_config = {
+ 	.reg_stride = 4,
+ };
+ 
++static const struct platform_device_id syscon_ids[] = {
++	{ "syscon-icc", },
++	{ "syscon", },
++	{ "", }
++};
++
++static int syscon_bus_lookup_by_compatible(struct device_node *np)
++{
++	size_t count, i;
++
++	i = 0;
++	count = sizeof(syscon_ids)/sizeof(struct platform_device_id) - 1;
++
++	while (i < count) {
++		if (of_device_is_compatible(np,syscon_ids[i].name))
++			return i;
++		i++;
++	}
++
++	return REGMAP_MAX_BUS;
++}
++
+ static struct syscon *of_syscon_register(struct device_node *np)
+ {
+ 	struct syscon *syscon;
+ 	struct regmap *regmap;
+ 	void __iomem *base;
+ 	u32 reg_io_width;
+-	int ret;
++	int ret, bus;
+ 	struct regmap_config syscon_config = syscon_regmap_config;
+ 	struct resource res;
+ 
+-	if (!of_device_is_compatible(np, "syscon"))
++	bus = syscon_bus_lookup_by_compatible(np);
++	if (bus >= REGMAP_MAX_BUS)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	syscon = kzalloc(sizeof(*syscon), GFP_KERNEL);
+@@ -87,11 +116,28 @@ static struct syscon *of_syscon_register(struct device_node *np)
+ 	if (ret)
+ 		reg_io_width = 4;
+ 
++	syscon_config.name = of_node_full_name(np);
+ 	syscon_config.reg_stride = reg_io_width;
+ 	syscon_config.val_bits = reg_io_width * 8;
+ 	syscon_config.max_register = resource_size(&res) - reg_io_width;
+ 
+-	regmap = regmap_init_mmio(NULL, base, &syscon_config);
++	switch (bus) {
++	case REGMAP_MMIO_BUS:
++		regmap = regmap_init_mmio(NULL, base, &syscon_config);
++		break;
++
++	case REGMAP_ICC_BUS:
++#if IS_ENABLED(CONFIG_REGMAP_ICC) && IS_ENABLED(CONFIG_SOC_GRX500)
++		regmap = regmap_init_icc(NULL, base,
++					 res.start, &syscon_config);
++#else
++		regmap = regmap_init_mmio(NULL, base, &syscon_config);
++#endif
++		break;
++
++	default:
++		goto err_regmap;
++	}
+ 	if (IS_ERR(regmap)) {
+ 		pr_err("regmap init failed\n");
+ 		ret = PTR_ERR(regmap);
+@@ -176,7 +222,7 @@ struct regmap *syscon_regmap_lookup_by_pdevname(const char *s)
+ EXPORT_SYMBOL_GPL(syscon_regmap_lookup_by_pdevname);
+ 
+ struct regmap *syscon_regmap_lookup_by_phandle(struct device_node *np,
+-					const char *property)
++					       const char *property)
+ {
+ 	struct device_node *syscon_np;
+ 	struct regmap *regmap;
+@@ -204,6 +250,7 @@ static int syscon_probe(struct platform_device *pdev)
+ 	struct regmap_config syscon_config = syscon_regmap_config;
+ 	struct resource *res;
+ 	void __iomem *base;
++	int bus;
+ 
+ 	syscon = devm_kzalloc(dev, sizeof(*syscon), GFP_KERNEL);
+ 	if (!syscon)
+@@ -220,7 +267,31 @@ static int syscon_probe(struct platform_device *pdev)
+ 	syscon_config.max_register = res->end - res->start - 3;
+ 	if (pdata)
+ 		syscon_config.name = pdata->label;
+-	syscon->regmap = devm_regmap_init_mmio(dev, base, &syscon_config);
++
++	bus = syscon_bus_lookup_by_compatible(dev->of_node);
++	if (bus >= REGMAP_MAX_BUS)
++		return -EINVAL;
++
++	switch (bus) {
++	case REGMAP_MMIO_BUS:
++		syscon->regmap = regmap_init_mmio(dev, base,
++						  &syscon_config);
++		break;
++
++	case REGMAP_ICC_BUS:
++
++#if IS_ENABLED(CONFIG_REGMAP_ICC) && IS_ENABLED(CONFIG_SOC_GRX500)
++		syscon->regmap = regmap_init_icc(dev, base, res->start,
++						 &syscon_config);
++#else
++		syscon->regmap = regmap_init_mmio(dev, base,
++						  &syscon_config);
++#endif
++		break;
++
++	default:
++		return -ENOMEM;
++	}
+ 	if (IS_ERR(syscon->regmap)) {
+ 		dev_err(dev, "regmap init failed\n");
+ 		return PTR_ERR(syscon->regmap);
+@@ -233,11 +304,6 @@ static int syscon_probe(struct platform_device *pdev)
+ 	return 0;
+ }
+ 
+-static const struct platform_device_id syscon_ids[] = {
+-	{ "syscon", },
+-	{ }
+-};
+-
+ static struct platform_driver syscon_driver = {
+ 	.driver = {
+ 		.name = "syscon",
+diff --git a/include/linux/regmap.h b/include/linux/regmap.h
+index f6673132431d..764960c681b1 100644
+--- a/include/linux/regmap.h
++++ b/include/linux/regmap.h
+@@ -453,6 +453,11 @@ struct regmap *__regmap_init_mmio_clk(struct device *dev, const char *clk_id,
+ 				      const struct regmap_config *config,
+ 				      struct lock_class_key *lock_key,
+ 				      const char *lock_name);
++struct regmap *__regmap_init_icc_clk(struct device *dev, const char *clk_id,
++				     void __iomem *regs, phys_addr_t paddr,
++				     const struct regmap_config *config,
++				     struct lock_class_key *lock_key,
++				     const char *lock_name);
+ struct regmap *__regmap_init_ac97(struct snd_ac97 *ac97,
+ 				  const struct regmap_config *config,
+ 				  struct lock_class_key *lock_key,
+@@ -486,6 +491,12 @@ struct regmap *__devm_regmap_init_mmio_clk(struct device *dev,
+ 					   const struct regmap_config *config,
+ 					   struct lock_class_key *lock_key,
+ 					   const char *lock_name);
++struct regmap *__devm_regmap_init_icc_clk(struct device *dev,
++					  const char *clk_id,
++					  void __iomem *regs, phys_addr_t paddr,
++					  const struct regmap_config *config,
++					  struct lock_class_key *lock_key,
++					  const char *lock_name);
+ struct regmap *__devm_regmap_init_ac97(struct snd_ac97 *ac97,
+ 				       const struct regmap_config *config,
+ 				       struct lock_class_key *lock_key,
+@@ -610,7 +621,37 @@ int regmap_attach_dev(struct device *dev, struct regmap *map,
+ 	regmap_init_mmio_clk(dev, NULL, regs, config)
+ 
+ /**
+- * regmap_init_ac97(): Initialise AC'97 register map
++ * regmap_init_icc_clk() - Initialise register map with register clock
++ *
++ * @dev: Device that will be interacted with
++ * @clk_id: register clock consumer ID
++ * @regs: Pointer to memory-mapped IO region
++ * @paddr: Physical address of IO region
++ * @config: Configuration for register map
++ *
++ * The return value will be an ERR_PTR() on error or a valid pointer to
++ * a struct regmap.
++ */
++#define regmap_init_icc_clk(dev, clk_id, regs, paddr, config)		\
++	__regmap_lockdep_wrapper(__regmap_init_icc_clk, #config,	\
++				dev, clk_id, regs, paddr, config)
++
++/**
++ * regmap_init_icc() - Initialise register map
++ *
++ * @dev: Device that will be interacted with
++ * @regs: Pointer to memory-mapped IO region
++ * @paddr: Physical address of IO region
++ * @config: Configuration for register map
++ *
++ * The return value will be an ERR_PTR() on error or a valid pointer to
++ * a struct regmap.
++ */
++#define regmap_init_icc(dev, regs, paddr, config)		\
++	regmap_init_icc_clk(dev, NULL, regs, paddr, config)
++
++/**
++ * regmap_init_ac97() - Initialise AC'97 register map
+  *
+  * @ac97: Device that will be interacted with
+  * @config: Configuration for register map
+@@ -724,6 +765,38 @@ bool regmap_ac97_default_volatile(struct device *dev, unsigned int reg);
+ #define devm_regmap_init_mmio(dev, regs, config)		\
+ 	devm_regmap_init_mmio_clk(dev, NULL, regs, config)
+ 
++/**
++ * devm_regmap_init_icc_clk() - Initialise managed register map with clock
++ *
++ * @dev: Device that will be interacted with
++ * @clk_id: register clock consumer ID
++ * @regs: Pointer to memory-mapped IO region
++ * @paddr: Physical address of IO region
++ * @config: Configuration for register map
++ *
++ * The return value will be an ERR_PTR() on error or a valid pointer
++ * to a struct regmap.  The regmap will be automatically freed by the
++ * device management code.
++ */
++#define devm_regmap_init_icc_clk(dev, clk_id, regs, paddr, config)	\
++	__regmap_lockdep_wrapper(__devm_regmap_init_icc_clk, #config,	\
++				dev, clk_id, regs, paddr, config)
++
++/**
++ * devm_regmap_init_icc() - Initialise managed register map
++ *
++ * @dev: Device that will be interacted with
++ * @regs: Pointer to memory-mapped IO region
++ * @paddr: Physical address of IO region
++ * @config: Configuration for register map
++ *
++ * The return value will be an ERR_PTR() on error or a valid pointer
++ * to a struct regmap.  The regmap will be automatically freed by the
++ * device management code.
++ */
++#define devm_regmap_init_icc(dev, regs, paddr, config)		\
++	devm_regmap_init_icc_clk(dev, NULL, regs, paddr, config)
++
+ /**
+  * devm_regmap_init_ac97(): Initialise AC'97 register map
+  *
+diff --git a/include/uapi/linux/icc/drv_icc.h b/include/uapi/linux/icc/drv_icc.h
+index 6679227b037c..b7c55dc8ed3a 100644
+--- a/include/uapi/linux/icc/drv_icc.h
++++ b/include/uapi/linux/icc/drv_icc.h
+@@ -42,12 +42,13 @@
+ /*---------------------------------------------------------------------------*/
+ /* Device connection structure                                               */
+ /*---------------------------------------------------------------------------*/
+-typedef struct{
+- uint8_t src_client_id;
+- uint8_t dst_client_id;
+- uint8_t msg_id;
+- uint8_t param_attr;
+- uint32_t param[MAX_UPSTRM_DATAWORDS];
++
++typedef struct {
++	uint8_t src_client_id;
++	uint8_t dst_client_id;
++	uint8_t msg_id;
++	uint8_t param_attr;
++	uint32_t param[MAX_UPSTRM_DATAWORDS];
+ } icc_msg_t;
+ 
+ typedef struct{
+@@ -67,8 +68,16 @@ typedef enum
+ 	 PR,/*procfs redirector*/
+ 	 SEC_SERVICE = 10, /*Secure service */
+ 	 SEC_STORAGE = 11, /*Secure storage service */
++	 RM,/*Regmap driver for CGU,RCU,EPU*/
+    MAX_CLIENT=21/*MAX_CLIENT_ID*/
+ } icc_devices;/*enum for all the possible clients*/
++
++enum {
++        REGMAP_WR_MSGID,
++        REGMAP_RD_MSGID,
++        REGMAP_CF_MSGID
++};
++
+ /******************************************************************************
+  * Exported functions
+  ******************************************************************************/
+@@ -93,13 +102,13 @@ typedef enum
+ /**
+  * ICC Device Structure.
+  */
+-typedef struct
+-{
+-   /* Wakeuplist for the select mechanism */
+-   wait_queue_head_t wakeuplist;
+-   void (*up_callback) (icc_wake_type);
+-   volatile int Installed;
+-}icc_dev;
++
++typedef struct {
++	/* Wakeuplist for the select mechanism */
++	wait_queue_head_t wakeuplist;
++	void (*up_callback) (icc_wake_type);
++	volatile int Installed;
++} icc_dev;
+ 
+ int icc_open (struct inode *inode, struct file *file_p);
+ int icc_close (struct inode *inode, struct file *filp);
+@@ -108,6 +117,9 @@ int icc_register_callback (icc_devices type,
+ int icc_unregister_callback (icc_devices type);
+ int icc_read (icc_devices type, icc_msg_t * rw);
+ int icc_write (icc_devices type, icc_msg_t * rw);
++icc_msg_t *icc_sync_write(icc_devices type, icc_msg_t *rw);
++int icc_regmap_sync_read(phys_addr_t paddr, unsigned int *val);
++int icc_regmap_sync_write(phys_addr_t paddr, unsigned int val);
+ #endif /*__KERNEL__*/
+ #ifdef __LIBRARY__
+ int icc_init(void);

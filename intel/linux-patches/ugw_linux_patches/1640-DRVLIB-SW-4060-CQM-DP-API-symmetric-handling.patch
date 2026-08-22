@@ -1,0 +1,234 @@
+From 9e31376ef2c6345433508db4791f56f4fbebe21b Mon Sep 17 00:00:00 2001
+From: Lishan Liu <lishan.liu@intel.com>
+Date: Tue, 30 Mar 2021 16:13:58 +0800
+Subject: [PATCH] DRVLIB_SW-4060: CQM DP API symmetric handling
+
+---
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c | 152 +++++++++++++++++++--------
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.h |   1 +
+ 2 files changed, 109 insertions(+), 44 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index 0cf2dc3b2232..cb6b83268bd8 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -2160,9 +2160,8 @@ static s32 cqm_dp_port_dealloc(struct module *owner, u32 dev_port,
+ {
+ 	u32 num;
+ 	struct cqm_res_t *res = NULL;
+-	int port, idx, shared_p;
++	int port, shared_p;
+ 	struct cqm_dqm_port_info *p_info;
+-	void *buf;
+ 
+ 	if ((dp_port_resources_get(&port_id, &num, &res,
+ 				   flags) != 0) && (!res)) {
+@@ -2199,18 +2198,6 @@ static s32 cqm_dp_port_dealloc(struct module *owner, u32 dev_port,
+ 
+ 	/* Free ACA port */
+ 	if ((flags & FLAG_ACA) && (p_info->deq_info.pkt_base)) {
+-		struct cqm_bm_free free_info;
+-
+-		free_info.policy_base = 0;
+-		for (idx = 0; idx < p_info->deq_info.prefill_pkt_num; idx++) {
+-			if (p_info->deq_info.pkt_base[idx]) {
+-				buf = (void *)p_info->deq_info.pkt_base[idx];
+-				free_info.buf = buf;
+-				cqm_buffer_free_by_policy_prx300(&free_info);
+-			} else {
+-				break;
+-			}
+-		}
+ 		dmam_free_coherent(cqm_ctrl->dev, p_info->deq_info.dma_size,
+ 				   p_info->deq_info.pkt_base,
+ 				   (dma_addr_t)p_info->deq_info.pkt_base_paddr);
+@@ -2549,39 +2536,33 @@ static int fill_rx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 			p_info->deq_info.pkt_base_paddr = (void *)dma_paddr;
+ 			p_info->deq_info.pkt_base = dma_vaddr;
+ 			p_info->deq_info.dma_size = dma_size;
++		}
+ 
+-			for (idx = 0; idx <
+-			     dp_data->rx_ring[ring_idx].prefill_pkt_num;
+-			     idx++) {
+-				/* depends on the dc port policy right now
+-				 * its fixed to policy 0
+-				 */
+-				buf = (u32)cqm_buff_alloc_by_policy_prx300(cpu,
+-									   0,
+-									   0);
+-				if (!buf) {
+-					dev_err(cqm_ctrl->dev, "%s: BM alloc failed\n",
+-						__func__);
+-
+-					while (--idx >= 0) {
+-						buf = p_info->
+-							deq_info.pkt_base[idx];
+-						cqm_buffer_free(cpu,
+-								(void *)buf,
+-								1);
+-					}
+-					dmam_free_coherent(cqm_ctrl->dev,
+-							   dma_size,
+-							   dma_vaddr,
+-							   dma_paddr);
+-					ltq_free_dma(p_info->dma_ch);
+-					return CBM_FAILURE;
++		for (idx = 0;
++		     (idx < dp_data->rx_ring[ring_idx].prefill_pkt_num) &&
++		     (!p_info->deq_info.pkt_base[idx]);
++		     idx++) {
++		     /* depends on the dc port policy right now
++		      * its fixed to policy 0
++		      */
++			buf = (u32)cqm_buff_alloc_by_policy_prx300(cpu, 0, 0);
++			if (!buf) {
++				dev_err(cqm_ctrl->dev, "%s: BM alloc failed\n",
++					__func__);
++
++				while (--idx >= 0) {
++					buf = p_info->deq_info.pkt_base[idx];
++					cqm_buffer_free(cpu, (void *)buf, 1);
+ 				}
++				dmam_free_coherent(cqm_ctrl->dev, dma_size,
++						   dma_vaddr, dma_paddr);
++				ltq_free_dma(p_info->dma_ch);
++				return CBM_FAILURE;
++			}
+ 			p_info->deq_info.pkt_base[idx] =
+-					__pa(buf - CQM_POOL_METADATA);
++				__pa(buf - CQM_POOL_METADATA);
+ 			vbase = p_info->deq_info.pkt_base + tbl_size;
+ 			vbase[idx] = buf - CQM_POOL_METADATA;
+-			}
+ 		}
+ 
+ 		dp_data->rx_ring[ring_idx].out_dma_ch_to_gswip =
+@@ -2604,7 +2585,6 @@ static int fill_rx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 				dp_data->rx_ring[ring_idx].prefill_pkt_num;
+ 		/* Need to be disccused and modified later base on policy */
+ 		dp_data->rx_ring[ring_idx].rx_policy_base = 0;
+-
+ 		p_info->dma_ch_in_use = true;
+ 		ret = CBM_SUCCESS;
+ 	}
+@@ -2612,12 +2592,90 @@ static int fill_rx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 	return ret;
+ }
+ 
++static s32 dp_port_dealloc_complete(struct cbm_dp_alloc_complete_data *dp,
++				    s32 port_id, u32 flags)
++{
++	u32 num;
++	struct cqm_res_t *res = NULL;
++	int port, idx, shared_p;
++	struct cqm_dqm_port_info *p_info;
++	void *buf;
++	struct cqm_pmac_port_map *shared_dp = NULL;
++	struct cqm_pmac_port_map *local_dp = NULL;
++
++	dev_dbg(cqm_ctrl->dev, "%s: enter port_id:%d, flags:%x\n",
++		__func__, port_id, flags);
++
++	if ((dp_port_resources_get(&port_id, &num, &res,
++				   flags) != 0) && (!res)) {
++		dev_err(cqm_ctrl->dev,
++			"Error getting resources for port_id %d\n", port_id);
++		return CBM_FAILURE;
++	}
++	if (port_id >= PMAC_MAX_NUM || port_id < 0)
++		return DP_FAILURE;
++
++	port = res[0].cqm_deq_port;
++	p_info = &dqm_port_info[port];
++	if (p_info->ref_cnt != 0)
++		return DP_SUCCESS;
++
++	local_dp = is_dp_allocated(port_id, flags);
++	if (!local_dp) {
++		dev_err(cqm_ctrl->dev, "%s invalid dp %d\n",
++			__func__, port_id);
++		return DP_FAILURE;
++	}
++
++	if (local_dp->aca_buf_ref_cnt)
++		local_dp->aca_buf_ref_cnt = 0;
++
++	if (flags & DP_F_SHARE_RES) {
++		shared_p = port_id ^ 1;
++		shared_dp = is_dp_allocated(shared_p, flags);
++		if (shared_dp) {
++			if (shared_dp->aca_buf_ref_cnt) {
++				dev_dbg(cqm_ctrl->dev,
++					"shared port_id %d aca buf in use\n",
++					shared_p);
++					return DP_SUCCESS;
++			}
++		}
++	}
++
++	dev_dbg(cqm_ctrl->dev, "%s free deq port = %d flag:%x ptk_base :%lx\n",
++		__func__, port, flags & FLAG_ACA,
++		(unsigned long)p_info->deq_info.pkt_base);
++
++	/* Free ACA port */
++	if ((flags & FLAG_ACA) && (p_info->deq_info.pkt_base)) {
++		struct cqm_bm_free free_info;
++
++		free_info.policy_base = 0;
++		for (idx = 0; idx < p_info->deq_info.prefill_pkt_num; idx++) {
++			if (p_info->deq_info.pkt_base[idx]) {
++				buf = (void *)p_info->deq_info.pkt_base[idx];
++				free_info.buf = buf;
++				cqm_buffer_free_by_policy_prx300(&free_info);
++				p_info->deq_info.pkt_base[idx] = 0;
++			} else {
++				break;
++			}
++		}
++	}
++
++	devm_kfree(cqm_ctrl->dev, res);
++
++	return DP_SUCCESS;
++}
++
+ static s32 dp_port_alloc_complete(struct module *owner, struct net_device *dev,
+ 				  u32 dev_port, s32 dp_port,
+ 				  struct cbm_dp_alloc_complete_data *data,
+ 				  u32 flags)
+ {
+ 	u32 reg;
++	struct cqm_pmac_port_map *local_dp = NULL;
+ 
+ 	dev_dbg(cqm_ctrl->dev, "%s: enter dp_port:%d, flags:0x%x\n",
+ 		__func__, dp_port, flags);
+@@ -2626,9 +2684,15 @@ static s32 dp_port_alloc_complete(struct module *owner, struct net_device *dev,
+ 		return CBM_FAILURE;
+ 
+ 	if (flags & DP_F_DEREGISTER)
+-		return CBM_SUCCESS;
++		return dp_port_dealloc_complete(data, dp_port, flags);
+ 
+ 	if (flags & FLAG_ACA) {
++		local_dp = is_dp_allocated(dp_port, flags);
++		if (local_dp) {
++			if (!local_dp->aca_buf_ref_cnt)
++				local_dp->aca_buf_ref_cnt++;
++		}
++
+ 		if (fill_rx_ring_data(data) != CBM_SUCCESS)
+ 			return CBM_FAILURE;
+ 		fill_tx_ring_data(data);
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+index 6d5442b5cdae..e616a33aa251 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+@@ -557,6 +557,7 @@ struct cqm_pmac_port_map {
+ 	u32 dma_chnl_init;
+ 	u32 num_dma_chan;
+ 	u32 eqp_en_cnt;
++	u32 aca_buf_ref_cnt;
+ 	struct list_head list;
+ };
+ 

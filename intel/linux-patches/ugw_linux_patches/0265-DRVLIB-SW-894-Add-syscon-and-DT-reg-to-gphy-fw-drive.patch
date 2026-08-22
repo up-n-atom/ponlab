@@ -1,0 +1,201 @@
+From 96701732e7a9f6e35c3446795cd1d95787c4bb1c Mon Sep 17 00:00:00 2001
+From: Peter Harliman Liem <peter.harliman.liem@intel.com>
+Date: Thu, 6 Sep 2018 15:18:01 +0800
+Subject: [PATCH] DRVLIB_SW-894 - Add syscon and DT reg to gphy-fw driver
+
+- Chiptop and CGU syscon are needed to configure LAN_MUX and
+  firmware address in prx300 platform
+- Registers are now retrieved via DT instead of hardcoded
+---
+ drivers/net/ethernet/lantiq/xrx500_phy_fw.c | 93 ++++++++++++++++++++---------
+ 1 file changed, 64 insertions(+), 29 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+index 03c0f64827ed..b3068d976b0a 100644
+--- a/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
++++ b/drivers/net/ethernet/lantiq/xrx500_phy_fw.c
+@@ -12,8 +12,8 @@
+ #include <linux/firmware.h>
+ #include <linux/of_platform.h>
+ #include <linux/reset.h>
+-
+-#include <lantiq_soc.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
+ 
+ #define XRX200_GPHY_FW_ALIGN	(16 * 1024)
+ 
+@@ -30,6 +30,8 @@ struct prx300_reset_control {
+ 
+ struct xway_gphy_data {
+ 	struct device *dev;
++	struct regmap *syscfg, *cgu_syscfg;
++	void __iomem *base;
+ 
+ 	size_t fw_size;
+ 	dma_addr_t dma_addr;
+@@ -74,18 +76,15 @@ static u32 xrx500_gphy[] = {
+ 	GPHYF_LBADR_XRX500,
+ };
+ 
+-#define GSW_L_TOP_BASE 0xBC003C00
+-
+-/* prx300 gphy register definition */
+-#define PRX300_GPHY_CGU_BASE 0xb6200000
++/* prx300 register definition */
++/* CGU0 */
+ #define PRX300_GPHY_FCR 0x800
+ #define PRX300_GPHY0_GPS0 0x804
+ #define PRX300_GPHY0_GPS1 0x808
+ #define PRX300_GPHY0_GPS0_LO 0x3f004000
+ #define PRX300_GPHY0_GPS0_HI 0
+ #define PRX300_FW_LOAD_ADDR 0x18da0000
+-
+-#define PRX300_GPHY_CDB_PDI_BASE 0xb6210100
++/* GPHY CDB */
+ #define PRX300_GPHY_CDB_PDI_PLL_CFG0 0x0
+ #define PRX300_GPHY_CDB_PDI_PLL_CFG2 0x8
+ #define PRX300_GPHY_CDB_PDI_PLL_MISC 0xc
+@@ -93,18 +92,26 @@ static u32 xrx500_gphy[] = {
+ #define PRX300_PLL_REFDIV 0x4
+ #define PRX300_GPHY_FORCE_LATCH 1
+ #define PRX300_GPHY_CLEAR_STICKY 1
+-
+-#define PRX300_CHIP_TOP 0xb6180000
++/* Chiptop */
+ #define PRX300_IFMUX_CFG 0x120
++#define PRX300_LAN_MUX_MASK 0x2
++#define PRX300_LAN_MUX_GPHY 0x0
+ 
+-static void gsw_reg_w32(u32 base, u32 val, u32 reg_off)
++static u32 gsw_reg_r32(void __iomem *base, u32 reg_off)
+ {
+-	ltq_w32(val, (void __iomem *)(base + reg_off));
++	return __raw_readl(base + reg_off);
+ }
+ 
+-static void gsw_reg_w32_mask(u32 base, u32 clear, u32 val, u32 reg_off)
++static void gsw_reg_w32(void __iomem *base, u32 val, u32 reg_off)
+ {
+-	ltq_w32_mask(clear, val, (void __iomem *)(base + reg_off));
++	__raw_writel(val, base + reg_off);
++}
++
++static void gsw_reg_w32_mask(void __iomem *base, u32 clear, u32 val,
++			     u32 reg_off)
++{
++	gsw_reg_w32(base, val | (gsw_reg_r32(base, reg_off) & (~clear)),
++		    reg_off);
+ }
+ 
+ /* xrx500 specific boot sequence */
+@@ -118,9 +125,9 @@ static int xrx500_gphy_boot(struct xway_gphy_data *priv)
+ 			continue;
+ 
+ 		reset_control_assert(rst->phy[i]);
+-		gsw_reg_w32(GSW_L_TOP_BASE, (priv->dma_addr & 0xFFFF),
++		gsw_reg_w32(priv->base, (priv->dma_addr & 0xFFFF),
+ 			    xrx500_gphy[i]);
+-		gsw_reg_w32(GSW_L_TOP_BASE, ((priv->dma_addr >> 16) & 0xFFFF),
++		gsw_reg_w32(priv->base, ((priv->dma_addr >> 16) & 0xFFFF),
+ 			    (xrx500_gphy[i] + 4));
+ 		reset_control_deassert(rst->phy[i]);
+ 		dev_info(priv->dev, "booting GPHY%u firmware for GRX500\n", i);
+@@ -172,7 +179,8 @@ static int prx300_gphy_boot(struct xway_gphy_data *priv)
+ 		 priv->virt_addr, priv->dma_addr);
+ 
+ 	/* set LAN interface to GPHY */
+-	gsw_reg_w32_mask(PRX300_CHIP_TOP, 0x2, 0x0, PRX300_IFMUX_CFG);
++	regmap_update_bits(priv->syscfg, PRX300_IFMUX_CFG, PRX300_LAN_MUX_MASK,
++			   PRX300_LAN_MUX_GPHY);
+ 
+ 	/* GPHY reset */
+ 	reset_control_assert(rst->gphy);
+@@ -187,11 +195,12 @@ static int prx300_gphy_boot(struct xway_gphy_data *priv)
+ 	reset_control_deassert(rst->gphy_cdb);
+ 
+ 	/* GPHY FW address and pin strapping */
+-	gsw_reg_w32(PRX300_GPHY_CGU_BASE, priv->dma_addr, PRX300_GPHY_FCR);
+-	gsw_reg_w32(PRX300_GPHY_CGU_BASE, PRX300_GPHY0_GPS0_LO,
+-		    PRX300_GPHY0_GPS0);
+-	gsw_reg_w32(PRX300_GPHY_CGU_BASE, PRX300_GPHY0_GPS0_HI,
+-		    PRX300_GPHY0_GPS1);
++	regmap_update_bits(priv->cgu_syscfg, PRX300_GPHY_FCR, ~0,
++			   priv->dma_addr);
++	regmap_update_bits(priv->cgu_syscfg, PRX300_GPHY0_GPS0, ~0,
++			   PRX300_GPHY0_GPS0_LO);
++	regmap_update_bits(priv->cgu_syscfg, PRX300_GPHY0_GPS1, ~0,
++			   PRX300_GPHY0_GPS0_HI);
+ 
+ 	/* release GPHY reset */
+ 	reset_control_deassert(rst->gphy);
+@@ -201,15 +210,14 @@ static int prx300_gphy_boot(struct xway_gphy_data *priv)
+ 	reset_control_deassert(rst->gphy_pwr_down);
+ 
+ 	/* Set divider and misc config */
+-	gsw_reg_w32_mask(PRX300_GPHY_CDB_PDI_BASE, 0xFFF0,
+-			 (PRX300_PLL_FBDIV << 4), PRX300_GPHY_CDB_PDI_PLL_CFG0);
+-	gsw_reg_w32(PRX300_GPHY_CDB_PDI_BASE, (PRX300_PLL_REFDIV << 8),
++	gsw_reg_w32_mask(priv->base, 0xFFF0, (PRX300_PLL_FBDIV << 4),
++			 PRX300_GPHY_CDB_PDI_PLL_CFG0);
++	gsw_reg_w32(priv->base, (PRX300_PLL_REFDIV << 8),
+ 		    PRX300_GPHY_CDB_PDI_PLL_CFG2);
+-	gsw_reg_w32_mask(PRX300_GPHY_CDB_PDI_BASE,
++	gsw_reg_w32_mask(priv->base, (PRX300_GPHY_FORCE_LATCH << 13) |
++			 (PRX300_GPHY_CLEAR_STICKY << 14),
+ 			 (PRX300_GPHY_FORCE_LATCH << 13) |
+-			  (PRX300_GPHY_CLEAR_STICKY << 14),
+-			 (PRX300_GPHY_FORCE_LATCH << 13) |
+-			  (PRX300_GPHY_CLEAR_STICKY << 14),
++			 (PRX300_GPHY_CLEAR_STICKY << 14),
+ 			 PRX300_GPHY_CDB_PDI_PLL_MISC);
+ 
+ 	/* delay to wait until firmware boots up */
+@@ -225,6 +233,22 @@ static int prx300_dt_parse(struct xway_gphy_data *priv)
+ {
+ 	struct prx300_reset_control *rst = &priv->rst.prx300;
+ 
++	/* get chiptop regmap */
++	priv->syscfg = syscon_regmap_lookup_by_phandle(priv->dev->of_node,
++						       "intel,syscon");
++	if (IS_ERR(priv->syscfg)) {
++		dev_err(priv->dev, "No phandle for intel,syscon\n");
++		return PTR_ERR(priv->syscfg);
++	}
++
++	/* get CGU regmap */
++	priv->cgu_syscfg = syscon_regmap_lookup_by_phandle(priv->dev->of_node,
++							   "intel,cgu-syscon");
++	if (IS_ERR(priv->cgu_syscfg)) {
++		dev_err(priv->dev, "No phandle for intel,cgu-syscon\n");
++		return PTR_ERR(priv->cgu_syscfg);
++	}
++
+ 	rst->gphy = devm_reset_control_get(priv->dev, "gphy");
+ 	if (IS_ERR(rst->gphy)) {
+ 		dev_err(priv->dev, "fail to get gphy prop\n");
+@@ -287,6 +311,13 @@ static int xway_phy_fw_probe(struct platform_device *pdev)
+ {
+ 	int ret = 0;
+ 	struct xway_gphy_data *priv;
++	struct resource *res;
++
++	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
++	if (!res) {
++		dev_err(&pdev->dev, "no resources\n");
++		return -ENODEV;
++	}
+ 
+ 	priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+ 	if (!priv) {
+@@ -294,6 +325,10 @@ static int xway_phy_fw_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 	}
+ 
++	priv->base = devm_ioremap_resource(&pdev->dev, res);
++	if (!priv->base)
++		return -ENOMEM;
++
+ 	priv->soc_data = of_device_get_match_data(&pdev->dev);
+ 	if (!priv->soc_data) {
+ 		dev_err(&pdev->dev, "Failed to find soc data!\n");

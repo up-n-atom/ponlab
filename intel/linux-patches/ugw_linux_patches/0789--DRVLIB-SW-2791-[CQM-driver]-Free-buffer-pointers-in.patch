@@ -1,0 +1,151 @@
+From a5f668136cf2ba549733a40fccbd587cfb56fd8b Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Thu, 5 Sep 2019 17:35:09 +0800
+Subject: [PATCH]  DRVLIB_SW-2791: [CQM driver] Free buffer pointers in TXIN
+ ring of PRX300
+
+ Free the buffer pointer in TXIN ring of the Direct Connect device in subif deregistration.(dp_enable API with CBM_PORT_F_DISABLE flag) for prx300 & Fix the free of the RXIN ring in device deregistration
+---
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c | 35 +++++++++++++++++++++++++---
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.h | 23 ++++++++++++++++--
+ include/net/lantiq_cbm_api.h                 |  1 +
+ 3 files changed, 54 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index 6bbe45a7519b..45bc8cf7c6a0 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -2049,7 +2049,7 @@ static s32 cqm_dp_port_dealloc(struct module *owner, u32 dev_port,
+ 
+ 	/* Free ACA port */
+ 	if ((flags & FLAG_ACA) && (p_info->deq_info.pkt_base)) {
+-		for (idx = 0; idx < p_info->deq_info.num_desc; idx++) {
++		for (idx = 0; idx < p_info->deq_info.prefill_pkt_num; idx++) {
+ 			if (p_info->deq_info.pkt_base[idx]) {
+ 				buf = (void *)p_info->deq_info.pkt_base[idx];
+ 				cqm_buffer_free(cpu, buf, 1);
+@@ -2338,6 +2338,8 @@ static int fill_rx_ring_data(struct cbm_dp_alloc_complete_data *dp_data)
+ 
+ 		dp_data->rx_ring[ring_idx].num_pkt =
+ 				dp_data->rx_ring[ring_idx].prefill_pkt_num;
++		p_info->deq_info.prefill_pkt_num =
++				dp_data->rx_ring[ring_idx].prefill_pkt_num;
+ 
+ 		/* Need to be disccused and modified later base on policy */
+ 		dp_data->rx_ring[ring_idx].rx_policy_base = 0;
+@@ -2408,6 +2410,31 @@ static s32 handle_dma_chnl_init(int port, u32 flags)
+ 	return CBM_SUCCESS;
+ }
+ 
++static void cqm_free_aca_port(s32 port)
++{
++	struct cqm_dqm_port_info *p_info = &dqm_port_info[port];
++	int id = 0, cnt = p_info->deq_info.num_desc * 3;
++	void *deq = cqm_ctrl->deq;
++	u32 reg, val;
++
++	while (cnt--) {
++		id = id % p_info->deq_info.num_desc;
++		reg = cbm_r32(deq + DQ_SCPU_PORT(port, desc[id].desc0) + 0xC);
++		rmb(); /* read before write */
++
++		if (reg & OWN_BIT) {
++			val = cbm_r32(deq +
++				      DQ_SCPU_PORT(port, desc[id].desc0) + 8);
++			cbm_w32((deq +
++				 DQ_SCPU_PORT(port, scpu_ptr_rtn[id].ptr_rtn0)),
++				 val);
++			wmb(); /* write before read */
++		}
++
++		id++;
++	}
++}
++
+ static s32 dp_enable(struct module *owner, u32 port_id,
+ 		     struct cbm_dp_en_data *data, u32 flags, u32 alloc_flags)
+ {
+@@ -2434,6 +2461,8 @@ static s32 dp_enable(struct module *owner, u32 port_id,
+ 	case DQM_CPU_TYPE:
+ 	case DQM_ACA_TYPE:
+ 		init_cqm_deq_cpu_port(port, data->tx_ring_size);
++		if ((type == DQM_ACA_TYPE) && (flags & CBM_PORT_F_DISABLE))
++			cqm_free_aca_port(port);
+ 		break;
+ 	case DQM_PON_TYPE:
+ 		if (flags & CBM_PORT_F_DISABLE) {
+@@ -3675,12 +3704,12 @@ static int conf_deq_aca_port(const struct dqm_aca_port *aca_ptr)
+ 	port = aca_ptr->port;
+ 	p_info = &dqm_port_info[port];
+ 	memset(&local_entry, 0, sizeof(local_entry));
+-	p_info->deq_info.cbm_dq_port_base = deq + DQ_CPU_PORT(port, desc0);
++	p_info->deq_info.cbm_dq_port_base = deq + DQ_SCPU_PORT(port, desc);
+ 	p_info->deq_info.num_desc = aca_ptr->num_desc;
+ 	p_info->deq_info.num_free_burst = aca_ptr->num_free_burst;
+ 	p_info->deq_info.port_no = port;
+ 	p_info->deq_info.dma_tx_chan = 255;
+-	p_info->cbm_buf_free_base = deq + DQ_CPU_PORT(port, ptr_rtn_dw2);
++	p_info->cbm_buf_free_base = deq + DQ_SCPU_PORT(port, scpu_ptr_rtn);
+ 	p_info->num_free_entries = (port > 3) ? 32 : 1;
+ 	p_info->dq_txpush_num = aca_ptr->txpush_desc;
+ 	p_info->dma_dt_ch = aca_ptr->dma_chan;
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+index bd84f1d20384..bf721f13ee6e 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.h
+@@ -195,6 +195,9 @@ enum CQM_QOS_LINK_MODE {
+ #define DQ_CPU_PORT(idx, reg)\
+ (CFG_CPU_EGP_0 + ((idx) * 0x1000) + offsetof(struct cqm_dqm_cpu_egp_reg, reg))
+ 
++#define DQ_SCPU_PORT(idx, reg)\
++(CFG_CPU_EGP_0 + ((idx) * 0x1000) + offsetof(struct cqm_dqm_aca_egp_reg, reg))
++
+ #define DQ_DMA_PORT(idx, reg)\
+ (CFG_CPU_EGP_0 + ((idx) * 0x1000) + offsetof(struct cqm_dqm_dma_egp_reg, reg))
+ 
+@@ -270,8 +273,9 @@ struct flowid_desc {
+ 	uint8_t row:5;
+ };
+ #endif
+-struct cbm_scpu_ptr_rtn {
+-	u32 ptr_rtn;
++struct cqm_scpu_ptr_rtn {
++	u32 ptr_rtn0;
++	u32 ptr_rtn1;
+ };
+ 
+ #ifdef CONFIG_CPU_LITTLE_ENDIAN
+@@ -450,6 +454,21 @@ struct cqm_dqm_cpu_egp_reg {
+ 	struct cbm_desc desc1;
+ };
+ 
++struct cqm_dqm_aca_egp_reg {
++	u32 cfg;
++	u32 dqpc;
++	u32 resv0[6];
++	u32 irncr;
++	u32 irnicr;
++	u32 irnen;
++	u32 resv1;
++	u32 dptr;
++	u32 bprc;
++	u32 resv2[50];
++	struct cqm_scpu_ptr_rtn scpu_ptr_rtn[32];
++	struct cbm_desc desc[32];
++};
++
+ struct cqm_dqm_dma_egp_reg {
+ 	u32 cfg;
+ 	u32 dqpc;
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index febea3018af8..c3ef22c0655b 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -499,6 +499,7 @@ typedef struct cbm_dq_info {
+ 	u32 *pkt_base; /*!<packet list base DMA virtual address */
+ 	void *pkt_base_paddr;	/* packet list base DMA physical address */
+ 	size_t dma_size;	/* size of allocated DMA memory */
++	int prefill_pkt_num; /* number of pre-fill packet buffer requested */
+ } cbm_dq_info_t;
+ 
+ /*!

@@ -1,0 +1,292 @@
+From 054609e470c9efdc9674b8f5fe87966ea0c4b767 Mon Sep 17 00:00:00 2001
+From: Hauke Mehrtens <hauke.mehrtens@intel.com>
+Date: Fri, 5 Jun 2020 18:12:47 +0200
+Subject: [PATCH] PONRTSYS-6950: Add colmark support
+
+This depends on the in kernel NET_ACT_COLMARK support.
+
+This code translates between the tc command in the kernel and the DP
+manager API.
+---
+ drivers/net/datapath/pon_qos/Kconfig              |   1 +
+ drivers/net/datapath/pon_qos/Makefile             |   3 +-
+ drivers/net/datapath/pon_qos/pon_qos_tc_colmark.c | 138 ++++++++++++++++++++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_colmark.h |  16 +++
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.c  |  21 ++++
+ drivers/net/datapath/pon_qos/pon_qos_tc_flower.h  |   1 +
+ 6 files changed, 179 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/datapath/pon_qos/Kconfig b/drivers/net/datapath/pon_qos/Kconfig
+index ec0c6b55eb4b..18318c6f8385 100644
+--- a/drivers/net/datapath/pon_qos/Kconfig
++++ b/drivers/net/datapath/pon_qos/Kconfig
+@@ -4,6 +4,7 @@ config PON_QOS
+ 	tristate "PON QoS driver"
+ 	depends on INTEL_DATAPATH
+ 	select NET_SCH_RED
++	select NET_ACT_COLMARK
+ 
+ 	help
+ 	  This driver provides user space API for configuring PON specific QoS
+diff --git a/drivers/net/datapath/pon_qos/Makefile b/drivers/net/datapath/pon_qos/Makefile
+index d518106a61fa..f1b7fbf49ec9 100644
+--- a/drivers/net/datapath/pon_qos/Makefile
++++ b/drivers/net/datapath/pon_qos/Makefile
+@@ -16,4 +16,5 @@ pon_qos-objs := \
+ 	pon_qos_tc_lct.o \
+ 	pon_qos_tc_pce.o \
+ 	pon_qos_tc_mirred.o \
+-	pon_qos_tc_ds_tc_remap.o
++	pon_qos_tc_ds_tc_remap.o \
++	pon_qos_tc_colmark.o
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_colmark.c b/drivers/net/datapath/pon_qos/pon_qos_tc_colmark.c
+new file mode 100644
+index 000000000000..fb84a1dcb6cd
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_colmark.c
+@@ -0,0 +1,138 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#include <linux/netdevice.h>
++#include <linux/types.h>
++#include <net/pkt_cls.h>
++#include <net/tc_act/tc_colmark.h>
++#include <net/datapath_api.h>
++#include <net/datapath_api_qos.h>
++#include "pon_qos_tc_flower.h"
++#include "pon_qos_tc_vlan_prepare.h"
++#include "pon_qos_tc_colmark.h"
++
++static struct net_device *pon_qos_get_indev(struct net_device *dev,
++					    struct tc_cls_flower_offload *f)
++{
++	int ifi = (int)*(int *)f->key;
++
++	if (ifi)
++		return dev_get_by_index(dev_net(dev), ifi);
++	return NULL;
++}
++
++int pon_qos_colmark_offload(struct net_device *dev,
++			    struct tc_cls_flower_offload *f)
++{
++	int flags;
++	struct dp_meter_cfg *meter_cfg;
++	struct net_device *indev;
++	dp_subif_t subif;
++	int ret;
++	struct tc_action *a;
++	bool ingress;
++
++	if (!tc_single_action(f->exts)) {
++		netdev_err(dev, "colmark: multiple tc actions not supported.\n");
++		return -ENOTSUPP;
++	}
++
++	if (!is_tcf_colmark(f->exts->actions[0])) {
++		netdev_err(dev, "colmark: not a colmark action\n");
++		return -ENOTSUPP;
++	}
++	a = f->exts->actions[0];
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "colmark: can not get subif\n");
++		return ret;
++	}
++
++	meter_cfg = kzalloc(sizeof(*meter_cfg), GFP_KERNEL);
++	if (!meter_cfg)
++		return -ENOMEM;
++
++	/* The enumerations in the TC colmark are matching enumerations in
++	 * the dp manager.
++	 */
++	meter_cfg->col_mode = tcf_colmark_mode(a);
++	meter_cfg->mode = tcf_colmark_precedence(a);
++	meter_cfg->type = tcf_colmark_mtype(a);
++	ingress = pon_qos_tc_flower_is_ingress(dev, f);
++	meter_cfg->dir = ingress ? DP_DIR_INGRESS : DP_DIR_EGRESS;
++
++	indev = pon_qos_get_indev(dev, f);
++
++	/* Update unoffload in case we do not use DP_COL_MARKING */
++	flags = DP_COL_MARKING;
++	/* On the pmapper and when the indev is the same as the normal dev
++	 * we should use the bridge port.
++	 */
++	if (subif.flag_pmapper || (indev && indev == dev))
++		flags |= DP_METER_ATTACH_BRPORT;
++	else
++		flags |= DP_METER_ATTACH_CTP;
++
++	/* The indev is only used when it is the same as the normal dev, it
++	 * should be fine it decrese the ref counter here already.
++	 */
++	if (indev)
++		dev_put(indev);
++
++	/* No need to acllocate a meter_id, it is not used for color marking. */
++	ret = dp_meter_add(dev, meter_cfg, flags);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "colmark: Meter config failed: %i\n", ret);
++		goto out_free;
++	}
++
++	ret = pon_qos_tc_flower_storage_add(dev, f->cookie,
++					    TC_TYPE_COLMARK,
++					    meter_cfg, (void *)flags);
++	if (ret < 0) {
++		netdev_err(dev, "colmark: can not add to storage\n");
++		goto out_dp_remove;
++	}
++
++	return 0;
++
++out_dp_remove:
++	dp_meter_del(dev, meter_cfg, flags);
++out_free:
++	kfree(meter_cfg);
++	return ret;
++}
++
++int pon_qos_colmark_unoffload(struct net_device *dev,
++			      void *meter_cfg_ptr, void *flags_ptr)
++{
++	int flags = (int)flags_ptr;
++	struct dp_meter_cfg *meter_cfg = meter_cfg_ptr;
++	int ret;
++
++	/* It is not possible to delete the color marking, dp_meter_del() will
++	 * only delete the metering in DP manager and not the color marking.
++	 * Instead of deleting the setting, just overwrite it with a new one
++	 * using the default settings, DP manager does not store any list of
++	 * the settings, so this should be save.
++	 * Please adapt this to delete the color marking in case
++	 * dp_meter_add() or dp_meter_del() change.
++	 */
++	meter_cfg->col_mode = 0;
++	meter_cfg->mode = DP_NO_MARKING;
++	meter_cfg->type = srTCM;
++	ret = dp_meter_add(dev, meter_cfg, flags);
++	if (ret != DP_SUCCESS) {
++		/* We can not do anything when this fails and will probably leak
++		 * some memory because we do not know how much was deleted.
++		 */
++		netdev_err(dev, "colmark: deletion failed: %i\n", ret);
++	}
++	kfree(meter_cfg);
++	return 0;
++}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_colmark.h b/drivers/net/datapath/pon_qos/pon_qos_tc_colmark.h
+new file mode 100644
+index 000000000000..17cf19791bd2
+--- /dev/null
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_colmark.h
+@@ -0,0 +1,16 @@
++// SPDX-License-Identifier: GPL-2.0
++/******************************************************************************
++ *
++ * Copyright (c) 2020 Intel Corporation
++ *
++ *****************************************************************************/
++
++#include <linux/netdevice.h>
++#include <linux/types.h>
++#include <net/pkt_cls.h>
++
++int pon_qos_colmark_offload(struct net_device *dev,
++			    struct tc_cls_flower_offload *f);
++
++int pon_qos_colmark_unoffload(struct net_device *dev,
++			      void *meter_cfg_ptr, void *flags_ptr);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+index 23446621ff05..efe368f28519 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.c
+@@ -6,12 +6,14 @@
+  *****************************************************************************/
+ #include <net/pkt_cls.h>
+ #include <net/tc_act/tc_mirred.h>
++#include <net/tc_act/tc_colmark.h>
+ #include <net/flow_dissector.h>
+ #include "pon_qos_tc_flower.h"
+ #include "pon_qos_tc_ext_vlan.h"
+ #include "pon_qos_tc_vlan_filter.h"
+ #include "pon_qos_tc_qmap.h"
+ #include "pon_qos_tc_mirred.h"
++#include "pon_qos_tc_colmark.h"
+ 
+ struct pon_qos_storage_node {
+ 	/** Unique key for TC flower - flower cookie */
+@@ -39,6 +41,8 @@ static char *flower_type_str_get(enum pon_qos_tc_flower_type type)
+ 		return "TC_TYPE_QUEUE";
+ 	case TC_TYPE_MIRRED:
+ 		return "TC_TYPE_MIRRED";
++	case TC_TYPE_COLMARK:
++		return "TC_TYPE_COLMARK";
+ 	default:
+ 		return "TC_TYPE_UNKNOWN";
+ 	}
+@@ -83,6 +87,8 @@ static int flower_remove(struct net_device *dev,
+ 		return pon_qos_tc_unmap(dev, arg1);
+ 	case TC_TYPE_MIRRED:
+ 		return pon_qos_mirred_unoffload(dev, f, handle);
++	case TC_TYPE_COLMARK:
++		return pon_qos_colmark_unoffload(dev, arg1, arg2);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+@@ -129,6 +135,16 @@ static bool is_type_mirred(struct net_device *dev,
+ 	return false;
+ }
+ 
++static bool is_type_colmark(struct net_device *dev,
++			    struct tc_cls_flower_offload *f)
++{
++	/* This driver supports only signle actions for now */
++	if (!tc_single_action(f->exts))
++		return false;
++
++	return is_tcf_colmark(f->exts->actions[0]);
++}
++
+ static bool is_type_queue(struct net_device *dev,
+ 			  struct tc_cls_flower_offload *f)
+ {
+@@ -173,6 +189,9 @@ flower_type_get(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 	if (is_type_mirred(dev, f))
+ 		return TC_TYPE_MIRRED;
+ 
++	if (is_type_colmark(dev, f))
++		return TC_TYPE_COLMARK;
++
+ 	if (is_type_queue(dev, f))
+ 		return TC_TYPE_QUEUE;
+ 
+@@ -203,6 +222,8 @@ static int pon_qos_tc_flower_replace(struct net_device *dev,
+ 		return pon_qos_tc_map(dev, f);
+ 	case TC_TYPE_MIRRED:
+ 		return pon_qos_mirred_offload(dev, f, handle);
++	case TC_TYPE_COLMARK:
++		return pon_qos_colmark_offload(dev, f);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+index aa5d800adbe9..f98429ea76e5 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_flower.h
+@@ -14,6 +14,7 @@ enum pon_qos_tc_flower_type {
+ 	TC_TYPE_VLAN_FILTER = 2,
+ 	TC_TYPE_QUEUE = 3,
+ 	TC_TYPE_MIRRED = 4,
++	TC_TYPE_COLMARK = 5,
+ };
+ 
+ int pon_qos_tc_flower_storage_add(struct net_device *dev,

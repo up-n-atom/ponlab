@@ -1,0 +1,93 @@
+From f69820723d6b249e94771891e9acfb622a6b30c0 Mon Sep 17 00:00:00 2001
+From: Radhakrishna Ravipati <radha.ravipatix.krishna@intel.com>
+Date: Thu, 6 May 2021 13:25:14 +0530
+Subject: [PATCH] UGW_SW-58900: Fix Kernel Panic Observed in Mcast helper
+ invoke callback function
+
+Lock is missing to maintain mcast_helper callback list, locking mechanism added
+
+Root-Cause: Mcast_helper callback has 3 operations where concurrency possible:
+(1) Registration by PPA and WiFi
+(2) De-registration by PPA and WiFi
+(3) List traversal and invoke the respective callback.
+---
+ net/mcast_helper/mcast_helper_reg.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/net/mcast_helper/mcast_helper_reg.c b/net/mcast_helper/mcast_helper_reg.c
+index c33114f87502..382b6f30fdcb 100644
+--- a/net/mcast_helper/mcast_helper_reg.c
++++ b/net/mcast_helper/mcast_helper_reg.c
+@@ -64,8 +64,11 @@ typedef struct _mcast_callback_t{
+ 	Mcast_module_callback_t callbackfun;
+ 	struct list_head list;	/* mcast_member interface map  List  */
+ 	uint32_t uflag;
++	struct rcu_head rcu_head;
+ } MCAST_CALLBACK_t;
+ 
++static DEFINE_MUTEX(mch_cb_list_lock);
++
+ LIST_HEAD(mch_callback_list_g);
+ 
+ static int  mcast_helper_send_netlink_msg_user(struct net_device *netdev ,int type, int queryflag, void *data)
+@@ -148,8 +151,9 @@ static int mcast_helper_reg_callback(struct net_device *netdev,
+ 	mc_callback_rec->modName = modName;
+ 	mc_callback_rec->uflag = flags & LTQ_MC_F_DIRECTPATH;
+ 	INIT_LIST_HEAD(&mc_callback_rec->list);
+-	list_add_tail(&mc_callback_rec->list, head);
+-
++	mutex_lock(&mch_cb_list_lock);
++	list_add_tail_rcu(&mc_callback_rec->list, head);
++	mutex_unlock(&mch_cb_list_lock);
+ 	if ((flags & LTQ_MC_F_FW_RESET) == LTQ_MC_F_FW_RESET)
+ 		mcast_helper_send_netlink_msg_user(netdev, RTM_NEWLINK, 0, NULL);
+ 
+@@ -168,15 +172,16 @@ static int mcast_helper_dereg_callback(struct net_device *netdev,
+ 
+ 	if (netdev == NULL)
+ 		return FAILURE;
+-
++	mutex_lock(&mch_cb_list_lock);
+ 	list_for_each_safe(liter, gliter, head) {
+ 		mc_callback_rec = list_entry(liter, MCAST_CALLBACK_t, list);
+ 		if (mc_callback_rec != NULL) {
+ 			if (mc_callback_rec->netDev->name != NULL) {
+ 				if (!strncmp (netdev->name, mc_callback_rec->netDev->name, IFNAMSIZ)) {
+ 					if (!strncmp (modName->name, mc_callback_rec->modName->name, MODULE_NAME_LEN)) {
+-						list_del(&mc_callback_rec->list);
+-						kfree(mc_callback_rec);
++						list_del_rcu(&mc_callback_rec->list);
++						kfree_rcu(mc_callback_rec, rcu_head);
++						mutex_unlock(&mch_cb_list_lock);
+ 						if ((flags & LTQ_MC_F_FW_RESET) == LTQ_MC_F_FW_RESET)
+ 							mcast_helper_send_netlink_msg_user(netdev, RTM_DELLINK, 0, NULL);
+ 						return SUCCESS;
+@@ -185,7 +190,7 @@ static int mcast_helper_dereg_callback(struct net_device *netdev,
+ 			}
+ 		}
+ 	}
+-
++	mutex_unlock(&mch_cb_list_lock);
+ 	return FAILURE;
+ }
+ 
+@@ -224,9 +229,8 @@ int mcast_helper_invoke_callback(unsigned int grpidx,struct net_device *netdev,v
+ 	struct list_head *liter = NULL;
+ 	MCAST_CALLBACK_t *mc_callback_rec = NULL;
+ 	unsigned int passflag = flag;
+-	list_for_each(liter,&mch_callback_list_g) {
+-		mc_callback_rec = list_entry(liter, MCAST_CALLBACK_t,list);
+-
++	rcu_read_lock();
++	list_for_each_entry_rcu(mc_callback_rec, &mch_callback_list_g, list) {
+ 		if((mc_callback_rec->netDev->name != NULL) && (netdev->name != NULL)){
+ 			if (strcmp (netdev->name, mc_callback_rec->netDev->name)== 0)
+ 			{
+@@ -257,6 +261,7 @@ int mcast_helper_invoke_callback(unsigned int grpidx,struct net_device *netdev,v
+ 			}
+ 		}
+ 	}
++	rcu_read_unlock();
+ 	return SUCCESS;
+ }
+ 

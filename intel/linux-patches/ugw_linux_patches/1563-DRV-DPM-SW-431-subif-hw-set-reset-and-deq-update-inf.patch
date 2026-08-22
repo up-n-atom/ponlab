@@ -1,0 +1,942 @@
+From e3a7b697dd9c36d6fc68c311b2385c370abcf1a2 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Wed, 23 Dec 2020 18:12:22 +0800
+Subject: [PATCH] DRV_DPM_SW-431: subif_hw_set/reset and deq_update_info API
+ cleanup
+
+---
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 681 ++++++++++++-----------
+ 1 file changed, 344 insertions(+), 337 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index 039f96306be9..32f5661cac1a 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -12,12 +12,12 @@
+ 
+ #include <net/datapath_api.h>
+ #include <net/datapath_api_gswip31.h>
+-#include <linux/if_vlan.h>
+ #include "../datapath.h"
+ #include "../datapath_instance.h"
+ #include "../datapath_pce.h"
+ #include "datapath_ppv4.h"
+ #include "datapath_misc.h"
++#include <linux/if_vlan.h>
+ #include <linux/bitfield.h>
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+@@ -1171,15 +1171,6 @@ static int reset_ctp_bp(int inst, int ctp, int portid, int bp)
+ 	return DP_SUCCESS;
+ }
+ 
+-static char *q_flag_str(int q_flag)
+-{
+-	if (q_flag == DP_SUBIF_AUTO_NEW_Q)
+-		return "auto_new_queue";
+-	if (q_flag == DP_SUBIF_SPECIFIC_Q)
+-		return "specified_queue";
+-	return "sharing_queue";
+-}
+-
+ static int dp_get_subif_share_bp(int inst, int portid)
+ {
+ 	struct pmac_port_info *port_info;
+@@ -1196,7 +1187,9 @@ static int dp_get_subif_share_bp(int inst, int portid)
+ 	return DP_FAILURE;
+ }
+ 
+-static int update_queue_info(int inst, struct ppv4_q_sch_port *q_port)
++static
++int alloc_q(int inst, struct ppv4_q_sch_port *q_port,
++	    struct cqm_port_info *deq_pinfo)
+ {
+ 	struct q_info *q_info;
+ 
+@@ -1229,6 +1222,13 @@ static int update_queue_info(int inst, struct ppv4_q_sch_port *q_port)
+ 	q_info->ref_cnt = 1;
+ 	q_info->q_node_id = q_port->q_node;
+ 	q_info->cqm_dequeue_port = q_port->cqe_deq;
++
++	deq_pinfo->qos_port = q_port->port_node;
++	if (!deq_pinfo->f_first_qid) {
++		deq_pinfo->first_qid = q_port->qid;
++		deq_pinfo->f_first_qid = 1;
++	}
++
+ 	DP_DEBUG(DP_DBG_FLAG_REG,
+ 		 "%s: %s=%d %s=%d q[%d].cnt=%d\n",
+ 		 "new_queue_alloc",
+@@ -1239,7 +1239,8 @@ static int update_queue_info(int inst, struct ppv4_q_sch_port *q_port)
+ 	return DP_SUCCESS;
+ }
+ 
+-static int free_queue_info(int inst, int dp_port, int qid)
++static
++int free_q(int inst, int dp_port, int qid, struct cqm_port_info *deq_pinfo)
+ {
+ 	struct q_info *q_info;
+ 	struct dp_node_alloc node;
+@@ -1272,29 +1273,29 @@ static int free_queue_info(int inst, int dp_port, int qid)
+ 			 qid);
+ 		return DP_FAILURE;
+ 	}
++
++	if (deq_pinfo->f_first_qid && deq_pinfo->first_qid == qid) {
++		deq_pinfo->f_first_qid = 0;
++		deq_pinfo->first_qid = 0;
++		DP_DEBUG(DP_DBG_FLAG_QOS, "q_id[%d] is freed\n", qid);
++	}
++
+ 	return DP_SUCCESS;
+ }
+ 
+ static int deq_update_info(struct dp_subif_upd_info *info)
+ {
+-	int old_cqm_deq_idx, old_num_cqm_deq, old_def_qid, old_cqm_deq_port;
+-	int new_def_qid, i;
++	int old_cqm_deq_idx, old_num_cqm_deq, old_cqm_deq_port;
++	int i;
+ 	static cbm_queue_map_entry_t lookup = {0};
+-	u32 lookup_f;
+-	struct cqm_port_info *old_deq_pinfo, *new_deq_pinfo;
++	struct cqm_port_info *deq_pinfo;
+ 	int subif_ix;
+ 	u32 dma_ch_offset = 0;
+ 	struct ppv4_q_sch_port q_port = {0};
+ 	struct dp_subif_info *sif;
+ 	struct pmac_port_info *port_info;
++	int cbm_inst = dp_port_prop[info->inst].cbm_inst;
+ 
+-	lookup_f = CBM_QUEUE_MAP_F_FLOWID_L_DONTCARE |
+-			   CBM_QUEUE_MAP_F_FLOWID_H_DONTCARE |
+-			   CBM_QUEUE_MAP_F_EN_DONTCARE |
+-			   CBM_QUEUE_MAP_F_DE_DONTCARE |
+-			   CBM_QUEUE_MAP_F_MPE1_DONTCARE |
+-			   CBM_QUEUE_MAP_F_MPE2_DONTCARE |
+-			   CBM_QUEUE_MAP_F_TC_DONTCARE;
+ 	port_info = get_dp_port_info(info->inst, info->dp_port);
+ 	subif_ix = GET_VAP(info->subif, port_info->vap_offset,
+ 			   port_info->vap_mask);
+@@ -1302,46 +1303,34 @@ static int deq_update_info(struct dp_subif_upd_info *info)
+ 	old_cqm_deq_idx = sif->cqm_port_idx;
+ 	old_num_cqm_deq = sif->num_qid;
+ 
++	q_port.cqe_deq = port_info->deq_port_base + info->new_cqm_deq_idx;
++	q_port.inst = info->inst;
++	q_port.dp_port = info->dp_port;
++	q_port.ctp = subif_ix;
++
+ 	/* update new deq info */
+ 	for (i = 0; i < info->new_num_cqm_deq; i++) {
+-		q_port.cqe_deq = port_info->deq_port_base +
+-				 info->new_cqm_deq_idx + i;
+-		new_deq_pinfo =
+-			get_dp_deqport_info(info->inst, q_port.cqe_deq);
+-		q_port.inst = info->inst;
+-		q_port.dp_port = info->dp_port;
+-		q_port.ctp = subif_ix;
++		q_port.cqe_deq += i;
++		deq_pinfo = get_dp_deqport_info(info->inst, q_port.cqe_deq);
+ 
+-		if (new_deq_pinfo->ref_cnt == 0) {
+-			/* allocate new queue (example), if tcont is changed*/
+-			if (update_queue_info(info->inst, &q_port)) {
+-				pr_err("%s fail for dp_port=%d\n",
+-				       "new_queue_alloc", q_port.dp_port);
++		/* allocate new queue (example), if tcont is changed */
++		if (!deq_pinfo->ref_cnt) {
++			if (alloc_q(info->inst, &q_port, deq_pinfo))
+ 				return DP_FAILURE;
+-			}
+-			new_def_qid = q_port.qid;
+-			if (!new_deq_pinfo->f_first_qid) {
+-				new_deq_pinfo->first_qid = q_port.qid;
+-				new_deq_pinfo->f_first_qid = 1;
+-			}
+-			/* update port table */
+-			new_deq_pinfo->ref_cnt++;
+ 		} else {
+-			new_def_qid = new_deq_pinfo->first_qid;
+-			q_port.q_node = new_deq_pinfo->q_node;
+-			q_port.port_node = new_deq_pinfo->qos_port;
+-			get_dp_q_info(info->inst, new_def_qid)->ref_cnt++;
+-			new_deq_pinfo->ref_cnt++;
++			q_port.qid = deq_pinfo->first_qid;
++			q_port.q_node = deq_pinfo->q_node;
++			q_port.port_node = deq_pinfo->qos_port;
++			get_dp_q_info(info->inst, q_port.qid)->ref_cnt++;
+ 		}
+-		dma_ch_offset = new_deq_pinfo->dma_ch_offset;
+-		if (port_info->num_dma_chan)
+-			atomic_inc(&(dp_dma_chan_tbl[info->inst] +
+-				   dma_ch_offset)->ref_cnt);
++
++		dma_ch_offset = deq_pinfo->dma_ch_offset;
++
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+ 			 "cqm_p[%d].cnt=%d\n", q_port.cqe_deq,
+-			 new_deq_pinfo->ref_cnt);
++			 deq_pinfo->ref_cnt);
+ 		/* update subif table with new info*/
+-		sif->qid_list[i] = new_def_qid;
++		sif->qid_list[i] = q_port.qid;
+ 		sif->q_node[i] = q_port.q_node;
+ 		sif->qos_deq_port[i] = q_port.port_node;
+ 		sif->cqm_deq_port[i] = q_port.cqe_deq;
+@@ -1351,18 +1340,23 @@ static int deq_update_info(struct dp_subif_upd_info *info)
+ 
+ 			if (port_info->alloc_flags & DP_F_EPON)
+ 				lookup.sub_if_id = info->new_cqm_deq_idx + i;
+-			else /*Note:CQM need full subif(15bits)*/
++			else
+ 				lookup.sub_if_id = info->subif;
+ 
+-			cbm_queue_map_set(dp_port_prop[info->inst].cbm_inst,
+-					  new_def_qid, &lookup, lookup_f);
++			if (cbm_queue_map_set(cbm_inst, q_port.qid, &lookup,
++					      CQM_QMAP_F_EP_SUBIF_ONLY)) {
++				pr_err("%s: cbm_queue_map_set failed\n",
++				       __func__);
++				return DP_FAILURE;
++			}
++
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+-				 "%s %s=%d %s=%d %s=%d %s=%d %s=0x%x %s=%d\n",
++				 "%s %s=%d %s=%d %s=%d %s=%d %s=%d\n",
+ 				 "cbm_queue_map_set",
+-				 "qid", new_def_qid, "for dp_port", lookup.ep,
++				 "qid", q_port.qid, "for dp_port", lookup.ep,
+ 				 "num_subif", port_info->num_subif,
+-				 "lu_mode", port_info->cqe_lu_mode, "flag",
+-				 lookup_f, "subif", subif_ix);
++				 "lu_mode", port_info->cqe_lu_mode,
++				 "subif", subif_ix);
+ 		}
+ 		/* enable cqm DEQ port*/
+ 		if (dp_cbm_deq_port_enable(port_info->owner, info->inst,
+@@ -1370,34 +1364,25 @@ static int deq_update_info(struct dp_subif_upd_info *info)
+ 					   info->new_num_cqm_deq, 0,
+ 					   dma_ch_offset))
+ 			return DP_FAILURE;
++
++		deq_pinfo->ref_cnt++;
++		if (port_info->num_dma_chan)
++			atomic_inc(&(dp_dma_chan_tbl[info->inst] +
++				     dma_ch_offset)->ref_cnt);
+ 	}
+ 
+ 	/* remove old deq port info */
+ 	for (i = 0; i < old_num_cqm_deq; i++) {
+ 		old_cqm_deq_port = port_info->deq_port_base +
+ 				   old_cqm_deq_idx + i;
+-		old_deq_pinfo =	get_dp_deqport_info(info->inst,
+-						    old_cqm_deq_port);
+-		/* retrieve the qid corresponding to old deq port */
+-		old_def_qid = old_deq_pinfo->first_qid;
+-		old_deq_pinfo->ref_cnt--;
+-		if (!free_queue_info(info->inst, info->dp_port, old_def_qid)) {
+-			if (old_deq_pinfo->f_first_qid &&
+-			    old_deq_pinfo->first_qid == old_def_qid) {
+-				old_deq_pinfo->f_first_qid = 0;
+-				old_deq_pinfo->first_qid = 0;
+-				DP_DEBUG(DP_DBG_FLAG_QOS, "q_id[%d] is freed\n",
+-					 old_def_qid);
+-				DP_DEBUG(DP_DBG_FLAG_QOS,
+-					 "dp_deq_port_tbl[%d][%d].%s\n",
+-					 info->inst, old_cqm_deq_port,
+-					 "f_first_qid reset");
+-			}
+-		}
+-		DP_DEBUG(DP_DBG_FLAG_REG,
+-			 "old cqm_p[%d].cnt=%d\n", old_cqm_deq_port,
+-			 old_deq_pinfo->ref_cnt);
+-		dma_ch_offset =	old_deq_pinfo->dma_ch_offset;
++		deq_pinfo = get_dp_deqport_info(info->inst,
++						old_cqm_deq_port);
++
++		deq_pinfo->ref_cnt--;
++		free_q(info->inst, info->dp_port, deq_pinfo->first_qid,
++		       deq_pinfo);
++
++		dma_ch_offset =	deq_pinfo->dma_ch_offset;
+ 		if (port_info->num_dma_chan)
+ 			atomic_dec(&(dp_dma_chan_tbl[info->inst] +
+ 				     dma_ch_offset)->ref_cnt);
+@@ -1409,178 +1394,291 @@ static int deq_update_info(struct dp_subif_upd_info *info)
+ 	}
+ 	sif->cqm_port_idx = info->new_cqm_deq_idx;
+ 	sif->num_qid = info->new_num_cqm_deq;
++
+ 	return DP_SUCCESS;
+ }
+ 
+-static int subif_hw_set(int inst, int portid, int subif_ix,
+-			struct subif_platform_data *data, u32 flags)
++static int lookup_table_cfg(int inst, int portid,
++			    struct subif_platform_data *data, int subif_idx,
++			    int cfg_idx)
+ {
+-	struct ppv4_q_sch_port q_port = {0};
+ 	static cbm_queue_map_entry_t lookup = {0};
+-	u32 lookup_f;
+-	int subif, deq_port_idx = 0, bp = -1, i = 0;
+-	int dma_ch_offset = 0;
++	u32 lookup_f = CQM_QMAP_F_EP_SUBIF_ONLY;
+ 	struct pmac_port_info *port_info;
+ 	struct dp_subif_info *sif;
++	int subif, deq_port_idx, qid;
+ 	struct hal_priv *priv = HAL(inst);
+-	int q_flag = 0;
+-	int qid;
+-	struct cqm_port_info *deq_pinfo;
+-	struct bp_pmapper *bp_info;
+-	struct q_info *q_info;
++	int cbm_inst = dp_port_prop[inst].cbm_inst;
+ 
+-	if (!data || !data->subif_data) {
+-		pr_err("data NULL or subif_data NULL\n");
+-		return -1;
++	port_info = get_dp_port_info(inst, portid);
++	subif = SET_VAP(subif_idx, port_info->vap_offset, port_info->vap_mask);
++	sif = get_dp_port_subif(port_info, subif_idx);
++
++	qid = sif->qid_list[cfg_idx];
++
++	deq_port_idx = port_info->subif_info[subif_idx].cqm_port_idx;
++
++	if (data->subif_data->flag_ops & DP_SUBIF_VANI) {
++		lookup_f &= ~CBM_QUEUE_MAP_F_MPE2_DONTCARE;
++		lookup_f |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
++		lookup.sub_if_id_mask_bits = -1;
++		lookup.mpe2 = 0;
++		/* Map to CPU Q */
++		qid = get_dp_port_info(inst, 0)->subif_info[0].qid;
++	} else if (port_info->alloc_flags & DP_F_VUNI) {
++		/* Map to GSWIP */
++		lookup_f &= ~CBM_QUEUE_MAP_F_MPE2_DONTCARE;
++		lookup_f &= ~CBM_QUEUE_MAP_F_MPE1_DONTCARE;
++		lookup_f |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
++		lookup.sub_if_id_mask_bits = -1;
++		lookup.mpe2 = 1;
++		lookup.mpe1 = 0;
++	}
++
++	/* Map this port's lookup to its 1st queue only */
++	lookup.ep = portid;
++	if (port_info->alloc_flags & DP_F_EPON)
++		lookup.sub_if_id = deq_port_idx + cfg_idx;
++	else
++		lookup.sub_if_id = subif;
++
++	/* For 1st subif and mode 0, use CBM_QUEUE_MAP_F_SUBIF_DONTCARE,
++	 * otherwise, don't use this flag
++	 */
++	if (!port_info->num_subif &&
++	    port_info->cqe_lu_mode == CQE_LU_MODE0) {
++		lookup_f |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
++		lookup.sub_if_id_mask_bits = -1;
+ 	}
+-	if (!dp_dma_chan_tbl[inst]) {
+-		pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
++
++	/* Map to drop queue for DS only GEM */
++	if (data->dev && data->dev->priv_flags & IFF_NO_QUEUE)
++		qid = priv->ppv4_drop_q;
++
++	if (cbm_queue_map_set(cbm_inst, qid, &lookup, lookup_f)) {
++		pr_err("%s: cbm_queue_map_set failed\n", __func__);
+ 		return DP_FAILURE;
+ 	}
++
++	DP_DEBUG(DP_DBG_FLAG_QOS,
++		 "%s %s=%d %s=%d %s=%d %s=%d %s=0x%x %s=0x%x(%d)\n",
++		 "cbm_queue_map_set",
++		 "qid", qid, "for dp_port", lookup.ep,
++		 "num_subif", port_info->num_subif,
++		 "lu_mode", port_info->cqe_lu_mode, "flag", lookup_f,
++		 "subif", subif, subif_idx);
++
++	return DP_SUCCESS;
++}
++
++static
++void subif_pmapper_cfg(int inst, struct subif_platform_data *data,
++		       int bp, int portid, int subif_idx, int flags)
++{
++	struct bp_pmapper *bp_info;
++	struct pmac_port_info *port_info;
++	struct dp_subif_info *sif;
++
+ 	port_info = get_dp_port_info(inst, portid);
+-	subif = SET_VAP(subif_ix, port_info->vap_offset, port_info->vap_mask);
+-	sif = get_dp_port_subif(port_info, subif_ix);
++	sif = get_dp_port_subif(port_info, subif_idx);
+ 
+-	if (data->subif_data->ctp_dev) /* for pmapper later */
+-		bp = bp_pmapper_get(inst, data->dev);
+-	if (bp >= 0) {
+-		DP_DEBUG(DP_DBG_FLAG_DBG, "%s Reuse BP(%d) ctp_dev=%s\n",
+-			 data->dev ? data->dev->name : "NULL",
+-			 bp,
+-			 data->subif_data->ctp_dev->name);
++	bp_info = get_dp_bp_info(inst, bp);
++
++	if (flags & DP_F_DEREGISTER) {
++		ctp_dev_list_del(&bp_info->ctp_dev, sif->ctp_dev);
++		sif->ctp_dev = NULL;
++		bp_info->ref_cnt--;
++		if (!bp_info->ref_cnt) {
++			bp_info->dev = NULL;
++			bp_info->flag = 0;
++			DP_DEBUG(DP_DBG_FLAG_REG,
++				 "ctp ref_cnt become zero:%s\n",
++				 sif->device_name);
++		}
+ 	} else {
+-		DP_DEBUG(DP_DBG_FLAG_DBG, "need alloc BP for %s ctp_dev=%s\n",
+-			 data->dev ? data->dev->name : "NULL",
+-			 data->subif_data->ctp_dev ?
+-			 data->subif_data->ctp_dev->name : "NULL");
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "dp_bp_tbl[%d][%d]=%s current ref_cnt=%d\n",
++			 inst, bp, data->dev->name, bp_info->ref_cnt);
++		if (!bp_info->ref_cnt)
++			INIT_LIST_HEAD(&bp_info->ctp_dev);
++		bp_info->dev = data->dev;
++		bp_info->ref_cnt++;
++		bp_info->flag = 1;
++		sif->ctp_dev = data->subif_data->ctp_dev;
++		ctp_dev_list_add(&bp_info->ctp_dev, sif->ctp_dev, bp,
++				 subif_idx);
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_REG,
++		 "inst=%d subif_ix=%d pmapper.cnt=%d\n",
++		 inst, subif_idx, bp_info->ref_cnt);
++}
++
++static int subif_bp_cfg(int inst, struct subif_platform_data *data,
++			int portid, int subif_idx, int flags)
++{
++	struct pmac_port_info *port_info;
++	struct dp_subif_info *sif;
++	int bp = -1;
++	struct bp_pmapper *bp_info;
++	bool bp_cfg = false;
++	int vap = 0;
++
++	port_info = get_dp_port_info(inst, portid);
++	sif = get_dp_port_subif(port_info, subif_idx);
++
++	/* CTP Max = 1 only in case of DSL now */
++	if (port_info->ctp_max == 1) {
++		if (!port_info->num_subif)
++			bp_cfg = true;
++	} else {
++		vap = subif_idx;
++		bp_cfg = true;
++	}
++
++	/* De-Register */
++	if (flags & DP_F_DEREGISTER) {
++		bp = sif->bp;
++		if (sif->ctp_dev)
++			subif_pmapper_cfg(inst, data, bp, portid, subif_idx,
++					  flags);
++		if (bp_cfg) {
++			if (reset_ctp_bp(inst, vap, portid, bp))
++				return DP_FAILURE;
++
++			bp_info = get_dp_bp_info(inst, bp);
++			if (!bp_info->ref_cnt) {
++				if (dp_gsw_free_bp(inst, bp))
++					return DP_FAILURE;
++			}
++		}
++		return DP_SUCCESS;
++	}
++
++	/* Register */
++	if (data->subif_data->ctp_dev) {
++		bp = bp_pmapper_get(inst, data->dev);
++		subif_pmapper_cfg(inst, data, bp, portid, subif_idx, flags);
++	}
++
++	if (bp < 0) {
+ 		sif->mac_learn_dis = data->subif_data->mac_learn_disable;
+-		if (port_info->ctp_max == 1 && port_info->num_subif > 0)
++		if (port_info->ctp_max == 1 && port_info->num_subif)
+ 			bp = dp_get_subif_share_bp(inst, portid);
+ 		else
+-			bp = dp_gsw_alloc_bp(inst, portid, subif_ix,
++			bp = dp_gsw_alloc_bp(inst, portid, subif_idx,
+ 					     CPU_FID, CPU_BP,
+ 					     data->subif_data->flag_ops);
+ 		if (bp < 0) {
+-			pr_err("Fail to alloc bridge port\n");
+-			return -1;
++			pr_err("%s: Fail to alloc bridge port\n", __func__);
++			return DP_FAILURE;
+ 		}
+ 	}
+ 	sif->bp = bp;
+-	if (port_info->ctp_max == 1) {
+-		if (port_info->num_subif == 0)
+-			set_ctp_bp(inst, 0, portid, sif->bp, data);
+-	} else {
+-		set_ctp_bp(inst, subif_ix, portid, sif->bp, data);
++	if (bp_cfg)
++		set_ctp_bp(inst, vap, portid, bp, data);
++
++	return DP_SUCCESS;
++}
++
++static int subif_hw_set(int inst, int portid, int subif_ix,
++			struct subif_platform_data *data, u32 flags)
++{
++	struct ppv4_q_sch_port q_port = {0};
++	int deq_port_idx = 0, i = 0;
++	int dma_ch_offset = 0;
++	struct pmac_port_info *port_info;
++	struct dp_subif_info *sif;
++	struct hal_priv *priv = HAL(inst);
++	struct cqm_port_info *deq_pinfo;
++	struct q_info *q_info;
++
++	if (!data || !data->subif_data) {
++		pr_err("%s: data NULL or subif_data NULL\n", __func__);
++		return DP_FAILURE;
+ 	}
+-	data->act = 0;
+-	if (flags & DP_F_SUBIF_LOGICAL) {
+-		pr_err("need more for logical dev??\n");
+-		return 0;
++	if (!dp_dma_chan_tbl[inst]) {
++		pr_err("%s: dp_dma_chan_tbl[%d] NULL\n", __func__, inst);
++		return DP_FAILURE;
+ 	}
+ 
+-	bp_info = get_dp_bp_info(inst, bp);
+-	if (data->subif_data->ctp_dev) {
+-		DP_DEBUG(DP_DBG_FLAG_DBG,
+-			 "dp_bp_tbl[%d][%d]=%s current ref_cnt=%d\n",
+-			 inst, bp, data->dev->name,
+-			 bp_info->ref_cnt);
+-		if (!bp_info->ref_cnt)
+-			INIT_LIST_HEAD(&bp_info->ctp_dev);
+-		bp_info->dev = data->dev;
+-		bp_info->ref_cnt++;
+-		bp_info->flag = 1;
+-		sif->ctp_dev = data->subif_data->ctp_dev;
+-		ctp_dev_list_add(&bp_info->ctp_dev, sif->ctp_dev, bp,
+-				 subif_ix);
++	if (flags & DP_F_SUBIF_LOGICAL) {
++		pr_err("%s: need more for logical dev??\n", __func__);
++		return DP_SUCCESS;
+ 	}
+-	DP_DEBUG(DP_DBG_FLAG_DBG,
+-		 "inst=%d portid=%d dp numsubif=%d subif_ix=%d pmapper.cnt=%d\n",
+-		 inst, portid,
+-		 port_info->num_subif, subif_ix,
+-		 bp_info->ref_cnt);
+-	if (data->subif_data)
+-		deq_port_idx = data->subif_data->deq_port_idx;
+-	if (port_info->deq_port_num < deq_port_idx + 1) {
+-		pr_err("Wrong deq_port_idx(%d), should < %d\n",
+-		       deq_port_idx, port_info->deq_port_num);
+-		return -1;
++
++	if (!priv) {
++		pr_err("%s: priv NULL\n", __func__);
++		return DP_FAILURE;
+ 	}
+-	/*QUEUE_CFG if needed */
+-	q_port.cqe_deq = port_info->deq_port_base + deq_port_idx;
++
+ 	if (data->subif_data->flag_ops & DP_SUBIF_DEQPORT_NUM &&
+ 	    data->subif_data->num_deq_port > DP_MAX_DEQ_PER_SUBIF) {
+ 		pr_err("deq_port(%d), cannot be more than max Q per subif %d\n",
+ 		       data->subif_data->num_deq_port, DP_MAX_DEQ_PER_SUBIF);
+-		return -1;
++		return DP_FAILURE;
++	}
++
++	port_info = get_dp_port_info(inst, portid);
++	sif = get_dp_port_subif(port_info, subif_ix);
++
++	if (data->subif_data)
++		deq_port_idx = data->subif_data->deq_port_idx;
++
++	if (port_info->deq_port_num < deq_port_idx + 1) {
++		pr_err("%s: Wrong deq_port_idx(%d), should < %d\n",
++		       __func__, deq_port_idx, port_info->deq_port_num);
++		return DP_FAILURE;
++	}
++
++	if (subif_bp_cfg(inst, data, portid, subif_ix, flags)) {
++		pr_err("%s: Bp Config failed\n", __func__);
++		return DP_FAILURE;
+ 	}
+ 	if (!priv) {
+ 		pr_err("priv NULL\n");
+ 		return -1;
+ 	}
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (unlikely(dp_dbg_flag & DP_DBG_FLAG_QOS)) {
+-		DP_DEBUG(DP_DBG_FLAG_QOS, "cqe_deq=%d\n", q_port.cqe_deq);
+-		DP_DEBUG(DP_DBG_FLAG_QOS, "priv=%p deq_port_stat=%p qdev=%p\n",
+-			 priv,
+-			 priv ? priv->deq_port_stat : NULL,
+-			 priv ? priv->qdev : NULL);
+-		DP_DEBUG(DP_DBG_FLAG_QOS, "cqe_deq=%d inst=%d\n",
+-			 q_port.cqe_deq, inst);
+-	}
+-#endif
++	data->act = 0;
++
++	/* QUEUE_CFG if needed */
++	q_port.cqe_deq = port_info->deq_port_base + deq_port_idx;
++
++	DP_DEBUG(DP_DBG_FLAG_QOS, "%s: %s=%d %s=%p %s=%p %s=%p %s=%d\n",
++		 __func__,
++		 "cqe_deq", q_port.cqe_deq,
++		 "priv", priv,
++		 "deq_port_stat", priv ? priv->deq_port_stat : NULL,
++		 "qdev", priv ? priv->qdev : NULL,
++		 "inst", inst);
++
+ 	for (i = 0; i < data->subif_data->num_deq_port; i++) {
+-		lookup_f = CBM_QUEUE_MAP_F_FLOWID_L_DONTCARE |
+-			   CBM_QUEUE_MAP_F_FLOWID_H_DONTCARE |
+-			   CBM_QUEUE_MAP_F_EN_DONTCARE |
+-			   CBM_QUEUE_MAP_F_DE_DONTCARE |
+-			   CBM_QUEUE_MAP_F_MPE1_DONTCARE |
+-			   CBM_QUEUE_MAP_F_MPE2_DONTCARE |
+-			   CBM_QUEUE_MAP_F_TC_DONTCARE;
+-		q_port.cqe_deq = port_info->deq_port_base + deq_port_idx + i;
++		q_port.cqe_deq += i;
+ 		deq_pinfo = get_dp_deqport_info(inst, q_port.cqe_deq);
+ 
+ 		q_port.tx_pkt_credit = deq_pinfo->tx_pkt_credit;
+-		q_port.tx_ring_addr = (u32)deq_pinfo->txpush_addr_qos;
++		q_port.tx_ring_addr = deq_pinfo->txpush_addr_qos;
++		q_port.tx_ring_addr_push = deq_pinfo->txpush_addr;
+ 		q_port.tx_ring_size = deq_pinfo->tx_ring_size;
+ 		q_port.inst = inst;
+ 		q_port.dp_port = portid;
+ 		q_port.ctp = subif_ix;
+ 
+ 		dma_ch_offset = deq_pinfo->dma_ch_offset;
+-		if (data->subif_data->flag_ops & DP_SUBIF_SPECIFIC_Q) {
+-			q_flag = DP_SUBIF_SPECIFIC_Q;
+-		} else if (data->subif_data->flag_ops & DP_SUBIF_AUTO_NEW_Q) {
+-			q_flag = DP_SUBIF_AUTO_NEW_Q;
+-		}  else { /*sharing mode (default)*/
++		if (!(data->subif_data->flag_ops &
++		      (DP_SUBIF_SPECIFIC_Q | DP_SUBIF_AUTO_NEW_Q))) {
+ 			if (!deq_pinfo->f_first_qid)
+-				q_flag = DP_SUBIF_AUTO_NEW_Q;/*no Q create yet*/
++				data->subif_data->flag_ops =
++					DP_SUBIF_AUTO_NEW_Q;
+ 		}
+-		DP_DEBUG(DP_DBG_FLAG_QOS, "Queue decision:%s\n",
+-			 q_flag_str(q_flag));
+-
+-		if (q_flag == DP_SUBIF_AUTO_NEW_Q) {
+-			if (update_queue_info(inst, &q_port)) {
+-				pr_err("%s fail for dp_port=%d\n",
+-				       "new_queue_alloc", q_port.dp_port);
+-				return -1;
+-			}
+-			/* update port table */
+-			deq_pinfo->ref_cnt++;
+-			if (port_info->num_dma_chan)
+-				atomic_inc(&(dp_dma_chan_tbl[inst] +
+-					     dma_ch_offset)->ref_cnt);
+-			deq_pinfo->qos_port = q_port.port_node;
+-			if (!deq_pinfo->f_first_qid) {
+-				deq_pinfo->first_qid = q_port.qid;
+-				deq_pinfo->f_first_qid = 1;
+-				DP_DEBUG(DP_DBG_FLAG_QOS,
+-					 "dp_deq_port_tbl[%d][%d].first_qid=%d\n",
+-					 inst, q_port.cqe_deq,
+-					 deq_pinfo->first_qid);
+-			}
+-			/* update scheduler table later */
+ 
+-		} else if (q_flag == DP_SUBIF_SPECIFIC_Q) {
++		if (data->subif_data->flag_ops & DP_SUBIF_AUTO_NEW_Q) {
++			if (alloc_q(inst, &q_port, deq_pinfo))
++				return DP_FAILURE;
++
++		} else if (data->subif_data->flag_ops & DP_SUBIF_SPECIFIC_Q) {
++			DP_DEBUG(DP_DBG_FLAG_QOS,
++				 "Queue decision: %s\n", "specified_queue");
+ 
+ 			/* Single GEM or 1 Subif have only 1 Qid
+ 			 * Multiple GEM or Multiple Subif can have same Qid
+@@ -1591,19 +1689,11 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 				q_info->need_free = 0; /* caller Q,so no free */
+ 				q_info->cqm_dequeue_port = q_port.cqe_deq;
+ 				deq_pinfo->qos_port = -1;
+-				deq_pinfo->ref_cnt++;
+-				if (port_info->num_dma_chan)
+-					atomic_inc(&(dp_dma_chan_tbl[inst] +
+-						     dma_ch_offset)->ref_cnt);
+ 			} else {
+ 				/* Multiple subif can have same Q, we increment
+ 				 * Q reference count if Queue created by DPM
+ 				 */
+ 				q_info->ref_cnt++;
+-				deq_pinfo->ref_cnt++;
+-				if (port_info->num_dma_chan)
+-					atomic_inc(&(dp_dma_chan_tbl[inst] +
+-						     dma_ch_offset)->ref_cnt);
+ 			}
+ 
+ 			q_port.qid = data->subif_data->q_id;
+@@ -1611,38 +1701,42 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 			q_port.port_node = deq_pinfo->qos_port;
+ 
+ 		} else {
++			DP_DEBUG(DP_DBG_FLAG_QOS,
++				 "Queue decision:%s\n", "shared_queue");
++
+ 			/* auto sharing queue: if go to here,
+ 			 * it means sharing queue
+ 			 * is ready and it is created by previous
+ 			 * dp_register_subif_ext
+ 			 */
+ 
+-			/* get already stored q_node_id/qos_port id to q_port
+-			 */
++			/* get already stored q_node_id/qos_port id to q_port */
+ 			q_port.qid = deq_pinfo->first_qid;
+ 			q_port.q_node = deq_pinfo->q_node;
+ 			q_port.port_node = deq_pinfo->qos_port;
+ 			get_dp_q_info(inst, q_port.qid)->ref_cnt++;
+-			deq_pinfo->ref_cnt++;
+-			if (port_info->num_dma_chan)
+-				atomic_inc(&(dp_dma_chan_tbl[inst] +
+-					     dma_ch_offset)->ref_cnt);
+ 		}
++
++		deq_pinfo->ref_cnt++;
++		if (port_info->num_dma_chan)
++			atomic_inc(&(dp_dma_chan_tbl[inst] +
++				     dma_ch_offset)->ref_cnt);
++
+ 		DP_DEBUG(DP_DBG_FLAG_QOS,
+-			 "%s:%s=%d %s=%d q[%d].cnt=%d cqm_p[%d].cnt=%d %s=%d\n",
+-			 "subif_hw_set",
++			 "%s: %s=%d %s=%d q[%d].cnt=%d cqm_p[%d].cnt=%d %s=%d\n",
++			 __func__,
+ 			 "dp_port", portid,
+ 			 "vap", subif_ix,
+ 			 q_port.qid, get_dp_q_info(inst, q_port.qid)->ref_cnt,
+-			 q_port.cqe_deq,
+-			 deq_pinfo->ref_cnt,
++			 q_port.cqe_deq, deq_pinfo->ref_cnt,
+ 			 "tx_dma_chan ref",
+ 			 atomic_read(&(dp_dma_chan_tbl[inst] +
+ 				       dma_ch_offset)->ref_cnt));
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_QOS_HAL)
++
++		/* first CTP */
+ 		if (deq_pinfo->ref_cnt == 1)
+-			data->act = TRIGGER_CQE_DP_ENABLE; /*first CTP*/
+-#endif
++			data->act = TRIGGER_CQE_DP_ENABLE;
++
+ 		/* update caller dp_subif_data.q_id with allocated queue num */
+ 		data->subif_data->q_id = q_port.qid;
+ 		/* update subif table */
+@@ -1652,92 +1746,49 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 		sif->cqm_deq_port[i] = q_port.cqe_deq;
+ 		sif->cqm_port_idx = deq_port_idx;
+ 		port_info->subif_info[subif_ix].cqm_port_idx = deq_port_idx;
+-		qid = q_port.qid;
+-		if (data->subif_data->flag_ops & DP_SUBIF_VANI) {
+-			lookup_f &= ~CBM_QUEUE_MAP_F_MPE2_DONTCARE;
+-			lookup_f |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
+-			lookup.sub_if_id_mask_bits = -1;
+-			lookup.mpe2 = 0;
+-			/* Map to CPU Q */
+-			qid = get_dp_port_info(inst, 0)->subif_info[0].qid;
+-		} else if (port_info->alloc_flags & DP_F_VUNI) {
+-			/* Map to GSWIP */
+-			lookup_f &= ~CBM_QUEUE_MAP_F_MPE2_DONTCARE;
+-			lookup_f &= ~CBM_QUEUE_MAP_F_MPE1_DONTCARE;
+-			lookup_f |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
+-			lookup.sub_if_id_mask_bits = -1;
+-			lookup.mpe2 = 1;
+-			lookup.mpe1 = 0;
+-		}
+-		/* Map this port's lookup to its 1st queue only */
+-		lookup.ep = portid;
+-		if (port_info->alloc_flags & DP_F_EPON)
+-			lookup.sub_if_id = deq_port_idx + i;
+-		else /*Note:CQM need full subif(15bits)*/
+-			lookup.sub_if_id = subif;
+-
+-		/* For mode 0,
+-		 * use CBM_QUEUE_MAP_F_SUBIF_DONTCARE,
+-		 * otherwise, don't use this flag
+-		 */
+-		if (port_info->cqe_lu_mode == CQE_LU_MODE0) {
+-			lookup_f |= CBM_QUEUE_MAP_F_SUBIF_DONTCARE;
+-			lookup.sub_if_id_mask_bits = -1;
+-		}
+-
+-		/* Map to drop queue for DS only GEM */
+-		if (data->dev && data->dev->priv_flags & IFF_NO_QUEUE)
+-			qid = priv->ppv4_drop_q;
+ 
+-		cbm_queue_map_set(dp_port_prop[inst].cbm_inst, qid,
+-				  &lookup, lookup_f);
+-		DP_DEBUG(DP_DBG_FLAG_QOS,
+-			 "%s %s=%d %s=%d %s=%d %s=%d %s=0x%x %s=0x%x(%d)\n",
+-			 "cbm_queue_map_set",
+-			 "qid", qid, "for dp_port", lookup.ep,
+-			 "num_subif", port_info->num_subif,
+-			 "lu_mode", port_info->cqe_lu_mode, "flag", lookup_f,
+-			 "subif", subif, subif_ix);
++		if (lookup_table_cfg(inst, portid, data, subif_ix, i))
++			return DP_FAILURE;
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 			  struct subif_platform_data *data, u32 flags)
+ {
+-	int qid, i;
++	int qid, idx;
+ 	int cqm_deq_port;
+ 	int dma_ch_offset;
+ 	struct pmac_port_info *port_info = get_dp_port_info(inst, portid);
+ 	struct dp_subif_info *sif = get_dp_port_subif(port_info, subif_ix);
+-	int bp = sif->bp;
+ 	struct cqm_port_info *deq_pinfo;
+ 	struct bp_pmapper *bp_info;
+ 	struct q_info *q_info;
+ 
+ 	if (!dp_dma_chan_tbl[inst]) {
+-		pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
++		pr_err("%s: dp_dma_chan_tbl[%d] NULL\n", __func__, inst);
+ 		return DP_FAILURE;
+ 	}
+-	for (i = 0; i < sif->num_qid; i++) {
+-		qid = sif->qid_list[i];
+-		cqm_deq_port = sif->cqm_deq_port[i];
++
++	bp_info = get_dp_bp_info(inst, sif->bp);
++
++	for (idx = 0; idx < sif->num_qid; idx++) {
++		qid = sif->qid_list[idx];
++		cqm_deq_port = sif->cqm_deq_port[idx];
+ 		deq_pinfo = get_dp_deqport_info(inst, cqm_deq_port);
+ 		dma_ch_offset = deq_pinfo->dma_ch_offset;
+-		bp = sif->bp;
+-		bp_info = get_dp_bp_info(inst, bp);
+ 		q_info = get_dp_q_info(inst, qid);
+ 
+ 		/* santity check table */
+ 		if (!deq_pinfo->ref_cnt) {
+-			pr_err("Why dp_deq_port_tbl[%d][%d].ref_cnt Zero\n",
+-			       inst, cqm_deq_port);
++			pr_err("%s: Why dp_deq_port_tbl[%d][%d].ref_cnt Zero\n",
++			       __func__, inst, cqm_deq_port);
+ 			return DP_FAILURE;
+ 		}
+-		if (sif->ctp_dev &&
+-		    !bp_info->ref_cnt) {
+-			pr_err("Why dp_bp_tbl[%d][%d].ref_cnt =%d\n",
+-			       inst, bp, bp_info->ref_cnt);
++		if (sif->ctp_dev && !bp_info->ref_cnt) {
++			pr_err("%s: Why dp_bp_tbl[%d][%d].ref_cnt =%d\n",
++			       __func__, inst, sif->bp, bp_info->ref_cnt);
+ 			return DP_FAILURE;
+ 		}
+ 
+@@ -1746,61 +1797,18 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 		if (port_info->num_dma_chan)
+ 			atomic_dec(&(dp_dma_chan_tbl[inst] +
+ 				     dma_ch_offset)->ref_cnt);
+-		if (i == 0) { /* Cannot reset BP for all qid */
+-			if (sif->ctp_dev) { /* pmapper */
+-				ctp_dev_list_del(&bp_info->ctp_dev, sif->ctp_dev);
+-				sif->ctp_dev = NULL;
+-				bp_info->ref_cnt--;
+-				if (!bp_info->ref_cnt) {
+-					bp_info->dev = NULL;
+-					bp_info->flag = 0;
+-					DP_DEBUG(DP_DBG_FLAG_REG,
+-						 "ctp ref_cnt become zero:%s\n",
+-						 sif->device_name);
+-				}
+-			}
+-			/* Check for max_ctp since CTP,BP is shared,
+-			 * for all subif in case of DSL
+-			 */
+-			if (port_info->ctp_max == 1) {
+-				if (port_info->num_subif == 0) {
+-					reset_ctp_bp(inst, 0, portid, bp);
+-					if (!bp_info->ref_cnt) {
+-						/*NULL already, then free it */
+-						DP_DEBUG(DP_DBG_FLAG_PAE,
+-							 "Free BP[%d] vap=%d\n",
+-							 bp, subif_ix);
+-						dp_gsw_free_bp(inst, bp);
+-					}
+-				}
+-			} else {
+-				reset_ctp_bp(inst, subif_ix, portid, bp);
+-				if (!bp_info->ref_cnt) {
+-					/*NULL already, then free it */
+-					DP_DEBUG(DP_DBG_FLAG_PAE,
+-						 "Free BP[%d] vap=%d\n",
+-						 bp, subif_ix);
+-					dp_gsw_free_bp(inst, bp);
+-				}
+-			}
++
++		/* Cannot reset BP for all qid */
++		if (!idx) {
++			if (subif_bp_cfg(inst, data, portid, subif_ix, flags))
++				return DP_FAILURE;
+ 		}
+-#ifdef CONFIG_INTEL_DATAPATH_QOS_HAL
+-		cqm_deq_port = q_info->cqm_dequeue_port;
+ 
++		cqm_deq_port = q_info->cqm_dequeue_port;
+ 		deq_pinfo = get_dp_deqport_info(inst, cqm_deq_port);
+ 
+-		if (!free_queue_info(inst, portid, qid)) {
+-			if (deq_pinfo->f_first_qid &&
+-			    deq_pinfo->first_qid == qid) {
+-				deq_pinfo->f_first_qid = 0;
+-				deq_pinfo->first_qid = 0;
+-				DP_DEBUG(DP_DBG_FLAG_QOS, "q_id[%d] is freed\n",
+-					 qid);
+-				DP_DEBUG(DP_DBG_FLAG_QOS,
+-					 "dp_deq_port_tbl[%d][%d].f_first_qid reset\n",
+-					 inst, cqm_deq_port);
+-			}
+-		}
++		free_q(inst, portid, qid, deq_pinfo);
++
+ 		DP_DEBUG(DP_DBG_FLAG_QOS,
+ 			 "%s:%s=%d %s=%d q[%d].cnt=%d cqm_p[%d].cnt=%d %s=%d\n",
+ 			 __func__,
+@@ -1811,7 +1819,6 @@ static int subif_hw_reset(int inst, int portid, int subif_ix,
+ 			 "tx_dma_chan_ref",
+ 			 atomic_read(&(dp_dma_chan_tbl[inst] +
+ 				       dma_ch_offset)->ref_cnt));
+-#endif /* CONFIG_INTEL_DATAPATH_QOS_HAL */
+ 
+ 		if (!port_info->num_subif && deq_pinfo->ref_cnt) {
+ 			pr_err("%s: num_subif(%d) not match %s[%d][%d].ref_cnt\n",

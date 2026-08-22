@@ -1,0 +1,651 @@
+From 52243be81d300f07794a608056621c5ffbe87f9e Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Mon, 2 Dec 2019 21:07:23 +0800
+Subject: [PATCH] PONRTSYS-4854: XPCS/ETH - add XPCS power on/off support
+
+---
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c | 105 +++++++++++--
+ drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h |   2 +
+ drivers/net/ethernet/lantiq/xpcs/xpcs.c          | 180 +++++++++++++++--------
+ drivers/net/ethernet/lantiq/xpcs/xpcs.h          |  32 +++-
+ drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c    |  39 +++--
+ 5 files changed, 258 insertions(+), 100 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+index 2d20ea0bf4b9..d08f5eef41dc 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.c
+@@ -319,7 +319,7 @@ static int  ethtool_eee_set(struct net_device *dev,
+ 	return retval;
+ }
+ 
+-int serdes_ethtool_get_link_ksettings(struct net_device *dev,
++static int serdes_ethtool_get_link_ksettings(struct net_device *dev,
+ 				      struct ethtool_link_ksettings *cmd)
+ {
+ 	struct ltq_eth_priv *priv = netdev_priv(dev);
+@@ -332,8 +332,15 @@ int serdes_ethtool_get_link_ksettings(struct net_device *dev,
+ 	pdev = of_find_device_by_node(priv->xpcs_node);
+ 	if (pdev) {
+ #ifdef CONFIG_INTEL_XPCS
+-		/* Speed Get in Ethtool */
+-		ret = xpcs_ethtool_ksettings_get(&pdev->dev, cmd);
++		struct xpcs_ops *ops = xpcs_pdev_ops(pdev);
++
++		if (IS_ERR(ops))
++			ret = PTR_ERR(ops);
++		else if (!ops->ethtool_ksettings_get)
++			ret = -EINVAL;
++		else
++			/* Speed Get in Ethtool */
++			ret = ops->ethtool_ksettings_get(&pdev->dev, cmd);
+ #endif
+ 	} else {
+ 		pr_err("Cannot get Xpcs pdev for %s\n", dev->name);
+@@ -342,7 +349,7 @@ int serdes_ethtool_get_link_ksettings(struct net_device *dev,
+ 	return ret;
+ }
+ 
+-int serdes_ethtool_set_link_ksettings(struct net_device *dev,
++static int serdes_ethtool_set_link_ksettings(struct net_device *dev,
+ 				      const struct ethtool_link_ksettings *cmd)
+ {
+ 	struct ltq_eth_priv *priv = netdev_priv(dev);
+@@ -356,8 +363,15 @@ int serdes_ethtool_set_link_ksettings(struct net_device *dev,
+ 	pdev = of_find_device_by_node(priv->xpcs_node);
+ 	if (pdev) {
+ #ifdef CONFIG_INTEL_XPCS
+-		/* Speed Get in Ethtool */
+-		ret = xpcs_ethtool_ksettings_set(&pdev->dev, cmd);
++		struct xpcs_ops *ops = xpcs_pdev_ops(pdev);
++
++		if (IS_ERR(ops))
++			ret = PTR_ERR(ops);
++		else if (!ops->ethtool_ksettings_set)
++			ret = -EINVAL;
++		else
++			/* Speed Get in Ethtool */
++			ret = ops->ethtool_ksettings_set(&pdev->dev, cmd);
+ #endif
+ 	} else {
+ 		 pr_err("Cannot get Xpcs pdev for %s\n", dev->name);
+@@ -473,6 +487,55 @@ static const struct ethtool_ops serdes_ethtool_ops = {
+ 	.get_ethtool_stats	= get_ethtool_stats,
+ };
+ 
++static int eth_serdes_power(struct net_device *dev, bool up)
++{
++	int ret = 0;
++
++#ifdef CONFIG_INTEL_XPCS
++	struct ltq_eth_priv *priv = netdev_priv(dev);
++	struct platform_device *pdev;
++	struct xpcs_ops *ops;
++
++	pr_debug("%s(%s, %d)\n", __func__, dev->name, up);
++
++	if (priv->master)
++		priv = priv->master;
++
++	if ((!up || atomic_inc_return(&priv->powerup) != 1)
++	    && (up || atomic_dec_if_positive(&priv->powerup) != 0))
++		return 0;
++
++	if (!priv->xpcs_node) {
++		pr_err("Cannot get Xpcs device tree node for %s\n", dev->name);
++		return -EINVAL;
++	}
++
++	pdev = of_find_device_by_node(priv->xpcs_node);
++	if (!pdev) {
++		pr_err("Cannot get Xpcs pdef for %s\n", dev->name);
++		return -EINVAL;
++	}
++
++	ops = xpcs_pdev_ops(pdev);
++	if (IS_ERR(ops))
++		return PTR_ERR(ops);
++
++	if (up) {
++		if (ops->power_on)
++			ret = ops->power_on(&pdev->dev);
++		else
++			ret = -EINVAL;
++	} else {
++		if (ops->power_off)
++			ret = ops->power_off(&pdev->dev);
++		else
++			ret = -EINVAL;
++	}
++#endif
++
++	return ret;
++}
++
+ /* open the network device interface*/
+ static int ltq_eth_open(struct net_device *dev)
+ {
+@@ -495,6 +558,8 @@ static int ltq_eth_open(struct net_device *dev)
+ 		return -1;
+ 	}
+ 
++	eth_serdes_power(dev, true);
++
+ 	return 0;
+ }
+ 
+@@ -504,6 +569,9 @@ static int ltq_eth_stop(struct net_device *dev)
+ 	int ret;
+ 
+ 	pr_debug("%s called for device %s\n", __func__, dev->name);
++
++	eth_serdes_power(dev, false);
++
+ 	ret = dp_rx_enable(dev, dev->name, DP_RX_DISABLE);
+ 
+ 	if (ret != DP_SUCCESS) {
+@@ -816,16 +884,17 @@ static int ltq_disable_gsw_r_jumbo(struct net_device *dev)
+ 	return 0;
+ }
+ 
+-static void ltq_set_max_pkt_len (struct ltq_eth_priv *priv, u16 pkt_len)
++static void ltq_set_max_pkt_len(struct ltq_eth_priv *priv, u16 pkt_len)
+ {
+ 	struct core_ops *ops = NULL;
++
+ 	pkt_len += ETH_HLEN + ETH_FCS_LEN;
+-	if(priv != NULL) {
+-		if(priv->wan)
++	if (priv != NULL) {
++		if (priv->wan)
+ 			ops = gsw_get_swcore_ops(1);
+ 		else
+ 			ops = gsw_get_swcore_ops(0);
+-		if(ops == NULL)
++		if (ops == NULL)
+ 			return;
+ 
+ 		/* Set the MAC_FLEN register for max packet length */
+@@ -861,7 +930,7 @@ static int ltq_change_mtu(struct net_device *dev, int new_mtu)
+ 	} else {
+ 
+ 		/* set the max pkt length on the switch */
+-		ltq_set_max_pkt_len(priv,(u16)new_mtu);
++		ltq_set_max_pkt_len(priv, (u16)new_mtu);
+ 
+ 		/* if the MTU > 1500, do the jumbo config in switch */
+ 		if (new_mtu > ETH_DATA_LEN && !(priv->jumbo_enabled)) {
+@@ -896,8 +965,9 @@ static int ltq_start_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	int len;
+ 
+ 	/* pad packet to avoid stuck in traffic queues
+-	   as ethernet expects min of ETH_ZLEN bytes */
+-	if (skb_put_padto(skb,ETH_ZLEN)) {
++	 *  as ethernet expects min of ETH_ZLEN bytes
++	 */
++	if (skb_put_padto(skb, ETH_ZLEN)) {
+ 		priv->stats.tx_dropped++;
+ 		return 0;
+ 	}
+@@ -1703,7 +1773,8 @@ xrx500_of_port(struct net_device *dev, struct device_node *port)
+ }
+ 
+ static int ltq_eth_dev_reg(struct xrx500_hw *hw, u32 xgmac_id_param,
+-			   u32 lct_en, u32 dp_port, int start, int end)
++			   u32 lct_en, u32 dp_port, int start, int end,
++			   struct ltq_eth_priv *master)
+ {
+ 	int i, err, num = 1;
+ 
+@@ -1732,6 +1803,7 @@ static int ltq_eth_dev_reg(struct xrx500_hw *hw, u32 xgmac_id_param,
+ 			snprintf(eth_dev[i]->name, IFNAMSIZ,
+ 				 "eth0_%d_%d",  hw->num_devs, num);
+ 		}
++		priv->master = master;
+ 
+ 		eth_dev[i]->netdev_ops = &ltq_eth_drv_ops;
+ 		ltq_eth_drv_eth_addr_setup(eth_dev[i], priv->id);
+@@ -1901,7 +1973,7 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 			priv->extra_subif = extra_subif_param;
+ 			priv->start = dev_num;
+ 			priv->end = dev_num + priv->extra_subif;
+-			dev_num = priv->extra_subif;
++			dev_num += priv->extra_subif;
+ 	}
+ 	strcpy(hw->devs[hw->num_devs]->name, name);
+ 	hw->devs[hw->num_devs]->netdev_ops = &ltq_eth_drv_ops;
+@@ -1993,7 +2065,8 @@ static int xrx500_of_iface(struct xrx500_hw *hw, struct device_node *iface,
+ 		net_start = priv->start;
+ 		net_end = priv->end;
+ 		ltq_eth_dev_reg(&xrx500_hw, xgmac_id_param, lct_en_param,
+-				dp_port_id_param, net_start, net_end);
++				dp_port_id_param, net_start, net_end,
++				priv);
+ 	}
+ 
+ 	hw->num_devs++;
+diff --git a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+index 033525da7ad9..38ec24c7491d 100644
+--- a/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
++++ b/drivers/net/ethernet/lantiq/ltq_eth_drv_xrx500.h
+@@ -86,6 +86,8 @@ struct ltq_eth_priv {
+ 	int start;
+ 	/*! max netdevices for extra subif/lct */
+ 	int end;
++	struct ltq_eth_priv *master;
++	atomic_t powerup;
+ 	struct ethtool_cmd bkup_cmd;
+ 	bool needs_recovery;
+ 	#define FLAG_PAUSE_AUTO         0x00000001
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+index a8e26060327e..efcf4f1fe23d 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+@@ -201,14 +201,14 @@ static int xpcs_rxtx_stable(struct xpcs_prv_data *pdata)
+ 
+ 		if (pseq_state == 4) {
+ 			if (pdata->mode == TENG_KR_MODE)
+-				pr_debug("%s: Tx/Rx stable (Power_Good State) "
+-					 "Speed: 10G\n", pdata->name);
++				pr_debug("%s: Tx/Rx stable (Power_Good State) Speed: 10G\n",
++					 pdata->name);
+ 			else if (pdata->mode == ONEG_XAUI_MODE)
+-				pr_debug("%s: Tx/Rx stable (Power_Good State) "
+-					 "Speed: 1G\n", pdata->name);
++				pr_debug("%s: Tx/Rx stable (Power_Good State) Speed: 1G\n",
++					 pdata->name);
+ 			else if (pdata->mode == TWOP5G_SGMII_MODE)
+-				pr_debug("%s: Tx/Rx stable (Power_Good State) "
+-					 "Speed: 2.5G\n", pdata->name);
++				pr_debug("%s: Tx/Rx stable (Power_Good State) Speed: 2.5G\n",
++					 pdata->name);
+ 
+ 			break;
+ 		}
+@@ -720,11 +720,10 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ /* 2.5G SGMII Mode */
+ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata)
+ {
+-	if (!strcmp(pdata->name, "wan_xpcs")) {
++	if (!strcmp(pdata->name, "wan_xpcs"))
+ 		pdata->mpllb = 0;
+-	} else {
++	else
+ 		pdata->mpllb = 1;
+-	}
+ 
+ 	if (xpcs_byp_pwrupseq(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+@@ -1019,8 +1018,104 @@ static int xpcs_reset(struct device *dev)
+ 	return 0;
+ }
+ 
+-int xpcs_ethtool_ksettings_get(struct device *dev,
+-			       struct ethtool_link_ksettings *cmd)
++static int xpcs_power_off(struct device *dev)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	struct phy *phy = pdata->phy;
++
++	dev_dbg(dev, "%s: %s\n", __func__, pdata->name);
++
++	if (!dev || !phy) {
++		dev_err(dev, "XPCS Power Off: Cannot get phy or dev\n");
++		return -EINVAL;
++	}
++
++	if (!pdata->state)
++		return 0;
++
++	pdata->state = 0;
++
++	/* Xpcs reset assert */
++	reset_control_assert(pdata->xpcs_rst);
++
++	/* RCU reset PHY */
++	phy_power_off(phy);
++
++	/* Exit PHY */
++	phy_exit(phy);
++
++	return 0;
++}
++
++static int xpcs_power_on(struct device *dev)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	struct phy *phy = pdata->phy;
++	int ret = 0;
++
++	dev_dbg(dev, "%s: %s\n", __func__, pdata->name);
++
++	if (!dev || !phy) {
++		dev_err(dev, "XPCS Power On: Cannot get phy or dev\n");
++		return -EINVAL;
++	}
++
++	if (pdata->state)
++		return 0;
++
++	/* Init PHY */
++	ret = phy_init(phy);
++
++	if (ret < 0) {
++		dev_dbg(dev, "phy_init err %s.\n", pdata->name);
++		return ret;
++	}
++
++	/* Power ON PHY */
++	phy_power_on(phy);
++
++	/* Xpcs reset deassert */
++	reset_control_deassert(pdata->xpcs_rst);
++
++	/* Power ON XPCS */
++	ret = xpcs_init(pdata);
++
++	if (ret < 0) {
++		dev_dbg(dev, "xpcs_init err %s.\n", pdata->name);
++		return ret;
++	}
++
++	pdata->state = 1;
++
++	ret = phy_calibrate(phy);
++
++	return ret;
++}
++
++static int xpcs_reinit(struct device *dev, u32 mode)
++{
++	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
++	int ret;
++
++	if (!dev) {
++		dev_err(dev, "XPCS Reinit: Cannot get phy or dev\n");
++		return -EINVAL;
++	}
++
++	ret = xpcs_power_off(dev);
++	if (ret)
++		return ret;
++
++	/* Change mode to new mode */
++	pdata->mode = mode;
++
++	ret = xpcs_power_on(dev);
++
++	return ret;
++}
++
++static int xpcs_ethtool_ksettings_get(struct device *dev,
++				      struct ethtool_link_ksettings *cmd)
+ {
+ 	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
+ 
+@@ -1047,10 +1142,9 @@ int xpcs_ethtool_ksettings_get(struct device *dev,
+ 	cmd->base.duplex = DUPLEX_FULL;
+ 	return 0;
+ }
+-EXPORT_SYMBOL(xpcs_ethtool_ksettings_get);
+ 
+-int xpcs_ethtool_ksettings_set(struct device *dev,
+-			       const struct ethtool_link_ksettings *cmd)
++static int xpcs_ethtool_ksettings_set(struct device *dev,
++				      const struct ethtool_link_ksettings *cmd)
+ {
+ 	u32 speed = cmd->base.speed;
+ 	u32 mode;
+@@ -1080,57 +1174,6 @@ int xpcs_ethtool_ksettings_set(struct device *dev,
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(xpcs_ethtool_ksettings_set);
+-
+-int xpcs_reinit(struct device *dev, u32 mode)
+-{
+-	struct xpcs_prv_data *pdata = dev_get_drvdata(dev);
+-	struct phy *phy = pdata->phy;
+-	int ret = 0;
+-
+-	if (!dev || !phy) {
+-		dev_err(dev, "XPCS Reinit: Cannot get phy or dev\n");
+-		return -1;
+-	}
+-
+-	/* Xpcs reset assert */
+-	reset_control_assert(pdata->xpcs_rst);
+-
+-	/* RCU reset PHY */
+-	phy_power_off(phy);
+-
+-	/* Exit PHY */
+-	phy_exit(phy);
+-
+-	/* Init PHY */
+-	ret = phy_init(phy);
+-
+-	if (ret < 0) {
+-		dev_dbg(dev, "phy_init err %s.\n", pdata->name);
+-		return ret;
+-	}
+-
+-	/* Power ON PHY */
+-	phy_power_on(phy);
+-
+-	/* Xpcs reset deassert */
+-	reset_control_deassert(pdata->xpcs_rst);
+-
+-	/* Change mode to new mode */
+-	pdata->mode = mode;
+-
+-	/* Power ON XPCS */
+-	ret = xpcs_init(pdata);
+-
+-	if (ret < 0) {
+-		dev_dbg(dev, "xpcs_init err %s.\n", pdata->name);
+-		return ret;
+-	}
+-
+-	ret = phy_calibrate(phy);
+-
+-	return ret;
+-}
+ 
+ static int xpcs_probe(struct platform_device *pdev)
+ {
+@@ -1157,6 +1200,11 @@ static int xpcs_probe(struct platform_device *pdev)
+ 	pdata->id = pdev->id;
+ 	pdata->dev = dev;
+ 
++	pdata->ops.ethtool_ksettings_get = xpcs_ethtool_ksettings_get;
++	pdata->ops.ethtool_ksettings_set = xpcs_ethtool_ksettings_set;
++	pdata->ops.power_off = xpcs_power_off;
++	pdata->ops.power_on = xpcs_power_on;
++
+ 	pdata->irq_num = platform_get_irq_byname(pdev, XPCS_IRQ_NAME);
+ 
+ 	if (pdata->irq_num <= 0) {
+@@ -1212,6 +1260,8 @@ static int xpcs_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
++	pdata->state = 1;
++
+ 	if (xpcs_sysfs_init(pdata)) {
+ 		dev_dbg(dev, "%s: sysfs init failed!\n", pdata->name);
+ 		return -EINVAL;
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.h b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+index 64bd64efd4ec..a43cd1368e24 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.h
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+@@ -3,6 +3,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/ethtool.h>
++#include <linux/platform_device.h>
+ 
+ #define XPCS_SUCCESS			0
+ #define XPCS_FAILURE			-1
+@@ -551,7 +552,7 @@
+ #define PCS_DIG_STS_PSEQ_STATE_POS		2
+ #define PCS_DIG_STS_PSEQ_STATE_WIDTH		3
+ 
+-#define MAX_XPCS 				6
++#define MAX_XPCS				6
+ 
+ enum {
+ 	BACKPL_ETH_PCS = 0,
+@@ -657,6 +658,15 @@ struct xpcs_mode_cfg {
+ 	int (*set_mode)(struct xpcs_prv_data *);
+ };
+ 
++struct xpcs_ops {
++	int (*ethtool_ksettings_get)(struct device *dev,
++				     struct ethtool_link_ksettings *cmd);
++	int (*ethtool_ksettings_set)(struct device *dev,
++				     const struct ethtool_link_ksettings *cmd);
++	int (*power_off)(struct device *dev);
++	int (*power_on)(struct device *dev);
++};
++
+ struct xpcs_prv_data {
+ 	u32 id;
+ 	u32 num_resources;
+@@ -667,9 +677,13 @@ struct xpcs_prv_data {
+ 	struct device *dev;
+ 	struct phy *phy;
+ 
++	struct xpcs_ops ops;
++
+ 	/* XPCS Interface Name */
+ 	const char *name;
+ 
++	int state;
++
+ 	/* XPCS Mode 10G, 1G, 2.5G */
+ 	u32 mode;
+ 
+@@ -777,11 +791,17 @@ static inline void XPCS_RGWR(struct xpcs_prv_data *pdata, u32 reg, u32 val)
+ 	} while (0)
+ 
+ int xpcs_sysfs_init(struct xpcs_prv_data *priv);
+-int xpcs_ethtool_ksettings_get(struct device *dev,
+-				struct ethtool_link_ksettings *cmd);
+-int xpcs_ethtool_ksettings_set(struct device *dev,
+-			       const struct ethtool_link_ksettings *cmd);
+-int xpcs_reinit(struct device *dev, u32 mode);
++
++static inline struct xpcs_ops *xpcs_pdev_ops(struct platform_device *pdev)
++{
++	struct xpcs_prv_data *pdata;
++
++	if (!pdev)
++		return ERR_PTR(-EINVAL);
++
++	pdata = platform_get_drvdata(pdev);
++	return &pdata->ops;
++}
+ 
+ #endif
+ 
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+index 9a772542a53b..4a6901b5d793 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+@@ -25,6 +25,9 @@ xpcs_linksts_show(struct device *dev,
+ 
+ 	pdata = dev_get_drvdata(dev);
+ 
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
+ 	off = sprintf(buf + off, "\n%s: LINK Status\n", pdata->name);
+ 	off += sprintf(buf + off, "\n");
+ 
+@@ -95,13 +98,13 @@ xpcs_linksts_show(struct device *dev,
+ 
+ 	val = XPCS_RGRD_VAL(pdata, PMA_KR_LP_CESTS, LP_RR);
+ 	off += sprintf(buf + off, "\tPMA_KR_LP_CESTS LP_RR:               %s\n",
+-		       val ? "The LP rx has determined that the training is "
+-		       "complete, and it is ready to receive data." :
+-		       "The LP rx is requesting that the training "
+-		       "should be continued.");
++		       val ?
++		       "The LP rx has determined that the training is complete, and it is ready to receive data."
++		       :
++		       "The LP rx is requesting that the training should be continued.");
+ 
+-	off += sprintf(buf + off, "\n10GBASE-KR LD coeff Update Local Device "
+-		       "requests to Link Partner.\n");
++	off += sprintf(buf + off,
++		       "\n10GBASE-KR LD coeff Update Local Device requests to Link Partner.\n");
+ 	off += sprintf(buf + off, "\n");
+ 
+ 	val = XPCS_RGRD_VAL(pdata, PMA_KR_LD_CEU, LD_INIT);
+@@ -119,10 +122,10 @@ xpcs_linksts_show(struct device *dev,
+ 
+ 	val = XPCS_RGRD_VAL(pdata, PMA_KR_LD_CESTS, LD_RR);
+ 	off += sprintf(buf + off, "\tPMA_KR_LD_CESTS RR:                  %s\n",
+-		       val ? "The LD rx has determined that the training is "
+-		       "complete, and it is ready to receive data." :
+-		       "The LD rx is requesting that the training "
+-		       "should be continued.");
++		       val ?
++		       "The LD rx has determined that the training is complete, and it is ready to receive data."
++		       :
++		       "The LD rx is requesting that the training should be continued.");
+ 
+ 	off += sprintf(buf + off, "\nAutonegotiation Status Register\n");
+ 	off += sprintf(buf + off, "\n");
+@@ -154,8 +157,9 @@ xpcs_linksts_show(struct device *dev,
+ 
+ 	val = XPCS_RGRD_VAL(pdata, AN_STS, PR);
+ 	off += sprintf(buf + off, "\tPage Received:                       %s\n",
+-		       val ? "Page is received and the corresponding "
+-		       "Link Code Word is stored " : "No page received");
++		       val ?
++		       "Page is received and the corresponding Link Code Word is stored "
++		       : "No page received");
+ 
+ 	val = XPCS_RGRD_VAL(pdata, AN_STS, PDF);
+ 	off += sprintf(buf + off, "\tParallel Detection Fault in CL73 :   %s\n",
+@@ -249,6 +253,9 @@ xpcs_cl73_info_show(struct device *dev,
+ 
+ 	pdata = dev_get_drvdata(dev);
+ 
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
+ 	off = sprintf(buf + off, "\n%s: CL 73 Status\n", pdata->name);
+ 	off += sprintf(buf + off, "\n");
+ 
+@@ -316,6 +323,9 @@ xpcs_table_show(struct device *dev,
+ 
+ 	pdata = dev_get_drvdata(dev);
+ 
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
+ 	off = sprintf(buf + off, "\n%s: Table Show\n", pdata->name);
+ 	off += sprintf(buf + off, "\n");
+ 
+@@ -488,7 +498,7 @@ xpcs_table_show(struct device *dev,
+ 
+ static DEVICE_ATTR_RO(xpcs_table);
+ 
+-static const char *xpcs_status_strings[] = {
++static const char * const xpcs_status_strings[] = {
+ 	"Wait for Ack High 0",
+ 	"Wait for Ack Low 0",
+ 	"Wait for Ack High 1",
+@@ -507,6 +517,9 @@ static ssize_t xpcs_status_show(struct device *dev,
+ 
+ 	pdata = dev_get_drvdata(dev);
+ 
++	if (!pdata->state)
++		return sprintf(buf, "\n%s: power off\n", pdata->name);
++
+ 	off = sprintf(buf + off, "\n%s: RX/TX Stable Status\n", pdata->name);
+ 	off += sprintf(buf + off, "\n");
+ 

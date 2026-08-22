@@ -1,0 +1,280 @@
+From d197eae9a37ba52ae5fc9b78cc642e56417e7379 Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <kamil.rywacki@intel.com>
+Date: Wed, 10 Feb 2021 02:21:22 +0100
+Subject: [PATCH] PONRTSYS-8538: Fix VLAN forwarding rules order
+
+- DP API PCE: add optional user_data argument which allows requesting index range during creation
+- PON QOS: provide requested index range to correctly order rules
+---
+ drivers/net/datapath/dpm/datapath_pce.c          | 79 ++++++++++++++++--------
+ drivers/net/datapath/dpm/datapath_pce.h          |  2 -
+ drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c | 17 +++--
+ drivers/net/datapath/pon_qos/pon_qos_tc_pce.c    | 48 ++++++++++++++
+ include/net/datapath_api.h                       |  8 +++
+ 5 files changed, 120 insertions(+), 34 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_pce.c b/drivers/net/datapath/dpm/datapath_pce.c
+index db45ca8acc9e..eb6999c5d8c7 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.c
++++ b/drivers/net/datapath/dpm/datapath_pce.c
+@@ -622,6 +622,47 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+ 	return DP_SUCCESS;
+ }
+ 
++static int pce_rule_add_index_get(struct dp_subblk_entry *subblk_entry,
++				  struct dp_pce_user_data *user_data)
++{
++	int i;
++	u32 start = 0;
++	u32 end = subblk_entry->subblk_rules_max;
++
++	if (user_data && user_data->idx_en) {
++		DP_DEBUG(DP_DBG_FLAG_PCE, "%s: %s %d %s %u %s %u\n",
++			 __func__,
++			 "user_idx_en", user_data->idx_en,
++			 "user_idx_s", user_data->idx_s,
++			 "user_idx_e", user_data->idx_e);
++
++		start = user_data->idx_s;
++		end = user_data->idx_e;
++
++		if (start >= end || end > subblk_entry->subblk_rules_max) {
++			pr_err("%s: Sub-block range incorrect %s %u %s %u %s %u\n",
++			       __func__,
++			       "start", user_data->idx_s,
++			       "end", user_data->idx_e,
++			       "max", subblk_entry->subblk_rules_max);
++			return DP_FAILURE;
++		}
++	}
++
++	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: %s %u %s %u\n",
++		 __func__,
++		 "start", start,
++		 "end", end);
++
++	for (i = start; i < end; i++) {
++		if (test_bit(i, subblk_entry->_used))
++			continue;
++		return i;
++	}
++
++	return DP_FAILURE;
++}
++
+ /* Pce Rule Operations
+  * pce_rule     : Pce rule Entry to add
+  * subblk_entry : Sub-Block on which rule need to be added
+@@ -629,10 +670,11 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+  */
+ static int pce_rule_add(GSW_PCE_rule_t *pce,
+ 			struct dp_blk_entry *blk_entry,
+-			struct dp_subblk_entry *subblk_entry)
++			struct dp_subblk_entry *subblk_entry,
++			struct dp_pce_user_data *user_data)
+ {
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
+-	int index = 0, i;
++	int index;
+ 
+ 	if (!ops)
+ 		return -1;
+@@ -656,33 +698,16 @@ static int pce_rule_add(GSW_PCE_rule_t *pce,
+ 		return -1;
+ 	}
+ 
+-	if (!subblk_entry->manual_index_en) {
+-		for (i = 0; i < subblk_entry->subblk_rules_max; i++) {
+-			if (test_bit(i, subblk_entry->_used))
+-				continue;
+-			index = i;
+-			break;
+-		}
+-	} else {
+-		if (subblk_entry->manual_index >
+-		    subblk_entry->subblk_rules_max) {
+-			pr_err("%s: Manual user index out of range: %u\n",
+-			       __func__, subblk_entry->manual_index);
+-			return -1;
+-		}
+-		index = subblk_entry->manual_index;
++	index = pce_rule_add_index_get(subblk_entry, user_data);
++	if (index < 0) {
++		pr_err("%s: Sub-block index not available!\n",
++		       __func__);
++		return -1;
+ 	}
+ 
+ 	pce->pattern.nIndex += index;
+-	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: Index %d\n",
+-		 __func__, pce->pattern.nIndex);
+-
+-	/* check if index is already occupied */
+-	if (test_bit(index, subblk_entry->_used)) {
+-		pr_err("%s: Index already in use, subblk_index: %d, nIndex: %d\n",
+-		       __func__, index, pce->pattern.nIndex);
+-		return -1;
+-	}
++	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: subblk_index %d, pce_index %d\n",
++		 __func__, index, pce->pattern.nIndex);
+ 
+ 	if (ops->gsw_tflow_ops.TFLOW_PceRuleWrite(ops, pce)) {
+ 		pr_err("%s: TFLOW_PceRuleWite failed, nIndex: %d\n",
+@@ -1057,7 +1082,7 @@ int dp_pce_rule_add_priv(struct dp_pce_blk_info *pce_blk_info,
+ 	}
+ 
+ 	/* Add PCE rule inside sub-block entry */
+-	ret = pce_rule_add(pce, blk_entry, subblk_entry);
++	ret = pce_rule_add(pce, blk_entry, subblk_entry, blk_info->user_data);
+ 	if (ret < 0) {
+ 		pr_err("%s: pce_rule_add failed\n", __func__);
+ 		subblk_del(blk_entry, subblk_entry);
+diff --git a/drivers/net/datapath/dpm/datapath_pce.h b/drivers/net/datapath/dpm/datapath_pce.h
+index dfe24afe5dab..6b2dfe99ded2 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.h
++++ b/drivers/net/datapath/dpm/datapath_pce.h
+@@ -45,8 +45,6 @@ struct dp_subblk_entry {
+ 	u32 subblk_firstindex;	/* Sub-Block Starting Pce Index */
+ 	u32 subblk_rules_max;	/* num of rules in this Sub-Block */
+ 	u32 subblk_rules_used;	/* num of rules used for this Sub-Block */
+-	bool manual_index_en;	/* Enable use of manual index from user */
+-	u32 manual_index;	/* User provided manual index */
+ 	DECLARE_BITMAP(_used, PCE_SUBBLK_SIZE_MAX);	/* Used rules */
+ 	bool subblk_protected;  /* Indicates this sub-blk is protected or not */
+ };
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+index 4d1efedfc8f5..668233eb3dcb 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_mirred.c
+@@ -33,6 +33,17 @@ static int pon_qos_parse_flower(struct net_device *dev,
+ {
+ 	memset(flt, 0, sizeof(*flt));
+ 
++	if (f->dissector->used_keys &
++			~(BIT(FLOW_DISSECTOR_KEY_CONTROL) |
++				BIT(FLOW_DISSECTOR_KEY_BASIC) |
++				BIT(FLOW_DISSECTOR_KEY_VLAN))) {
++		pr_debug("%s: Unsupported key used: 0x%x\n", __func__,
++			 f->dissector->used_keys);
++		return -EINVAL;
++	}
++	pr_debug("%s: Supported key used: 0x%x\n", __func__,
++		 f->dissector->used_keys);
++
+ 	flt->proto = f->common.protocol;
+ 	/* Classification/Matching arguments parsing */
+ 	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_VLAN)) {
+@@ -50,13 +61,9 @@ static int pon_qos_parse_flower(struct net_device *dev,
+ 			   mask->vlan_id);
+ 		flt->key = *key;
+ 		flt->mask = *mask;
+-
+-		return 0;
+ 	}
+ 
+-	netdev_err(dev, "%s: Unsupported key used: 0x%x\n", __func__,
+-		   f->dissector->used_keys);
+-	return -EINVAL;
++	return 0;
+ }
+ 
+ static int pon_qos_parse_act_mirred(struct net_device *dev,
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+index 715c59a1a127..87fe2082347a 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_pce.c
+@@ -115,6 +115,45 @@ subblk_id_find(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static int pce_index_range_get(enum pce_type type,
++			       u32 *start,
++			       u32 *stop)
++{
++	switch (type) {
++	case PCE_COMMON:
++		*start = 0;
++		*stop = PON_QOS_PCE_BLOCK_ENTRIES_MAX;
++		break;
++	case PCE_MIRR_VLAN_FWD:
++		*start = 0;
++		*stop = 16;
++		break;
++	case PCE_MIRR_VLAN_DROP:
++		*start = 16;
++		*stop = 26;
++		break;
++	case PCE_MIRR_VLAN_WILD:
++		*start = 26;
++		*stop = 27;
++		break;
++	case PCE_MIRR_UNTAG_FWD:
++		*start = 27;
++		*stop = 28;
++		break;
++	case PCE_MIRR_UNTAG_DROP:
++		*start = 28;
++		*stop = 29;
++		break;
++	default:
++		pr_err("%s: Range not found!\n", __func__);
++		return -EINVAL;
++	}
++
++	pr_debug("%s: Range assigned, start: %u, stop: %u\n", __func__,
++		 *start, *stop);
++	return 0;
++}
++
+ #define TC_PCE_SUBBLK_SIZE 32
+ 
+ int pon_qos_pce_rule_create(struct net_device *dev,
+@@ -124,6 +163,7 @@ int pon_qos_pce_rule_create(struct net_device *dev,
+ {
+ 	struct dp_pce_blk_info *pce_blk_info;
+ 	struct pce_node *tc_pce = NULL;
++	struct dp_pce_user_data user_data = {0};
+ 	int portid, subif;
+ 	u32 index;
+ 	s32 ret;
+@@ -156,6 +196,14 @@ int pon_qos_pce_rule_create(struct net_device *dev,
+ 	pce_blk_info->info.subblk_id = subblk_id_find(dev, pce_rule->region,
+ 						      portid, subif);
+ 
++	ret = pce_index_range_get(type, &user_data.idx_s, &user_data.idx_e);
++	if (ret != 0) {
++		kfree(pce_blk_info);
++		return ret;
++	}
++	user_data.idx_en = true;
++	pce_blk_info->info.user_data = &user_data;
++
+ 	ret = dp_pce_rule_add(pce_blk_info, pce_rule);
+ 	if (ret < 0) {
+ 		netdev_err(dev, "%s: dp_pce_rule_add failed err %d\n",
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index 9d425b3978ad..3ab2d1bb772e 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -2369,6 +2369,13 @@ int dp_get_dc_config(struct dp_dc_res *res, int flag);
+  */
+ int dp_set_br_vlan_limit(struct net_device *br_dev, u32 maxvlanid);
+ 
++/* Sub-Blocks user data which will be used to manipulate rule creation */
++struct dp_pce_user_data {
++	bool idx_en;	/* Enable user to request index within range */
++	u32 idx_s;	/* Requested start index */
++	u32 idx_e;	/* Requested end index */
++};
++
+ /*!
+  *@brief struct dp_subblk_info to pass PCE Sub-Block Information
+  */
+@@ -2392,6 +2399,7 @@ struct dp_subblk_info {
+ 				 */
+ 	int subblk_size;	/*!< [in] Sub-Block Size */
+ 	char subblk_name[32];  /*!< [in] Name for sub-block */
++	struct dp_pce_user_data *user_data; /*!< [in] Optional user data */
+ };
+ 
+ /*!

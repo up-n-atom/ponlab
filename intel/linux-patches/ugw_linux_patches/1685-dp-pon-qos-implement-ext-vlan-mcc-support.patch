@@ -1,0 +1,242 @@
+From 43f626fd9a019d6c217706bc8028771adf72489a Mon Sep 17 00:00:00 2001
+From: "Rywacki, Kamil" <krywacki@maxlinear.com>
+Date: Fri, 21 May 2021 12:57:06 +0200
+Subject: [PATCH] dp: pon_qos: implement ext vlan mcc support
+
+PONRTSYS-1937: Implement Extended VLAN operations offload for multicast control flows
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c | 80 +++++++++++++++++++---
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_filter.c  |  5 +-
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.c |  6 +-
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_storage.h |  3 +
+ 4 files changed, 83 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+index 7f61ddead492..d74cad967100 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_ext_vlan.c
+@@ -17,6 +17,7 @@
+ #include <net/datapath_api.h>
+ #include <net/datapath_api_vlan.h>
+ #include <uapi/linux/tc_act/tc_vlan.h>
++#include <uapi/linux/icmpv6.h>
+ #include "pon_qos_tc_flower.h"
+ #include "pon_qos_tc_vlan_prepare.h"
+ #include "pon_qos_tc_vlan_storage.h"
+@@ -337,13 +338,15 @@ static void dp_vlan_list_update(struct net_device *dev,
+ 
+ static int dp_update(struct net_device *dev,
+ 		     struct dp_tc_vlan *dp_vlan,
+-		     bool ingress)
++		     bool ingress,
++		     bool mcc)
+ {
+ 	struct pon_qos_vlan_storage_node *p;
+ 
+ 	list_for_each_entry(p, &tc_ext_vlan_storage, list) {
+ 		if (dev == p->dev &&
+-		    ingress == p->ingress) {
++		    ingress == p->ingress &&
++		    mcc == p->mcc) {
+ 			dp_vlan_list_update(dev, dp_vlan, p);
+ 		}
+ 	}
+@@ -356,6 +359,57 @@ static int dp_update(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static int check_mld_type(struct net_device *dev,
++			  const struct tc_cls_flower_offload *f)
++{
++	struct flow_dissector_key_icmp *key = NULL;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_ICMP)) {
++		key = skb_flow_dissector_target(f->dissector,
++						FLOW_DISSECTOR_KEY_ICMP,
++						f->key);
++
++		switch (key->type) {
++		case ICMPV6_MGM_QUERY:
++		case ICMPV6_MGM_REPORT:
++		case ICMPV6_MGM_REDUCTION:
++		case ICMPV6_NI_REPLY:
++			netdev_dbg(dev, "MLD type: %u\n", key->type);
++			return 0;
++		default:
++			netdev_dbg(dev, "Invalid MLD type\n");
++			return -EIO;
++		}
++	}
++
++	netdev_dbg(dev, "Missing MLD type\n");
++	return -EIO;
++}
++
++static bool is_mcc(struct net_device *dev,
++		   const struct tc_cls_flower_offload *f)
++{
++	struct flow_dissector_key_basic *key = NULL;
++	struct flow_dissector *d = f->dissector;
++	int ret;
++
++	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_BASIC)) {
++		key = skb_flow_dissector_target(d, FLOW_DISSECTOR_KEY_BASIC,
++						f->key);
++
++		if (key->ip_proto == IPPROTO_IGMP)
++			return true;
++
++		if (key->ip_proto == IPPROTO_ICMPV6) {
++			ret = check_mld_type(dev, f);
++			if (ret == 0)
++				return true;
++		}
++	}
++
++	return false;
++}
++
+ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 			    struct tc_cls_flower_offload *f,
+ 			    bool ingress)
+@@ -363,8 +417,8 @@ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 	struct dp_tc_vlan dp_vlan = {0};
+ 	struct pon_qos_vlan_storage_node *node;
+ 	enum tc_flower_vlan_tag tag;
+-
+-	int err = 0;
++	bool mcc = is_mcc(dev, f);
++	int err;
+ 
+ 	netdev_dbg(dev, "Extended VLAN add start\n");
+ 
+@@ -374,10 +428,16 @@ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 
+ 	trace_ev_add_enter(dev, NULL, -1, -1, ingress);
+ 
+-	node = pon_qos_tc_vlan_storage_get(dev, ingress, tag,
++	if (mcc) {
++		dp_vlan.mcast_flag = DP_MULTICAST_SESSION;
++		netdev_dbg(dev, "Extended VLAN multicast control\n");
++	}
++
++	node = pon_qos_tc_vlan_storage_get(dev, ingress, tag, mcc,
+ 					   &tc_ext_vlan_storage);
+ 	if (!node) {
+-		err = pon_qos_tc_vlan_storage_crt(dev, ingress, tag, &node);
++		err = pon_qos_tc_vlan_storage_crt(dev, ingress, tag,
++						  mcc, &node);
+ 		if (err)
+ 			return err;
+ 		list_add(&node->list, &tc_ext_vlan_storage);
+@@ -409,7 +469,7 @@ int pon_qos_tc_ext_vlan_add(struct net_device *dev,
+ 	netdev_dbg(dev, "Extended VLAN rule added, storage: %p, ingress: %d, tag: %d, rule_cnt: %d\n",
+ 		   node, node->ingress, node->tag, node->rule_cnt);
+ 
+-	err = dp_update(dev, &dp_vlan, ingress);
++	err = dp_update(dev, &dp_vlan, ingress, mcc);
+ 
+ 	trace_ev_add_exit(dev, node, node->tag, node->rule_cnt, ingress);
+ 
+@@ -470,7 +530,7 @@ int pon_qos_tc_ext_vlan_del(struct net_device *dev,
+ 
+ 	pon_qos_tc_vlan_storage_del(dev, node);
+ 
+-	ret = dp_update(dev, &dp_vlan, ingress);
++	ret = dp_update(dev, &dp_vlan, ingress, node->mcc);
+ 
+ 	trace_ev_del_exit(dev, node, node->tag, node->rule_cnt, ingress);
+ 
+@@ -549,6 +609,10 @@ static void print_node(struct seq_file *file,
+ 		seq_printf(file, " unknown");
+ 		break;
+ 	}
++
++	if (p->mcc)
++		seq_printf(file, " mcc");
++
+ 	seq_printf(file, "\n");
+ 
+ 	if (p->tag == TC_VLAN_UNTAGGED) {
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
+index aa588f766de5..7fcff46c7c88 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
+@@ -195,10 +195,11 @@ int pon_qos_tc_vlan_filter_add(struct net_device *dev,
+ 	if (tag == TC_VLAN_UNKNOWN)
+ 		return -EIO;
+ 
+-	node = pon_qos_tc_vlan_storage_get(dev, ingress, tag,
++	node = pon_qos_tc_vlan_storage_get(dev, ingress, tag, false,
+ 					   &tc_vlan_filter_storage);
+ 	if (!node) {
+-		err = pon_qos_tc_vlan_storage_crt(dev, ingress, tag, &node);
++		err = pon_qos_tc_vlan_storage_crt(dev, ingress, tag,
++						  false, &node);
+ 		if (err)
+ 			return err;
+ 		list_add(&node->list, &tc_vlan_filter_storage);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
+index c5dc62dfd96e..caa295efa169 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.c
+@@ -16,6 +16,7 @@ struct pon_qos_vlan_storage_node
+ *pon_qos_tc_vlan_storage_get(struct net_device *dev,
+ 			     bool ingress,
+ 			     enum tc_flower_vlan_tag tag,
++			     bool mcc,
+ 			     struct list_head *head)
+ {
+ 	struct pon_qos_vlan_storage_node *p;
+@@ -23,7 +24,8 @@ struct pon_qos_vlan_storage_node
+ 	list_for_each_entry(p, head, list) {
+ 		if (dev == p->dev &&
+ 		    ingress == p->ingress &&
+-		    tag == p->tag) {
++		    tag == p->tag &&
++		    mcc == p->mcc) {
+ 			netdev_dbg(dev, "VLAN storage found: %p\n", p);
+ 			return p;
+ 		}
+@@ -36,6 +38,7 @@ struct pon_qos_vlan_storage_node
+ int pon_qos_tc_vlan_storage_crt(struct net_device *dev,
+ 				bool ingress,
+ 				enum tc_flower_vlan_tag tag,
++				bool mcc,
+ 				struct pon_qos_vlan_storage_node **node)
+ {
+ 	*node = kzalloc(sizeof(**node), GFP_KERNEL);
+@@ -47,6 +50,7 @@ int pon_qos_tc_vlan_storage_crt(struct net_device *dev,
+ 	(*node)->dev = dev;
+ 	(*node)->ingress = ingress;
+ 	(*node)->tag = tag;
++	(*node)->mcc = mcc;
+ 	INIT_LIST_HEAD(&(*node)->rules);
+ 
+ 	netdev_dbg(dev, "VLAN storage created: %p\n", *node);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+index 30c625427e58..911e7f8e96ca 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_storage.h
+@@ -71,6 +71,7 @@ struct pon_qos_vlan_storage_node {
+ 	enum tc_flower_vlan_tag tag;
+ 	struct list_head rules;
+ 	int rule_cnt;
++	bool mcc;
+ 	struct list_head list;
+ };
+ 
+@@ -78,11 +79,13 @@ struct pon_qos_vlan_storage_node
+ *pon_qos_tc_vlan_storage_get(struct net_device *dev,
+ 			     bool ingress,
+ 			     enum tc_flower_vlan_tag tag,
++			     bool mcc,
+ 			     struct list_head *head);
+ 
+ int pon_qos_tc_vlan_storage_crt(struct net_device *dev,
+ 				bool ingress,
+ 				enum tc_flower_vlan_tag tag,
++				bool mcc,
+ 				struct pon_qos_vlan_storage_node **node);
+ 
+ void pon_qos_tc_vlan_storage_del(struct net_device *dev,

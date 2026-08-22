@@ -1,0 +1,315 @@
+From c38bb0ff2caf2df9d0508a17b4f228b20edf6b23 Mon Sep 17 00:00:00 2001
+From: avishalo <avi1.shalom@intel.com>
+Date: Tue, 3 Mar 2020 10:45:01 +0200
+Subject: [PATCH] PONRTSYS-7025: Register PPV4 to power manager
+
+Signed-off-by: avishalo <avi1.shalom@intel.com>
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          | 65 +++++++++++++++++++++-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.h          |  4 ++
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c  | 58 ++++++++++++++++++-
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h | 24 ++++++++
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  |  4 +-
+ include/linux/pp_api.h                             | 11 ----
+ 6 files changed, 152 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 34f96c5f4197..22fa991463b0 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -15,6 +15,7 @@
+ #ifdef CONFIG_PPV4_LGM
+ #include <linux/skb_extension.h>
+ #include <linux/learning_layer_api.h>
++#include <linux/platform_data/intel_epu.h>
+ #endif
+ #include <linux/pp_qos_api.h>
+ #include <linux/pp_api.h>
+@@ -53,6 +54,9 @@ struct pp_misc_db {
+ 
+ 	/*! max prints for brief command */
+ 	u32 dbg_print_cnt;
++
++	/*! Ingore clock freq' updates */
++	u32 dbg_ignore_clock_freq_updates;
+ };
+ 
+ static inline void __desc_free(skb_cookie c);
+@@ -60,6 +64,10 @@ static inline void __desc_free(skb_cookie c);
+ /* Driver Database */
+ static struct pp_misc_db *db;
+ 
++static int pm_notifier(struct notifier_block *nb, unsigned long e, void *data);
++
++static struct notifier_block nb = { .notifier_call =  pm_notifier};
++
+ s32 misc_stats_get(struct misc_stats *stats)
+ {
+ 	atomic_t *db_cnt, *cnt;
+@@ -1177,6 +1185,18 @@ s32 pp_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 	return 0;
+ }
+ 
++#ifdef CONFIG_DEBUG_FS
++u32 ignore_clk_updates_get(void)
++{
++	return db->dbg_ignore_clock_freq_updates;
++}
++
++void ignore_clk_updates_set(u32 ignore_updates)
++{
++	db->dbg_ignore_clock_freq_updates = ignore_updates;
++}
++#endif
++
+ /**
+  * @brief PP SKB cookie destructor
+  * @param c skb cookie to free
+@@ -1218,7 +1238,46 @@ static s32 __pp_misc_db_init(struct pp_misc_init_param *init_param)
+ 	}
+ 
+ 	db->hw_clk = init_param->hw_clk;
++	/* Limit max printout to 10 lines by default */
+ 	db->dbg_print_cnt = 10;
++	/* Do not ignore updates by default */
++	db->dbg_ignore_clock_freq_updates = 0;
++	return 0;
++}
++
++static u32 convert_event_to_hw_clk(unsigned long e)
++{
++	if (e == EPU_ADP_DFS_LVL_H)
++		return HIGH_CLOCK;
++	else if (e == EPU_ADP_DFS_LVL_M)
++		return MED_CLOCK;
++	else if (e == EPU_ADP_DFS_LVL_L)
++		return LOW_CLOCK;
++
++	pr_err("Invalid event received [%lu]\n", e);
++	return HIGH_CLOCK;
++}
++
++/**
++ * @brief Called to update upon clock freq' changes
++ * @param nb notifier block
++ * @param e new clock EPU_ADP_DFS_LVL_H | EPU_ADP_DFS_LVL_M | EPU_ADP_DFS_LVL_L
++ * @param data not relevant
++ * @return s32
++ */
++static int pm_notifier(struct notifier_block *nb, unsigned long e, void *data)
++{
++	u32 hw_clk;
++
++	/* in case we would like to ignore updates, then just return */
++	if (db->dbg_ignore_clock_freq_updates) {
++		pr_info("DBG: PPv4 driver ignores clock freq update\n");
++		return 0;
++	}
++
++	hw_clk = convert_event_to_hw_clk(e);
++	if (pp_hw_clock_freq_set(hw_clk))
++		pr_err("Failed to run pp_hw_clock_freq_set(%u)\n", hw_clk);
+ 	return 0;
+ }
+ #endif /* CONFIG_PPV4_LGM */
+@@ -1259,7 +1318,10 @@ s32 pp_misc_init(struct pp_misc_init_param *init_param)
+ 		pr_err("Failed to init sysfs stuff, ret %d\n", ret);
+ 		return ret;
+ 	}
+-	pr_debug("done\n");
++
++	ret = epu_adp_lvl_notitfy_register(&nb);
++	if (unlikely(ret))
++		pr_err("Failed to epu_adp_lvl_notitfy_register\n");
+ 
+ #endif /* CONFIG_PPV4_LGM */
+ 
+@@ -1290,6 +1352,7 @@ void pp_misc_exit(void)
+ 		kfree(db);
+ 		db = NULL;
+ 	}
++	epu_adp_lvl_notitfy_unregister(&nb);
+ #endif
+ 
+ 	pr_debug("done\n");
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+index ff34b28c41e4..31df7ee7082b 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+@@ -56,6 +56,10 @@ struct misc_stats {
+ };
+ 
+ #ifdef CONFIG_PPV4_LGM
++#define HIGH_CLOCK 600
++#define MED_CLOCK  300
++#define LOW_CLOCK  150
++
+ struct pp_driver_stats {
+ 	struct pmgr_stats    pmgr_stats;
+ 	struct smgr_stats    smgr_stats;
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
+index 516af36643ec..6dee17837f20 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_debugfs.c
+@@ -330,6 +330,60 @@ void __pp_rxdma_desc_show(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(rxdma_desc, __pp_rxdma_desc_show, NULL);
+ 
++void __pp_clk_freq_status_show(struct seq_file *f)
++{
++	u32 dbg_ignore_updates;
++
++	dbg_ignore_updates = ignore_clk_updates_get();
++	if (dbg_ignore_updates)
++		seq_puts(f, "Listen to clk freq updates is disabled\n");
++	else
++		seq_puts(f, "Listen to clk freq updates is enabled\n");
++}
++
++void __pp_clk_freq_status_set(char *cmd_buf, void *data)
++{
++	u32 dbg_ignore_updates;
++
++	if (kstrtou32(cmd_buf, 10, &dbg_ignore_updates))
++		pr_info("failed to parse '%s'\n", cmd_buf);
++
++	if (dbg_ignore_updates != 0 && dbg_ignore_updates != 1) {
++		pr_info("/sys/kernel/debug/pp/misc/ignore_clk_updates help:\n");
++		pr_info("echo 0 > /sys/kernel/debug/pp/misc/ignore_clk_updates : Allow updates to be processed by PPv4 driver\n");
++		pr_info("echo 1 > /sys/kernel/debug/pp/misc/ignore_clk_updates : Ignore updates from being processed by PPv4 driver\n");
++		return;
++	}
++
++	ignore_clk_updates_set(dbg_ignore_updates);
++}
++
++PP_DEFINE_DEBUGFS(ignore_clk_updates, __pp_clk_freq_status_show,
++		  __pp_clk_freq_status_set);
++
++void __free_running_ctr_show(struct seq_file *f)
++{
++	unsigned long addr;
++	void *virt;
++	u32  val = 0;
++
++	addr = 0xF1050438;
++	virt = pp_phys_to_virt(addr);
++	if (virt) {
++		val = PP_REG_RD32(virt);
++	} else {
++		virt = ioremap(addr, 4);
++		if (virt) {
++			val = PP_REG_RD32(virt);
++			iounmap(virt);
++		}
++	}
++
++	seq_printf(f, "Free Running Counter: %u\n", val);
++}
++
++PP_DEFINE_DEBUGFS(free_running_ctr, __free_running_ctr_show, NULL);
++
+ /**
+  * @brief Set PP driver hw clock frequency
+  */
+@@ -507,7 +561,9 @@ PP_DEFINE_DEBUGFS(nf, __dbg_nf_get, __dbg_nf_set);
+ static struct debugfs_file files[] = {
+ 	{"clock",     &PP_DEBUGFS_FOPS(clock)},
+ 	{"desc_show", &PP_DEBUGFS_FOPS(desc)},
++	{"free_running_ctr", &PP_DEBUGFS_FOPS(free_running_ctr)},
+ 	{"nf",        &PP_DEBUGFS_FOPS(nf)},
++	{"ignore_clk_updates", &PP_DEBUGFS_FOPS(ignore_clk_updates)},
+ };
+ 
+ /**
+@@ -529,7 +585,7 @@ static struct debugfs_file drv_files[] = {
+ static struct debugfs_file hal_files[] = {
+ 	{"read",    &PP_DEBUGFS_FOPS(regs_rd)},
+ 	{"write32", &PP_DEBUGFS_FOPS(regs_wr)},
+-#if IS_ENABLED(CONFIG_PPV4_LGM)
++#if IS_ENABLED(CONFIG_PPV4_LGM)	
+ 	{"global",          &PP_DEBUGFS_FOPS(hal_global)},
+ 	{"pps",             &PP_DEBUGFS_FOPS(hal_pps)},
+ 	{"resources",       &PP_DEBUGFS_FOPS(resources)},
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h
+index 8dcdf4ea6908..5f6d3c15fece 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc_internal.h
+@@ -102,6 +102,17 @@ s32 pp_misc_sysfs_init(struct kobject *parent);
+  */
+ void pp_misc_sysfs_clean(void);
+ 
++/**
++ * @brief Set PP hw clock frequency
++ *        this doesn't change the actual HW clock frequency but
++ *        only update the PP driver and HW configurations.
++ *        e.g. TBM, QoS etc...
++ * @note in case new clock cannot be set, the old clock will be kept
++ * @param clk_MHz new HW clock frequency in mega HZ
++ * @return s32 on on success, error code otherwise
++ */
++s32 pp_hw_clock_freq_set(u32 clk_MHz);
++
+ #ifdef CONFIG_DEBUG_FS
+ /**
+  * @brief misc debug init
+@@ -115,6 +126,19 @@ s32 pp_misc_dbg_init(struct pp_misc_init_param *init_param);
+  * @return s32
+  */
+ s32 pp_misc_dbg_clean(void);
++
++/**
++ * @brief Get the status of ignore updates 
++ * @return 1 for ignoring, 0 for listen to notification
++ */
++u32 ignore_clk_updates_get(void);
++
++/**
++ * @brief Set whether to listen or ignore clk freq updates
++ * @param ignore_updates new configuration for ignoring or not
++ * @return none
++ */
++void ignore_clk_updates_set(u32 ignore_updates);
+ #else
+ static inline s32 pp_misc_dbg_init(struct pp_misc_init_param *init_param)
+ {
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index 36d9ad12eece..a62e61befc70 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -2075,11 +2075,13 @@ void qos_pools_clean(struct pp_qos_dev *qdev)
+ s32 qos_dev_init_db(struct pp_qos_dev *qdev, u32 max_ports, u32 max_queues,
+ 		    u32 reserved_queues, u32 num_syncqs)
+ {
+-	u32 i;
++	u32 i, id;
+ 
+ 	QOS_LOG_DEBUG("\n");
+ 
++	id = qdev->id;
+ 	memset(qdev, 0, sizeof(struct pp_qos_dev));
++	qdev->id = id;
+ 	qdev->init_params.max_ports = max_ports;
+ 
+ 	QOS_LOCK_INIT(qdev);
+diff --git a/include/linux/pp_api.h b/include/linux/pp_api.h
+index ab18d6f78d5a..7ed97e15ed96 100755
+--- a/include/linux/pp_api.h
++++ b/include/linux/pp_api.h
+@@ -1296,15 +1296,4 @@ s32 pp_port_flush(u16 port_id, struct pp_request *req);
+  * @return s32 return 0 for success
+  */
+ s32 pp_session_dst_queue_update(u32 id, u16 dst_q);
+-
+-/**
+- * @brief Set PP hw clock frequency
+- *        this doesn't change the actual HW clock frequency but
+- *        only update the PP driver and HW configurations.
+- *        e.g. TBM, QoS etc...
+- * 7@note in case new clock cannot be set, the old clock will be kept
+- * @param clk_MHz new HW clock frequency in mega HZ
+- * @return s32 on on success, error code otherwise
+- */
+-s32 pp_hw_clock_freq_set(u32 clk_MHz);
+ #endif /* __PP_API_H__ */
+\ No newline at end of file

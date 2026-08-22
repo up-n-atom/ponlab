@@ -1,0 +1,278 @@
+From 2f7d225957388c33bcd155bd72a46375e9511b67 Mon Sep 17 00:00:00 2001
+From: "Druzga, LukaszX" <lukaszx.druzga@intel.com>
+Date: Mon, 7 Dec 2020 09:13:05 +0100
+Subject: [PATCH] PONRTSYS-8310: cnts for pmapper show only packets for one gem
+ port
+
+Read counters values from the bridge port for pmapper instead of reading from single gem.
+Unregister pmappers from mib_counters module in proper way.
+---
+ drivers/net/datapath/dpm/datapath_api.c            | 18 +++++
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 77 ++++++++++++++++++++--
+ .../net/datapath/pon_qos/pon_qos_tc_vlan_filter.c  | 19 +-----
+ include/net/datapath_api.h                         |  6 ++
+ 4 files changed, 96 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index a7ca85e59d1b..3b68f48f63ca 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -1709,6 +1709,24 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ }
+ EXPORT_SYMBOL(dp_get_netif_subifid);
+ 
++bool dp_is_pmapper_check(struct net_device *dev)
++{
++	dp_subif_t subif = {0};
++	int ret;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "can not get subif\n");
++		return false;
++	}
++
++	if (subif.flag_pmapper)
++		return true;
++
++	return false;
++}
++EXPORT_SYMBOL(dp_is_pmapper_check);
++
+ /*Note:
+  * try to get subif according to netif, skb,vcc,dst_mac.
+  * For DLS nas interface, must provide valid subif_data, otherwise set to NULL.
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+index 2f4eaebf7474..2df57953c920 100644
+--- a/drivers/net/datapath/mib_counters/dp_mib_counters.c
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -134,6 +134,10 @@ struct mib_counters {
+ 	struct last_counters last;
+ 	/** stored 64 bits wide counters */
+ 	struct mib_counters_u64 wide_cntrs;
++	/** bridge port id */
++	u16 br_port_id;
++	/** indicates if related device is a pmapper */
++	bool is_pmapper;
+ };
+ 
+ struct work_list_el {
+@@ -177,6 +181,26 @@ static u64 wraparound(u64 curr, u64 last, u32 size)
+ 	return ((u64)WRAPAROUND_MAX_32) + curr - last;
+ }
+ 
++static s16 get_bridge_port_id(struct net_device *dev)
++{
++	dp_subif_t subif = {0};
++	int ret;
++
++	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0);
++	if (ret != DP_SUCCESS) {
++		netdev_err(dev, "can not get subif\n");
++		return -1;
++	}
++
++	if (subif.bport >= DP_MAX_BP_NUM) {
++		pr_err("BP port(%d) out of range %d\n",
++			subif.bport, DP_MAX_BP_NUM);
++		return -1;
++	}
++
++	return subif.bport;
++}
++
+ /* Update counters for one device */
+ static void update_dev_counters(struct mib_counters *cnt, u8 initial_update)
+ {
+@@ -190,6 +214,11 @@ static void update_dev_counters(struct mib_counters *cnt, u8 initial_update)
+ 	s64 qos_drop_pkts = 0;
+ 	s32 ret = 0;
+ 	u8 i = 0;
++	u16 port_id = 0;
++	GSW_portType_t port_type = GSW_CTP_PORT;
++
++	if (!cnt)
++		return;
+ 
+ 	tmp_counters = devm_kzalloc(&g_dp_dev->dev,
+ 				    (2 * sizeof(GSW_RMON_Port_cnt_t)),
+@@ -203,10 +232,18 @@ static void update_dev_counters(struct mib_counters *cnt, u8 initial_update)
+ 		 "MIB CNT - update counters for dev: %s, port_id: %d, sub_if_id_grp: %d\n",
+ 		 cnt->dev->name, cnt->port_id, cnt->sub_if_id_grp);
+ 
++	if (cnt->is_pmapper) {
++		port_type = GSW_BRIDGE_PORT;
++		port_id = cnt->br_port_id;
++		DP_DEBUG(DP_DBG_FLAG_MIB, "MIB CNT - use BP: %d\n", port_id);
++	} else {
++		port_id = cnt->port_id;
++	}
++
+ 	/* read current counters' values */
+ 	for (i = 0; i < 2; i++) {
+-		tmp_counters[i].ePortType = GSW_CTP_PORT;
+-		tmp_counters[i].nPortId = cnt->port_id;
++		tmp_counters[i].ePortType = port_type;
++		tmp_counters[i].nPortId = port_id;
+ 		tmp_counters[i].nSubIfIdGroup = cnt->sub_if_id_grp;
+ 		tmp_counters[i].bPceBypass = i;
+ 
+@@ -426,6 +463,7 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	struct mib_counters *dev_cnt;
+ 	struct pmac_port_info *port_info;
+ 	s32 sub_if_id_grp;
++	s16 bridge_port_id;
+ 
+ 	if ((!dev) || (port_id < 0) || (port_id > MAX_PORT)) {
+ 		pr_err("MIB CNT ERROR - WRONG data passed to %s: port_id %d, dev <%p>, dev->name %s\n",
+@@ -443,6 +481,14 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 		return -EINVAL;
+ 	}
+ 
++	bridge_port_id = get_bridge_port_id(dev);
++
++	if (bridge_port_id < 0) {
++		pr_err("MIB CNT ERROR - WRONG data passed to %s: port_id %d, sub_if %d, dev %s - bridge_port_id %d !\n",
++		       __func__, port_id, sub_if, dev->name, bridge_port_id);
++		return -EINVAL;
++	}
++
+ 	dev_cnt = devm_kzalloc(&g_dp_dev->dev,
+ 			       sizeof(struct mib_counters),
+ 			       GFP_ATOMIC);
+@@ -453,6 +499,8 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	dev_cnt->dev = dev;
+ 	dev_cnt->port_id = port_id;
+ 	dev_cnt->sub_if_id_grp = sub_if_id_grp;
++	dev_cnt->br_port_id = bridge_port_id;
++	dev_cnt->is_pmapper = dp_is_pmapper_check(dev);
+ 	/* check if given net dev is on UNI side of bridge */
+ 	dev_cnt->dev_is_uni = (port_info->alloc_flags & DP_F_FAST_ETH_LAN) ||
+ 		(port_info->alloc_flags & DP_F_FAST_ETH_WAN);
+@@ -480,6 +528,8 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	struct mib_counters *mib_cnt;
+ 	struct list_head *p, *q;
+ 	s32 sub_if_id_grp;
++	u32 removed_num = 0;
++	bool is_pmapper = false;
+ 
+ 	if ((!dev) || (port_id < 0) || (port_id > MAX_PORT)) {
+ 		pr_err("MIB CNT ERROR - WRONG data passed to %s: port_id %d, dev <%p>, dev->name %s\n",
+@@ -501,14 +551,18 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 		 "MIB CNT - looking for item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d\n",
+ 		 dev->name, port_id, sub_if, inst);
+ 
++	is_pmapper = dp_is_pmapper_check(dev);
++
+ 	write_lock(&dev_list_lock);
+ 	list_for_each_safe(p, q, &registered_devices_list) {
+ 		mib_cnt = list_entry(p, struct mib_counters, dev_list);
+ 
+ 		if ((mib_cnt->port_id == port_id) &&
+-		    (mib_cnt->sub_if_id_grp == sub_if_id_grp) &&
++		    (mib_cnt->sub_if_id_grp == sub_if_id_grp ||
++		     (is_pmapper &&
++		      (mib_cnt->br_port_id == get_bridge_port_id(dev)))) &&
+ 		    (mib_cnt->inst == inst) &&
+-		    (!strcmp(mib_cnt->dev->name, dev->name))) {
++		    (mib_cnt->dev == dev)) {
+ 			DP_DEBUG(DP_DBG_FLAG_MIB,
+ 				 "MIB CNT - list item: name = %s, port_id = %d, sub_if_id_grp = %d, inst = %d - removed\n",
+ 				 mib_cnt->dev->name,
+@@ -517,6 +571,7 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 				 mib_cnt->inst);
+ 			list_del(p);
+ 			devm_kfree(&g_dp_dev->dev, mib_cnt);
++			removed_num++;
+ 		} else {
+ 			DP_DEBUG(DP_DBG_FLAG_MIB,
+ 				 "MIB CNT - list item: name = %s, port_id = %d, sub_if_id_grp = %d, inst = %d - doesn't match\n",
+@@ -528,6 +583,11 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	}
+ 	write_unlock(&dev_list_lock);
+ 
++	if (removed_num != 1) {
++		pr_err("MIB CNT - item found %d times: name = %s, port_id = %d, sub_if = %d, inst = %d\n",
++			removed_num, dev->name, port_id, sub_if, inst);
++	}
++
+ 	return 0;
+ }
+ 
+@@ -537,15 +597,20 @@ struct mib_counters *find_registered_dev(s32 port_id, s32 sub_if_id_grp,
+ {
+ 	struct mib_counters *mib_cnt;
+ 	struct list_head *p;
++	bool is_pmapper;
++
++	is_pmapper = dp_is_pmapper_check(dev);
+ 
+ 	read_lock(&dev_list_lock);
+ 	list_for_each(p, &registered_devices_list)
+ 	{
+ 		mib_cnt = list_entry(p, struct mib_counters, dev_list);
+ 		if ((mib_cnt->port_id == port_id) &&
+-		    (mib_cnt->sub_if_id_grp == sub_if_id_grp) &&
++		    (mib_cnt->sub_if_id_grp == sub_if_id_grp ||
++		     (is_pmapper &&
++		      (mib_cnt->br_port_id == get_bridge_port_id(dev)))) &&
+ 		    (mib_cnt->inst == inst) &&
+-		    (!strcmp(mib_cnt->dev->name, dev->name))) {
++		    (mib_cnt->dev == dev)) {
+ 			read_unlock(&dev_list_lock);
+ 			return mib_cnt;
+ 		}
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
+index c0d8a2a39793..b24b7982284a 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_vlan_filter.c
+@@ -275,23 +275,6 @@ int pon_qos_tc_vlan_filter_del(struct net_device *dev,
+ 	return dp_update(dev, &dp_vlan, ingress);
+ }
+ 
+-static bool pon_qos_tc_is_pmapper_check(struct net_device *dev)
+-{
+-	dp_subif_t subif = {0};
+-	int ret;
+-
+-	ret = dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0);
+-	if (ret != DP_SUCCESS) {
+-		netdev_err(dev, "can not get subif\n");
+-		return false;
+-	}
+-
+-	if (subif.flag_pmapper)
+-		return true;
+-
+-	return false;
+-}
+-
+ static bool pon_qos_tc_lookup_by_cvid(struct pon_qos_vlan_storage_node *node,
+ 				      int cvid)
+ {
+@@ -328,7 +311,7 @@ static struct net_device *pon_qos_tc_search_pmapper_on_list(int cvid,
+ 	list_for_each_entry(p, storage, list) {
+ 		rtnl_lock();
+ 		if (p->ingress == ingress &&
+-		    pon_qos_tc_is_pmapper_check(p->dev)) {
++		    dp_is_pmapper_check(p->dev)) {
+ 			if (pon_qos_tc_lookup_by_cvid(p, cvid)) {
+ 				rtnl_unlock();
+ 				return p->dev;
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index 108684c9a915..2b1ddd7ee35e 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -1556,6 +1556,12 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ 			     void *subif_data, uint8_t dst_mac[DP_MAX_ETH_ALEN],
+ 			     dp_subif_t *subif, uint32_t flags);
+ 
++/*! @brief  Check if given interface is a pmapper
++ *@param[in] dev  pointer to stack network interface structure
++ *@return true if the interface is a pmapper; false otherwise
++ */
++bool dp_is_pmapper_check(struct net_device *dev);
++
+ /*! @brief  The API is for CBM to send received packets(skb) to dp lib. Datapath
+  *	lib will do basic packet parsing and forwards it to related drivers,\n
+  *	like ethernet driver, wifi and lte and so on. Noted.

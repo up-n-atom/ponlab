@@ -1,0 +1,386 @@
+From 4e618992e8c4d4316ec5d93e291eeef740135abd Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Tue, 10 Mar 2020 16:00:40 +0800
+Subject: [PATCH] DRV_DPM_SW-186: Register Notification triggered too early
+ bugfix
+
+---
+ drivers/net/datapath/dpm/datapath.h          |   3 +
+ drivers/net/datapath/dpm/datapath_api.c      | 117 ++++++---------------------
+ drivers/net/datapath/dpm/datapath_misc.c     |  14 +++-
+ drivers/net/datapath/dpm/datapath_notifier.c |  40 +++++++++
+ 4 files changed, 82 insertions(+), 92 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 6f35b6db032f..d322865724dd 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -1082,6 +1082,9 @@ static inline bool is_dsl(struct pmac_port_info *port)
+ 	return (port->alloc_flags & DP_F_FAST_DSL);
+ }
+ 
++int dp_notifier_invoke(int inst,
++		       struct net_device *dev, u32 port_id, enum DP_EVENT_TYPE type);
++
+ int dp_dealloc_cqm_port(struct module *owner, u32 dev_port,
+ 			struct pmac_port_info *port,
+ 			struct cbm_dp_alloc_data *data, u32 flags);
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index 647517b4f2c2..adecebe1cb70 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -349,7 +349,6 @@ static int32_t dp_alloc_port_private(int inst,
+ 	int i;
+ 	struct cbm_dp_alloc_data cbm_data = {0};
+ 	struct pmac_port_info *port;
+-	struct dp_evt_notif_data notif_data;
+ 	struct inst_info *dp_info = get_dp_prop_info(inst);
+ 
+ 	if (!owner) {
+@@ -370,10 +369,7 @@ static int32_t dp_alloc_port_private(int inst,
+ 		DP_DEBUG(DP_DBG_FLAG_REG, "\n");
+ 	}
+ #endif
+-	notif_data.inst = inst;
+-	notif_data.dev = dev;
+-	notif_data.mod = owner;
+-	notif_data.dev_port = dev_port;
++
+ 	cbm_data.dp_inst = inst;
+ 	cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+ 	port = get_dp_port_info(inst, port_id);
+@@ -385,9 +381,9 @@ static int32_t dp_alloc_port_private(int inst,
+ 			return DP_FAILURE;
+ 		}
+ 
+-		atomic_notifier_call_chain(&dp_evt_notif_list,
+-					   DP_EVENT_DE_ALLOC_PORT,
+-					   &notif_data);
++		dp_notifier_invoke(inst, dev, port_id,
++				   DP_EVENT_DE_ALLOC_PORT);
++
+ 		cbm_data.deq_port = port->deq_port_base;
+ 		cbm_data.dma_chan = port->dma_chan;
+ 		cbm_dp_port_dealloc(owner, dev_port, port_id,
+@@ -512,9 +508,7 @@ static int32_t dp_alloc_port_private(int inst,
+ 		 "Port %d allocation succeed for module %s with dev_port %d\n",
+ 		 port_id, owner->name, dev_port);
+ 
+-	atomic_notifier_call_chain(&dp_evt_notif_list,
+-				   DP_EVENT_ALLOC_PORT,
+-				   &notif_data);
++	dp_notifier_invoke(inst, dev, port_id, DP_EVENT_ALLOC_PORT);
+ 
+ 	return port_id;
+ }
+@@ -568,13 +562,11 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 				  struct dp_subif_data *data, u32 flags)
+ {
+ 	int res = DP_FAILURE;
+-
+ 	int i, port_id, start, end, j;
+ 	struct pmac_port_info *port_info;
+ 	struct cbm_dp_en_data cbm_data = {0};
+ 	struct subif_platform_data platfrm_data = {0};
+ 	struct dp_subif_info *sif;
+-	struct dp_evt_notif_data notif_data;
+ 	u32 cqm_deq_port;
+ 	u32 dma_ch_offset;
+ 	u32 dma_ch_ref, dma_ch_ref_curr;
+@@ -643,7 +635,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 		 */
+ 		if (port_info->status) {
+ 			if (dp_port_prop[inst].info.subif_platform_set(
+-				inst, port_id, i, &platfrm_data, flags)) {
++				    inst, port_id, i, &platfrm_data, flags)) {
+ 				pr_err("subif_platform_set fail\n");
+ 				goto EXIT;
+ 			} else {
+@@ -696,7 +688,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 			cbm_data.num_dma_chan = port_info->num_dma_chan;
+ 			cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+ 			cbm_data.deq_port = port_info->deq_port_base +
+-						data->deq_port_idx;
++					    data->deq_port_idx;
+ 			if ((cbm_data.deq_port == 0) ||
+ 			    (cbm_data.deq_port >= DP_MAX_CQM_DEQ)) {
+ 				pr_err("Wrong deq_port: %d\n",
+@@ -755,24 +747,6 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 	if (i < end) {
+ 		res = DP_SUCCESS;
+ 
+-		notif_data.inst = inst;
+-		notif_data.dpid = subif_id->port_id;
+-		notif_data.subif = subif_id->subif;
+-
+-		if (get_dp_bp_info(inst, sif->bp)->ref_cnt <= 1) {
+-			notif_data.dev = dev;
+-			atomic_notifier_call_chain(&dp_evt_notif_list,
+-						   DP_EVENT_REGISTER_SUBIF,
+-						   &notif_data);
+-		}
+-
+-		if (data->ctp_dev) {
+-			notif_data.dev = data->ctp_dev;
+-			atomic_notifier_call_chain(&dp_evt_notif_list,
+-						   DP_EVENT_REGISTER_SUBIF,
+-						   &notif_data);
+-		}
+-
+ 		if (get_dp_bp_info(inst, sif->bp)->ref_cnt > 1)
+ 			return res;
+ 		dp_inst_add_dev(dev, subif_name,
+@@ -801,7 +775,6 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	struct cbm_dp_en_data cbm_data = {0};
+ 	struct subif_platform_data platfrm_data = {0};
+ 	struct dp_subif_info *sif;
+-	struct dp_evt_notif_data notif_data;
+ 	u32 dma_ch_offset, dma_ch_ref;
+ 	struct inst_info *dp_info = get_dp_prop_info(inst);
+ 	struct dp_node_alloc port_node;
+@@ -856,16 +829,9 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	}
+ 	bp = sif->bp;
+ 
+-	if (sif->ctp_dev) {
+-		notif_data.inst = inst;
+-		notif_data.dev = sif->ctp_dev;
+-		notif_data.dpid = subif_id->port_id;
+-		notif_data.subif = subif_id->subif;
+-
+-		atomic_notifier_call_chain(&dp_evt_notif_list,
+-					   DP_EVENT_DE_REGISTER_SUBIF,
+-					   &notif_data);
+-	}
++	if (sif->ctp_dev)
++		dp_notifier_invoke(inst, sif->ctp_dev, port_id,
++				   DP_EVENT_DE_REGISTER_SUBIF);
+ 
+ 	/* reset mib, flag, and others */
+ 	memset(&sif->mib, 0, sizeof(sif->mib));
+@@ -925,14 +891,8 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 		dp_inst_del_dev(dev, subif_name, inst, port_id,
+ 				subif_id->subif, 0);
+ 
+-		notif_data.inst = inst;
+-		notif_data.dev = dev;
+-		notif_data.dpid = subif_id->port_id;
+-		notif_data.subif = subif_id->subif;
+-
+-		atomic_notifier_call_chain(&dp_evt_notif_list,
+-					   DP_EVENT_DE_REGISTER_SUBIF,
+-					   &notif_data);
++		dp_notifier_invoke(inst, dev, port_id,
++				   DP_EVENT_DE_REGISTER_SUBIF);
+ 	}
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_REG, "  dp_port=%d subif=%d cqm_port=%d\n",
+@@ -1002,7 +962,6 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 	int vap, bp = 0, fid = 0, res = DP_FAILURE;
+ 	int f_new_subif = -1, f_old_subif = -1, f_rem_old_dev = 0;
+ 	struct net_device *old_dev, *old_ctp_dev;
+-	struct dp_evt_notif_data notif_data;
+ 	struct bp_pmapper_dev *bp_info;
+ 	dp_subif_t *new_subif_id_sync, *old_subif_id_sync;
+ 	dp_get_netif_subifid_fn_t subifid_fn = NULL;
+@@ -1017,9 +976,7 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 		pr_err("dp_update_subif failed, info->new_dev NULL\n");
+ 		return res;
+ 	}
+-	notif_data.inst = info->inst;
+-	notif_data.dpid = info->dp_port;
+-	notif_data.subif = info->subif;
++
+ 	port_info = get_dp_port_info(info->inst, info->dp_port);
+ 	vap = GET_VAP(info->subif, port_info->vap_offset,
+ 		      port_info->vap_mask);
+@@ -1059,17 +1016,6 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 				bp_info->dev = info->new_dev;
+ 				bp_info->ref_cnt = 1;
+ 				bp_info->flag = 1;
+-				notif_data.dev = info->new_dev;
+-				atomic_notifier_call_chain(
+-					&dp_evt_notif_list,
+-					DP_EVENT_REGISTER_SUBIF,
+-					&notif_data);
+-				/* call notifier for ctp_dev */
+-				notif_data.dev = info->new_ctp_dev;
+-				atomic_notifier_call_chain(
+-					&dp_evt_notif_list,
+-					DP_EVENT_REGISTER_SUBIF,
+-					&notif_data);
+ 			}
+ 			dp_inst_add_dev(info->new_dev, NULL, info->inst,
+ 					info->dp_port, bp, vap, 0);
+@@ -1087,11 +1033,7 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 			}
+ 			if (info->new_ctp_dev) {
+ 				bp_info->ref_cnt++;
+-				notif_data.dev = info->new_ctp_dev;
+-				atomic_notifier_call_chain(
+-					&dp_evt_notif_list,
+-					DP_EVENT_REGISTER_SUBIF,
+-					&notif_data);
++
+ 				DP_DEBUG(DP_DBG_FLAG_REG,
+ 					 "update bp refcnt:%d\n",
+ 					 bp_info->ref_cnt);
+@@ -1116,10 +1058,9 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 			}
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+ 				 "reduce old bp refcnt:%d\n", bp_info->ref_cnt);
+-			notif_data.dev = old_ctp_dev;
+-			atomic_notifier_call_chain(&dp_evt_notif_list,
+-						   DP_EVENT_DE_REGISTER_SUBIF,
+-						   &notif_data);
++			dp_notifier_invoke(info->inst,
++					   old_ctp_dev, info->dp_port,
++					   DP_EVENT_DE_REGISTER_SUBIF);
+ 		}
+ 		/* added to make the subif_sync info similar to de-register
+ 		 * subif to force update rcu link list for old_dev/old_ctp_dev
+@@ -1135,10 +1076,9 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 			 old_dev->name);
+ 		dp_inst_del_dev(old_dev, NULL, info->inst, info->dp_port,
+ 				vap, 0);
+-		notif_data.dev = old_dev;
+-		atomic_notifier_call_chain(&dp_evt_notif_list,
+-					   DP_EVENT_DE_REGISTER_SUBIF,
+-					   &notif_data);
++
++		dp_notifier_invoke(info->inst, old_dev, info->dp_port,
++				   DP_EVENT_DE_REGISTER_SUBIF);
+ 		dp_free_bp_priv(info->inst, sif->bp);
+ 	}
+ 	/* collect old subif info to update rcu list */
+@@ -1336,7 +1276,6 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 	struct pmac_port_info *port_info;
+ 	struct dp_dev_data tmp_data = {0};
+ 	struct cbm_dp_alloc_complete_data *cbm_data = NULL;
+-	struct dp_evt_notif_data notif_data;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("dp_register_dev failed for datapath not init yet\n");
+@@ -1355,11 +1294,6 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 
+ 	port_info = get_dp_port_info(inst, port_id);
+ 
+-	notif_data.inst = inst;
+-	notif_data.dev = port_info->dev;
+-	notif_data.dpid = port_info->port_id;
+-	notif_data.mod = port_info->owner;
+-
+ 	DP_LIB_LOCK(&dp_lock);
+ 	if (flags & DP_F_DEREGISTER) {	/*de-register */
+ 		if (port_info->status != PORT_DEV_REGISTERED) {
+@@ -1367,9 +1301,10 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 				 "No or %s to de-register for num_subif=%d\n",
+ 				 owner->name, port_info->num_subif);
+ 		} else if (port_info->status == PORT_DEV_REGISTERED) {
+-			atomic_notifier_call_chain(&dp_evt_notif_list,
+-						   DP_EVENT_DE_REGISTER_DEV,
+-						   &notif_data);
++
++			dp_notifier_invoke(inst, port_info->dev, port_id,
++					   DP_EVENT_DE_REGISTER_DEV);
++
+ 			port_info->status = PORT_ALLOCATED;
+ 			DP_CB(inst, dev_platform_set)(inst, port_id, data,
+ 						      flags);
+@@ -1444,8 +1379,8 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 	if (dp_cb)
+ 		port_info->cb = *dp_cb;
+ 
+-	atomic_notifier_call_chain(&dp_evt_notif_list, DP_EVENT_REGISTER_DEV,
+-				   &notif_data);
++	dp_notifier_invoke(inst, port_info->dev, port_id,
++			   DP_EVENT_REGISTER_DEV);
+ 
+ 	DP_LIB_UNLOCK(&dp_lock);
+ 	devm_kfree(&g_dp_dev->dev, cbm_data);
+diff --git a/drivers/net/datapath/dpm/datapath_misc.c b/drivers/net/datapath/dpm/datapath_misc.c
+index 6d52c9f95046..1ba13a88c76a 100644
+--- a/drivers/net/datapath/dpm/datapath_misc.c
++++ b/drivers/net/datapath/dpm/datapath_misc.c
+@@ -982,6 +982,7 @@ int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
+ {
+ 	void *subif_data = NULL;
+ 	struct pmac_port_info *port;
++	struct dp_subif_info *sif;
+ 
+ 	/* Note: workaround to set dummy subif_data via subif_name for DSL case.
+ 	 *       During dp_get_netif_subifID, subif_data is used to get its PVC
+@@ -1010,10 +1011,21 @@ int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
+ 		if (*f_subif_up == 1) {
+ 			dp_update_subif(dev, subif_data, &subif_id[0],
+ 					subif_name, flags, subifid_fn);
+-			if (data && data->ctp_dev)
++
++			sif = get_dp_port_subif(port, subif_id->subif);
++
++			if (get_dp_bp_info(0, sif->bp)->ref_cnt <= 1)
++				dp_notifier_invoke(0, dev, subif_id->port_id,
++						   DP_EVENT_REGISTER_SUBIF);
++
++			if (data && data->ctp_dev) {
+ 				dp_update_subif(data->ctp_dev, subif_data,
+ 						&subif_id[1], NULL, flags,
+ 						subifid_fn);
++				dp_notifier_invoke(0, data->ctp_dev,
++						   subif_id->port_id,
++						   DP_EVENT_REGISTER_SUBIF);
++			}
+ 		}
+ 	}
+ 	return 0;
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index 3ea8c3a30a8f..05baa0ac8760 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -31,6 +31,46 @@ int unregister_notifier(u32 flag)
+ 	return unregister_netdevice_notifier(&dp_dev_notifier);
+ }
+ 
++int dp_notifier_invoke(int inst, struct net_device *dev,
++		       u32 port_id, enum DP_EVENT_TYPE type)
++{
++	struct pmac_port_info *port_info;
++	struct dp_evt_notif_data notif_data;
++	dp_subif_t subif;
++
++	port_info = get_dp_port_info(inst, port_id);
++
++	notif_data.inst = inst;
++	notif_data.dev = dev;
++	notif_data.dev_port = port_info->dev_port;
++	notif_data.mod = port_info->owner;
++	notif_data.dpid = port_info->port_id;
++
++	switch (type) {
++	case DP_EVENT_ALLOC_PORT:
++		break;
++	case DP_EVENT_DE_ALLOC_PORT:
++		break;
++	case DP_EVENT_REGISTER_DEV:
++		break;
++	case DP_EVENT_DE_REGISTER_DEV:
++		break;
++	case DP_EVENT_REGISTER_SUBIF:
++	case DP_EVENT_DE_REGISTER_SUBIF:
++		dp_get_port_subitf_via_dev_private(dev, &subif);
++		notif_data.dpid = subif.port_id;
++		notif_data.subif = subif.subif;
++		break;
++	default:
++		pr_err("%s Unsupported Event %d\n", __func__, type);
++		return DP_FAILURE;
++	}
++
++	atomic_notifier_call_chain(&dp_evt_notif_list, type, &notif_data);
++
++	return DP_SUCCESS;
++}
++
+ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)

@@ -1,0 +1,158 @@
+From 6962a2028bc3faf3991e8942c2cfd0d5d6d024d5 Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Tue, 5 Nov 2019 12:59:55 +0200
+Subject: [PATCH] PONRTSYS-6264: Optimize PPv4 BM cache distribution
+
+---
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c  |  3 +-
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.c        | 48 ++++++++++++++++++----
+ .../net/ppv4/pp-hal/buffer-manager/bm_internal.h   |  7 ++++
+ 3 files changed, 48 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+index 61a7123b5894..073d7469e0f0 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+@@ -1867,8 +1867,7 @@ s32 pp_bmgr_set_total_active_pools(u32 num_active_pools)
+ 	if (unlikely(!__bmgr_is_ready()))
+ 		return -EPERM;
+ 
+-	if (num_active_pools > db->cfg.max_pools ||
+-	    !is_power_of_2(num_active_pools)) {
++	if (num_active_pools > db->cfg.max_pools) {
+ 		pr_err("Number active pools %d is not valid\n",
+ 		       num_active_pools);
+ 		return -EINVAL;
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+index 29304047e171..7488d4b6ae47 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+@@ -24,6 +24,9 @@
+ #include "bm.h"
+ #include "bm_internal.h"
+ 
++/* Each cache row contains 4 pointers which are 16 bytes */
++#define BM_BURST_BYTES_TO_CACHE_ROWS(sz, num) (((sz) * (num)) >> 4)
++
+ struct bmgr_db *db;
+ u64 bm_base_addr;
+ u64 bm_ram_base_addr;
+@@ -87,6 +90,7 @@ s32 bm_init(const struct pp_bm_init_param * const cfg)
+ 	u32 reg_val = 0;
+ 	u8  pool_idx;
+ 	s32 ret = 0;
++	u32 burst_sz, burst_sz_val, burst_num, burst_num_val;
+ 
+ 	if (!cfg->valid)
+ 		return -EINVAL;
+@@ -103,8 +107,9 @@ s32 bm_init(const struct pp_bm_init_param * const cfg)
+ 	db->max_groups = cfg->max_groups;
+ 	db->max_policies = cfg->max_policies;
+ 	db->total_configured_pcu_fifo_sz = cfg->pcu_fifo_sz;
+-	db->total_free_pcu_fifo_sz = cfg->pcu_fifo_sz;
++	db->total_free_pcu_fifo_sz = 0;
+ 	db->pcu_pool_fifo_sz = 0;
++	db->pcu_fifo_sz_alignment = 0;
+ 
+ 	/* Clear all pool enable bits */
+ 	PP_REG_WR32(PP_BM_PCU_POOL_EN_REG, 0);
+@@ -116,18 +121,25 @@ s32 bm_init(const struct pp_bm_init_param * const cfg)
+ 	reg_val |= FIELD_PREP(PP_BM_BMNGR_CTRL_PM_ARB_DIS_MSK, 0);
+ 	PP_REG_WR32(PP_BM_BMNGR_CTRL_REG, reg_val);
+ 
+-	for (pool_idx = 0 ; pool_idx < db->max_pools; pool_idx++) {
+-		ret = __bm_pool_burst_size_set(pool_idx,
+-					       BM_OCPM_BURST_SIZE_256B);
++	burst_sz = BM_OCPM_BURST_SIZE_256B;
++	burst_num = BM_OCPM_NUM_OF_BURSTS_2;
++	for (pool_idx = 0; pool_idx < db->max_pools; pool_idx++) {
++		ret = __bm_pool_burst_size_set(pool_idx, burst_sz);
+ 		if (ret)
+ 			goto bm_init_done;
+ 
+-		ret = __bm_pool_num_bursts_set(pool_idx,
+-					       BM_OCPM_NUM_OF_BURSTS_2);
++		ret = __bm_pool_num_bursts_set(pool_idx, burst_num);
+ 		if (ret)
+ 			goto bm_init_done;
+ 	}
+ 
++	burst_sz_val = BM_OCPM_BURST_SIZE_VAL(burst_sz);
++	burst_num_val = BM_OCPM_NUM_OF_BURSTS_VAL(burst_num);
++
++	/* Calculate number of cache rows alignment requirement */
++	db->pcu_fifo_sz_alignment =
++		BM_BURST_BYTES_TO_CACHE_ROWS(burst_sz_val, burst_num_val);
++
+ 	/* Reset group reserved buffers */
+ 	PP_REG_WR32(PP_BM_GRP_RES_REG_IDX(0), 0);
+ 
+@@ -145,14 +157,34 @@ void bm_exit(void)
+ 
+ s32 bm_set_total_active_pools(u32 num_active_pools)
+ {
++	u32 fifo_sz_not_aligned;
++	u32 fifo_sz_quarter;
++
+ 	if (db->pcu_pool_fifo_sz) {
+ 		pr_err("Number of active pools is already configured\n");
+ 		return -EINVAL;
+ 	}
+ 
+-	db->pcu_pool_fifo_sz =
++	if (!db->pcu_fifo_sz_alignment) {
++		pr_err("Fifo size alignment must not be 0\n");
++		return -EINVAL;
++	}
++
++	/* Distribute total available cache rows equally among active pools */
++	fifo_sz_not_aligned =
+ 		db->total_configured_pcu_fifo_sz / num_active_pools;
+-	pr_debug("Pool fifo size %u\n", db->pcu_pool_fifo_sz);
++
++	/* Fifo sz quarter must be aligned with pcu_pool_fifo_sz_alignment */
++	fifo_sz_quarter =
++		rounddown(fifo_sz_not_aligned >> 2, db->pcu_fifo_sz_alignment);
++
++	/* Obtain the aligned fifo sz */
++	db->pcu_pool_fifo_sz = fifo_sz_quarter * 4;
++	db->total_free_pcu_fifo_sz = db->pcu_pool_fifo_sz * num_active_pools;
++
++	pr_debug("Pool fifo size %u (utilization %u%%)\n", db->pcu_pool_fifo_sz,
++		 db->total_free_pcu_fifo_sz * 100 /
++		 db->total_configured_pcu_fifo_sz);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h b/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h
+index b47c71104ec3..77d0a0106d59 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm_internal.h
+@@ -82,6 +82,7 @@ struct bmgr_db {
+ 	u32 total_configured_pcu_fifo_sz;
+ 	u32 total_free_pcu_fifo_sz;
+ 	u32 pcu_pool_fifo_sz;
++	u32 pcu_fifo_sz_alignment;
+ };
+ 
+ #define BM_OFFSET_OF_PLCY(policy)                     (policy<<2)
+@@ -124,6 +125,9 @@ struct bmgr_db {
+ #define BM_OCPM_BURST_SIZE_256B                       (2)
+ #define BM_OCPM_BURST_SIZE_512B                       (3)
+ 
++/* Convert burst size index to actual value */
++#define BM_OCPM_BURST_SIZE_VAL(sz)                    (BIT((sz) + 6))
++
+ #define BM_OCPM_BURST_SIZE_FIELD(pool)      \
+ 	GENMASK((pool << 1) + 1, pool << 1)
+ 
+@@ -140,6 +144,9 @@ struct bmgr_db {
+ #define BM_OCPM_NUM_OF_BURSTS_3                       (2)
+ #define BM_OCPM_NUM_OF_BURSTS_4                       (3)
+ 
++/* Convert num bursts index to actual value */
++#define BM_OCPM_NUM_OF_BURSTS_VAL(num)                ((num) + 1)
++
+ #define BM_OCPM_NUM_BURSTS_FIELD(pool)      \
+ 	GENMASK((pool << 1) + 1, pool << 1)
+ 

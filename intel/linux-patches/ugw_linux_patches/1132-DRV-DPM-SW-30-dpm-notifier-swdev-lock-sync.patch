@@ -1,0 +1,165 @@
+From 7fa3dd0cafac0f31c2dc869a3060afae6bab123f Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Wed, 15 Apr 2020 11:18:14 +0800
+Subject: [PATCH] DRV_DPM_SW-30 - dpm notifier, swdev lock sync
+
+---
+ drivers/net/datapath/dpm/datapath.h                |  2 +
+ drivers/net/datapath/dpm/datapath_notifier.c       |  5 +++
+ drivers/net/datapath/dpm/datapath_swdev.c          | 46 +++++++++++++---------
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   |  3 +-
+ 4 files changed, 36 insertions(+), 20 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 8f254310fa90..a4ac7dc239e7 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -123,10 +123,12 @@ static inline bool is_invalid_inst(unsigned int inst)
+ #define DP_DEFINE_LOCK(lock) DEFINE_SPINLOCK(lock)
+ #define DP_LIB_LOCK    spin_lock_bh
+ #define DP_LIB_UNLOCK  spin_unlock_bh
++extern spinlock_t dp_lock;
+ #else
+ #define DP_DEFINE_LOCK(lock) DEFINE_MUTEX(lock)
+ #define DP_LIB_LOCK    mutex_lock
+ #define DP_LIB_UNLOCK  mutex_unlock
++extern struct mutex dp_lock;
+ #endif
+ 
+ #define PARSER_FLAG_SIZE   40
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index 44cbe1b2efe9..8e6ef634093d 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -98,12 +98,14 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 			 "Skip zero mac address for %s\n", dev->name);
+ 		return 0;
+ 	}
++	DP_LIB_LOCK(&dp_lock);
+ 	idx = dp_dev_hash(dev, NULL);
+ 	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
+ 	if (!dp_dev) {
+ 		DP_DEBUG(DP_DBG_FLAG_NOTIFY,
+ 			 "datapath dev(%s) not exists!!,No mac config\n",
+ 			 dev ? dev->name : "NULL");
++		DP_LIB_UNLOCK(&dp_lock);
+ 		return 0;
+ 	}
+ 	inst = dp_dev->inst;
+@@ -112,6 +114,7 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 		DP_DEBUG(DP_DBG_FLAG_DBG,
+ 			 "get subifid fail(%s), No Mac config\n",
+ 			 dev ? dev->name : "NULL");
++		DP_LIB_UNLOCK(&dp_lock);
+ 		return DP_FAILURE;
+ 	}
+ 	vap = GET_VAP(subif.subif, port->vap_offset,
+@@ -184,6 +187,7 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 				} else {
+ 					pr_err("FID alloc failed in %s\r\n",
+ 					       __func__);
++					DP_LIB_UNLOCK(&dp_lock);
+ 					return 0;
+ 				}
+ 			}
+@@ -246,6 +250,7 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 	default:
+ 		break;
+ 	}
++	DP_LIB_UNLOCK(&dp_lock);
+ #endif
+ 	return 0;
+ }
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index ed9c47f15a15..e818133a494c 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -65,6 +65,7 @@ EXPORT_SYMBOL(get_dp_g_bridge_id_entry_hash_table_info);
+ int dp_get_fid_by_brname(struct net_device *dev, int *inst)
+ {
+ 	struct br_info *br_info;
++	u32 fid;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("%s failed: datapath not initialized yet\n", __func__);
+@@ -76,12 +77,17 @@ int dp_get_fid_by_brname(struct net_device *dev, int *inst)
+ 		return DP_FAILURE;
+ 	}
+ 
++	swdev_lock();
+ 	br_info = dp_swdev_bridge_entry_lookup(dev->name);
+-	if (!br_info)
++	if (!br_info) {
++		swdev_unlock();
+ 		return -1;
+-
++	}
+ 	*inst = br_info->inst;
+-	return br_info->fid;
++	fid = br_info->fid;
++	swdev_unlock();
++
++	return fid;
+ }
+ EXPORT_SYMBOL(dp_get_fid_by_brname);
+ 
+@@ -990,26 +996,30 @@ int dp_notif_br_alloc(struct net_device *br_dev)
+ 	struct inst_info *dp_info = get_dp_prop_info(0);
+ 
+ 	br_id = dp_info->swdev_alloc_bridge_id(0);
+-	if (br_id) {
+-		if (dp_info->swdev_bridge_cfg_set(0, br_id) == 0) {
+-			br_info = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_info),
+-					       GFP_ATOMIC);
+-			if (!br_info)
+-				return -1;
+-			br_info->fid = br_id;
+-			br_info->inst = 0;
+-			br_info->flag = 0;
+-			strcpy(br_info->br_device_name, br_dev->name);
+-			INIT_LIST_HEAD(&br_info->bp_list);
+-			dp_swdev_insert_bridge_id_entry(br_info);
+-		} else {
+-			pr_err("Switch configuration failed\r\n");
++	if (br_id == -1) {
++		pr_err("Switch bridge alloc failed\r\n");
++		return br_id;
++	}
++	swdev_lock();
++	if (dp_info->swdev_bridge_cfg_set(0, br_id) == 0) {
++		br_info = devm_kzalloc(&g_dp_dev->dev, sizeof(*br_info),
++				       GFP_ATOMIC);
++		if (!br_info) {
++			swdev_unlock();
+ 			return -1;
+ 		}
++		br_info->fid = br_id;
++		br_info->inst = 0;
++		br_info->flag = 0;
++		strcpy(br_info->br_device_name, br_dev->name);
++		INIT_LIST_HEAD(&br_info->bp_list);
++		dp_swdev_insert_bridge_id_entry(br_info);
+ 	} else {
+-		pr_err("Switch bridge alloc failed\r\n");
++		pr_err("Switch configuration failed\r\n");
++		swdev_unlock();
+ 		return -1;
+ 	}
++	swdev_unlock();
+ 	return br_id;
+ }
+ 
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index f825501f21a3..03dd39926d12 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -3933,8 +3933,7 @@ int dp_queue_map_get_31(struct dp_queue_map_get *cfg, int flag)
+ 	}
+ 
+ EXIT:
+-	if (!qmap_entry)
+-		kfree(qmap_entry);
++	kfree(qmap_entry);
+ 	qmap_entry = NULL;
+ 	return res;
+ }

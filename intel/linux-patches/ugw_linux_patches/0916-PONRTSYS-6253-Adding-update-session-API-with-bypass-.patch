@@ -1,0 +1,578 @@
+From 81f9790516089f44d5d6e926b41b45bc06d01a15 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Mon, 9 Dec 2019 10:38:30 +0200
+Subject: [PATCH] PONRTSYS-6253: Adding update session API with bypass cuckoo
+ hash, write direct to interface
+
+---
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c    |   2 -
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |  62 ++++++++-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.h    |   1 +
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c | 141 ++++++++++++++++++---
+ .../pp-session-mgr/pp_session_mgr_internal.h       |   8 ++
+ drivers/net/ppv4/pp-hal/classifier/classifier.c    |  75 ++++++++++-
+ drivers/net/ppv4/pp-hal/classifier/classifier.h    |  29 +++++
+ drivers/net/ppv4/pp-hal/session-info/pp_si.c       |  40 ++++++
+ drivers/net/ppv4/pp-hal/session-info/pp_si.h       |  15 +++
+ 9 files changed, 352 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+index 55f668680a48..9a78a0e367c6 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+@@ -170,8 +170,6 @@ void remove_shared_bwl_group_help(struct seq_file *f)
+ PP_DEFINE_DEBUGFS(shared_grp_del, remove_shared_bwl_group_help,
+ 		  remove_shared_bwl_group);
+ 
+-#define DBG_MAX_PROPS	(32)
+-
+ struct dbg_prop {
+ 	char          field[32];
+ 	char          desc[128];
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index e2e9f4b057bf..183c864e0ecb 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -1276,13 +1276,21 @@ static inline void __smgr_stats_sess_cr_failed(struct sess_info *sess)
+ }
+ 
+ /**
+- * @brief Update stats upon session create failure
++ * @brief Update stats upon session delete failure
+  */
+ static inline void __smgr_stats_sess_del_failed(void)
+ {
+ 	atomic_inc(&db->stats.sess_delete_fail);
+ }
+ 
++/**
++ * @brief Update stats upon session update failure
++ */
++static inline void __smgr_stats_sess_update_failed(void)
++{
++	atomic_inc(&db->stats.sess_update_fail);
++}
++
+ /**
+  * @brief Update stats upon port flush failure
+  */
+@@ -3084,6 +3092,58 @@ static s32 __smgr_sess_create(struct sess_info *sess)
+ 	return ret;
+ }
+ 
++/**
++ * @brief Update a PP session
++ * @param sess_id session id to update
++ * @param si new si
++ * @return s32 0 on success update, error code otherwise
++ */
++s32 pp_session_update(u32 sess_id, struct pp_hw_si *hw_si)
++{
++	struct sess_db_entry *ent;
++	struct sess_db_info *info;
++	s32 ret = 0;
++
++	pr_debug("updating session %u\n", sess_id);
++
++	__smgr_lock();
++
++	if (unlikely(!__smgr_is_sess_exist(sess_id))) {
++		__smgr_stats_invalid_args();
++		ret = -ENOENT;
++		goto done;
++	}
++
++	ent = __smgr_get_sess_db_ent(sess_id);
++	if (unlikely(!ent)) {
++		pr_crit("Session exist with DB no entry!!!\n");
++		ret = -ENOENT;
++		goto done;
++	}
++	info = &ent->info;
++
++	/* Update session in classifier */
++	ret = cls_session_update(sess_id, info->fv_sz, &info->hash, hw_si);
++	if (unlikely(ret)) {
++		__smgr_stats_hw_err();
++		pr_err("update session %u from HW failed\n", sess_id);
++		goto done;
++	}
++
++	pr_debug("session %u was updated\n", sess_id);
++
++done:
++	if (unlikely(ret)) {
++		pr_err("Failed to update session %u, ret = %d\n",
++		       sess_id, ret);
++		__smgr_stats_sess_update_failed();
++	}
++
++	__smgr_unlock();
++
++	return ret;
++}
++
+ /**
+  * @brief Session create work to be schedule using a work queue in
+  *        async mode or to be called directly in sync mode
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+index a18a08cb8e5e..8364b361a6be 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+@@ -115,6 +115,7 @@ struct smgr_stats {
+ 	/* errors */
+ 	atomic_t sess_create_fail;
+ 	atomic_t sess_delete_fail;
++	atomic_t sess_update_fail;
+ 	atomic_t port_flush_fail;
+ 	atomic_t flush_all_fail;
+ 	atomic_t inactive_fail;
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index c38698c3b4c0..ca9b2433cb1b 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -271,39 +271,55 @@ void __smgr_dbg_session_si_dump(struct seq_file *f)
+ 	__smgr_dbg_si_top_dump(f, &si);
+ 
+ 	if (SI_IS_DPU_EXIST(&si)) {
+-		seq_printf(f, " %-20s: %u\n", "dpu.nat_sz     ",
++		seq_printf(f, " %-20s: %u\n",
++			   pp_si_fld2str(SI_FLD_DPU_NAT_SZ),
+ 			   si.dpu.nat_sz);
+-		seq_printf(f, " %-20s: %u\n", "dpu.nhdr_sz    ",
++		seq_printf(f, " %-20s: %u\n",
++			   pp_si_fld2str(SI_FLD_DPU_NHDR_SZ),
+ 			   si.dpu.nhdr_sz);
+-		seq_printf(f, " %-20s: %u\n", "dpu.nhdr_l3_off",
++		seq_printf(f, " %-20s: %u\n",
++			   pp_si_fld2str(SI_FLD_DPU_NHDR_L3_OFF),
+ 			   si.dpu.nhdr_l3_off);
+-		seq_printf(f, " %-20s: %u\n", "dpu.lyr_fld_off",
++		seq_printf(f, " %-20s: %u\n",
++			   pp_si_fld2str(SI_FLD_DPU_LYR_FLD_OFF),
+ 			   si.dpu.lyr_fld_off);
+-		seq_printf(f, " %-20s: %u\n", "dpu.pppoe_off",
++		seq_printf(f, " %-20s: %u\n",
++			   pp_si_fld2str(SI_FLD_DPU_PPPOE_OFF),
+ 			   si.dpu.pppoe_off);
+ 	}
+ 	if (SI_IS_SCE_EXIST(&si)) {
+-		seq_printf(f, " %-20s: %#x\n", "sce.l3_csum_delta",
++		seq_printf(f, " %-20s: %#x\n",
++			   pp_si_fld2str(SI_FLD_SCE_L3_CSUM),
+ 			   si.sce.l3_csum_delta);
+-		seq_printf(f, " %-20s: %#x\n", "sce.l4_csum_delta",
++		seq_printf(f, " %-20s: %#x\n",
++			   pp_si_fld2str(SI_FLD_SCE_L4_CSUM),
+ 			   si.sce.l4_csum_delta);
+-		seq_printf(f, " %-20s: %#x\n", "sce.l4_csum_zero",
++		seq_printf(f, " %-20s: %#x\n",
++			   pp_si_fld2str(SI_FLD_SCE_L4_CSUM_ZERO),
+ 			   si.sce.l4_csum_zero);
+-		seq_printf(f, " %-20s: %#x\n", "sce.nhdr_csum    ",
++		seq_printf(f, " %-20s: %#x\n",
++			   pp_si_fld2str(SI_FLD_SCE_NHDR_CSUM),
+ 			   si.sce.nhdr_csum);
+-		seq_printf(f, " %-20s: %#x\n", "sce.dscp         ",
++		seq_printf(f, " %-20s: %#x\n",
++			   pp_si_fld2str(SI_FLD_SCE_DSCP),
+ 			   si.sce.dscp);
+-		seq_printf(f, " %-20s: %u\n", "sce.tot_len_diff ",
++		seq_printf(f, " %-20s: %u\n",
++			   pp_si_fld2str(SI_FLD_SCE_IP_LEN_DIFF),
+ 			   si.sce.tot_len_diff);
+-		seq_printf(f, " %-20s: %u(%#x)\n", "sce.new_dst_port ",
++		seq_printf(f, " %-20s: %u(%#x)\n",
++			   pp_si_fld2str(SI_FLD_SCE_DST_PORT),
+ 			   si.sce.new_dst_port, si.sce.new_dst_port);
+-		seq_printf(f, " %-20s: %u(%#x)\n", "sce.new_src_port ",
++		seq_printf(f, " %-20s: %u(%#x)\n",
++			   pp_si_fld2str(SI_FLD_SCE_SRC_PORT),
+ 			   si.sce.new_src_port, si.sce.new_src_port);
+-		seq_printf(f, " %-20s: %u(%#x)\n", "sce.ttl_diff ",
++		seq_printf(f, " %-20s: %u(%#x)\n",
++			   pp_si_fld2str(SI_FLD_SCE_TTL_DIFF),
+ 			   si.sce.ttl_diff, si.sce.ttl_diff);
+-		seq_printf(f, " %-20s: %u(%#x)\n", "sce.pppoe_diff ",
++		seq_printf(f, " %-20s: %u(%#x)\n",
++			   pp_si_fld2str(SI_FLD_SCE_PPPOE_DIFF),
+ 			   si.sce.pppoe_diff, si.sce.pppoe_diff);
+-		seq_printf(f, " %-20s: %u(%#x)\n", "sce.l2_org_val ",
++		seq_printf(f, " %-20s: %u(%#x)\n",
++			   pp_si_fld2str(SI_FLD_SCE_L2_ORG_VAL),
+ 			   si.sce.l2_org_val, si.sce.l2_org_val);
+ 	}
+ 	if (SI_IS_BCE_EXIST(&si)) {
+@@ -2143,9 +2159,15 @@ void __smgr_dbg_session_compare_last_fv_dump(struct seq_file *f)
+ 	u32 fv_sz;
+ 	bool full_match = true;
+ 	bool match;
++	struct sess_db_info info;
+ 
+ 	memset(&hw_si,  0, sizeof(hw_si));
+ 
++	if (smgr_session_info_get(dbg_sess_id, &info)) {
++		pr_err("Session %u does not exist!", dbg_sess_id);
++		return;
++	}
++
+ 	ret = cls_session_si_get(dbg_sess_id, &hw_si);
+ 	if (ret)
+ 		return;
+@@ -2195,6 +2217,92 @@ void __smgr_dbg_session_compare_last_fv_dump(struct seq_file *f)
+ PP_DEFINE_DEBUGFS(session_compare_last_fv,
+ 		  __smgr_dbg_session_compare_last_fv_dump, NULL);
+ 
++s32 sess_update_get_si(char *field, u32 id, struct pp_hw_si *si)
++{
++	/* Make sure first property is the session id */
++	if (strncmp(field, "id", strlen("id"))) {
++		pr_err("First prop (%s) must be id\n", field);
++		return -EINVAL;
++	}
++
++	/* Get session SI */
++	if (unlikely(cls_session_si_get(id, si))) {
++		pr_err("couldn't get si for session %u", id);
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++void sess_update_set(char *cmd_buf, void *data)
++{
++	u8 *field;
++	char *tok, *ptr, *pval;
++	unsigned long res;
++	u32 id = 0;
++	u32 first_prop = 1;
++	struct pp_hw_si si = {0};
++	enum pp_si_fld si_fld;
++
++	field = kzalloc(PP_DBGFS_WR_STR_MAX, GFP_KERNEL);
++	if (!field)
++		return;
++
++	ptr = (char *)cmd_buf;
++
++	while ((tok = strsep(&ptr, " \t\n\r")) != NULL) {
++		if (tok[0] == '\0')
++			continue;
++
++		strcpy(field, tok);
++		pval = strchr(field, '=');
++		if (!pval) {
++			pr_err("Wrong format for prop %s\n", tok);
++			goto out;
++		}
++
++		*pval = '\0';
++		pval++;
++
++		if (kstrtoul(pval, 0, &res)) {
++			pr_err("kstrtoul failed\n");
++			goto out;
++		}
++
++		if (first_prop) {
++			first_prop = 0;
++			if (sess_update_get_si(field, res, &si))
++				goto out;
++			id = res;
++		} else {
++			if (!pp_si_str2fld(field, &si_fld))
++				pp_si_fld_set(&si, si_fld, res);
++			else
++				pr_err("Unsupported field %s\n", field);
++		}
++	}
++
++	if (pp_session_update(id, &si))
++		pr_err("pp_session_update failed (id %u)", id);
++
++out:
++	kfree(field);
++}
++
++void sess_update_help(struct seq_file *f)
++{
++	u32 idx;
++
++	seq_puts(f, "echo id=[sess_id] [fld]=[value]... > sess_update\n");
++	seq_puts(f, "Supported fields:\n");
++	seq_puts(f, "=================\n");
++
++	for (idx = 0; idx < SI_FLD_LAST; idx++)
++		seq_printf(f, "%s\n", pp_si_fld2str(idx));
++}
++
++PP_DEFINE_DEBUGFS(sess_update, sess_update_help, sess_update_set);
++
+ static struct debugfs_file debugfs_files[] = {
+ 	{ "sessions", &PP_DEBUGFS_FOPS(sessions) },
+ 	{ "inact_sessions", &PP_DEBUGFS_FOPS(inact_sess_dump) },
+@@ -2213,6 +2321,7 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "sgc", &PP_DEBUGFS_FOPS(sgc) },
+ 	{ "frag_stats", &PP_DEBUGFS_FOPS(frag_stats) },
+ 	{ "compare_last_fv", &PP_DEBUGFS_FOPS(session_compare_last_fv) },
++	{ "sess_update", &PP_DEBUGFS_FOPS(sess_update) },
+ };
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 86988d41c20b..c6f2dea248a7 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -589,6 +589,14 @@ s32 smgr_mcast_init(u32 invalid_sess_id);
+  */
+ void smgr_mcast_exit(void);
+ 
++/**
++ * @brief Update a PP session
++ * @param sess_id session id to update
++ * @param si new si
++ * @return s32 0 on success update, error code otherwise
++ */
++s32 pp_session_update(u32 sess_id, struct pp_hw_si *hw_si);
++
+ #ifdef CONFIG_DEBUG_FS
+ /**
+  * @brief Get session manager busy sessions bitmap, set bit specify
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.c b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+index fff27eeb822c..5a73d8663c91 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+@@ -626,6 +626,16 @@ s32 cls_fv_mask_get(void *mask)
+ }
+ 
+ s32 cls_session_lookup(void *fv, u32 fv_sz, struct pp_hash *hash, u32 *id)
++{
++	return cls_session_lookup_verbose(fv, fv_sz, hash, id, NULL, NULL);
++}
++
++s32 cls_session_lookup_verbose(void *fv,
++			       u32 fv_sz,
++			       struct pp_hash *hash,
++			       u32 *id,
++			       u8 *tbl_idx,
++			       u8 *slot_idx)
+ {
+ 	struct cuckoo_hash_item session;
+ 
+@@ -643,8 +653,9 @@ s32 cls_session_lookup(void *fv, u32 fv_sz, struct pp_hash *hash, u32 *id)
+ 	session.h2      = hash->h2;
+ 	session.sig     = hash->sig;
+ 
+-	if (cuckoo_hash_lookup(db->cuckoo, &session) != EEXIST) {
+-		pr_debug("session not found in cuckoo hash\n");
++	if (cuckoo_hash_lookup_verbose(db->cuckoo, &session,
++				       tbl_idx, slot_idx) != EEXIST) {
++		pr_debug("session not found in cuckoo hash (verbose)\n");
+ 		goto done;
+ 	}
+ 
+@@ -962,6 +973,66 @@ static void __cls_add_cmd_send(const struct cuckoo_hash_action *event)
+ 	pr_debug("CMD done successfully\n");
+ }
+ 
++s32 cls_session_update(u32 id, u32 fv_sz, struct pp_hash *hash,
++		       struct pp_hw_si *new_si)
++{
++	struct cuckoo_hash_action event;
++	s32 ret;
++	u32 s_id;
++	u8 tbl_idx;
++	u8 slot_idx;
++
++	if (unlikely(ptr_is_null(hash)))
++		return -EINVAL;
++
++	/* store the si template for the event handling */
++	db->cls_si_req = (u32 *)new_si;
++	db->cls_cmd_status = 0;
++
++	/* prepare the cuckoo item */
++	if (id >= db->num_sessions) {
++		pr_err("invalid session id %u, support %u sessions\n",
++		       id, db->num_sessions);
++		return -EINVAL;
++	}
++
++#ifdef CONFIG_PPV4_FPGA
++	memcpy(&db->fv[id], CLS_FV_START_ADDR(si, fv_sz), fv_sz);
++	event.item.key = &db->fv[id];
++#else /* !CONFIG_PPV4_FPGA */
++	event.item.key = (void *)CLS_FV_ADDR((unsigned long)(db->si_base_virt),
++					     id, fv_sz);
++#endif /* CONFIG_PPV4_FPGA */
++
++	ret = cls_session_lookup_verbose(event.item.key, fv_sz, hash, &s_id,
++					 &tbl_idx, &slot_idx);
++	if (ret) {
++		pr_err("cls_session_lookup_verbose failed session id %u\n", id);
++		return -EINVAL;
++	}
++
++	if (id != s_id) {
++		pr_err("found session id %u instead of %u\n", s_id, id);
++		return -EINVAL;
++	}
++
++	event.type = ITEM_ADDED;
++	event.item.key_len = fv_sz;
++	event.item.value = (void *)(unsigned long)id;
++	event.item.h1 = hash->h1;
++	event.item.h2 = hash->h2;
++	event.item.sig = hash->sig;
++
++	event.new_tbl = tbl_idx;
++	event.new_slot = slot_idx;
++	event.old_tbl = tbl_idx;
++	event.old_slot = slot_idx;
++
++	__cls_add_cmd_send(&event);
++
++	return db->cls_cmd_status;
++}
++
+ static void __cls_move_cmd_send(const struct cuckoo_hash_action *event)
+ {
+ 	u32 reg;
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.h b/drivers/net/ppv4/pp-hal/classifier/classifier.h
+index 0d970b9c2c46..be583078e718 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.h
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.h
+@@ -80,6 +80,17 @@ s32 cls_session_dsi_update(u32 id, u16 dst_q, bool clr_cntr);
+  */
+ s32 cls_session_del(u32 id, u32 fv_sz, struct pp_hash *hash);
+ 
++/**
++ * @brief Update existing session from the hash tables
++ * @param id session index
++ * @param fv_sz FV size
++ * @param hash session hash results
++ * @param new_si New hw si to set
++ * @return s32 0 on success, error code otherwise
++ */
++s32 cls_session_update(u32 id, u32 fv_sz, struct pp_hash *hash,
++		       struct pp_hw_si *new_si);
++
+ /**
+  * @brief Lookup for a session in hash tables
+  * @param fv session FV
+@@ -91,6 +102,24 @@ s32 cls_session_del(u32 id, u32 fv_sz, struct pp_hash *hash);
+  */
+ s32 cls_session_lookup(void *fv, u32 fv_sz, struct pp_hash *hash, u32 *id);
+ 
++/**
++ * @brief Lookup for a session in hash tables (verbose version)
++ * @param fv session FV
++ * @param fv_sz FV size
++ * @param hash session hash results
++ * @param id session id, returned by the function, if session
++ *           not found this value will be CLS_SESSION_INVALID
++ * @param tbl_idx if item found, return the table index
++ * @param slot_idx if item found, return the slot index
++ * @return s32 0 on success, error code otherwise
++ */
++s32 cls_session_lookup_verbose(void *fv,
++			       u32 fv_sz,
++			       struct pp_hash *hash,
++			       u32 *id,
++			       u8 *tbl_idx,
++			       u8 *slot_idx);
++
+ /**
+  * @brief Flush all sessions in the hash tables
+  * @param void
+diff --git a/drivers/net/ppv4/pp-hal/session-info/pp_si.c b/drivers/net/ppv4/pp-hal/session-info/pp_si.c
+index 9611fa7af231..925a75f34e56 100644
+--- a/drivers/net/ppv4/pp-hal/session-info/pp_si.c
++++ b/drivers/net/ppv4/pp-hal/session-info/pp_si.c
+@@ -75,6 +75,28 @@ static const char * const si_chck_flags_str[] = {
+ 	"INVALID",
+ };
+ 
++const char * const pp_si_fld2str(enum pp_si_fld fld)
++{
++	if (pp_si_field_id_is_valid(fld))
++		return si_flds[fld].name;
++
++	return NULL;
++}
++
++s32 pp_si_str2fld(const char * const name, enum pp_si_fld *fld)
++{
++	u32 idx;
++
++	for (idx = 0; idx < SI_FLDS_NUM; idx++) {
++		if (!strcmp(si_flds[idx].name, name)) {
++			*fld = idx;
++			return 0;
++		}
++	}
++
++	return -EINVAL;
++}
++
+ /**
+  * @brief Convert value to SI SCE l4 checksum delta
+  * @param val value to convert
+@@ -1128,6 +1150,11 @@ s32 pp_si_tbm_info_set(u16 *tbm, u16 n_tbm, struct pp_si *si)
+ 
+ void pp_si_init(void)
+ {
++	u32 idx;
++	u32 newlen;
++	char prefix[] = "SI_FLD_";
++	u32 prefix_len = strlen(prefix);
++
+ 	/* Init all SI simple static fields that doesn't require any
+ 	 * validity check or any special conversions
+ 	 */
+@@ -1217,5 +1244,18 @@ void pp_si_init(void)
+ 		BUF_FLD_INIT_SIMPLE(dsi_flds, DSI_FLD_ACTIVE);
+ 		BUF_FLD_INIT_SIMPLE(dsi_flds, DSI_FLD_VALID);
+ 	}
++
++	/* Save fields names as lower case and without the SI_FLD_ prefix */
++	for (idx = SI_FLD_FIRST; idx < SI_FLDS_NUM; idx++) {
++		if (strlen(si_flds[idx].name) > prefix_len &&
++		    strstr(si_flds[idx].name, prefix)) {
++			newlen = strlen(si_flds[idx].name) - prefix_len;
++			memmove(si_flds[idx].name,
++				&si_flds[idx].name[prefix_len],
++				newlen);
++			si_flds[idx].name[newlen] = '\0';
++			str_tolower(si_flds[idx].name);
++		}
++	}
+ }
+ 
+diff --git a/drivers/net/ppv4/pp-hal/session-info/pp_si.h b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+index 53541118fe1f..467fd9c49c7d 100644
+--- a/drivers/net/ppv4/pp-hal/session-info/pp_si.h
++++ b/drivers/net/ppv4/pp-hal/session-info/pp_si.h
+@@ -732,6 +732,21 @@ s32 pp_si_tbm_info_set(u16 *tbm, u16 n_tbm, struct pp_si *si);
+  */
+ const char * const pp_si_chck_flag_to_str(u32 flag);
+ 
++/**
++ * @brief converts si fields enum to str 
++ * @param fld enum value
++ * @return enum string
++ */
++const char * const pp_si_fld2str(enum pp_si_fld fld);
++
++/**
++ * @brief converts si fields str to enum
++ * @param name enum name
++ * @param fld output contains the enum value, if exists
++ * @return 0 if name exists in enum, error code otherwise
++ */
++s32 pp_si_str2fld(const char * const name, enum pp_si_fld *fld);
++
+ /**
+  * @brief Initialize some stuff to make encoding and decoding SI
+  *        easier

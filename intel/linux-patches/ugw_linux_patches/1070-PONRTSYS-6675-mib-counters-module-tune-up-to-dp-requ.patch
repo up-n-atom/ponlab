@@ -1,0 +1,295 @@
+From aea52351a16f27724ea755ec325ec1a6ac3c2c2f Mon Sep 17 00:00:00 2001
+From: Robert Dabrowski <robertx.dabrowski@intel.com>
+Date: Fri, 28 Feb 2020 09:25:30 +0100
+Subject: [PATCH] PONRTSYS-6675: mib_counters module - tune up to dp
+ requirements - read initial counters when dev added - set dev_is_uni flag
+ when new UNI BP dev added to list - register callback for ethtool statistics
+ - fix range check - remove include mib_counters header from dp
+
+---
+ drivers/net/datapath/dpm/datapath_api.c            | 14 ++++-
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c   | 16 +++--
+ .../net/datapath/mib_counters/dp_mib_counters.c    | 73 +++++++++++++++++-----
+ include/net/datapath_api.h                         | 12 ++++
+ 4 files changed, 92 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index cb09f22a57af..0a27dba806e2 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -107,6 +107,13 @@ void (*dp_dev_get_ethtool_stats_fn)(struct net_device *dev,
+ 				    u64 *data) = NULL;
+ EXPORT_SYMBOL(dp_dev_get_ethtool_stats_fn);
+ 
++void dp_set_ethtool_stats_fn(int inst, void (*cb)(struct net_device *dev,
++			struct ethtool_stats *stats, u64 *data))
++{
++	dp_dev_get_ethtool_stats_fn = cb;
++}
++EXPORT_SYMBOL(dp_set_ethtool_stats_fn);
++
+ int dp_register_ops(int inst, enum DP_OPS_TYPE type, void *ops)
+ {
+ 	if (is_invalid_inst(inst) || type >= DP_OPS_CNT) {
+@@ -2586,12 +2593,17 @@ void dp_net_dev_get_ethtool_stats(struct net_device *dev,
+ 	struct inst_info *pinfo = &dp_port_prop[subif.inst].info;
+ 
+ 	/* This is for the Mib counter wraparound module */
+-	if (dp_dev_get_ethtool_stats_fn)
++	if (dp_dev_get_ethtool_stats_fn) {
++		DP_DEBUG(DP_DBG_FLAG_MIB,
++			 "MIB call dp_dev_get_ethtool_stats_fn callback\n");
+ 		return dp_dev_get_ethtool_stats_fn(dev, stats, data);
++	}
+ 
+ 	if (!pinfo->dp_net_dev_get_ethtool_stats)
+ 		return;
+ 
++	DP_DEBUG(DP_DBG_FLAG_MIB,
++		 "MIB call pinfo->dp_net_dev_get_ethtool_stats\n");
+ 	pinfo->dp_net_dev_get_ethtool_stats(dev, stats, data);
+ }
+ EXPORT_SYMBOL(dp_net_dev_get_ethtool_stats);
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index f6d67bc8ecb0..ab74b6cbe9f6 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -20,10 +20,6 @@
+ #include "datapath_switchdev.h"
+ #endif
+ 
+-#if IS_ENABLED(CONFIG_INTEL_MIB_COUNTERS)
+-#include "../../mib_counters/dp_mib_counters.h"
+-#endif
+-
+ static void init_dma_desc_mask(void)
+ {
+ 	/*mask 0: to remove the bit, 1 -- keep the bit */
+@@ -2317,10 +2313,18 @@ int register_dp_cap_gswip31(int flag)
+ 		dp_net_dev_get_ss_stat_strings_3X;
+ 	cap.info.dp_net_dev_get_ss_stat_strings_count =
+ 		dp_net_dev_get_ss_stat_strings_count_3X;
+-	cap.info.dp_net_dev_get_ethtool_stats =
+ #if IS_ENABLED(CONFIG_INTEL_MIB_COUNTERS)
+-		mib_cnt_get_ethtool_stats_31;
++	/* The full ethtool statistics support is provided in mib_counters
++	 * kernel module where special callback fn is registered for the
++	 * statistics purpose
++	 */
++	cap.info.dp_net_dev_get_ethtool_stats = NULL;
+ #else
++	/* In case mib_counters module is not compiled in
++	 * here is registered simple counters retrieval function
++	 * without overflow handling
++	 */
++	cap.info.dp_net_dev_get_ethtool_stats =
+ 		dp_net_dev_get_ethtool_stats_31;
+ #endif
+ 
+diff --git a/drivers/net/datapath/mib_counters/dp_mib_counters.c b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+index 7da60d499117..d62ae5e2e390 100644
+--- a/drivers/net/datapath/mib_counters/dp_mib_counters.c
++++ b/drivers/net/datapath/mib_counters/dp_mib_counters.c
+@@ -16,7 +16,16 @@
+ #include "../dpm/gswip31/datapath_misc.h"
+ 
+ /* Counters update interval = 3[min] -> 180'000[ms] */
+-#define CNT_UPDATE_TIME 180000
++#define CNT_UPDATE_TIME 180000U
++
++/* Maximal number of dp ports and sub_ifs:
++ * for port: FLM-12, LGM-16
++ * for subif: SFU 256 and HGU 128
++ */
++#define MAX_PORT 12
++#define MAX_SUBIF 256
++
++#define INITIAL_UPDATE 1
+ 
+ struct mib_counters_u64 {
+ #define _DP_ETHTOOL(x, y)	u64 y;
+@@ -38,6 +47,8 @@ struct mib_counters {
+ 	s32 port_id;
+ 	/** sub interface id group*/
+ 	s32 sub_if_id_grp;
++	/** flag indicates dev is UNI side bridge port */
++	u8 dev_is_uni;
+ 	/** last read counters */
+ 	GSW_RMON_Port_cnt_t last_read_rmon;
+ 	/** stored 64 bits wide counters */
+@@ -70,12 +81,10 @@ static u64 wraparound(u64 curr, u64 last, u32 size)
+ }
+ 
+ /* Update counters for one device */
+-static void update_dev_counters(struct mib_counters *cnt)
++static void update_dev_counters(struct mib_counters *cnt, u8 initial_update)
+ {
+ 	GSW_RMON_Port_cnt_t *tmp_counters;
+ 	struct core_ops *ops;
+-	/* net device is a bridge port on UNI side */
+-	u8 dev_is_uni = 0;
+ 	s32 ret = 0;
+ 	u8 i = 0;
+ 
+@@ -103,8 +112,7 @@ static void update_dev_counters(struct mib_counters *cnt)
+ 		/* read CTP counters */
+ 		ret = ops->gsw_rmon_ops.RMON_Port_Get(ops, &tmp_counters[i]);
+ 		if (ret != DP_SUCCESS) {
+-			netdev_err(cnt->dev,
+-				   "RMON_Port_Get returned %d\n", ret);
++			pr_err("MIB CNT ERROR - RMON_Port_Get - %d\n", ret);
+ 			devm_kfree(&g_dp_dev->dev, tmp_counters);
+ 			return;
+ 		}
+@@ -119,24 +127,33 @@ static void update_dev_counters(struct mib_counters *cnt)
+ 	 * Do not overwrite CTP Tx counters for an UNI interface
+ 	 * in "shortcut" mode
+ 	 */
+-
+-	/* TODO: find out better way to check given dev is UNI bridge port */
+-	dev_is_uni = cnt->dev->name[0] == 'e';
+-
+-	if (!(dev_is_uni && shortcut_mode)) {
++	if (!(cnt->dev_is_uni && shortcut_mode)) {
+ #define _DP_ETHTOOL_TX(r)	tmp_counters[0].r = tmp_counters[1].r;
+ 		DP_ETHTOOL_STAT_REG_TX_DECLARE
+ #undef _DP_ETHTOOL_TX
+ 	}
++
++	/* On initial update, just after new device is added to update
++	 * counter list, counters values read first time can be invalid.
++	 * Therefore the value just read will not be added to the 64 bits
++	 * cumulative counters
++	 */
++	if (initial_update == INITIAL_UPDATE) {
++		write_lock(&cnt->cnt_lock);
++		cnt->last_read_rmon = tmp_counters[0];
++		write_unlock(&cnt->cnt_lock);
++		return;
++	}
++
+ 	/* update 64 bits wide counters based on last read values */
+ 	write_lock(&cnt->cnt_lock);
+ #define _DP_ETHTOOL(x, y) cnt->wide_cntrs.y += wraparound(tmp_counters[0].y, cnt->last_read_rmon.y, sizeof(cnt->last_read_rmon.y));
+ 	DP_ETHTOOL_STAT_REG_DECLARE
+ #undef _DP_ETHTOOL
+-	write_unlock(&cnt->cnt_lock);
+ 
+ 	/* Update last read counters set */
+ 	cnt->last_read_rmon = tmp_counters[0];
++	write_unlock(&cnt->cnt_lock);
+ 
+ 	devm_kfree(&g_dp_dev->dev, tmp_counters);
+ }
+@@ -151,7 +168,7 @@ static void update_all_devs_counters(void)
+ 	list_for_each(p, &registered_devices_list)
+ 	{
+ 		mib_cnt = list_entry(p, struct mib_counters, dev_list);
+-		update_dev_counters(mib_cnt);
++		update_dev_counters(mib_cnt, !INITIAL_UPDATE);
+ 	}
+ 	read_unlock(&dev_list_lock);
+ }
+@@ -162,6 +179,15 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	struct mib_counters *dev_cnt;
+ 	struct pmac_port_info *port_info;
+ 
++	if ((!dev) ||
++	    (port_id < 0) || (port_id > MAX_PORT) ||
++	    (sub_if < 0) || (sub_if > MAX_SUBIF)) {
++		DP_DEBUG(DP_DBG_FLAG_MIB,
++			 "MIB CNT - net dev to add: name = %s, port_id = %d, sub_if = %d, inst = %d - WRONG DATA !\n",
++			 dev->name, port_id, sub_if, inst);
++		return -EINVAL;
++	}
++
+ 	dev_cnt = devm_kzalloc(&g_dp_dev->dev,
+ 			       sizeof(struct mib_counters),
+ 			       GFP_ATOMIC);
+@@ -175,6 +201,10 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	dev_cnt->port_id = port_id;
+ 	dev_cnt->sub_if_id_grp = GET_VAP(sub_if, port_info->vap_offset,
+ 					 port_info->vap_mask);
++	/* check if given net dev is on UNI side of bridge */
++	dev_cnt->dev_is_uni = (port_info->alloc_flags & DP_F_FAST_ETH_LAN) ||
++		(port_info->alloc_flags & DP_F_FAST_ETH_WAN);
++
+ 	rwlock_init(&dev_cnt->cnt_lock);
+ 
+ 	INIT_LIST_HEAD(&dev_cnt->dev_list);
+@@ -187,6 +217,9 @@ s32 add_dev_to_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 		 "MIB CNT - added device: %s port_id = %d, sub_if_id_grp = %d\n",
+ 		 dev->name, port_id, dev_cnt->sub_if_id_grp);
+ 
++	/* read counters for just added dev to save initial value */
++	update_dev_counters(dev_cnt, INITIAL_UPDATE);
++
+ 	return 0;
+ }
+ 
+@@ -198,9 +231,11 @@ s32 rm_dev_from_list(struct net_device *dev, s32 port_id, s32 sub_if, s32 inst)
+ 	struct list_head *p, *q;
+ 	s32 sub_if_id_grp;
+ 
+-	if ((!dev) || (port_id < 0) || (port_id > 12) || (sub_if < 0) || (sub_if > 512)) {
++	if ((!dev) ||
++	    (port_id < 0) || (port_id > MAX_PORT) ||
++	    (sub_if < 0) || (sub_if > MAX_SUBIF)) {
+ 		DP_DEBUG(DP_DBG_FLAG_MIB,
+-			 "MIB CNT - item to delete: name = %s, port_id = %d, sub_if = %d, inst = %d  - POSSIBLY WRONG DATA !\n",
++			 "MIB CNT - net dev to delete: name = %s, port_id = %d, sub_if = %d, inst = %d - WRONG DATA !\n",
+ 			 dev->name, port_id, sub_if, inst);
+ 		return -EINVAL;
+ 	}
+@@ -366,7 +401,7 @@ void mib_cnt_get_ethtool_stats_31(struct net_device *dev,
+ 	devm_kfree(&g_dp_dev->dev, ps_subif);
+ 
+ 	/* Update counters for the requested net device */
+-	update_dev_counters(mib_cnt);
++	update_dev_counters(mib_cnt, !INITIAL_UPDATE);
+ 
+ 	/* Copy wide counters to update by reinserted packets */
+ 	wide_cnt_mod = mib_cnt->wide_cntrs;
+@@ -450,6 +485,9 @@ static int __init mib_counters_mod_init(void)
+ 	of_property_read_u32(np, "gsw_mode", &gsw_mode);
+ 	shortcut_mode = ((gsw_mode & BIT(0)) == GSW_SHORTCUT_MODE);
+ 
++	/* Register ethtool stats cb function */
++	dp_set_ethtool_stats_fn(0, mib_cnt_get_ethtool_stats_31);
++
+ 	return 0;
+ }
+ 
+@@ -485,6 +523,9 @@ static void __exit mib_counters_mod_exit(void)
+ 		devm_kfree(&g_dp_dev->dev, mib_cnt);
+ 	}
+ 	write_unlock(&dev_list_lock);
++
++	/* Deregister ethtool stats cb function */
++	dp_set_ethtool_stats_fn(0, NULL);
+ }
+ 
+ module_init(mib_counters_mod_init);
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index ea982b318add..4f3d7c907877 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -1950,6 +1950,18 @@ struct dp_event {
+  */
+ int dp_register_event_cb(struct dp_event *info, uint32_t flag);
+ 
++/*!
++ *@brief dp_set_ethtool_stats_fn API to register callback function which
++ * retrieves counters for ethtool statistics
++ *@param[in] inst: dp instance id
++ *@param[in] cb: pointer to function called for retrieve counters for
++ *		 ethtool statistics
++ */
++void dp_set_ethtool_stats_fn(int inst,
++			     void (*cb)(struct net_device *dev,
++					struct ethtool_stats *stats,
++					u64 *data));
++
+ /*! @brief Enumerator DP_OPS_TYPE */
+ enum DP_OPS_TYPE {
+ 	DP_OPS_BM, /*!< BM ops type */

@@ -1,0 +1,482 @@
+From bae17fe2a86718af567018e3be74bcf40815eb48 Mon Sep 17 00:00:00 2001
+From: "Vishnu Swaroop Kumar Sarma, Duddu" <duddu.swaroop@intel.com>
+Date: Wed, 18 Mar 2020 18:56:05 +0530
+Subject: [PATCH] PONRTSYS-5734 validate the pll divider rates for pll0_cfga
+
+ACL check on cpu frequency value
+CPU frequencies need to checked for ACL policy by the TEP. Therefore IAP
+needs to inform the TEP about the valid CPU scaling frequenies defined
+in DT.
+---
+ drivers/base/tep-sec.c           |  94 +++++++++++++-------
+ drivers/cpufreq/xrx500-cpufreq.c | 188 ++++++++++++++++++++++++++++++++-------
+ 2 files changed, 220 insertions(+), 62 deletions(-)
+
+diff --git a/drivers/base/tep-sec.c b/drivers/base/tep-sec.c
+index 4ae0de0d8f40..f0b03981454b 100644
+--- a/drivers/base/tep-sec.c
++++ b/drivers/base/tep-sec.c
+@@ -11,10 +11,11 @@
+ #define tep_reg_read(paddr)		readl((void *)KSEG1ADDR(paddr))
+ #define tep_reg_writel(reg, paddr)	writel(reg, (void *)KSEG1ADDR(paddr))
+ #define UPDATE_BITS(r, m, v)		(((r) & (~(m))) | ((v) & (m)))
+-#define VALIDATE_ADDR(A)	((((A) >= RCU_BASE) && ((A) <= RCU_BASE + RCU_OFF)) ||\
+-				(((A) >= CHIPTOP_BASE) && ((A) <= CHIPTOP_BASE + CHIPTOP_OFF)) ||\
+-				(((A) >= CGU_BASE) && ((A) <= CGU_BASE + CGU_OFF)) ||\
+-				(((A) >= GPHYCDB_BASE) && ((A) <= GPHYCDB_BASE + GPHYCDB_OFF)))
++#define VALIDATE_ADDR(A)\
++	((((A) >= RCU_BASE) && ((A) <= RCU_BASE + RCU_OFF)) ||\
++	(((A) >= CHIPTOP_BASE) && ((A) <= CHIPTOP_BASE + CHIPTOP_OFF)) ||\
++	(((A) >= CGU_BASE) && ((A) <= CGU_BASE + CGU_OFF)) ||\
++	(((A) >= GPHYCDB_BASE) && ((A) <= GPHYCDB_BASE + GPHYCDB_OFF)))
+ 
+ /* SECURE REGISTERs BASE */
+ #define RCU_BASE		0x16100000
+@@ -23,7 +24,7 @@
+ #define CHIPTOP_OFF		0x1000
+ #define CGU_BASE		0x16200000
+ #define CGU_OFF			0x810
+-#define GPHYCDB_BASE	0x16210080
++#define GPHYCDB_BASE		0x16210080
+ #define GPHYCDB_OFF		0x90
+ 
+ /* RCU Register definition */
+@@ -122,7 +123,8 @@ struct secure_regs gsec_w[] = {
+ 	{CHIPTOP_BASE + XBAR2_BASE, REG_ACCESS_PROTECTED, 0, 0},
+ 	{CHIPTOP_BASE + XBAR4_BASE, REG_ACCESS_PROTECTED, 0, 0},
+ 	{CGU_BASE + PLL0A_CFG0, REG_ACCESS_ONCE, UINT_MAX, 0},
+-	{CGU_BASE + PLL0A_CFG1, (REG_ACCESS_ONCE | REG_ACCESS_SELECTIVE), 0xFFFFFFFE, 0x1},
++	{CGU_BASE + PLL0A_CFG1, (REG_ACCESS_ONCE | REG_ACCESS_SELECTIVE),
++							0xFFFFFFF0, 0xF},
+ 	{CGU_BASE + PLL0A_CFG2, REG_ACCESS_ONCE, UINT_MAX, 0},
+ 	{CGU_BASE + PLL0B_CFG0, REG_ACCESS_ONCE, UINT_MAX, 0},
+ 	{CGU_BASE + PLL0B_CFG1, REG_ACCESS_ONCE, UINT_MAX, 0},
+@@ -136,6 +138,25 @@ struct secure_regs gsec_w[] = {
+ 	{CGU_BASE + GPHY_FCR, REG_ACCESS_ONCE, UINT_MAX, 0},
+ };
+ 
++/* global variable for clock divider valid list */
++static u32 g_cf_table;
++
++/* validate cpu freq divider values */
++static bool validate_freq_divider(u32 val)
++{
++	u32 table = g_cf_table;
++
++	if (g_cf_table == 0)
++		return true;
++
++	while (table) {
++		if ((table & 0xF) == val)
++			return true;
++		table = table >> 4;
++	}
++	return false;
++}
++
+ static int tep_sec_readl(phys_addr_t paddr, u32 *val)
+ {
+ 	int idx;
+@@ -214,6 +235,15 @@ static int tep_sec_writel(phys_addr_t paddr, u32 val)
+ 			break;
+ 	}
+ 
++	/* Validate the values if REG is PLL0A_CFG1 */
++	if (gsec_w[idx].paddr == (CGU_BASE + PLL0A_CFG1)) {
++		if (validate_freq_divider(val & 0xF) == false) {
++			pr_err("!!! ===%s: paddr 0x%x out of range !!!\n",
++			       __func__, paddr);
++			return -EINVAL;
++		}
++	}
++
+ 	if ((idx >= 0) && (idx < size)) {
+ 		reg = tep_reg_read(paddr);
+ 		if (gsec_w[idx].mode == REG_ACCESS_PROTECTED) {
+@@ -250,7 +280,6 @@ static int tep_sec_writel(phys_addr_t paddr, u32 val)
+ 	} else {
+ 		reg = val;
+ 	}
+-
+ 	tep_reg_writel(reg, paddr);
+ 	return 0;
+ }
+@@ -275,23 +304,26 @@ static void process_regmap_message(icc_devices client_id)
+ 		val = icc_reply_msg.param[1];
+ 
+ 		switch (rw.msg_id) {
+-			case REGMAP_WR_MSGID:
+-				tep_sec_writel((phys_addr_t)addr, val);
+-				break;
+-
+-			case REGMAP_RD_MSGID:
+-				val = 0;
+-				tep_sec_readl((phys_addr_t)addr, &val);
+-				icc_reply_msg.param[1] = val;
+-				break;
+-
+-			case REGMAP_CF_MSGID:
+-				/* For clock frequency table from IAP */
+-				break;
+-
+-			default:
+-				icc_reply_msg.param[2] = 1;
+-				break;
++		case REGMAP_WR_MSGID:
++			tep_sec_writel((phys_addr_t)addr, val);
++			break;
++
++		case REGMAP_RD_MSGID:
++			val = 0;
++			tep_sec_readl((phys_addr_t)addr, &val);
++			icc_reply_msg.param[1] = val;
++			break;
++
++		case REGMAP_CF_MSGID:
++			/* For clock frequency table from IAP */
++			/* No response required , so return */
++			/* store the bitfield in global variable */
++			g_cf_table = rw.param[0];
++			return;
++
++		default:
++			icc_reply_msg.param[2] = 1;
++			break;
+ 		}
+ 		icc_write(client_id, &icc_reply_msg);
+ 	} else {
+@@ -327,30 +359,29 @@ int __init init_icc_regmap(void)
+ 
+ 	if (result_cgu == 0)
+ 		result_cgu = icc_register_callback(REGMAP_CGU,
+-					&pfn_icc_regmap_callback_cgu);
++						&pfn_icc_regmap_callback_cgu);
+ 	if (result_rcu == 0)
+ 		result_rcu = icc_register_callback(REGMAP_RCU,
+-					&pfn_icc_regmap_callback_rcu);
++						&pfn_icc_regmap_callback_rcu);
+ 	if (result_ct == 0)
+ 		result_ct = icc_register_callback(REGMAP_CT,
+-					&pfn_icc_regmap_callback_ct);
++						&pfn_icc_regmap_callback_ct);
+ 	if (result_cgu < 0) {
+ 		pr_err("%s: icc_register_callback failed for cgu\n",
+-				 __func__);
++		       __func__);
+ 		icc_unregister_callback(REGMAP_CGU);
+ 		icc_close((struct inode *)REGMAP_CGU, NULL);
+ 		return -EBUSY;
+ 	}
+ 	if (result_rcu < 0) {
+-		pr_err("%s: icc_register_callback failed for rcu\n",
+-				 __func__);
++		pr_err("%s: icc_register_callback failed for rcu\n", __func__);
+ 		icc_unregister_callback(REGMAP_RCU);
+ 		icc_close((struct inode *)REGMAP_RCU, NULL);
+ 		return -EBUSY;
+ 	}
+ 	if (result_ct < 0) {
+ 		pr_err("%s: icc_register_callback failed for chip top\n",
+-				__func__);
++		       __func__);
+ 		icc_unregister_callback(REGMAP_CT);
+ 		icc_close((struct inode *)REGMAP_CT, NULL);
+ 		return -EBUSY;
+@@ -359,4 +390,3 @@ int __init init_icc_regmap(void)
+ }
+ module_init(init_icc_regmap);
+ MODULE_LICENSE("GPL v2");
+-
+diff --git a/drivers/cpufreq/xrx500-cpufreq.c b/drivers/cpufreq/xrx500-cpufreq.c
+index ba0aef15c75b..82e8ae23cc1b 100644
+--- a/drivers/cpufreq/xrx500-cpufreq.c
++++ b/drivers/cpufreq/xrx500-cpufreq.c
+@@ -21,15 +21,25 @@
+ #include <linux/pm_opp.h>
+ #include <linux/cpufreq.h>
+ #include <lantiq_soc.h>
++#include <linux/icc/drv_icc.h>
++#include <linux/regmap.h>
++#include <linux/mfd/syscon.h>
+ 
+ #define VERSIONS_COUNT 1
++#define MAX_SCALING_FREQ 8
++/* CGU Register: PLL0A_CFG1 */
++#define CGU_PLL0A_CFG2	0xC
++/* bitfield FBDIV / REFDIV */
++#define FBDIV		0xFFF
++#define REFDIV		0xFC0000
+ 
+ /* OPP supported_hw definition for XRX500/PRX300 Family SoC.
+-   This enables us to select only a subset of OPPs from the
+-   larger OPP table, based on what version of the hardware we are running on.
+-   The representation is 1 bit per version, max 32 bit.
+-   This opp_table->supported_hw will be bitwise mask with OPP-DT paramter
+-   opp-supported-hw. */
++ * This enables us to select only a subset of OPPs from the
++ * larger OPP table, based on what version of the hardware we are running on.
++ * The representation is 1 bit per version, max 32 bit.
++ * This opp_table->supported_hw will be bitwise mask with OPP-DT parameter
++ * opp-supported-hw.
++ */
+ #define SOC_HW_ID_GRX5838	0x1
+ #define SOC_HW_ID_GRX5828	0x2
+ #define SOC_HW_ID_GRX5628	0x4
+@@ -39,10 +49,12 @@
+ #define SOC_HW_ID_GRX3506	0x40
+ #define SOC_HW_ID_GRX3508	0x80
+ #define SOC_HW_ID_IRX200	0x100
+-#define SOC_HW_ID_FMX_FIBERPHY	0x1000
+-#define SOC_HW_ID_FMX_SFU	0x2000
+-#define SOC_HW_ID_FMX_SFP	0x4000
+-#define SOC_HW_ID_FMX_DPU	0x8000
++#define SOC_HW_ID_PRX_FIBERPHY	0x1000
++#define SOC_HW_ID_PRX_SFU	0x2000
++#define SOC_HW_ID_PRX_SFP	0x4000
++#define SOC_HW_ID_PRX_DPU	0x8000
++#define PLF_GRX500		0xAB
++#define PLF_PRX			0xAC
+ 
+ static const struct of_device_id machines[] = {
+ 	{ .compatible = "lantiq,xrx500", },
+@@ -52,23 +64,23 @@ static const struct of_device_id machines[] = {
+ 
+ extern unsigned long loops_per_jiffy;
+ static int xrx500_cpufreq_transition_notifier(struct notifier_block *nb,
+-					unsigned long val, void *data);
++					      unsigned long val, void *data);
+ 
+ /* MIPS cpu_data[] structure has no per_cpu jiffiy variable like arm.
+-   Therefore we just have one global loops_per_jiffy. The adjust_jiffies()
+-   function in the core cpufreq.c module is active only for none SMP systems.
+-   xrx500 has CONFIG_SMP set, therefore we need this implementation here.
+-   CPUFREQ_TRANSITION_NOTIFIER is called for every CPU running Linux.
+-   That means we have to consider that loops_per_jiffy is changed only once
+-   during one frequency transition.
+-*/
++ * Therefore we just have one global loops_per_jiffy. The adjust_jiffies()
++ * function in the core cpufreq.c module is active only for none SMP systems.
++ * xrx500 has CONFIG_SMP set, therefore we need this implementation here.
++ * CPUFREQ_TRANSITION_NOTIFIER is called for every CPU running Linux.
++ * That means we have to consider that loops_per_jiffy is changed only once
++ * during one frequency transition.
++ */
+ static int one_trans;
+ static struct notifier_block xrx500_cpufreq_transition_notifier_block = {
+ 	.notifier_call = xrx500_cpufreq_transition_notifier
+ };
+ 
+ static int xrx500_cpufreq_transition_notifier(struct notifier_block *nb,
+-					unsigned long val, void *data)
++					      unsigned long val, void *data)
+ {
+ 	struct cpufreq_freqs *freq = data;
+ 
+@@ -85,55 +97,66 @@ static int xrx500_cpufreq_transition_notifier(struct notifier_block *nb,
+ 		}
+ 		/* adjust udelay for each cpu */
+ 		cpu_data[freq->cpu].udelay_val = loops_per_jiffy;
+-
+ 	}
+ 	return NOTIFY_OK;
+ }
+ 
+-static unsigned int xrx500_pnum2version(struct device *dev, unsigned int id)
++static unsigned int xrx500_pnum2version(struct device *dev, unsigned int id,
++					unsigned int *plf)
+ {
+ 	switch (id) {
+ 	case SOC_ID_GRX5838:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX5838;
+ 	case SOC_ID_GRX5828:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX5828;
+ 	case SOC_ID_GRX5628:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX5628;
+ 	case SOC_ID_GRX5821:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX5821;
+ 	case SOC_ID_GRX5831:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX5831;
+ 	case SOC_ID_GRX58312:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX58312;
+ 	case SOC_ID_GRX3506:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX3506;
+ 	case SOC_ID_GRX3508:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_GRX3508;
+ 	case SOC_ID_IRX200:
++		*plf = PLF_GRX500;
+ 		return SOC_HW_ID_IRX200;
+ 	case SOC_ID_FMX_FIBERPHY:
+-		return SOC_HW_ID_FMX_FIBERPHY;
++		*plf = PLF_PRX;
++		return SOC_HW_ID_PRX_FIBERPHY;
+ 	case SOC_ID_FMX_SFU:
+-		return SOC_HW_ID_FMX_SFU;
++		*plf = PLF_PRX;
++		return SOC_HW_ID_PRX_SFU;
+ 	case SOC_ID_FMX_SFP:
+-		return SOC_HW_ID_FMX_SFP;
++		*plf = PLF_PRX;
++		return SOC_HW_ID_PRX_SFP;
+ 	case SOC_ID_FMX_DPU:
+-		return SOC_HW_ID_FMX_DPU;
++		*plf = PLF_PRX;
++		return SOC_HW_ID_PRX_DPU;
+ 	default:
+ 		return -EINVAL;
+ 	}
+ }
+ 
+-
+ int xrx500_opp_set_supported_hw(struct device *cpu_dev)
+ {
+-	unsigned int id;
+-	int version;
++	unsigned int version, id, platform;
+ 	int ret;
+ 
+ 	id = ltq_get_cpu_id();
+ 
+-	version = xrx500_pnum2version(cpu_dev, id);
++	version = xrx500_pnum2version(cpu_dev, id, &platform);
+ 	if (version < 0) {
+ 		dev_err(cpu_dev, "unknown chip id (0x%x)\n", id);
+ 		return ret;
+@@ -154,7 +177,14 @@ static int xrx500_cpufreq_driver_init(void)
+ 	struct device_node *np = of_find_node_by_path("/");
+ 	struct device *cpu_dev;
+ 	const struct of_device_id *match;
+-	int ret;
++	int ret, i;
++	struct cpufreq_policy *policy;
++	struct cpufreq_frequency_table *pos;
++	struct cpufreq_frequency_table *table;
++	struct regmap *cgu_pllcfg;
++	unsigned int val, f_vco_clk;
++	unsigned int div, platform;
++	icc_msg_t w;
+ 
+ 	if (!np)
+ 		return -ENODEV;
+@@ -170,6 +200,7 @@ static int xrx500_cpufreq_driver_init(void)
+ 		return -ENODEV;
+ 	}
+ 
++	(void)xrx500_pnum2version(cpu_dev, ltq_get_cpu_id(), &platform);
+ 	ret = xrx500_opp_set_supported_hw(cpu_dev);
+ 	if (ret)
+ 		return ret;
+@@ -184,8 +215,105 @@ static int xrx500_cpufreq_driver_init(void)
+ 	/* Instantiate cpufreq-dt */
+ 	platform_device_register_full(&devinfo);
+ 
+-	return ret;
++	if (platform == PLF_PRX) {
++		/* we need to check what is the current f_vco_clock for pll0a
++		 *f_vco_clk = f_osc_clk * FBDIV / REFDIV
++		 *f_osc_clk = 40MHz
++		 */
++		/* get CGU regmap */
++		cgu_pllcfg = syscon_regmap_lookup_by_phandle(cpu_dev->of_node,
++							"intel,cgu-syscon");
++		regmap_read(cgu_pllcfg, CGU_PLL0A_CFG2, &val);
++		f_vco_clk = 40000 * (val & FBDIV) / ((val & REFDIV) >> 18);
+ 
++		if (IS_ERR(cgu_pllcfg)) {
++			dev_err(cpu_dev, "No phandle for intel,cgu-syscon\n");
++			return PTR_ERR(cgu_pllcfg);
++		}
++
++		/* expose scaling frequencies to TEP for policy check
++		 * max scaling frequencies supported are MAX_SCALING_FREQ.
++		 * We expose directly the valid clk divider value used in
++		 * CGU Register: PLL0A_CFG1:PLL_CLK0. Every frequency value is
++		 * mapped to a 4-bit divider value.
++		 * write.param: bit(3:0)   -> freq1
++		 * write.param: bit(7:4)   -> freq2
++		 * write.param: bit(11:8)  -> freq3
++		 * write.param: bit(15:12) -> freq4
++		 * write.param: bit(19:16) -> freq5
++		 * write.param: bit(23:20) -> freq6
++		 * write.param: bit(27:24) -> freq7
++		 * write.param: bit(31:28) -> freq8
++		 */
++		policy = cpufreq_cpu_get(0);
++		pos = policy->freq_table;
++		table = policy->freq_table;
++		if (!table)
++			return -ENODEV;
++		i = 0;
++		memset(&w, 0, sizeof(icc_msg_t));
++		cpufreq_for_each_valid_entry(pos, table) {
++			if (i < MAX_SCALING_FREQ) {
++				div = (f_vco_clk / pos->frequency);
++				switch (div) {
++				case 2:
++					w.param[0]  |= (1 << (i * 4));
++					break;
++				case 3:
++					w.param[0]  |= (2 << (i * 4));
++					break;
++				case 4:
++					w.param[0]  |= (3 << (i * 4));
++					break;
++				case 5:
++					w.param[0]  |= (4 << (i * 4));
++					break;
++				case 6:
++					w.param[0]  |= (5 << (i * 4));
++					break;
++				case 8:
++					w.param[0]  |= (6 << (i * 4));
++					break;
++				case 10:
++					w.param[0] |= (7 << (i * 4));
++					break;
++				case 12:
++					w.param[0] |= (8 << (i * 4));
++					break;
++				case 16:
++					w.param[0] |= (9 << (i * 4));
++					break;
++				case 20:
++					w.param[0] |= (10 << (i * 4));
++					break;
++				case 24:
++					w.param[0] |= (11 << (i * 4));
++					break;
++				case 32:
++					w.param[0] |= (12 << (i * 4));
++					break;
++				case 40:
++					w.param[0] |= (13 << (i * 4));
++					break;
++				case 48:
++					w.param[0] |= (14 << (i * 4));
++					break;
++				case 64:
++					w.param[0] |= (15 << (i * 4));
++					break;
++				default:
++					break;
++				}
++				i++;
++			}
++		}
++		/* expose scaling frequencies to TEP-RegMap for policy check */
++		w.src_client_id = REGMAP_CGU;
++		w.dst_client_id = REGMAP_CGU;
++		w.msg_id = REGMAP_CF_MSGID;
++		ret = icc_write(REGMAP_CGU, &w);
++	}
++	return ret;
+ }
+ module_init(xrx500_cpufreq_driver_init);
+ 

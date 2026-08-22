@@ -1,0 +1,275 @@
+From e0718af6ae9bef0e02f430a70c88bca08f205362 Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zahari.doychev@intel.com>
+Date: Wed, 24 Jul 2019 16:42:00 +0200
+Subject: [PATCH] PONRTSYS-3949: dp_eth_reinsert: initial version
+
+This is a simple driver providing user space API for packet insertion back
+for hardware processing. The re-inserted packets go through the complete
+switch processing including vlan ops etc.
+
+The driver provides dedicated network device (insX) which can be used for
+the packet insertion. The application can use normal sockets and specify
+the insertion point i.e., network device using the socket SO_MARK option.
+For re-inserting back packets ingressing on the LAN port eth0_x and on the
+PON port gem or pmapper netdev has to be used.
+
+Below is code snippet example showing how applications can insert packets
+using the driver:
+
+{
+
+	...
+
+	struct msghdr msg;
+	struct cmsghdr *cmsg;
+	struct iovec msgvec;
+	char packet[1024];
+	size_t packet_len;
+	const unsigned char ether_broadcast_addr[]=
+				    {0xff,0xff,0xff,0xff,0xff,0xff};
+	struct sockaddr_ll addr={0};
+	union {
+		char ifi[CMSG_SPACE(sizeof(unsigned int))];
+		struct cmsghdr align;
+	} u;
+	int flags = 0, ret = 0;
+
+	addr.sll_family = PF_PACKET;
+	addr.sll_ifindex = ifi;
+	addr.sll_halen = ETHER_ADDR_LEN;
+	addr.sll_protocol = htons(ETH_P_ALL);
+	memcpy(addr.sll_addr, ether_broadcast_addr, ETHER_ADDR_LEN);
+
+	/* Fill packet with payload */
+	...
+
+	msgvec.iov_base = packet;
+	msgvec.iov_len = packet_len;
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = &addr;
+	msg.msg_namelen = sizeof(addr);
+	msg.msg_control = u.ifi;
+	msg.msg_controllen = CMSG_LEN(sizeof(unsigned int));
+	msg.msg_flags = 0;
+	msg.msg_iov = &msgvec;
+	msg.msg_iovlen = 1;
+
+	/* CMSG hdr */
+	cmsg = CMSG_FIRSTHDR(&msg);
+	cmsg->cmsg_level = SOL_SOCKET;
+	cmsg->cmsg_type = SO_MARK;
+	cmsg->cmsg_len = CMSG_LEN(sizeof(unsigned int));
+	*(uint32_t *)CMSG_DATA(cmsg) = reifi;
+
+	int n = sendmsg(s, &msg, flags);
+	if (n <= 0)
+		return -1;
+
+	...
+}
+---
+ drivers/net/datapath/Kconfig                       |   1 +
+ drivers/net/datapath/dp_eth_reinsert/Kconfig       |  13 ++
+ drivers/net/datapath/dp_eth_reinsert/Makefile      |   2 +
+ .../net/datapath/dp_eth_reinsert/dp_eth_reinsert.c | 146 +++++++++++++++++++++
+ drivers/net/ethernet/lantiq/Makefile               |   1 +
+ 5 files changed, 163 insertions(+)
+
+diff --git a/drivers/net/datapath/Kconfig b/drivers/net/datapath/Kconfig
+index 5425a5067489..48e0dfeb3902 100644
+--- a/drivers/net/datapath/Kconfig
++++ b/drivers/net/datapath/Kconfig
+@@ -13,4 +13,5 @@ source "drivers/net/datapath/dpm/Kconfig"
+ source "drivers/net/datapath/umt/Kconfig"
+ source "drivers/net/datapath/mib_counters/Kconfig"
+ source "drivers/net/datapath/pon_qos/Kconfig"
++source "drivers/net/datapath/dp_eth_reinsert/Kconfig"
+ endif # INTEL_NP_NET_CORE
+diff --git a/drivers/net/datapath/dp_eth_reinsert/Kconfig b/drivers/net/datapath/dp_eth_reinsert/Kconfig
+new file mode 100644
+index 000000000000..e32a0518b141
+--- /dev/null
++++ b/drivers/net/datapath/dp_eth_reinsert/Kconfig
+@@ -0,0 +1,13 @@
++if INTEL_DATAPATH
++
++config DP_ETH_REINSERT
++	tristate "Datapath reinsert driver"
++
++	help
++	  This driver provides user space API for reinserting packets back for
++	  hardware processing before sending them out. The driver provides
++	  special reinsertion network devices used for the reinsertion. The
++	  network device for the reinsertion point is passed using the
++	  SO_MARK socket option.
++
++endif
+diff --git a/drivers/net/datapath/dp_eth_reinsert/Makefile b/drivers/net/datapath/dp_eth_reinsert/Makefile
+new file mode 100644
+index 000000000000..0b8e09c9795c
+--- /dev/null
++++ b/drivers/net/datapath/dp_eth_reinsert/Makefile
+@@ -0,0 +1,2 @@
++obj-$(CONFIG_DP_ETH_REINSERT) += dp_eth_reinsert.o
++
+diff --git a/drivers/net/datapath/dp_eth_reinsert/dp_eth_reinsert.c b/drivers/net/datapath/dp_eth_reinsert/dp_eth_reinsert.c
+new file mode 100644
+index 000000000000..4349794c11ea
+--- /dev/null
++++ b/drivers/net/datapath/dp_eth_reinsert/dp_eth_reinsert.c
+@@ -0,0 +1,146 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (C) 2020 Intel Corporation. */
++
++#include <linux/module.h>
++#include <linux/kernel.h>
++#include <linux/errno.h>
++#include <linux/types.h>
++#include <linux/netdevice.h>
++#include <linux/etherdevice.h>
++#include <linux/skbuff.h>
++#include <linux/if_arp.h>
++
++#include <net/datapath_api.h>
++
++static struct net_device *rndev;
++
++struct dp_eth_reinsert_priv {
++	struct net_device_stats stats;
++	int status;
++	struct net_device *dev;
++};
++
++int dp_eth_reinsert_open(struct net_device *dev)
++{
++	netif_start_queue(dev);
++	return 0;
++}
++
++int dp_eth_reinsert_release(struct net_device *dev)
++{
++	netif_stop_queue(dev);
++	return 0;
++}
++
++int dp_eth_reinsert_config(struct net_device *dev, struct ifmap *map)
++{
++	return 0;
++}
++
++static bool dp_eth_reinsert_skb_mark_ok(struct sk_buff *skb)
++{
++	if (!skb || !skb->sk || !skb->sk->sk_socket)
++		return false;
++
++	if (skb->sk->sk_socket->type == SOCK_RAW && skb->mark > 0)
++		return true;
++
++	return false;
++}
++
++int dp_eth_reinsert_tx(struct sk_buff *skb, struct net_device *dev)
++{
++	struct dma_tx_desc_0 *dw0 = (struct dma_tx_desc_0 *)&skb->DW0;
++	struct dma_tx_desc_1 *dw1 = (struct dma_tx_desc_1 *)&skb->DW1;
++	struct net_device *rdev = NULL;
++	dp_subif_t subif = {0};
++	int ret = -EINVAL;
++
++	do {
++		/* ifindex for reinsertion passed using the SO_MARK */
++		if (!dp_eth_reinsert_skb_mark_ok(skb))
++			break;
++
++		rdev = dev_get_by_index(&init_net, skb->mark);
++		if (!rdev)
++			break;
++
++		ret = dp_get_netif_subifid(rdev, NULL, NULL, NULL, &subif, 0);
++		if (ret != DP_SUCCESS) {
++			netdev_err(skb->dev, "%s: err %d for %s\n",
++				   __func__, ret, rdev->name);
++			break;
++		}
++
++		dw1->field.ep = subif.port_id;
++		dw0->field.dest_sub_if_id = subif.subif;
++		netdev_dbg(skb->dev, "%s: ifi: %u if: %s EP: %u subif: %u\n",
++			   __func__, rdev->ifindex, rdev->name,
++			   subif.port_id, subif.subif);
++		ret = dp_xmit(rdev, &subif, skb, skb->len, DP_TX_INSERT);
++		if (ret)
++			netdev_err(skb->dev, "%s: insert fail\n", __func__);
++
++		/* dp_xmit always frees the skb */
++		ret = 0;
++	} while (0);
++
++	if (rdev)
++		dev_put(rdev);
++
++	if (ret)
++		dev_kfree_skb(skb);
++
++	return NETDEV_TX_OK;
++}
++
++static const struct net_device_ops dp_eth_reinsert_netdev_ops = {
++	.ndo_open            = dp_eth_reinsert_open,
++	.ndo_stop            = dp_eth_reinsert_release,
++	.ndo_start_xmit      = dp_eth_reinsert_tx,
++	.ndo_set_config      = dp_eth_reinsert_config,
++};
++
++void dp_eth_reinsert_init(struct net_device *dev)
++{
++	struct dp_eth_reinsert_priv *priv;
++
++	ether_setup(dev); /* assign some of the fields */
++	dev->netdev_ops = &dp_eth_reinsert_netdev_ops;
++	dev->flags |= IFF_NOARP;
++	dev->features |= NETIF_F_HW_CSUM;
++	dev->type = ARPHRD_VOID;
++
++	priv = netdev_priv(dev);
++
++	memset(priv, 0, sizeof(struct dp_eth_reinsert_priv));
++}
++
++void dp_eth_reinsert_cleanup(void)
++{
++	if (rndev) {
++		unregister_netdev(rndev);
++		free_netdev(rndev);
++	}
++}
++
++int dp_eth_reinsert_init_module(void)
++{
++	int ret = -ENOMEM;
++
++	rndev = alloc_netdev(sizeof(struct dp_eth_reinsert_priv),
++			     "ins%d", NET_NAME_UNKNOWN,
++			     dp_eth_reinsert_init);
++	if (!rndev)
++		return ret;
++
++	ret = register_netdev(rndev);
++
++	if (ret)
++		dp_eth_reinsert_cleanup();
++
++	return ret;
++}
++
++module_init(dp_eth_reinsert_init_module);
++module_exit(dp_eth_reinsert_cleanup);
+diff --git a/drivers/net/ethernet/lantiq/Makefile b/drivers/net/ethernet/lantiq/Makefile
+index c72e2e54e819..ad70e126fd1b 100644
+--- a/drivers/net/ethernet/lantiq/Makefile
++++ b/drivers/net/ethernet/lantiq/Makefile
+@@ -20,3 +20,4 @@ obj-$(CONFIG_QOS_MGR) += qos_mgr/
+ obj-$(CONFIG_LTQ_TOE_DRIVER) += ltq_toe_drv.o
+ obj-$(CONFIG_INTEL_MIB_COUNTERS) += ../../datapath/mib_counters/
+ obj-$(CONFIG_PON_QOS) += ../../datapath/pon_qos/
++obj-$(CONFIG_DP_ETH_REINSERT) += ../../datapath/dp_eth_reinsert/

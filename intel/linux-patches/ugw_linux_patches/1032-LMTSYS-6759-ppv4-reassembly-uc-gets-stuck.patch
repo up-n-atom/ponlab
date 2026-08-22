@@ -1,0 +1,1166 @@
+From 59fe9d3cf91b7c40f8f785f02962231000a3c0e1 Mon Sep 17 00:00:00 2001
+From: Emergi Idan <idan.emergi@intel.com>
+Date: Sun, 2 Feb 2020 17:20:20 +0200
+Subject: [PATCH] LMTSYS-6759: ppv4 reassembly uc gets stuck
+
+Enable reassembly in PPv4
+Add additional UC debug capabilities
+
+Signed-off-by: Emergi Idan <idan.emergi@intel.com>
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |  51 ++---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |  31 ++-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c | 134 ++++++++---
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      | 246 +++++++++++++++++++--
+ drivers/net/ppv4/pp-hal/micro-controller/uc.h      |   8 +
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   |  10 +-
+ .../net/ppv4/pp-hal/micro-controller/uc_debugfs.c  | 211 +++++++++++++++++-
+ .../net/ppv4/pp-hal/micro-controller/uc_internal.h |  55 +++++
+ .../pp-hal/micro-controller/uc_private_engines.h   |  22 ++
+ drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h |  35 ++-
+ 10 files changed, 694 insertions(+), 109 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 290641b563f5..67b00fd7b92a 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -260,8 +260,7 @@ s32 pp_nf_set(enum pp_nf_type type, struct pp_nf_info *nf)
+ 	}
+ 
+ 	/* store nf info */
+-	if (type != PP_NF_REASSEMBLY)
+-		set_bit(type, &db->nf_en);
++	set_bit(type, &db->nf_en);
+ 	memcpy(&db->nf[type], nf, sizeof(*nf));
+ 
+ 	/* Notify session manager of the new NF added */
+@@ -552,76 +551,52 @@ s32 pp_global_stats_get(void *stats, u32 num_stats, void *data)
+ 		return -EINVAL;
+ 
+ 	ret = port_dist_stats_get(&__stats->port_dist_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("port_dist_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = rpb_stats_get(&__stats->rpb_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("rpb_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = prsr_stats_get(&__stats->parser_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("prsr_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = cls_stats_get(&__stats->cls_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("cls_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = chk_stats_get(&__stats->chk_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("chk_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = mod_stats_get(&__stats->mod_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("mod_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = rx_dma_stats_get(&__stats->rx_dma_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("rx_dma_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = pp_qos_stats_get(data, &__stats->qos_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("pp_qos_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = pp_smgr_mcast_stats_get(&__stats->mcast_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("pp_smgr_mcast_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = pp_smgr_frag_stats_get(&__stats->frag_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("pp_smgr_frag_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = smgr_sq_dbg_stats_get(&__stats->syncq_stats, false);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("smgr_sq_dbg_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	ret = pp_smgr_reassembly_stats_get(&__stats->reass_stats);
+-	if (unlikely(ret)) {
++	if (unlikely(ret))
+ 		pr_err("pp_smgr_reassembly_stats_get failed\n");
+-		return ret;
+-	}
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 74c10f03f39e..323d963a674f 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -1748,8 +1748,7 @@ s32 pp_smgr_reassembly_stats_get(struct smgr_reass_stats *stats)
+ 		if (!uc_is_cpu_active(UC_IS_EGR, cid))
+ 			continue;
+ 
+-		ret = uc_egr_mbox_cmd_send(UC_CMD_REASSEMBLY_STATS, cid, NULL,
+-					   0, &cpu_stats, sizeof(cpu_stats));
++		ret = uc_reass_stats_get(cid, &cpu_stats);
+ 		if (unlikely(ret)) {
+ 			pr_err("failed to get reassembly uc cpu %u counters\n",
+ 			       cid);
+@@ -2097,7 +2096,7 @@ static void __smgr_fv_oob_set(struct sess_info *sess)
+ }
+ 
+ static s32 hash_calc(struct sess_info *sess, void *fv, u32 fv_sz,
+-                     struct pp_hash *hash)
++		     struct pp_hash *hash)
+ {
+ 	if (SESS_ARGS_IS_FLAG_OFF(sess, PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT))
+ 		return 0;
+@@ -2979,19 +2978,19 @@ static s32 __smgr_si_mod_info_set(struct sess_info *sess)
+ }
+ 
+ /**
+-* __smgr_si_df_mask_set() - Sets dont frag mask info
+-* @si: Session information
+-* @flags: User flags
+-*
+-* The function configures the DF mask bits according to the user input.
+-* In frag mode checker, we want to mask the internal DF,
+-* so that the checker will divert the packets to the uc anyway.
+-* In that case, fragmenter uc can check where to fragment based on
+-* the learning output.
+-* The real value from the user is copied to the SI UD in both modes
+-*
+-* Return: 0 on Success.
+-*/
++ * @brief __smgr_si_df_mask_set() - Sets dont frag mask info
++ * @param si Session information
++ * @param: User flags
++ *
++ * The function configures the DF mask bits according to the user input.
++ * In frag mode checker, we want to mask the internal DF,
++ * so that the checker will divert the packets to the uc anyway.
++ * In that case, fragmenter uc can check where to fragment based on
++ * the learning output.
++ * The real value from the user is copied to the SI UD in both modes
++ *
++ * @return 0 on Success.
++ */
+ static s32 __smgr_si_df_mask_set(struct pp_si *si, unsigned long flags)
+ {
+ 	u32 int_df_mask = 1;
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 922e57bda799..59c97c3a1018 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -188,7 +188,6 @@ void __smgr_dbg_inact_sessions_dump(struct seq_file *f)
+ 	req.req_prio = 0;
+ 	req.req_id   = get_jiffies_64();
+ 	ret = pp_inactive_sessions_get(&req, sessions, n_sessions);
+-	return;
+ }
+ 
+ PP_DEFINE_DEBUGFS(inact_sess_dump, __smgr_dbg_inact_sessions_dump, NULL);
+@@ -2171,11 +2170,49 @@ void __smgr_dbg_sgc_show_all(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(sgc, __smgr_dbg_sgc_show_all, __smgr_dbg_sgc);
+ 
+-void __smgr_dbg_reass_stats_show(struct seq_file *f)
++s32 __smgr_reass_stats_get(void *_stats, u32 num_stats, void *data)
+ {
+-	struct reassembly_stats stats[UC_CPUS_MAX], *it;
+-	s32 ret;
+-	u32 cid, i;
++	struct reassembly_stats *stats;
++	s32 ret = 0;
++	u32 cid;
++
++	stats = (struct reassembly_stats *)_stats;
++	for (cid = 0; cid < num_stats; cid++) {
++		ret = uc_reass_stats_get(cid, &stats[cid]);
++		if (unlikely(ret)) {
++			pr_err("failed to get reassembly uc cpu %u counters\n",
++			       cid);
++			break;
++		}
++	}
++
++	return ret;
++}
++
++s32 __smgr_reass_stats_diff(void *pre, u32 num_pre, void *post, u32 num_post,
++			    void *delta, u32 num_delta, void *data)
++{
++	struct reassembly_stats *__pre, *__post, *__delta;
++	u32 i;
++
++	if (unlikely(ptr_is_null(pre) || ptr_is_null(post) ||
++		     ptr_is_null(delta)))
++		return -EINVAL;
++
++	__pre   = pre;
++	__post  = post;
++	__delta = delta;
++	for (i = 0; i < num_pre; i++)
++		U32_STRUCT_DIFF(&__pre[i], &__post[i], &__delta[i]);
++
++	return 0;
++}
++
++s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
++			    void *data)
++{
++	struct reassembly_stats *stats, *it;
++	u32 cid;
+ 	char **str;
+ 	static const char * const cntrs_str[] = {
+ 		"rx_pkts",
+@@ -2193,41 +2230,66 @@ void __smgr_dbg_reass_stats_show(struct seq_file *f)
+ 		"unsupported",
+ 		"invalid_len",
+ 		"dropped",
++		"res",
+ 	};
+ 
+-	for (cid = 0; cid < UC_CPUS_MAX; cid++) {
+-		ret = uc_egr_mbox_cmd_send(UC_CMD_REASSEMBLY_STATS, cid, NULL,
+-					   0, &stats[cid], sizeof(stats[cid]));
+-		if (unlikely(ret)) {
+-			pr_err("failed to get reassembly uc cpu %u counters\n",
+-			       cid);
+-			return;
++	pr_buf(buf, sz, *n, "\n");
++	pr_buf_cat(buf, sz, *n,
++		   "|=====================================================================|\n");
++	pr_buf_cat(buf, sz, *n,
++		   "|              Reassembly UC Statistics                               |\n");
++	pr_buf_cat(buf, sz, *n,
++		   "|=====================================================================|\n");
++	pr_buf_cat(buf, sz, *n,
++		   "| %-15s ", "Counter");
++	for (cid = 0; cid < num; cid++)
++		pr_buf_cat(buf, sz, *n, "|  CPU%u      ", cid);
++	pr_buf_cat(buf, sz, *n, "|\n");
++	pr_buf_cat(buf, sz, *n,
++		   "|-----------------+------------+------------+------------+------------|\n");
++
++	cid = 0;
++	stats = (struct reassembly_stats *)s;
++	for_each_arr_entry(str, cntrs_str, ARRAY_SIZE(cntrs_str), cid++) {
++		pr_buf_cat(buf, sz, *n, "| %-15s ", *str);
++		for_each_arr_entry(it, stats, num) {
++			pr_buf_cat(buf, sz, *n, "| %10u ",
++				   *(((u32 *)it) + cid));
+ 		}
++		pr_buf_cat(buf, sz, *n, "|\n");
+ 	}
++	pr_buf_cat(buf, sz, *n,
++		   "|---------------------------------------------------------------------|\n\n");
+ 
+-	seq_puts(f, "\n");
+-	seq_puts(f, "|=====================================================================|\n");
+-	seq_puts(f, "|              Reassembly UC Statistics                               |\n");
+-	seq_puts(f, "|=====================================================================|\n");
+-	seq_printf(f, "| %-15s ", "Counter");
+-	for (cid = 0; cid < UC_CPUS_MAX; cid++)
+-		seq_printf(f, "|  CPU%u      ", cid);
+-	seq_puts(f, "|\n");
+-	seq_puts(f, "|-----------------+------------+------------+------------+------------|\n");
++	return 0;
++}
+ 
+-	i = 0;
+-	for_each_arr_entry(str, cntrs_str, ARRAY_SIZE(cntrs_str), i++) {
+-		seq_printf(f, "| %-15s ", *str);
+-		for_each_arr_entry(it, stats, ARRAY_SIZE(stats)) {
+-			seq_printf(f, "| %10u ", *(((u32 *)it) + i));
+-		}
+-		seq_puts(f, "|\n");
+-	}
+-	seq_puts(f, "|---------------------------------------------------------------------|\n\n");
++void __smgr_dbg_reass_stats_show(struct seq_file *f)
++{
++	pp_stats_show_seq(f, sizeof(struct reassembly_stats),
++			  UC_CPUS_MAX, __smgr_reass_stats_get,
++			  __smgr_reass_stats_show, NULL);
+ }
+ 
+ PP_DEFINE_DEBUGFS(reass_stats, __smgr_dbg_reass_stats_show, NULL);
+ 
++void __smgr_dbg_reass_pps_show(struct seq_file *f)
++{
++	pp_pps_show_seq(f, sizeof(struct reassembly_stats), UC_CPUS_MAX,
++			__smgr_reass_stats_get, __smgr_reass_stats_diff,
++			__smgr_reass_stats_show, NULL);
++}
++
++PP_DEFINE_DEBUGFS(reass_pps, __smgr_dbg_reass_pps_show, NULL);
++
++static int __smgr_dbg_reass_timeout_set(void *data, u64 val)
++{
++	return uc_egr_mbox_cmd_send(UC_CMD_REASSEMBLY_TIMEOUT_THR, (u32)val,
++				    NULL, 0, NULL, 0);
++}
++
++PP_DEFINE_DBGFS_ATT(reass_timeout, NULL, __smgr_dbg_reass_timeout_set);
++
+ #define PP_MAX_FV_WORD_SIZE    32
+ #define PP_MAX_FV_OFFSET_IN_SI 32
+ 
+@@ -2396,7 +2458,6 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "xsi_raw", &PP_DEBUGFS_FOPS(session_si_raw) },
+ 	{ "stats", &PP_DEBUGFS_FOPS(stats) },
+ 	{ "enable", &PP_DEBUGFS_FOPS(enable) },
+-	{ "reassembly_stats", &PP_DEBUGFS_FOPS(reass_stats) },
+ 	{ "delete_session", &PP_DEBUGFS_FOPS(sess_del) },
+ 	{ "flush", &PP_DEBUGFS_FOPS(flush) },
+ 	{ "session_dstq_set", &PP_DEBUGFS_FOPS(sess_dst_q_set) },
+@@ -2410,6 +2471,12 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "sess_update", &PP_DEBUGFS_FOPS(sess_update) },
+ };
+ 
++static struct debugfs_file reassembly_files[] = {
++	{ "stats", &PP_DEBUGFS_FOPS(reass_stats) },
++	{ "pps", &PP_DEBUGFS_FOPS(reass_pps) },
++	{ "timeout", &PP_DEBUGFS_FOPS(reass_timeout) },
++};
++
+ /**
+  * @brief Set the multicast destination
+  */
+@@ -2746,6 +2813,11 @@ s32 smgr_dbg_init(struct dentry *parent)
+ 	if (unlikely(ret))
+ 		goto done;
+ 
++	ret = pp_debugfs_create(dbgfs, "reassembly", NULL, reassembly_files,
++				ARRAY_SIZE(reassembly_files), NULL);
++	if (unlikely(ret))
++		goto done;
++
+ 	ret = pp_debugfs_create(dbgfs, "mcast", NULL, debugfs_mcast_files,
+ 				ARRAY_SIZE(debugfs_mcast_files), NULL);
+ 	if (unlikely(ret))
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index b1f41f2f888a..9cb8fe4f8536 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -110,6 +110,9 @@ static size_t     logger_buff_sz;
+  */
+ static u32 tdox_state_arr_offset;
+ 
++/* @brief Reassembly stats offset in the egress UC SRAM */
++static u32 reass_stats_sram_off;
++
+ /**
+  * @define base address for the tx manager add packet credit
+  *         register per port.
+@@ -164,6 +167,207 @@ bool uc_is_cpu_valid(bool uc_is_egr, u32 cid)
+ 	return false;
+ }
+ 
++/**
++ * @brief Test whether a task id is valid or not
++ * @param uc_is_egr select cluster
++ * @param tid task if
++ * @return bool true in case it is valid, false otherwise
++ */
++static bool uc_is_task_is_valid(bool uc_is_egr, u32 tid)
++{
++	u32 num_tasks = uc_is_egr ? UC_EGR_MAXTASK : UC_ING_MAXTASK;
++
++	if (tid < num_tasks)
++		return true;
++
++	pr_err("invalid %s task id %u\n", uc_is_egr ? "EGRESS" : "INGRESS",
++	       tid);
++	return false;
++}
++
++s32 uc_reass_stats_get(u32 cid, struct reassembly_stats *stats)
++{
++	u32 off;
++
++	if (unlikely(ptr_is_null(stats)))
++		return -EINVAL;
++
++	if (!uc_is_cpu_valid(UC_IS_EGR, cid))
++		return -EINVAL;
++
++	off = reass_stats_sram_off + cid * sizeof(*stats);
++	PP_REG_RD_REP(UC_SSRAM(EGRESS, off), stats, sizeof(*stats));
++
++	return 0;
++}
++
++s32 uc_task_pc_get(bool uc_is_egr, u32 cid, u32 tid, u32 *pc)
++{
++	u64 addr;
++
++	if (ptr_is_null(pc))
++		return -EINVAL;
++
++	if (!uc_is_cpu_active(uc_is_egr, cid))
++		return -EINVAL;
++
++	if (!uc_is_task_is_valid(uc_is_egr, tid))
++		return -EINVAL;
++
++	if (pp_silicon_step_get() == PP_SSTEP_A) {
++		if (uc_is_egr)
++			addr = UC_A_AUX_PC_REG(EGRESS, cid, tid);
++		else
++			addr = UC_A_AUX_PC_REG(INGRESS, cid, tid);
++	} else {
++		if (uc_is_egr)
++			addr = UC_B_AUX_PC_REG(EGRESS, cid, tid);
++		else
++			addr = UC_B_AUX_PC_REG(INGRESS, cid, tid);
++	}
++
++	*pc = PP_REG_RD32(addr);
++
++	return 0;
++}
++
++s32 uc_task_status32_get(bool uc_is_egr, u32 cid, u32 tid, u32 *status)
++{
++	u64 addr;
++
++	if (ptr_is_null(status))
++		return -EINVAL;
++
++	if (!uc_is_cpu_active(uc_is_egr, cid))
++		return -EINVAL;
++
++	if (!uc_is_task_is_valid(uc_is_egr, tid))
++		return -EINVAL;
++
++	if (pp_silicon_step_get() == PP_SSTEP_A) {
++		if (uc_is_egr)
++			addr = UC_A_AUX_S32_REG(EGRESS, cid, tid);
++		else
++			addr = UC_A_AUX_S32_REG(INGRESS, cid, tid);
++	} else {
++		if (uc_is_egr)
++			addr = UC_B_AUX_S32_REG(EGRESS, cid, tid);
++		else
++			addr = UC_B_AUX_S32_REG(INGRESS, cid, tid);
++	}
++	*status = PP_REG_RD32(addr);
++
++	return 0;
++}
++
++s32 uc_task_ready_get(bool uc_is_egr, u32 cid, u32 tid, bool *ready)
++{
++	u64 addr;
++
++	if (ptr_is_null(ready))
++		return -EINVAL;
++
++	if (!uc_is_cpu_active(uc_is_egr, cid))
++		return -EINVAL;
++
++	if (!uc_is_task_is_valid(uc_is_egr, tid))
++		return -EINVAL;
++
++	if (uc_is_egr)
++		addr = UC_MTSR_READY_REG(EGRESS, cid, tid);
++	else
++		addr = UC_MTSR_READY_REG(INGRESS, cid, tid);
++
++	*ready = !!PP_REG_RD32(addr);
++
++	return 0;
++}
++
++s32 uc_task_popa_active_get(bool uc_is_egr, u32 cid, u32 tid, bool *active,
++			    u32 *queue)
++{
++	u32 num_queues, i;
++	ulong active_map;
++	u64 addr;
++
++	if (ptr_is_null(active) || ptr_is_null(queue))
++		return -EINVAL;
++
++	if (!uc_is_cpu_active(uc_is_egr, cid))
++		return -EINVAL;
++
++	if (!uc_is_task_is_valid(uc_is_egr, tid))
++		return -EINVAL;
++
++	if (uc_is_egr)
++		num_queues = UC_EGR_MAXQUEUE;
++	else
++		num_queues = UC_ING_MAXQUEUE;
++
++	*active = false;
++	for (i = 0; i < num_queues; i++) {
++		if (pp_silicon_step_get() == PP_SSTEP_A) {
++			if (uc_is_egr)
++				addr = UC_A_POPA_ACT_LO_REG(EGRESS, cid, i);
++			else
++				addr = UC_A_POPA_ACT_LO_REG(INGRESS, cid, i);
++		} else {
++			if (uc_is_egr)
++				addr = UC_B_POPA_ACT_LO_REG(EGRESS, cid, i);
++			else
++				addr = UC_B_POPA_ACT_LO_REG(INGRESS, cid, i);
++		}
++
++		active_map = (ulong)PP_REG_RD32(addr);
++
++		if (!test_bit(tid, &active_map))
++			continue;
++
++		if (!*active) {
++			*active = true;
++			*queue = i;
++		} else {
++			pr_debug("%s task %u.%u is already active on queue %u\n",
++				 uc_is_egr ? "EGRESS" : "INGRESS", cid, tid,
++				 *queue);
++		}
++	}
++
++	return 0;
++}
++
++s32 uc_task_regs_get(bool uc_is_egr, u32 cid, u32 tid, u32 *regs, u32 num)
++{
++	u64 addr;
++	u32 i;
++
++	if (ptr_is_null(regs))
++		return -EINVAL;
++
++	if (!uc_is_cpu_active(uc_is_egr, cid))
++		return -EINVAL;
++
++	if (!uc_is_task_is_valid(uc_is_egr, tid))
++		return -EINVAL;
++
++	for (i = 0; i < min(num, UC_TASK_REGS_NUM); i++) {
++		if (pp_silicon_step_get() == PP_SSTEP_A) {
++			if (uc_is_egr)
++				addr = UC_A_PRIV_GP_REG(EGRESS, cid, i, tid);
++			else
++				addr = UC_A_PRIV_GP_REG(INGRESS, cid, i, tid);
++		} else {
++			if (uc_is_egr)
++				addr = UC_B_PRIV_GP_REG(EGRESS, cid, i, tid);
++			else
++				addr = UC_B_PRIV_GP_REG(INGRESS, cid, i, tid);
++		}
++		regs[i] = PP_REG_RD32(addr);
++	}
++
++	return 0;
++}
++
+ bool uc_is_cpu_active(bool uc_is_egr, u32 cid)
+ {
+ 	u8 act_bmap = uc_is_egr ? eg_cpu_act_bmap : in_cpu_act_bmap;
+@@ -455,7 +659,7 @@ s32 uc_fat_get(bool uc_is_egr, u32 ent, u32 *val, bool *enable)
+ 			reg = UC_B_CLUSTERBRIDGE_VALID(EGRESS, ent);
+ 			*enable = PP_FIELD_GET(UC_B_FAT_EN_MSK,
+ 					       PP_REG_RD32(reg));
+-			if (ent < UC_B_FAT_MAX_ENT ) {
++			if (ent < UC_B_FAT_MAX_ENT) {
+ 				reg = UC_B_CLUSTERBRIDGE_FAT(EGRESS, ent);
+ 				*val = PP_FIELD_GET(UC_B_FAT_VAL_MSK,
+ 						    PP_REG_RD32(reg));
+@@ -468,7 +672,7 @@ s32 uc_fat_get(bool uc_is_egr, u32 ent, u32 *val, bool *enable)
+ 			reg = UC_B_CLUSTERBRIDGE_VALID(INGRESS, ent);
+ 			*enable = PP_FIELD_GET(UC_B_FAT_EN_MSK,
+ 					       PP_REG_RD32(reg));
+-			if (ent < UC_B_FAT_MAX_ENT ) {
++			if (ent < UC_B_FAT_MAX_ENT) {
+ 				reg = UC_B_CLUSTERBRIDGE_FAT(INGRESS, ent);
+ 				*val = PP_FIELD_GET(UC_B_FAT_VAL_MSK,
+ 						    PP_REG_RD32(reg));
+@@ -512,20 +716,26 @@ s32 uc_fat_set(bool uc_is_egr, u8 ent, u32 val, bool enable)
+ 			PP_REG_WR32(UC_A_CLUSTERBRIDGE_FAT(INGRESS, ent), val);
+ 	} else {
+ 		if (uc_is_egr) {
+-			PP_REG_WR32(UC_B_CLUSTERBRIDGE_VALID(EGRESS, ent), enable);
+-			if (ent < UC_B_FAT_MAX_ENT ) {
+-				PP_REG_WR32(UC_B_CLUSTERBRIDGE_FAT(EGRESS, ent), val);
++			PP_REG_WR32(UC_B_CLUSTERBRIDGE_VALID(EGRESS, ent),
++				    enable);
++			if (ent < UC_B_FAT_MAX_ENT) {
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_FAT(EGRESS, ent),
++					    val);
+ 			} else {
+ 				ent -= UC_B_FAT_MAX_ENT;
+-				PP_REG_WR32(UC_B_CLUSTERBRIDGE_BASE(EGRESS, ent), val);
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_BASE(EGRESS,
++								    ent), val);
+ 			}
+ 		} else {
+-			PP_REG_WR32(UC_B_CLUSTERBRIDGE_VALID(INGRESS, ent), enable);
+-			if (ent < UC_B_FAT_MAX_ENT ) {
+-				PP_REG_WR32(UC_B_CLUSTERBRIDGE_FAT(INGRESS, ent), val);
++			PP_REG_WR32(UC_B_CLUSTERBRIDGE_VALID(INGRESS, ent),
++				    enable);
++			if (ent < UC_B_FAT_MAX_ENT) {
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_FAT(INGRESS,
++								   ent), val);
+ 			} else {
+ 				ent -= UC_B_FAT_MAX_ENT;
+-				PP_REG_WR32(UC_B_CLUSTERBRIDGE_BASE(INGRESS, ent), val);
++				PP_REG_WR32(UC_B_CLUSTERBRIDGE_BASE(INGRESS,
++								    ent), val);
+ 			}
+ 		}
+ 	}
+@@ -1104,8 +1314,8 @@ s32 uc_nf_set(enum pp_nf_type nf, u16 pid, u16 qos_port, u16 tx_queue,
+ 	case PP_NF_IPSEC:
+ 		uc_port = UC_IPSEC_PORT;
+ 		/* set the ipsec tx queue */
+-		ret = uc_egr_mbox_cmd_send(UC_CMD_IPSEC_QUEUE, tx_queue, NULL, 0,
+-					   NULL, 0);
++		ret = uc_egr_mbox_cmd_send(UC_CMD_IPSEC_QUEUE, tx_queue, NULL,
++					   0, NULL, 0);
+ 		if (unlikely(ret))
+ 			return ret;
+ 		/* set the ipsec pid */
+@@ -1115,7 +1325,6 @@ s32 uc_nf_set(enum pp_nf_type nf, u16 pid, u16 qos_port, u16 tx_queue,
+ 			return ret;
+ 		break;
+ 	case PP_NF_REASSEMBLY:
+-		return 0; /* temporary workaround due to FW issue */
+ 		uc_port = UC_REASS_PORT;
+ 
+ 		ret = __nf_reass_set(tx_queue, dflt_hif);
+@@ -1215,14 +1424,21 @@ static s32 __uc_ver_verify(bool uc_is_egr)
+ s32 __uc_egr_info_set(void)
+ {
+ 	struct eg_uc_init_info info;
++	s32 ret;
+ 
+ 	memset(&info, 0, sizeof(info));
+ 	info.logger_buff    = (u32)logger_buff_phys;
+ 	info.logger_buff_sz = logger_buff_sz;
+ 	info.chk_base       = UC_PP_ADDR(chk_base_addr);
+ 
+-	return uc_egr_mbox_cmd_send(UC_CMD_INIT, 0, (const void *)&info,
+-				    sizeof(info), NULL, 0);
++	ret = uc_egr_mbox_cmd_send(UC_CMD_INIT, 0, (const void *)&info,
++				   sizeof(info), NULL, 0);
++	if (unlikely(ret))
++		return ret;
++
++	return uc_egr_mbox_cmd_send(UC_CMD_REASSEMBLY_STATS_OFF, 0, NULL, 0,
++				    &reass_stats_sram_off,
++				    sizeof(reass_stats_sram_off));
+ }
+ 
+ /**
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.h b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+index ec44a6c783c8..08ee22f86e2a 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+@@ -112,6 +112,14 @@ enum uc_mbox_set {
+ 	UC_EGR_MBOX1,
+ };
+ 
++/**
++ * @brief Get reassembly tasks stats
++ * @param cid CPU id
++ * @param stats stats buffer
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_reass_stats_get(u32 cid, struct reassembly_stats *stats);
++
+ /**
+  * @brief send a mailbox command to the egress(only) uc
+  * @param type command type
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index a6a816e2bd12..c227e5756466 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -13,7 +13,7 @@
+  * the version here
+  */
+ #define EGRESS_VER_MAJOR  1
+-#define EGRESS_VER_MINOR  9
++#define EGRESS_VER_MINOR  10
+ 
+ #define INGRESS_VER_MAJOR 1
+ #define INGRESS_VER_MINOR 2
+@@ -53,9 +53,13 @@ enum uc_mbox_cmd_type {
+ 	UC_CMD_IPSEC_QUEUE,
+ 	/*! set the reassembly info */
+ 	UC_CMD_REASSEMBLY_INFO,
+-	/*! get UC CPU reassembly stats */
+-	UC_CMD_REASSEMBLY_STATS,
++	/*! get reassembly stats in SRAM */
++	UC_CMD_REASSEMBLY_STATS_OFF,
++	/*! set reassembly context timeout */
++	UC_CMD_REASSEMBLY_TIMEOUT_THR,
++	/* read UC AUX register value */
+ 	UC_CMD_AUX_REG_RD,
++	/* write UC AUX register value */
+ 	UC_CMD_AUX_REG_WR,
+ 	/*! get the fragmentation stats */
+ 	UC_CMD_FRAG_STATS,
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c b/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c
+index 6c1adf4d1fa4..323ff1a2b512 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_debugfs.c
+@@ -30,6 +30,8 @@
+  */
+ static struct dentry *dbgfs;
+ 
++static u32 gcid, gtid;
++
+ static void uc_dbg_nf_cfg_set(char *cmd_buf, void *data)
+ {
+ 	u16 pid, qos_port, tx_queue, host_q;
+@@ -444,7 +446,8 @@ static void __uc_log_set(char *args, void *data)
+ 
+ static void uc_dbg_log_show(struct seq_file *f)
+ {
+-	char *level_str[] = { "FATAL", "ERROR", "WARN", "INFO", "DEBUG" };
++	static const char *const level_str[] = { "FATAL", "ERROR", "WARN",
++						 "INFO", "DEBUG" };
+ 	struct uc_log_msg *msgs, *msg;
+ 	void *buff;
+ 	size_t sz;
+@@ -463,9 +466,9 @@ static void uc_dbg_log_show(struct seq_file *f)
+ 	for_each_arr_entry(msg, msgs, sz / sizeof(*msg)) {
+ 		if (strlen(msg->str) == 0)
+ 			continue;
+-		seq_printf(f, "[%8x]:[%-5s]:[%s]: %s %u, %#x\n", msg->ts,
+-			   level_str[msg->level], msg->func, msg->str, msg->val,
+-			   msg->val);
++		seq_printf(f, "[%8x]:[%-5s]:[%s]: %s %u, %#x\n",
++			   msg->ts, level_str[msg->level], msg->func,
++			   msg->str, msg->val, msg->val);
+ 	}
+ 	seq_puts(f, "\n");
+ 
+@@ -586,6 +589,202 @@ static void __uc_aux_reg(char *args, void *data)
+ 
+ PP_DEFINE_DEBUGFS(uc_aux_reg, NULL, __uc_aux_reg);
+ 
++static void uc_tasks_show(bool uc_is_egr, struct seq_file *f)
++{
++	u8 cid, tid, num_cpu, num_tasks;
++	u32 pc, status, queue;
++	bool ready, active;
++
++	uc_ccu_maxcpus_get(uc_is_egr, &num_cpu);
++	num_tasks = uc_is_egr ? UC_EGR_MAXTASK : UC_ING_MAXTASK;
++
++	seq_puts(f, " +---------------------------------------------------------+\n");
++	seq_puts(f, " | Task ID | PC         | STATUS32   | Ready | POPA Active |\n");
++	seq_puts(f, " +---------+------------+------------+-------+-------------+\n");
++	for (cid = 0; cid < num_cpu; cid++) {
++		for (tid = 0; tid < num_tasks; tid++) {
++			uc_task_pc_get(uc_is_egr, cid, tid, &pc);
++			uc_task_status32_get(uc_is_egr, cid, tid, &status);
++			uc_task_ready_get(uc_is_egr, cid, tid, &ready);
++			uc_task_popa_active_get(uc_is_egr, cid, tid, &active,
++						&queue);
++
++			/** 0xe4000098 is a pc value for tasks which aren't
++			 *  any tasks, it may change in the future
++			 */
++			if (pc == 0xe4000098)
++				continue;
++
++			seq_puts(f, " |");
++			seq_printf(f, " CPU%u.%02u |", cid, tid);
++			seq_printf(f, " %#010x |", pc);
++			seq_printf(f, " %#010x |", status);
++			seq_printf(f, " %-5s |", BOOL2STR(ready));
++			if (active)
++				seq_printf(f, " %-8s Q%u |\n", BOOL2STR(active),
++					   queue);
++			else
++				seq_printf(f, " %-11s |\n", BOOL2STR(active));
++		}
++		seq_puts(f, " +---------+------------+------------+-------+-------------+\n");
++	}
++	seq_puts(f, " +---------------------------------------------------------+\n");
++}
++
++static void uc_egr_tasks_show(struct seq_file *f)
++{
++	uc_tasks_show(true, f);
++}
++PP_DEFINE_DEBUGFS(egr_tasks, uc_egr_tasks_show, NULL);
++
++static void uc_ing_tasks_show(struct seq_file *f)
++{
++	uc_tasks_show(false, f);
++}
++PP_DEFINE_DEBUGFS(ing_tasks, uc_ing_tasks_show, NULL);
++
++enum uc_task_set_opts {
++	uc_task_set_tok_help = 1,
++	uc_task_set_tok_cid,
++	uc_task_set_tok_tid,
++};
++
++static const match_table_t uc_task_set_tokens = {
++	{ uc_task_set_tok_help, "help" },
++	{ uc_task_set_tok_cid,  "cid=%u" },
++	{ uc_task_set_tok_tid,  "tid=%u" },
++};
++
++static void uc_task_set_help(void)
++{
++	pr_info("\n");
++	pr_info(" Usage: echo cid=<cpu id> tid=<task id> > egr_task\n");
++	pr_info(" Usage: echo cid=<cpu id> tid=<task id> > ing_task\n");
++}
++
++static void uc_task_set(char *args, void *data)
++{
++	substring_t substr[MAX_OPT_ARGS];
++	enum uc_task_set_opts opt;
++	char *tok;
++	s32 tmp;
++
++	/* iterate over user arguments */
++	while ((tok = strsep(&args, " \t\n")) != NULL) {
++		if (!*tok)
++			continue;
++		opt = match_token(tok, uc_task_set_tokens, substr);
++		switch (opt) {
++		case uc_task_set_tok_help:
++			uc_task_set_help();
++			return;
++		case uc_task_set_tok_cid:
++			if (match_int(&substr[0], &tmp))
++				goto opt_parse_err;
++			gcid = (u32)tmp;
++			break;
++		case uc_task_set_tok_tid:
++			if (match_int(&substr[0], &tmp))
++				goto opt_parse_err;
++			gtid = (u32)tmp;
++			break;
++		default:
++			pr_info("Error: Invalid option '%s'\n", tok);
++			break;
++		}
++	}
++
++	return;
++
++opt_parse_err:
++	pr_err("Failed to parse %s value\n", tok);
++}
++
++struct status32 {
++	u32 halt:1,
++	    irq_prio:4,
++	    exception:1,
++	    delay_branch:1,
++	    user_mode:1,
++	    overflow:1,
++	    carry:1,
++	    negative:1,
++	    zero:1,
++	    zero_oh:1,
++	    zero_div_exp_en:1,
++	    stack_check:1,
++	    table_pend:1,
++	    reg_bank:3,
++	    align_check:1,
++	    user_sleep_en:1,
++	    secure_mode:1,
++	    rsrv:9,
++	    irq_en:1;
++};
++
++static void uc_task_show(bool uc_is_egr, struct seq_file *f)
++{
++	struct status32 status;
++	u32 pc, queue, regs[32], i;
++	bool ready, active;
++	s32 ret = 0;
++
++	seq_puts(f, " +---------------------------------------------------------+\n");
++	seq_puts(f, " | Task ID | PC         | STATUS32   | Ready | POPA Active |\n");
++	seq_puts(f, " +---------+------------+------------+-------+-------------+\n");
++	ret |= uc_task_pc_get(uc_is_egr, gcid, gtid, &pc);
++	ret |= uc_task_status32_get(uc_is_egr, gcid, gtid, (u32 *)&status);
++	ret |= uc_task_ready_get(uc_is_egr, gcid, gtid, &ready);
++	ret |= uc_task_popa_active_get(uc_is_egr, gcid, gtid, &active, &queue);
++	ret |= uc_task_regs_get(uc_is_egr, gcid, gtid, regs, ARRAY_SIZE(regs));
++
++	if (ret)
++		return;
++
++	seq_puts(f, " |");
++	seq_printf(f, " CPU%u.%02u |", gcid, gtid);
++	seq_printf(f, " %#010x |", pc);
++	seq_printf(f, " %#010x |", *((u32 *)&status));
++	seq_printf(f, " %-5s |", BOOL2STR(ready));
++	if (active)
++		seq_printf(f, " %-8s Q%u |\n", BOOL2STR(active),
++				queue);
++	else
++		seq_printf(f, " %-11s |\n", BOOL2STR(active));
++
++	seq_puts(f, " +---------+------------+------------+-------+-------------+\n");
++	seq_puts(f, " |    Status 32           |\n");
++	seq_puts(f, " +--------------+---------+\n");
++	seq_printf(f, " | %-12s | %-7s |\n", "Halt", BOOL2STR(status.halt));
++	seq_printf(f, " | %-12s | %-7s |\n", "Overflow",
++		   BOOL2STR(status.overflow));
++	seq_printf(f, " | %-12s | %-7s |\n", "Exception",
++		   BOOL2STR(status.exception));
++	seq_printf(f, " | %-12s | %-7s |\n", "Zero", BOOL2STR(status.zero));
++	seq_printf(f, " | %-12s | %-7s |\n", "Zero_div_exp",
++		   BOOL2EN(status.zero_div_exp_en));
++	seq_printf(f, " | %-12s | %-7s |\n", "Stack_check",
++		   BOOL2EN(status.stack_check));
++	seq_puts(f, " +--------------+---------+\n");
++	seq_puts(f, " |    Registers           |\n");
++	seq_puts(f, " +-----+------------------+\n");
++	for (i = 0; i < ARRAY_SIZE(regs); i++)
++		seq_printf(f, " | R%02u | %#010x       |\n", i, regs[i]);
++	seq_puts(f, " +-----+------------------+\n");
++}
++
++static void uc_egr_task_show(struct seq_file *f)
++{
++	uc_task_show(true, f);
++}
++PP_DEFINE_DEBUGFS(egr_task, uc_egr_task_show, uc_task_set);
++
++static void uc_ing_task_show(struct seq_file *f)
++{
++	uc_task_show(true, f);
++}
++PP_DEFINE_DEBUGFS(ing_task, uc_ing_task_show, uc_task_set);
++
+ static struct debugfs_file uc_dbg_files[] = {
+ 	{"nf_cfg", &PP_DEBUGFS_FOPS(nf_cfg)},
+ 	{"core_run_halt", &PP_DEBUGFS_FOPS(core_run_halt)},
+@@ -597,6 +796,10 @@ static struct debugfs_file uc_dbg_files[] = {
+ 	{"log", &PP_DEBUGFS_FOPS(uc_log)},
+ 	{"aux_reg", &PP_DEBUGFS_FOPS(uc_aux_reg)},
+ 	{"version", &PP_DEBUGFS_FOPS(version)},
++	{"egr_tasks", &PP_DEBUGFS_FOPS(egr_tasks)},
++	{"egr_task", &PP_DEBUGFS_FOPS(egr_task)},
++	{"ing_tasks", &PP_DEBUGFS_FOPS(ing_tasks)},
++	{"ing_task", &PP_DEBUGFS_FOPS(ing_task)},
+ };
+ 
+ s32 uc_dbg_init(struct dentry *parent)
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+index 3e4ed3a74a81..777329ba6822 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_internal.h
+@@ -29,6 +29,8 @@
+  */
+ #define UC_B_TXMGR_PORT_OFF 4
+ 
++#define UC_TASK_REGS_NUM    32U
++
+ /**
+  * @enum uc_egr_port
+  * @brief uc egress port type
+@@ -57,6 +59,59 @@ s32 uc_egr_mbox_init(void);
+  */
+ void uc_egr_mbox_exit(void);
+ 
++/**
++ * @brief Get the program counter register of CPU's task
++ * @param uc_is_egr select the uc cluster
++ * @param cid cpu index
++ * @param tid task index
++ * @param pc the program counter
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_task_pc_get(bool uc_is_egr, u32 cid, u32 tid, u32 *pc);
++
++/**
++ * @brief Get the status32 register of CPU's task
++ * @param uc_is_egr select the uc cluster
++ * @param cid cpu index
++ * @param tid task index
++ * @param status the status32
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_task_status32_get(bool uc_is_egr, u32 cid, u32 tid, u32 *status);
++
++/**
++ * @brief Get the ready to run bit of CPU's task
++ * @param uc_is_egr select the uc cluster
++ * @param cid cpu index
++ * @param tid task index
++ * @param ready the ready bit
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_task_ready_get(bool uc_is_egr, u32 cid, u32 tid, bool *ready);
++
++/**
++ * @brief Get the status and queue of POPA for a CPU's task
++ * @param uc_is_egr select the uc cluster
++ * @param cid cpu index
++ * @param tid task index
++ * @param active if the task is waiting for POPA
++ * @param queue for which queue the task is waiting
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_task_popa_active_get(bool uc_is_egr, u32 cid, u32 tid, bool *active,
++			    u32 *queue);
++
++/**
++ * @brief Get CPU's task registers
++ * @param uc_is_egr select the uc cluster
++ * @param cid cpu index
++ * @param tid task index
++ * @param regs registers array
++ * @param num number of registers to get, 0 till 'num'
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_task_regs_get(bool uc_is_egr, u32 cid, u32 tid, u32 *regs, u32 num);
++
+ /**
+  * @brief check if cpu is valid
+  * @param uc_is_egr select the uc cluster
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_private_engines.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_private_engines.h
+index 939bee2ac67b..57a38aa04ca5 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_private_engines.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_private_engines.h
+@@ -23,6 +23,13 @@
+  * @define boot configuration
+  */
+ #define BOOT_AID           0
++#define MTSR_AID           3
++#define GP_REG_A_AID       8
++#define GP_REG_B_AID       16
++#define AUX_REG_A_AID      9
++#define AUX_REG_B_AID      17
++#define POPA_A_AID         12
++#define POPA_B_AID         4
+ 
+ ////////////////////////////////
+ // RID of registers, per AID: //
+@@ -58,4 +65,19 @@
+  */
+ #define BOOT_GETFUSE       6
+ 
++/* MTSR */
++#define MTSR_READY         0
++
++/* AUX_REG */
++#define AUX_REG_A_PC       0
++#define AUX_REG_B_PC       0
++#define AUX_REG_A_S32      1 /* status32 */
++#define AUX_REG_B_S32      1 /* status32 */
++
++/* POPA */
++#define POPA_A_ACT_LO      6
++#define POPA_B_ACT_LO      6
++#define POPA_A_ACT_HI      7
++#define POPA_B_ACT_HI      7
++
+ #endif /* __PP_UC_PRIVATE_ENGINES_H__ */
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h
+index 3badc75c389d..eec5f44f0f0d 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_regs.h
+@@ -115,6 +115,15 @@ extern u64 uc_ing_base_addr;
+ #define UC_PRIV_BASE(t)                \
+ 	((t ## _UC_BASE) | (PERIPH_ID_PRVT_ACCL << 20))
+ 
++/**
++ * @define private accelerators address
++ * @param t uc type name INGRESS/EGRESS
++ * @param c uc cpu id
++ * @param a accelerator name AID
++ */
++#define UC_PRIV_ACC(t, c, a)           \
++	(UC_PRIV_BASE(t) | ((c) << 18) | (a##_AID << 13))
++
+ /**
+  * @define private accelerators register address
+  * @param t uc type name INGRESS/EGRESS
+@@ -122,8 +131,8 @@ extern u64 uc_ing_base_addr;
+  * @param a accelerator name AID
+  * @param r register id RID
+  */
+-#define UC_PRIV_REG(t, c, a, r)        \
+-	(UC_PRIV_BASE(t) | ((c) << 18) | (a ## _AID << 13) | (a ## _ ## r << 8))
++#define UC_PRIV_REG(t, c, a, r) \
++	(UC_PRIV_ACC(t, c, a) | (a##_##r << 8))
+ 
+ /**
+  * @define private accelerators register word address
+@@ -136,6 +145,18 @@ extern u64 uc_ing_base_addr;
+ #define UC_PRIV_REG_IDX(t, c, a, r, w) \
+ 	(UC_PRIV_REG(t, c, a, r) | ((w) << 2))
+ 
++/**
++ * @define task gp register address
++ * @param t uc type name INGRESS/EGRESS
++ * @param c uc cpu id
++ * @param r register id
++ * @param tid task id
++ */
++#define UC_A_PRIV_GP_REG(t, c, r, tid) \
++	(UC_PRIV_ACC(t, c, GP_REG_A) | ((r) << 8) | ((tid) << 2))
++#define UC_B_PRIV_GP_REG(t, c, r, tid) \
++	(UC_PRIV_ACC(t, c, GP_REG_B) | ((r) << 8) | ((tid) << 2))
++
+ /**  BOOT **/
+ 
+ /**
+@@ -171,6 +192,16 @@ extern u64 uc_ing_base_addr;
+ #define UC_BOOT_GPREG_MSK              GENMASK(31, 0)
+ #define UC_BOOT_GPREG_REG(t, c)        UC_PRIV_REG(t, c, BOOT, GPREG)
+ 
++#define UC_MTSR_READY_REG(t, c, tid)  UC_PRIV_REG_IDX(t, c, MTSR, READY, tid)
++#define UC_A_AUX_PC_REG(t, c, tid)    UC_PRIV_REG_IDX(t, c, AUX_REG_A, PC, tid)
++#define UC_B_AUX_PC_REG(t, c, tid)    UC_PRIV_REG_IDX(t, c, AUX_REG_B, PC, tid)
++#define UC_A_AUX_S32_REG(t, c, tid)   UC_PRIV_REG_IDX(t, c, AUX_REG_A, S32, tid)
++#define UC_B_AUX_S32_REG(t, c, tid)   UC_PRIV_REG_IDX(t, c, AUX_REG_B, S32, tid)
++#define UC_A_POPA_ACT_LO_REG(t, c, q) UC_PRIV_REG_IDX(t, c, POPA_A, ACT_LO, q)
++#define UC_A_POPA_ACT_HI_REG(t, c, q) UC_PRIV_REG_IDX(t, c, POPA_A, ACT_HI, q)
++#define UC_B_POPA_ACT_LO_REG(t, c, q) UC_PRIV_REG_IDX(t, c, POPA_B, ACT_LO, q)
++#define UC_B_POPA_ACT_HI_REG(t, c, q) UC_PRIV_REG_IDX(t, c, POPA_B, ACT_HI, q)
++
+ /*********************/
+ /* Shared registers */
+ /*********************/

@@ -1,0 +1,581 @@
+From 1feb887ff581dc98b6c3fb11ee8a3d79d2e9aeba Mon Sep 17 00:00:00 2001
+From: CI Assistant <yossi.ilkanaev@intel.com>
+Date: Mon, 11 Jun 2018 11:48:09 +0200
+Subject: [PATCH] UGW:25422: override esp in/out functions for eip97 engine,
+ add header file for ipsec support via engine
+
+---
+ drivers/crypto/Kconfig                             |  42 -----
+ .../net/ethernet/lantiq/datapath/datapath_api.c    |   2 +-
+ drivers/net/ethernet/lantiq/ppa/Kconfig            |   7 +
+ drivers/net/ethernet/lantiq/ppa/ppa_hook.c         |  39 +++--
+ include/crypto/ltq_ipsec_ins.h                     | 178 +++++++++++++++++++++
+ net/ipv4/esp4.c                                    | 109 +++++++++++++
+ net/xfrm/xfrm_output.c                             |  33 +++-
+ net/xfrm/xfrm_policy.c                             |   9 +-
+ 8 files changed, 353 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+index cd7958c1c149..4d2b81f2b223 100644
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -555,46 +555,4 @@ config CRYPTO_DEV_ROCKCHIP
+ 
+ source "drivers/crypto/chelsio/Kconfig"
+ 
+-config CRYPTO_DEV_LANTIQ_EIP123
+-   tristate "Support Lantiq EIP123 hardware crypto engine"
+-   depends on LANTIQ && SOC_TYPE_GRX500_TEP
+-   default n
+-   help
+-      Selects Hardware accelerated EIP123 crypto drivers.
+-
+-config CRYPTO_DEV_LANTIQ_EIP97
+-   tristate "Support Lantiq EIP97 hardware crypto engine"
+-   depends on LANTIQ && SOC_GRX500
+-   select CRYPTO_AUTHENC
+-   select CRYPTO_SHA1
+-   select CRYPTO_SHA256
+-   select CRYPTO_SHA512
+-   select CRYPTO_MD5
+-   select CRYPTO_AES
+-   select CRYPTO_DES
+-   select CRYPTO_MANAGER_DISABLE_TESTS
+-   default n
+-   help
+-      Selects Hardware accelerated EIP97 crypto drivers.
+-
+-config LTQ_CRYPTO_TEST
+-   tristate "Lantiq Crypto Test"
+-   depends on m && CRYPTO_DEV_LANTIQ_EIP97
+-   help
+-      Test suites for the hw crypto algs
+-
+-config LTQ_MPE_IPSEC_SUPPORT
+-   bool
+-   depends on LTQ_PPA_MPE_IP97
+-   default y
+-
+-config LTQ_CRYPTO_MAX_RING_USED
+-   int "Maximum number of ring used in the driver"
+-   depends on CRYPTO_DEV_LANTIQ_EIP97
+-   default "4" if LTQ_MPE_IPSEC_SUPPORT
+-   default "2"
+-   help
+-     Number of rings used in the driver. By default, the driver supports up to
+-     two rings. However, if MPE firmware is used, we only use 1 ring in the driver
+-
+ endif # CRYPTO_HW
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+index 5721efbfdbfc..514dc48f5a95 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -399,7 +399,7 @@ static int32_t dp_alloc_port_private(int inst,
+ 		    ("cbm_dp_port_alloc fail for %s/dev_port %d: %d\n",
+ 		     owner->name, dev_port, port_id);
+ 		return DP_FAILURE;
+-	} else if (!(cbm_data.flags & CBM_PORT_DP_SET) ||
++	} else if (!(cbm_data.flags & CBM_PORT_DP_SET) &&
+ 		   !(cbm_data.flags & CBM_PORT_DQ_SET)) {
+ 		PR_ERR("%s NO DP_SET/DQ_SET(%x):%s/dev_port %d\n",
+ 		       "cbm_dp_port_alloc",
+diff --git a/drivers/net/ethernet/lantiq/ppa/Kconfig b/drivers/net/ethernet/lantiq/ppa/Kconfig
+index 336592ec2ee5..5bfceb51fde6 100644
+--- a/drivers/net/ethernet/lantiq/ppa/Kconfig
++++ b/drivers/net/ethernet/lantiq/ppa/Kconfig
+@@ -66,5 +66,12 @@ config PPA_BR_SESS_LEARNING
+         help
+             Bridge session learning support for PPA
+ 
++config PPA_MPE_IP97
++         tristate "INTEL PPA MPE IP97 Support"
++         depends on PPA && SOC_GRX500
++         default n
++         help
++            INTEL PPA MPE IP97 Support
++
+ endif # PPA
+ endmenu
+diff --git a/drivers/net/ethernet/lantiq/ppa/ppa_hook.c b/drivers/net/ethernet/lantiq/ppa/ppa_hook.c
+index 538f0ddc37da..1cabd20225ae 100644
+--- a/drivers/net/ethernet/lantiq/ppa/ppa_hook.c
++++ b/drivers/net/ethernet/lantiq/ppa/ppa_hook.c
+@@ -783,7 +783,6 @@ static unsigned int ppa_prert_hook_fn (void *priv,
+ 
+ 	return NF_ACCEPT;
+ }
+-
+ static unsigned int ppa_postrt_hook_fn(void *priv,
+ 		struct sk_buff *skb,
+ 		const struct nf_hook_state *state)
+@@ -791,40 +790,38 @@ static unsigned int ppa_postrt_hook_fn(void *priv,
+ #if IS_ENABLED(CONFIG_PPA_MPE_IP97)
+ 	struct iphdr *hdr = ip_hdr(skb);
+ 	/* exclude the encrypted ipsec tunnel packets */
+-	if (hdr->protocol != IPPROTO_ESP) {
+-#endif /* CONFIG_PPA_MPE_IP97*/
+-		if (!ppa_hook_session_add_fn)
+-			return NF_ACCEPT;
++	if (hdr->protocol == IPPROTO_ESP || skb_dst(skb)->flags & DST_XFRM_TUNNEL || !ppa_hook_session_add_fn) 
++		return NF_ACCEPT;
++#else /* CONFIG_PPA_MPE_IP97*/
++	if (skb_dst(skb)->flags & DST_XFRM_TUNNEL || !ppa_hook_session_add_fn)
++		return NF_ACCEPT;
++#endif
+ 
+ #if IS_ENABLED(CONFIG_INTEL_IPQOS_ACCEL_DISABLE)
+ 		/* check for 13th bit in NFMARK set by IPQOS classifier */
+ 		/* If this bit is set, dont call PPA session add fn*/
+-		bool accel_st = 0;
++	bool accel_st = 0;
+ #if IS_ENABLED(CONFIG_NETWORK_EXTMARK)
+-		GET_DATA_FROM_MARK_OPT(skb->extmark, ACCELSEL_MASK,
++	GET_DATA_FROM_MARK_OPT(skb->extmark, ACCELSEL_MASK,
+ 				       ACCELSEL_START_BIT_POS, accel_st);
+ #endif /* CONFIG_NETWORK_EXTMARK*/
+-		if (accel_st != 0)
+-			return NF_ACCEPT;
++	if (accel_st != 0)
++		return NF_ACCEPT;
+ #endif /* CONFIG_INTEL_IPQOS_ACCEL_DISABLE*/
+ 
+-		struct nf_conn *ct = NULL;
+-		enum ip_conntrack_info ctinfo;
+-		uint32_t flags;
++	struct nf_conn *ct;
++	enum ip_conntrack_info ctinfo;
++	uint32_t flags;
+ 
+-		ct = nf_ct_get(skb, &ctinfo);
++	ct = nf_ct_get(skb, &ctinfo);
++	flags = 0; /* post routing */
++	flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ?
++		 PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
+ 
+-		flags = 0; /* post routing */
+-		flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ?
+-			 PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++	ppa_hook_session_add_fn(skb, ct, flags);
+ 
+-		ppa_hook_session_add_fn(skb, ct, flags);
+-#if IS_ENABLED(CONFIG_PPA_MPE_IP97)
+-	}
+-#endif /* CONFIG_PPA_MPE_IP97*/
+ 	return NF_ACCEPT;
+ }
+-
+ static unsigned int ppa_localin_hook_fn(void *priv,
+ 		struct sk_buff *skb,
+ 		const struct nf_hook_state *state)
+diff --git a/include/crypto/ltq_ipsec_ins.h b/include/crypto/ltq_ipsec_ins.h
+new file mode 100644
+index 000000000000..e9f50b3107a1
+--- /dev/null
++++ b/include/crypto/ltq_ipsec_ins.h
+@@ -0,0 +1,178 @@
++#ifndef _LTQ_IPSEC_INS_H
++#define _LTQ_IPSEC_INS_H
++
++#ifdef CONFIG_PPA_MPE_IP97
++#include <linux/kernel.h>
++
++/* Flag bits for the IPsecFlags field. Combine any values using a
++   bitwise or.
++   Of SAB_IPSEC_ESP and SAB_AH, exactly one must be set.
++   Of SAB_IPSEC_TUNNEL and SAB_IPSEC_TRANSPORT, exactly one must be set.
++   Of SAB_IPSEC_IPV4 and SAB_IPSEC_IPV6, exactly one must be set.
++*/
++
++
++/* IPSEC mode */
++#define LTQ_SAB_IPSEC_ESP             0x00000001U 
++#define LTQ_SAB_IPSEC_AH              0x00000002U
++
++/* Transport or Tunnel */
++#define LTQ_SAB_IPSEC_TUNNEL          0x00000004U   
++#define LTQ_SAB_IPSEC_TRANSPORT       0x00000008U
++
++/* IP Type */
++#define LTQ_SAB_IPSEC_IPV4            0x00000010U
++#define LTQ_SAB_IPSEC_IPV6            0x00000020U
++
++#define MAX_IV_LEN					  32
++#define MAX_NONCE_LEN				  8
++
++/* flags */
++#define LTQ_STATIC_IV				  0x00000001  /* Tell API not to generate random IV, debug purpose only */
++
++/* Direction */
++enum
++{
++    LTQ_SAB_DIRECTION_OUTBOUND,
++    LTQ_SAB_DIRECTION_INBOUND
++};
++
++
++/* Encryption Algo */
++enum
++{
++    LTQ_SAB_CRYPTO_NULL,
++    LTQ_SAB_CRYPTO_DES,
++    LTQ_SAB_CRYPTO_3DES,
++    LTQ_SAB_CRYPTO_AES,
++    LTQ_SAB_CRYPTO_ARCFOUR
++};
++
++/* Encryption Mode used */
++enum
++{
++    LTQ_SAB_CRYPTO_MODE_ECB,
++    LTQ_SAB_CRYPTO_MODE_CBC,
++    LTQ_SAB_CRYPTO_MODE_OFB,
++    LTQ_SAB_CRYPTO_MODE_CFB,
++    LTQ_SAB_CRYPTO_MODE_CFB1,
++    LTQ_SAB_CRYPTO_MODE_CFB8,
++    LTQ_SAB_CRYPTO_MODE_CTR,
++    LTQ_SAB_CRYPTO_MODE_ICM,
++    LTQ_SAB_CRYPTO_MODE_CCM,       // Only use with AES, set LTQ_SAB_AUTH_AES_CCM 
++    LTQ_SAB_CRYPTO_MODE_GCM,       // Only use with AES, set LTQ_SAB_AUTH_AES_GCM 
++    LTQ_SAB_CRYPTO_MODE_GMAC,      // Only use with AES, set LTQ_SAB_AUTH_AES_GMAC 
++    LTQ_SAB_CRYPTO_MODE_STATELESS, // For ARC4 
++    LTQ_SAB_CRYPTO_MODE_STATEFUL,  // For ARC4 
++};
++
++
++/* Auth Algo used */
++enum
++{
++    LTQ_SAB_AUTH_NULL,
++    LTQ_SAB_AUTH_HASH_MD5,
++    LTQ_SAB_AUTH_HASH_SHA1,
++    LTQ_SAB_AUTH_HASH_SHA2_224,
++    LTQ_SAB_AUTH_HASH_SHA2_256,
++    LTQ_SAB_AUTH_HASH_SHA2_384,
++    LTQ_SAB_AUTH_HASH_SHA2_512,
++    LTQ_SAB_AUTH_SSLMAC_MD5,
++    LTQ_SAB_AUTH_SSLMAC_SHA1,
++    LTQ_SAB_AUTH_HMAC_MD5,
++    LTQ_SAB_AUTH_HMAC_SHA1,
++    LTQ_SAB_AUTH_HMAC_SHA2_224,
++    LTQ_SAB_AUTH_HMAC_SHA2_256,
++    LTQ_SAB_AUTH_HMAC_SHA2_384,
++    LTQ_SAB_AUTH_HMAC_SHA2_512,
++    LTQ_SAB_AUTH_AES_XCBC_MAC, 	// Can also be used to implement AES-CMAC 
++    LTQ_SAB_AUTH_AES_CCM,      	// Set matching crypto algorithm and mode 
++    LTQ_SAB_AUTH_AES_GCM,       // Set matching crypto algorithm and mode 
++    LTQ_SAB_AUTH_AES_GMAC,     	// Set matching crypto algorithm and mode 
++};
++
++typedef struct
++{
++    void * p;
++} DMABuf_Handle_t;
++
++/* Proposed structure definition that can be passed to EIP97 API.
++ * Some of the EIP97 DDK APIs require bit conventions as defined above. 
++ * Please follow them accordingly. 
++ */
++
++struct ltq_crypto_ipsec_params {
++	int ipsec_mode;				/* AH/ESP */
++	int ipsec_tunnel;			/* Tunnel or transport mode */
++	int direction;				/* INBOUND or OUTBOUND */
++	int ip_type;				/* IPv4 or IPv6*/
++	unsigned int ring_no;		/* Ring number this SA is registered to */
++	unsigned int data_len;		/* size of packet */
++	unsigned int crypto_offs;	/* DWORD offset of buffer */
++	unsigned int total_pad_offs;	/* IPSec packet padding length offset (for all outbound) */
++	unsigned int hash_pad_offs;	/* AES-CCM MSG length offset value (depends on pkt alignment) */
++	unsigned int msg_len_offs;	/* AES-CCM MSG length offset value */
++	unsigned int pad_blksize;	/* Padding block size filled by eip97 */
++	u32	flags;					/* optional flag for future use */
++	u32	spi;					/* SPI number */
++	
++	u32 crypto_algo;			/* crypto algo used */
++	u32 crypto_mode;			/* crypto mode used */
++	u32	cryptosize;				/* size of encrypted data */
++	u32 crypto_keysize;			/* key size used for crypto algo */
++	u8 *crypto_key;				/* pointer to the crypto key buffer */
++	
++	u32 auth_algo;				/* auth algo used */
++	u32	authsize;				/* expected size of authentication data */
++	u32 auth_keysize;			/* key size used for auth algo */
++	u8 *auth_key;				/* pointer to the auth key buffer */
++	u8 opad[64];				/* opad buffer filled by eip97 api */
++	u8 ipad[64];				/* ipad buffer filled by eip97 api */
++	u8 authkey3[16];			/* Third auth key for XCBC algorithm */
++	
++	u8 nonce[MAX_NONCE_LEN];	/* nonce buffer */
++	u8 IV[MAX_IV_LEN];			/* IV buffer */
++	u8 ivsize;					/* Length of IV */
++	u8 ICV_length;				/* Length of ICV */
++	
++	u32 *SA_buffer;				/* SA buffer updated by eip97 api */
++	u32 *token_buffer;			/* token instruction word updated by eip97 api */
++	u32 *context_data;			/* context data */
++	unsigned int SAWords;		/* No of words in SA */
++	
++	u32 token_headerword;		/* token header instruction word updated by eip97 api */
++	unsigned int tokenwords;	/* number of dwords for token buffer updated by eip97 api */
++
++	/* Handles which have to be returned to the 
++	 * DDK
++	 */
++	DMABuf_Handle_t SAHandle;
++	DMABuf_Handle_t TokenHandle;
++	DMABuf_Handle_t SrcHandle;
++	DMABuf_Handle_t DstHandle;
++};
++
++struct ltq_ipsec_complete {
++	int err;
++	void *data;
++	u32 ret_pkt_len;
++	u8 nexthdr;
++	int flag;
++	void (*callback_fn)(struct ltq_ipsec_complete *complete);
++	u32 *token_ptr;
++};
++
++
++/* API - dummy placer */
++int ltq_ipsec_setkey(struct ltq_crypto_ipsec_params *ipsec_params); 
++int ltq_get_ipsec_token(struct ltq_crypto_ipsec_params *ipsec_params); 
++void ltq_destroy_ipsec_sa(struct ltq_crypto_ipsec_params *ipsec_params);
++int ltq_ipsec_enc(u32 spi, u16 ip_prot, u8 *in, u8 *out, void (*callback)(struct ltq_ipsec_complete *done),
++			unsigned int buflen, void *ip_data);
++int ltq_ipsec_dec(u32 spi, u8 *in, u8 *out, void (*callback)(struct ltq_ipsec_complete *done),
++            unsigned int buflen, void *ip_data);
++int ltq_get_length_params(u32 spi, unsigned int *ivsize, unsigned int *ICV_length,
++			unsigned int *blksize);
++struct ltq_crypto_ipsec_params *ltq_ipsec_get_params(u32); 
++#endif /* CONFIG_PPA_MPE_IP97 */ 
++#endif /* _LTQ_IPSEC_INS_H */
+diff --git a/net/ipv4/esp4.c b/net/ipv4/esp4.c
+index 3d8021d55336..0f26bcb8f244 100644
+--- a/net/ipv4/esp4.c
++++ b/net/ipv4/esp4.c
+@@ -17,6 +17,7 @@
+ #include <net/icmp.h>
+ #include <net/protocol.h>
+ #include <net/udp.h>
++#include <crypto/ltq_ipsec_ins.h>
+ 
+ struct esp_skb_cb {
+ 	struct xfrm_skb_cb xfrm;
+@@ -127,7 +128,68 @@ static void esp_output_done_esn(struct crypto_async_request *base, int err)
+ 	esp_output_restore_header(skb);
+ 	esp_output_done(base, err);
+ }
++#if defined(CONFIG_PPA_MPE_IP97)
++int (*ltq_ipsec_enc_hook)(u32 spi, u16 ip_prot, u8 *in, u8 *out, void (*callback)(struct ltq_ipsec_complete *done),
++			unsigned int buflen, void *ip_data) = NULL;
++EXPORT_SYMBOL(ltq_ipsec_enc_hook);
+ 
++int (*ltq_get_len_param_hook)(u32 spi, unsigned int *ivsize, unsigned int *ICV_length,
++			unsigned int *blksize) = NULL;
++EXPORT_SYMBOL(ltq_get_len_param_hook);
++
++static void esp_output_done_fastpath(struct ltq_ipsec_complete *done)
++{
++	struct sk_buff *skb = (struct sk_buff *)(done->data);
++	skb->len = done->ret_pkt_len;
++	skb->data = skb_transport_header(skb);
++	skb->tail = skb->data + skb->len;
++	skb_push(skb, -skb_network_offset(skb));
++	xfrm_output_resume(skb, done->err);
++}
++
++static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
++{
++	int32_t err;
++	int32_t trailer_len = 0;
++	uint32_t iv_len = 0, icv_len = 0, blk_size = 0;
++	struct sk_buff *trailer;
++	uint16_t nexthdr;
++	
++	if(!ltq_get_len_param_hook) {
++		printk("param pointer is NULL\n");
++		return ;
++	}
++	ltq_get_len_param_hook(x->id.spi, &iv_len, &icv_len, &blk_size);
++	trailer_len = icv_len + blk_size ;
++	err = skb_cow_data(skb, trailer_len, &trailer);
++	if (err < 0)
++		goto error;
++	
++	skb_linearize(skb);
++	nexthdr = ip_hdr(skb)->protocol;
++	ip_hdr(skb)->protocol = IPPROTO_ESP;
++	if(!ltq_ipsec_enc_hook) {
++		printk("enc hook is NULL\n");
++		return ;
++	}
++	err = ltq_ipsec_enc_hook(x->id.spi, nexthdr, skb->data, skb_transport_header(skb), esp_output_done_fastpath, skb->len, skb);
++	if (err == -EINPROGRESS)
++		goto error;
++
++	if (err == -EBUSY)
++		err = NET_XMIT_DROP;
++
++	if(err > 0) {
++		skb->data = skb_transport_header(skb);
++		skb->len = err;
++		skb->tail = skb->data + skb->len;
++		skb_push(skb, -skb_network_offset(skb));
++		return 0;
++	}
++error:
++	return err;
++}
++#else
+ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
+ {
+ 	int err;
+@@ -304,6 +366,7 @@ static int esp_output(struct xfrm_state *x, struct sk_buff *skb)
+ error:
+ 	return err;
+ }
++#endif
+ 
+ static int esp_input_done2(struct sk_buff *skb, int err)
+ {
+@@ -409,7 +472,52 @@ static void esp_input_done_esn(struct crypto_async_request *base, int err)
+ 	esp_input_restore_header(skb);
+ 	esp_input_done(base, err);
+ }
++#if defined(CONFIG_PPA_MPE_IP97)
++int (*ltq_ipsec_dec_hook)(u32 spi, u8 *in, u8 *out, void (*callback)(struct ltq_ipsec_complete *done),
++		unsigned int buflen, void *ip_data) = NULL;
+ 
++EXPORT_SYMBOL(ltq_ipsec_dec_hook);
++
++static void esp_input_done_fastpath(struct ltq_ipsec_complete *done)
++{
++	int ihl;
++	struct iphdr *iph;
++	struct sk_buff *skb = (struct sk_buff *)(done->data);
++	skb->len = done->ret_pkt_len;
++	iph = ip_hdr(skb);
++	ihl = iph->ihl * 4;
++	skb->transport_header = skb->network_header = skb->data  - ihl;
++	skb->tail = skb->data  + skb->len;
++	xfrm_input_resume(skb, done->nexthdr);
++}
++static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
++{
++	int32_t err;
++	struct sk_buff *trailer;
++	
++	err = skb_cow_data(skb, 0, &trailer);
++	if (err < 0)
++		goto error;
++	
++	skb_linearize(skb);
++	if(!ltq_ipsec_dec_hook) {
++		printk("dec hook is NULL\n");
++		return;
++	}
++	err = ltq_ipsec_dec_hook(x->id.spi, skb->data, skb->data, esp_input_done_fastpath, skb->len, skb);
++	if (err == -EINPROGRESS)
++		goto error;
++	
++	if(err > 0) {
++		skb->len = err;
++		skb->tail = skb->data  + skb->len;
++		return 0;
++	}
++
++error:
++	return err;
++}
++#else
+ /*
+  * Note: detecting truncated vs. non-truncated authentication data is very
+  * expensive, so we only support truncated data, which is the recommended
+@@ -501,6 +609,7 @@ static int esp_input(struct xfrm_state *x, struct sk_buff *skb)
+ out:
+ 	return err;
+ }
++#endif
+ 
+ static u32 esp4_get_mtu(struct xfrm_state *x, int mtu)
+ {
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 2c4aa7b5ccd5..555aad23584b 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -18,7 +18,9 @@
+ #include <linux/spinlock.h>
+ #include <net/dst.h>
+ #include <net/xfrm.h>
+-
++#if defined(CONFIG_PPA_MPE_IP97)
++#include <net/ppa/ppa_api.h>
++#endif
+ static int xfrm_output2(struct net *net, struct sock *sk, struct sk_buff *skb);
+ 
+ static int xfrm_skb_check_space(struct sk_buff *skb)
+@@ -137,6 +139,35 @@ int xfrm_output_resume(struct sk_buff *skb, int err)
+ 	struct net *net = xs_net(skb_dst(skb)->xfrm);
+ 
+ 	while (likely((err = xfrm_output_one(skb, err)) == 0)) {
++#if defined(CONFIG_PPA_MPE_IP97)
++		 if (ppa_hook_session_add_fn){
++#if IS_ENABLED(CONFIG_INTEL_IPQOS_ACCEL_DISABLE)
++		/* check for 13th bit in NFMARK set by IPQOS classifier */
++		/* If this bit is set, dont call PPA session add fn*/
++		bool accel_st = 0;
++#if IS_ENABLED(CONFIG_NETWORK_EXTMARK)
++		GET_DATA_FROM_MARK_OPT(skb->extmark, ACCELSEL_MASK,
++				       ACCELSEL_START_BIT_POS, accel_st);
++#endif /* CONFIG_NETWORK_EXTMARK*/
++		if (accel_st == 0){
++#endif /* CONFIG_INTEL_IPQOS_ACCEL_DISABLE*/
++
++		struct nf_conn *ct = NULL;
++		enum ip_conntrack_info ctinfo;
++		uint32_t flags;
++
++		ct = nf_ct_get(skb, &ctinfo);
++
++		flags = 0; /* post routing */
++		flags |= CTINFO2DIR(ctinfo) == IP_CT_DIR_ORIGINAL ?
++			 PPA_F_SESSION_ORG_DIR : PPA_F_SESSION_REPLY_DIR;
++
++		ppa_hook_session_add_fn(skb, ct, flags);
++#if IS_ENABLED(CONFIG_INTEL_IPQOS_ACCEL_DISABLE)
++		}
++#endif
++	}
++#endif
+ 		nf_reset(skb);
+ 
+ 		err = skb_dst(skb)->ops->local_out(net, skb->sk, skb);
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index b00ed36b9aac..6032d02cd61a 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -2584,6 +2584,11 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+ 		 * some barriers, but at the moment barriers
+ 		 * are implied between each two transformations.
+ 		 */
++#if defined(CONFIG_PPA_MPE_IP97)
++		/*skip policy checks if MPE has already decrypted 
++		the packet, skb->DW1 is set to 0x30000 by DP*/
++		if( (skb->DW1 & 0x30000) ==  0x0) {
++#endif	
+ 		for (i = xfrm_nr-1, k = 0; i >= 0; i--) {
+ 			k = xfrm_policy_ok(tpp[i], sp, k, family);
+ 			if (k < 0) {
+@@ -2599,7 +2604,9 @@ int __xfrm_policy_check(struct sock *sk, int dir, struct sk_buff *skb,
+ 			XFRM_INC_STATS(net, LINUX_MIB_XFRMINTMPLMISMATCH);
+ 			goto reject;
+ 		}
+-
++#if defined(CONFIG_PPA_MPE_IP97)
++	}
++#endif
+ 		xfrm_pols_put(pols, npols);
+ 		return 1;
+ 	}

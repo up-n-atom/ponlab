@@ -1,0 +1,341 @@
+From ccaaaea9e92ea57a837c7bac4b70e360d0a10db6 Mon Sep 17 00:00:00 2001
+From: Hua Ma <hua.ma@linux.intel.com>
+Date: Thu, 21 Jun 2018 17:38:18 +0800
+Subject: [PATCH] Add support for ppp generic files
+
+---
+ drivers/net/ppp/ppp_generic.c | 125 +++++++++++++++++++++++++++++++++++++-----
+ drivers/net/ppp/pppoe.c       |  53 ++++++++++++++++++
+ include/linux/ppp_channel.h   |   3 +
+ 3 files changed, 167 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/net/ppp/ppp_generic.c b/drivers/net/ppp/ppp_generic.c
+index 801bab5968d0..72ffae5492c6 100644
+--- a/drivers/net/ppp/ppp_generic.c
++++ b/drivers/net/ppp/ppp_generic.c
+@@ -78,7 +78,7 @@
+  */
+ struct ppp_file {
+ 	enum {
+-		INTERFACE=1, CHANNEL
++		INTERFACE = 1, CHANNEL
+ 	}		kind;
+ 	struct sk_buff_head xq;		/* pppd transmit queue */
+ 	struct sk_buff_head rq;		/* receive queue for pppd */
+@@ -371,10 +371,61 @@ static const int npindex_to_ethertype[NUM_NP] = {
+ #define ppp_xmit_unlock(ppp)	spin_unlock_bh(&(ppp)->wlock)
+ #define ppp_recv_lock(ppp)	spin_lock_bh(&(ppp)->rlock)
+ #define ppp_recv_unlock(ppp)	spin_unlock_bh(&(ppp)->rlock)
+-#define ppp_lock(ppp)		do { ppp_xmit_lock(ppp); \
+-				     ppp_recv_lock(ppp); } while (0)
+-#define ppp_unlock(ppp)		do { ppp_recv_unlock(ppp); \
+-				     ppp_xmit_unlock(ppp); } while (0)
++#define ppp_lock(ppp)		do { ppp_xmit_lock(ppp);\
++				     ppp_recv_lock(ppp); } \
++					 while (0)
++#define ppp_unlock(ppp)		do { ppp_recv_unlock(ppp);\
++				     ppp_xmit_unlock(ppp); } \
++					 while (0)
++
++#ifdef CONFIG_PPA
++extern int32_t (*ppa_ppp_get_chan_info_fn)
++	(struct net_device *ppp_dev, struct ppp_channel **chan);
++
++/*function returns the ppp channel priv data structure*/
++static int ppp_get_info(struct net_device *ppp_dev, struct ppp_channel **chan)
++{
++	struct ppp *ppp;
++	struct channel *pch;
++	struct list_head *list;
++	int ret = -EFAULT;
++
++	if (unlikely(!ppp_dev))
++		return ret;
++
++	ppp = netdev_priv(ppp_dev);
++
++	if (unlikely(!(ppp_dev->flags & IFF_POINTOPOINT) || !ppp))
++		return ret;
++
++	/*check ppp validity */
++	if (unlikely(ppp->file.dead || atomic_read(&ppp->file.refcnt) == 0 ||
++			!ppp->dev || ppp->n_channels == 0))
++		goto err_unlockppp;
++
++	/*don't support multipul link*/
++	if (unlikely(ppp->flags & SC_MULTILINK))
++		goto err_unlockppp;
++
++	list = &ppp->channels;
++	if (unlikely(list_empty(list)))
++		goto err_unlockppp;
++
++	list = list->next;
++	pch = list_entry(list, struct channel, clist);
++
++	if (unlikely(!pch->chan))
++		goto err_unlockppp;
++
++	*chan = pch->chan;
++
++	return 0;
++
++err_unlockppp:
++
++	return ret;
++}
++#endif /* CONFIG_PPA */
+ 
+ /*
+  * /dev/ppp device routines.
+@@ -1211,6 +1262,9 @@ static int __init ppp_init(void)
+ 	/* not a big deal if we fail here :-) */
+ 	device_create(ppp_class, NULL, MKDEV(PPP_MAJOR, 0), NULL, "ppp");
+ 
++#ifdef CONFIG_PPA
++	ppa_ppp_get_chan_info_fn = ppp_get_info;
++#endif /* CONFIG_PPA */
+ 	return 0;
+ 
+ out_class:
+@@ -1593,6 +1647,15 @@ ppp_send_frame(struct ppp *ppp, struct sk_buff *skb)
+ 		/* peek at outbound CCP frames */
+ 		ppp_ccp_peek(ppp, skb, 0);
+ 		break;
++#ifdef CONFIG_INTEL_IPQOS
++	case PPP_LCP:
++	case PPP_IPCP:
++	case PPP_PAP:
++	case PPP_CHAP:
++		/* MARK LCP frames with highest priority */
++		skb->priority = 7;
++		break;
++#endif /* CONFIG_INTEL_IPQOS*/
+ 	}
+ 
+ 	/* try to do packet compression */
+@@ -1715,7 +1778,7 @@ static int ppp_mp_explode(struct ppp *ppp, struct sk_buff *skb)
+ 				  *having no queued packets before
+ 				  *starting the fragmentation*/
+ 
+-	hdrlen = (ppp->flags & SC_MP_XSHORTSEQ)? MPHDRLEN_SSN: MPHDRLEN;
++	hdrlen = (ppp->flags & SC_MP_XSHORTSEQ) ? MPHDRLEN_SSN : MPHDRLEN;
+ 	i = 0;
+ 	list_for_each_entry(pch, &ppp->channels, clist) {
+ 		if (pch->chan) {
+@@ -1927,6 +1990,10 @@ static void __ppp_channel_push(struct channel *pch)
+ 	if (pch->chan) {
+ 		while (!skb_queue_empty(&pch->file.xq)) {
+ 			skb = skb_dequeue(&pch->file.xq);
++#ifdef CONFIG_INTEL_IPQOS
++/* MARK LCP frames with highest priority */
++			skb->priority = 7;
++#endif /* CONFIG_INTEL_IPQOS*/
+ 			if (!pch->chan->ops->start_xmit(pch->chan, skb)) {
+ 				/* put the packet back and try again later */
+ 				skb_queue_head(&pch->file.xq, skb);
+@@ -2108,8 +2175,7 @@ ppp_receive_nonmp_frame(struct ppp *ppp, struct sk_buff *skb)
+ 			skb_copy_bits(skb, 0, skb_put(ns, skb->len), skb->len);
+ 			consume_skb(skb);
+ 			skb = ns;
+-		}
+-		else
++		} else
+ 			skb->ip_summed = CHECKSUM_NONE;
+ 
+ 		len = slhc_uncompress(ppp->vj, skb->data + 2, skb->len - 2);
+@@ -2146,6 +2212,15 @@ ppp_receive_nonmp_frame(struct ppp *ppp, struct sk_buff *skb)
+ 	case PPP_CCP:
+ 		ppp_ccp_peek(ppp, skb, 1);
+ 		break;
++#ifdef CONFIG_INTEL_IPQOS
++	case PPP_LCP:
++	case PPP_IPCP:
++	case PPP_PAP:
++	case PPP_CHAP:
++		/* MARK LCP frames with highest priority */
++		skb->priority = 7;
++		break;
++#endif /* CONFIG_INTEL_IPQOS*/
+ 	}
+ 
+ 	++ppp->stats64.rx_packets;
+@@ -2228,7 +2303,7 @@ ppp_decompress_frame(struct ppp *ppp, struct sk_buff *skb)
+ 	if (proto == PPP_COMP) {
+ 		int obuff_size;
+ 
+-		switch(ppp->rcomp->compress_proto) {
++		switch (ppp->rcomp->compress_proto) {
+ 		case CI_MPPE:
+ 			obuff_size = ppp->mru + PPP_HDRLEN + 1;
+ 			break;
+@@ -2287,7 +2362,7 @@ ppp_receive_mp_frame(struct ppp *ppp, struct sk_buff *skb, struct channel *pch)
+ {
+ 	u32 mask, seq;
+ 	struct channel *ch;
+-	int mphdrlen = (ppp->flags & SC_MP_SHORTSEQ)? MPHDRLEN_SSN: MPHDRLEN;
++	int mphdrlen = (ppp->flags & SC_MP_SHORTSEQ) ? MPHDRLEN_SSN : MPHDRLEN;
+ 
+ 	if (!pskb_may_pull(skb, mphdrlen + 1) || ppp->mrru == 0)
+ 		goto err;		/* no good, throw it away */
+@@ -2437,13 +2512,13 @@ ppp_mp_reconstruct(struct ppp *ppp)
+ 			/* Fragment `seq' is lost, keep going. */
+ 			lost = 1;
+ 			oldseq = seq;
+-			seq = seq_before(minseq, PPP_MP_CB(p)->sequence)?
+-				minseq + 1: PPP_MP_CB(p)->sequence;
++			seq = seq_before(minseq, PPP_MP_CB(p)->sequence) ?
++				minseq + 1 : PPP_MP_CB(p)->sequence;
+ 
+ 			if (ppp->debug & 1)
+ 				netdev_printk(KERN_DEBUG, ppp->dev,
+ 					      "lost frag %u..%u\n",
+-					      oldseq, seq-1);
++					      oldseq, seq - 1);
+ 
+ 			goto again;
+ 		}
+@@ -2647,6 +2722,22 @@ char *ppp_dev_name(struct ppp_channel *chan)
+ 	return name;
+ }
+ 
++/*
++ * Return the PPP device interface pointer
++ */
++struct net_device *ppp_device(struct ppp_channel *chan)
++{
++	struct channel *pch = chan->ppp;
++	struct net_device *dev = NULL;
++
++	if (pch) {
++		read_lock_bh(&pch->upl);
++		if (pch->ppp && pch->ppp->dev)
++			dev = pch->ppp->dev;
++		read_unlock_bh(&pch->upl);
++	}
++	return dev;
++}
+ 
+ /*
+  * Disconnect a channel from the generic layer.
+@@ -2797,7 +2888,7 @@ ppp_ccp_peek(struct ppp *ppp, struct sk_buff *skb, int inbound)
+ 		 * Remember:
+ 		 * A ConfReq indicates what the sender would like to receive
+ 		 */
+-		if(inbound)
++		if (inbound)
+ 			/* He is proposing what I should send */
+ 			ppp->xstate &= ~SC_COMP_RUN;
+ 		else
+@@ -3241,6 +3332,11 @@ static void __exit ppp_cleanup(void)
+ 	/* should never happen */
+ 	if (atomic_read(&ppp_unit_count) || atomic_read(&channel_count))
+ 		pr_err("PPP: removing module but units remain!\n");
++
++#ifdef CONFIG_PPA
++	ppa_ppp_get_chan_info_fn = NULL;
++#endif /* CONFIG_PPA */
++
+ 	rtnl_link_unregister(&ppp_link_ops);
+ 	unregister_chrdev(PPP_MAJOR, "ppp");
+ 	device_destroy(ppp_class, MKDEV(PPP_MAJOR, 0));
+@@ -3293,6 +3389,7 @@ EXPORT_SYMBOL(ppp_unregister_channel);
+ EXPORT_SYMBOL(ppp_channel_index);
+ EXPORT_SYMBOL(ppp_unit_number);
+ EXPORT_SYMBOL(ppp_dev_name);
++EXPORT_SYMBOL(ppp_device);
+ EXPORT_SYMBOL(ppp_input);
+ EXPORT_SYMBOL(ppp_input_error);
+ EXPORT_SYMBOL(ppp_output_wakeup);
+diff --git a/drivers/net/ppp/pppoe.c b/drivers/net/ppp/pppoe.c
+index 804c52c35f07..8a3bc545055f 100644
+--- a/drivers/net/ppp/pppoe.c
++++ b/drivers/net/ppp/pppoe.c
+@@ -270,6 +270,51 @@ static inline void delete_item(struct pppoe_net *pn, __be16 sid,
+ 	write_unlock_bh(&pn->hash_lock);
+ }
+ 
++#ifdef CONFIG_PPA
++extern int32_t (*ppa_check_pppoe_addr_valid_fn)
++	(struct net_device *dev, struct pppoe_addr *pa);
++
++static int check_pppoe_addr_valid(struct net_device *dev, struct pppoe_addr *pa)
++{
++	struct pppox_sock *po = NULL;
++	struct pppoe_net *pn;
++	struct net_device *pppoe_netdev = NULL;
++	int ret = -EFAULT;
++
++	if ((!pa->dev) || (!pa->remote) || (pa->sid == 0))
++		return ret;
++
++	pn = pppoe_pernet(dev_net(dev));
++	pppoe_netdev = dev_get_by_name(dev_net(dev), pa->dev);
++	if (pppoe_netdev) {
++		po = get_item(pn, pa->sid, pa->remote, pppoe_netdev->ifindex);
++
++		if (!po) {
++			printk("Cannot find the pppoe addr in hash table\n");
++			goto err;
++		}
++
++		if (!po->pppoe_dev || !(po->pppoe_pa.remote[0] |
++			po->pppoe_pa.remote[1] | po->pppoe_pa.remote[2] |
++			po->pppoe_pa.remote[3] | po->pppoe_pa.remote[4] |
++			po->pppoe_pa.remote[5])) {
++			printk("no pppoe device or remote address is zero\n");
++			goto err;
++		}
++
++		ret = 0;
++	}
++
++err:
++	if (pppoe_netdev)
++		dev_put(pppoe_netdev);
++	if (po)
++		sock_put(sk_pppox(po));
++
++	return ret;
++}
++#endif /* CONFIG_PPA */
++
+ /***************************************************************************
+  *
+  *  Handler for device events.
+@@ -1196,6 +1241,10 @@ static int __init pppoe_init(void)
+ 	dev_add_pack(&pppoed_ptype);
+ 	register_netdevice_notifier(&pppoe_notifier);
+ 
++#ifdef CONFIG_PPA
++	ppa_check_pppoe_addr_valid_fn = check_pppoe_addr_valid;
++#endif
++
+ 	return 0;
+ 
+ out_unregister_pppoe_proto:
+@@ -1208,6 +1257,10 @@ static int __init pppoe_init(void)
+ 
+ static void __exit pppoe_exit(void)
+ {
++
++#ifdef CONFIG_PPA
++	ppa_check_pppoe_addr_valid_fn = NULL;
++#endif
+ 	unregister_netdevice_notifier(&pppoe_notifier);
+ 	dev_remove_pack(&pppoed_ptype);
+ 	dev_remove_pack(&pppoes_ptype);
+diff --git a/include/linux/ppp_channel.h b/include/linux/ppp_channel.h
+index 5d87f810a3b7..c0a8a02d3ba2 100644
+--- a/include/linux/ppp_channel.h
++++ b/include/linux/ppp_channel.h
+@@ -75,6 +75,9 @@ extern int ppp_unit_number(struct ppp_channel *);
+ /* Get the device name associated with a channel, or NULL if none */
+ extern char *ppp_dev_name(struct ppp_channel *);
+ 
++/* Get the device pointer associated with a channel, or NULL if none */
++extern struct net_device *ppp_device(struct ppp_channel *);
++
+ /*
+  * SMP locking notes:
+  * The channel code must ensure that when it calls ppp_unregister_channel,

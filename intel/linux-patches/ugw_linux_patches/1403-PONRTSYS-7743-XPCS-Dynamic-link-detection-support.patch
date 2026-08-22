@@ -1,0 +1,214 @@
+From b688d07686c25e5617d883aa0583220b420ddf1e Mon Sep 17 00:00:00 2001
+From: Dinesh Sudham <dineshx.sudham@intel.com>
+Date: Mon, 7 Sep 2020 20:37:43 +0800
+Subject: [PATCH] PONRTSYS-7743:XPCS: Dynamic link detection support
+
+Link between XPCS and its PHY or SFP dynamic,
+serdes should be reconfigured on each link change.
+This feature add support for dynamicaly configure
+serdes based on speed
+
+Signed-off-by: Dinesh Sudham <dineshx.sudham@intel.com>
+---
+ drivers/net/ethernet/lantiq/xpcs/xpcs.c       | 106 +++++++++++++++-----------
+ drivers/net/ethernet/lantiq/xpcs/xpcs.h       |   8 +-
+ drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c |   5 --
+ 3 files changed, 64 insertions(+), 55 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+index 8476e4b6459a..63c43217fdcc 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+@@ -276,6 +276,31 @@ struct xpcs_mode_cfg mode_cfg[MAX_XPCS_MODE] = {
+ 	},
+ };
+ 
++static const char *mode_to_speed(u32 mode)
++{
++	switch (mode) {
++	case ONEG_XAUI_MODE:
++		return "1Gbps";
++	case TWOP5G_SGMII_MODE:
++		return "2.5Gbps";
++	case TENG_KR_MODE:
++	case TENG_XAUI_MODE:
++		return "10Gbps";
++	default:
++		return "Unknown";
++	}
++}
++
++static void xpcs_print_status(struct xpcs_prv_data *pdata)
++{
++	if (pdata->link)
++		dev_dbg(pdata->dev, "Link is Up - %s/%s\n",
++			 mode_to_speed(pdata->mode),
++			 pdata->duplex == DUPLEX_FULL ? "Full" : "Half");
++	else
++		dev_dbg(pdata->dev, "Link is Down\n");
++}
++
+ static int xpcs_rxtx_stable(struct xpcs_prv_data *pdata)
+ {
+ 	int i = 0;
+@@ -1616,51 +1641,41 @@ static int xpcs_ethtool_ksettings_set(struct device *dev,
+ 	return 0;
+ }
+ 
+-static bool get_sgmii_link_status(struct xpcs_prv_data *pdata)
++static void xpcs_get_link_sts(struct xpcs_prv_data *pdata)
+ {
+ 	int ret;
+ 
+-	ret = XPCS_RGRD(pdata, SR_MII_STS);
+-	if (ret < 0)
+-		return ret;
+-	/* Link status is latched low, so read again to get
+-	 * current state
+-	 */
+-	ret = XPCS_RGRD(pdata, SR_MII_STS);
+-	if (ret < 0)
+-		return ret;
+-
+-	if (!(ret & XPCS_SGMII_LINK_STS))
+-		return false;
+-
+-	return true;
+-}
+-static bool get_teng_link_status(struct xpcs_prv_data *pdata)
+-{
+-	int ret;
++	switch (pdata->mode) {
++	case TENG_KR_MODE:
++	case ONEG_XAUI_MODE:
++		ret = XPCS_RGRD(pdata, PCS_STS1);
++		ret = XPCS_RGRD(pdata, PCS_STS1);
++		break;
+ 
+-	ret = XPCS_RGRD(pdata, PCS_KR_STS1);
+-	if (ret < 0)
+-		return ret;
+-	/* Link status is latched low, so read again to get
+-	 * current state
++	case TWOP5G_SGMII_MODE:
++	/* FIXME: On SFP platform Sometimes PC_STS1 shows
++	 * wrong link status for 2.5G Link partner.
+ 	 */
+-	ret = XPCS_RGRD(pdata, PCS_KR_STS1);
+-	if (ret < 0)
+-		return ret;
++		ret = XPCS_RGRD(pdata, SR_MII_STS);
++		ret = XPCS_RGRD(pdata, SR_MII_STS);
++		break;
+ 
+-	if (!(ret & XPCS_KR_LINK_STS))
+-		return false;
++	default:
++		return;
++	}
+ 
+-	return true;
++	if (ret < 0)
++		return;
++	if (ret & 0x0004)
++		pdata->link = 1;
+ }
++
+ /* Poll the link state and reconfigure serdes */
+ static void xpcs_link_poll_work(struct work_struct *work)
+ {
+ 	struct xpcs_prv_data *pdata = container_of(work, struct xpcs_prv_data,
+ 						link_change_work.work);
+ 	u32 mode = 0;
+-	bool teng_link = true, sgmii_link = true;
+ 
+ 	/* Since the device can be in the wrong mode when a link is
+ 	 * (re-)established (SFP connected after the interface is
+@@ -1668,21 +1683,24 @@ static void xpcs_link_poll_work(struct work_struct *work)
+ 	 * is no link, try switching modes and checking the status
+ 	 * again
+ 	 */
+-	if (pdata->link_mode > (MAX_XPCS_MODE - 1))
+-		pdata->link_mode = 0;
++	 pdata->link = 0;
++	 xpcs_get_link_sts(pdata);
+ 
+-	mode = pdata->link_change_seq[pdata->link_mode];
+-	pdata->link_mode++;
++	if (pdata->link) {
++		pdata->link_mode = 0;
++	} else {
++		if (pdata->link_mode > (MAX_XPCS_MODE - 1))
++			pdata->link_mode = 0;
++		mode = pdata->link_change_seq[pdata->link_mode];
++		xpcs_reinit(pdata->dev, mode);
++		pdata->link_mode++;
++	}
+ 
+-	if (!get_teng_link_status(pdata))
+-		teng_link = false;
+-	if (!get_sgmii_link_status(pdata))
+-		sgmii_link = false;
++	if (pdata->old_link != pdata->link) {
++		pdata->old_link = pdata->link;
++		xpcs_print_status(pdata);
++	}
+ 
+-	if (!(teng_link || sgmii_link) && mode != TENG_XAUI_MODE)
+-		xpcs_reinit(pdata->dev, mode);
+-	else
+-		pdata->link_mode = 0;
+ 
+ 	/* Reschedule work for every poll interval */
+ 	queue_delayed_work(pdata->link_poll,
+@@ -1708,7 +1726,7 @@ static int dynamic_link_detection(struct xpcs_prv_data *pdata)
+ 					&pdata->poll_interval);
+ 	if (err) {
+ 		dev_warn(pdata->dev, "using default poll interval\n");
+-		pdata->poll_interval = 3;
++		pdata->poll_interval = 2;
+ 	}
+ 	pdata->link_poll =
+ 		create_singlethread_workqueue("xpcs_dynamic_link");
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.h b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+index 5e9a7839c72d..25ef0f6670dd 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.h
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+@@ -575,12 +575,6 @@
+ #define PMA_RX_EQ_CTRL0_VGA1_GAIN_0_POS	12
+ #define PMA_RX_EQ_CTRL0_VGA1_GAIN_0_WIDTH	4
+ 
+-#define PCS_KR_STS1_RPCS_BKLK_POS    0
+-#define PCS_KR_STS1_RPCS_BKLK_WIDTH  1
+-
+-#define XPCS_KR_LINK_STS 0x0001
+-#define XPCS_SGMII_LINK_STS 0x0004
+-
+ enum {
+ 	BACKPL_ETH_PCS = 0,
+ 	OTHER_PCS_CONFIG = 1
+@@ -850,6 +844,8 @@ struct xpcs_prv_data {
+ 
+ 	/* Serdes configurable data */
+ 	void *serdes_cfg;
++
++	unsigned int link, old_link;
+ };
+ 
+ #define xpcs_r32(reg)		readl(reg)
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+index 1e0e1c8dd0c0..6658ac5d8e5f 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs_sysfs.c
+@@ -237,11 +237,6 @@ xpcs_linksts_show(struct device *dev,
+ 	val = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS);
+ 	off += sprintf(buf + off, "\tSGMII/QSGMII/USXGMII mode Port0 Rx:  %s\n",
+ 		       val ? "LINK UP" : "LINK DOWN");
+-	off += sprintf(buf + off, "\n10GBASE-R Status\n");
+-	off += sprintf(buf + off, "\n");
+-	val = XPCS_RGRD_VAL(pdata, PCS_KR_STS1, RPCS_BKLK);
+-	off += sprintf(buf + off, "\t10GBASE-R:  %s\n",
+-		       val ? "LINK UP" : "LINK DOWN");
+ 
+ 	return off;
+ }

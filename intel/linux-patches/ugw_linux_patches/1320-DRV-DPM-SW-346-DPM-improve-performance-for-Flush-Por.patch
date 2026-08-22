@@ -1,0 +1,165 @@
+From c9162608eadece3720b89de97d8888edb7715506 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Wed, 15 Jul 2020 18:24:36 +0800
+Subject: [PATCH] DRV_DPM_SW-346: DPM improve performance for Flush Port API
+
+---
+ .../net/datapath/dpm/gswip31/datapath_ppv4_api.c   | 82 ++++++++--------------
+ 1 file changed, 29 insertions(+), 53 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+index a1cb649a4bea..58880e3d3a4d 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4_api.c
+@@ -329,12 +329,7 @@ static int queue_flush_31(int inst, int node_id, int flag)
+ {
+ 	struct hal_priv *priv = HAL(inst);
+ 	struct pp_qos_queue_conf queue_cfg = {0};
+-#ifdef DP_FLUSH_VIA_AUTO
+-	u32 qocc;
+-	int times = 10000;
+-#else
+ 	struct pp_qos_queue_conf tmp_q_cfg = {0};
+-#endif
+ 	int qid = get_qid_by_node(inst, node_id, 0);
+ 	int res = DP_SUCCESS;
+ 	struct dp_lookup_entry *lookup = NULL;
+@@ -379,22 +374,7 @@ static int queue_flush_31(int inst, int node_id, int flag)
+ 			goto EXIT;
+ 		}
+ 	}
+-#ifdef DP_FLUSH_VIA_AUTO
+-	while (times--) {
+-		get_q_qocc(inst, qid, &qocc);
+-		if (qocc == 0) /* no packet in the queue */
+-			break;
+-		udelay(10);
+-	};
+-	if (qocc)
+-		DP_DEBUG(DP_DBG_FLAG_QOS,
+-			 "Auto Q[%d] Flushing failed:qocc=%u ???\n",
+-			 qid, qocc);
+-	else
+-		DP_DEBUG(DP_DBG_FLAG_QOS,
+-			 "Auto Q[%d] Flushing ok:qocc=%u\n", qid, qocc);
+ 
+-#else /* flush queue via CQM API */
+ 	if (parent == priv->ppv4_drop_p) {
+ 		/* already attached to drop queue and can directly flush */
+ 		DP_DEBUG(DP_DBG_FLAG_QOS,
+@@ -422,16 +402,7 @@ static int queue_flush_31(int inst, int node_id, int flag)
+ 			 tmp_q_cfg.queue_child_prop.parent);
+ 
+ 		cqm_queue_flush_31(cbm_inst, priv->cqm_drop_p, qid);
+-#ifdef DP_FLUSH_SUSPEND_Q
+-		/* set to suspend again before move back to original parent */
+-		if (pp_qos_queue_suspend(priv->qdev, node_id)) {
+-			pr_err("pp_qos_queue_suspend fail q[%d] to parent=%d\n",
+-			       qid, tmp_q_cfg.queue_child_prop.parent);
+-			goto EXIT;
+-		}
+-		DP_DEBUG(DP_DBG_FLAG_QOS,
+-			 "suspend queue[%d/%d]\n", qid, node_id);
+-#endif
++
+ 		if (flag & FLUSH_RESTORE_QOS_PORT) {
+ 			/* move back the queue to original parent
+ 			 * with original variable queue_cfg
+@@ -448,16 +419,7 @@ static int queue_flush_31(int inst, int node_id, int flag)
+ 				 qid, queue_cfg.queue_child_prop.parent);
+ 		}
+ 	}
+-#endif /* end of DP_FLUSH_VIA_AUTO */
+ 
+-#ifdef DP_FLUSH_SUSPEND_Q
+-	if (pp_qos_queue_suspend(priv->qdev, node_id)) {
+-		pr_err("qos_queue_set fail\n");
+-		goto EXIT;
+-	}
+-	DP_DEBUG(DP_DBG_FLAG_QOS,
+-		 "suspend queue[%d/%d]\n", qid, node_id);
+-#endif
+ 	/* restore lookup entry mapping for this qid if needed */
+ 	if (flag & FLUSH_RESTORE_LOOKUP) {
+ 		int i;
+@@ -2681,11 +2643,13 @@ int dp_deq_port_res_get_31(struct dp_dequeue_res *res, int flag)
+ 		res->num_q += q_num;
+ 		if (!res->q_res)
+ 			continue;
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+ 		DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL, "port[%d/%d] queue list\n",
+ 			 k, priv->deq_port_stat[k].node_id);
+ 		for (i = 0; i < q_num; i++)
+ 			DP_DEBUG(DP_DBG_FLAG_QOS_DETAIL,
+ 				 "  q[/%d]\n", q_ids[i]);
++#endif
+ 		for (i = 0; (i < q_num) && (idx < res->q_res_size); i++) {
+ 			memset(&t.q_info, 0, sizeof(t.q_info));
+ 			if (dp_qos_queue_info_get(priv->qdev,
+@@ -4383,10 +4347,16 @@ int dp_port_block_flush_31(struct dp_qos_blk_flush_port *cfg,
+ 			   int flag)
+ {
+ 	struct hal_priv *priv;
+-	struct dp_dequeue_res deq = {0};
+-	struct dp_queue_res *q_res;
+ 	int i = 0;
+ 	struct dp_qos_blk_flush_queue q_cfg;
++	struct pmac_port_info *port_info;
++	u32 cqm_deq_port = 0;
++	u16 q_ids[MAX_Q_PER_PORT] = {0};
++	u32 q_num;
++	u32 q_size = MAX_Q_PER_PORT;
++
++	if (!cfg || is_invalid_inst(cfg->inst) || is_invalid_port(cfg->dp_port))
++		return DP_FAILURE;
+ 
+ 	priv = HAL(cfg->inst);
+ 	if (!priv || !priv->qdev) {
+@@ -4395,29 +4365,35 @@ int dp_port_block_flush_31(struct dp_qos_blk_flush_port *cfg,
+ 		return DP_FAILURE;
+ 	}
+ 
+-	q_res = kzalloc((sizeof(*q_res) * MAX_Q_PER_PORT), GFP_ATOMIC);
+-	if (!q_res)
++	port_info = get_dp_port_info(cfg->inst, cfg->dp_port);
++	if (!port_info->deq_port_num)
+ 		return DP_FAILURE;
+ 
+-	deq.dp_port = cfg->dp_port;
+-	deq.cqm_deq_idx = cfg->deq_port_idx;
+-	deq.q_res = q_res;
+-	deq.q_res_size = MAX_Q_PER_PORT;
++	if (cfg->deq_port_idx == DEQ_PORT_OFFSET_ALL)
++		cqm_deq_port = port_info->deq_port_base;
++	else
++		cqm_deq_port = port_info->deq_port_base + cfg->deq_port_idx;
++
++	if (!is_deqport_valid(cqm_deq_port) ||
++	    is_port_node_free(priv, cqm_deq_port))
++		return DP_FAILURE;
+ 
+-	if (dp_deq_port_res_get_31(&deq, flag)) {
+-		pr_err("%s dp_deq_port_res_get failed\n", __func__);
+-		kfree(q_res);
++	if (dp_qos_port_get_queues(priv->qdev,
++				   priv->deq_port_stat[cqm_deq_port].node_id,
++				   q_ids, q_size, &q_num)) {
++		pr_err("%s: port[%d/%d]\n", __func__,
++		       cqm_deq_port,
++		       priv->deq_port_stat[cqm_deq_port].node_id);
+ 		return DP_FAILURE;
+ 	}
+ 
+ 	q_cfg.inst = cfg->inst;
+ 
+ 	/* Even if fail, continue to block and flush other queues */
+-	for (i = 0; i < deq.num_q; i++) {
+-		q_cfg.q_id = deq.q_res[i].q_id;
++	for (i = 0; i < q_size; i++) {
++		q_cfg.q_id = get_qid_by_node(cfg->inst, q_ids[i], 0);
+ 		dp_queue_block_flush_31(&q_cfg, flag);
+ 	}
+ 
+-	kfree(q_res);
+ 	return DP_SUCCESS;
+ }

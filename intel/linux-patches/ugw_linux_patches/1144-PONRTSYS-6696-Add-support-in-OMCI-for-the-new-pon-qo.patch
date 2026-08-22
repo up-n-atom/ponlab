@@ -1,0 +1,158 @@
+From cea9e5454ea00379f839e90f759ced1dbf24ef19 Mon Sep 17 00:00:00 2001
+From: Przemyslaw Czarnota <przemyslawx.czarnota@intel.com>
+Date: Fri, 17 Apr 2020 12:49:06 +0200
+Subject: [PATCH] PONRTSYS-6696: Add support in OMCI for the new pon qos driver
+
+- Set up default WRED values
+- Add a missing fallback in dp_ndo_setup_tc()
+
+Strict priority scheduling related test cases were dropping ~50% of
+packets and were failing. This was because of the missing WRED configuration in
+PON QoS driver. This change configures default WRED values, which should
+prevent from dropping so many packets.
+
+The default values were moved from the QoS Manager.
+---
+ drivers/net/datapath/dpm/datapath_instance.c  |  9 ++-
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c | 82 ++++++++++++++++++++++++++-
+ 2 files changed, 88 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index 59b2a9cd4d46..b07294f7ebac 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -204,9 +204,14 @@ EXPORT_SYMBOL(pon_qos_setup_tc_fn);
+ static int dp_ndo_setup_tc(struct net_device *dev, u32 handle,
+ 			   __be16 protocol, struct tc_to_netdev *tc)
+ {
++	int ret = -1;
++
+ #if IS_ENABLED(CONFIG_PON_QOS)
+-	if (pon_qos_setup_tc_fn)
+-		return pon_qos_setup_tc_fn(dev, handle, protocol, tc, -1, -1);
++	if (pon_qos_setup_tc_fn) {
++		ret = pon_qos_setup_tc_fn(dev, handle, protocol, tc, -1, -1);
++		if (!ret)
++			return ret;
++	}
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 5d4d59c7551e..480cdb61970a 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -48,6 +48,26 @@ int pon_qos_port_delete(struct pon_qos_port *port)
+ 	return 0;
+ }
+ 
++#define PORT_GREEN_TH (4 * 1024 * 1024)
++#define PORT_YELLOW_TH (2 * 1024 * 1024)
++static int pon_qos_overwrite_port_thresholds(struct pon_qos_qdisc *sch)
++{
++	struct dp_port_cfg_info port_cfg_info = {
++		.inst = sch->inst,
++		.pid = sch->epn,
++		.green_threshold = PORT_GREEN_TH,
++		.yellow_threshold = PORT_YELLOW_TH,
++	};
++
++	if (dp_qos_port_conf_set(&port_cfg_info, 0) == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: dp_qos_port_conf_set() failed\n",
++			   __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
+ int pon_qos_fill_port_data(struct pon_qos_qdisc *sch)
+ {
+ 	dp_subif_t subif = {0};
+@@ -73,11 +93,19 @@ int pon_qos_fill_port_data(struct pon_qos_qdisc *sch)
+ 	if (ret < 0)
+ 		return -2;
+ 
+-	/* save hw egress prot settings */
++	/* save hw egress port settings */
+ 	sch->inst = subif.inst;
+ 	sch->def_q = q_res[0].q_id;
+ 	sch->epn = deq.cqm_deq_port;
+ 
++	if (sch->deq_idx >= 0) {
++		if (pon_qos_overwrite_port_thresholds(sch)) {
++			netdev_err(sch->dev, "%s: pon_qos_overwrite_port_thresholds() failed\n",
++				   __func__);
++			return -3;
++		}
++	}
++
+ 	return 0;
+ }
+ 
+@@ -483,6 +511,54 @@ static int pon_qos_sched_policy_update(struct pon_qos_qdisc *sch,
+ 	return 0;
+ }
+ 
++#define WRED_GREEN_MAX_TH (500 * 1024)
++#define WRED_GREEN_MIN_TH ((WRED_GREEN_MAX_TH * 90) / 100)
++#define WRED_GREEN_MAX_P 100
++#define WRED_YELLOW_MAX_TH (250 * 1024)
++#define WRED_YELLOW_MIN_TH ((WRED_YELLOW_MAX_TH * 90) / 100)
++#define WRED_YELLOW_MAX_P 100
++
++#define WRED_UNASSIGNED_TH 500
++#define WRED_RED_TH 8000
++
++static int pon_qos_queue_wred_defaults_set(struct pon_qos_qdisc *sch, int idx)
++{
++	struct dp_queue_conf q_cfg = {
++		.q_id = sch->qids[idx].qid,
++		.inst = sch->inst
++	};
++
++	/** Read */
++	if (dp_queue_conf_get(&q_cfg, 0) == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: dp_queue_conf_get() failed\n",
++			   __func__);
++		return -1;
++	}
++
++	/** Modify */
++	q_cfg.act = DP_NODE_EN;
++	q_cfg.drop = DP_QUEUE_DROP_WRED;
++
++	q_cfg.min_size[0] = WRED_GREEN_MIN_TH;
++	q_cfg.max_size[0] = WRED_GREEN_MAX_TH;
++	q_cfg.wred_slope[0] = WRED_GREEN_MAX_P;
++	q_cfg.min_size[1] = WRED_YELLOW_MIN_TH;
++	q_cfg.max_size[1] = WRED_YELLOW_MAX_TH;
++	q_cfg.wred_slope[1] = WRED_YELLOW_MAX_P;
++
++	q_cfg.wred_min_guaranteed = WRED_UNASSIGNED_TH;
++	q_cfg.wred_max_allowed = WRED_RED_TH;
++
++	/** Write */
++	if (dp_queue_conf_set(&q_cfg, 1) == DP_FAILURE) {
++		netdev_err(sch->dev, "%s: dp_queue_conf_set() failed\n",
++			   __func__);
++		return -1;
++	}
++
++	return 0;
++}
++
+ int pon_qos_queue_add(struct pon_qos_qdisc *sch, int arbi, int prio_w, int idx)
+ {
+ 	struct dp_node_link node = {0};
+@@ -530,6 +606,10 @@ int pon_qos_queue_add(struct pon_qos_qdisc *sch, int arbi, int prio_w, int idx)
+ 	if (ret < 0)
+ 		netdev_err(sch->dev, "%s:policy set fail\n", __func__);
+ 
++	ret = pon_qos_queue_wred_defaults_set(sch, idx);
++	if (ret < 0)
++		netdev_err(sch->dev, "%s:wred defaults set fail\n", __func__);
++
+ 	return 0;
+ }
+ 

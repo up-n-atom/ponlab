@@ -1,0 +1,813 @@
+From 90c1658f21f19ba7849c2faf7d3b9de5f56d94dc Mon Sep 17 00:00:00 2001
+From: Jack Ping CHNG <jack.ping.chng@linux.intel.com>
+Date: Thu, 14 May 2020 22:08:26 +0800
+Subject: [PATCH] DRV_DPM_SW-258: DPM Add new API to set callback for
+ net_device ops
+
+- Provide new API for setting callback in net_device ops
+- Remove subif_name in dp_dev_hash and dp_dev_lookup
+- Combine dp_dev_hash and dp_dev_lookup
+---
+ drivers/net/datapath/dpm/datapath_api.c       |  26 ++-
+ drivers/net/datapath/dpm/datapath_instance.c  | 254 +++++++++++++++++++-------
+ drivers/net/datapath/dpm/datapath_instance.h  |  14 +-
+ drivers/net/datapath/dpm/datapath_ioctl.c     |  57 +++---
+ drivers/net/datapath/dpm/datapath_ioctl.h     |   3 +-
+ drivers/net/datapath/dpm/datapath_notifier.c  |   9 +-
+ drivers/net/datapath/dpm/datapath_proc.c      |   6 +-
+ drivers/net/datapath/dpm/datapath_swdev.c     |  84 ++++-----
+ drivers/net/datapath/dpm/datapath_swdev_api.h |   3 +-
+ include/net/datapath_api.h                    |  21 +++
+ 10 files changed, 304 insertions(+), 173 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index f732c794b77f..a8c2c8cf29b6 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -1025,7 +1025,6 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 	struct pmac_port_info *port_info;
+ 	struct dp_subif_info *sif;
+ 	struct dp_dev *dp_dev;
+-	u32 idx;
+ 	int vap, bp = 0, fid = 0, res = DP_FAILURE;
+ 	int f_new_subif = -1, f_old_subif = -1, f_rem_old_dev = 0;
+ 	struct net_device *old_dev, *old_ctp_dev;
+@@ -1066,9 +1065,7 @@ int32_t dp_update_subif_info(struct dp_subif_upd_info *info)
+ 	/* update the master device info to subif */
+ 	if (info->new_dev != old_dev) {
+ 		/* check if exists in DP dev_list */
+-		idx = dp_dev_hash(info->new_dev, NULL);
+-		dp_dev = dp_dev_lookup(&dp_dev_list[idx],
+-				       info->new_dev, NULL, 0);
++		dp_dev = dp_dev_lookup(info->new_dev);
+ 		if (!dp_dev) {
+ 			DP_DEBUG(DP_DBG_FLAG_REG,
+ 				 "new master dev(%s) not exists\n",
+@@ -2893,6 +2890,27 @@ int dp_get_mtu_size(struct net_device *dev, u32 *mtu_size)
+ }
+ EXPORT_SYMBOL(dp_get_mtu_size);
+ 
++int dp_set_net_dev_ops(struct net_device *dev, void *ops_cb, int ops_offset,
++		       u32 flag)
++{
++	int res;
++
++	if (unlikely(!dp_init_ok)) {
++		pr_err("%s failed: datapath not initialized yet\n", __func__);
++		return DP_FAILURE;
++	}
++
++	DP_LIB_LOCK(&dp_lock);
++
++	res = dp_set_net_dev_ops_priv(dev, ops_cb, ops_offset,
++				      flag | DP_OPS_OWNER_EXT);
++
++	DP_LIB_UNLOCK(&dp_lock);
++
++	return res;
++}
++EXPORT_SYMBOL(dp_set_net_dev_ops);
++
+ static int __init dp_init(void)
+ {
+ 	return dp_basic_proc();
+diff --git a/drivers/net/datapath/dpm/datapath_instance.c b/drivers/net/datapath/dpm/datapath_instance.c
+index 082c1e7387b8..0f80e0d3348d 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.c
++++ b/drivers/net/datapath/dpm/datapath_instance.c
+@@ -158,26 +158,23 @@ struct dp_hw_cap *match_hw_cap(struct dp_inst_info *info, u32 flag)
+ /*Note: like pon one device can have multiple ctp,
+  *ie, it may register multiple times
+  */
+-u32 dp_dev_hash(void *dev, void *name)
++u32 dp_dev_hash(void *dev)
+ {
+-	return hash_ptr(dev ? dev : name, DP_DEV_HASH_BIT_LENGTH);
++	return hash_ptr(dev, DP_DEV_HASH_BIT_LENGTH);
+ }
+ 
+-struct dp_dev *dp_dev_lookup(struct hlist_head *head,
+-			     struct net_device *dev, char *subif_name, u32 flag)
++struct dp_dev *dp_dev_lookup(struct net_device *dev)
+ {
++	struct hlist_head *head;
+ 	struct dp_dev *item;
++	u32 idx;
+ 
+-	if (!dev) {
+-		hlist_for_each_entry(item, head, hlist) {
+-			if (strcmp(item->subif_name, subif_name) == 0)
+-				return item;
+-		}
+-	} else {
+-		hlist_for_each_entry(item, head, hlist) {
+-			if (item->dev == dev)
+-				return item;
+-		}
++	idx = dp_dev_hash(dev);
++	head = &dp_dev_list[idx];
++
++	hlist_for_each_entry(item, head, hlist) {
++		if (item->dev == dev)
++			return item;
+ 	}
+ 	return NULL;
+ }
+@@ -236,92 +233,89 @@ static int dp_ndo_setup_tc(struct net_device *dev,
+ int dp_inst_add_dev(struct net_device *dev, char *subif_name, int inst,
+ 		    int ep, int bp, int ctp, u32 flag)
+ {
++	struct subif_basic *subif;
+ 	struct dp_dev *dp_dev;
+-	u8 new_f = 0;
++	int new_f = 0;
+ 	u32 idx;
+-	u32 vap;
+-	struct subif_basic *subif;
+-	struct dp_subif_info *sif;
+-#if IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)
+-	int err = DP_SUCCESS;
++#if (IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)) && !IS_ENABLED(CONFIG_GRX500_CBM)
++	int offset;
+ #endif
+-	struct pmac_port_info *port_info = get_dp_port_info(inst, ep);
+ 
+-	if (!dev && !subif_name) {
+-		pr_err("Why dev/subif_name both NULL?\n");
+-		return -1;
++	if (!dev) {
++		pr_err("%s dev is NULL\n", __func__);
++		return DP_FAILURE;
+ 	}
+-	idx = dp_dev_hash(dev, subif_name);
++
+ 	subif = devm_kzalloc(&g_dp_dev->dev, sizeof(*subif), GFP_ATOMIC);
+ 	if (!subif)
+-		return -1;
++		return DP_FAILURE;
+ 
+ 	subif->subif = ctp;
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, subif_name, flag);
+-	if (!dp_dev) { /*alloc new */
++
++	dp_dev = dp_dev_lookup(dev);
++	if (!dp_dev) {
+ 		dp_dev = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_dev),
+ 				      GFP_ATOMIC);
+ 		if (dp_dev) {
+ 			INIT_LIST_HEAD(&dp_dev->ctp_list);
+ 			new_f = 1;
++		} else {
++			devm_kfree(&g_dp_dev->dev, subif);
++			return DP_FAILURE;
+ 		}
+ 	}
+-	if (!dp_dev) {
+-		devm_kfree(&g_dp_dev->dev, subif);
+-		return -1;
+-	}
+-	if (new_f) {
++
++	if (new_f || !(dp_dev->owner & DP_OPS_OWNER_DPM)) {
+ 		dp_dev->inst = inst;
+ 		dp_dev->dev = dev;
++		dp_dev->ctp = ctp;
+ 		dp_dev->ep = ep;
+ 		dp_dev->bp = bp;
+-		dp_dev->ctp = ctp;
++
+ 		if (subif_name) {
+ 			strncpy(dp_dev->subif_name, subif_name,
+ 				sizeof(dp_dev->subif_name) - 1);
+ 		}
+-		hlist_add_head(&dp_dev->hlist, &dp_dev_list[idx]);
+-#if (IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)) && !IS_ENABLED(CONFIG_GRX500_CBM)
+-		/*backup ops*/
+-		if (dev) {
+-			dev->features |= NETIF_F_HW_TC;
+-			err = dp_ops_set((void **)&dev->netdev_ops,
+-					 offsetof(const struct net_device_ops,
+-						  ndo_setup_tc),
+-					 sizeof(*dev->netdev_ops),
+-					 (void **)&dp_dev->old_dev_ops,
+-					 &dp_dev->new_dev_ops,
+-					 &dp_ndo_setup_tc);
+-			if (err)
+-				return DP_FAILURE;
++
++		if (new_f) {
++			idx = dp_dev_hash(dev);
++			hlist_add_head(&dp_dev->hlist, &dp_dev_list[idx]);
+ 		}
++
++#if (IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)) && !IS_ENABLED(CONFIG_GRX500_CBM)
++		dev->features |= NETIF_F_HW_TC;
++		offset = offsetof(const struct net_device_ops, ndo_setup_tc);
++		dp_set_net_dev_ops_priv(dev, &dp_ndo_setup_tc, offset,
++					DP_OPS_NETDEV);
+ #endif
+-		vap = GET_VAP(subif->subif, port_info->vap_offset,
+-			      port_info->vap_mask);
+-		sif = get_dp_port_subif(port_info, vap);
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+-		if ((!(flag & DP_F_SUBIF_LOGICAL)) && sif->swdev_en == 1)
+-			dp_register_switchdev_ops(dp_dev, dev);
++		if (!(flag & DP_F_SUBIF_LOGICAL))
++			dp_register_switchdev_ops(dp_dev, 0);
+ #endif
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_PTP1588)
+-		dp_register_ptp_ioctl(dp_dev, dev, inst);
++		dp_register_ptp_ioctl(dp_dev, 0);
+ #endif
++		dp_dev->owner |= DP_OPS_OWNER_DPM;
+ 	}
++
+ 	dp_dev->count++;
+ 	list_add(&subif->list, &dp_dev->ctp_list);
++
+ 	DP_DEBUG(DP_DBG_FLAG_DBG, "%s:add new ctp=%d\n", __func__, ctp);
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 		    int ep, u16 ctp, u32 flag)
+ {
+ 	struct dp_dev *dp_dev;
+-	u32 idx;
+ 	struct subif_basic *tmp;
++#if (IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)) && !IS_ENABLED(CONFIG_GRX500_CBM)
++	int offset;
++#endif
+ 
+-	idx = dp_dev_hash(dev, subif_name);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, subif_name, flag);
++	dp_dev = dp_dev_lookup(dev);
+ 	if (!dp_dev) {
+ 		pr_err("Failed to dp_dev_lookup: %s_%s\n",
+ 		       dev ? dev->name : "NULL", subif_name);
+@@ -352,8 +346,6 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 
+ 			if (!dp_dev->count) {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+-				if (!dev)
+-					goto REMOVE;
+ 				if (netif_is_bridge_port(dev)) {
+ 					struct net_device *br_dev;
+ 					struct inst_info *dp_info;
+@@ -373,12 +365,22 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 							     dp_dev->bp);
+ 					rcu_read_unlock();
+ 				}
+-REMOVE:
+ #endif
+-				hlist_del(&dp_dev->hlist);
+-				if (dev)
+-					dp_ops_reset(dp_dev, dev);
+-				devm_kfree(&g_dp_dev->dev, dp_dev);
++				dp_dev->owner &= ~DP_OPS_OWNER_DPM;
++
++#if (IS_ENABLED(CONFIG_PPA) || IS_ENABLED(CONFIG_QOS_MGR)) && !IS_ENABLED(CONFIG_GRX500_CBM)
++				offset = offsetof(const struct net_device_ops,
++						  ndo_setup_tc);
++				dp_set_net_dev_ops_priv(dev, NULL,
++							offset,
++						DP_OPS_NETDEV | DP_OPS_RESET);
++#endif
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
++				dp_register_switchdev_ops(dp_dev, 1);
++#endif
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_PTP1588)
++				dp_register_ptp_ioctl(dp_dev, 1);
++#endif
+ 			}
+ 			return 0;
+ 		}
+@@ -389,6 +391,124 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 	return -1;
+ }
+ 
++int dp_set_net_dev_ops_priv(struct net_device *dev, void *ops_cb,
++			    int ops_offset, u32 flag)
++{
++	struct dp_dev *dp_dev;
++	void **dev_ops;
++	void **org_ops;
++	void *new_ops;
++	int ops_sz;
++	unsigned long org_cb = 0, new_cb;
++	int sz = sizeof(unsigned long);
++	int offset = ops_offset / sz;
++	int idx, err = DP_FAILURE;
++
++	if (!dev) {
++		pr_err("%s invalid dev\n", __func__);
++		return err;
++	}
++
++	dp_dev = dp_dev_lookup(dev);
++	if (!dp_dev && !(flag & DP_OPS_RESET)) {
++		/* New net_device, create and add to dp_dev_list */
++		idx = dp_dev_hash(dev);
++		dp_dev = devm_kzalloc(&g_dp_dev->dev, sizeof(*dp_dev),
++				      GFP_ATOMIC);
++		if (dp_dev) {
++			dp_dev->dev = dev;
++			dp_dev->owner = flag & DP_OPS_OWNER_EXT;
++			hlist_add_head(&dp_dev->hlist, &dp_dev_list[idx]);
++		}
++	}
++
++	if (!dp_dev) {
++		pr_err("%s failed to create dp_dev\n", __func__);
++		err = DP_FAILURE;
++		goto EXIT;
++	}
++
++	switch (flag & DP_OPS_MASK) {
++	case DP_OPS_NETDEV:
++		dev_ops = (void **)&dev->netdev_ops;
++		org_ops = (void **)&dp_dev->old_dev_ops;
++		new_ops = &dp_dev->new_dev_ops;
++		ops_sz = sizeof(*dev->netdev_ops);
++		break;
++
++	case DP_OPS_ETHTOOL:
++		dev_ops = (void **)&dev->ethtool_ops;
++		org_ops = (void **)&dp_dev->old_ethtool_ops;
++		new_ops = &dp_dev->new_ethtool_ops;
++		ops_sz = sizeof(*dev->ethtool_ops);
++		break;
++
++#if IS_ENABLED(CONFIG_NET_SWITCHDEV)
++	case DP_OPS_SWITCHDEV:
++		dev_ops = (void **)&dev->switchdev_ops;
++		org_ops = (void **)&dp_dev->old_swdev_ops;
++		new_ops = &dp_dev->new_swdev_ops;
++		ops_sz = sizeof(*dev->switchdev_ops);
++		break;
++#endif
++#if IS_ENABLED(CONFIG_INTEL_VPN)
++	case DP_OPS_XFRMDEV:
++		dev_ops = (void **)&dev->xfrmdev_ops;
++		org_ops = (void **)&dp_dev->old_xfrm_ops;
++		new_ops = &dp_dev->new_xfrm_ops;
++		ops_sz = sizeof(*dev->xfrmdev_ops);
++		break;
++#endif
++	default:
++		pr_err("%s ops not supported\n", __func__);
++		goto EXIT;
++	}
++
++	if (offset >= ops_sz / sz) {
++		pr_err("%s wrong ops offset\n", __func__);
++		goto ERR;
++	}
++
++	new_cb = *((unsigned long *)new_ops + offset);
++	if (*org_ops)
++		org_cb = *((unsigned long *)(*org_ops) + offset);
++
++	if (flag & DP_OPS_RESET) {
++		/* Set ops with original callback */
++		if (org_cb == new_cb) {
++			pr_warn("%s ops already reset\n", __func__);
++			goto EXIT;
++		}
++
++		err = dp_ops_set(dev_ops, ops_offset, ops_sz,
++				 org_ops, new_ops, (void *)org_cb);
++		if (!err)
++			dp_dev->cb_cnt--;
++	} else {
++		/* Set ops with new callback */
++		if (new_cb == (unsigned long)ops_cb || new_cb != org_cb) {
++			pr_warn("%s ops already set\n", __func__);
++			goto EXIT;
++		}
++
++		err = dp_ops_set(dev_ops, ops_offset, ops_sz,
++				 org_ops, new_ops, ops_cb);
++		if (!err)
++			dp_dev->cb_cnt++;
++	}
++
++ERR:
++	/* If failed to set ops, and no other owner */
++	if (!dp_dev->cb_cnt && !(dp_dev->owner & DP_OPS_OWNER_DPM)) {
++		hlist_del(&dp_dev->hlist);
++		dp_ops_reset(dp_dev, dev);
++		devm_kfree(&g_dp_dev->dev, dp_dev);
++	}
++
++EXIT:
++	return err;
++}
++
+ u32 dp_mod_hash(struct module *owner, u16 ep)
+ {
+ 	return hash_ptr(owner, DP_MOD_HASH_BIT_LENGTH);
+@@ -489,10 +609,8 @@ int dp_get_inst_via_dev(struct net_device *dev, char *subif_name,
+ {
+ 	struct dp_dev *dp_dev;
+ 
+-	if (!dev && !subif_name) /*for ATM IPOA/PPPOA */
+-		return 0; /*workaround:otherwise caller need to check value */
+ 
+-	dp_dev = dp_dev_lookup(dp_dev_list, dev, subif_name, flag);
++	dp_dev = dp_dev_lookup(dev);
+ 	if (!dp_dev)
+ 		return 0; /*workaround:otherwise caller need to check value */
+ 
+diff --git a/drivers/net/datapath/dpm/datapath_instance.h b/drivers/net/datapath/dpm/datapath_instance.h
+index b863d013623f..e30e49fbe1f8 100644
+--- a/drivers/net/datapath/dpm/datapath_instance.h
++++ b/drivers/net/datapath/dpm/datapath_instance.h
+@@ -19,11 +19,13 @@ extern struct dp_hw_cap hw_cap_list[DP_MAX_HW_CAP];
+ 		(DP_F_FAST_WLAN | DP_F_FAST_DSL)) && \
+ 		!((flags) & (DP_TX_CAL_CHKSUM | DP_TX_DSL_FCS)))
+ 
++#define DP_OPS_MASK			GENMASK(15, 1)
++#define DP_OPS_OWNER_DPM	BIT(16) /* DP as ops owner */
++#define DP_OPS_OWNER_EXT	BIT(17) /* external user as ops owner */
++
+ extern struct hlist_head dp_dev_list[DP_DEV_HASH_SIZE];
+-u32 dp_dev_hash(void *dev, void *name);
+-struct dp_dev *dp_dev_lookup(struct hlist_head *head,
+-			     struct net_device *dev, char *subif_name,
+-			     u32 flag);
++u32 dp_dev_hash(void *dev);
++struct dp_dev *dp_dev_lookup(struct net_device *dev);
+ 
+ struct subif_basic {
+ 	struct list_head list;
+@@ -53,6 +55,8 @@ struct dp_dev {
+ 	int fid;
+ 	u32 count;
+ 	struct list_head ctp_list;
++	int cb_cnt;
++	u32 owner;
+ 	const struct net_device_ops *old_dev_ops;
+ 	struct net_device_ops new_dev_ops;
+ 	const struct ethtool_ops *old_ethtool_ops;
+@@ -74,6 +78,8 @@ int dp_inst_del_dev(struct net_device *dev, char *subif_name, int inst,
+ 		    int ep, u16 ctp, u32 flag);
+ int dp_inst_insert_mod(struct module *owner, u16 ep, u32 inst, u32 flag);
+ int dp_inst_del_mod(struct module *owner, u16 ep, u32 flag);
++int dp_set_net_dev_ops_priv(struct net_device *dev, void *ops_cb,
++			    int ops_offset, u32 flag);
+ 
+ int proc_inst_dev_dump(struct seq_file *s, int pos);
+ int proc_inst_dev_start(void);
+diff --git a/drivers/net/datapath/dpm/datapath_ioctl.c b/drivers/net/datapath/dpm/datapath_ioctl.c
+index 030208642a96..da04af6f5848 100644
+--- a/drivers/net/datapath/dpm/datapath_ioctl.c
++++ b/drivers/net/datapath/dpm/datapath_ioctl.c
+@@ -56,7 +56,6 @@ int dp_ops_set(void **dev_ops, int ops_cb_offset,
+ 	       void *dp_new_ops, void *new_ops_cb)
+ {
+ 	void **dev_ops_cb = NULL;
+-	int i;
+ 
+ 	if (!dev_ops) {
+ 		pr_err("dev_ops NULL\n");
+@@ -69,9 +68,7 @@ int dp_ops_set(void **dev_ops, int ops_cb_offset,
+ 	if (*dev_ops != dp_new_ops) {
+ 		if (*dev_ops) {
+ 			*dp_orig_ops_cb = *dev_ops; /* save * old * ops * */
+-			for (i = 0; i < ops_size / sizeof(unsigned long *); i++)
+-				*((unsigned long *)(dp_new_ops) + i) =
+-					*((unsigned long *)(*dev_ops) + i);
++			memcpy(dp_new_ops, *dev_ops, ops_size);
+ 		} else {
+ 			*dp_orig_ops_cb = NULL;
+ 		}
+@@ -92,11 +89,9 @@ static int dp_ndo_ptp_ioctl(struct net_device *dev,
+ 	struct mac_ops *ops;
+ 	int inst = 0;
+ 	struct pmac_port_info *port;
+-	u32 idx = 0;
+ 	struct dp_dev *dp_dev = NULL;
+ 
+-	idx = dp_dev_hash(dev, NULL);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
++	dp_dev = dp_dev_lookup(dev);
+ 	if (!dp_dev) {
+ 		pr_err("\n dp_dev NULL\n");
+ 		return -EFAULT;
+@@ -142,42 +137,34 @@ static int dp_ndo_ptp_ioctl(struct net_device *dev,
+ 	return err;
+ }
+ 
+-int dp_register_ptp_ioctl(struct dp_dev *dp_dev,
+-			  struct net_device *dev, int inst)
++int dp_register_ptp_ioctl(struct dp_dev *dp_dev, int reset)
+ {
+ 	struct dp_cap cap;
+-	int err = DP_SUCCESS;
++	void *cb[] = {&dp_ndo_ptp_ioctl, &get_tsinfo};
++	int offset[] = {offsetof(const struct net_device_ops, ndo_do_ioctl),
++			offsetof(const struct ethtool_ops, get_ts_info)};
++	u32 flag[] = {DP_OPS_NETDEV, DP_OPS_ETHTOOL};
++	int i;
+ 
+-	if (!dev)
+-		return DP_FAILURE;
+-	if (!dp_dev)
++	if (!dp_dev) {
++		pr_err("%s dp_dev is null\n", __func__);
+ 		return DP_FAILURE;
+-	cap.inst = inst;
++	}
++
++	cap.inst = dp_dev->inst;
+ 	dp_get_cap(&cap, 0);
+ 	if (!cap.hw_ptp)
+ 		return DP_FAILURE;
+ 
+-	/* netdev ops register */
+-	err = dp_ops_set((void **)&dev->netdev_ops,
+-			 offsetof(const struct net_device_ops, ndo_do_ioctl),
+-			 sizeof(*dev->netdev_ops),
+-			 (void **)&dp_dev->old_dev_ops,
+-			 &dp_dev->new_dev_ops,
+-			 &dp_ndo_ptp_ioctl);
+-	if (err)
+-		return DP_FAILURE;
+-
+-	/* ethtool ops register */
+-	err = dp_ops_set((void **)&dev->ethtool_ops,
+-			 offsetof(const struct ethtool_ops, get_ts_info),
+-			 sizeof(*dev->ethtool_ops),
+-			 (void **)&dp_dev->old_ethtool_ops,
+-			 &dp_dev->new_ethtool_ops,
+-			 &get_tsinfo);
+-	if (err)
+-		return DP_FAILURE;
+-
+-	DP_DEBUG(DP_DBG_FLAG_INST, "%s done:%s\n", __func__, dev->name);
++	for (i = 0; i < ARRAY_SIZE(offset); i++) {
++		if (reset)
++			flag[i] |= DP_OPS_RESET;
++		if (dp_set_net_dev_ops_priv(dp_dev->dev, cb[i], offset[i],
++					    flag[i])) {
++			pr_err("%s failed to register ops %d\n", __func__, i);
++			return DP_FAILURE;
++		}
++	}
+ 
+ 	return DP_SUCCESS;
+ }
+diff --git a/drivers/net/datapath/dpm/datapath_ioctl.h b/drivers/net/datapath/dpm/datapath_ioctl.h
+index c60f30592a1e..9595959c5487 100644
+--- a/drivers/net/datapath/dpm/datapath_ioctl.h
++++ b/drivers/net/datapath/dpm/datapath_ioctl.h
+@@ -11,8 +11,7 @@
+ #include "datapath_instance.h"
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_PTP1588)
+-int dp_register_ptp_ioctl(struct dp_dev *dp_dev,
+-			  struct net_device *dp_port, int inst);
++int dp_register_ptp_ioctl(struct dp_dev *dp_dev, int reset);
+ #endif
+ int dp_ops_reset(struct dp_dev *dp_dev,
+ 		 struct net_device *dev);
+diff --git a/drivers/net/datapath/dpm/datapath_notifier.c b/drivers/net/datapath/dpm/datapath_notifier.c
+index ac5eaf018797..daf519d1ec43 100644
+--- a/drivers/net/datapath/dpm/datapath_notifier.c
++++ b/drivers/net/datapath/dpm/datapath_notifier.c
+@@ -86,7 +86,6 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 	struct dp_dev *dp_dev;
+ 	struct br_info *br_info;
+ 	int fid, inst, vap = 0;
+-	u32 idx;
+ 	struct pmac_port_info *port;
+ 	dp_subif_t subif = {0};
+ 	struct inst_property *prop;
+@@ -105,8 +104,7 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 		return 0;
+ 	}
+ 	DP_LIB_LOCK(&dp_lock);
+-	idx = dp_dev_hash(dev, NULL);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
++	dp_dev = dp_dev_lookup(dev);
+ 	if (!dp_dev) {
+ 		DP_DEBUG(DP_DBG_FLAG_NOTIFY,
+ 			 "datapath dev(%s) not exists!!,No mac config\n",
+@@ -114,6 +112,11 @@ int dp_event(struct notifier_block *this, unsigned long event, void *ptr)
+ 		DP_LIB_UNLOCK(&dp_lock);
+ 		return 0;
+ 	}
++
++	if (!(dp_dev->owner & DP_OPS_OWNER_DPM)) {
++		DP_LIB_UNLOCK(&dp_lock);
++		return 0;
++	}
+ 	inst = dp_dev->inst;
+ 	port = get_dp_port_info(inst, dp_dev->ep);
+ 	if (dp_get_netif_subifid(dev, NULL, NULL, NULL, &subif, 0)) {
+diff --git a/drivers/net/datapath/dpm/datapath_proc.c b/drivers/net/datapath/dpm/datapath_proc.c
+index de36194374c8..d31af046a9cb 100644
+--- a/drivers/net/datapath/dpm/datapath_proc.c
++++ b/drivers/net/datapath/dpm/datapath_proc.c
+@@ -516,7 +516,6 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ 	struct net_device *dev = sif->netif;
+ 	struct net_device *br_dev;
+ 	struct dp_dev *dp_dev;
+-	u32 idx;
+ 
+ 	if (port->status != PORT_SUBIF_REGISTERED || !sif->flags) {
+ 		pr_err("subif not registered\n");
+@@ -525,8 +524,7 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ 	if (!sif->swdev_en == !enable)
+ 		return DP_SUCCESS;
+ 
+-	idx = dp_dev_hash(dev, NULL);
+-	dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
++	dp_dev = dp_dev_lookup(dev);
+ 	if (!dp_dev) {
+ 		pr_err("dp_dev lookup failed\n");
+ 		return DP_FAILURE;
+@@ -536,7 +534,7 @@ static int set_switchdev(int inst, int ep, int vap, bool enable)
+ 	rtnl_unlock();
+ 
+ 	if (enable) {
+-		if (dp_register_switchdev_ops(dp_dev, dev)) {
++		if (dp_register_switchdev_ops(dp_dev, 0)) {
+ 			pr_err("fail to register swdev ops\n");
+ 			return DP_FAILURE;
+ 		}
+diff --git a/drivers/net/datapath/dpm/datapath_swdev.c b/drivers/net/datapath/dpm/datapath_swdev.c
+index e07dfb36690d..2db888a1b130 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev.c
++++ b/drivers/net/datapath/dpm/datapath_swdev.c
+@@ -286,7 +286,7 @@ static int dp_swdev_cfg_vlan(struct bridge_id_entry_item *br_item,
+ 			     struct net_device *dev)
+ {
+ 	struct dp_dev *dp_dev;
+-	u32 idx, inst;
++	u32 inst;
+ 	int vap;
+ 	struct inst_info *i_info;
+ 	struct pmac_port_info *p_info;
+@@ -296,8 +296,7 @@ static int dp_swdev_cfg_vlan(struct bridge_id_entry_item *br_item,
+ 	if (p_info->swdev_en != 1)
+ 		return 0;
+ 	if (br_item->flags & LOGIC_DEV_REGISTER) {
+-		idx = dp_dev_hash(dev, NULL);
+-		dp_dev = dp_dev_lookup(&dp_dev_list[idx], dev, NULL, 0);
++		dp_dev = dp_dev_lookup(dev);
+ 		if (!dp_dev) {
+ 			pr_err("\n dp_dev NULL\n");
+ 			/* Cannot return -1 from here as this fn is
+@@ -841,6 +840,7 @@ static int dp_swdev_port_attr_set(struct net_device *dev,
+ 	/* switchdev attr orig dev -> bridge port dev pointer
+ 	 * then get the bridge dev from switchdev attr's orig dev
+ 	 */
++
+ 	br_dev = netdev_master_upper_dev_get(attr->orig_dev);
+ 	if (!br_dev)
+ 		return -EOPNOTSUPP;
+@@ -899,6 +899,7 @@ static int dp_swdev_port_attr_get(struct net_device *dev,
+ 	 * cannot be set as this blocks bridgeport offload_fwd_mark
+ 	 * setting at linux bridge level("nbp_switchdev_mark_set")
+ 	 */
++
+ 	br_dev = netdev_master_upper_dev_get(attr->orig_dev);
+ 	if (!br_dev)
+ 		return 0;
+@@ -1006,59 +1007,40 @@ int dp_notif_br_alloc(struct net_device *br_dev)
+ }
+ 
+ /* This function registers the created port in datapath to switchdev */
+-int dp_register_switchdev_ops(struct dp_dev  *dp_dev, struct net_device *dev)
++int dp_register_switchdev_ops(struct dp_dev *dp_dev, int reset)
+ {
+-	int err = DP_SUCCESS;
++	int i;
++	u32 vap, flag = DP_OPS_SWITCHDEV;
+ 	struct inst_info *inst_info = get_dp_prop_info(dp_dev->inst);
++	void *cb[] = {&dp_swdev_port_attr_get, &dp_swdev_port_attr_set,
++		      &dp_swdev_port_obj_add, &dp_swdev_port_obj_del};
++	int offset[] = {offsetof(struct switchdev_ops, switchdev_port_attr_get),
++			offsetof(struct switchdev_ops, switchdev_port_attr_set),
++			offsetof(struct switchdev_ops, switchdev_port_obj_add),
++			offsetof(struct switchdev_ops, switchdev_port_obj_del)};
++	struct pmac_port_info *port_info;
++	struct dp_subif_info *sif;
++
++	port_info = get_dp_port_info(dp_dev->inst, dp_dev->ep);
++	vap = GET_VAP(dp_dev->ctp, port_info->vap_offset, port_info->vap_mask);
++	sif = get_dp_port_subif(port_info, vap);
++
++	if (inst_info->swdev_flag && sif->swdev_en) {
++		if (reset)
++			flag |= DP_OPS_RESET;
+ 
+-	if (!dev) {
+-		pr_err("cannot support switchdev if dev is NULL\n");
+-		return -1;
+-	}
+-	if (inst_info->swdev_flag == 1) {
+-		if (!dev->netdev_ops) {
+-			pr_err("netdev_ops not defined\n");
+-			return -1;
+-		}
+ 		/* switchdev ops register */
+-		err = dp_ops_set((void **)&dev->switchdev_ops,
+-				 offsetof(const struct switchdev_ops,
+-					  switchdev_port_attr_get),
+-				 sizeof(*dev->switchdev_ops),
+-				 (void **)&dp_dev->old_swdev_ops,
+-				 &dp_dev->new_swdev_ops,
+-				 &dp_swdev_port_attr_get);
+-		if (err)
+-			return DP_FAILURE;
+-		err = dp_ops_set((void **)&dev->switchdev_ops,
+-				 offsetof(const struct switchdev_ops,
+-					  switchdev_port_attr_set),
+-				 sizeof(*dev->switchdev_ops),
+-				 (void **)&dp_dev->old_swdev_ops,
+-				 &dp_dev->new_swdev_ops,
+-				 &dp_swdev_port_attr_set);
+-		if (err)
+-			return DP_FAILURE;
+-		err = dp_ops_set((void **)&dev->switchdev_ops,
+-				 offsetof(const struct switchdev_ops,
+-					  switchdev_port_obj_add),
+-				 sizeof(*dev->switchdev_ops),
+-				 (void **)&dp_dev->old_swdev_ops,
+-				 &dp_dev->new_swdev_ops,
+-				 &dp_swdev_port_obj_add);
+-		if (err)
+-			return DP_FAILURE;
+-		err = dp_ops_set((void **)&dev->switchdev_ops,
+-				 offsetof(const struct switchdev_ops,
+-					  switchdev_port_obj_del),
+-				 sizeof(*dev->switchdev_ops),
+-				 (void **)&dp_dev->old_swdev_ops,
+-				 &dp_dev->new_swdev_ops,
+-				 &dp_swdev_port_obj_del);
+-		if (err)
+-			return DP_FAILURE;
++		for (i = 0; i < ARRAY_SIZE(offset); i++) {
++			if (dp_set_net_dev_ops_priv(dp_dev->dev, cb[i],
++						    offset[i], flag)) {
++				pr_err("%s failed to register ops %d\n",
++				       __func__, i);
++				return DP_FAILURE;
++			}
++		}
+ 	}
+-	return 0;
++
++	return DP_SUCCESS;
+ }
+ 
+ void dp_switchdev_exit(void)
+diff --git a/drivers/net/datapath/dpm/datapath_swdev_api.h b/drivers/net/datapath/dpm/datapath_swdev_api.h
+index 2bc8a2078aff..77941e304211 100644
+--- a/drivers/net/datapath/dpm/datapath_swdev_api.h
++++ b/drivers/net/datapath/dpm/datapath_swdev_api.h
+@@ -7,8 +7,7 @@
+ #define DATAPATH_SWIHDEV_API_H
+ 
+ int dp_switchdev_init(void);
+-int dp_register_switchdev_ops(struct dp_dev *dp_dev,
+-			      struct net_device *dev);
++int dp_register_switchdev_ops(struct dp_dev *dp_dev, int reset);
+ int dp_del_br_if(struct net_device *dev, struct net_device *br_dev,
+ 		 int inst, int bport);
+ int dp_notif_br_alloc(struct net_device *br_dev);
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index f1606c238273..c5c7f40fba62 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -2181,4 +2181,25 @@ int dp_net_dev_get_ss_stat_strings_count(struct net_device *dev);
+ void dp_net_dev_get_ethtool_stats(struct net_device *dev,
+ 				  struct ethtool_stats *stats, u64 *data);
+ 
++#define DP_OPS_RESET		BIT(0) /*!< set ops to original ops */
++#define DP_OPS_NETDEV		BIT(1) /*!< set ops for net_device_ops */
++#define DP_OPS_ETHTOOL		BIT(2) /*!< set ops for ethtool_ops */
++#define DP_OPS_SWITCHDEV	BIT(3) /*!< set ops for switchdev_ops */
++#define DP_OPS_XFRMDEV		BIT(4) /*!< set ops for xfrmdev_ops */
++
++/*!
++ *@brief dp_set_net_dev_ops API
++ *@param[in] dev: pointer to net_device structure
++ *@param[in] ops_callback: pointer to new callback,
++ *                         will be ignore if DP_OPS_RESET is set in flag
++ *@param[in] ops_offset: offset of the new callback,
++ *                       e.g. offsetof(const struct net_device_ops, ndo_xxx)
++ *@param[in] flag: ops to change - DP_OPS_x
++ *@return DP_SUCCESS on succeed and DP_FAILURE on failure
++ *@note: Set to new ops - dp_set_net_dev_ops(dev, ops, ops_offset, DP_OPS_NETDEV
++ *       Reset to orginal ops - dp_set_net_dev_ops(dev, NULL, ops_offset,
++ *                                                 DP_OPS_NETDEV|DP_OPS_RESET);
++ */
++int dp_set_net_dev_ops(struct net_device *dev, void *ops_cb, int ops_offset,
++		       u32 flag);
+ #endif /*DATAPATH_API_H */

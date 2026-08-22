@@ -1,0 +1,457 @@
+From 3c1f0f3f3c35b6397eebff4c9b26feaf38f6c598 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Thu, 24 Dec 2020 09:23:10 +0200
+Subject: [PATCH] LMTSYS-4257: [LGM][PPV4]session mirroring implementation
+
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |   8 +-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    |   4 +-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c | 184 +++++++++++++++++++++
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      |  22 +--
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   |  49 ++++--
+ 5 files changed, 240 insertions(+), 27 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index bdec70c279b2..9ea58bf8cc98 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -1074,11 +1074,11 @@ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 		   "| Drop          %10llu  | Drop        %10llu  | Drop        %10llu  |\n",
+ 		   mcast->drop_pkt, reass->err.dropped, frag->total_drops);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Reassembled %10llu  | bmgr drops  %10llu  |\n",
+-		   reass->reassembled, frag->bmgr_drops);
++		   "| Mirror TX     %10llu  | Reassembled %10llu  | bmgr drops  %10llu  |\n",
++		   mcast->mirror_tx_pkt, reass->reassembled, frag->bmgr_drops);
+ 	pr_buf_cat(buf, sz, *n,
+-		   "|                           | Accelerated %10llu  | df drops    %10llu  |\n",
+-		   reass->accelerated, frag->df_drops);
++		   "| Mirror Drop   %10llu  | Accelerated %10llu  | df drops    %10llu  |\n",
++		   mcast->mirror_drop_pkt, reass->accelerated, frag->df_drops);
+ 	pr_buf_cat(buf, sz, *n,
+ 		   "|                           | Diverted    %10llu  | max frags dr%10llu  |\n",
+ 		   reass->diverted, frag->max_frags_drops);
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index c6802b87de68..2da14acf0ed7 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -2749,9 +2749,9 @@ static s32 __smgr_si_ud_set(struct sess_info *s)
+ 		reass_info.eg_port_tr = cfg.tx.tailroom_size;
+ 		reass_info.flags = 0;
+ 		if (cfg.tx.wr_desc)
+-			reass_info.flags |= REASS_INFO_FLAG_WR_DESC;
++			reass_info.flags |= BUFF_EX_FLAG_WR_DESC;
+ 		if (cfg.tx.prel2_en)
+-			reass_info.flags |= REASS_INFO_FLAG_PREL2_EN;
++			reass_info.flags |= BUFF_EX_FLAG_PREL2_EN;
+ 
+ 		ret = pp_port_get(s->args->in_port, &cfg);
+ 		if (unlikely(ret)) {
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 15c963e53d11..247443ba987f 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -35,6 +35,8 @@
+ static struct dentry *dbgfs;
+ static u32            dbg_sess_id;
+ static unsigned long  req_id;
++static u16 mirroring_orig_q = U16_MAX;
++static u16 mirroring_sess_id = U16_MAX;
+ 
+ static void __smgr_dbg_inactive_cb(struct pp_inactive_list_cb_args *args)
+ {
+@@ -2526,6 +2528,175 @@ void sess_update_help(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(sess_update, sess_update_help, sess_update_set);
+ 
++enum sess_mirroring_opts {
++	sess_mirroring_opt_enable = 1,
++	sess_mirroring_opt_id,
++	sess_mirroring_opt_q,
++	sess_mirroring_opt_gpid,
++	sess_mirroring_opt_ps,
++};
++
++static const match_table_t sess_mirroring_tokens = {
++	{sess_mirroring_opt_enable,  "en=%u"},
++	{sess_mirroring_opt_id, "id=%u"},
++	{sess_mirroring_opt_q, "q=%u"},
++	{sess_mirroring_opt_gpid,  "gpid=%u"},
++	{sess_mirroring_opt_ps,  "ps=%x"},
++};
++
++void sess_mirroring_set(char *cmd_buf, void *data)
++{
++	substring_t substr[MAX_OPT_ARGS];
++	enum sess_mirroring_opts opt;
++	char *tok;
++	s32 val;
++	s32 ret = 0;
++	struct pp_dsi dsi;
++	struct mcast_sess_mirroring_cmd cmd = {0};
++	u32 sess_id = 0;
++	struct pp_nf_info nf;
++	struct pp_port_cfg cfg;
++
++	cmd_buf = strim(cmd_buf);
++	/* iterate over user arguments */
++	while ((tok = strsep(&cmd_buf, " \t\n")) != NULL) {
++		if (!*tok)
++			continue;
++		opt = match_token(tok, sess_mirroring_tokens, substr);
++		switch (opt) {
++		case sess_mirroring_opt_enable:
++			if (match_int(&substr[0], &val))
++				goto opt_parse_err;
++			cmd.enable = (u32)val;
++		case sess_mirroring_opt_id:
++			if (match_int(&substr[0], &val))
++				goto opt_parse_err;
++			sess_id = (u32)val;
++			break;
++		case sess_mirroring_opt_q:
++			if (match_int(&substr[0], &val))
++				goto opt_parse_err;
++			cmd.q = (u16)val;
++			break;
++		case sess_mirroring_opt_gpid:
++			if (match_int(&substr[0], &val))
++				goto opt_parse_err;
++			cmd.gpid = (u16)val;
++			break;
++		case sess_mirroring_opt_ps:
++			if (match_int(&substr[0], &val))
++				goto opt_parse_err;
++			cmd.ps0 = (u16)val;
++			cmd.ps_valid = 1;
++		default:
++			pr_info("Error: Invalid option '%s'\n", tok);
++			return;
++		}
++	}
++
++	if (cmd.enable) {
++		if (mirroring_orig_q != U16_MAX) {
++			pr_info("Error: Session %u mirroring alrady in use\n",
++				mirroring_sess_id);
++			return;
++		}
++
++		/* Get DSI Q */
++		if (unlikely(smgr_session_dsi_get(sess_id, &dsi))) {
++			pr_err("couldn't get dsi for session %u", sess_id);
++			return;
++		}
++
++		cmd.orig_q = dsi.dst_q;
++		mirroring_orig_q = cmd.orig_q;
++		mirroring_sess_id = sess_id;
++
++		if (unlikely(pp_port_get(cmd.gpid, &cfg))) {
++			pr_err("pp_port_get eg_port err\n");
++			return;
++		}
++
++		cmd.eg_port_hr = cfg.tx.headroom_size;
++		cmd.eg_port_tr = cfg.tx.tailroom_size;
++		cmd.base_policy = cfg.tx.base_policy;
++		cmd.policies_map = cfg.tx.policies_map;
++		cmd.flags = 0;
++
++		if (cfg.tx.wr_desc)
++			cmd.flags |= BUFF_EX_FLAG_WR_DESC;
++		if (cfg.tx.prel2_en)
++			cmd.flags |= BUFF_EX_FLAG_PREL2_EN;
++
++		ret = uc_egr_mbox_cmd_send(UC_CMD_MCAST_SESS_MIRRORING, 0,
++					   (const void *)&cmd, sizeof(cmd),
++					   NULL, 0);
++		if (ret) {
++			pr_err("UC_CMD_MCAST_SESS_MIRRORING command failed\n");
++			return;
++		}
++
++		/* get the multicast nf info */
++		ret = pp_nf_get(PP_NF_MULTICAST, &nf);
++		if (ret) {
++			pr_err("failed to get the multicast nf info\n");
++			mirroring_orig_q = U16_MAX;
++			cmd.enable = 0;
++			uc_egr_mbox_cmd_send(UC_CMD_MCAST_SESS_MIRRORING, 0,
++					     (const void *)&cmd, sizeof(cmd),
++					     NULL, 0);
++			mirroring_sess_id = U16_MAX;
++			return;
++		}
++
++		ret = pp_session_dst_queue_update(sess_id, nf.q);
++		if (ret) {
++			pr_err("failed to set dst queue\n");
++			mirroring_orig_q = U16_MAX;
++			cmd.enable = 0;
++			uc_egr_mbox_cmd_send(UC_CMD_MCAST_SESS_MIRRORING, 0,
++					     (const void *)&cmd, sizeof(cmd),
++					     NULL, 0);
++			mirroring_sess_id = U16_MAX;
++			return;
++		}
++	} else {
++		ret = chk_session_dsi_q_update(mirroring_sess_id,
++					       mirroring_orig_q);
++		if (unlikely(ret)) {
++			pr_err("failed to update session %u dest queue to %u\n",
++			       mirroring_sess_id, mirroring_orig_q);
++			return;
++		}
++
++		mirroring_orig_q = U16_MAX;
++
++		ret = uc_egr_mbox_cmd_send(UC_CMD_MCAST_SESS_MIRRORING, 0,
++					   (const void *)&cmd, sizeof(cmd),
++					   NULL, 0);
++		if (ret) {
++			pr_err("UC_CMD_MCAST_SESS_MIRRORING command failed\n");
++			return;
++		}
++
++		mirroring_sess_id = U16_MAX;
++	}
++
++	return;
++
++opt_parse_err:
++	pr_err("Failed to parse %s value\n", tok);
++}
++
++void sess_mirroring_help(struct seq_file *f)
++{
++	seq_puts(f, "Enable:\n");
++	seq_puts(f, "echo en=1 id=[sess_id] q=[new_dst_q] gpid=[new_gpid] > sess_mirroring\n");
++	seq_puts(f, "Disable:\n");
++	seq_puts(f, "echo en=0 > sess_mirroring\n");
++}
++
++PP_DEFINE_DEBUGFS(sess_mirroring, sess_mirroring_help, sess_mirroring_set);
++
+ static struct debugfs_file debugfs_files[] = {
+ 	{ "sessions", &PP_DEBUGFS_FOPS(sessions) },
+ 	{ "inact_sessions", &PP_DEBUGFS_FOPS(inact_sessions) },
+@@ -2546,6 +2717,7 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "tdox_en",   &PP_DEBUGFS_FOPS(tdox_en_fops) },
+ 	{ "compare_last_fv", &PP_DEBUGFS_FOPS(session_compare_last_fv) },
+ 	{ "sess_update", &PP_DEBUGFS_FOPS(sess_update) },
++	{ "sess_mirroring", &PP_DEBUGFS_FOPS(sess_mirroring) },
+ };
+ 
+ static struct debugfs_file reassembly_files[] = {
+@@ -2646,6 +2818,8 @@ static void __smgr_dbg_pkt_stats_show(struct seq_file *f)
+ 	u64 total_rx  = 0;
+ 	u64 total_tx  = 0;
+ 	u64 total_drp = 0;
++	u64 total_mirror_tx  = 0;
++	u64 total_mirror_drp = 0;
+ 
+ 	seq_puts(f, "\n");
+ 	seq_puts(f, " +--------------------------------------------+\n");
+@@ -2668,15 +2842,25 @@ static void __smgr_dbg_pkt_stats_show(struct seq_file *f)
+ 			   stats[i].tx_pkt);
+ 		seq_printf(f, " | %-8u | %-9s | %-19llu |\n", i, "DROP",
+ 			   stats[i].drop_pkt);
++		seq_printf(f, " | %-8u | %-9s | %-19llu |\n", i, "MIRROR TX",
++			   stats[i].mirror_tx_pkt);
++		seq_printf(f, " | %-8u | %-9s | %-19llu |\n", i, "MIRROR DROP",
++			   stats[i].mirror_drop_pkt);
+ 		seq_puts(f, " +----------+-----------+---------------------+\n");
+ 		total_rx  += stats[i].rx_pkt;
+ 		total_tx  += stats[i].tx_pkt;
+ 		total_drp += stats[i].drop_pkt;
++		total_mirror_tx  += stats[i].mirror_tx_pkt;
++		total_mirror_drp += stats[i].mirror_drop_pkt;
+ 	}
+ 	seq_printf(f, " | %-8s | %-9s | %-19llu |\n", "TOTAL", "RX", total_rx);
+ 	seq_printf(f, " | %-8s | %-9s | %-19llu |\n", "TOTAL", "TX", total_tx);
+ 	seq_printf(f, " | %-8s | %-9s | %-19llu |\n", "TOTAL", "DROP",
+ 		   total_drp);
++	seq_printf(f, " | %-8s | %-9s | %-19llu |\n", "TOTAL", "MIRROR TX",
++		   total_mirror_tx);
++	seq_printf(f, " | %-8s | %-9s | %-19llu |\n", "TOTAL", "MIRROR DROP",
++		   total_mirror_drp);
+ 	seq_puts(f, " +----------+-----------+---------------------+\n");
+ 	seq_puts(f, "\n");
+ }
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index c4b9450c5614..a290704d1587 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -380,9 +380,11 @@ s32 uc_mcast_stats_get(struct mcast_stats *stats)
+ 			pr_err("failed to get mcast uc cpu %u counters\n", i);
+ 			return ret;
+ 		}
+-		stats->rx_pkt   += cpu_stats.rx_pkt;
+-		stats->tx_pkt   += cpu_stats.tx_pkt;
+-		stats->drop_pkt += cpu_stats.drop_pkt;
++		stats->rx_pkt          += cpu_stats.rx_pkt;
++		stats->tx_pkt          += cpu_stats.tx_pkt;
++		stats->drop_pkt        += cpu_stats.drop_pkt;
++		stats->mirror_tx_pkt   += cpu_stats.mirror_tx_pkt;
++		stats->mirror_drop_pkt += cpu_stats.mirror_drop_pkt;
+ 	}
+ 
+ 	return 0;
+@@ -1447,8 +1449,6 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 	struct pp_si dflt_si;
+ 	s32 ret;
+ 	struct rx_dma_port_cfg port_cfg;
+-	struct pp_rx_dma_init_params cfg;
+-	u8 idx;
+ 
+ 	memset(&info, 0, sizeof(info));
+ 
+@@ -1483,11 +1483,7 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 	info.host_port_tr = port_cfg.tailroom_size;
+ 	info.host_port_flags = 0;
+ 	if (port_cfg.wr_desc)
+-		info.host_port_flags |= REASS_INFO_FLAG_WR_DESC;
+-
+-	rx_dma_config_get(&cfg);
+-	for (idx = 0 ; idx < RX_DMA_MAX_POOLS ; idx++)
+-		info.buffer_size[idx] = cfg.buffer_size[idx];
++		info.host_port_flags |= BUFF_EX_FLAG_WR_DESC;
+ 
+ 	/* Write host info to SRAM to be used by ingress uc */
+ 	PP_REG_WR32(UC_SSRAM(INGRESS, INGRESS_HOST_INFO_PORT_SSRAM_OFF),
+@@ -1713,6 +1709,8 @@ static s32 __uc_ver_verify(bool uc_is_egr)
+ s32 __uc_egr_info_set(void)
+ {
+ 	struct eg_uc_init_info info;
++	struct pp_rx_dma_init_params cfg;
++	u8 idx;
+ 
+ 	memset(&info, 0, sizeof(info));
+ 	info.logger_buff    = __convert_36b_addr_to_32b(logger_buff_phys);
+@@ -1723,6 +1721,10 @@ s32 __uc_egr_info_set(void)
+ 		__convert_36b_addr_to_32b(chk_dsi_phys_base_get());
+ 	info.cls_base       = UC_PP_ADDR(cls_base_addr);
+ 
++	rx_dma_config_get(&cfg);
++	for (idx = 0 ; idx < RX_DMA_MAX_POOLS ; idx++)
++		info.buffer_size[idx] = cfg.buffer_size[idx];
++
+ 	return uc_egr_mbox_cmd_send(UC_CMD_INIT, 0, (const void *)&info,
+ 				    sizeof(info), NULL, 0);
+ }
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index 5854b130f483..dfd68b46359b 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -13,7 +13,7 @@
+  * the version here
+  */
+ #define EGRESS_VER_MAJOR  1
+-#define EGRESS_VER_MINOR  19
++#define EGRESS_VER_MINOR  20
+ 
+ #define INGRESS_VER_MAJOR 1
+ #define INGRESS_VER_MINOR 3
+@@ -32,11 +32,15 @@
+ #define CLS_LOCK_REG_IDX  7
+ 
+ /**
+- * @define REASS_INFO_FLAG, to be used with struct si_ud_reass_info.flags
++ * @define BUFF_EX_FLAG, to be used with struct buffer_ex_info.flags si_ud_reass_info.flags
+  */
+-#define REASS_INFO_FLAG_WR_DESC           (BIT(0))
+-#define REASS_INFO_FLAG_PREL2_EN          (BIT(1))
+-#define REASS_INFO_FLAG_MEMORY_PORT       (BIT(2))
++#define BUFF_EX_FLAG_WR_DESC           (BIT(0))
++#define BUFF_EX_FLAG_PREL2_EN          (BIT(1))
++/**
++ * @define BUFF_EX_FLAG, to be used with struct si_ud_reass_info.flags
++ * NOTE - si_ud_reass_info.flags also includes buffer_ex_info.flags!
++ */
++#define REASS_INFO_FLAG_MEMORY_PORT    (BIT(2))
+ 
+ /**
+  * @enum uc_mbox_cmd_type
+@@ -60,6 +64,8 @@ enum uc_mbox_cmd_type {
+ 	UC_CMD_MCAST_QUEUE,
+ 	/*! set the multicast group bitmap */
+ 	UC_CMD_MCAST_DST,
++	/*! Set the multicast uc to work in session mirroring mode */
++	UC_CMD_MCAST_SESS_MIRRORING,
+ 	/*! set the ipsec pp port id */
+ 	UC_CMD_IPSEC_PID,
+ 	/*! set the ipsec pp rx queue id (second cycle) */
+@@ -128,6 +134,8 @@ struct uc_log_msg {
+ 	char func[16];
+ };
+ 
++#define _RX_DMA_MAX_POOLS (5)
++
+ /**
+  * @struct eg_uc_init_info
+  * @brief UC init info
+@@ -145,6 +153,10 @@ struct eg_uc_init_info {
+ 	u32 chk_dsi_ddr_base;
+ 	/* classifier base address */
+ 	u32 cls_base;
++	/*! Policy buffer sizes */
++	u16 buffer_size[_RX_DMA_MAX_POOLS];
++	/*! Reserved */
++	u16 res;
+ };
+ 
+ /**
+@@ -205,6 +217,10 @@ struct mcast_stats {
+ 	u64 tx_pkt;
+ 	/*! drop packet counter */
+ 	u64 drop_pkt;
++	/*! Mirror TX packet counter */
++	u64 mirror_tx_pkt;
++	/*! Mirror drop packet counter */
++	u64 mirror_drop_pkt;
+ };
+ 
+ /**
+@@ -280,8 +296,6 @@ struct egress_stats {
+ 	struct frag_stats frag;
+ };
+ 
+-#define _RX_DMA_MAX_POOLS (5)
+-
+ /**
+  * @brief Reassembly network function parameters for the FW
+  */
+@@ -290,10 +304,6 @@ struct reassembly_info {
+ 	u16 host_port_hr;
+ 	/*! Host port tailroom */
+ 	u16 host_port_tr;
+-	/*! Policy buffer sizes */
+-	u16 buffer_size[_RX_DMA_MAX_POOLS];
+-	/*! Reserved */
+-	u16 res;
+ 	/*! host base policy */
+ 	u8  host_base_policy;
+ 	/*! host policies bitmap */
+@@ -348,4 +358,21 @@ struct tdox_record_remove_cmd {
+ 	u32 tdox_id;
+ };
+ 
++/**
++ * @brief mcast uc session mirroring
++ */
++struct mcast_sess_mirroring_cmd {
++	u16 enable;
++	u16 orig_q;
++	u16 q;
++	u16 gpid;
++	u32 ps0;
++	u16 ps_valid;
++	u16 eg_port_hr;
++	u16 eg_port_tr;
++	u16 flags;
++	u16 base_policy;
++	u8  policies_map;
++};
++
+ #endif /* __PP_UC_COMMON_H__ */

@@ -1,0 +1,378 @@
+From 280a1d25575affd2696fd99c02bf17f720ae281f Mon Sep 17 00:00:00 2001
+From: Gu Chao <gux.chao@intel.com>
+Date: Fri, 12 Jun 2020 17:24:39 +0800
+Subject: [PATCH] DRV_DPM_SW-285: FLM DPM ref counter enhancement to support
+ dual radio with single dc umt
+
+- refactor dp_register_subif_private() to be in-sync with LGM
+- fix compiler warning on uninitialized varaible in find_pattern()
+- call cbm_dp_enable() before subif_platform_set()
+---
+ drivers/net/datapath/dpm/datapath.h     |   1 +
+ drivers/net/datapath/dpm/datapath_api.c | 268 +++++++++++++++-----------------
+ 2 files changed, 125 insertions(+), 144 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath.h b/drivers/net/datapath/dpm/datapath.h
+index 13a7f2c3ff3e..1544f7f5a0e9 100644
+--- a/drivers/net/datapath/dpm/datapath.h
++++ b/drivers/net/datapath/dpm/datapath.h
+@@ -683,6 +683,7 @@ struct dma_chan_info {
+ struct cqm_port_info {
+ 	u32 f_first_qid : 1; /*0 not valid */
+ 	u32 ref_cnt; /*reference counter: the number of CTP attached to it*/
++	u32 ref_cnt_umt; /* ref counter of UMT */
+ 	u32 tx_pkt_credit;  /*PP port tx bytes credit */
+ 	void *txpush_addr; /* QOS push addr after shift or mask from
+ 			    * PP QOS point of view
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index c4798f1ad65c..ad01ca227447 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -614,7 +614,6 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 				  /*device related info*/
+ 				  struct dp_subif_data *data, u32 flags)
+ {
+-	int res = DP_FAILURE;
+ 	int i, port_id, start, end, j;
+ 	struct pmac_port_info *port_info;
+ 	struct cbm_dp_en_data cbm_data = {0};
+@@ -636,7 +635,7 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+ 			 "register subif failed:%s is not a registered dev!\n",
+ 			 subif_name);
+-		return res;
++		return DP_FAILURE;
+ 	}
+ 	if (!dp_dma_chan_tbl[inst]) {
+ 		pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
+@@ -649,16 +648,15 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 				DP_DEBUG(DP_DBG_FLAG_REG,
+ 					 "reg subif fail:%s not support dev\n",
+ 					 subif_name);
+-				return res;
++				return DP_FAILURE;
+ 			}
+ 			if (!(flags & DP_F_ALLOC_EXPLICIT_SUBIFID)) {
+ 				/*Share same subif with its base device
+ 				 *For GRX350: nothing need except save it
+ 				 *For PRX300: it need to allocate BP for it
+ 				 */
+-				res = add_logic_dev(inst, port_id, dev,
+-						    subif_id, flags);
+-				return res;
++				return add_logic_dev(inst, port_id, dev,
++						     subif_id, flags);
+ 			}
+ 		}
+ 		start = 0;
+@@ -669,151 +667,127 @@ int32_t dp_register_subif_private(int inst, struct module *owner,
+ 				port_info->vap_mask);
+ 		end = start + 1;
+ 	}
+-
+ 	/*pr_info("search range: start=%d end=%d\n",start, end);*/
+ 	/*allocate a free subif */
+ 	for (i = start; i < end; i++) {
+ 		sif = get_dp_port_subif(port_info, i);
+-		if (sif->flags) /*used already & not free*/
+-			continue;
++		if (!sif->flags)
++			break;
++	}
++	if (i >= end) {
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "register subif failed for no matched vap\n");
++		return DP_FAILURE;
++	}
++	if (data->num_deq_port == 0)
++		data->num_deq_port = 1;
+ 
+-		if (data->num_deq_port == 0)
+-			data->num_deq_port = 1;
+-		cqm_deq_port = port_info->deq_port_base + data->deq_port_idx;
+-		dma_ch_offset =	DP_DEQ(inst, cqm_deq_port).dma_ch_offset;
+-		dma_ch_ref_curr = atomic_read(&(dp_dma_chan_tbl[inst] +
+-						dma_ch_offset)->ref_cnt);
+-		/*now find a free subif or valid subif
+-		 *need to do configuration HW
+-		 */
+-		if (dp_port_prop[inst].info.subif_platform_set(
+-			inst, port_id, i, &platfrm_data, flags)) {
+-			pr_err("subif_platform_set fail\n");
+-			goto EXIT;
+-		} else {
+-			DP_DEBUG(DP_DBG_FLAG_REG,
+-				 "subif_platform_set succeed\n");
+-		}
+-		sif->flags = 1;
+-		sif->netif = dev;
+-		port_info->port_id = port_id;
+-		/*currently this field is used for EPON case. Later can further
+-		 * enhance
++	cqm_deq_port = port_info->deq_port_base + data->deq_port_idx;
++	dma_ch_offset =	DP_DEQ(inst, cqm_deq_port).dma_ch_offset;
++	dma_ch_ref_curr = atomic_read(&(dp_dma_chan_tbl[inst] +
++					dma_ch_offset)->ref_cnt);
++	cbm_data.dp_inst = inst;
++	cbm_data.num_dma_chan = port_info->num_dma_chan;
++	cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
++	cbm_data.deq_port = port_info->deq_port_base + data->deq_port_idx;
++	if ((cbm_data.deq_port == 0) ||
++	    (cbm_data.deq_port >= DP_MAX_CQM_DEQ)) {
++		pr_err("Wrong deq_port: %d\n", cbm_data.deq_port);
++		return DP_FAILURE;
++	}
++	if (!dp_dma_chan_tbl[inst]) {
++		pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
++		return DP_FAILURE;
++	}
++	for (j = 0; j < data->num_deq_port; j++) {
++		cqm_deq_port = sif->cqm_deq_port[j];
++		dma_ch_offset = DP_DEQ(inst, cqm_deq_port).dma_ch_offset;
++		dma_ch_ref = atomic_read(&(dp_dma_chan_tbl[inst] +
++					   dma_ch_offset)->ref_cnt);
++		cbm_data.deq_port = port_info->deq_port_base +
++				    data->deq_port_idx + j;
++		if (get_dp_deqport_info(inst, cbm_data.deq_port)->ref_cnt)
++			continue;
++		/* No need to enable DMA if multiple DEQ->single
++		 * DMA
+ 		 */
+-		sif->num_qid = data->num_deq_port;
+-		sif->deq_port_idx = data->deq_port_idx;
+-
+-		if (subif_id->subif < 0) /*dynamic:shift bits as HW defined*/
+-			sif->subif = SET_VAP(i, port_info->vap_offset,
+-					     port_info->vap_mask);
+-		else /*provided by caller since it is alerady shifted properly*/
+-			sif->subif = subif_id->subif;
+-		strncpy(sif->device_name, subif_name,
+-			sizeof(sif->device_name) - 1);
+-		sif->subif_flag = flags;
+-		sif->data_flag_ops = data->flag_ops;
+-		if (data->flag_ops & DP_SUBIF_RX_FLAG)
+-			STATS_SET(sif->rx_flag, !!data->rx_en_flag);
++		if (j != 0)
++			cbm_data.dma_chnl_init = 0;
+ 		else
+-			STATS_SET(sif->rx_flag, 1);
+-
+-#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
+-		if (data->flag_ops & DP_SUBIF_SWDEV)
+-			sif->swdev_en = data->swdev_en_flag;
+-		else
+-			sif->swdev_en = port_info->swdev_en;
+-#endif
+-		port_info->status = PORT_SUBIF_REGISTERED;
+-		/* to disable CPU bridge port from bp member list */
+-		if (data->flag_ops & DP_SUBIF_BP_CPU_DISABLE)
+-			sif->cpu_port_en = 0;
+-		else
+-			sif->cpu_port_en = 1;
+-		subif_id->port_id = port_id;
+-		subif_id->subif = sif->subif;
+-		sif->subif_groupid = i;
+-		/* set port as LCT port */
+-		if (data->flag_ops & DP_F_DATA_LCT_SUBIF)
+-			port_info->lct_idx = i;
+-		port_info->num_subif++;
+-		if ((port_info->num_subif == 1) ||
+-		    (platfrm_data.act & TRIGGER_CQE_DP_ENABLE)) {
+-			cbm_data.dp_inst = inst;
+-			cbm_data.num_dma_chan = port_info->num_dma_chan;
+-			cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+-			cbm_data.deq_port = port_info->deq_port_base +
+-					    data->deq_port_idx;
+-			if ((cbm_data.deq_port == 0) ||
+-			    (cbm_data.deq_port >= DP_MAX_CQM_DEQ)) {
+-				pr_err("Wrong deq_port: %d\n",
+-				       cbm_data.deq_port);
+-				return res;
+-			}
+-			if (!dp_dma_chan_tbl[inst]) {
+-				pr_err("dp_dma_chan_tbl[%d] NULL\n", inst);
+-				return res;
+-			}
+-			for (j = 0; j < data->num_deq_port; j++) {
+-				cqm_deq_port = sif->cqm_deq_port[j];
+-				dma_ch_offset =
+-					DP_DEQ(inst, cqm_deq_port).dma_ch_offset;
+-				dma_ch_ref =
+-					atomic_read(&(dp_dma_chan_tbl[inst] +
+-						      dma_ch_offset)->ref_cnt);
+-				cbm_data.deq_port = port_info->deq_port_base +
+-						    data->deq_port_idx + j;
+-				/* No need to enable DMA if multiple DEQ->single
+-				 * DMA
+-				 */
+-				if (j != 0)
+-					cbm_data.dma_chnl_init = 0;
+-				else
+-					/* PPA Directpath/LitePath don't have DMA CH */
+-					if (dma_ch_ref_curr == 0 &&
+-					    !(port_info->alloc_flags &
+-					      DP_F_DIRECT))
+-						/*to enable DMA*/
+-						cbm_data.dma_chnl_init = 1;
+-				DP_DEBUG(DP_DBG_FLAG_REG,
+-					 "%s%d%s%d%s%d%s%d%d\n",
+-					 "cbm_dp_enable: dp_port=", port_id,
+-					 " deq_port=", cbm_data.deq_port,
+-					 " dma_chnl_init=",
+-					 cbm_data.dma_chnl_init,
+-					 " tx_dma_chan ref=",
+-					 dma_ch_ref, dma_ch_ref_curr);
+-				if (cbm_dp_enable(owner, port_id, &cbm_data, 0,
+-						  port_info->alloc_flags)) {
+-					DP_DEBUG(DP_DBG_FLAG_REG,
+-						 "cbm_dp_enable fail\n");
+-					return res;
+-				}
+-			}
+-			DP_DEBUG(DP_DBG_FLAG_REG, "cbm_dp_enable ok\n");
+-		} else {
+-			DP_DEBUG(DP_DBG_FLAG_REG,
+-				 "No need cbm_dp_enable:dp_port=%d subix=%d\n",
+-				 port_id, i);
++			/* PPA Directpath/LitePath don't have DMA CH */
++			if (dma_ch_ref_curr == 0 &&
++			    !(port_info->alloc_flags & DP_F_DIRECT))
++				/*to enable DMA*/
++				cbm_data.dma_chnl_init = 1;
++		DP_DEBUG(DP_DBG_FLAG_REG,
++			 "%s%d%s%d%s%d%s%d%d\n",
++			 "cbm_dp_enable: dp_port=", port_id,
++			 " deq_port=", cbm_data.deq_port,
++			 " dma_chnl_init=", cbm_data.dma_chnl_init,
++			 " tx_dma_chan ref=", dma_ch_ref, dma_ch_ref_curr);
++		if (cbm_dp_enable(owner, port_id, &cbm_data, 0,
++				  port_info->alloc_flags)) {
++			DP_DEBUG(DP_DBG_FLAG_REG, "cbm_dp_enable fail\n");
++			return DP_FAILURE;
+ 		}
+-		break;
+ 	}
+-
+-	if (i < end) {
+-		res = DP_SUCCESS;
+-
+-		if (get_dp_bp_info(inst, sif->bp)->ref_cnt > 1)
+-			return res;
+-		dp_inst_add_dev(dev, subif_name,
+-				subif_id->inst, subif_id->port_id,
+-				sif->bp,
+-				subif_id->subif, flags);
+-	} else {
+-		DP_DEBUG(DP_DBG_FLAG_REG,
+-			 "register subif failed for no matched vap\n");
++	DP_DEBUG(DP_DBG_FLAG_REG, "cbm_dp_enable ok\n");
++	/*now find a free subif or valid subif
++	 *need to do configuration HW
++	 */
++	if (dp_info->subif_platform_set(inst, port_id, i,
++					&platfrm_data, flags)) {
++		pr_err("subif_platform_set fail\n");
++		return DP_FAILURE;
+ 	}
+-EXIT:
++	DP_DEBUG(DP_DBG_FLAG_REG, "subif_platform_set succeed\n");
+ 
+-	return res;
++	sif->flags = 1;
++	sif->netif = dev;
++	port_info->port_id = port_id;
++	/*currently this field is used for EPON case. Later can further
++	 * enhance
++	 */
++	sif->num_qid = data->num_deq_port;
++	sif->deq_port_idx = data->deq_port_idx;
++
++	if (subif_id->subif < 0) /*dynamic:shift bits as HW defined*/
++		sif->subif = SET_VAP(i, port_info->vap_offset,
++				     port_info->vap_mask);
++	else /*provided by caller since it is alerady shifted properly*/
++		sif->subif = subif_id->subif;
++	strncpy(sif->device_name, subif_name, sizeof(sif->device_name) - 1);
++	sif->subif_flag = flags;
++	sif->data_flag_ops = data->flag_ops;
++	if (data->flag_ops & DP_SUBIF_RX_FLAG)
++		STATS_SET(sif->rx_flag, !!data->rx_en_flag);
++	else
++		STATS_SET(sif->rx_flag, 1);
++
++#if IS_ENABLED(CONFIG_INTEL_DATAPATH_SWITCHDEV)
++	if (data->flag_ops & DP_SUBIF_SWDEV)
++		sif->swdev_en = data->swdev_en_flag;
++	else
++		sif->swdev_en = port_info->swdev_en;
++#endif
++	port_info->status = PORT_SUBIF_REGISTERED;
++	/* to disable CPU bridge port from bp member list */
++	if (data->flag_ops & DP_SUBIF_BP_CPU_DISABLE)
++		sif->cpu_port_en = 0;
++	else
++		sif->cpu_port_en = 1;
++	subif_id->port_id = port_id;
++	subif_id->subif = sif->subif;
++	sif->subif_groupid = i;
++	/* set port as LCT port */
++	if (data->flag_ops & DP_F_DATA_LCT_SUBIF)
++		port_info->lct_idx = i;
++	port_info->num_subif++;
++	if (get_dp_bp_info(inst, sif->bp)->ref_cnt > 1)
++		return DP_SUCCESS;
++	dp_inst_add_dev(dev, subif_name, subif_id->inst, subif_id->port_id,
++			sif->bp, subif_id->subif, flags);
++	return DP_SUCCESS;
+ }
+ 
+ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+@@ -910,7 +884,6 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 		dp_notifier_invoke(inst, dev, port_id,
+ 				   DP_EVENT_DE_REGISTER_SUBIF);
+ 	}
+-
+ 	/* reset mib, flag, and others */
+ 	memset(&sif->mib, 0, sizeof(sif->mib));
+ 	sif->flags = 0;
+@@ -1361,6 +1334,9 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 	struct pmac_port_info *port_info;
+ 	struct dp_dev_data tmp_data = {0};
+ 	struct cbm_dp_alloc_complete_data *cbm_data = NULL;
++#if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	struct cqm_port_info *p;
++#endif
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		pr_err("dp_register_dev failed for datapath not init yet\n");
+@@ -1389,7 +1365,9 @@ int32_t dp_register_dev_ext(int inst, struct module *owner, u32 port_id,
+ 			DP_CB(inst, dev_platform_set)(inst, port_id, data,
+ 						      flags);
+ #if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
+-			remove_umt(inst, &port_info->umt);
++			p = get_dp_deqport_info(inst, port_info->deq_port_base);
++			if (p->ref_cnt_umt && !(--p->ref_cnt_umt))
++				remove_umt(inst, &port_info->umt);
+ #endif
+ 			res = DP_SUCCESS;
+ 		} else {
+@@ -1867,6 +1845,7 @@ static int dp_register_dc(int inst, u32 port_id,
+ {
+ 	struct pmac_port_info *port = get_dp_port_info(inst, port_id);
+ #if !IS_ENABLED(CONFIG_INTEL_DATAPATH_HAL_GSWIP30)
++	struct cqm_port_info *deq;
+ 	struct umt_port_res *res;
+ 	struct umt_ops *ops = dp_get_umt_ops(inst);
+ #endif
+@@ -1908,8 +1887,9 @@ static int dp_register_dc(int inst, u32 port_id,
+ 		pr_err("No UMT driver registered\n");
+ 		return -ENODEV;
+ 	}
+-
+-	ret = ops->umt_request(ops->umt_dev, data->umt);
++	deq = get_dp_deqport_info(inst, res->cqm_dq_pid);
++	if (!deq->ref_cnt_umt++)
++		ret = ops->umt_request(ops->umt_dev, data->umt);
+ 	memcpy(&port->umt, data->umt, sizeof(struct dp_umt_port));
+ 	return ret;
+ #endif

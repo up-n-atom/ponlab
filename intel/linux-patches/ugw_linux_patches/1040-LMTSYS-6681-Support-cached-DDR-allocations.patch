@@ -1,0 +1,763 @@
+From 13eaba7876e4327fe6705a2a48767bb4ee6e3e35 Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Sun, 23 Feb 2020 10:38:47 +0200
+Subject: [PATCH] LMTSYS-6681: Support cached DDR allocations
+
+---
+ .../net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c  |  20 ++---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.h          |   4 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c     |  91 ++++++++-----------
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c   | 100 ++++++++++++---------
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  |   9 +-
+ drivers/net/ppv4/pp-dev/pp_regs.c                  |  41 ++++++++-
+ drivers/net/ppv4/pp-hal/buffer-manager/bm.c        |  16 ++--
+ drivers/net/ppv4/pp-headers/pp_common.h            |  30 +++++++
+ .../ppv4/pp-tools/unit-test/tests/pp_bm_tests.c    |  13 ++-
+ .../ppv4/pp-tools/unit-test/tests/pp_qos_tests.c   |  16 ++--
+ 10 files changed, 201 insertions(+), 139 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+index afda63102ebe..ba9fd894373b 100644
+--- a/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-buffer-mgr/pp_buffer_mgr.c
+@@ -547,10 +547,9 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 	/* Allocate pool_param->pool_num_of_buff * POINTER_SIZE bytes array */
+ 	pool->internal_ptrs_sz = PAGE_ALIGN(sizeof(unsigned int) *
+ 					    pool_params->num_buffers);
+-	pool->internal_ptrs_virt =
+-		dma_zalloc_coherent(NULL, pool->internal_ptrs_sz,
+-				    &pool->internal_ptrs_phys,
+-				    GFP_ATOMIC);
++	pool->internal_ptrs_virt = pp_dma_alloc(pool->internal_ptrs_sz,
++						GFP_ATOMIC,
++						&pool->internal_ptrs_phys);
+ 
+ 	if (!pool->internal_ptrs_virt) {
+ 		pr_err("Could not allocate %u bytes for pool %u pointers\n",
+@@ -574,6 +573,7 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 		temp_pointers_table_ptr++;
+ 		user_array_ptr += pool_params->size_of_buffer;
+ 	}
++	pp_cache_writeback(pool->internal_ptrs_virt, pool->internal_ptrs_sz);
+ 
+ 	cfg.num_buffers = pool_params->num_buffers;
+ 	cfg.ptr_table_addr_low = (u32)pool->internal_ptrs_phys;
+@@ -615,9 +615,9 @@ __bmgr_pool_configure(const struct pp_bmgr_pool_params * const pool_params,
+ 
+ free_memory:
+ 	/* free pointers_table */
+-	dma_free_coherent(NULL, pool->internal_ptrs_sz,
+-			  (void *)pool->internal_ptrs_virt,
+-			  pool->internal_ptrs_phys);
++	pp_dma_free(pool->internal_ptrs_sz,
++		    (void *)pool->internal_ptrs_virt,
++		    &pool->internal_ptrs_phys);
+ 	pool->is_busy = 0;
+ 	__bmgr_db_unlock();
+ 	return ret;
+@@ -746,9 +746,9 @@ static s32 __bmgr_pool_remove(u8 pool_id, bool lock)
+ 	pool = &db->pools[pool_id];
+ 
+ 	/* free pointers_table */
+-	dma_free_coherent(NULL, pool->internal_ptrs_sz,
+-			  (void *)pool->internal_ptrs_virt,
+-			  pool->internal_ptrs_phys);
++	pp_dma_free(pool->internal_ptrs_sz,
++		    (void *)pool->internal_ptrs_virt,
++		    &pool->internal_ptrs_phys);
+ 
+ 	/* Reset pool config */
+ 	cfg.min_guaranteed_enable = false;
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+index 230ec6241d1e..8837487e3018 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.h
+@@ -29,9 +29,9 @@
+  */
+ struct pp_misc_init_param {
+ 	bool        valid;
+-	u32         hw_clk;       /*! hw_clk HW Clock in MHz             */
++	u32         hw_clk;       /*! hw_clk HW Clock in MHz */
+ 	u32         ppv4_regs_sz; /*! size of ppv4 io registers in bytes */
+-	phys_addr_t ppv4_base;    /*! PP HW phyisical base addres        */
++	phys_addr_t ppv4_base;    /*! PP HW phyisical base addres */
+ 	struct dentry *root_dbgfs;
+ 	struct dentry *hal_dbgfs;
+ 	struct kobject *sysfs;
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+index a406ae0504a4..d683b3cf3e71 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+@@ -37,26 +37,6 @@ struct ppv4_qos_fw_sec {
+ 	u32 size;
+ };
+ 
+-void ddr_cache_flush(struct pp_qos_dev *qdev, void *addr, u32 size)
+-{
+-	if (!qdev) {
+-		QOS_LOG_ERR("Qos device NULL\n");
+-		return;
+-	}
+-
+-	dma_map_single(pp_dev_get(), addr, size, DMA_TO_DEVICE);
+-}
+-
+-void ddr_cache_invalidate(struct pp_qos_dev *qdev, void *addr, u32 size)
+-{
+-	if (!qdev) {
+-		QOS_LOG_ERR("Qos device NULL\n");
+-		return;
+-	}
+-
+-	dma_map_single(pp_dev_get(), addr, size, DMA_FROM_DEVICE);
+-}
+-
+ enum fw_soc_rev {
+ 	FW_SOC_REV_A = 0,
+ 	FW_SOC_REV_B,
+@@ -262,8 +242,7 @@ s32 do_load_firmware(struct pp_qos_dev *qdev,
+ 			     ALIGN(stack_sz, align);
+ 	}
+ 
+-	virt_txt = dmam_alloc_coherent(pp_dev_get(), alloc_size,
+-				       &phys_txt, GFP_KERNEL);
++	virt_txt = pp_dma_alloc(alloc_size, GFP_KERNEL, &phys_txt);
+ 	if (!virt_txt) {
+ 		pr_err("Could not allocate %u bytes for fw\n", alloc_size);
+ 		kfree(secs);
+@@ -293,23 +272,19 @@ s32 do_load_firmware(struct pp_qos_dev *qdev,
+ 
+ 	kfree(secs);
+ 
++	/* Write back all elf sections */
++	pp_cache_writeback(virt_txt, alloc_size);
++
+ 	/* Set Guard Regions */
+ 	PP_REG_WR32((ulong)qdev->init_params.qos_uc_base
+ 		    + PPV4_QOS_CMD_BUF_GUARD_OFFSET,
+ 		    PPV4_QOS_UC_GUARD_MAGIC);
+ 
+-	/* Flush cache before uc read FW code */
+-	ddr_cache_flush(qdev, virt_txt, alloc_size);
+-
+ 	ret = wake_uc(wakeuc);
+ 	if (ret) {
+ 		pr_err("wake_uc failed\n");
+ 		return ret;
+ 	}
+-
+-	/* Invalidate cache */
+-	ddr_cache_invalidate(qdev, virt_txt, alloc_size);
+-
+ 	QOS_LOG_DEBUG("waked fw\n");
+ 
+ 	if (pp_reg_poll_x(qdev->init_params.fwcom.cmdbuf, U32_MAX,
+@@ -1858,6 +1833,9 @@ static void create_update_port_tree_cmd(struct pp_qos_dev *qdev, u32 phy)
+ 	for (word_idx = 0; word_idx < QOS_MAX_NUM_QUEUES >> 5; word_idx++)
+ 		cmd.fw.bitmap[word_idx] = bitmap_word[word_idx];
+ 
++	pp_cache_writeback(qdev->hwconf.rlms_container,
++			   QOS_MAX_NUM_QUEUES * sizeof(u16));
++
+ 	/* Update BWL buffer before tree update */
+ 	update_bwl_buffer(qdev, phy);
+ 
+@@ -1974,6 +1952,15 @@ void update_preds(struct pp_qos_dev *qdev, u32 phy, bool queue_port_changed)
+ 	}
+ }
+ 
++void stats_identifier_put(struct pp_qos_dev *qdev, u32 cmd_size)
++{
++	u32 *addr;
++
++	addr = (u32 *)(qdev->hwconf.fw_stats_ddr_virt + cmd_size);
++	*addr = FW_OK_CODE;
++	pp_cache_writeback(addr, 4);
++}
++
+ void create_get_port_stats_cmd(struct pp_qos_dev *qdev, u32 phy, u32 addr,
+ 			       struct pp_qos_port_stat *pstat)
+ {
+@@ -1982,10 +1969,7 @@ void create_get_port_stats_cmd(struct pp_qos_dev *qdev, u32 phy, u32 addr,
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	/* Put identifier at end of statistics buffer */
+-	*(u32 *)(qdev->hwconf.fw_stats_ddr_virt +
+-	sizeof(struct port_stats_s)) = FW_OK_CODE;
+-
++	stats_identifier_put(qdev, sizeof(struct port_stats_s));
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_PORT_STATS,
+ 		 sizeof(cmd), CMD_FLAGS_POST_PROCESS_EXT, (void *)pstat,
+@@ -2014,10 +1998,7 @@ void create_get_queue_stats_cmd(struct pp_qos_dev *qdev,
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	/* Put identifier at end of statistics buffer */
+-	*(u32 *)(qdev->hwconf.fw_stats_ddr_virt +
+-		sizeof(struct queue_stats_s)) = FW_OK_CODE;
+-
++	stats_identifier_put(qdev, sizeof(struct queue_stats_s));
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_QUEUE_STATS,
+ 		 sizeof(cmd), CMD_FLAGS_POST_PROCESS_EXT, (void *)qstat,
+@@ -2054,9 +2035,7 @@ void create_get_qm_stats_cmd(struct pp_qos_dev *qdev, u32 rlm, u32 addr,
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	/* Put identifier at end of statistics buffer */
+-	*(u32 *)(qdev->hwconf.fw_stats_ddr_virt + sizeof(struct qm_info)) =
+-	FW_OK_CODE;
++	stats_identifier_put(qdev, sizeof(struct qm_info));
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_QM_STATS,
+ 		 sizeof(cmd), CMD_FLAGS_POST_PROCESS_EXT, (void *)qstat,
+@@ -2197,10 +2176,7 @@ void create_get_codel_stats_cmd(struct pp_qos_dev *qdev, u32 rlm, u32 addr,
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	/* Put identifier at end of statistics buffer */
+-	*(u32 *)(qdev->hwconf.fw_stats_ddr_virt +
+-	sizeof(struct codel_qstats_s)) = FW_OK_CODE;
+-
++	stats_identifier_put(qdev, sizeof(struct codel_qstats_s));
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_CODEL_STATS,
+ 		 sizeof(cmd), CMD_FLAGS_POST_PROCESS_EXT, (void *)qstat,
+@@ -2225,10 +2201,7 @@ void create_get_node_info_cmd(struct pp_qos_dev *qdev, u32 phy, u32 addr,
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	/* Put identifier at end of statistics buffer */
+-	*(u32 *)(qdev->hwconf.fw_stats_ddr_virt +
+-	sizeof(struct hw_node_info_s)) = FW_OK_CODE;
+-
++	stats_identifier_put(qdev, sizeof(struct hw_node_info_s));
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_NODE_INFO,
+ 		 sizeof(cmd), CMD_FLAGS_POST_PROCESS_EXT, (void *)info,
+@@ -2274,10 +2247,7 @@ void create_get_sys_info_cmd(struct pp_qos_dev *qdev,
+ 	if (PP_QOS_DEVICE_IS_ASSERT(qdev))
+ 		return;
+ 
+-	/* Put identifier at end of statistics buffer */
+-	*(u32 *)(qdev->hwconf.fw_stats_ddr_virt +
+-	sizeof(struct system_stats_s)) = FW_OK_CODE;
+-
++	stats_identifier_put(qdev, sizeof(struct system_stats_s));
+ 	memset(&cmd, 0, sizeof(cmd));
+ 	cmd_init(qdev, &cmd.base, CMD_TYPE_GET_SYSTEM_INFO,
+ 		 sizeof(cmd), CMD_FLAGS_POST_PROCESS_EXT, (void *)info,
+@@ -2805,6 +2775,7 @@ static s32 post_process_external(struct pp_qos_dev *qdev,
+ 	struct qm_info *qminfo, *qminfo_ptr;
+ 	u32 stats_poll = 0;
+ 	u32 fw_signal = FW_OK_CODE;
++	volatile u32 *fw_signal_addr;
+ 	void *qinfo_entry;
+ 	void *response = NULL;
+ 	s32 ret = 0;
+@@ -2814,8 +2785,11 @@ static s32 post_process_external(struct pp_qos_dev *qdev,
+ 
+ 	/* Validate statistics buffer is ready before read */
+ 	while (fw_signal == FW_OK_CODE) {
+-		fw_signal = *(volatile u32 *)(qdev->hwconf.fw_stats_ddr_virt +
+-				     dcmd->cmd.response_sz);
++		fw_signal_addr =
++			(volatile u32 *)(qdev->hwconf.fw_stats_ddr_virt +
++					 dcmd->cmd.response_sz);
++		pp_cache_invalidate(fw_signal_addr, 4);
++		fw_signal = *fw_signal_addr;
+ 		if (stats_poll++ > PP_REG_DFLT_RETRIES) {
+ 			QOS_LOG_ERR("DDR stats poll exceeded %u thr\n",
+ 				    PP_REG_DFLT_RETRIES);
+@@ -3027,6 +3001,8 @@ s32 check_completion(struct pp_qos_dev *qdev)
+ 		QOS_ASSERT(ret == len,
+ 			   "Command queue does not contain a full command\n");
+ 		if (dcmd.cmd.flags & CMD_FLAGS_POST_PROCESS_EXT) {
++			pp_cache_invalidate(qdev->hwconf.fw_stats_ddr_virt,
++					    qdev->hwconf.fw_stats_sz);
+ 			ret = post_process_external(qdev, &dcmd);
+ 			if (ret)
+ 				return ret;
+@@ -3055,8 +3031,10 @@ s32 check_completion(struct pp_qos_dev *qdev)
+ 	internals->pushed = 0;
+ 
+ 	memset((void *)qdev->hwconf.bwl_ddr_virt, 0, qdev->hwconf.bwl_sz);
+-	memset(qdev->hwconf.sbwl_ddr_virt, 0, qdev->hwconf.sbwl_sz);
++	pp_cache_writeback(qdev->hwconf.bwl_ddr_virt, qdev->hwconf.bwl_sz);
+ 
++	memset(qdev->hwconf.sbwl_ddr_virt, 0, qdev->hwconf.sbwl_sz);
++	pp_cache_writeback(qdev->hwconf.sbwl_ddr_virt, qdev->hwconf.sbwl_sz);
+ 	return 0;
+ }
+ 
+@@ -3082,6 +3060,8 @@ void print_fw_log(struct pp_qos_dev *qdev)
+ 	unsigned long msg_addr;
+ 	unsigned long addr, cur;
+ 
++	pp_cache_invalidate(qdev->hwconf.fw_logger_ddr_virt,
++			    qdev->hwconf.fw_logger_sz);
+ 	addr = (unsigned long)(qdev->hwconf.fw_logger_ddr_virt);
+ 	num_messages = *(u32 *)(addr + PPV4_QOS_LOGGER_WRITE_IDX_OFFSET);
+ 	msg_read_count = *(u32 *)(addr + PPV4_QOS_LOGGER_READ_IDX_OFFSET);
+@@ -3108,6 +3088,7 @@ void print_fw_log(struct pp_qos_dev *qdev)
+ 
+ 	/* When done write the correct read count */
+ 	*(u32 *)(addr + PPV4_QOS_LOGGER_READ_IDX_OFFSET) = num_messages;
++	pp_cache_writeback((void *)addr + PPV4_QOS_LOGGER_READ_IDX_OFFSET, 4);
+ }
+ 
+ /* Post commands to be pushed at the end of cmdq */
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+index 074d646eee7b..b47004188059 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+@@ -659,6 +659,8 @@ s32 store_queue_list_max_allowed(struct pp_qos_dev *qdev,
+ 		*(u32 *)addr = node->data.queue.max_allowed;
+ 		rlms++;
+ 	}
++	pp_cache_writeback(qdev->hwconf.max_allow_ddr_virt,
++			   qdev->hwconf.max_allow_sz);
+ 
+ 	/* Read last address to make sure data is written */
+ 	if (addr)
+@@ -3893,8 +3895,7 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 	cfg->qm_sz = PAGE_ALIGN(qdev->init_params.wred_total_avail_resources *
+ 				PPV4_QOS_DESC_SIZE);
+ 
+-	cfg->qm_ddr_virt = dma_zalloc_coherent(NULL, cfg->qm_sz,
+-					       &dma, GFP_KERNEL);
++	cfg->qm_ddr_virt = pp_dma_alloc(cfg->qm_sz, GFP_KERNEL, &dma);
+ 	if (unlikely(!cfg->qm_ddr_virt)) {
+ 		pr_err("Could not allocate %u bytes for queue manager\n",
+ 		       (u32)cfg->qm_sz);
+@@ -3912,9 +3913,8 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 
+ 	/* Allocate FW Logger buffer */
+ 	cfg->fw_logger_sz = PAGE_ALIGN(PPV4_QOS_LOGGER_BUF_SIZE);
+-	cfg->fw_logger_ddr_virt = dma_zalloc_coherent(NULL, cfg->fw_logger_sz,
+-						      &cfg->fw_logger_ddr_phys,
+-						      GFP_KERNEL);
++	cfg->fw_logger_ddr_virt = pp_dma_alloc(cfg->fw_logger_sz, GFP_KERNEL,
++					       &cfg->fw_logger_ddr_phys);
+ 	if (unlikely(!cfg->fw_logger_ddr_virt)) {
+ 		pr_err("Could not allocate %u bytes for logger\n",
+ 		       (u32)cfg->fw_logger_sz);
+@@ -3923,9 +3923,8 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 
+ 	/* Allocate FW Statistics buffer */
+ 	cfg->fw_stats_sz = PAGE_ALIGN(PPV4_QOS_STAT_SIZE);
+-	cfg->fw_stats_ddr_virt = dma_zalloc_coherent(NULL, cfg->fw_stats_sz,
+-						     &cfg->fw_stats_ddr_phys,
+-						     GFP_KERNEL);
++	cfg->fw_stats_ddr_virt = pp_dma_alloc(cfg->fw_stats_sz, GFP_KERNEL,
++					      &cfg->fw_stats_ddr_phys);
+ 	if (unlikely(!cfg->fw_stats_ddr_virt)) {
+ 		pr_err("Could not allocate %u bytes for stats buffer\n",
+ 		       (u32)cfg->fw_stats_sz);
+@@ -3935,10 +3934,8 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 	/* Allocate max allowed buffer */
+ 	cfg->max_allow_sz =
+ 		PAGE_ALIGN(qdev->init_params.max_queues * sizeof(u32));
+-	cfg->max_allow_ddr_virt =
+-		dma_zalloc_coherent(NULL, cfg->max_allow_sz,
+-				    &cfg->max_allow_ddr_phys,
+-				    GFP_KERNEL);
++	cfg->max_allow_ddr_virt = pp_dma_alloc(cfg->max_allow_sz, GFP_KERNEL,
++					       &cfg->max_allow_ddr_phys);
+ 	if (unlikely(!cfg->max_allow_ddr_virt)) {
+ 		pr_err("Could not allocate %u bytes for max allowed buffer\n",
+ 		       (u32)cfg->max_allow_sz);
+@@ -3962,10 +3959,8 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 
+ 	/* Allocate BWL allowed buffer */
+ 	cfg->bwl_sz = PAGE_ALIGN(NUM_OF_NODES * sizeof(u32));
+-	cfg->bwl_ddr_virt =
+-		dma_zalloc_coherent(NULL, cfg->bwl_sz,
+-				    &cfg->bwl_ddr_phys,
+-				    GFP_KERNEL);
++	cfg->bwl_ddr_virt = pp_dma_alloc(cfg->bwl_sz, GFP_KERNEL,
++					 &cfg->bwl_ddr_phys);
+ 	if (unlikely(!cfg->bwl_ddr_virt)) {
+ 		pr_err("Could not allocate %u bytes for bwl buffer\n",
+ 		       (u32)cfg->bwl_sz);
+@@ -3974,10 +3969,8 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 
+ 	/* Allocate SBWL allowed buffer */
+ 	cfg->sbwl_sz = PAGE_ALIGN(NUM_OF_NODES * sizeof(u32));
+-	cfg->sbwl_ddr_virt =
+-		dma_zalloc_coherent(NULL, cfg->sbwl_sz,
+-				    &cfg->sbwl_ddr_phys,
+-				    GFP_KERNEL);
++	cfg->sbwl_ddr_virt = pp_dma_alloc(cfg->sbwl_sz, GFP_KERNEL,
++					  &cfg->sbwl_ddr_phys);
+ 	if (unlikely(!cfg->sbwl_ddr_virt)) {
+ 		pr_err("Could not allocate %u bytes for sbwl buffer\n",
+ 		       (u32)cfg->sbwl_sz);
+@@ -3987,9 +3980,7 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 	return 0;
+ 
+ sbwl_alloc_err:
+-	dma_free_coherent(NULL, cfg->bwl_sz,
+-			  cfg->bwl_ddr_virt,
+-			  cfg->bwl_ddr_phys);
++	pp_dma_free(cfg->bwl_sz, cfg->bwl_ddr_virt, &cfg->bwl_ddr_phys);
+ 
+ bwl_alloc_err:
+ 	kfree(qdev->hwconf.rlms_container);
+@@ -3999,26 +3990,26 @@ s32 __qos_ddr_allocate(struct pp_qos_dev *qdev)
+ 
+ api_str_alloc_err:
+ 	/* Free max allowed buffer */
+-	dma_free_coherent(NULL, cfg->max_allow_sz,
+-			  cfg->max_allow_ddr_virt,
+-			  cfg->max_allow_ddr_phys);
++	pp_dma_free(cfg->max_allow_sz,
++		    cfg->max_allow_ddr_virt,
++		    &cfg->max_allow_ddr_phys);
+ 
+ max_allowed_alloc_err:
+ 	/* Free stats buffer */
+-	dma_free_coherent(NULL, cfg->fw_stats_sz,
+-			  cfg->fw_stats_ddr_virt,
+-			  cfg->fw_stats_ddr_phys);
++	pp_dma_free(cfg->fw_stats_sz,
++		    cfg->fw_stats_ddr_virt,
++		    &cfg->fw_stats_ddr_phys);
+ 
+ stats_alloc_err:
+ 	/* Free Logger */
+-	dma_free_coherent(NULL, cfg->fw_logger_sz,
+-			  cfg->fw_logger_ddr_virt,
+-			  cfg->fw_logger_ddr_phys);
++	pp_dma_free(cfg->fw_logger_sz,
++		    cfg->fw_logger_ddr_virt,
++		    &cfg->fw_logger_ddr_phys);
+ logger_alloc_err:
+ 	/* Free QM */
+-	dma_free_coherent(NULL, cfg->qm_sz,
+-			  cfg->qm_ddr_virt,
+-			  cfg->qm_ddr_phys);
++	pp_dma_free(cfg->qm_sz,
++		    cfg->qm_ddr_virt,
++		    &cfg->qm_ddr_phys);
+ qm_alloc_err:
+ 	return -ENOMEM;
+ }
+@@ -4027,23 +4018,44 @@ void __qos_ddr_free(struct pp_qos_dev *qdev)
+ {
+ 	/* Free queue manager descriptor buffer */
+ 	if (qdev->hwconf.qm_ddr_virt) {
+-		dma_free_coherent(NULL, qdev->hwconf.qm_sz,
+-				  qdev->hwconf.qm_ddr_virt,
+-				  qdev->hwconf.qm_ddr_phys);
++		pp_dma_free(qdev->hwconf.qm_sz,
++			    qdev->hwconf.qm_ddr_virt,
++			    &qdev->hwconf.qm_ddr_phys);
+ 	}
+ 
+ 	/* Free FW Logger buffer */
+ 	if (qdev->hwconf.fw_logger_ddr_virt) {
+-		dma_free_coherent(NULL, qdev->hwconf.fw_logger_sz,
+-				  qdev->hwconf.fw_logger_ddr_virt,
+-				  qdev->hwconf.fw_logger_ddr_phys);
++		pp_dma_free(qdev->hwconf.fw_logger_sz,
++			    qdev->hwconf.fw_logger_ddr_virt,
++			    &qdev->hwconf.fw_logger_ddr_phys);
+ 	}
+ 
+ 	/* Free FW Statistics buffer */
+ 	if (qdev->hwconf.fw_stats_ddr_virt) {
+-		dma_free_coherent(NULL, qdev->hwconf.fw_stats_sz,
+-				  qdev->hwconf.fw_stats_ddr_virt,
+-				  qdev->hwconf.fw_stats_ddr_phys);
++		pp_dma_free(qdev->hwconf.fw_stats_sz,
++			    qdev->hwconf.fw_stats_ddr_virt,
++			    &qdev->hwconf.fw_stats_ddr_phys);
++	}
++
++	/* Free max allow buffer */
++	if (qdev->hwconf.max_allow_ddr_virt) {
++		pp_dma_free(qdev->hwconf.max_allow_sz,
++			    qdev->hwconf.max_allow_ddr_virt,
++			    &qdev->hwconf.max_allow_ddr_phys);
++	}
++
++	/* Free BWL buffer */
++	if (qdev->hwconf.bwl_ddr_virt) {
++		pp_dma_free(qdev->hwconf.bwl_sz,
++			    qdev->hwconf.bwl_ddr_virt,
++			    &qdev->hwconf.bwl_ddr_phys);
++	}
++
++	/* Free SBWL buffer */
++	if (qdev->hwconf.sbwl_ddr_virt) {
++		pp_dma_free(qdev->hwconf.sbwl_sz,
++			    qdev->hwconf.sbwl_ddr_virt,
++			    &qdev->hwconf.sbwl_ddr_phys);
+ 	}
+ 
+ 	/* Free API string buffer */
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index 6f8c29427481..2c98c314ed40 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -2335,6 +2335,9 @@ void update_bwl_buffer(struct pp_qos_dev *qdev, u32 phy)
+ 				node_bw_limited_wrapper, NULL,
+ 				update_bwl_buffer_node, NULL);
+ 
++	pp_cache_writeback(qdev->hwconf.bwl_ddr_virt, qdev->hwconf.bwl_sz);
++	pp_cache_writeback(qdev->hwconf.sbwl_ddr_virt, qdev->hwconf.sbwl_sz);
++
+ 	/* Read last address to make sure data is written */
+ 	bwl_val = *(u32 *)(qdev->hwconf.bwl_ddr_virt +
+ 			   qdev->hwconf.bwl_sz - 4);
+@@ -4241,8 +4244,7 @@ void qos_descriptor_pop(struct pp_qos_dev *qdev, u32 queue_id, u32 *descriptor)
+ 
+ 	memset(descriptor, 0, 16);
+ 	sz = PAGE_ALIGN(QOS_DESC_WORDS_CNT * sizeof(u32));
+-	desc_addr = dmam_alloc_coherent(pp_dev_get(), sz, &desc_addr_phys,
+-					GFP_KERNEL);
++	desc_addr = pp_dma_alloc(sz, GFP_KERNEL, &desc_addr_phys);
+ 	if (!desc_addr)
+ 		return;
+ 
+@@ -4263,8 +4265,9 @@ void qos_descriptor_pop(struct pp_qos_dev *qdev, u32 queue_id, u32 *descriptor)
+ 	}
+ 
+ 	memcpy((void *)descriptor, (void *)desc_addr, QOS_DESC_WORDS_CNT * 4);
++	pp_cache_invalidate(desc_addr, QOS_DESC_WORDS_CNT * sizeof(u32));
+ 
+ free_mem:
+ 	QOS_UNLOCK(qdev);
+-	dma_free_coherent(NULL, sz, desc_addr, desc_addr_phys);
++	pp_dma_free(sz, desc_addr, &desc_addr_phys);
+ }
+diff --git a/drivers/net/ppv4/pp-dev/pp_regs.c b/drivers/net/ppv4/pp-dev/pp_regs.c
+index 724a9d2da486..bc5d4b3e022a 100644
+--- a/drivers/net/ppv4/pp-dev/pp_regs.c
++++ b/drivers/net/ppv4/pp-dev/pp_regs.c
+@@ -66,7 +66,8 @@ s32 pp_raw_reg_poll(u64 addr, u32 mask, u32 val, u32 retries,
+ 	return ret;
+ }
+ 
+-#define PPV4_MAX_IO_REGIONS (30)
++/* TBD - reduce back to 30 once no need for ddr allocations bookeeping */
++#define PPV4_MAX_IO_REGIONS (500)
+ 
+ static struct pp_io_region regions[PPV4_MAX_IO_REGIONS];
+ static u32                 regions_cnt;
+@@ -209,3 +210,41 @@ inline void pp_memcpy(void *dst, void *src, u32 cnt)
+ 		byte_buf++;
+ 	}
+ }
++
++void *pp_dma_alloc(size_t size, gfp_t flag, dma_addr_t *dma_handle)
++{
++	void *addr;
++#ifndef CONFIG_PPV4_LGM
++	struct pp_io_region region;
++#endif
++	addr = dma_zalloc_coherent(pp_dev_get(), size, dma_handle, flag);
++	if (!addr)
++		return NULL;
++
++#ifndef CONFIG_PPV4_LGM
++	/* For FLM make sure to store original virtual address */
++	region.virt = addr;
++	region.phys = *dma_handle;
++	region.sz = size;
++
++	pp_region_add(&region);
++
++	/* Overwrite virtual address */
++	addr = phys_to_virt(*dma_handle);
++#endif
++
++	return addr;
++}
++
++void pp_dma_free(size_t size, void *address, dma_addr_t *dma_handle)
++{
++	void *virt_addr;
++
++	/* In FLM use stored virtual address rather than the user's address */
++	if (!IS_ENABLED(CONFIG_PPV4_LGM))
++		virt_addr = pp_phys_to_virt(*dma_handle);
++	else
++		virt_addr = address;
++
++	dma_free_coherent(pp_dev_get(), size, virt_addr, *dma_handle);
++}
+diff --git a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+index 652efda07a9e..36483c1c2a14 100644
+--- a/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
++++ b/drivers/net/ppv4/pp-hal/buffer-manager/bm.c
+@@ -657,14 +657,14 @@ s32 bm_pop_buffer(struct bmgr_buff_info *buff_info)
+ 	bm_addr_phys |= BM_POP_ADDR_OFFSET(buff_info->policy_id);
+ 
+ 	sz = PAGE_ALIGN(2 * sizeof(u32));
+-	dst_addr = dma_alloc_coherent(NULL, sz, &dst_addr_phys,
+-				      GFP_KERNEL | GFP_DMA);
++	dst_addr = pp_dma_alloc(sz, GFP_KERNEL | GFP_DMA, &dst_addr_phys);
+ 	if (!dst_addr) {
+-		pr_err("Could not allocate using dma_alloc_coherent\n");
++		pr_err("Could not allocate using dma_alloc\n");
+ 		return -ENOMEM;
+ 	}
+ 
+ 	qos_uc_mcdma_copy(qdev, bm_addr_phys, (u32)dst_addr_phys, 8);
++	pp_cache_invalidate(dst_addr, 8);
+ 
+ 	low = PP_REG_RD32(dst_addr);
+ 	high = PP_REG_RD32(dst_addr + 4);
+@@ -679,7 +679,7 @@ s32 bm_pop_buffer(struct bmgr_buff_info *buff_info)
+ 	buff_info->pool_id = (high & 0xFF000000) >> 24;
+ 
+ free_mem:
+-	dma_free_coherent(NULL, sz, dst_addr, dst_addr_phys);
++	pp_dma_free(sz, dst_addr, &dst_addr_phys);
+ 
+ 	return ret;
+ }
+@@ -704,10 +704,9 @@ s32 bm_push_buffer(struct bmgr_buff_info *buff_info)
+ 		return -EINVAL;
+ 
+ 	sz = PAGE_ALIGN(2 * sizeof(u32));
+-	src_addr = dma_alloc_coherent(NULL, sz, &src_addr_phys,
+-				      GFP_KERNEL | GFP_DMA);
++	src_addr = pp_dma_alloc(sz, GFP_KERNEL | GFP_DMA, &src_addr_phys);
+ 	if (!src_addr) {
+-		pr_err("Could not allocate using dma_alloc_coherent\n");
++		pr_err("Could not allocate using dma_alloc\n");
+ 		ret = -ENOMEM;
+ 		goto free_mem;
+ 	}
+@@ -722,11 +721,12 @@ s32 bm_push_buffer(struct bmgr_buff_info *buff_info)
+ 
+ 	*(u32 *)src_addr = addr_low;
+ 	*(((u32 *)src_addr) + 1) = value;
++	pp_cache_writeback(src_addr, 8);
+ 
+ 	qos_uc_mcdma_copy(qdev, src_addr_phys, bm_addr_phys, 8);
+ 
+ free_mem:
+-	dma_free_coherent(NULL, sz, src_addr, src_addr_phys);
++	pp_dma_free(sz, src_addr, &src_addr_phys);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ppv4/pp-headers/pp_common.h b/drivers/net/ppv4/pp-headers/pp_common.h
+index 8757634e32b3..ec9e8e7c98ce 100644
+--- a/drivers/net/ppv4/pp-headers/pp_common.h
++++ b/drivers/net/ppv4/pp-headers/pp_common.h
+@@ -19,6 +19,7 @@
+ #include <linux/jiffies.h>
+ #include <linux/delay.h>
+ #include <linux/version.h>
++#include <linux/dma-mapping.h>
+ #if KERNEL_VERSION(4, 12, 0) > LINUX_VERSION_CODE
+ #include <linux/vmalloc.h>
+ #endif
+@@ -1368,6 +1369,35 @@ static inline s32 pp_pps_show(size_t stats_sz, u32 num_stats, __stats_get get,
+ 	pp_pps_show(ssz, num, get, diff, show, data, (f)->buf, (f)->size,      \
+ 		    &(f)->count)
+ 
++/**
++ * @brief Allocate contiguos physical memory
++ */
++void *pp_dma_alloc(size_t size, gfp_t flag, dma_addr_t *dma_handle);
++
++/**
++ * @brief Free contiguos physical memory
++ */
++void pp_dma_free(size_t size, void *address, dma_addr_t *dma_handle);
++
++/**
++ * @brief Cache writeback
++ */
++static inline void pp_cache_writeback(void *addr, size_t size)
++{
++	if (!IS_ENABLED(CONFIG_PPV4_LGM))
++		dma_map_single(pp_dev_get(), addr, size, DMA_TO_DEVICE);
++}
++
++/**
++ * @brief Cache invalidate
++ */
++static inline void pp_cache_invalidate(volatile void *addr, size_t size)
++{
++	if (!IS_ENABLED(CONFIG_PPV4_LGM))
++		dma_map_single(pp_dev_get(), (void *)addr, size,
++			       DMA_FROM_DEVICE);
++}
++
+ #if IS_ENABLED(CONFIG_DEBUG_FS)
+ /**
+  * @brief PPv4 FPGA init sequence debug init
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c
+index eea48a7bea31..229bbbd677c6 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_bm_tests.c
+@@ -276,10 +276,9 @@ static int pp_bm_configuration_test(void *data)
+ 	/* Create Pools */
+ 	for (pool_id = 0 ; pool_id < cfg.max_pools ; pool_id++) {
+ 		pool_params.flags = POOL_ENABLE_FOR_MIN_GRNT_POLICY_CALC;
+-		bm_virt_ddr[pool_id] =
+-			dma_alloc_coherent(NULL, BM_ALLOC_SZ,
+-					   &bm_phys_ddr[pool_id],
+-					   GFP_KERNEL);
++		bm_virt_ddr[pool_id] = pp_dma_alloc(BM_ALLOC_SZ,
++						    GFP_KERNEL,
++						    &bm_phys_ddr[pool_id]);
+ 		if (!bm_virt_ddr[pool_id]) {
+ 			pr_err("Could not allocate %u bytes for buffer manager\n",
+ 			       BM_ALLOC_SZ);
+@@ -443,9 +442,9 @@ static int pp_bm_post_test(void *data)
+ 		if (unlikely(pp_bmgr_pool_remove(pool_id)))
+ 			pr_info("Removing pool %d failed\n", pool_id);
+ 		/* Release pool memory */
+-		dma_free_coherent(NULL, BM_ALLOC_SZ,
+-				  bm_virt_ddr[pool_id],
+-				  bm_phys_ddr[pool_id]);
++		pp_dma_free(BM_ALLOC_SZ,
++			    bm_virt_ddr[pool_id],
++			    bm_phys_ddr[pool_id]);
+ 	}
+ 
+ 	/* Reset bm config if no need to restore previous config */
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
+index e1d5c4d3796b..6a843805312c 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
+@@ -2573,11 +2573,9 @@ static int qos_pre_test(void *data)
+ 
+ 	for (ring_idx = 0; ring_idx < QOS_TEST_NUM_RING_ADDR; ring_idx++) {
+ 		ring_addr_virt[ring_idx] =
+-			dma_alloc_coherent(NULL,
+-					   PPV4_QOS_DESC_SIZE *
+-					   QOS_NUM_RING_DESCRIPTORS,
+-					   &ring_addr_phys[ring_idx],
+-					   GFP_KERNEL);
++			pp_dma_alloc(PPV4_QOS_DESC_SIZE *
++				     QOS_NUM_RING_DESCRIPTORS,
++				     GFP_KERNEL, &ring_addr_phys[ring_idx]);
+ 		if (!ring_addr_virt[ring_idx]) {
+ 			pr_err("Could not allocate %u bytes for ring\n",
+ 			       PPV4_QOS_DESC_SIZE * QOS_NUM_RING_DESCRIPTORS);
+@@ -2623,10 +2621,10 @@ static int qos_post_test(void *data)
+ 	}
+ 
+ 	for (ring_idx = 0; ring_idx < QOS_TEST_NUM_RING_ADDR; ring_idx++) {
+-		dma_free_coherent(NULL, PPV4_QOS_DESC_SIZE *
+-				  QOS_NUM_RING_DESCRIPTORS,
+-				  ring_addr_virt[ring_idx],
+-				  ring_addr_phys[ring_idx]);
++		pp_dma_free(PPV4_QOS_DESC_SIZE *
++			    QOS_NUM_RING_DESCRIPTORS,
++			    ring_addr_virt[ring_idx],
++			    &ring_addr_phys[ring_idx]);
+ 	}
+ 
+ #ifdef FW_CHECK_SYNC

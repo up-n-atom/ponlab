@@ -1,0 +1,177 @@
+From 4f38100b8ba922589272f316a4b8ccb43e7a7f17 Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Wed, 24 Jul 2019 16:30:24 +0300
+Subject: [PATCH] PONRTSYS-4778: add supend/resume queue
+
+---
+ drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c | 82 ++++++++++++------------
+ 1 file changed, 41 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+index e60df47ee405..d025d543dad4 100644
+--- a/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
++++ b/drivers/net/ethernet/lantiq/ppv4/qos/pp_qos_fw.c
+@@ -2094,9 +2094,10 @@ static void set_child(
+ 	child->valid = valid;
+ }
+ 
+-static uint32_t *restart_node(
++static uint32_t *suspend_node(
+ 		struct pp_qos_dev *qdev,
+ 		unsigned int phy,
++		unsigned int suspend,
+ 		uint32_t *_cur,
+ 		uint32_t **_prev,
+ 		struct cmd_internal *cmd)
+@@ -2115,13 +2116,13 @@ static uint32_t *restart_node(
+ 	child.valid = 0;
+ 	sched.valid = 0;
+ 	queue.valid = 0;
+-	common.suspend = 1;
++	common.suspend = suspend;
+ 
+ 	node = get_node_from_phy(qdev->nodes, phy);
+ 	QOS_ASSERT(!node_port(node), "Can't restart port %u\n", phy);
+ 
+ 	if (node_sched(node)) {
+-		QOS_LOG_DEBUG("CMD_INTERNAL_RESTART_SCHED: %u\n", phy);
++		QOS_LOG_DEBUG("CMD_INTERNAL_SUSPEND_SCHED: %u\n", phy);
+ 		cmd->base.pos = cur;
+ 		cur = fw_write_set_sched_cmd(
+ 				cur,
+@@ -2136,22 +2137,6 @@ static uint32_t *restart_node(
+ 				qdev->drvcmds.pendq,
+ 				cmd,
+ 				cmd->base.len);
+-
+-		common.suspend = 0;
+-		cmd->base.pos = cur;
+-		*_prev = cur;
+-		cur = fw_write_set_sched_cmd(
+-				cur,
+-				phy,
+-				0,
+-				&common,
+-				&parent,
+-				&child,
+-				&sched);
+-		cmd_queue_put(
+-				qdev->drvcmds.pendq,
+-				cmd,
+-				cmd->base.len);
+ 	} else if (node_queue(node)) {
+ 		cmd->base.pos = cur;
+ 		queue.rlm = node->data.queue.rlm;
+@@ -2159,22 +2144,7 @@ static uint32_t *restart_node(
+ 			(node->data.queue.alias_master_id == PP_QOS_INVALID_ID)
+ 			? 0 : 1;
+ 
+-		QOS_LOG_DEBUG("CMD_INTERNAL_RESTART_QUEUE: %u\n", phy);
+-		cur = fw_write_set_queue_cmd(
+-				cur,
+-				phy,
+-				0,
+-				&common,
+-				&child,
+-				&queue);
+-		cmd_queue_put(
+-				qdev->drvcmds.pendq,
+-				cmd,
+-				cmd->base.len);
+-
+-		common.suspend = 0;
+-		cmd->base.pos = cur;
+-		*_prev = cur;
++		QOS_LOG_DEBUG("CMD_INTERNAL_SUSPEND_QUEUE: %u\n", phy);
+ 		cur = fw_write_set_queue_cmd(
+ 				cur,
+ 				phy,
+@@ -2187,7 +2157,6 @@ static uint32_t *restart_node(
+ 				cmd,
+ 				cmd->base.len);
+ 	}
+-
+ 	return cur;
+ }
+ 
+@@ -2895,6 +2864,33 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 
+ 	if (!internals->ongoing) {
+ 		common.suspend = 1;
++		for (i = internals->moved_nodes_index;
++		     i < internals->num_moved_nodes; ++i) {
++			// Verify space for a command (suspend)
++			if (remain < MAX_FW_CMD_SIZE) {
++				internals->moved_nodes_index = i;
++				QOS_LOG_DEBUG("reentry required: remain %d, move ind %u, num moved %u\n",
++					      remain,
++					      internals->moved_nodes_index,
++					      internals->num_moved_nodes);
++				goto signal_uc;
++			}
++
++			prev = cur;
++			cur = suspend_node(qdev,
++					internals->moved_nodes[i].phy,
++					common.suspend,
++					cur,
++					&prev,
++					&cmd_internal);
++			if (cur != prev) {
++				pushed += 1;
++				remain = cmdbuf_sz - ((uintptr_t)cur - (uintptr_t)start);
++			}
++		}
++
++		internals->moved_nodes_index = i;
++
+ 		for (i = 0; i < internals->num_suspend_ports; ++i) {
+ 			prev = cur;
+ 			QOS_LOG_DEBUG("CMD_INTERNAL_SUSPEND_PORT port: %u\n",
+@@ -2920,6 +2916,8 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 		}
+ 		if (pushed)
+ 			internals->ongoing = 1;
++
++		internals->moved_nodes_index = 0;
+ 	}
+ 
+ 	while ((remain >= MAX_FW_CMD_SIZE) &&
+@@ -3115,10 +3113,11 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 	}
+ 
+ 	if (cmd_queue_is_empty(qdev->drvcmds.cmdq)) {
++		common.suspend = 0;
+ 		for (i = internals->moved_nodes_index;
+ 		     i < internals->num_moved_nodes; ++i) {
+-			// Verify space for 2 commands (suspend + resume)
+-			if (remain < 2 * MAX_FW_CMD_SIZE) {
++			// Verify space for a command (resume)
++			if (remain < MAX_FW_CMD_SIZE) {
+ 				internals->moved_nodes_index = i;
+ 				QOS_LOG_DEBUG("reentry required: remain %d, move ind %u, num moved %u\n",
+ 					      remain,
+@@ -3128,19 +3127,20 @@ void enqueue_cmds(struct pp_qos_dev *qdev)
+ 			}
+ 
+ 			prev = cur;
+-			cur = restart_node(qdev,
++			cur = suspend_node(qdev,
+ 					internals->moved_nodes[i].phy,
++					common.suspend,
+ 					cur,
+ 					&prev,
+ 					&cmd_internal);
+ 			if (cur != prev) {
+-				pushed += 2;
++				pushed += 1;
+ 				remain = cmdbuf_sz - ((uintptr_t)cur - (uintptr_t)start);
+ 			}
+ 		}
+ 
+ 		internals->moved_nodes_index = i;
+-		common.suspend = 0;
++
+ 		for (i = internals->suspend_ports_index;
+ 		     i < internals->num_suspend_ports; ++i) {
+ 			/* In case port was suspended, and it was removed,

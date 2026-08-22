@@ -1,0 +1,154 @@
+From cee7c1cca4ecc8f886080c9abbdc9c77d92f7f3c Mon Sep 17 00:00:00 2001
+From: Zahari Doychev <zdoychev@maxlinear.com>
+Date: Thu, 1 Apr 2021 19:34:29 +0200
+Subject: [PATCH] PONRTSYS-8435: dp: pon_qos: fix tc assignment handling
+
+The tc_cookie was not update properly and was pass to the
+queue mapping function always as zero. The vlan_prio option was also no
+honored in all cases when setting a queue mapping. The conditions to handle
+all this cases of setting and unsetting are fixed.
+---
+ drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c | 26 ++++++++++++-----
+ drivers/net/datapath/pon_qos/pon_qos_tc_qos.c  | 40 ++++++++++++++++++++++++--
+ 2 files changed, 56 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+index 0ff55775a5ac..d2bf7dfacb78 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qmap.c
+@@ -18,7 +18,7 @@ struct flower_cls_map {
+ 	__be16 proto;
+ 	u32 pref;
+ 	u32 classid;
+-	u32 tc_cookie;
++	char tc_cookie;
+ 	bool ingress;
+ 	struct flow_dissector_key_vlan key;
+ 	struct flow_dissector_key_vlan mask;
+@@ -134,10 +134,11 @@ static int __pon_qos_tc_map(struct net_device *dev,
+ 	int ret;
+ 
+ 	qmap.indev = indev;
+-	if (!indev)
+-		qmap.subif = tc;
+-	else
++	if (en)
+ 		qmap.subif = map->key.vlan_priority;
++	else
++		qmap.subif = tc;
++
+ 	/* when Q is removed we should unmap the same classid */
+ 	qmap.handle = map->classid;
+ 	qmap.tc_cookie = map->tc_cookie;
+@@ -175,8 +176,16 @@ int pon_qos_tc_map(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 	if (ret < 0)
+ 		goto err_put_indev;
+ 
++	if (!indev && !map->mask.vlan_priority &&
++	    tc_cookie == PON_QOS_TC_COOKIE_EMPTY) {
++		netdev_err(dev, "%s: no class specified\n", __func__);
++		ret = -EINVAL;
++		goto err;
++	}
++
+ 	map->dev = dev;
+ 	map->in_ifi = ifi;
++	map->tc_cookie = tc_cookie;
+ 
+ 	ret = __pon_qos_tc_map(dev, map, indev, 0, true);
+ 	if (ret < 0) {
+@@ -184,7 +193,6 @@ int pon_qos_tc_map(struct net_device *dev, struct tc_cls_flower_offload *f)
+ 		goto err;
+ 	}
+ 
+-	map->tc_cookie = tc_cookie;
+ 	ret = pon_qos_tc_flower_storage_add(dev, f->cookie,
+ 					    TC_TYPE_QUEUE,
+ 					    (void *)map, NULL);
+@@ -210,6 +218,7 @@ EXPORT_SYMBOL(pon_qos_tc_map);
+ int pon_qos_tc_unmap(struct net_device *dev, void *list_node)
+ {
+ 	struct flower_cls_map *map;
++	struct net_device *indev = NULL;
+ 	int ret = 0;
+ 
+ 	if (!list_node)
+@@ -218,7 +227,11 @@ int pon_qos_tc_unmap(struct net_device *dev, void *list_node)
+ 	map = list_node;
+ 
+ 	if (map->mapped) {
+-		ret = __pon_qos_tc_map(dev, map, NULL, map->tc, false);
++		if (map->in_ifi)
++			indev = dev_get_by_index(dev_net(dev), map->in_ifi);
++		ret = __pon_qos_tc_map(dev, map, indev, map->tc, false);
++		if (indev)
++			dev_put(indev);
+ 		if (ret < 0) {
+ 			netdev_err(dev, "%s: queue unmap fail\n", __func__);
+ 			return ret;
+@@ -227,7 +240,6 @@ int pon_qos_tc_unmap(struct net_device *dev, void *list_node)
+ 
+ 	list_del(&map->list);
+ 	kfree(map);
+-
+ 	return 0;
+ }
+ EXPORT_SYMBOL(pon_qos_tc_unmap);
+diff --git a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+index 1992f35ad032..3edfa8ea6b5a 100644
+--- a/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
++++ b/drivers/net/datapath/pon_qos/pon_qos_tc_qos.c
+@@ -935,6 +935,39 @@ static int pon_qos_map_qid(struct pon_qos_q_data *qid,
+ 
+ 	return ret;
+ }
++
++/*
++ * classid option identifies the queue id.
++ *
++ * Queue mapping scenarios PON upstream:
++ *  - GEM port is mapped to specific queue: The GEM port netdev is passed using
++ *    the indev option and defines the subif/CTP which is mapped to the qid.
++ *    "... flower indev gem1023 classid 100:1 action ok"
++ *
++ *  - GEM port + Traffic Class to specific queue: The GEM port netdev is passed
++ *    using the indev option and defines the subif/CTP and the tc action cookie
++ *    defines the traffic class [0..15] which are mapped to the queue id.
++ *    "... flower indev gem1029 classid 100:1 action cookie 07 ok"
++ *
++ * Queue mapping scenarios PON downstream:
++ *  - GEM port is mapped to specific queue: The GEM port netdev is passed using
++ *    the indev option and defines the subif/CTP which force traffic class
++ *    configuration is set according to the classid number i.e. queue priority.
++ *    "... flower indev gem1023 classid 100:1 action ok"
++ *
++ *  - Traffic Class is mapped to specific queue: The traffic class is passed
++ *    either using the vlan_prio option [0..7] where each pbit=0 -> TC=0 and so
++ *    on or using the tc action cookie.
++ *    "... flower classid 100:1 action cookie 07 ok"
++ *    "... flower vlan_prio 7 classid 100:1 action ok"
++ *
++ *  In downstream additionally extVLAN rules to reassign the TC after the vlan
++ *  operations are configured. The reassignment maps pbit=0 -> TC=0 and so on.
++ *
++ *  The above queue mappings can be applied independently for any netdev and
++ *  direction if required.
++ */
++
+ int pon_qos_update_qmap(struct net_device *dev,
+ 			struct pon_qos_qmap_tc *q_tc,
+ 			bool en)
+@@ -970,9 +1003,10 @@ int pon_qos_update_qmap(struct net_device *dev,
+ 	}
+ 	tc = q_tc->subif;
+ 
+-	netdev_dbg(dev, "port: %d deq_i: %d qid: %d handle: %#x tc: %d ds:%s\n",
+-		   sch->port, sch->deq_idx, qid->qid, q_tc->handle, tc,
+-		   sch->ds ? "true" : "false");
++	netdev_dbg(dev, "port:%d deq_i:%d q:%d cls:%#x tc:%d/%u ds:%s en:%d\n",
++		   sch->port, sch->deq_idx, qid->qid, q_tc->handle,
++		   tc, q_tc->tc_cookie,
++		   sch->ds ? "true" : "false", en);
+ 
+ 	/* TODO: DPM uses port zero currently as the CPU port */
+ 	if (pon_qos_is_cpu_port(sch->port)) {

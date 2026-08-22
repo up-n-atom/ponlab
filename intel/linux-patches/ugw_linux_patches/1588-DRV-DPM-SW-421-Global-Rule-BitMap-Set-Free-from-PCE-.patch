@@ -1,0 +1,181 @@
+From 60b6ea7e1cdf74c5de34147a4391b9604adf7052 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Fri, 22 Jan 2021 14:08:49 +0800
+Subject: [PATCH] DRV_DPM_SW-421: Global Rule BitMap Set/Free from PCE
+ Framework
+
+---
+ drivers/net/datapath/dpm/datapath_pce.c | 86 +++++++++++++++++++++------------
+ 1 file changed, 56 insertions(+), 30 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_pce.c b/drivers/net/datapath/dpm/datapath_pce.c
+index c33876b5cb96..c643452afdd9 100644
+--- a/drivers/net/datapath/dpm/datapath_pce.c
++++ b/drivers/net/datapath/dpm/datapath_pce.c
+@@ -55,21 +55,22 @@ static bool contiguous_free_idx(u32 *entries, int *start_idx, int size)
+  * subblk_size - from 0 .. blk max
+  */
+ static int check_subblk_entry_avail(struct dp_blk_entry *blk_entry,
+-				    int subblk_size, int subblk_firstidx)
++				    struct dp_subblk_info *blk_info)
+ {
+ 	struct dp_subblk_entry *subblk_entry = NULL;
+ 	u32 *rules;
+-	int i = 0, start_free_idx = subblk_firstidx;
++	int i = 0, start_free_idx = blk_info->subblk_firstidx;
+ 	int start_idx = 0;
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_PCE,
+ 		 "%s: subblk_size: %d, subblk_firstidx: %d\n",
+-		 __func__, subblk_size, subblk_firstidx);
++		 __func__, blk_info->subblk_size, blk_info->subblk_firstidx);
+ 
+-	if (subblk_firstidx > blk_entry->blk_rules_max)
++	if (blk_info->subblk_firstidx > blk_entry->blk_rules_max)
+ 		return -1;
+ 
+-	if ((subblk_firstidx + subblk_size) > blk_entry->blk_rules_max)
++	if ((blk_info->subblk_firstidx + blk_info->subblk_size) >
++	    blk_entry->blk_rules_max)
+ 		return -1;
+ 
+ 	rules = kzalloc((sizeof(u32) * blk_entry->blk_rules_max), GFP_ATOMIC);
+@@ -87,7 +88,7 @@ static int check_subblk_entry_avail(struct dp_blk_entry *blk_entry,
+ 		}
+ 	}
+ 
+-	if (!contiguous_free_idx(rules, &start_free_idx, subblk_size)) {
++	if (!contiguous_free_idx(rules, &start_free_idx, blk_info->subblk_size)) {
+ 		kfree(rules);
+ 		return -1;
+ 	}
+@@ -95,14 +96,15 @@ static int check_subblk_entry_avail(struct dp_blk_entry *blk_entry,
+ 	kfree(rules);
+ 
+ 	DP_DEBUG(DP_DBG_FLAG_PCE, "%s: start_free_idx: %d\n",
+-		 __func__, (blk_entry->blk_firstindex + subblk_firstidx));
++		 __func__,
++		 (blk_entry->blk_firstindex + blk_info->subblk_firstidx));
+ 
+-	return (blk_entry->blk_firstindex + subblk_firstidx);
++	return (blk_entry->blk_firstindex + blk_info->subblk_firstidx);
+ }
+ 
+ /* Return the first free continuous entry inside the block */
+-static int get_subblk_free_idx(struct dp_blk_entry *blk_entry,
+-			       int subblk_size)
++static
++int get_subblk_free_idx(struct dp_blk_entry *blk_entry, int subblk_size)
+ {
+ 	struct dp_subblk_entry *subblk_entry = NULL;
+ 	u32 *rules;
+@@ -118,8 +120,7 @@ static int get_subblk_free_idx(struct dp_blk_entry *blk_entry,
+ 
+ 	/* Mark the entries as used */
+ 	list_for_each_entry(subblk_entry, &blk_entry->subblk_list, list) {
+-		start_idx = subblk_entry->subblk_firstindex -
+-			    blk_entry->blk_firstindex;
++		start_idx = subblk_entry->subblk_firstindex - blk_entry->blk_firstindex;
+ 		for (i = start_idx;
+ 		     i < (start_idx + subblk_entry->subblk_rules_max);
+ 		     i++) {
+@@ -414,6 +415,8 @@ static struct dp_subblk_entry *subblk_add(struct dp_blk_entry *blk_entry,
+ {
+ 	struct dp_subblk_entry *subblk_entry;
+ 	int rules_left = 0, firstindex = 0;
++	struct core_ops *ops = gsw_get_swcore_ops(0);
++	GSW_PCE_GlobalBitMap_t gbitmap = {0};
+ 
+ 	/* if already have return the entry */
+ 	subblk_entry = get_subblk_entry(blk_entry, blk_info->subblk_id);
+@@ -437,28 +440,37 @@ static struct dp_subblk_entry *subblk_add(struct dp_blk_entry *blk_entry,
+ 		return NULL;
+ 	}
+ 
+-	/* if subblk_firstidx > 0, Use this as first index to allocate
+-	 * else, find a free index and return in subblk_id
++	/* Allocate and block num of rules in Global entries
++	 * Sub-block Free index will be found out by GSWIP API entry
+ 	 */
+-	if (blk_info->subblk_firstidx > 0) {
+-		firstindex =
+-			check_subblk_entry_avail(blk_entry,
+-						 blk_info->subblk_size,
+-						 blk_info->subblk_firstidx);
+-		if (firstindex == -1) {
+-			pr_err("%s: Sub-Blk specified FirstIdx %d not avail\n",
+-			       __func__, blk_info->subblk_firstidx);
++	if (blk_entry->info.region == GSW_PCE_RULE_COMMMON) {
++		gbitmap.num_of_rules = blk_info->subblk_size;
++		if (ops->gsw_tflow_ops.TFLOW_GlobalRule_BitMapAlloc(ops, &gbitmap)) {
++			pr_err("%s: For Global rules cont %d space not avail\n",
++			       __func__, blk_info->subblk_size);
+ 			return NULL;
+ 		}
++		firstindex = gbitmap.base_index;
+ 	} else {
+-		firstindex =
+-			get_subblk_free_idx(blk_entry, blk_info->subblk_size);
+-		if (firstindex == -1) {
+-			pr_err("%s: No continuous Space Avail %d/%d used\n",
+-			       __func__,
+-			       blk_entry->blk_rules_used,
+-			       blk_entry->blk_rules_max);
+-			return NULL;
++		/* if subblk_firstidx > 0, Use this as first index to allocate
++		 * else, find a free index
++		 */
++		if (blk_info->subblk_firstidx > 0) {
++			firstindex = check_subblk_entry_avail(blk_entry, blk_info);
++			if (firstindex == -1) {
++				pr_err("%s: Sub-Blk specified FirstIdx %d not avail\n",
++				       __func__, blk_info->subblk_firstidx);
++				return NULL;
++			}
++		} else {
++			firstindex = get_subblk_free_idx(blk_entry, blk_info->subblk_size);
++			if (firstindex == -1) {
++				pr_err("%s: No continuous Space Avail %d/%d used\n",
++				       __func__,
++				       blk_entry->blk_rules_used,
++				       blk_entry->blk_rules_max);
++				return NULL;
++			}
+ 		}
+ 	}
+ 
+@@ -513,6 +525,9 @@ static struct dp_subblk_entry *subblk_add(struct dp_blk_entry *blk_entry,
+ static int subblk_del(struct dp_blk_entry *blk_entry,
+ 		      struct dp_subblk_entry *subblk_entry)
+ {
++	struct core_ops *ops = gsw_get_swcore_ops(0);
++	GSW_PCE_GlobalBitMap_t gbitmap = {0};
++
+ 	DP_DEBUG(DP_DBG_FLAG_PCE,
+ 		 "%s: %s %d %s %s %s %d %s %d %s %d %s %d\n",
+ 		 __func__,
+@@ -528,6 +543,16 @@ static int subblk_del(struct dp_blk_entry *blk_entry,
+ 	 */
+ 	if (!subblk_entry->subblk_rules_used &&
+ 	    !subblk_entry->subblk_protected) {
++		if (blk_entry->info.region == GSW_PCE_RULE_COMMMON) {
++			/* Mark all the subblk rules as free free in GSWIP API */
++			gbitmap.num_of_rules = subblk_entry->subblk_rules_max;
++			gbitmap.base_index = subblk_entry->subblk_firstindex;
++			if (ops->gsw_tflow_ops.TFLOW_GlobalRule_BitMapFree(ops, &gbitmap)) {
++				pr_err("%s: TFLOW_GlobalRule_BitMapFree failed\n", __func__);
++				return -1;
++			}
++		}
++
+ 		blk_entry->blk_rules_used -= subblk_entry->subblk_rules_max;
+ 		list_del(&subblk_entry->list);
+ 		kfree(subblk_entry);
+@@ -547,6 +572,7 @@ static int pce_rule_del(GSW_PCE_ruleDelete_t *pce,
+ 			struct dp_subblk_entry *subblk_entry)
+ {
+ 	struct core_ops *ops = gsw_get_swcore_ops(0);
++	GSW_PCE_GlobalBitMap_t gbitmap = {0};
+ 
+ 	if (!ops)
+ 		return -1;

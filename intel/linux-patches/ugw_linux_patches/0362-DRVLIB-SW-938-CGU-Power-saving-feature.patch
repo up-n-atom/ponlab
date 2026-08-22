@@ -1,0 +1,345 @@
+From e6bd2cf78201fb2e659873eb4a8b0e3f88e21b8c Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Tue, 13 Nov 2018 13:35:19 +0800
+Subject: [PATCH] DRVLIB_SW-938: CGU-Power-saving-feature
+
+---
+ drivers/clk/intel/clk-cgu-pll.c              | 44 ++++++++++++--
+ drivers/clk/intel/clk-cgu-pll.h              |  1 +
+ drivers/clk/intel/clk-cgu.c                  | 87 ++++++++++++++++++++++++++++
+ drivers/clk/intel/clk-cgu.h                  |  3 +
+ drivers/clk/intel/clk-prx300.c               | 53 ++++++++++++++---
+ include/dt-bindings/clock/intel,prx300-clk.h |  1 +
+ 6 files changed, 178 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/clk/intel/clk-cgu-pll.c b/drivers/clk/intel/clk-cgu-pll.c
+index 447da9fb9a27..865b1ae82bcf 100644
+--- a/drivers/clk/intel/clk-cgu-pll.c
++++ b/drivers/clk/intel/clk-cgu-pll.c
+@@ -230,7 +230,7 @@ const static struct clk_ops intel_grx500_pll_ops = {
+ 
+ static void
+ prx300_pll_get_params(struct intel_clk_pll *pll, unsigned int *mult,
+-		   unsigned int *div, unsigned int *frac)
++		      unsigned int *div, unsigned int *frac)
+ {
+ 	*mult = intel_get_clk_val(pll->map, pll->reg + 0x8, 0, 12);
+ 	*div = intel_get_clk_val(pll->map, pll->reg + 0x8, 18, 6);
+@@ -239,7 +239,7 @@ prx300_pll_get_params(struct intel_clk_pll *pll, unsigned int *mult,
+ 
+ static int
+ prx300_pll_set_params(struct intel_clk_pll *pll, unsigned int mult,
+-		   unsigned int div, unsigned int frac)
++		      unsigned int div, unsigned int frac)
+ {
+ 	intel_set_clk_val(pll->map, pll->reg + 0x8, 0, 12, mult);
+ 	intel_set_clk_val(pll->map, pll->reg + 0x8, 18, 6, div);
+@@ -285,7 +285,7 @@ static void prx300_pll_disable(struct clk_hw *hw)
+ 
+ static long
+ prx300_pll_round_rate(struct clk_hw *hw, unsigned long rate,
+-		   unsigned long *prate)
++		      unsigned long *prate)
+ {
+ 	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
+ 	int i;
+@@ -309,7 +309,7 @@ prx300_pll_round_rate(struct clk_hw *hw, unsigned long rate,
+ 
+ static int
+ prx300_pll_set_rate(struct clk_hw *hw, unsigned long rate,
+-		 unsigned long prate)
++		    unsigned long prate)
+ {
+ 	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
+ 	struct device *dev = pll->dev;
+@@ -420,3 +420,39 @@ void intel_clk_register_plls(struct intel_clk_provider *ctx,
+ 		intel_clk_add_lookup(ctx, hw, list->id);
+ 	}
+ }
++
++void intel_clk_plls_parse_vco_config(struct intel_clk_provider *ctx,
++				     const struct intel_pll_clk_data *list,
++				     u32 nr_clk)
++{
++	struct device *dev = ctx->dev;
++	struct device_node *child, *np = dev->of_node;
++	const struct intel_pll_clk_data *tmp;
++	struct of_phandle_args args;
++	u32 count = 0, idx;
++	struct clk *clk;
++
++	child = of_find_node_by_name(np, "plls_clk");
++
++	if (!child) {
++		dev_err(ctx->dev, "%s: Could not find plls_clk\n", __func__);
++		return;
++	}
++
++	do {
++		if (of_parse_phandle_with_args(child, "intel,pll_clks_vco",
++					       "#pll-clk-cells", count,
++					       &args) < 0)
++			break;
++
++		for (idx = 0, tmp = list; idx < nr_clk; idx++, tmp++) {
++			if (tmp->id == args.args[0]) {
++				clk = __clk_lookup(tmp->name);
++				if (clk_prepare_enable(clk))
++					continue;
++				clk_set_rate(clk, (unsigned long)args.args[1]);
++			}
++		}
++	} while (++count);
++}
++
+diff --git a/drivers/clk/intel/clk-cgu-pll.h b/drivers/clk/intel/clk-cgu-pll.h
+index 70d54084ff99..64f68b2e864b 100644
+--- a/drivers/clk/intel/clk-cgu-pll.h
++++ b/drivers/clk/intel/clk-cgu-pll.h
+@@ -23,6 +23,7 @@ struct intel_pll_rate_table {
+ 	unsigned int	mult;
+ 	unsigned int	div;
+ 	unsigned int	frac;
++	unsigned int	pll_ena;
+ };
+ 
+ struct intel_clk_pll {
+diff --git a/drivers/clk/intel/clk-cgu.c b/drivers/clk/intel/clk-cgu.c
+index 23de30950ac8..137af8b4f0b0 100644
+--- a/drivers/clk/intel/clk-cgu.c
++++ b/drivers/clk/intel/clk-cgu.c
+@@ -19,6 +19,8 @@
+ #define GATE_HW_REG_STAT(reg)	(reg)
+ #define GATE_HW_REG_EN(reg)	((reg) + 0x4)
+ #define GATE_HW_REG_DIS(reg)	((reg) + 0x8)
++#define MAX_DDIV_REG	8
++#define MAX_DIVIDER_VAL 64
+ 
+ #define to_intel_clk_mux(_hw) container_of(_hw, struct intel_clk_mux, hw)
+ #define to_intel_clk_divider(_hw) \
+@@ -502,11 +504,96 @@ static void intel_clk_ddiv_disable(struct clk_hw *hw)
+ 			  ddiv->shift_gate, ddiv->width_gate, 0);
+ }
+ 
++static int
++intel_clk_get_ddiv_val(u32 div, u32 *ddiv1, u32 *ddiv2)
++{
++	u32 idx, temp;
++
++	*ddiv1 = 1;
++	*ddiv2 = 1;
++
++	if (div > MAX_DIVIDER_VAL) {
++		pr_info("Crossed max DDIV %u\n", div);
++		div = MAX_DIVIDER_VAL;
++	}
++
++	if (div > 1) {
++		for (idx = 2; idx <= MAX_DDIV_REG; idx++) {
++			temp = DIV_ROUND_UP_ULL((u64)div, idx);
++			if ((div % idx == 0) && (temp <= MAX_DDIV_REG))
++				break;
++		}
++
++		if (idx > 8) {
++			pr_err("Invalid ddiv %u\n", div);
++			return -EINVAL;
++		}
++	}
++
++	*ddiv1 = temp;
++	*ddiv2 = idx;
++	return 0;
++}
++
++static long
++intel_clk_ddiv_round_rate(struct clk_hw *hw, unsigned long rate,
++			  unsigned long *prate)
++{
++	u32 div, ddiv1, ddiv2;
++	u64 rate64 = rate;
++
++	div = DIV_ROUND_CLOSEST_ULL((u64)*prate, rate);
++
++	if (div <= 0)
++		return *prate;
++
++	if (intel_clk_get_ddiv_val(div, &ddiv1, &ddiv2) != 0) {
++		if (intel_clk_get_ddiv_val(div + 1, &ddiv1, &ddiv2) != 0)
++			return -EINVAL;
++	}
++
++	rate64 = *prate;
++	do_div(rate64, ddiv1);
++	do_div(rate64, ddiv2);
++
++	return (unsigned long)rate64;
++}
++
++static int
++intel_clk_ddiv_set_rate(struct clk_hw *hw, unsigned long rate,
++			unsigned long prate)
++{
++	struct intel_clk_ddiv *ddiv = to_intel_clk_ddiv(hw);
++	u32 div, ddiv1, ddiv2;
++
++	div = DIV_ROUND_CLOSEST_ULL((u64)prate, rate);
++
++	if (intel_get_clk_val(ddiv->map, ddiv->reg, ddiv->shift2, 1)) {
++		div = DIV_ROUND_CLOSEST_ULL((u64)div, 5);
++		div = div * 2;
++	}
++
++	if (div <= 0)
++		return -EINVAL;
++
++	if (intel_clk_get_ddiv_val(div, &ddiv1, &ddiv2))
++		return -EINVAL;
++
++	intel_set_clk_val(ddiv->map, ddiv->reg,
++			  ddiv->shift0, ddiv->width0, ddiv1 - 1);
++
++	intel_set_clk_val(ddiv->map, ddiv->reg,
++			  ddiv->shift1, ddiv->width1, ddiv2 - 1);
++	return 0;
++}
++
+ const static struct clk_ops intel_clk_ddiv_ops = {
+ 	.recalc_rate	= intel_clk_ddiv_recalc_rate,
+ 	.is_enabled	= intel_clk_ddiv_is_enabled,
+ 	.enable		= intel_clk_ddiv_enable,
+ 	.disable	= intel_clk_ddiv_disable,
++	.set_rate = intel_clk_ddiv_set_rate,
++	.round_rate = intel_clk_ddiv_round_rate,
+ };
+ 
+ int intel_clk_register_ddiv(struct intel_clk_provider *ctx,
+diff --git a/drivers/clk/intel/clk-cgu.h b/drivers/clk/intel/clk-cgu.h
+index 7d729138a822..a78df8270110 100644
+--- a/drivers/clk/intel/clk-cgu.h
++++ b/drivers/clk/intel/clk-cgu.h
+@@ -324,6 +324,9 @@ void intel_clk_register_branches(struct intel_clk_provider *ctx,
+ void intel_clk_register_plls(struct intel_clk_provider *ctx,
+ 			     const struct intel_pll_clk_data *list,
+ 			     unsigned int nr_clk);
++void intel_clk_plls_parse_vco_config(struct intel_clk_provider *ctx,
++				     const struct intel_pll_clk_data *list,
++				     u32 nr_clk);
+ int intel_clk_register_ddiv(struct intel_clk_provider *ctx,
+ 			    const struct intel_clk_ddiv_data *list,
+ 			    unsigned int nr_clk);
+diff --git a/drivers/clk/intel/clk-prx300.c b/drivers/clk/intel/clk-prx300.c
+index fd76afb93ee4..c74d8bd2e16c 100644
+--- a/drivers/clk/intel/clk-prx300.c
++++ b/drivers/clk/intel/clk-prx300.c
+@@ -121,21 +121,48 @@ static const struct intel_clk_early_data prx300_early_clks[] __initconst = {
+ 	},
+ };
+ 
++static const struct intel_pll_rate_table pll1_clk_vco[] __initconst = {
++	{40000000, 1572864, 39, 1,  5395553,  1},
++	{40000000, 160000, 16, 4,  0,  1},
++	{ 0 },
++};
++
++static const struct intel_pll_rate_table ljpll3_clk_vco[] __initconst = {
++	{40000000, 10000000, 250, 1,  0,  1},
++	{40000000, 5000000, 125, 1,  0,  1},
++	{ 0 },
++};
++
++static const struct intel_pll_rate_table ljpll4_clk_vco[] __initconst = {
++	{40000000, 5000000, 125, 1,  0,  1},
++	{40000000, 640000, 32, 2,  0,  1},
++	{ 0 },
++};
++
++static const struct intel_pll_rate_table ljpll5_clk_vco[] __initconst = {
++	{40000000, 5000000, 125, 1,  0,  1},
++	{ 0 },
++};
++
+ static const struct intel_pll_clk_data prx300_pll_clks[] __initconst = {
+ 	[PLL0A] = INTEL_PLL(PRX300_CLK_PLL0A, PLL_PFM_V2, "pll0a", pll_p,
+ 			    CLK_IGNORE_UNUSED, PLL0A_CFG0, NULL, TYPE_ROPLL),
+ 	[PLL0B] = INTEL_PLL(PRX300_CLK_PLL0B, PLL_PFM_V2, "pll0b", pll_p,
+ 			    CLK_IGNORE_UNUSED, PLL0B_CFG0, NULL, TYPE_ROPLL),
+ 	[PLL1] = INTEL_PLL(PRX300_CLK_PLL1, PLL_PFM_V2, "pll1", pll_p,
+-			   CLK_IGNORE_UNUSED, PLL1_CFG0, NULL, TYPE_ROPLL),
++			   CLK_IGNORE_UNUSED, PLL1_CFG0, pll1_clk_vco,
++			   TYPE_ROPLL),
+ 	[PLL2] = INTEL_PLL(PRX300_CLK_PLL2, PLL_PFM_V2, "pll2", pll_p,
+ 			   CLK_IGNORE_UNUSED, PLL2_CFG0, NULL, TYPE_ROPLL),
+ 	[LJPLL3] = INTEL_PLL(PRX300_CLK_LJPLL3, PLL_PFM_V2, "ljpll3", pll_p,
+-			     CLK_IGNORE_UNUSED, LJPLL3_CFG0, NULL, TYPE_LJPLL),
++			     CLK_IGNORE_UNUSED, LJPLL3_CFG0, ljpll3_clk_vco,
++			     TYPE_LJPLL),
+ 	[LJPLL4] = INTEL_PLL(PRX300_CLK_LJPLL4, PLL_PFM_V2, "ljpll4", pll_p,
+-			     CLK_IGNORE_UNUSED, LJPLL4_CFG0, NULL, TYPE_LJPLL),
++			     CLK_IGNORE_UNUSED, LJPLL4_CFG0, ljpll4_clk_vco,
++			     TYPE_LJPLL),
+ 	[LJPLL5] = INTEL_PLL(PRX300_CLK_LJPLL5, PLL_PFM_V2, "ljpll5", pll_p,
+-			     CLK_IGNORE_UNUSED, LJPLL5_CFG0, NULL, TYPE_LJPLL),
++			     CLK_IGNORE_UNUSED, LJPLL5_CFG0, ljpll5_clk_vco,
++			     TYPE_LJPLL),
+ };
+ 
+ static const struct intel_clk_branch prx300_branch_clks[] __initconst = {
+@@ -157,6 +184,10 @@ static const struct intel_clk_branch prx300_branch_clks[] __initconst = {
+ 	INTEL_DIV(PRX300_CLK_DDR, "ddr", "pll2", CLK_IGNORE_UNUSED,
+ 		  PLL_DIV(PLL2_CFG0), 0, PLL_DIV_WIDTH, 26, 1, 0, 0, pll_div),
+ 
++	/* Fixed Factor */
++	INTEL_FIXED_FACTOR(PRX300_CLK_PONDEF, "pondef", "dd_pool",
++			   CLK_SET_RATE_PARENT, 0, 0, 0, 0, 0, 1, 2),
++
+ 	/* Gate0 clocks */
+ 	INTEL_GATE(PRX300_GCLK_XBAR0, "g_xbar0", NULL, CLK_IGNORE_UNUSED,
+ 		   CGU_GATE0, G_XBAR0_SHIFT, GATE_CLK_HW, 0),
+@@ -210,7 +241,7 @@ static const struct intel_clk_branch prx300_branch_clks[] __initconst = {
+ 		   G_DMA3_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(PRX300_GCLK_SWITCH, "g_switch", NULL, 0, CGU_GATE1,
+ 		   G_SWITCH_SHIFT, GATE_CLK_HW, 0),
+-	INTEL_GATE(PRX300_GCLK_PON, "g_pon", "dd_pool", 0, CGU_GATE1,
++	INTEL_GATE(PRX300_GCLK_PON, "g_pon", NULL, 0, CGU_GATE1,
+ 		   G_PON_SHIFT, GATE_CLK_HW, 0),
+ 	INTEL_GATE(PRX300_GCLK_AON, "g_aon", NULL, 0, CGU_GATE1,
+ 		   G_AON_SHIFT, GATE_CLK_HW, 0),
+@@ -262,8 +293,14 @@ static const struct intel_clk_ddiv_data prx300_ddiv_clks[] __initconst = {
+ 		   PLL_DIV(LJPLL3_CFG0), 18, PLL_DDIV_WIDTH,
+ 		   21, PLL_DDIV_WIDTH, 27, 1, 28, 0),
+ 	INTEL_DDIV(PRX300_CLK_PCIE, "pcie", "ljpll4", CLK_IGNORE_UNUSED,
+-		   PLL_DIV(LJPLL4_CFG0), 0, PLL_DDIV_WIDTH, 3,
+-		   PLL_DDIV_WIDTH, 24, 1, 29, 0),
++		   PLL_DIV(LJPLL4_CFG0), 0, PLL_DDIV_WIDTH,
++		   3, PLL_DDIV_WIDTH, 24, 1, 29, 0),
++	INTEL_DDIV(PRX300_CLK_PONPHY, "pon_phy", "ljpll5", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL5_CFG0), 0, PLL_DDIV_WIDTH,
++		   3, PLL_DDIV_WIDTH, 24, 1, 29, 0),
++	INTEL_DDIV(PRX300_CLK_PONIP, "pon_ip", "ljpll5", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL5_CFG0), 6, PLL_DDIV_WIDTH,
++		   9, PLL_DDIV_WIDTH, 25, 1, 28, 0),
+ };
+ 
+ static void __init prx300_clk_init(struct device_node *np)
+@@ -316,6 +353,8 @@ static int __init intel_prx300_cgu_probe(struct platform_device *pdev)
+ 
+ 	intel_clk_register_plls(ctx, prx300_pll_clks,
+ 				ARRAY_SIZE(prx300_pll_clks));
++	intel_clk_plls_parse_vco_config(ctx, prx300_pll_clks,
++					ARRAY_SIZE(prx300_pll_clks));
+ 	intel_clk_register_branches(ctx, prx300_branch_clks,
+ 				    ARRAY_SIZE(prx300_branch_clks));
+ 	intel_clk_register_ddiv(ctx, prx300_ddiv_clks,
+diff --git a/include/dt-bindings/clock/intel,prx300-clk.h b/include/dt-bindings/clock/intel,prx300-clk.h
+index 2f0e16fdf5e4..c10e1ee067f9 100644
+--- a/include/dt-bindings/clock/intel,prx300-clk.h
++++ b/include/dt-bindings/clock/intel,prx300-clk.h
+@@ -36,6 +36,7 @@
+ #define PRX300_CLK_PONIP	51
+ 
+ #define PRX300_CLK_SLIC		55
++#define PRX300_CLK_PONDEF	56
+ 
+ /* Gate0 clock shift */
+ #define PRX300_GCLK_XBAR0	80

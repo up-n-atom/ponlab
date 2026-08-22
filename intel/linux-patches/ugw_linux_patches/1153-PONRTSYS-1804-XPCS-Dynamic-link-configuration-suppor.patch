@@ -1,0 +1,297 @@
+From b718e9e03e2a6d48741e38f2bfe7eb28733f979c Mon Sep 17 00:00:00 2001
+From: Dinesh Sudham <dineshx.sudham@intel.com>
+Date: Thu, 23 Apr 2020 12:52:10 +0800
+Subject: [PATCH] PONRTSYS-1804:XPCS: Dynamic link configuration support
+
+Signed-off-by: Dinesh Sudham <dineshx.sudham@intel.com>
+---
+ drivers/net/ethernet/lantiq/xpcs/xpcs.c | 120 ++++++++++++++++++++++++++++++--
+ drivers/net/ethernet/lantiq/xpcs/xpcs.h |  51 +++++++++++++-
+ 2 files changed, 165 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.c b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+index 7aad858c7dc6..dcfa4f2bfd78 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.c
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.c
+@@ -44,9 +44,12 @@
+ #define XPCS_CTLE_POLE		"xpcs-rx_ctle_pole"
+ #define XPCS_VGA2_GAIN		"xpcs-rx_vga2_gain"
+ #define XPCS_VGA1_GAIN		"xpcs-rx_vga1_gain"
++#define LINK_POLL_TIME	"link_poll_interval"
++#define LINK_MODE_CFG	"xpcs_mode_cfg_seq"
+ 
+ #define PHY_BOOST(BOOST, POLE, VGA2, VGA1) \
+ 		((BOOST << 0) | (POLE << 5) | (VGA2 << 8) | (VGA1 << 12))
++
+ static void xpcs_cl37_an(struct xpcs_prv_data *pdata);
+ static void xpcs_cl73_an(struct xpcs_prv_data *pdata);
+ static void xpcs_cl72_startup(struct xpcs_prv_data *pdata);
+@@ -55,6 +58,7 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata);
+ static int xpcs_teng_xaui_mode(struct xpcs_prv_data *pdata);
+ static int xpcs_teng_kr_mode(struct xpcs_prv_data *pdata);
+ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata);
++static void xpcs_link_poll_work(struct work_struct *work);
+ static int xpcs_synphy_reset_sts(struct xpcs_prv_data *pdata);
+ 
+ struct xpcs_mode_cfg mode_cfg[MAX_XPCS_MODE] = {
+@@ -609,7 +613,7 @@ static int xpcs_teng_xaui_mode(struct xpcs_prv_data *pdata)
+ 	if (xpcs_vs_reset(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+ 
+-	if (pdata->conntype == CONN_TYPE_SFP) {
++	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+ 		/* Disable Autoneg */
+ 		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+ 	} else {
+@@ -661,7 +665,7 @@ static int xpcs_teng_kr_mode(struct xpcs_prv_data *pdata)
+ 	/* If connected to SFP module CL73 Auto-negotiation need to be
+ 	 * disabled
+ 	 */
+-	if (pdata->conntype == CONN_TYPE_SFP) {
++	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
+ 		/* Disable Autoneg */
+ 		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
+ 	} else {
+@@ -733,8 +737,13 @@ static int xpcs_oneg_xaui_mode(struct xpcs_prv_data *pdata)
+ 	if (xpcs_vs_reset(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+ 
+-	/* Enable Clause 37 Auto-negotiation */
+-	xpcs_cl37_an(pdata);
++	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
++		/* Disable Autoneg */
++		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++	} else {
++		/* Enable Clause 37 Auto-negotiation */
++		xpcs_cl37_an(pdata);
++	}
+ 
+ 	return XPCS_SUCCESS;
+ }
+@@ -814,6 +823,14 @@ static int xpcs_2p5g_sgmii_mode(struct xpcs_prv_data *pdata)
+ 	if (xpcs_vs_reset(pdata) != XPCS_SUCCESS)
+ 		return XPCS_FAILURE;
+ 
++	if (pdata->conntype == CONN_TYPE_ANEG_DIS) {
++		/* Disable Autoneg */
++		XPCS_RGWR_VAL(pdata, AN_CTRL, AN_EN, 0);
++	} else {
++		/* Enable Clause 37 Auto-negotiation */
++		xpcs_cl37_an(pdata);
++	}
++
+ 	return XPCS_SUCCESS;
+ }
+ 
+@@ -978,6 +995,8 @@ static int xpcs_parse_dts(struct platform_device *pdev,
+ 	struct device_node *rx;
+ 	struct device *dev = &pdev->dev;
+ 	struct xpcs_mode_cfg *xpcs_cfg = NULL;
++	struct of_phandle_args args;
++	int i;
+ 	u32 prop = 0;
+ 
+ 	(*pdata) = devm_kzalloc(dev, sizeof(**pdata), GFP_KERNEL);
+@@ -1074,6 +1093,25 @@ static int xpcs_parse_dts(struct platform_device *pdev,
+ 	xpcs_cfg = xpcs_get_cfg(TENG_KR_MODE);
+ 	xpcs_update_cfg(dev, xpcs_cfg, "serdes_10g_cfg");
+ 
++	/* Retrieve the dynamic link cfg sequence */
++	if (of_parse_phandle_with_fixed_args(dev->of_node,
++	    LINK_MODE_CFG, MAX_XPCS, 0, &args) < 0)
++		dev_dbg(dev, "Using static link configuration\n");
++	else {
++		(*pdata)->link_cfg = true;
++		/* Retrieve the jiffies to wait */
++		if (!device_property_read_u32
++		    (dev, LINK_POLL_TIME, &prop)) {
++			(*pdata)->poll_interval = prop;
++		} else {
++			dev_err(dev, "cannot get property poll_interval \n");
++			return -EINVAL;
++		}
++
++		for (i = 0; i < MAX_XPCS; i++)
++			(*pdata)->link_change_seq[i] = args.args[i];
++	}
++
+ 	platform_set_drvdata(pdev, (void *)(*pdata));
+ 
+ 	return XPCS_SUCCESS;
+@@ -1259,6 +1297,62 @@ static int xpcs_ethtool_ksettings_set(struct device *dev,
+ 	return 0;
+ }
+ 
++/* Poll the link state and reconfigure serdes */
++static void xpcs_link_poll_work(struct work_struct *work)
++{
++	struct xpcs_prv_data *pdata = container_of(work, struct xpcs_prv_data,
++						link_change_work.work);
++	bool link_status = false;
++	u32 mode = 0;
++
++	/* Since the device can be in the wrong mode when a link is
++	 * (re-)established (SFP connected after the interface is
++	 * up), the link status may report no link. If there
++	 * is no link, try switching modes and checking the status
++	 * again
++	 */
++	if (pdata->link_mode > (MAX_XPCS - 1))
++		pdata->link_mode = 0;
++	
++	mode = pdata->link_change_seq[pdata->link_mode];
++
++	switch (mode) {
++	case TENG_KR_MODE:
++	case TENG_XAUI_MODE:
++	case ONEG_XAUI_MODE:
++	case TWOP5G_SGMII_MODE:
++		link_status  = get_xpcs_link_status(pdata) > 0 ? 1 : 0;
++		/* 10000BaseX or 1000BaseX and 2500BaseX SGMII
++		 * cannot negotiate So disable Auto Negotiation.
++		 */
++		pdata->conntype = CONN_TYPE_ANEG_DIS;
++		break;
++	case SGMII_MODE_1000BASET:
++	case SGMII_MODE_2500BASET:
++		link_status = get_sgmii_link_status(pdata) > 0 ? 1 : 0;
++		/* 1000BaseT and 2500BaseT SGMII can negotiate
++		 * speed and duplex, So enable Auto Negotiation.
++		 */
++		pdata->conntype = CONN_TYPE_ANEG_PHY;
++		break;
++	}
++
++	if (!link_status) {
++		if (mode == SGMII_MODE_1000BASET)
++			mode = ONEG_XAUI_MODE;
++
++		if (mode == SGMII_MODE_2500BASET)
++			mode = TWOP5G_SGMII_MODE;
++
++		xpcs_reinit(pdata->dev, mode);
++		pdata->link_mode++;
++		/* Reschedule work for every poll interval */
++		queue_delayed_work(pdata->link_poll,
++				   &pdata->link_change_work,
++				   (HZ * pdata->poll_interval));
++	}
++}
++
+ static int xpcs_probe(struct platform_device *pdev)
+ {
+ 	struct resource *res;
+@@ -1355,6 +1449,24 @@ static int xpcs_probe(struct platform_device *pdev)
+ 	if (!pdata->serdes_cfg->xpcs_no_phy_cali)
+ 		ret = phy_calibrate(pdata->phy);
+ 
++	/* Schedule the link poll task if link is dynmically configurable*/
++	if (pdata->link_cfg) {
++		/* good to use the dev name */
++		snprintf(pdata->workqueue_name, sizeof(pdata->workqueue_name),
++			 "%s", pdata->name);
++		pdata->link_poll =
++			create_singlethread_workqueue(pdata->workqueue_name);
++		if (!pdata->link_poll) {
++			dev_err(dev, "Cannot create link change workqueue\n");
++			return -ENOMEM;
++		}
++
++		INIT_DELAYED_WORK(&pdata->link_change_work,
++				  xpcs_link_poll_work);
++		queue_delayed_work(pdata->link_poll,
++				   &pdata->link_change_work, (15 * HZ));
++	}
++
+ 	return XPCS_SUCCESS;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/xpcs/xpcs.h b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+index 63ae6e726ef3..fe874f3fb1f4 100644
+--- a/drivers/net/ethernet/lantiq/xpcs/xpcs.h
++++ b/drivers/net/ethernet/lantiq/xpcs/xpcs.h
+@@ -4,6 +4,7 @@
+ #include <linux/types.h>
+ #include <linux/ethtool.h>
+ #include <linux/platform_device.h>
++#include <linux/workqueue.h>
+ 
+ #define XPCS_SUCCESS			0
+ #define XPCS_FAILURE			-1
+@@ -581,8 +582,8 @@ enum {
+ };
+ 
+ enum {
+-	CONN_TYPE_SFP = 0,
+-	CONN_TYPE_PHY = 1,
++	CONN_TYPE_ANEG_DIS = 0,
++	CONN_TYPE_ANEG_PHY = 1,
+ 	CONN_TYPE_MAX,
+ };
+ 
+@@ -617,6 +618,11 @@ enum {
+ 	TX_ENQ
+ };
+ 
++enum {
++	 SGMII_MODE_1000BASET = 4,
++	 SGMII_MODE_2500BASET,
++};
++
+ struct xpcs_prv_data;
+ 
+ /* 10G XAUI Mode Switching */
+@@ -735,6 +741,21 @@ struct xpcs_prv_data {
+ 
+ 	/* XPCS SERDES cfg */
+ 	struct xpcs_serdes_cfg *serdes_cfg;
++
++	/* Scheduled link poll workitem */
++	struct workqueue_struct *link_poll;
++	/* Workqueue name */
++	char workqueue_name[16];
++	/* Delayable work to queue */
++	struct delayed_work link_change_work;
++	/* link cfg sequence */
++	u32 link_change_seq[MAX_XPCS];
++	/* Current state of the XPCS link mode */
++	u32 link_mode;
++	/* jiffies to wait before queueing */
++	unsigned int poll_interval;
++	/* Link is Dynamic or static */
++	bool link_cfg;
+ };
+ 
+ #define xpcs_r32(reg)		readl(reg)
+@@ -827,5 +848,31 @@ static inline struct xpcs_ops *xpcs_pdev_ops(struct platform_device *pdev)
+ 	return &pdata->ops;
+ }
+ 
++static inline int get_sgmii_link_status(struct xpcs_prv_data *pdata)
++{
++	bool link_status = false;
++
++	link_status = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS);
++	/* Link status is latched low, so read again to get
++	 * current state
++	 */
++	link_status = XPCS_RGRD_VAL(pdata, VR_MII_AN_CTRL, SGMII_LINK_STS);
++
++	return link_status;
++}
++
++static inline int get_xpcs_link_status(struct xpcs_prv_data *pdata)
++{
++	bool link_status = false;
++
++	link_status = XPCS_RGRD_VAL(pdata, PCS_STS1, RLU);
++	/* Link status is latched low, so read again to get
++	 * current state
++	 */
++	link_status = XPCS_RGRD_VAL(pdata, PCS_STS1, RLU);
++
++	return link_status;
++}
++
+ #endif
+ 

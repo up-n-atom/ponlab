@@ -1,0 +1,206 @@
+From bb5942f01ec0e42efc4e8136200206d8c9348190 Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Wed, 29 Jan 2020 14:41:27 +0200
+Subject: [PATCH] PONRTSYS-6515: Add hash value calculation support for B step
+
+---
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 22 ++++++++++
+ drivers/net/ppv4/pp-hal/classifier/classifier.c    | 43 +++++++++++++++++++
+ drivers/net/ppv4/pp-hal/classifier/classifier.h    | 10 +++++
+ .../ppv4/pp-hal/classifier/classifier_debugfs.c    | 50 ++++++++++++++++++++++
+ 4 files changed, 125 insertions(+)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index e473ed9037d6..0e059cb6f8c5 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -1938,6 +1938,14 @@ static bool __smgr_is_cls_info_valid(struct pp_sess_create_args *args)
+ 		}
+ 	}
+ 
++	/* Hash calculation is not supported in A Step */
++	if (test_bit(PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT, &args->flags)) {
++		if (unlikely(pp_silicon_step_get() == PP_SSTEP_A)) {
++			pr_err("hash calc is not supported in A step\n");
++			res = false;
++		}
++	}
++
+ 	return res;
+ }
+ 
+@@ -2076,6 +2084,15 @@ static void __smgr_fv_oob_set(struct sess_info *sess)
+ 		 ext_proto, int_proto, oob->proto_info);
+ }
+ 
++static s32 hash_calc(struct sess_info *sess, void *fv, u32 fv_sz,
++                     struct pp_hash *hash)
++{
++	if (SESS_ARGS_IS_FLAG_OFF(sess, PP_SESS_FLAG_INTERNAL_HASH_CALC_BIT))
++		return 0;
++
++	return cls_hash_calc(fv, fv_sz, hash);
++}
++
+ /**
+  * @brief Preform session lookup based on the ingress packet
+  * @param sess session info
+@@ -2113,6 +2130,11 @@ static s32 __smgr_sess_lookup(struct sess_info *sess)
+ 	 * swapped in the SI so we swap it before we lookup
+ 	 */
+ 	__buf_swap(&lu_fv, sizeof(lu_fv), &sess->si.fv, sess->si.fv_sz);
++
++	ret = hash_calc(sess, &lu_fv, sess->si.fv_sz, &args->hash);
++	if (unlikely(ret))
++		goto done;
++
+ 	/* lookup */
+ 	ret = cls_session_lookup(&lu_fv, sess->si.fv_sz, &args->hash, &id);
+ 	if (unlikely(ret))
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.c b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+index 54dd20518121..c2194fd1e686 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+@@ -15,6 +15,7 @@
+ #include "pp_si.h"
+ #include "classifier.h"
+ #include "classifier_internal.h"
++#include "infra.h"
+ 
+ /**
+  * @brief classifier HW base address
+@@ -1399,3 +1400,45 @@ s32 cls_init(struct pp_cls_init_param *init_param)
+ 	pr_debug("classifier initialized\n");
+ 	return 0;
+ }
++
++s32 cls_hash_calc(void *fv, u32 fv_sz, struct pp_hash *hash)
++{
++	u8 idx;
++	u32 fv_full[CLS_DBG_FV_NUM_REGS] = {0};
++	u32 reg = 0;
++
++	if (pp_silicon_step_get() == PP_SSTEP_A) {
++		pr_err("hash calc is not supported in A step\n");
++		return -EINVAL;
++	}
++
++	if (unlikely(ptr_is_null(fv)) || unlikely(ptr_is_null(hash)))
++		return -EINVAL;
++
++	if (fv_sz > (4 * CLS_DBG_FV_NUM_REGS)) {
++		pr_err("fv_sz %u too big\n", fv_sz);
++		return -EINVAL;
++	}
++
++	memcpy(fv_full, fv, fv_sz);
++
++	/* Write FV */
++	for (idx = 0; idx < CLS_DBG_FV_NUM_REGS; idx++)
++		PP_REG_WR32(PP_CLS_FV_TO_HASH_CALC_REG + (4 * idx),
++			    fv_full[idx]);
++
++	reg = PP_FIELD_PREP(PP_CLS_GO_CALC_MSK, 0x1);
++	PP_REG_WR32(PP_CLS_GO_CALC_REG, reg);
++
++	/* Wait for done bit */
++	if (pp_reg_poll(PP_CLS_GO_CALC_REG, PP_CLS_GO_CALC_GO_READY_MSK, 1)) {
++		pr_err("Failed polling on classifier calc reg\n");
++		return -EIO;
++	}
++
++	hash->h1 = PP_REG_RD32(PP_CLS_CALC_HASH_1_REG);
++	hash->h2 = PP_REG_RD32(PP_CLS_CALC_HASH_2_REG);
++	hash->sig = PP_REG_RD32(PP_CLS_CALC_HASH_SIG_REG);
++
++	return 0;
++}
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.h b/drivers/net/ppv4/pp-hal/classifier/classifier.h
+index 68291d2d8df0..8195b5dd4a92 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.h
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.h
+@@ -215,6 +215,16 @@ void cls_stats_reset(void);
+  */
+ s32 cls_session_si_get(u32 id, struct pp_hw_si *si);
+ 
++/**
++ * @brief calc hash by fv
++ * @note B step only
++ * @param fv field vector
++ * @param fv_sz field vector size in bytes. Up to 4 * CLS_DBG_FV_NUM_REGS
++ * @param hash [OUT] calculated Hash
++ * @return s32 0 on success, error code otherwise
++ */
++s32 cls_hash_calc(void *fv, u32 fv_sz, struct pp_hash *hash);
++
+ /**
+  * @brief Module init function
+  * @param init_param initial parameters
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c b/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c
+index f1a304bb89ef..9bfc1775d99d 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier_debugfs.c
+@@ -359,6 +359,55 @@ static int cls_dbg_sig_err_get(void *data, u64 *val)
+ 
+ PP_DEFINE_DBGFS_ATT(cls_dbg_sig_err, cls_dbg_sig_err_get, NULL);
+ 
++/**
++ * @brief Debugfs hash calc
++ */
++static void cls_dbg_hash_calc_set(char *cmd_buf, void *data)
++{
++	unsigned long fv[CLS_DBG_FV_NUM_REGS] = {0};
++	struct pp_hash hash;
++	char *tok, *args;
++	u32 cnt = 0;
++
++	args = cmd_buf;
++	args = strim(args);
++
++	/* iterate over user arguments */
++	while ((tok = strsep(&args, " \t\n")) != NULL) {
++		if (!*tok)
++			continue;
++
++		if (kstrtoul(tok, 0, &fv[cnt++])) {
++			pr_err("kstrtou32 err\n");
++			return;
++		}
++	}
++
++	if (cls_hash_calc((u32 *)&fv[0], cnt << 2, &hash)) {
++		pr_err("cls_hash_calc failed\n");
++		return;
++	}
++
++	pr_info("\n");
++	pr_info(" +---------------+-------------+\n");
++	pr_info(" | Hash Function | Last Result |\n");
++	pr_info(" +---------------+-------------+\n");
++	pr_info(" | HASH1         | 0x%-8X  |\n", hash.h1);
++	pr_info(" +---------------+-------------+\n");
++	pr_info(" | HASH2         | 0x%-8X  |\n", hash.h2);
++	pr_info(" +---------------+-------------+\n");
++	pr_info(" | SIG           | 0x%-8X  |\n", hash.sig);
++	pr_info(" +---------------+-------------+\n\n");
++}
++
++static void cls_dbg_hash_calc_help(struct seq_file *f)
++{
++	seq_puts(f, " <FV WORD0> <FV WORD1> <FV WORD2> ... <FV WORD31> \n");
++}
++
++PP_DEFINE_DEBUGFS(cls_dbg_hash_calc, cls_dbg_hash_calc_help,
++		  cls_dbg_hash_calc_set);
++
+ /**
+  * @brief Debugfs lookup stats show API
+  */
+@@ -1568,6 +1617,7 @@ static struct debugfs_file hash_dbg_files[] = {
+ 	{ "hash_select", &PP_DEBUGFS_FOPS(cls_dbg_hash_sel) },
+ 	{ "size", &PP_DEBUGFS_FOPS(cls_dbg_hash_size) },
+ 	{ "sig_err", &PP_DEBUGFS_FOPS(cls_dbg_sig_err) },
++	{ "hash_calc", &PP_DEBUGFS_FOPS(cls_dbg_hash_calc) },
+ };
+ 
+ static struct debugfs_file lookup_dbg_files[] = {

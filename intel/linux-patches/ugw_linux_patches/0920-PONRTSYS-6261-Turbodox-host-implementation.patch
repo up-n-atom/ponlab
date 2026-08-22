@@ -1,0 +1,2634 @@
+From 0036a04b2b317092bf906ab97e3bb359a856a32a Mon Sep 17 00:00:00 2001
+From: ofirbitt <ofir1.bitton@intel.com>
+Date: Mon, 2 Dec 2019 14:02:03 +0200
+Subject: [PATCH] PONRTSYS-6261: Turbodox host implementation
+
+---
+ drivers/net/ppv4/Makefile                          |   1 +
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |   2 +
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h |   5 -
+ .../net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c    |   8 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c     |   8 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c   |   8 +-
+ drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c  |   8 +-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 183 +++--
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.h    |  60 +-
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c |  84 ++-
+ .../pp-session-mgr/pp_session_mgr_internal.h       | 192 +++++-
+ .../pp-api/pp-session-mgr/pp_session_mgr_tdox.c    | 764 +++++++++++++++++++++
+ drivers/net/ppv4/pp-dev/pp_fpga.c                  |   4 +-
+ drivers/net/ppv4/pp-hal/checker/checker.h          |   9 +
+ drivers/net/ppv4/pp-hal/classifier/classifier.c    |   2 +-
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      |  74 +-
+ drivers/net/ppv4/pp-hal/micro-controller/uc.h      |  55 ++
+ drivers/net/ppv4/pp-headers/fpga_ppv4.h            |   2 +-
+ .../ppv4/pp-tools/init/pp_init_sequence_debugfs.c  |  28 +
+ drivers/net/ppv4/pp-tools/unit-test/pput_drv.c     |  55 +-
+ .../ppv4/pp-tools/unit-test/tests/pp_qos_tests.c   |   7 +-
+ .../pp-tools/unit-test/tests/pp_session_tests.c    | 346 +++++++++-
+ 22 files changed, 1704 insertions(+), 201 deletions(-)
+
+diff --git a/drivers/net/ppv4/Makefile b/drivers/net/ppv4/Makefile
+index ea1a400568d4..358ffb7ffac0 100644
+--- a/drivers/net/ppv4/Makefile
++++ b/drivers/net/ppv4/Makefile
+@@ -126,6 +126,7 @@ $(TARGET)-$(CONFIG_DEBUG_FS) += pp-api/pp-port-mgr/pp_port_mgr_debugfs.o
+ $(TARGET)-y += pp-api/pp-session-mgr/pp_session_mgr.o
+ $(TARGET)-y += pp-api/pp-session-mgr/pp_session_mgr_mcast.o
+ $(TARGET)-y += pp-api/pp-session-mgr/pp_session_mgr_syncq.o
++$(TARGET)-y += pp-api/pp-session-mgr/pp_session_mgr_tdox.o
+ $(TARGET)-$(CONFIG_DEBUG_FS) += pp-api/pp-session-mgr/pp_session_mgr_debugfs.o
+ endif
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index 7a6609fbc3d8..6490a3246c0f 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -258,6 +258,8 @@ s32 pp_nf_set(enum pp_nf_type type, struct pp_nf_info *nf)
+ 	set_bit(type, &db->nf_en);
+ 	memcpy(&db->nf[type], nf, sizeof(*nf));
+ 
++	/* Notify session manager of the new NF added */
++	smgr_nf_set(type, nf);
+ out:
+ 	return ret;
+ }
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
+index 460ff7d0a002..19e01d7c25da 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_common.h
+@@ -30,11 +30,6 @@
+ #include "list.h"
+ #endif
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_QOS]:%s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ /* #define PP_QOS_DISABLE_CMDQ */
+ /* #define PRINT_CREATE_CMD */
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+index 9a78a0e367c6..eddfd9d54889 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_debugfs.c
+@@ -5,6 +5,9 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  * Copyright (C) 2017-2019 Intel Corporation
+  */
++
++#define pr_fmt(fmt) "[PP_QOS_DBG]:%s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/kernel.h>
+ #include <linux/errno.h>
+ #include <linux/device.h>
+@@ -19,11 +22,6 @@
+ 
+ #define PP_QOS_DEBUGFS_DIR "ppv4_qos"
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_QOS_DBG]:%s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ #define AQM_LATENCY_TARGET  (10)       /* 10 miliseconds */
+ #define AQM_PEAK_RATE       (13107200) /* 100 Mbps */
+ #define AQM_MSR             (13107200) /* 100 Mbps */
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+index 7dd8ea208a03..f51800ded2bb 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_fw.c
+@@ -5,6 +5,9 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  * Copyright (C) 2017-2019 Intel Corporation
+  */
++
++#define pr_fmt(fmt) "[PP_QOS_FW]:%s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/time.h>
+ #include <linux/bitops.h>
+ #include <linux/init.h>
+@@ -16,11 +19,6 @@
+ #include "pp_regs.h"
+ #include "elf_parser.h"
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_QOS_FW]:%s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ #define FW_DCCM_START            (0xF0000000)
+ #define FW_CMD_BUFFER_DCCM_START (0xF0004000)
+ #define MAX_FW_CMD_SIZE          (sizeof(union uc_qos_cmd_s))
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+index 698972b3177c..6ca231194ff4 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_main.c
+@@ -5,6 +5,9 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  * Copyright (C) 2017-2019 Intel Corporation
+  */
++
++#define pr_fmt(fmt) "[PP_QOS_MAIN]:%s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/firmware.h>
+ #include <linux/bitops.h>
+ #include <linux/bitmap.h>
+@@ -17,11 +20,6 @@
+ #define PP_QOS_ENTER_FUNC()
+ #define PP_QOS_EXIT_FUNC()
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_QOS_MAIN]:%s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ static struct pp_qos_dev *qos_devs[PP_QOS_MAX_INSTANCES];
+ static spinlock_t drv_lock;
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+index 6b9835d5fe3d..4ca948b961f4 100644
+--- a/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
++++ b/drivers/net/ppv4/pp-api/pp-qos-mgr/pp_qos_utils.c
+@@ -5,6 +5,9 @@
+  * SPDX-License-Identifier: GPL-2.0-only
+  * Copyright (C) 2017-2019 Intel Corporation
+  */
++
++#define pr_fmt(fmt) "[PP_QOS_UTILS]:%s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/gcd.h>
+ #include <linux/seq_file.h>
+ #include <linux/bitmap.h>
+@@ -17,11 +20,6 @@
+ 
+ #define QOS_INVALID_PRIORITY   0xF
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_QOS_UTILS]:%s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ /******************************************************************************/
+ /*                                 stats                                      */
+ /******************************************************************************/
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index 3b65e519eaa6..dd5843b6e589 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -5,7 +5,7 @@
+  * Copyright (C) 2018-2019 Intel Corporation
+  */
+ 
+-#define pr_fmt(fmt) "[PP_SESS_MGR]:%s:%d: " fmt, __func__, __LINE__
++#define pr_fmt(fmt) "[PP_SMGR]:%s:%d: " fmt, __func__, __LINE__
+ 
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+@@ -144,52 +144,6 @@ union work_args {
+ 	struct inactive_work_args   inactive;
+ };
+ 
+-/**
+- * @brief Shortcuts for accessing the session's ingress outer and
+- *        inner packets
+- * @param sess session info pointer
+- */
+-#define SESS_INGRS_PKT(s)              ((struct fv_pkt_info *)(s)->args->in_pkt)
+-#define SESS_INGRS_HDR_LEN(s)          SESS_INGRS_OFFSETS(s).pkt_hdr_len
+-#define SESS_INGRS_OFFSETS(s)          SESS_INGRS_PKT(s)->fv_offsets
+-#define SESS_INGRS_OUTER_HDRS(s)       (&SESS_INGRS_PKT(s)->fv.outer)
+-#define SESS_INGRS_OUTER_L2(s)         SESS_INGRS_OUTER_HDRS(s)->l2
+-#define SESS_INGRS_OUTER_L3(s)         SESS_INGRS_OUTER_HDRS(s)->l3
+-#define SESS_INGRS_OUTER_L4(s)         SESS_INGRS_OUTER_HDRS(s)->l4
+-#define SESS_INGRS_OUTER_BMAP(s)       SESS_INGRS_PKT(s)->fv_outer_bitmap
+-#define SESS_INGRS_OUTER_OFFSETS(s)    SESS_INGRS_OFFSETS(s).outer_offsets
+-#define SESS_INGRS_TUNN(s)             SESS_INGRS_PKT(s)->fv.tunnel
+-#define SESS_INGRS_TUNN_BMAP(s)        SESS_INGRS_PKT(s)->fv_tunnel_bitmap
+-#define SESS_INGRS_INNER_HDRS(s)       (&SESS_INGRS_PKT(s)->fv.inner)
+-#define SESS_INGRS_INNER_L2(s)         SESS_INGRS_INNER_HDRS(s)->l2
+-#define SESS_INGRS_INNER_L3(s)         SESS_INGRS_INNER_HDRS(s)->l3
+-#define SESS_INGRS_INNER_L4(s)         SESS_INGRS_INNER_HDRS(s)->l4
+-#define SESS_INGRS_INNER_BMAP(s)       SESS_INGRS_PKT(s)->fv_inner_bitmap
+-#define SESS_INGRS_INNER_OFFSETS(s)    SESS_INGRS_OFFSETS(s).inner_offsets
+-
+-/**
+- * @brief Shortcuts for accessing the session's egress outer and inner
+- *        packets
+- * @param s session info pointer (struct sess_info)
+- */
+-#define SESS_EGRS_PKT(s)               ((struct fv_pkt_info *)(s)->args->eg_pkt)
+-#define SESS_EGRS_HDR_LEN(s)           SESS_EGRS_OFFSETS(s).pkt_hdr_len
+-#define SESS_EGRS_OFFSETS(s)           SESS_EGRS_PKT(s)->fv_offsets
+-#define SESS_EGRS_OUTER_HDRS(s)        (&SESS_EGRS_PKT(s)->fv.outer)
+-#define SESS_EGRS_OUTER_L2(s)          SESS_EGRS_OUTER_HDRS(s)->l2
+-#define SESS_EGRS_OUTER_L3(s)          SESS_EGRS_OUTER_HDRS(s)->l3
+-#define SESS_EGRS_OUTER_L4(s)          SESS_EGRS_OUTER_HDRS(s)->l4
+-#define SESS_EGRS_OUTER_BMAP(s)        SESS_EGRS_PKT(s)->fv_outer_bitmap
+-#define SESS_EGRS_OUTER_OFFSETS(s)     SESS_EGRS_OFFSETS(s).outer_offsets
+-#define SESS_EGRS_TUNN(s)              SESS_EGRS_PKT(s)->fv.tunnel
+-#define SESS_EGRS_TUNN_BMAP(s)         SESS_EGRS_PKT(s)->fv_tunnel_bitmap
+-#define SESS_EGRS_INNER_HDRS(s)        (&SESS_EGRS_PKT(s)->fv.inner)
+-#define SESS_EGRS_INNER_L2(s)          SESS_EGRS_INNER_HDRS(s)->l2
+-#define SESS_EGRS_INNER_L3(s)          SESS_EGRS_INNER_HDRS(s)->l3
+-#define SESS_EGRS_INNER_L4(s)          SESS_EGRS_INNER_HDRS(s)->l4
+-#define SESS_EGRS_INNER_BMAP(s)        SESS_EGRS_PKT(s)->fv_inner_bitmap
+-#define SESS_EGRS_INNER_OFFSETS(s)     SESS_EGRS_OFFSETS(s).inner_offsets
+-
+ /**
+  * @brief Shortcuts for accessing the session's nat packets, nat
+  *        packets are the packets which the nat changes are based on.
+@@ -282,19 +236,20 @@ static s32 __smgr_port_flush(u16 pid);
+ 
+ /* Shortcuts for database accesses */
+ #define DB_FREE_LIST_GET_NODE(_db) \
+-	list_first_entry(&_db->free_list, struct sess_db_entry, free_node)
++	list_first_entry(&(_db)->free_list, struct sess_db_entry, free_node)
+ #define DB_FREE_LIST_ADD_NODE(_db, _ent) \
+-	list_add_tail(&_ent->free_node, &_db->free_list)
++	list_add_tail(&(_ent)->free_node, &(_db)->free_list)
+ #define DB_FREE_LIST_DEL_NODE(_ent) \
+-	list_del_init(&_ent->free_node)
+-#define DB_IN_PORT_LIST_ADD_NODE(_db, _ent) \
+-	list_add_tail(&_ent->in_port_node, &_db->in_port[_ent->info.in_port])
+-#define DB_EG_PORT_LIST_ADD_NODE(_db, _ent) \
+-	list_add_tail(&_ent->eg_port_node, &_db->eg_port[_ent->info.eg_port])
++	list_del_init(&(_ent)->free_node)
++#define DB_IN_PORT_LIST_ADD_NODE(_db, _ent)                                    \
++	list_add_tail(&(_ent)->in_port_node,                                   \
++		      &(_db)->in_port[(_ent)->info.in_port])
++#define DB_EG_PORT_LIST_ADD_NODE(_db, _ent)                                    \
++	list_add_tail(&(_ent)->eg_port_node,                                   \
++		      &(_db)->eg_port[(_ent)->info.eg_port])
+ #define DB_IN_PORT_LIST_DEL_NODE(_ent) \
+-	list_del_init(&_ent->in_port_node)
+-#define DB_EG_PORT_LIST_DEL_NODE(_ent) \
+-	list_del_init(&_ent->eg_port_node)
++	list_del_init(&(_ent)->in_port_node)
++#define DB_EG_PORT_LIST_DEL_NODE(_ent) list_del_init(&(_ent)->eg_port_node)
+ 
+ /**
+  * @brief Module database
+@@ -447,13 +402,7 @@ __smgr_work_args_prepare(struct pp_request *req, work_func_t func)
+ 	return args;
+ }
+ 
+-/**
+- * @brief Shortcut for converting QoS logical ID to physical ID
+- * @param logical the logical ID
+- * @param physical result physical ID
+- * @return s32 0 on success, error code otherwise
+- */
+-static inline s32 __smgr_get_queue_phy_id(u16 logical, u16 *physical)
++s32 smgr_get_queue_phy_id(u16 logical, u16 *physical)
+ {
+ 	struct pp_qos_queue_info q_info;
+ 	struct pp_qos_dev *qdev;
+@@ -1214,6 +1163,7 @@ static inline void __smgr_stats_sess_created(struct sess_info *sess)
+ 	atomic_inc(&stats->sess_created);
+ 	atomic_inc(&stats->sess_open);
+ 	atomic_dec(&stats->sess_free);
++
+ 	if (atomic_read(&stats->sess_open_hi_wm) <
+ 	    atomic_read(&stats->sess_open))
+ 		atomic_set(&stats->sess_open_hi_wm,
+@@ -1546,7 +1496,7 @@ s32 pp_session_dst_queue_update(u32 id, u16 dst_q)
+ 		ret = -EINVAL;
+ 		goto unlock;
+ 	}
+-	ret = __smgr_get_queue_phy_id(dst_q, &phy_dst_q);
++	ret = smgr_get_queue_phy_id(dst_q, &phy_dst_q);
+ 	if (unlikely(ret))
+ 		goto unlock;
+ 
+@@ -1951,6 +1901,8 @@ static bool __smgr_is_sess_args_valid(struct pp_sess_create_args *args)
+ 		res = false;
+ 	if (unlikely(!smgr_mcast_is_info_valid(args)))
+ 		res = false;
++	if (unlikely(!smgr_tdox_is_info_valid(args)))
++		res = false;
+ 	if (false == res)
+ 		__smgr_stats_invalid_args();
+ 
+@@ -2222,34 +2174,33 @@ static bool __smgr_is_sess_supported(struct sess_info *sess)
+ static inline s32 __smgr_sess_ent_prepare(struct sess_info *sess)
+ {
+ 	struct pp_sess_create_args *args = sess->args;
+-	struct sess_db_entry *ent;
++	struct sess_db_entry *sess_ent;
+ 	u32 sess_id;
+ 
++	/* get the first entry from the free list */
+ 	if (unlikely(list_empty(&db->free_list))) {
+ 		pr_err("No free session available\n");
+ 		return -ENOSPC;
+ 	}
+-
+-	/* get the first entry from the free list */
+-	ent = DB_FREE_LIST_GET_NODE(db);
+-	DB_FREE_LIST_DEL_NODE(ent);
++	sess_ent = DB_FREE_LIST_GET_NODE(db);
++	DB_FREE_LIST_DEL_NODE(sess_ent);
+ 
+ 	/* Reset the info struct before using it */
+-	sess_id = ent->info.sess_id;
+-	memset(&ent->info, 0, sizeof(ent->info));
++	sess_id = sess_ent->info.sess_id;
++	memset(&sess_ent->info, 0, sizeof(sess_ent->info));
+ 
+ 	/* Prepare the entry */
+-	memcpy(&ent->info.hash, &args->hash, sizeof(args->hash));
+-	ent->info.sess_id   = sess_id;
+-	ent->info.in_port   = args->in_port;
+-	ent->info.eg_port   = args->eg_port;
+-	ent->info.fv_sz     = sess->si.fv_sz;
+-	ent->info.mod_flags = *sess->mod_flags;
+-	sess->mod_flags     = &ent->info.mod_flags;
+-	sess->db_ent        = ent;
+-	smgr_mcast_sess_ent_prepare(sess);
++	memcpy(&sess_ent->info.hash, &args->hash, sizeof(args->hash));
++	sess_ent->info.sess_id   = sess_id;
++	sess_ent->info.in_port   = args->in_port;
++	sess_ent->info.eg_port   = args->eg_port;
++	sess_ent->info.fv_sz     = sess->si.fv_sz;
++	sess_ent->info.mod_flags = *sess->mod_flags;
++	sess->mod_flags     = &sess_ent->info.mod_flags;
++	sess->db_ent        = sess_ent;
+ 
+-	return 0;
++	smgr_mcast_sess_ent_prepare(sess);
++	return smgr_tdox_sess_ent_prepare(sess);
+ }
+ 
+ /**
+@@ -2264,8 +2215,12 @@ static s32 __smgr_sess_ent_free(struct sess_db_entry *ent)
+ 	if (unlikely(ptr_is_null(ent)))
+ 		return -EINVAL;
+ 
++	/* Remove tdox entry if linked to this session */
++	smgr_tdox_session_remove(ent->info.tdox_ent);
++
+ 	/* add the session back to the free list */
+ 	DB_FREE_LIST_ADD_NODE(db, ent);
++
+ 	return 0;
+ }
+ 
+@@ -2628,9 +2583,9 @@ static s32 __smgr_frag_si_ud_set(struct sess_info *sess)
+ 			return ret;
+ 		}
+ 
+-		ret = __smgr_get_queue_phy_id(nf_info.q, &phys_q);
++		ret = smgr_get_queue_phy_id(nf_info.q, &phys_q);
+ 		if (unlikely(ret)) {
+-			pr_err("__smgr_get_queue_phy_id err %d\n", ret);
++			pr_err("smgr_get_queue_phy_id err %d\n", ret);
+ 			return ret;
+ 		}
+ 
+@@ -2955,7 +2910,7 @@ static s32 __smgr_si_create(struct sess_info *sess)
+ 	/* set session id first, cause some of the below APIs use it */
+ 	si->sess_id = sess->db_ent->info.sess_id;
+ 
+-	ret = __smgr_get_queue_phy_id(sess->args->dst_q, &sess->si.dst_q);
++	ret = smgr_get_queue_phy_id(sess->args->dst_q, &sess->si.dst_q);
+ 	if (unlikely(ret))
+ 		goto done;
+ 	ret = pp_si_sgc_info_set(args->sgc, ARRAY_SIZE(args->sgc), si);
+@@ -2979,8 +2934,19 @@ static s32 __smgr_si_create(struct sess_info *sess)
+ 	si->bce_ext     = false; /* not supported in PPv4 */
+ 	si->trim_l3_id  = SI_NO_TRIM_VALUE;
+ 
+-	if (test_bit(PP_SESS_FLAG_LRO_INFO_BIT, &args->flags))
++	if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_LRO_INFO_BIT)) {
+ 		si->tdox_flow = args->lro_info;
++	} else if (SESS_IS_FLAG_ON(sess->db_ent, SESS_FLAG_TDOX)) {
++		if (unlikely(ptr_is_null(sess->db_ent->info.tdox_ent))) {
++			pr_err("Session %u is missing Tdox entry in db\n",
++			       sess->db_ent->info.sess_id);
++			ret = -EINVAL;
++			goto done;
++		}
++		si->tdox_flow = sess->db_ent->info.tdox_ent->tdox_id;
++	} else {
++		si->tdox_flow = SMGR_INVALID_TDOX_SESS_ID;
++	}
+ 
+ 	__smgr_si_flags_set(sess);
+ 
+@@ -3074,10 +3040,13 @@ static s32 __smgr_sess_create(struct sess_info *sess)
+ 		goto err_unlock;
+ 	}
+ 	smgr_sq_start(sess);
++	smgr_tdox_record_create(sess->db_ent);
+ 
+ 	pr_debug("session %u created\n", sess->db_ent->info.sess_id);
+ 	__smgr_stats_sess_created(sess);
++
+ 	__smgr_sess_track(sess);
++
+ 	__smgr_sess_debug(sess);
+ unlock:
+ 	__smgr_unlock();
+@@ -3098,13 +3067,7 @@ static s32 __smgr_sess_create(struct sess_info *sess)
+ 	return ret;
+ }
+ 
+-/**
+- * @brief Update a PP session
+- * @param sess_id session id to update
+- * @param si new si
+- * @return s32 0 on success update, error code otherwise
+- */
+-s32 pp_session_update(u32 sess_id, struct pp_hw_si *hw_si)
++s32 smgr_session_update(u32 sess_id, struct pp_hw_si *hw_si)
+ {
+ 	struct sess_db_entry *ent;
+ 	struct sess_db_info *info;
+@@ -4311,6 +4274,25 @@ static s32 __smgr_db_async_init(void)
+ 	return 0;
+ }
+ 
++void smgr_nf_set(enum pp_nf_type type, struct pp_nf_info *nf)
++{
++	switch (type) {
++	case PP_NF_REASSEMBLY:
++	break;
++	case PP_NF_TURBODOX:
++		smgr_tdox_late_init();
++	break;
++	case PP_NF_FRAGMENTER:
++	break;
++	case PP_NF_MULTICAST:
++	break;
++	case PP_NF_IPSEC:
++	break;
++	default:
++		pr_err("Unknown nf type %u\n", type);
++	}
++}
++
+ /**
+  * @brief Initialized session manager database
+  * @dev device to use for all memories allocations, we allocate using
+@@ -4331,7 +4313,7 @@ static s32 __smgr_db_init(struct pp_smgr_init_param *init_param)
+ 	 */
+ 	if (unlikely(init_param->num_sessions > SMGR_MAX_HW_SESSIONS)) {
+ 		pr_err("To much sessions to support, max is %u\n",
+-		       SMGR_MAX_HW_SESSIONS);
++			SMGR_MAX_HW_SESSIONS);
+ 		return -E2BIG;
+ 	}
+ 
+@@ -4353,9 +4335,11 @@ static s32 __smgr_db_init(struct pp_smgr_init_param *init_param)
+ 	spin_lock_init(&db->lock);
+ 	/* allocate bitmap for HW crawler */
+ 	/* roundup session number to fit crawler hw limitations */
+-	db->inact_bmap_sz = max(CHK_CRWLR_MIN_ITR_SIZE * 2, db->n_sessions);
++	db->inact_bmap_sz =
++		max(CHK_CRWLR_MIN_ITR_SIZE * 2, db->n_sessions);
+ 	db->inact_bmap_sz = roundup_pow_of_two(db->inact_bmap_sz);
+-	db->inact_bmap_sz = BITS_TO_LONGS(db->inact_bmap_sz) * sizeof(ulong);
++	db->inact_bmap_sz =
++		BITS_TO_LONGS(db->inact_bmap_sz) * sizeof(ulong);
+ 	if (IS_ENABLED(CONFIG_PPV4_FPGA)) {
+ #if IS_ENABLED(CONFIG_PPV4_FPGA)
+ 		db->inact_bmap      = (void *)DDR_MBOX_BASE;
+@@ -4381,6 +4365,10 @@ static s32 __smgr_db_init(struct pp_smgr_init_param *init_param)
+ 		return ret;
+ 	/* sessions entries init */
+ 	ret = __smgr_db_sessions_init(dev);
++	if (unlikely(ret))
++		return ret;
++	/* tdox sessions entries init */
++	ret = smgr_tdox_init(dev);
+ 	if (unlikely(ret))
+ 		return ret;
+ 	/* caches */
+@@ -4485,6 +4473,9 @@ void pp_smgr_exit(void)
+ 	smgr_dbg_clean();
+ 	/* Clean multicast */
+ 	smgr_mcast_exit();
++	/* Clean tdox */
++	smgr_tdox_exit();
++
+ 	/* Free database memory */
+ 	__smgr_db_destroy();
+ 
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+index 8364b361a6be..37ea995a90e2 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.h
+@@ -11,6 +11,7 @@
+ #include <linux/types.h>
+ #include <linux/init.h>
+ #include <linux/debugfs.h> /* struct dentry */
++#include <linux/pp_api.h> /* For PP APIs */
+ 
+ /**
+  * enum smgr_frag_mode - Fragmentation mode
+@@ -43,6 +44,11 @@ struct pp_smgr_init_param {
+ };
+ 
+ #ifdef CONFIG_PHY_INTEL_COMBO_LGM
++
++/**
++ * @define Invalid tdox session id
++ */
++#define SMGR_INVALID_TDOX_SESS_ID  (1023)
+ /**
+  * @struct Session manager statistics definitions
+  * @sess_create_req total number of requests to create sessions
+@@ -208,6 +214,25 @@ struct smgr_sq_stats {
+ 	u32 err_q_disconnect_failed;
+ };
+ 
++/**
++ * @struct smgr_tdox_stats
++ * @brief tdox UC cpu statistics
++ */
++struct smgr_tdox_stats {
++	u32 uc_rx_pkt;
++	u32 uc_tx_pkt;
++	u32 free_list_cnt;
++	u32 busy_list_cnt;
++	u32 obsolete_list_cnt;
++	u32 cand_free_list_cnt;
++	u32 cand_busy_list_cnt;
++	u32 tdox_sess_free;
++	u32 tdox_free_candidates;
++	u32 tdox_sess_full_fail;
++	u32 tdox_candidate_full_fail;
++	u32 tdox_create_args_err;
++};
++
+ /**
+  * @brief Get session manager statistics
+  * @param stats buffer
+@@ -268,13 +293,36 @@ void smgr_sq_lspp_rcv(u32 session);
+ s32 smgr_sq_dbg_stats_get(struct smgr_sq_stats *stats, bool reset);
+ 
+ /**
+- * @brief Enable/disable nf acceleration
+- * @param nf network function to set
+- * @param en true to enable, false to disable
+- * @param queue nf physical queue
+- * @return s32 0 on success
++ * @brief Set NF in session manager
++ */
++void smgr_nf_set(enum pp_nf_type type, struct pp_nf_info *nf);
++
++/**
++ * @brief Allocate sessions array
++ * @note it is the user responsibility to free the memory
++ * @param sessions pointer to return the array address
++ * @param n_sessions number of sessions
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_sessions_arr_alloc(u32 **sessions, u32 *n_sessions);
++
++/**
++ * @brief Get tdox stats
++ * @param stats statistics structure
++ * @return 0 if success
++ */
++s32 smgr_tdox_stats_get(struct smgr_tdox_stats *stats);
++
++/**
++ * @brief modify tdox timer period (debug)
++ */
++void smgr_tdox_dbg_timer_set(u32 period_ms);
++
++/**
++ * @brief Get tdox enable state
++ * @return true if tdox is enabled
+  */
+-s32 smgr_nf_en_set(enum pp_nf_type nf, bool en, u16 queue);
++bool smgr_tdox_enable_get(void);
+ 
+ /**
+  * @brief initialized PP session manager driver
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index ca9b2433cb1b..e55fe0224260 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -471,6 +471,84 @@ void __smgr_dbg_frag_stats(struct seq_file *f)
+ 
+ PP_DEFINE_DEBUGFS(frag_stats, __smgr_dbg_frag_stats, NULL);
+ 
++/**
++ * @brief Dump fragmentation stats
++ */
++void __smgr_dbg_tdox_stats(struct seq_file *f)
++{
++	struct smgr_tdox_stats tdox_stats;
++	s32 ret;
++
++	ret = smgr_tdox_stats_get(&tdox_stats);
++	if (ret)
++		return;
++
++	seq_puts(f, "\n");
++	seq_puts(f, "|==============================|\n");
++	seq_puts(f, "|        Tdox Statistics       |\n");
++	seq_puts(f, "|==============================|\n");
++	seq_printf(f, "| %-15s ", "uC Stats");
++	seq_puts(f, "|\n");
++	seq_puts(f, "|-----------------|------------|\n");
++	seq_printf(f, "| %-15s ", " uC Rx ");
++	seq_printf(f, "| %10u |\n", tdox_stats.uc_rx_pkt);
++	seq_printf(f, "| %-15s ", " uC Tx ");
++	seq_printf(f, "| %10u |\n", tdox_stats.uc_tx_pkt);
++	seq_puts(f, "|------------------------------|\n");
++	seq_printf(f, "| %-15s ", "Entry Stats");
++	seq_puts(f, "|\n");
++	seq_puts(f, "|-----------------|------------|\n");
++	seq_printf(f, "| %-15s ", " Free Entries ");
++	seq_printf(f, "| %10u |\n", tdox_stats.tdox_sess_free);
++	seq_printf(f, "| %-15s ", " Free Cand ");
++	seq_printf(f, "| %10u |\n", tdox_stats.tdox_free_candidates);
++	seq_puts(f, "|------------------------------|\n");
++	seq_printf(f, "| %-15s ", "Session Stats");
++	seq_puts(f, "|\n");
++	seq_puts(f, "|-----------------|------------|\n");
++	seq_printf(f, "| %-15s ", " Tdox Full ");
++	seq_printf(f, "| %10u |\n", tdox_stats.tdox_sess_full_fail);
++	seq_printf(f, "| %-15s ", " TdoxCand Full ");
++	seq_printf(f, "| %10u |\n", tdox_stats.tdox_candidate_full_fail);
++	seq_printf(f, "| %-15s ", " Create Fail ");
++	seq_printf(f, "| %10u |\n", tdox_stats.tdox_create_args_err);
++	seq_puts(f, "|-----------------|------------|\n");
++	seq_printf(f, "| %-15s ", "Lists Stats");
++	seq_puts(f, "|\n");
++	seq_puts(f, "|-----------------|------------|\n");
++	seq_printf(f, "| %-15s ", " free ");
++	seq_printf(f, "| %10u |\n", tdox_stats.free_list_cnt);
++	seq_printf(f, "| %-15s ", " busy ");
++	seq_printf(f, "| %10u |\n", tdox_stats.busy_list_cnt);
++	seq_printf(f, "| %-15s ", " obsolete ");
++	seq_printf(f, "| %10u |\n", tdox_stats.obsolete_list_cnt);
++	seq_printf(f, "| %-15s ", " cand_free ");
++	seq_printf(f, "| %10u |\n", tdox_stats.cand_free_list_cnt);
++	seq_printf(f, "| %-15s ", " cand_busy ");
++	seq_printf(f, "| %10u |\n", tdox_stats.cand_busy_list_cnt);
++	seq_puts(f, "|------------------------------|\n");
++}
++
++PP_DEFINE_DEBUGFS(tdox_stats, __smgr_dbg_tdox_stats, NULL);
++
++static int __smgr_dbg_tdox_en_set(void *data, u64 val)
++{
++	smgr_tdox_enable_set(val);
++	return 0;
++}
++
++static int __smgr_dbg_tdox_en_get(void *data, u64 *val)
++{
++	u32 tout;
++
++	tout = smgr_tdox_enable_get();
++	*val = (u64)tout;
++	return 0;
++}
++
++PP_DEFINE_DBGFS_ATT(tdox_en_fops, __smgr_dbg_tdox_en_get,
++		    __smgr_dbg_tdox_en_set);
++
+ /**
+  * @brief Dump specific session si and dsi raw data, uses session ID
+  *        that was set by xsession file
+@@ -516,6 +594,8 @@ static void __smgr_pr_session_flags(struct seq_file *f, ulong flags)
+ 		"MTU_CHECK",
+ 		"MCAST_GRP",
+ 		"MCAST_DST",
++		"SESS_FLAG_TDOX",
++		"SESS_FLAG_TDOX_SUPP",
+ 	};
+ 	u32 flag;
+ 
+@@ -2282,7 +2362,7 @@ void sess_update_set(char *cmd_buf, void *data)
+ 		}
+ 	}
+ 
+-	if (pp_session_update(id, &si))
++	if (smgr_session_update(id, &si))
+ 		pr_err("pp_session_update failed (id %u)", id);
+ 
+ out:
+@@ -2320,6 +2400,8 @@ static struct debugfs_file debugfs_files[] = {
+ 	{ "dual_tbm", &PP_DEBUGFS_FOPS(dual_tbm) },
+ 	{ "sgc", &PP_DEBUGFS_FOPS(sgc) },
+ 	{ "frag_stats", &PP_DEBUGFS_FOPS(frag_stats) },
++	{ "tdox_stats", &PP_DEBUGFS_FOPS(tdox_stats) },
++	{ "tdox_en",   &PP_DEBUGFS_FOPS(tdox_en_fops) },
+ 	{ "compare_last_fv", &PP_DEBUGFS_FOPS(session_compare_last_fv) },
+ 	{ "sess_update", &PP_DEBUGFS_FOPS(sess_update) },
+ };
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index c6f2dea248a7..1e1dc9bc0dd5 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -56,6 +56,8 @@ enum smgr_sess_flags {
+ 	SESS_FLAG_MTU_CHCK,
+ 	SESS_FLAG_MCAST_GRP,
+ 	SESS_FLAG_MCAST_DST,
++	SESS_FLAG_TDOX,
++	SESS_FLAG_TDOX_SUPP,
+ 	SMGR_FLAGS_NUM,
+ };
+ 
+@@ -87,30 +89,75 @@ enum smgr_sess_flags {
+ #define LEARN_FV_TUNN_FLAGS \
+ 	(FV_TUNNEL_VXLAN | FV_TUNNEL_GNV | FV_TUNNEL_L2TPUDP)
+ 
+-/**
+- * @define Session's default checker flags
+- * @note  'SI_CHCK_FLAG_DVRT_FRAG' flag should be added once
+- *        fragmentor uc will be enabled
+- */
+-#define SESS_CHCK_DFLT_FLAGS                       \
+-		(BIT(SI_CHCK_FLAG_UPDT_SESS_CNT) | \
+-		 BIT(SI_CHCK_FLAG_DYN_SESS))
+-
+ /**
+  * @brief Shortcuts for session entry flags operations
+  * @param e session db entry pointer (struct sess_db_entry)
+  * @param f flag
+  */
+-#define SESS_FLAG_SET(e, f)           set_bit(f,   &(e)->info.flags)
++#define SESS_FLAG_SET(e, f)           set_bit(f, &(e)->info.flags)
+ #define SESS_FLAG_CLR(e, f)           clear_bit(f, &(e)->info.flags)
+ 
++/**
++ * @brief Shortcuts for session entry flags testing
++ * @param s session db entry pointer (struct sess_db_entry)
++ * @param f flag
++ */
++#define SESS_IS_FLAG_ON(e, f)    test_bit(f, &(e)->info.flags)
++#define SESS_IS_FLAG_OFF(e, f)   !test_bit(f, &(e)->info.flags)
++
+ /**
+  * @brief Shortcuts for session args flags testing
+  * @param s session info pointer
+  * @param f flag
+  */
+-#define SESS_ARGS_IS_FLAG_ON(s, f)    test_bit(f,  &(s)->args->flags)
+-#define SESS_ARGS_IS_FLAG_OFF(s, f)   !test_bit(f,  &(s)->args->flags)
++#define SESS_ARGS_IS_FLAG_ON(s, f)    test_bit(f, &(s)->args->flags)
++#define SESS_ARGS_IS_FLAG_OFF(s, f)   !test_bit(f, &(s)->args->flags)
++
++/**
++ * @brief Shortcuts for accessing the session's ingress outer and
++ *        inner packets
++ * @param sess session info pointer
++ */
++#define SESS_INGRS_PKT(s)              ((struct fv_pkt_info *)(s)->args->in_pkt)
++#define SESS_INGRS_HDR_LEN(s)          SESS_INGRS_OFFSETS(s).pkt_hdr_len
++#define SESS_INGRS_OFFSETS(s)          SESS_INGRS_PKT(s)->fv_offsets
++#define SESS_INGRS_OUTER_HDRS(s)       (&SESS_INGRS_PKT(s)->fv.outer)
++#define SESS_INGRS_OUTER_L2(s)         SESS_INGRS_OUTER_HDRS(s)->l2
++#define SESS_INGRS_OUTER_L3(s)         SESS_INGRS_OUTER_HDRS(s)->l3
++#define SESS_INGRS_OUTER_L4(s)         SESS_INGRS_OUTER_HDRS(s)->l4
++#define SESS_INGRS_OUTER_BMAP(s)       SESS_INGRS_PKT(s)->fv_outer_bitmap
++#define SESS_INGRS_OUTER_OFFSETS(s)    SESS_INGRS_OFFSETS(s).outer_offsets
++#define SESS_INGRS_TUNN(s)             SESS_INGRS_PKT(s)->fv.tunnel
++#define SESS_INGRS_TUNN_BMAP(s)        SESS_INGRS_PKT(s)->fv_tunnel_bitmap
++#define SESS_INGRS_INNER_HDRS(s)       (&SESS_INGRS_PKT(s)->fv.inner)
++#define SESS_INGRS_INNER_L2(s)         SESS_INGRS_INNER_HDRS(s)->l2
++#define SESS_INGRS_INNER_L3(s)         SESS_INGRS_INNER_HDRS(s)->l3
++#define SESS_INGRS_INNER_L4(s)         SESS_INGRS_INNER_HDRS(s)->l4
++#define SESS_INGRS_INNER_BMAP(s)       SESS_INGRS_PKT(s)->fv_inner_bitmap
++#define SESS_INGRS_INNER_OFFSETS(s)    SESS_INGRS_OFFSETS(s).inner_offsets
++
++/**
++ * @brief Shortcuts for accessing the session's egress outer and inner
++ *        packets
++ * @param s session info pointer (struct sess_info)
++ */
++#define SESS_EGRS_PKT(s)               ((struct fv_pkt_info *)(s)->args->eg_pkt)
++#define SESS_EGRS_HDR_LEN(s)           SESS_EGRS_OFFSETS(s).pkt_hdr_len
++#define SESS_EGRS_OFFSETS(s)           SESS_EGRS_PKT(s)->fv_offsets
++#define SESS_EGRS_OUTER_HDRS(s)        (&SESS_EGRS_PKT(s)->fv.outer)
++#define SESS_EGRS_OUTER_L2(s)          SESS_EGRS_OUTER_HDRS(s)->l2
++#define SESS_EGRS_OUTER_L3(s)          SESS_EGRS_OUTER_HDRS(s)->l3
++#define SESS_EGRS_OUTER_L4(s)          SESS_EGRS_OUTER_HDRS(s)->l4
++#define SESS_EGRS_OUTER_BMAP(s)        SESS_EGRS_PKT(s)->fv_outer_bitmap
++#define SESS_EGRS_OUTER_OFFSETS(s)     SESS_EGRS_OFFSETS(s).outer_offsets
++#define SESS_EGRS_TUNN(s)              SESS_EGRS_PKT(s)->fv.tunnel
++#define SESS_EGRS_TUNN_BMAP(s)         SESS_EGRS_PKT(s)->fv_tunnel_bitmap
++#define SESS_EGRS_INNER_HDRS(s)        (&SESS_EGRS_PKT(s)->fv.inner)
++#define SESS_EGRS_INNER_L2(s)          SESS_EGRS_INNER_HDRS(s)->l2
++#define SESS_EGRS_INNER_L3(s)          SESS_EGRS_INNER_HDRS(s)->l3
++#define SESS_EGRS_INNER_L4(s)          SESS_EGRS_INNER_HDRS(s)->l4
++#define SESS_EGRS_INNER_BMAP(s)        SESS_EGRS_PKT(s)->fv_inner_bitmap
++#define SESS_EGRS_INNER_OFFSETS(s)     SESS_EGRS_OFFSETS(s).inner_offsets
+ 
+ /**
+  * @enum Session manager mode
+@@ -134,6 +181,7 @@ enum smgr_state {
+  * @fv_sz session field vector size for quick reference
+  * @hash session hash results calculated by the HW
+  * @mcast session mcast info
++ * @tdox_ent Link to turbodox entry
+  * @ingress session ingress packet, needed for debug printing
+  * @egress session egress packet, needed for debug printing
+  */
+@@ -146,12 +194,54 @@ struct sess_db_info {
+ 	u8  fv_sz;
+ 	struct pp_hash hash;
+ 	struct pp_mcast mcast;
++	struct tdox_db_entry *tdox_ent;
+ #ifdef CONFIG_DEBUG_FS
+ 	struct fv_pkt_info ingress;
+ 	struct fv_pkt_info egress;
+ #endif
+ };
+ 
++/**
++ * @brief Tdox session information
++ */
++struct tdox_info {
++	u32 supp_enable:1,
++	    is_tunnel:1,
++	    is_candidate:1,
++	    low_queue:9,
++	    high_queue:9;
++};
++
++/**
++ * @brief Tdox uc create command
++ */
++struct tdox_record_create_cmd {
++	struct tdox_info info;
++	u16 sess_id;
++	u16 tdox_id;
++};
++
++/**
++ * @brief Tdox uc remove command
++ */
++struct tdox_record_remove_cmd {
++	u16 tdox_id;
++};
++
++/**
++ * @brief Session manager tdox session database entry definition
++ * @tdox_id tdox id
++ * @info relevant session info
++ * @sess_ent corresponding session entry
++ * @tdox_node list node for attaching the session to the tdox lists
++ */
++struct tdox_db_entry {
++	u16 tdox_id;
++	struct tdox_info info;
++	struct sess_db_entry *sess_ent;
++	struct list_head tdox_node;
++} __aligned(CACHE_LINE_SIZE);
++
+ /**
+  * @brief Session manager session database entry definition
+  * @info session info
+@@ -337,15 +427,6 @@ static inline bool smgr_is_sess_mcast_dst(const struct sess_db_info *sess)
+  */
+ s32 smgr_sessions_bmap_alloc(ulong **bmap, u32 *n_bits);
+ 
+-/**
+- * @brief Allocate sessions array
+- * @note it is the user responsibility to free the memory
+- * @param sessions pointer to return the array address
+- * @param n_sessions number of sessions
+- * @return s32 0 on success, error code otherwise
+- */
+-s32 smgr_sessions_arr_alloc(u32 **sessions, u32 *n_sessions);
+-
+ /**
+  * @brief Test whether session id is valid or not
+  * @note Valid session id doesn't mean the session exist
+@@ -379,6 +460,21 @@ s32 smgr_session_dsi_get(u32 id, struct pp_dsi *dsi);
+  */
+ s32 smgr_sgc_sessions_bmap_get(u8 grp, u16 cntr, ulong *bmap, u32 n_bits);
+ 
++/**
++ * @brief Shortcut for converting QoS logical ID to physical ID
++ * @param logical the logical ID
++ * @param physical result physical ID
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_get_queue_phy_id(u16 logical, u16 *physical);
++
++/**
++ * @brief Update a PP session
++ * @param sess_id session id to update
++ * @param si new si
++ * @return s32 0 on success update, error code otherwise
++ */
++s32 smgr_session_update(u32 sess_id, struct pp_hw_si *hw_si);
+ /* ========================================================================== */
+ /*                       Synchronization queues                               */
+ /* ========================================================================== */
+@@ -589,13 +685,57 @@ s32 smgr_mcast_init(u32 invalid_sess_id);
+  */
+ void smgr_mcast_exit(void);
+ 
++/* ========================================================================== */
++/*                               Turbodox                                     */
++/* ========================================================================== */
++
+ /**
+- * @brief Update a PP session
+- * @param sess_id session id to update
+- * @param si new si
+- * @return s32 0 on success update, error code otherwise
++ * @brief Helper function to initialize tdox manager
++ * @return s32 0 on success, error code otherwise
++ */
++s32 smgr_tdox_init(struct device *dev);
++
++/**
++ * @brief Fetching tdox record info and sending mailbox to uC
++ * @param ent session entry in db
++ * @return 0 if success
++ */
++s32 smgr_tdox_record_create(struct sess_db_entry *sess_ent);
++
++/**
++ * @brief Validate args are valid for tdox session
++ * @param ent session args
++ * @return true if args are valid
++ */
++bool smgr_tdox_is_info_valid(struct pp_sess_create_args *args);
++
++/**
++ * @brief Prepare tdox db before seession creation
++ * @param ent session info
++ * @return 0 if success
++ */
++s32 smgr_tdox_sess_ent_prepare(struct sess_info *sess);
++
++/**
++ * @brief Remove tdox entry
++ * @param ent tdox entry in db
++ */
++void smgr_tdox_session_remove(struct tdox_db_entry *ent);
++
++/**
++ * @brief Set tdox enable state
++ */
++void smgr_tdox_enable_set(bool enable);
++
++/**
++ * @brief Initiate late parameters
++ */
++void smgr_tdox_late_init(void);
++
++/**
++ * @brief Clean tdox resources
+  */
+-s32 pp_session_update(u32 sess_id, struct pp_hw_si *hw_si);
++void smgr_tdox_exit(void);
+ 
+ #ifdef CONFIG_DEBUG_FS
+ /**
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c
+new file mode 100644
+index 000000000000..28d86e629f0a
+--- /dev/null
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_tdox.c
+@@ -0,0 +1,764 @@
++/*
++ * Description: PP session manager turbodox module
++ *
++ * SPDX-License-Identifier: GPL-2.0-only
++ * Copyright (C) 2019 Intel Corporation
++ */
++
++#define pr_fmt(fmt) "[PP_SESS_MGR_TDOX]:%s:%d: " fmt, __func__, __LINE__
++
++#include <linux/kernel.h>     /* For pr_err/pr_debug/...   */
++#include <linux/types.h>      /* For standard types        */
++#include <linux/spinlock.h>   /* For DB lock               */
++#include <linux/errno.h>      /* For the EINVAL/EEXIST/... */
++#include <linux/bug.h>        /* For WARN()                */
++#include <linux/list.h>       /* For free/act lists        */
++#include <linux/timer.h>      /* For sync/done timers      */
++#include <linux/jiffies.h>    /* For jiffies               */
++#include <linux/pp_qos_api.h> /* For QoS manager APIs      */
++
++#include "uc.h"
++#include "classifier.h"
++#include "pp_session_mgr.h"
++#include "pp_session_mgr_internal.h"
++
++#define TDOX_BYPASS 1
++
++/**
++ * @define Tdox timer interval
++ */
++#define SMGR_TDOX_TIMER_INTERVAL_MS  (3000)
++/**
++ * @define Number of required entries is doubled due to candidates
++ */
++#define SMGR_TDOX_DB_NUM_ENTRIES (UC_MAX_TDOX_SESSIONS * 2)
++
++#define DB_TDOX_FREE_LIST_GET_NODE(_db)                                        \
++	list_first_entry(&(_db)->tdox_free_list, struct tdox_db_entry,         \
++			 tdox_node)
++#define DB_TDOX_FREE_LIST_ADD_NODE(_db, _ent)                                  \
++	list_add_tail(&(_ent)->tdox_node, &(_db)->tdox_free_list)
++#define DB_TDOX_MOVE_TO_FREE_LIST(_db, _ent)                                   \
++	list_move_tail(&(_ent)->tdox_node, &(_db)->tdox_free_list)
++#define DB_TDOX_MOVE_TO_BUSY_LIST(_db, _ent)                                   \
++	list_move_tail(&(_ent)->tdox_node, &(_db)->tdox_busy_list)
++#define DB_TDOX_MOVE_TO_OBSOLETE_LIST(_db, _ent)                               \
++	list_move_tail(&(_ent)->tdox_node, &(_db)->tdox_obsolete_list)
++#define DB_TDOX_CANDIDATE_FREE_LIST_GET_NODE(_db)                              \
++	list_first_entry(&(_db)->tdox_candidate_free_list,                     \
++			 struct tdox_db_entry, tdox_node)
++#define DB_TDOX_CANDIDATE_FREE_LIST_ADD_NODE(_db, _ent)                        \
++	list_add_tail(&(_ent)->tdox_node, &(_db)->tdox_candidate_free_list)
++#define DB_TDOX_MOVE_TO_CANDIDATE_FREE_LIST(_db, _ent)                         \
++	list_move_tail(&(_ent)->tdox_node, &(_db)->tdox_candidate_free_list)
++#define DB_TDOX_MOVE_TO_CANDIDATE_BUSY_LIST(_db, _ent)                         \
++	list_move_tail(&(_ent)->tdox_node, &(_db)->tdox_candidate_busy_list)
++
++/**
++ * @brief Module database
++ */
++static struct smgr_tdox_db *db;
++
++/**
++ * @brief Tdox database statistics
++ */
++struct tdox_db_stats {
++	/*! Free tdox sessions counter */
++	atomic_t              tdox_sess_free;
++	/*! Free tdox session candidates counter */
++	atomic_t              tdox_free_candidates;
++	/*! Tdox full counter */
++	atomic_t              tdox_sess_full_fail;
++	/*! Candidate full counter */
++	atomic_t              tdox_candidate_full_fail;
++	/*! Tdox session create args error */
++	atomic_t              tdox_create_args_err;
++};
++
++/**
++ * @brief Tdox database definitions
++*/
++struct smgr_tdox_db {
++	/*! turbodox enable */
++	bool                  enable;
++	/*! turbodox state machine array sram offset */
++	u32                   tdox_state_arr_offset;
++	/*! turbodox free sessions list */
++	struct list_head      tdox_free_list;
++	/*! turbodox busy sessions list */
++	struct list_head      tdox_busy_list;
++	/*! turbodox obsolete sessions list */
++	struct list_head      tdox_obsolete_list;
++	/*! turbodox free candidate sessions list */
++	struct list_head      tdox_candidate_free_list;
++	/*! turbodox busy candidate sessions list */
++	struct list_head      tdox_candidate_busy_list;
++	/*! tdox sessions array */
++	struct tdox_db_entry  *tdox_sessions;
++	/*! tdox host timer */
++	struct timer_list     tdox_timer;
++	/*! tdox host timer interval milliseconds  */
++	u32                   tdox_timer_interval;
++	/*! tdox db stats */
++	struct tdox_db_stats  stats;
++	/*! Tdox db lock */
++	spinlock_t            tdox_lock;
++};
++
++s32 smgr_tdox_init(struct device *dev)
++{
++	struct tdox_db_entry *tdox_ent;
++	u32 i;
++
++	/* allocate database structure */
++	db = devm_kzalloc(dev, sizeof(*db), GFP_KERNEL);
++	if (unlikely(!db)) {
++		pr_err("Failed to allocate database memory\n");
++		return -ENOMEM;
++	}
++
++	spin_lock_init(&db->tdox_lock);
++
++	/* init free sessions list */
++	INIT_LIST_HEAD(&db->tdox_free_list);
++	INIT_LIST_HEAD(&db->tdox_busy_list);
++	INIT_LIST_HEAD(&db->tdox_obsolete_list);
++	INIT_LIST_HEAD(&db->tdox_candidate_free_list);
++	INIT_LIST_HEAD(&db->tdox_candidate_busy_list);
++
++	/* allocate sessions db entries */
++	db->tdox_sessions =
++		pp_devm_kvcalloc(dev, SMGR_TDOX_DB_NUM_ENTRIES,
++				 sizeof(*db->tdox_sessions),
++				 GFP_KERNEL);
++
++	if (!db->tdox_sessions) {
++		pr_err("Failed to allocate %u tdox sessions memory\n",
++		       SMGR_TDOX_DB_NUM_ENTRIES);
++		return -ENOMEM;
++	}
++
++	for (i = 0; i < SMGR_TDOX_DB_NUM_ENTRIES; i++) {
++		tdox_ent = &db->tdox_sessions[i];
++		/* init sessions lists nodes */
++		INIT_LIST_HEAD(&tdox_ent->tdox_node);
++		/* add the session to the free list */
++		if (i < UC_MAX_TDOX_SESSIONS) {
++			/* Free entries */
++			tdox_ent->tdox_id = i;
++			DB_TDOX_FREE_LIST_ADD_NODE(db, tdox_ent);
++		} else {
++			/* Candidates */
++			tdox_ent->tdox_id = SMGR_INVALID_TDOX_SESS_ID;
++			DB_TDOX_CANDIDATE_FREE_LIST_ADD_NODE(db, tdox_ent);
++		}
++		tdox_ent->sess_ent = NULL;
++	}
++	atomic_set(&db->stats.tdox_sess_free, UC_MAX_TDOX_SESSIONS);
++	atomic_set(&db->stats.tdox_free_candidates, UC_MAX_TDOX_SESSIONS);
++
++	if (IS_ENABLED(TDOX_BYPASS))
++		db->enable = false;
++	else
++		db->enable = true;
++
++	return 0;
++}
++
++static u32 tdox_list_count(struct list_head *list)
++{
++	u32 cnt = 0;
++	struct tdox_db_entry *ent;
++
++	list_for_each_entry(ent, list, tdox_node) {
++		cnt++;
++	}
++
++	return cnt;
++}
++
++bool smgr_tdox_enable_get(void)
++{
++	return db->enable;
++}
++
++void smgr_tdox_enable_set(bool enable)
++{
++	db->enable = enable;
++	if (enable)
++		smgr_tdox_late_init();
++}
++
++s32 smgr_tdox_record_create(struct sess_db_entry *sess_ent)
++{
++	s32 ret = 0;
++	struct tdox_record_create_cmd cmd;
++	struct tdox_db_entry *tdox_ent;
++
++	if (unlikely(ptr_is_null(sess_ent)))
++		return -EINVAL;
++
++	tdox_ent = sess_ent->info.tdox_ent;
++
++	if (SESS_IS_FLAG_OFF(sess_ent, SESS_FLAG_TDOX))
++		return 0;
++
++	cmd.info = tdox_ent->info;
++	cmd.sess_id = tdox_ent->sess_ent->info.sess_id;
++	cmd.tdox_id = tdox_ent->tdox_id;
++
++#ifndef TDOX_NO_FW
++	/* send command */
++	ret = uc_egr_mbox_cmd_send_buff(UC_CMD_TDOX_CREATE, &cmd, sizeof(cmd));
++	if (ret) {
++		pr_err("UC_CMD_TDOX_CREATE %u command failed\n", tdox_flow);
++		return ret;
++	}
++#endif
++
++	return ret;
++}
++
++bool smgr_tdox_is_info_valid(struct pp_sess_create_args *args)
++{
++	u16 queue_phy;
++
++	/* If not Tdox return */
++	if (!test_bit(PP_SESS_FLAG_TDOX_BIT, &args->flags))
++		return true;
++
++	if (test_bit(PP_SESS_FLAG_LRO_INFO_BIT, &args->flags)) {
++		pr_debug("LRO & TDOX flags cannot co-exist\n");
++		atomic_inc(&db->stats.tdox_create_args_err);
++		return false;
++	}
++
++	if (!args->in_pkt || !args->eg_pkt) {
++		pr_debug("TDOX requires in/eg packets\n");
++		atomic_inc(&db->stats.tdox_create_args_err);
++		return false;
++	}
++
++	if (!(args->in_pkt->fv_outer_bitmap & FV_L4_TCP)) {
++		pr_debug("TDOX supports only TCP\n");
++		atomic_inc(&db->stats.tdox_create_args_err);
++		return false;
++	}
++
++	if (args->in_pkt->fv_outer_bitmap & FV_L3_FRAG_1ST ||
++	    args->in_pkt->fv_inner_bitmap & FV_L3_FRAG_1ST ||
++	    args->eg_pkt->fv_outer_bitmap & FV_L3_FRAG_1ST ||
++	    args->eg_pkt->fv_inner_bitmap & FV_L3_FRAG_1ST) {
++		pr_debug("TDOX does not support fragmented packets\n");
++		atomic_inc(&db->stats.tdox_create_args_err);
++		return false;
++	}
++
++	if (smgr_get_queue_phy_id(args->dst_q_high, &queue_phy)) {
++		atomic_inc(&db->stats.tdox_create_args_err);
++		return false;
++	}
++
++	return true;
++}
++
++static s32 tdox_set_db_entry(struct tdox_db_entry *tdox_ent,
++			     struct sess_info *sess)
++{
++	u16 queue_phy;
++	s32 ret;
++
++	/* Copy session parameters for future use */
++	tdox_ent->info.supp_enable =
++		SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_TDOX_SUPP_BIT);
++	tdox_ent->info.is_tunnel = SESS_INGRS_TUNN_BMAP(sess);
++	ret = smgr_get_queue_phy_id(sess->args->dst_q, &queue_phy);
++	if (ret)
++		return ret;
++	tdox_ent->info.low_queue = queue_phy;
++
++	ret = smgr_get_queue_phy_id(sess->args->dst_q_high, &queue_phy);
++	if (ret)
++		return ret;
++	tdox_ent->info.high_queue = queue_phy;
++
++	return 0;
++}
++
++static bool tdox_allocate_free_entry(struct tdox_db_entry **tdox_ent)
++{
++	/* If free list empty try inserting a candidate */
++	if (list_empty(&db->tdox_free_list)) {
++		atomic_inc(&db->stats.tdox_sess_full_fail);
++		return false;
++	}
++	/* get the first entry from the tdox free list */
++	*tdox_ent = DB_TDOX_FREE_LIST_GET_NODE(db);
++	(*tdox_ent)->info.is_candidate = 0;
++	DB_TDOX_MOVE_TO_BUSY_LIST(db, *tdox_ent);
++	atomic_dec(&db->stats.tdox_sess_free);
++
++	return true;
++}
++
++static bool tdox_allocate_candidate_entry(struct tdox_db_entry **tdox_ent)
++{
++	if (list_empty(&db->tdox_candidate_free_list)) {
++		atomic_inc(&db->stats.tdox_candidate_full_fail);
++		return false;
++	}
++
++	*tdox_ent = DB_TDOX_CANDIDATE_FREE_LIST_GET_NODE(db);
++	(*tdox_ent)->info.is_candidate = 1;
++	DB_TDOX_MOVE_TO_CANDIDATE_BUSY_LIST(db, *tdox_ent);
++	atomic_dec(&db->stats.tdox_free_candidates);
++
++	return true;
++}
++
++s32 smgr_tdox_sess_ent_prepare(struct sess_info *sess)
++{
++	struct tdox_db_entry *tdox_ent;
++	struct sess_db_entry *sess_ent;
++	s32 ret = 0;
++
++	sess_ent = sess->db_ent;
++
++	if (!db->enable) {
++		sess_ent->info.tdox_ent = NULL;
++		return 0;
++	}
++
++	if (SESS_ARGS_IS_FLAG_OFF(sess, PP_SESS_FLAG_TDOX_BIT)) {
++		sess_ent->info.tdox_ent = NULL;
++		return 0;
++	}
++
++	spin_lock_bh(&db->tdox_lock);
++
++	if (tdox_allocate_free_entry(&tdox_ent)) {
++		pr_debug("Allocated Tdox Entry %u. Session %u\n",
++			 tdox_ent->tdox_id, sess_ent->info.sess_id);
++		/* Set session db flags */
++		SESS_FLAG_SET(sess_ent, SESS_FLAG_TDOX);
++		if (SESS_ARGS_IS_FLAG_ON(sess, PP_SESS_FLAG_TDOX_SUPP_BIT))
++			SESS_FLAG_SET(sess_ent, SESS_FLAG_TDOX_SUPP);
++	} else {
++		if (tdox_allocate_candidate_entry(&tdox_ent)) {
++			pr_debug("Allocated Tdox Candidate. Session %u\n",
++				 sess_ent->info.sess_id);
++		} else {
++			goto unlock;
++		}
++	}
++
++	/* Link tdox entry with session entry and vice versa */
++	sess_ent->info.tdox_ent = tdox_ent;
++	tdox_ent->sess_ent = sess_ent;
++	ret = tdox_set_db_entry(tdox_ent, sess);
++
++unlock:
++	spin_unlock_bh(&db->tdox_lock);
++
++	return ret;
++}
++
++/**
++ * @brief Helper function to detach tdox entry from an existing session
++ */
++static s32 tdox_detach(struct sess_db_entry *sess_ent, bool update_session,
++		       bool remove_record)
++{
++#ifndef TDOX_NO_FW
++	struct tdox_record_remove_cmd cmd;
++#endif
++	struct tdox_db_entry *tdox_ent;
++	struct pp_hw_si si;
++	s32 ret = 0;
++
++	SESS_FLAG_CLR(sess_ent, SESS_FLAG_TDOX);
++	SESS_FLAG_CLR(sess_ent, SESS_FLAG_TDOX_SUPP);
++	tdox_ent = sess_ent->info.tdox_ent;
++	sess_ent->info.tdox_ent = NULL;
++	tdox_ent->sess_ent = NULL;
++
++	if (!update_session)
++		return 0;
++
++	/* Get session SI */
++	if (unlikely(cls_session_si_get(sess_ent->info.sess_id, &si))) {
++		pr_err("couldn't get si for session %u",
++		       sess_ent->info.sess_id);
++		return -EINVAL;
++	}
++	ret = pp_si_fld_set(&si, SI_FLD_TDOX_FLOW, SMGR_INVALID_TDOX_SESS_ID);
++	if (ret) {
++		pr_err("couldn't set si fld tdox for session %u",
++		       sess_ent->info.sess_id);
++		return -EINVAL;
++	}
++	ret = smgr_session_update(sess_ent->info.sess_id, &si);
++	if (ret) {
++		pr_err("couldn't set si fld tdox for session %u",
++		       sess_ent->info.sess_id);
++		return -EINVAL;
++	}
++
++#ifndef TDOX_NO_FW
++	if (remove_record) {
++		cmd.tdox_id = tdox_ent->tdox_id;
++		/* send command */
++		ret = uc_egr_mbox_cmd_send_buff(UC_CMD_TDOX_REMOVE, &cmd,
++						sizeof(cmd));
++		if (ret) {
++			pr_err("UC_CMD_TDOX_REMOVE %u command failed\n",
++			       tdox_ent->tdox_id);
++			return ret;
++		}
++	}
++#endif
++
++	return ret;
++}
++
++void smgr_tdox_session_remove(struct tdox_db_entry *ent)
++{
++	enum tdox_uc_state state;
++	s32 ret;
++
++	/* Check if session is linked with tdox */
++	if (!ent)
++		return;
++
++	spin_lock_bh(&db->tdox_lock);
++	if (ent->info.is_candidate) {
++		pr_debug("Removing candidate session %u\n",
++			 ent->sess_ent->info.sess_id);
++		/* Detach, no need to update session as it is a candidate */
++		tdox_detach(ent->sess_ent, false, false);
++		/* Update candidates db */
++		DB_TDOX_MOVE_TO_FREE_LIST(db, ent);
++		atomic_inc(&db->stats.tdox_free_candidates);
++		goto unlock;
++	} else if (SESS_IS_FLAG_OFF(ent->sess_ent, SESS_FLAG_TDOX)) {
++		pr_err("Session %u with Tdox %u with no flag\n",
++		       ent->sess_ent->info.sess_id, ent->tdox_id);
++	}
++
++	ret = uc_tdox_state_get(ent->tdox_id, &state);
++	if (ret) {
++		pr_err("Failed fetching tdox id %u state\n", ent->tdox_id);
++		goto unlock;
++	}
++
++	switch (state) {
++	case TDOX_NONQUALIFIED_UC_INACTIVE:
++		pr_debug("Removing nonqualified tdox %u. session %u\n",
++			 ent->tdox_id, ent->sess_ent->info.sess_id);
++		/* Detach, do not update session, do not send delete cmd */
++		tdox_detach(ent->sess_ent, false, false);
++		DB_TDOX_MOVE_TO_FREE_LIST(db, ent);
++		atomic_inc(&db->stats.tdox_sess_free);
++		break;
++	case TDOX_NEW:
++	case TDOX_QUALIFIED_UC_INACTIVE:
++	case TDOX_QUALIFIED_UC_ACTIVE:
++		pr_debug("Obsolating qualified/new tdox %u. session %u\n",
++			 ent->tdox_id, ent->sess_ent->info.sess_id);
++		/* Detach, do not update session, send delete cmd */
++		tdox_detach(ent->sess_ent, false, true);
++		/* In case uc is active change to obsolete state */
++		DB_TDOX_MOVE_TO_OBSOLETE_LIST(db, ent);
++		break;
++	case TDOX_NONQUALIFIED_UC_ACTIVE:
++		pr_debug("Obsolating NONQUALIFIED ACTIVE tdox %u. session %u\n",
++			 ent->tdox_id, ent->sess_ent->info.sess_id);
++		/* Detach, do not update session,do not send delete cmd */
++		tdox_detach(ent->sess_ent, false, false);
++		/* In case uc is active change to obsolete state */
++		DB_TDOX_MOVE_TO_OBSOLETE_LIST(db, ent);
++		break;
++	default:
++		pr_err("Unknown Tdox state %u\n", state);
++	}
++unlock:
++	spin_unlock_bh(&db->tdox_lock);
++}
++
++/**
++ * @brief Helper function to attach tdox entry to an existing session
++ */
++static s32 tdox_attach(struct sess_db_entry *sess_ent,
++		       struct tdox_db_entry *tdox_ent)
++{
++	struct pp_hw_si si;
++	s32 ret = 0;
++
++	SESS_FLAG_SET(sess_ent, SESS_FLAG_TDOX);
++	if (tdox_ent->info.supp_enable)
++		SESS_FLAG_SET(sess_ent, SESS_FLAG_TDOX_SUPP);
++
++	sess_ent->info.tdox_ent = tdox_ent;
++
++	/* Get session SI */
++	if (unlikely(cls_session_si_get(sess_ent->info.sess_id, &si))) {
++		pr_err("couldn't get si for session %u",
++		       sess_ent->info.sess_id);
++		return -EINVAL;
++	}
++	ret = pp_si_fld_set(&si, SI_FLD_TDOX_FLOW, tdox_ent->tdox_id);
++	if (ret) {
++		pr_err("couldn't set si fld tdox for session %u",
++		       sess_ent->info.sess_id);
++		return -EINVAL;
++	}
++	ret = smgr_session_update(sess_ent->info.sess_id, &si);
++	if (ret) {
++		pr_err("couldn't set si fld tdox for session %u",
++		       sess_ent->info.sess_id);
++		return -EINVAL;
++	}
++	/* Create tdox record */
++	ret = smgr_tdox_record_create(sess_ent);
++	if (ret) {
++		pr_err("Error creating tdox record %u\n", tdox_ent->tdox_id);
++		return -EINVAL;
++	}
++
++	return ret;
++}
++
++static void smgr_tdox_nonqualified_process(void)
++{
++	struct tdox_db_entry *ent, *tmp;
++	enum tdox_uc_state state;
++	u32 busy_cnt = 0, remove_busy_cnt = 0;
++	s32 ret;
++
++	/* Iterate through busy list and manage any non qualified entry */
++	list_for_each_entry_safe(ent, tmp, &db->tdox_busy_list, tdox_node) {
++		busy_cnt++;
++		ret = uc_tdox_state_get(ent->tdox_id, &state);
++		if (ret) {
++			pr_err("Failed fetching tdox id %u state\n",
++			       ent->tdox_id);
++			return;
++		}
++
++		if (state == TDOX_NONQUALIFIED_UC_INACTIVE) {
++			remove_busy_cnt++;
++			/* Detach Tdox from session */
++			tdox_detach(ent->sess_ent, true, false);
++			/* Update Tdox db */
++			DB_TDOX_MOVE_TO_FREE_LIST(db, ent);
++			atomic_inc(&db->stats.tdox_sess_free);
++		}
++	}
++
++	if (busy_cnt || remove_busy_cnt) {
++		pr_debug("Busy cnt: %u, removed: %u\n", busy_cnt,
++			 remove_busy_cnt);
++	}
++}
++
++static void smgr_tdox_obsolete_process(void)
++{
++	struct tdox_db_entry *obsolete_ent, *tmp;
++	u32 cnt = 0;
++
++	/* Iterate through obsolete list and free all entries */
++	list_for_each_entry_safe(obsolete_ent, tmp,
++				 &db->tdox_obsolete_list, tdox_node) {
++		/* Remove Tdox from session if active */
++		if (obsolete_ent->sess_ent)
++			tdox_detach(obsolete_ent->sess_ent, true, false);
++
++		cnt++;
++		/* Update Tdox db */
++		DB_TDOX_MOVE_TO_FREE_LIST(db, obsolete_ent);
++		atomic_inc(&db->stats.tdox_sess_free);
++	}
++	if (cnt)
++		pr_debug("Obsoletes Freed: %u\n", cnt);
++}
++
++static void smgr_tdox_candidate_process(void)
++{
++	s32 ret;
++	struct tdox_db_entry *cand_ent, *new_ent, *tmp;
++	u32 cnt = 0;
++
++	/* Iterate through busy candidate list and move them to busy list */
++	list_for_each_entry_safe(cand_ent, tmp,
++				 &db->tdox_candidate_busy_list,
++				 tdox_node) {
++		if (list_empty(&db->tdox_free_list))
++			return;
++
++		cnt++;
++
++		/* Get a free entry and attach candidate session */
++		new_ent = DB_TDOX_FREE_LIST_GET_NODE(db);
++		/* Add new entry to busy list */
++		DB_TDOX_MOVE_TO_BUSY_LIST(db, new_ent);
++		atomic_dec(&db->stats.tdox_sess_free);
++
++		/* Copy session info from candidate entry */
++		new_ent->info = cand_ent->info;
++		new_ent->sess_ent = cand_ent->sess_ent;
++
++		/* Update candidates db */
++		cand_ent->sess_ent = NULL;
++		DB_TDOX_MOVE_TO_CANDIDATE_FREE_LIST(db, cand_ent);
++		atomic_inc(&db->stats.tdox_free_candidates);
++
++		/* Attach new tdox entry with existing session */
++		ret = tdox_attach(new_ent->sess_ent, new_ent);
++		if (ret) {
++			pr_err("Error attaching tdox record %u\n",
++			       new_ent->tdox_id);
++			tdox_detach(new_ent->sess_ent, true, false);
++			DB_TDOX_MOVE_TO_FREE_LIST(db, new_ent);
++			atomic_inc(&db->stats.tdox_sess_free);
++		}
++	}
++
++	if (cnt)
++		pr_debug("Candidates Activated: %u\n", cnt);
++}
++
++#if IS_ENABLED(CONFIG_PPV4_FPGA)
++/**
++ * @brief tdox timer handler
++ * @param t the timer object
++ */
++static void tdox_cb(unsigned long t)
++{
++#else
++/**
++ * @brief tdox timer handler
++ * @param t the timer object
++ */
++static void tdox_cb(struct timer_list *timer)
++{
++#endif
++	u32 timer_delay_jiffies;
++
++	spin_lock_bh(&db->tdox_lock);
++
++	/* Busy => Free */
++	if (!list_empty(&db->tdox_busy_list))
++		smgr_tdox_nonqualified_process();
++
++	/* Candidate => Busy */
++	if (!list_empty(&db->tdox_candidate_busy_list) &&
++	    !list_empty(&db->tdox_free_list))
++		smgr_tdox_candidate_process();
++
++	/* Obsolete => Free
++	 * Obsolete process is located last in order to make
++	 * sure we use the freed entry only on the next timer tick
++	 */
++	if (!list_empty(&db->tdox_obsolete_list))
++		smgr_tdox_obsolete_process();
++
++	/* Restart timer */
++	timer_delay_jiffies =
++		jiffies + msecs_to_jiffies(db->tdox_timer_interval);
++	mod_timer(&db->tdox_timer, timer_delay_jiffies);
++
++	spin_unlock_bh(&db->tdox_lock);
++}
++
++void smgr_tdox_dbg_timer_set(u32 period_ms)
++{
++	u32 timer_delay_jiffies;
++
++	spin_lock_bh(&db->tdox_lock);
++
++	del_timer(&db->tdox_timer);
++	db->tdox_timer_interval = period_ms;
++	timer_delay_jiffies =
++		jiffies + msecs_to_jiffies(period_ms);
++	mod_timer(&db->tdox_timer, timer_delay_jiffies);
++
++	spin_unlock_bh(&db->tdox_lock);
++}
++
++void smgr_tdox_late_init(void)
++{
++	u32 timer_delay_jiffies;
++
++	if (!db->enable)
++		return;
++
++	spin_lock_bh(&db->tdox_lock);
++
++#if IS_ENABLED(CONFIG_PPV4_FPGA)
++	setup_timer(&db->tdox_timer, tdox_cb,
++		    (ulong)&db->tdox_timer);
++	setup_timer(&db->tdox_timer, tdox_cb,
++		    (ulong)&db->tdox_timer);
++#else
++	timer_setup(&db->tdox_timer, tdox_cb, 0);
++	timer_setup(&db->tdox_timer, tdox_cb, 0);
++#endif
++
++	db->tdox_timer_interval = SMGR_TDOX_TIMER_INTERVAL_MS;
++
++	timer_delay_jiffies = jiffies +
++		msecs_to_jiffies(db->tdox_timer_interval);
++	mod_timer(&db->tdox_timer, timer_delay_jiffies);
++
++	spin_unlock_bh(&db->tdox_lock);
++}
++
++s32 smgr_tdox_stats_get(struct smgr_tdox_stats *stats)
++{
++	if (unlikely(ptr_is_null(stats)))
++		return -EINVAL;
++
++	spin_lock_bh(&db->tdox_lock);
++	/** TBD add command
++	 * ret = uc_egr_mbox_cmd_send(UC_CMD_TDOX_STATS,
++	 *			      0, &stats, sizeof(stats));
++	 * if (unlikely(ret)) {
++	 *	pr_err("failed to get tdox uc cpu %u counters\n", cid);
++	 *	stats->uc_rx_pkt = 0;
++	 *	stats->uc_tx_pkt = 0;
++	 * }
++	 **/
++
++	stats->uc_rx_pkt = 0;
++	stats->uc_tx_pkt = 0;
++
++	stats->free_list_cnt = tdox_list_count(&db->tdox_free_list);
++	stats->busy_list_cnt = tdox_list_count(&db->tdox_busy_list);
++	stats->obsolete_list_cnt = tdox_list_count(&db->tdox_obsolete_list);
++	stats->cand_free_list_cnt =
++		tdox_list_count(&db->tdox_candidate_free_list);
++	stats->cand_busy_list_cnt =
++		tdox_list_count(&db->tdox_candidate_busy_list);
++	stats->tdox_sess_free = atomic_read(&db->stats.tdox_sess_free);
++	stats->tdox_free_candidates =
++		atomic_read(&db->stats.tdox_free_candidates);
++	stats->tdox_sess_full_fail =
++		atomic_read(&db->stats.tdox_sess_full_fail);
++	stats->tdox_candidate_full_fail =
++		atomic_read(&db->stats.tdox_candidate_full_fail);
++	stats->tdox_create_args_err =
++		atomic_read(&db->stats.tdox_create_args_err);
++	spin_unlock_bh(&db->tdox_lock);
++
++	return 0;
++}
++
++void smgr_tdox_exit(void)
++{
++	spin_lock_bh(&db->tdox_lock);
++	del_timer(&db->tdox_timer);
++	spin_unlock_bh(&db->tdox_lock);
++
++	kfree(db);
++	db = NULL;
++}
+diff --git a/drivers/net/ppv4/pp-dev/pp_fpga.c b/drivers/net/ppv4/pp-dev/pp_fpga.c
+index 2fdd655f0221..eefb21e7b708 100644
+--- a/drivers/net/ppv4/pp-dev/pp_fpga.c
++++ b/drivers/net/ppv4/pp-dev/pp_fpga.c
+@@ -45,7 +45,7 @@
+ /* session cache and counters cache RDL has wrong base address, using these */
+ #define PP_CNTR_CACHE_BASE_      0xF1D00000ULL
+ #define PP_SESS_CACHE_BASE_      0xF1E00C00ULL
+-#define PP_NUM_SESSION           64
++#define PP_NUM_SESSION           1024
+ #define PP_NUM_SYNCQ             0
+ #define PP_HW_NUM_SYNCQ          32
+ #define RPB_MEM_SIZE             0x40000
+@@ -135,6 +135,8 @@ void pp_fpga_cfg_get(struct pp_dts_cfg *cfg)
+ 	cfg->qos_params.fw_sec_data_stack.max_size = 0x2000;
+ 	cfg->qos_params.reserved_ports[0] = 1;
+ 	cfg->qos_params.reserved_ports[1] = 1;
++	/* Reserve last QoS port for testing */
++	cfg->qos_params.reserved_ports[PP_QOS_MAX_PORTS - 1] = 1;
+ 	cfg->qos_params.num_syncqs = PP_NUM_SYNCQ;
+ 
+ 	/* Classifier */
+diff --git a/drivers/net/ppv4/pp-hal/checker/checker.h b/drivers/net/ppv4/pp-hal/checker/checker.h
+index 648b59d0e6e7..16c5a44eb68c 100644
+--- a/drivers/net/ppv4/pp-hal/checker/checker.h
++++ b/drivers/net/ppv4/pp-hal/checker/checker.h
+@@ -69,6 +69,15 @@
+ #define SGC_GRP6_CNTRS_NUM                         (64)
+ #define SGC_GRP7_CNTRS_NUM                         (8)
+ 
++/**
++ * @define Session's default checker flags
++ * @note  'SI_CHCK_FLAG_DVRT_FRAG' flag should be added once
++ *        fragmentor uc will be enabled
++ */
++#define SESS_CHCK_DFLT_FLAGS                       \
++		(BIT(SI_CHCK_FLAG_UPDT_SESS_CNT) | \
++		 BIT(SI_CHCK_FLAG_DYN_SESS))
++
+ /**
+  * @struct Checker module init parameters
+  * @valid params valid
+diff --git a/drivers/net/ppv4/pp-hal/classifier/classifier.c b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+index 5a73d8663c91..50d8fa0b7a1e 100644
+--- a/drivers/net/ppv4/pp-hal/classifier/classifier.c
++++ b/drivers/net/ppv4/pp-hal/classifier/classifier.c
+@@ -997,7 +997,7 @@ s32 cls_session_update(u32 id, u32 fv_sz, struct pp_hash *hash,
+ 	}
+ 
+ #ifdef CONFIG_PPV4_FPGA
+-	memcpy(&db->fv[id], CLS_FV_START_ADDR(si, fv_sz), fv_sz);
++	memcpy(&db->fv[id], CLS_FV_START_ADDR(new_si, fv_sz), fv_sz);
+ 	event.item.key = &db->fv[id];
+ #else /* !CONFIG_PPV4_FPGA */
+ 	event.item.key = (void *)CLS_FV_ADDR((unsigned long)(db->si_base_virt),
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index 428f0f0bb53b..2bb5b78eaf36 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -128,6 +128,11 @@ static dma_addr_t logger_buff_phys;
+  */
+ static size_t     logger_buff_sz;
+ 
++/**
++ * @brief UC Tdox state offset
++ */
++static u32 tdox_state_arr_offset;
++
+ /**
+  * @define base address for the tx manager add packet credit
+  *         register per port.
+@@ -1115,6 +1120,67 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 					 sizeof(info) / sizeof(u32));
+ }
+ 
++s32 __nf_tdox_set(void)
++{
++	s32 ret = 0;
++#ifndef TDOX_NO_FW
++	struct tdox_uc_config cfg;
++
++	ret = uc_egr_mbox_cmd_send(UC_CMD_TDOX_CONF_GET,
++				   SMGR_TDOX_CPU_ID,
++				   &cfg,
++				   sizeof(cfg));
++	if (unlikely(ret)) {
++		pr_err("failed to get tdox config\n");
++		return ret;
++	}
++	tdox_state_arr_offset = cfg.record_state_offset;
++#else
++	u32 idx;
++
++	/* stub - zero all 512 entries */
++	tdox_state_arr_offset = 0x7E00;
++
++	for (idx = 0; idx < 128; idx += 4)
++		PP_REG_WR32(UC_SSRAM(EGRESS, tdox_state_arr_offset + idx), 0);
++#endif
++	return ret;
++}
++
++s32 uc_tdox_dbg_state_set(u16 tdox_id, enum tdox_uc_state state)
++{
++	u32 word_offset, bit_offset, states_word, offset;
++
++	if (tdox_id >= UC_MAX_TDOX_SESSIONS)
++		return -EINVAL;
++
++	word_offset = (tdox_id / 4) * 4; /* Round down */
++	offset = tdox_state_arr_offset + word_offset;
++	bit_offset = (tdox_id % 4) * BITS_PER_BYTE;
++	states_word = PP_REG_RD32(UC_SSRAM(EGRESS, offset));
++	states_word &= ~(0xFF << bit_offset);
++	states_word |= state << bit_offset;
++	PP_REG_WR32(UC_SSRAM(EGRESS, offset), states_word);
++
++	return 0;
++}
++
++s32 uc_tdox_state_get(u16 tdox_id, enum tdox_uc_state *state)
++{
++	u32 offset;
++
++	if (tdox_id >= UC_MAX_TDOX_SESSIONS)
++		return -EINVAL;
++
++	offset = tdox_state_arr_offset + tdox_id;
++	*state = PP_REG_RD8(UC_SSRAM(EGRESS, offset));
++
++	pr_debug("Tdox record %u. state %u. state addr %#x\n", tdox_id, *state,
++		 (u32)UC_SSRAM(EGRESS, offset));
++
++	return 0;
++}
++
+ s32 uc_nf_set(enum pp_nf_type nf, u16 pid, u16 qos_port, u16 tx_queue,
+ 	      u16 dflt_hif)
+ {
+@@ -1165,8 +1231,12 @@ s32 uc_nf_set(enum pp_nf_type nf, u16 pid, u16 qos_port, u16 tx_queue,
+ 		break;
+ 	case PP_NF_TURBODOX:
+ 		uc_port = UC_TDOX_PORT;
+-		pr_err("PP_NF_TURBODOX not supported\n");
+-		return -EINVAL;
++		ret = __nf_tdox_set();
++		if (unlikely(ret)) {
++			pr_err("__nf_tdox_set failed, ret %d\n", ret);
++			return ret;
++		}
++		break;
+ 	case PP_NF_FRAGMENTER:
+ 		uc_port = UC_FRAG_PORT;
+ 		break;
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.h b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+index 93745c5d03ab..d42724987bc9 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+@@ -11,6 +11,9 @@
+ 
+ #include <linux/types.h>
+ #include <linux/debugfs.h>      /* struct dentry */
++#include <linux/pp_api.h>
++
++#define TDOX_NO_FW
+ 
+ /**
+  * @define used as parameter to the uc API for egress uc
+@@ -74,6 +77,34 @@ struct uc_init_params {
+ };
+ 
+ #ifdef CONFIG_PHY_INTEL_COMBO_LGM
++/**
++ * @define maximum of supported turbodox sessions
++ */
++#define UC_MAX_TDOX_SESSIONS  (512)
++
++/**
++ * @enum tdox uc states
++ */
++enum tdox_uc_state {
++	/*! Newly created */
++	TDOX_NEW,
++	/*! Session tagged as qualified but not flowing through uc */
++	TDOX_QUALIFIED_UC_INACTIVE,
++	/*! Session tagged as qualified and flowing through uc */
++	TDOX_QUALIFIED_UC_ACTIVE,
++	/*! Session tagged as non qualified but not flowing through uc */
++	TDOX_NONQUALIFIED_UC_INACTIVE,
++	/*! Session tagged as non qualified and flowing through uc */
++	TDOX_NONQUALIFIED_UC_ACTIVE,
++};
++
++/**
++ * @brief Config read from tdox at boot
++ */
++struct tdox_uc_config {
++	u32 record_state_offset;
++};
++
+ /**
+  * @enum uc_mbox_cmd_type
+  * @brief mailbox command type
+@@ -108,6 +139,14 @@ enum uc_mbox_cmd_type {
+ 	UC_CMD_AUX_REG_WR,
+ 	/*! get the fragmentation stats */
+ 	UC_CMD_FRAG_STATS,
++	/*! Get Tdox configuration */
++	UC_CMD_TDOX_CONF_GET,
++	/*! Create Tdox record */
++	UC_CMD_TDOX_CREATE,
++	/*! Create Tdox record */
++	UC_CMD_TDOX_REMOVE,
++	/*! Get Tdox record */
++	UC_CMD_TDOX_STATS,
+ 
+ 	UC_CMD_LAST      = UC_CMD_FRAG_STATS,
+ 	UC_CMD_MAX       = U32_MAX,
+@@ -188,6 +227,22 @@ void uc_egr_mbox_buff_free(void *virt, dma_addr_t phys, size_t sz);
+ s32 uc_nf_set(enum pp_nf_type nf, u16 pid, u16 qos_port, u16 tx_queue,
+ 	      u16 dflt_hif);
+ 
++/**
++ * @brief This API is for testing only, host should never modify tdox state
++ * @param tdox_id tdox record id
++ * @param state record state
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_tdox_dbg_state_set(u16 tdox_id, enum tdox_uc_state state);
++
++/**
++ * @brief Read tdox state
++ * @param tdox_id tdox record id
++ * @param state record state
++ * @return s32 0 on success, error code otherwise
++ */
++s32 uc_tdox_state_get(u16 tdox_id, enum tdox_uc_state *state);
++
+ /**
+  * @brief check if cpu is active
+  * @param uc_is_egr select the uc cluster
+diff --git a/drivers/net/ppv4/pp-headers/fpga_ppv4.h b/drivers/net/ppv4/pp-headers/fpga_ppv4.h
+index 8f40a08d9cc6..28b766844a13 100644
+--- a/drivers/net/ppv4/pp-headers/fpga_ppv4.h
++++ b/drivers/net/ppv4/pp-headers/fpga_ppv4.h
+@@ -66,7 +66,7 @@
+  * Classifier DSI DDR_DSI_BASE: Size 0x40000bytes
+  */
+ #define DDR_DSI_BASE       0x3040000ULL
+-#define DDR_DSI_SIZE       0x1000
++#define DDR_DSI_SIZE       0x4000
+ 
+ /**
+  * Classifier hash table 1 DDR_HT1_BASE: Size 0x1000bytes
+diff --git a/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c b/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c
+index 24fe8a93dda9..7da09aa0df0b 100644
+--- a/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c
++++ b/drivers/net/ppv4/pp-tools/init/pp_init_sequence_debugfs.c
+@@ -45,6 +45,9 @@ static u16 mcast_cycle2_queue;
+ static u16 reassembly_queue;
+ static u16 reassembly_cycle2_queue;
+ 
++static u16 tdox_queue;
++static u16 tdox_cycle2_queue;
++
+ static s32 __port_mng_init(void)
+ {
+ 	struct pp_hif_datapath dp;
+@@ -262,6 +265,15 @@ static s32 __misc_init(void)
+ 		return -1;
+ 	}
+ 
++	nf.pid = PP_MAX_PORT - 1;
++	nf.q = tdox_queue;
++	nf.cycl2_q = tdox_cycle2_queue;
++
++	if (unlikely(pp_nf_set(PP_NF_TURBODOX, &nf))) {
++		pr_err("reassembly pp_nf_set failed\n");
++		return -1;
++	}
++
+ 	pr_info("done\n");
+ 
+ 	return 0;
+@@ -389,6 +401,7 @@ static s32 __qos_init(void)
+ 	}
+ 	mcast_cycle2_queue = queue_id;
+ 	reassembly_cycle2_queue = queue_id;
++	tdox_cycle2_queue = queue_id;
+ 
+ 	pr_info("allocated queue id %d\n", queue_id);
+ 	default_exception_queue = queue_id;
+@@ -474,6 +487,21 @@ static s32 __qos_init(void)
+ 	reassembly_queue = queue_id;
+ 
+ 	pr_info("reassembly allocated queue id %d\n", queue_id);
++
++	/* Allocate tdox queue */
++	if (unlikely(pp_qos_queue_allocate(qdev, &queue_id))) {
++		pr_err("pp_qos_queue_allocate failed\n");
++		return -EINVAL;
++	}
++
++	queue_conf.queue_child_prop.priority = 6;
++	if (unlikely(pp_qos_queue_set(qdev, queue_id, &queue_conf))) {
++		pr_err("pp_qos_queue_set failed\n");
++		return -EINVAL;
++	}
++	tdox_queue = queue_id;
++
++	pr_info("tdox allocated queue id %d\n", queue_id);
+ 	pr_info("done\n");
+ 
+ 	return 0;
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c b/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c
+index aa30e1164286..baccd0284b83 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/pput_drv.c
+@@ -21,6 +21,7 @@
+ #include <linux/module.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
++#include <linux/kthread.h>
+ #include "pput.h"
+ #include "pp_common.h"
+ #include "pp_debugfs_common.h"
+@@ -28,6 +29,8 @@
+ #define MOD_NAME "PP Unit Test"
+ #define MOD_VERSION "0.0.1"
+ 
++static struct task_struct *thread_st;
++
+ const char * const component_str[] = {
+ 	"PP Infra", "PP Session", "PP Port", "PP Qos", "PP Bm", "PP Parser"
+ };
+@@ -94,19 +97,22 @@ static bool pput_should_run_test(struct pp_test_t *test,
+ 	}
+ }
+ 
+-/**
+- * Run all test in certain level
+- *
+- * @param component Component to run
+- * @param level Level to run
+- *
+- * @return zero for success
+- */
+-static int pput_run(u32 component, u32 level, char *single_test_name)
++struct thread_args {
++	u32 component;
++	u32 level;
++	char *single_test_name;
++};
++
++static int pput_thread(void *args)
+ {
+ 	struct registered_test *rtest;
+ 	int result, n = 0, buf_sz = (8 * 1024);
+-	char *buf, *str, *tok;
++	char *buf, *str, *tok, *single_test_name;
++	u32 component, level;
++
++	component = ((struct thread_args *)args)->component;
++	level = ((struct thread_args *)args)->level;
++	single_test_name = ((struct thread_args *)args)->single_test_name;
+ 
+ 	buf = kzalloc(buf_sz, GFP_KERNEL);
+ 	if (!buf)
+@@ -151,6 +157,35 @@ static int pput_run(u32 component, u32 level, char *single_test_name)
+ 	while ((tok = strsep(&str, "\n")) != NULL)
+ 		pr_info("%s\n", tok);
+ 	kfree(buf);
++	kfree(args);
++
++	thread_st = NULL;
++	do_exit(0);
++	return 0;
++}
++
++/**
++ * Run all test in certain level
++ *
++ * @param component Component to run
++ * @param level Level to run
++ *
++ * @return zero for success
++ */
++static int pput_run(u32 component, u32 level, char *single_test_name)
++{
++	struct thread_args *args;
++
++	/* Allow only 1 thread at a time */
++	if (thread_st)
++		kthread_stop(thread_st);
++
++	args = kzalloc(sizeof(*args), GFP_KERNEL);
++	args->component = component;
++	args->level = level;
++	args->single_test_name = single_test_name;
++
++	thread_st = kthread_run(pput_thread, args, "pput_thread");
+ 
+ 	return 0;
+ }
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
+index be09f86e954b..ed3554cbf0c2 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_qos_tests.c
+@@ -6,6 +6,8 @@
+  * Copyright (C) 2018-2019 Intel Corporation
+  */
+ 
++#define pr_fmt(fmt) "[PP_QOS_TEST] %s:%d: " fmt, __func__, __LINE__
++
+ #include <linux/types.h>
+ #include <linux/kernel.h>
+ #include <linux/string.h>
+@@ -25,11 +27,6 @@
+ #include "fpga_ppv4.h"
+ #endif
+ 
+-#ifdef pr_fmt
+-#undef pr_fmt
+-#define pr_fmt(fmt) "[PP_QOS_TEST] %s:%d: " fmt, __func__, __LINE__
+-#endif
+-
+ #define QOS_TEST_NUM_RING_ADDR   (5)
+ #define QOS_NUM_RING_DESCRIPTORS (5)
+ 
+diff --git a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c
+index 740b24665bf3..0a0173563605 100644
+--- a/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c
++++ b/drivers/net/ppv4/pp-tools/unit-test/tests/pp_session_tests.c
+@@ -18,11 +18,13 @@
+ #include <linux/learning_layer_api.h>
+ #include <linux/pp_api.h>
+ #include "../pput.h"
++#include "uc_regs.h"
+ #include "pp_si.h"
+ #include "pp_common.h"
+ #include "pp_port_mgr.h"
+ #include "checker.h"
+-#include "pp_session_mgr_internal.h"
++#include "pp_session_mgr.h"
++#include "uc.h"
+ 
+ struct sgc_grp_test_info {
+ 	u32 n_cntrs, owner;
+@@ -33,7 +35,7 @@ struct sgc_grp_test_info {
+ #define NUM_CLOCKS 3
+ 
+ /* QoS port */
+-#define PP_SESSION_TEST_QOS_PORT 7
++#define PP_SESSION_TEST_QOS_PORT (PP_QOS_MAX_PORTS - 1)
+ 
+ struct tbm_calc_data {
+ 	u64 rate;
+@@ -60,9 +62,11 @@ static struct tbm_calc_data data_1M = {
+ 
+ static struct sgc_grp_test_info groups[PP_SI_SGC_MAX];
+ static u32 created_sessions[32];
++static u32 *created_tdox_sessions;
+ static u32 pp_port = U32_MAX;
+ static u32 qos_queue = U32_MAX;
+ static u32 qos_port = U32_MAX;
++struct pp_hash tdox_hash;
+ 
+ static int pp_si_encode_decode_test(void *data);
+ static int pp_sess_pre_test(void *data);
+@@ -81,6 +85,10 @@ static int pp_dual_tbm_mod_test(void *data);
+ static int pp_dual_tbm_calc_test(void *data);
+ static int pp_dual_tbm_invalid_args_test(void *data);
+ static int pp_dual_tbm_free_test(void *data);
++static int pp_tdox_max_session_test(void *unused);
++static int pp_tdox_candidate_test(void *unused);
++static int pp_tdox_nonqulaified_test(void *unused);
++static int pp_tdox_session_remove_test(void *unused);
+ 
+ static struct pp_test_t pp_session_tests[] = {
+ 	{
+@@ -93,7 +101,8 @@ static struct pp_test_t pp_session_tests[] = {
+ 	{
+ 		.component = PP_SESSION_TESTS,
+ 		.test_name = "pp_sess_pre_test",
+-		.level_bitmap = PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++		.level_bitmap = PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS |
++				PP_UT_LEVEL_MUST_RUN,
+ 		.test_data = NULL,
+ 		.fn = pp_sess_pre_test,
+ 	},
+@@ -181,6 +190,34 @@ static struct pp_test_t pp_session_tests[] = {
+ 		.test_data = NULL,
+ 		.fn = pp_dual_tbm_invalid_args_test,
+ 	},
++	{
++		.component = PP_SESSION_TESTS,
++		.test_name = "pp_tdox_max_session_test",
++		.level_bitmap = PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++		.test_data = NULL,
++		.fn = pp_tdox_max_session_test,
++	},
++	{
++		.component = PP_SESSION_TESTS,
++		.test_name = "pp_tdox_candidate_test",
++		.level_bitmap = PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++		.test_data = NULL,
++		.fn = pp_tdox_candidate_test,
++	},
++	{
++		.component = PP_SESSION_TESTS,
++		.test_name = "pp_tdox_nonqulaified_test",
++		.level_bitmap = PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++		.test_data = NULL,
++		.fn = pp_tdox_nonqulaified_test,
++	},
++	{
++		.component = PP_SESSION_TESTS,
++		.test_name = "pp_tdox_session_remove_test",
++		.level_bitmap = PP_UT_LEVEL_FULL | PP_UT_LEVEL_MUST_PASS,
++		.test_data = NULL,
++		.fn = pp_tdox_session_remove_test,
++	},
+ 	{
+ 		.component = PP_SESSION_TESTS,
+ 		.test_name = "pp_sess_post_test",
+@@ -288,6 +325,9 @@ static int pp_sess_pre_test(void *data)
+ 	}
+ 	pr_debug("qos queue %u allocated\n", qos_queue);
+ 
++	created_tdox_sessions =
++		kcalloc(UC_MAX_TDOX_SESSIONS * 2, sizeof(u32), GFP_KERNEL);
++
+ 	return PP_UT_PASS;
+ }
+ 
+@@ -616,7 +656,7 @@ static void __smgr_test_pkt_set(struct fv_pkt_info *pkt)
+ {
+ 	pkt->fv_outer_bitmap |= FV_L2_BASE;
+ 	pkt->fv_outer_bitmap |= FV_L3_IPV4;
+-	pkt->fv_outer_bitmap |= FV_L4_UDP;
++	pkt->fv_outer_bitmap |= FV_L4_TCP;
+ }
+ 
+ static int __sess_create_test_sync(void)
+@@ -642,6 +682,39 @@ static int __sess_create_test_sync(void)
+ 	return PP_UT_FAIL;
+ }
+ 
++static void __sess_args_default_set(struct pp_sess_create_args *args,
++				    struct fv_pkt_info *in_pkt,
++				    struct fv_pkt_info *eg_pkt,
++				    struct new_hdr *nhdr)
++{
++	u32 i;
++
++	memset(args, 0, sizeof(*args));
++	memset(in_pkt, 0, sizeof(*in_pkt));
++	memset(eg_pkt, 0, sizeof(*eg_pkt));
++	memset(nhdr,   0, sizeof(*nhdr));
++
++	__smgr_test_pkt_set(in_pkt);
++	__smgr_test_pkt_set(eg_pkt);
++
++	args->color = PP_COLOR_GREEN;
++	args->in_pkt  = in_pkt;
++	args->eg_pkt  = eg_pkt;
++	args->nhdr    = nhdr;
++	args->dst_q   = qos_queue;
++	args->dst_q_high = qos_queue;
++	args->ps_sz   = 0;
++	args->ps_off  = PP_INVALID_PS_OFF;
++	args->eg_port = pp_port;
++	args->in_port = pp_port;
++
++	/* create all session with each group sgc configured to sgc 0 */
++	for (i = 0; i < ARRAY_SIZE(args->sgc); i++)
++		args->sgc[i] = 0;
++	for (i = 0; i < ARRAY_SIZE(args->tbm); i++)
++		args->tbm[i] = PP_TBM_INVALID;
++}
++
+ static int pp_sess_create_test(void *unused)
+ {
+ 	struct pp_sess_create_args args;
+@@ -654,31 +727,9 @@ static int pp_sess_create_test(void *unused)
+ 	struct new_hdr     nhdr;
+ 
+ 	memset(&req,    0, sizeof(req));
+-	memset(&args,   0, sizeof(args));
+-	memset(&in_pkt, 0, sizeof(in_pkt));
+-	memset(&eg_pkt, 0, sizeof(eg_pkt));
+-	memset(&nhdr,   0, sizeof(nhdr));
+-
+-	args.color   = PP_COLOR_GREEN;
+-	args.in_pkt  = &in_pkt;
+-	args.eg_pkt  = &eg_pkt;
+-	args.nhdr    = &nhdr;
+-	args.dst_q   = qos_queue;
+-	args.ps_sz   = 0;
+-	args.ps_off  = PP_INVALID_PS_OFF;
+-	args.eg_port = pp_port;
+-	args.in_port = pp_port;
++	__sess_args_default_set(&args, &in_pkt, &eg_pkt, &nhdr);
+ 	req.cb       = __smgr_test_cb;
+ 
+-	__smgr_test_pkt_set(&in_pkt);
+-	__smgr_test_pkt_set(&eg_pkt);
+-
+-	/* create all session with each group sgc configured to sgc 0 */
+-	for (i = 0; i < ARRAY_SIZE(args.sgc); i++)
+-		args.sgc[i] = 0;
+-	for (i = 0; i < ARRAY_SIZE(args.tbm); i++)
+-		args.tbm[i] = PP_TBM_INVALID;
+-
+ 	for (i = 0; i < ARRAY_SIZE(created_sessions); i++) {
+ 		/* set session id to invalid */
+ 		created_sessions[i] = U32_MAX;
+@@ -766,6 +817,9 @@ static int pp_sess_post_test(void *data)
+ 	if (pp_port != U32_MAX)
+ 		pmgr_port_del(pp_port, false);
+ 
++	smgr_tdox_dbg_timer_set(3000);
++	kfree(created_tdox_sessions);
++
+ 	return PP_UT_PASS;
+ }
+ 
+@@ -1325,6 +1379,244 @@ static int pp_dual_tbm_free_test(void *data)
+ 	return PP_UT_PASS;
+ }
+ 
++/**
++ * @brief Test max tdox sessions
++ */
++static int pp_tdox_max_session_test(void *data)
++{
++	struct pp_sess_create_args args;
++	struct smgr_tdox_stats stats;
++	struct fv_pkt_info in_pkt; /* ingress packet */
++	struct fv_pkt_info eg_pkt; /* egress packet  */
++	struct new_hdr     nhdr;
++	s32 ret;
++	u32 i;
++
++	if (!smgr_tdox_enable_get())
++		return PP_UT_PASS;
++
++	__sess_args_default_set(&args, &in_pkt, &eg_pkt, &nhdr);
++	args.flags = PP_SESS_FLAG_TDOX_MSK;
++
++	/** 1. Create Max tdox sessions
++	 *  2. Make sure all sessions attached tdox
++	 */
++
++	/* Create maximum Tdox sessions */
++	for (i = 0; i < UC_MAX_TDOX_SESSIONS; i++) {
++		tdox_hash.h1++;
++		tdox_hash.h2++;
++		tdox_hash.sig++;
++		args.hash = tdox_hash;
++		ret = pp_session_create(&args, &created_tdox_sessions[i], NULL);
++		if (ret) {
++			pr_err("Failed creating session\n");
++			return PP_UT_FAIL;
++		}
++	}
++	smgr_tdox_stats_get(&stats);
++	if (stats.tdox_sess_free != 0) {
++		pr_err("Expected 0 free tdox sessions\n");
++		return PP_UT_FAIL;
++	}
++	if (stats.tdox_free_candidates != UC_MAX_TDOX_SESSIONS) {
++		pr_err("Expected %u free candidate tdox sessions\n",
++		       UC_MAX_TDOX_SESSIONS);
++		return PP_UT_FAIL;
++	}
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test max candidates
++ */
++static int pp_tdox_candidate_test(void *data)
++{
++	struct pp_sess_create_args args;
++	struct smgr_tdox_stats stats;
++	struct fv_pkt_info in_pkt; /* ingress packet */
++	struct fv_pkt_info eg_pkt; /* egress packet  */
++	struct new_hdr     nhdr;
++	s32 ret;
++	u32 i;
++
++	if (!smgr_tdox_enable_get())
++		return PP_UT_PASS;
++
++	__sess_args_default_set(&args, &in_pkt, &eg_pkt, &nhdr);
++	args.flags = PP_SESS_FLAG_TDOX_MSK;
++
++	/** 1. Create Additional Max tdox sessions
++	 *  2. Make sure all session attached to candidates
++	 */
++
++	/* Create maximum Tdox candidate sessions */
++	for (i = UC_MAX_TDOX_SESSIONS; i < UC_MAX_TDOX_SESSIONS * 2; i++) {
++		tdox_hash.h1++;
++		tdox_hash.h2++;
++		tdox_hash.sig++;
++		args.hash = tdox_hash;
++		ret = pp_session_create(&args, &created_tdox_sessions[i], NULL);
++		if (ret) {
++			pr_err("Failed creating session (ret %d)\n", ret);
++			return PP_UT_FAIL;
++		}
++	}
++	smgr_tdox_stats_get(&stats);
++	if (stats.tdox_sess_free != 0) {
++		pr_err("Expected 0 free tdox sessions\n");
++		return PP_UT_FAIL;
++	}
++	if (stats.tdox_free_candidates != 0) {
++		pr_err("Expected 0 free candidate tdox sessions\n");
++		return PP_UT_FAIL;
++	}
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test tdox non qualified
++ */
++static int pp_tdox_nonqulaified_test(void *data)
++{
++	struct pp_sess_create_args args;
++	struct smgr_tdox_stats stats;
++	struct fv_pkt_info in_pkt; /* ingress packet */
++	struct fv_pkt_info eg_pkt; /* egress packet  */
++	struct new_hdr     nhdr;
++	s32 ret;
++	u32 i;
++
++	if (!smgr_tdox_enable_get())
++		return PP_UT_PASS;
++
++	__sess_args_default_set(&args, &in_pkt, &eg_pkt, &nhdr);
++	args.flags = PP_SESS_FLAG_TDOX_MSK;
++
++	/** 1. All active tdox sessions should be removed
++	 *  2. Candidates will take over
++	 *  3. Also candidates will be removed
++	 *     since state is still non qualified
++	 */
++
++	/* Set all records as non qualified */
++	for (i = 0; i < UC_MAX_TDOX_SESSIONS; i++) {
++		ret = uc_tdox_dbg_state_set(i, TDOX_NONQUALIFIED_UC_INACTIVE);
++		if (ret) {
++			pr_err("Failed setting tdox state\n");
++			return PP_UT_FAIL;
++		}
++	}
++
++	/* Set tdox timer to 100 ms period */
++	smgr_tdox_dbg_timer_set(100);
++
++	pr_info("Wait 5 seconds...\n");
++	msleep(5000);
++
++	smgr_tdox_stats_get(&stats);
++	if (stats.tdox_sess_free != UC_MAX_TDOX_SESSIONS) {
++		pr_err("Expected %u free tdox sessions. got %u\n",
++		       UC_MAX_TDOX_SESSIONS, stats.tdox_sess_free);
++		return PP_UT_FAIL;
++	}
++	if (stats.tdox_free_candidates != UC_MAX_TDOX_SESSIONS) {
++		pr_err("Expected %u free candidate tdox sessions. got %u\n",
++		       UC_MAX_TDOX_SESSIONS, stats.tdox_free_candidates);
++		return PP_UT_FAIL;
++	}
++	/* Delete all sessions */
++	for (i = 0; i < UC_MAX_TDOX_SESSIONS * 2; i++) {
++		ret = pp_session_delete(created_tdox_sessions[i], NULL);
++		if (ret) {
++			pr_err("Failed deleting session\n");
++			return PP_UT_FAIL;
++		}
++	}
++	/* Set all records state to default */
++	for (i = 0; i < UC_MAX_TDOX_SESSIONS; i++) {
++		ret = uc_tdox_dbg_state_set(i, TDOX_NEW);
++		if (ret) {
++			pr_err("Failed setting tdox state\n");
++			return PP_UT_FAIL;
++		}
++	}
++	return PP_UT_PASS;
++}
++
++/**
++ * @brief Test tdox session remove
++ */
++static int pp_tdox_session_remove_test(void *data)
++{
++	struct pp_sess_create_args args;
++	struct smgr_tdox_stats stats;
++	struct fv_pkt_info in_pkt; /* ingress packet */
++	struct fv_pkt_info eg_pkt; /* egress packet  */
++	struct new_hdr     nhdr;
++	s32 ret;
++	u32 i;
++
++	if (!smgr_tdox_enable_get())
++		return PP_UT_PASS;
++
++	__sess_args_default_set(&args, &in_pkt, &eg_pkt, &nhdr);
++	args.flags = PP_SESS_FLAG_TDOX_MSK;
++
++	/** 1. Create Max tdox sessions
++	 *  2. Make sure sessions are created
++	 *  3. Delete all sessions
++	 *  4. Make sure all tdox are free
++	 */
++
++	/* Create maximum Tdox sessions */
++	for (i = 0; i < UC_MAX_TDOX_SESSIONS; i++) {
++		args.hash.h1++;
++		args.hash.h2++;
++		args.hash.sig++;
++		ret = pp_session_create(&args, &created_tdox_sessions[i], NULL);
++		if (ret) {
++			pr_err("Failed creating session\n");
++			return PP_UT_FAIL;
++		}
++	}
++	smgr_tdox_stats_get(&stats);
++	if (stats.tdox_sess_free != 0) {
++		pr_err("Expected 0 free tdox sessions\n");
++		return PP_UT_FAIL;
++	}
++	if (stats.tdox_free_candidates != UC_MAX_TDOX_SESSIONS) {
++		pr_err("Expected %u free candidate tdox sessions\n",
++		       UC_MAX_TDOX_SESSIONS);
++		return PP_UT_FAIL;
++	}
++
++	/* Delete all sessions */
++	for (i = 0; i < UC_MAX_TDOX_SESSIONS; i++) {
++		ret = pp_session_delete(created_tdox_sessions[i], NULL);
++		if (ret) {
++			pr_err("Failed deleting session\n");
++			return PP_UT_FAIL;
++		}
++	}
++
++	pr_info("Wait 10 seconds...\n");
++	msleep(10000);
++
++	smgr_tdox_stats_get(&stats);
++	if (stats.tdox_sess_free != UC_MAX_TDOX_SESSIONS) {
++		pr_err("Expected %u free tdox sessions. got %u\n",
++		       UC_MAX_TDOX_SESSIONS, stats.tdox_sess_free);
++		return PP_UT_FAIL;
++	}
++	if (stats.tdox_free_candidates != UC_MAX_TDOX_SESSIONS) {
++		pr_err("Expected %u free candidate tdox sessions. got %u\n",
++		       UC_MAX_TDOX_SESSIONS, stats.tdox_free_candidates);
++		return PP_UT_FAIL;
++	}
++	return PP_UT_PASS;
++}
++
+ /**
+  * Register all pp_session tests to pput
+  */

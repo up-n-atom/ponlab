@@ -1,0 +1,2718 @@
+From 58f4b8c3bc09d06964a59da04465d33f527bac7d Mon Sep 17 00:00:00 2001
+From: arathinx <ayyappanx.rathinam@intel.com>
+Date: Mon, 8 Oct 2018 17:38:26 +0800
+Subject: [PATCH] DRVLIB_SW-938: Disable gate clocks not used in CGU Driver
+
+---
+ arch/mips/lantiq/grx500/time.c                 |   2 +-
+ drivers/clk/intel/Kconfig                      |   6 +-
+ drivers/clk/intel/Makefile                     |  14 +-
+ drivers/clk/intel/clk-cgu-pll.c                | 422 +++++++++++++++++
+ drivers/clk/intel/clk-cgu-pll.h                |  39 ++
+ drivers/clk/intel/clk-cgu.c                    | 622 +++++++++++++++++++++++++
+ drivers/clk/intel/clk-cgu.h                    | 335 +++++++++++++
+ drivers/clk/intel/clk-falconmx.c               | 533 ---------------------
+ drivers/clk/intel/clk-prx300.c                 | 348 ++++++++++++++
+ include/dt-bindings/clock/intel,falconmx-clk.h | 210 ---------
+ include/dt-bindings/clock/intel,prx300-clk.h   |  89 ++++
+ 11 files changed, 1863 insertions(+), 757 deletions(-)
+
+diff --git a/arch/mips/lantiq/grx500/time.c b/arch/mips/lantiq/grx500/time.c
+index 4d22a59cd505..ac60866b14f5 100755
+--- a/arch/mips/lantiq/grx500/time.c
++++ b/arch/mips/lantiq/grx500/time.c
+@@ -53,7 +53,7 @@ void __init plat_time_init(void)
+ 		return;
+ 	}
+ 
+-	clk = of_clk_get(np, 0);
++	clk = of_clk_get_by_name(np, "cpu");
+ 	if (IS_ERR(clk)) {
+ 		pr_err("Failed to get CPU clock: %ld\n", PTR_ERR(clk));
+ 		return;
+diff --git a/drivers/clk/intel/Kconfig b/drivers/clk/intel/Kconfig
+index 37849c8a2970..cca2ea4c60ae 100644
+--- a/drivers/clk/intel/Kconfig
++++ b/drivers/clk/intel/Kconfig
+@@ -19,10 +19,10 @@ choice
+ 	depends on COMMON_CLK_INTEL
+ 	default GRX500_CLK
+ 
+-config FALCONMX_CLK
+-	bool "FALCONMX CLK"
++config PRX300_CLK
++	bool "PRX300 CLK"
+ 	help
+-	  Clock driver for FALCONMX platform.
++	  Clock driver for PRX300 platform.
+ 
+ config GRX500_CLK
+ 	bool "GRX500 CLK"
+diff --git a/drivers/clk/intel/Makefile b/drivers/clk/intel/Makefile
+index 677a3b4117ad..194bea837f2f 100644
+--- a/drivers/clk/intel/Makefile
++++ b/drivers/clk/intel/Makefile
+@@ -2,13 +2,7 @@
+ #Makefile for intel specific clk
+ #
+ 
+-obj-y += clk_api.o
+-ifneq ($(CONFIG_FALCONMX_CLK),)
+-	obj-y += clk-falconmx.o
+-else ifneq ($(CONFIG_GRX500_CLK),)
+-	obj-y += clk-grx500.o
+-else ifneq ($(CONFIG_GRX330_CLK),)
+-	obj-y += clk-grx330.o
+-else ifneq ($(CONFIG_GRX200_CLK),)
+-	obj-y += clk-grx200.o
+-endif
++obj-$(CONFIG_PRX300_CLK) += clk-prx300.o clk-cgu.o clk-cgu-pll.o
++obj-$(CONFIG_GRX500_CLK) += clk-grx500.o clk_api.o
++obj-$(CONFIG_GRX330_CLK) += clk-grx330.o clk_api.o
++obj-$(CONFIG_GRX200_CLK) += clk-grx200.o clk_api.o
+diff --git a/drivers/clk/intel/clk-cgu-pll.c b/drivers/clk/intel/clk-cgu-pll.c
+new file mode 100644
+index 000000000000..447da9fb9a27
+--- /dev/null
++++ b/drivers/clk/intel/clk-cgu-pll.c
+@@ -0,0 +1,422 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  Copyright (C) 2018 Intel Corporation.
++ *  Zhu YiXin <Yixin.zhu@intel.com>
++ */
++
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/clkdev.h>
++#include <linux/device.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++
++#include "clk-cgu-pll.h"
++#include "clk-cgu.h"
++
++#define to_intel_clk_pll(_hw)   container_of(_hw, struct intel_clk_pll, hw)
++#define to_intel_clk_early(_hw) container_of(_hw, struct intel_clk_early, hw)
++
++/*
++ * Calculate formula:
++ * rate = (prate * mult + (prate * frac) / frac_div) / div
++ */
++static unsigned long
++intel_pll_calc_rate(unsigned long prate, unsigned int mult,
++		    unsigned int div, unsigned int frac,
++		    unsigned int frac_div)
++{
++	u64 crate, frate, rate64;
++
++	rate64 = (u64)prate;
++	crate = rate64 * mult;
++
++	if (frac) {
++		frate = rate64 * frac;
++		do_div(frate, frac_div);
++		crate += frate;
++	}
++	do_div(crate, div);
++
++	return (unsigned long)crate;
++}
++
++static unsigned long
++grx500_early_recalc_rate(struct clk_hw *hw, unsigned long prate)
++{
++	struct intel_clk_early *early = to_intel_clk_early(hw);
++	unsigned int i, mux, mult, div, frac, val;
++	unsigned int reg, shift, width;
++
++	if (!early->mux) {
++		pr_err("%s: early clk must have mux!\n", __func__);
++		return 0;
++	}
++
++	if (!early->table) {
++		pr_err("%s: early clk must have div table!\n", __func__);
++		return 0;
++	}
++
++	mux = intel_get_clk_val(early->map, early->reg,
++				early->shift, early->width);
++	if (!mux) {
++		reg	= early->mreg0;
++		shift	= early->mshift0;
++		width	= early->mwidth0;
++	} else {
++		reg	= early->mreg1;
++		shift	= early->mshift1;
++		width	= early->mwidth1;
++	}
++
++	mult = intel_get_clk_val(early->map, reg, 2, 7);
++	frac = intel_get_clk_val(early->map, reg, 9, 21);
++	val = intel_get_clk_val(early->map, reg + 0x4, shift, width);
++	div = 0;
++
++	for (i = 0; early->table[i].div; i++)
++		if (early->table[i].val == val) {
++			div = early->table[i].div;
++			break;
++		}
++
++	if (!div) {
++		pr_err("%s: clk val %u is invalid for div table!\n",
++		       __func__, val);
++		return 0;
++	}
++
++	return intel_pll_calc_rate(prate, mult, div, frac, BIT(20));
++}
++
++const static struct clk_ops grx500_clk_early_ops = {
++	.recalc_rate = grx500_early_recalc_rate,
++};
++
++static unsigned long
++prx300_early_recalc_rate(struct clk_hw *hw, unsigned long prate)
++{
++	struct intel_clk_early *early = to_intel_clk_early(hw);
++	unsigned int i, div1 = 0, mult, div, frac, val;
++
++	mult = intel_get_clk_val(early->map, early->reg + 0x08, 0, 12);
++	frac = intel_get_clk_val(early->map, early->reg, 2, 24);
++	div = intel_get_clk_val(early->map, early->reg + 0x08, 18, 6);
++	val = intel_get_clk_val(early->map, early->reg + 0x04,
++				early->shift, early->width);
++
++	for (i = 0; early->table[i].div; i++)
++		if (early->table[i].val == val) {
++			div1 = early->table[i].div;
++			break;
++		}
++
++	if (!div1) {
++		pr_err("%s: clk val %u is invalid for div table!\n",
++		       __func__, val);
++		return 0;
++	}
++
++	div = div * div1;
++
++	return intel_pll_calc_rate(prate, mult, div, frac, BIT(24));
++}
++
++const static struct clk_ops prx300_clk_early_ops = {
++	.recalc_rate = prx300_early_recalc_rate,
++};
++
++int intel_clk_register_early(struct intel_clk_provider *ctx,
++			     const struct intel_clk_early_data *list,
++			     unsigned int nr_clk)
++{
++	struct clk_hw *hw;
++	struct clk_init_data init;
++	struct intel_clk_early *early;
++	int i, ret;
++
++	for (i = 0; i < nr_clk; i++, list++) {
++		early = kzalloc(sizeof(*early), GFP_KERNEL);
++		if (!early)
++			return -ENOMEM;
++
++		memset(&init, 0, sizeof(init));
++		init.name = list->name;
++		if (list->platform == PLL_PFM_V1) {
++			init.ops = &grx500_clk_early_ops;
++		} else if (list->platform == PLL_PFM_V2) {
++			init.ops = &prx300_clk_early_ops;
++		} else {
++			pr_err("%s: platform not support: %u\n",
++			       __func__, list->platform);
++			return -EINVAL;
++		}
++
++		init.flags = CLK_IS_BASIC |  CLK_GET_RATE_NOCACHE;
++		init.parent_names = list->parent_names;
++		init.num_parents = 1;
++
++		early->map	= ctx->map;
++		early->reg	= list->reg;
++		early->shift	= list->shift;
++		early->width	= list->width;
++		early->mux	= list->mux;
++		early->type	= list->type;
++		early->table	= list->table;
++		early->hw.init	= &init;
++
++		hw = &early->hw;
++		ret = clk_hw_register(NULL, hw);
++		if (ret) {
++			kfree(early);
++			pr_err("early clk register fail: %s\n", list->name);
++			return ret;
++		}
++
++		intel_clk_add_lookup(ctx, hw, i);
++	}
++	return 0;
++}
++
++static int intel_pll_wait_for_lock(struct intel_clk_pll *pll)
++{
++	const int max_loop_cnt = 100;
++	int i;
++
++	for (i = 0; i < max_loop_cnt; i++) {
++		if (!intel_get_clk_val(pll->map, pll->reg, 0, 1))
++			udelay(1);
++		else
++			return 0;
++	}
++
++	return -EIO;
++}
++
++static void
++grx500_pll_get_params(struct intel_clk_pll *pll, unsigned int *mult,
++		      unsigned int *frac)
++{
++	*mult = intel_get_clk_val(pll->map, pll->reg, 2, 7);
++	*frac = intel_get_clk_val(pll->map, pll->reg, 9, 21);
++}
++
++static unsigned long
++grx500_pll_recalc_rate(struct clk_hw *hw, unsigned long prate)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++	unsigned int mult, frac;
++
++	grx500_pll_get_params(pll, &mult, &frac);
++
++	return intel_pll_calc_rate(prate, mult, 1, frac, BIT(21));
++}
++
++static int grx500_pll_is_enabled(struct clk_hw *hw)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++
++	return intel_get_clk_val(pll->map, pll->reg, 1, 1);
++}
++
++const static struct clk_ops intel_grx500_pll_ops = {
++	.recalc_rate	= grx500_pll_recalc_rate,
++	.is_enabled	= grx500_pll_is_enabled,
++};
++
++static void
++prx300_pll_get_params(struct intel_clk_pll *pll, unsigned int *mult,
++		   unsigned int *div, unsigned int *frac)
++{
++	*mult = intel_get_clk_val(pll->map, pll->reg + 0x8, 0, 12);
++	*div = intel_get_clk_val(pll->map, pll->reg + 0x8, 18, 6);
++	*frac = intel_get_clk_val(pll->map, pll->reg, 2, 24);
++}
++
++static int
++prx300_pll_set_params(struct intel_clk_pll *pll, unsigned int mult,
++		   unsigned int div, unsigned int frac)
++{
++	intel_set_clk_val(pll->map, pll->reg + 0x8, 0, 12, mult);
++	intel_set_clk_val(pll->map, pll->reg + 0x8, 18, 6, div);
++	intel_set_clk_val(pll->map, pll->reg, 2, 24, frac);
++	intel_set_clk_val(pll->map, pll->reg, 28, 1, !!frac);
++	return intel_pll_wait_for_lock(pll);
++}
++
++static unsigned long
++prx300_pll_recalc_rate(struct clk_hw *hw, unsigned long prate)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++	unsigned int div, mult, frac;
++
++	prx300_pll_get_params(pll, &mult, &div, &frac);
++	if (pll->type == TYPE_LJPLL)
++		div *= 4;
++
++	return intel_pll_calc_rate(prate, mult, div, frac, BIT(24));
++}
++
++static int prx300_pll_is_enabled(struct clk_hw *hw)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++
++	return intel_get_clk_val(pll->map, pll->reg, 0, 1);
++}
++
++static int prx300_pll_enable(struct clk_hw *hw)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++
++	intel_set_clk_val(pll->map, pll->reg, 0, 1, 1);
++	return intel_pll_wait_for_lock(pll);
++}
++
++static void prx300_pll_disable(struct clk_hw *hw)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++
++	intel_set_clk_val(pll->map, pll->reg, 0, 1, 0);
++}
++
++static long
++prx300_pll_round_rate(struct clk_hw *hw, unsigned long rate,
++		   unsigned long *prate)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++	int i;
++	unsigned long cand_rate = 0;
++	const struct intel_pll_rate_table *tbl;
++
++	if (!pll->rate_table)
++		return prx300_pll_recalc_rate(hw, *prate);
++
++	tbl = pll->rate_table;
++	for (i = 0; i < pll->table_sz; i++) {
++		if (tbl[i].prate != *prate)
++			continue;
++		if (!cand_rate ||
++		    abs(tbl[i].rate - rate) < abs(cand_rate - rate))
++			cand_rate = tbl[i].rate;
++	}
++
++	return cand_rate;
++}
++
++static int
++prx300_pll_set_rate(struct clk_hw *hw, unsigned long rate,
++		 unsigned long prate)
++{
++	struct intel_clk_pll *pll = to_intel_clk_pll(hw);
++	struct device *dev = pll->dev;
++	const struct intel_pll_rate_table *tbl;
++	unsigned int mult, div, frac;
++	int i;
++
++	if (!pll->rate_table) {
++		dev_err(dev, "%s: set clk failed: %s rate: %lu, prate: %lu\n",
++			__func__, clk_hw_get_name(hw), rate, prate);
++		return -ENODEV;
++	}
++	tbl = pll->rate_table;
++	for (i = 0; i < pll->table_sz; i++) {
++		if (tbl[i].prate == prate && tbl[i].rate == rate)
++			break;
++	}
++	if (i >= pll->table_sz) {
++		dev_err(dev, "%s: No valid clk: %s, rate: %lu, prate: %lu\n",
++			__func__, clk_hw_get_name(hw), rate, prate);
++		return -EINVAL;
++	}
++
++	mult	= tbl[i].mult;
++	div	= tbl[i].div;
++	frac	= tbl[i].frac;
++
++	return prx300_pll_set_params(pll, mult, div, frac);
++}
++
++const static struct clk_ops intel_prx300_pll_ops = {
++	.recalc_rate	= prx300_pll_recalc_rate,
++	.is_enabled	= prx300_pll_is_enabled,
++	.enable		= prx300_pll_enable,
++	.disable	= prx300_pll_disable,
++	.round_rate	= prx300_pll_round_rate,
++	.set_rate	= prx300_pll_set_rate,
++};
++
++static struct clk_hw
++*intel_clk_register_pll(struct intel_clk_provider *ctx,
++			const struct intel_pll_clk_data *list)
++{
++	struct clk_init_data init;
++	struct intel_clk_pll *pll;
++	struct device *dev = ctx->dev;
++	struct clk_hw *hw;
++	const struct intel_pll_rate_table *table = list->rate_table;
++	int ret, i;
++
++	if (list->platform == PLL_PFM_V1) {
++		init.ops = &intel_grx500_pll_ops;
++	} else if (list->platform == PLL_PFM_V2) {
++		init.ops = &intel_prx300_pll_ops;
++	} else {
++		dev_err(dev, "%s: pll platform %d not supported!\n",
++			__func__, list->platform);
++		return ERR_PTR(-EINVAL);
++	}
++	init.name = list->name;
++	init.flags = list->flags | CLK_IS_BASIC;
++	init.parent_names = list->parent_names;
++	init.num_parents = list->num_parents;
++
++	pll = devm_kzalloc(dev, sizeof(*pll), GFP_KERNEL);
++	if (!pll)
++		return ERR_PTR(-ENOMEM);
++
++	pll->map	= ctx->map;
++	pll->dev	= ctx->dev;
++	pll->reg	= list->reg;
++	pll->flags	= list->flags;
++	pll->type	= list->type;
++	pll->hw.init	= &init;
++
++	if (table) {
++		for (i = 0; table[i].rate != 0; i++)
++			;
++		pll->table_sz = i;
++		pll->rate_table = devm_kmemdup(dev, table, i * sizeof(table[0]),
++					       GFP_KERNEL);
++		if (!pll->rate_table)
++			return ERR_PTR(-ENOMEM);
++	}
++	hw = &pll->hw;
++	ret = clk_hw_register(dev, hw);
++	if (ret)
++		return ERR_PTR(ret);
++
++	return hw;
++}
++
++void intel_clk_register_plls(struct intel_clk_provider *ctx,
++			     const struct intel_pll_clk_data *list,
++			     unsigned int nr_clk)
++{
++	struct clk_hw *hw;
++	int i;
++
++	for (i = 0; i < nr_clk; i++, list++) {
++		hw = intel_clk_register_pll(ctx, list);
++		if (IS_ERR(hw)) {
++			dev_err(ctx->dev, "%s: failed to register pll: %s\n",
++				__func__, list->name);
++			continue;
++		}
++
++		intel_clk_add_lookup(ctx, hw, list->id);
++	}
++}
+diff --git a/drivers/clk/intel/clk-cgu-pll.h b/drivers/clk/intel/clk-cgu-pll.h
+new file mode 100644
+index 000000000000..70d54084ff99
+--- /dev/null
++++ b/drivers/clk/intel/clk-cgu-pll.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ *  Copyright(c) 2018 Intel Corporation.
++ *  Zhu YiXin <Yixin.zhu@intel.com>
++ */
++
++#ifndef __INTEL_CLK_PLL_H
++#define __INTEL_CLK_PLL_H
++
++enum pll_platform {
++	PLL_PFM_V1, /* GRX500 */
++	PLL_PFM_V2, /* PRX300, LGM */
++};
++
++enum pll_type {
++	TYPE_ROPLL,
++	TYPE_LJPLL,
++};
++
++struct intel_pll_rate_table {
++	unsigned long	prate;
++	unsigned long	rate;
++	unsigned int	mult;
++	unsigned int	div;
++	unsigned int	frac;
++};
++
++struct intel_clk_pll {
++	struct clk_hw	hw;
++	struct device	*dev;
++	struct regmap	*map;
++	unsigned int	reg;
++	unsigned long	flags;
++	enum pll_type	type;
++	unsigned int	table_sz;
++	const struct intel_pll_rate_table *rate_table;
++};
++
++#endif /* __INTEL_CLK_PLL_H */
+diff --git a/drivers/clk/intel/clk-cgu.c b/drivers/clk/intel/clk-cgu.c
+new file mode 100644
+index 000000000000..23de30950ac8
+--- /dev/null
++++ b/drivers/clk/intel/clk-cgu.c
+@@ -0,0 +1,622 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  Copyright (C) 2018 Intel Corporation.
++ *  Zhu YiXin <Yixin.zhu@intel.com>
++ */
++#include <linux/clk.h>
++#include <linux/clk-provider.h>
++#include <linux/clkdev.h>
++#include <linux/device.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++
++#include "clk-cgu-pll.h"
++#include "clk-cgu.h"
++
++#define GATE_HW_REG_STAT(reg)	(reg)
++#define GATE_HW_REG_EN(reg)	((reg) + 0x4)
++#define GATE_HW_REG_DIS(reg)	((reg) + 0x8)
++
++#define to_intel_clk_mux(_hw) container_of(_hw, struct intel_clk_mux, hw)
++#define to_intel_clk_divider(_hw) \
++		container_of(_hw, struct intel_clk_divider, hw)
++#define to_intel_clk_gate(_hw) container_of(_hw, struct intel_clk_gate, hw)
++#define to_intel_clk_ddiv(_hw) container_of(_hw, struct intel_clk_ddiv, hw)
++#define struct_size(p, member, n)  (sizeof(*(p)) +\
++				   (sizeof(*(p)->member) * (n)))
++
++void intel_set_clk_val(struct regmap *map, u32 reg, u8 shift,
++		       u8 width, u32 set_val)
++{
++	u32 mask = GENMASK(width + shift, shift);
++
++	regmap_update_bits(map, reg, mask, set_val << shift);
++}
++
++u32 intel_get_clk_val(struct regmap *map, u32 reg, u8 shift,
++		      u8 width)
++{
++	u32 val;
++
++	if (regmap_read(map, reg, &val)) {
++		WARN_ONCE(1, "Failed to read clk reg: 0x%x\n", reg);
++		return 0;
++	}
++	val >>= shift;
++	val &= BIT(width) - 1;
++
++	return val;
++}
++
++void intel_clk_add_lookup(struct intel_clk_provider *ctx,
++			  struct clk_hw *hw, unsigned int id)
++{
++	pr_debug("Add clk: %s, id: %u\n", clk_hw_get_name(hw), id);
++	if (ctx->clk_data.hws)
++		ctx->clk_data.hws[id] = hw;
++}
++
++static struct clk_hw
++*intel_clk_register_fixed(struct intel_clk_provider *ctx,
++			  const struct intel_clk_branch *list)
++{
++	if (list->div_flags & CLOCK_FLAG_VAL_INIT)
++		intel_set_clk_val(ctx->map, list->div_off, list->div_shift,
++				  list->div_width, list->div_val);
++
++	return clk_hw_register_fixed_rate(NULL, list->name,
++					  list->parent_names[0],
++					  list->flags, list->mux_flags);
++}
++
++static u8 intel_clk_mux_get_parent(struct clk_hw *hw)
++{
++/*	struct intel_clk_mux *mux = to_intel_clk_mux(hw);
++ *	u32 val;
++ *
++ *	val = intel_get_clk_val(mux->map, mux->reg,mux->shift, mux->width);
++ *	return clk_mux_val_to_index(hw, NULL, mux->flags, val);
++ */
++	return 0;
++}
++
++static int intel_clk_mux_set_parent(struct clk_hw *hw, u8 index)
++{
++/*	struct intel_clk_mux *mux = to_intel_clk_mux(hw);
++ *	u32 val;
++ *
++ *	val = clk_mux_index_to_val(NULL, mux->flags, index);
++ *	intel_set_clk_val(mux->map, mux->reg, mux->shift, mux->width, val);
++ */
++	return 0;
++}
++
++static int intel_clk_mux_determine_rate(struct clk_hw *hw,
++					struct clk_rate_request *req)
++{
++	return __clk_mux_determine_rate(hw, req);
++}
++
++const static struct clk_ops intel_clk_mux_ops = {
++	.get_parent = intel_clk_mux_get_parent,
++	.set_parent = intel_clk_mux_set_parent,
++	.determine_rate = intel_clk_mux_determine_rate,
++};
++
++static struct clk_hw
++*intel_clk_register_mux(struct intel_clk_provider *ctx,
++			const struct intel_clk_branch *list)
++{
++	struct clk_init_data init;
++	struct clk_hw *hw;
++	struct intel_clk_mux *mux;
++	struct device *dev = ctx->dev;
++	u32 reg = list->mux_off;
++	u8 shift = list->mux_shift;
++	u8 width = list->mux_width;
++	unsigned long cflags = list->mux_flags;
++	int ret;
++
++	mux = devm_kzalloc(dev, sizeof(*mux), GFP_KERNEL);
++	if (!mux)
++		return ERR_PTR(-ENOMEM);
++
++	init.name = list->name;
++	init.ops = &intel_clk_mux_ops;
++	init.flags = list->flags | CLK_IS_BASIC;
++	init.parent_names = list->parent_names;
++	init.num_parents = list->num_parents;
++
++	mux->map = ctx->map;
++	mux->reg = reg;
++	mux->shift = shift;
++	mux->width = width;
++	mux->flags = cflags;
++	mux->dev = dev;
++	mux->hw.init = &init;
++
++	hw = &mux->hw;
++	ret = clk_hw_register(dev, hw);
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (cflags & CLOCK_FLAG_VAL_INIT)
++		intel_set_clk_val(ctx->map, reg, shift, width, list->mux_val);
++
++	return hw;
++}
++
++static unsigned long
++intel_clk_divider_recalc_rate(struct clk_hw *hw,
++			      unsigned long parent_rate)
++{
++	struct intel_clk_divider *divider = to_intel_clk_divider(hw);
++	unsigned int val;
++	unsigned long div;
++
++	val = intel_get_clk_val(divider->map, divider->reg,
++				divider->shift, divider->width);
++
++	div = divider_recalc_rate(hw, parent_rate, val, divider->table,
++				  divider->flags);
++	return div;
++}
++
++static long
++intel_clk_divider_round_rate(struct clk_hw *hw, unsigned long rate,
++			     unsigned long *prate)
++{
++	struct intel_clk_divider *divider = to_intel_clk_divider(hw);
++
++	return divider_round_rate(hw, rate, prate, divider->table,
++				  divider->width, divider->flags);
++}
++
++static int
++intel_clk_divider_set_rate(struct clk_hw *hw, unsigned long rate,
++			   unsigned long prate)
++{
++	struct intel_clk_divider *divider = to_intel_clk_divider(hw);
++	int value;
++
++	value = divider_get_val(rate, prate, divider->table,
++				divider->width, divider->flags);
++	if (value < 0)
++		return value;
++
++	intel_set_clk_val(divider->map, divider->reg,
++			  divider->shift, divider->width, value);
++
++	return 0;
++}
++
++static int intel_clk_divider_is_enabled(struct clk_hw *hw)
++{
++	struct intel_clk_divider *div = to_intel_clk_divider(hw);
++
++	return intel_get_clk_val(div->map, div->reg,
++				div->shift_gate, div->width_gate);
++}
++
++static int intel_clk_divider_enable(struct clk_hw *hw)
++{
++	struct intel_clk_divider *div = to_intel_clk_divider(hw);
++
++	intel_set_clk_val(div->map, div->reg,
++			  div->shift_gate, div->width_gate, 1);
++	return 0;
++}
++
++static void intel_clk_divider_disable(struct clk_hw *hw)
++{
++	struct intel_clk_divider *div = to_intel_clk_divider(hw);
++
++	intel_set_clk_val(div->map, div->reg,
++			  div->shift_gate, div->width_gate, 0);
++}
++
++const static struct clk_ops intel_clk_divider_ops = {
++	.recalc_rate = intel_clk_divider_recalc_rate,
++	.round_rate = intel_clk_divider_round_rate,
++	.set_rate = intel_clk_divider_set_rate,
++	.is_enabled = intel_clk_divider_is_enabled,
++	.enable = intel_clk_divider_enable,
++	.disable = intel_clk_divider_disable,
++};
++
++static struct clk_hw
++*intel_clk_register_divider(struct intel_clk_provider *ctx,
++			    const struct intel_clk_branch *list)
++{
++	struct clk_init_data init;
++	struct clk_hw *hw;
++	struct intel_clk_divider *div;
++	struct device *dev = ctx->dev;
++	unsigned long cflags = list->div_flags;
++	u32 reg = list->div_off;
++	u8 shift = list->div_shift;
++	u8 width = list->div_width;
++	u8 shift_gate = list->div_shift_gate;
++	u8 width_gate = list->div_width_gate;
++	int ret;
++
++	div = devm_kzalloc(dev, sizeof(*div), GFP_KERNEL);
++	if (!div)
++		return ERR_PTR(-ENOMEM);
++
++	init.name = list->name;
++	init.ops = &intel_clk_divider_ops;
++	init.flags = list->flags | CLK_IS_BASIC;
++	init.parent_names = &list->parent_names[0];
++	init.num_parents = 1;
++
++	div->map	= ctx->map;
++	div->reg	= reg;
++	div->shift	= shift;
++	div->width	= width;
++	div->shift_gate	= shift_gate;
++	div->width_gate	= width_gate;
++	div->flags	= cflags;
++	div->table	= list->div_table;
++	div->dev	= dev;
++	div->hw.init	= &init;
++
++	hw = &div->hw;
++	ret = clk_hw_register(dev, hw);
++
++	if (ret) {
++		dev_err(dev, "%s: register clk: %s failed!\n",
++			__func__, list->name);
++		return ERR_PTR(ret);
++	}
++
++	if (cflags & CLOCK_FLAG_VAL_INIT)
++		intel_set_clk_val(ctx->map, reg, shift, width, list->div_val);
++
++	return hw;
++}
++
++static struct clk_hw
++*intel_clk_register_fixed_factor(struct intel_clk_provider *ctx,
++				 const struct intel_clk_branch *list)
++{
++	struct clk_hw *hw;
++
++	hw = clk_hw_register_fixed_factor(ctx->dev, list->name,
++					  list->parent_names[0], list->flags,
++					  list->mult, list->div);
++	if (IS_ERR(hw))
++		return ERR_CAST(hw);
++
++	if (list->div_flags & CLOCK_FLAG_VAL_INIT)
++		intel_set_clk_val(ctx->map, list->div_off, list->div_shift,
++				  list->div_width, list->div_val);
++
++	return hw;
++}
++
++static int
++intel_clk_gate_enable(struct clk_hw *hw)
++{
++	struct intel_clk_gate *gate = to_intel_clk_gate(hw);
++	unsigned int reg;
++
++	if (gate->flags & GATE_CLK_HW) {
++		reg = GATE_HW_REG_EN(gate->reg);
++	} else if (gate->flags & GATE_CLK_SW) {
++		reg = gate->reg;
++	} else {
++		pr_err("%s: gate clk: %s: flag 0x%lx not supported!\n",
++		       __func__, clk_hw_get_name(hw), gate->flags);
++		return 0;
++	}
++
++	intel_set_clk_val(gate->map, reg, gate->shift, 1, 1);
++
++	return 0;
++}
++
++static void
++intel_clk_gate_disable(struct clk_hw *hw)
++{
++	struct intel_clk_gate *gate = to_intel_clk_gate(hw);
++	unsigned int reg;
++	unsigned int set;
++
++	if (gate->flags & GATE_CLK_HW) {
++		reg = GATE_HW_REG_DIS(gate->reg);
++		set = 1;
++	} else if (gate->flags & GATE_CLK_SW) {
++		reg = gate->reg;
++		set = 0;
++	} else {
++		dev_err(gate->dev,
++			"%s: gate clk: %s: flag 0x%lx not supported!\n",
++			__func__, clk_hw_get_name(hw), gate->flags);
++		return;
++	}
++
++	intel_set_clk_val(gate->map, reg, gate->shift, 1, set);
++}
++
++static int
++intel_clk_gate_is_enabled(struct clk_hw *hw)
++{
++	struct intel_clk_gate *gate = to_intel_clk_gate(hw);
++	unsigned int reg;
++
++	if (gate->flags & GATE_CLK_HW) {
++		reg = GATE_HW_REG_STAT(gate->reg);
++	} else if (gate->flags & GATE_CLK_SW) {
++		reg = gate->reg;
++	} else {
++		dev_err(gate->dev,
++			"%s: gate clk: %s: flag 0x%lx not supported!\n",
++			__func__, clk_hw_get_name(hw), gate->flags);
++		return 0;
++	}
++
++	return intel_get_clk_val(gate->map, reg, gate->shift, 1);
++}
++
++const static struct clk_ops intel_clk_gate_ops = {
++	.enable = intel_clk_gate_enable,
++	.disable = intel_clk_gate_disable,
++	.is_enabled = intel_clk_gate_is_enabled,
++};
++
++static struct clk_hw
++*intel_clk_register_gate(struct intel_clk_provider *ctx,
++			 const struct intel_clk_branch *list)
++{
++	struct clk_init_data init;
++	struct clk_hw *hw;
++	struct intel_clk_gate *gate;
++	struct device *dev = ctx->dev;
++	u32 reg = list->gate_off;
++	u8 shift = list->gate_shift;
++	unsigned long cflags = list->gate_flags;
++	const char *pname = list->parent_names[0];
++	int ret;
++
++	gate = devm_kzalloc(dev, sizeof(*gate), GFP_KERNEL);
++	if (!gate)
++		return ERR_PTR(-ENOMEM);
++
++	init.name = list->name;
++	init.ops = &intel_clk_gate_ops;
++	init.flags = list->flags | CLK_IS_BASIC;
++	init.parent_names = pname ? &pname : NULL;
++	init.num_parents = pname ? 1 : 0;
++
++	gate->map	= ctx->map;
++	gate->reg	= reg;
++	gate->shift	= shift;
++	gate->flags	= cflags;
++	gate->dev	= dev;
++	gate->hw.init	= &init;
++
++	hw = &gate->hw;
++	ret = clk_hw_register(dev, hw);
++	if (ret)
++		return ERR_PTR(ret);
++
++	if (cflags & CLOCK_FLAG_VAL_INIT)
++		intel_set_clk_val(ctx->map, reg, shift, 1, list->gate_val);
++
++	return hw;
++}
++
++void intel_clk_register_branches(struct intel_clk_provider *ctx,
++				 const struct intel_clk_branch *list,
++				 unsigned int nr_clk)
++{
++	struct clk_hw *hw;
++	unsigned int idx;
++
++	for (idx = 0; idx < nr_clk; idx++, list++) {
++		switch (list->type) {
++		case intel_clk_fixed:
++			hw = intel_clk_register_fixed(ctx, list);
++			break;
++		case intel_clk_mux:
++			hw = intel_clk_register_mux(ctx, list);
++			break;
++		case intel_clk_divider:
++			hw = intel_clk_register_divider(ctx, list);
++			break;
++		case intel_clk_fixed_factor:
++			hw = intel_clk_register_fixed_factor(ctx, list);
++			break;
++		case intel_clk_gate:
++			hw = intel_clk_register_gate(ctx, list);
++			break;
++		default:
++			dev_err(ctx->dev, "%s: type: %u not supported!\n",
++				__func__, list->type);
++			return;
++		}
++
++		if (IS_ERR(hw)) {
++			dev_err(ctx->dev,
++				"%s: register clk: %s, type: %u failed!\n",
++				__func__, list->name, list->type);
++			return;
++		}
++		intel_clk_add_lookup(ctx, hw, list->id);
++	}
++}
++
++static unsigned long
++intel_clk_ddiv_recalc_rate(struct clk_hw *hw,
++			   unsigned long parent_rate)
++{
++	struct intel_clk_ddiv *ddiv = to_intel_clk_ddiv(hw);
++	unsigned int div0, div1, exdiv;
++	u64 prate;
++
++	div0 = intel_get_clk_val(ddiv->map, ddiv->reg,
++				 ddiv->shift0, ddiv->width0) + 1;
++	div1 = intel_get_clk_val(ddiv->map, ddiv->reg,
++				 ddiv->shift1, ddiv->width1) + 1;
++	exdiv = intel_get_clk_val(ddiv->map, ddiv->reg,
++				  ddiv->shift2, ddiv->width2);
++
++	prate = (u64)parent_rate;
++	do_div(prate, div0);
++	do_div(prate, div1);
++
++	if (exdiv) {
++		do_div(prate, ddiv->div);
++		prate *= ddiv->mult;
++	}
++
++	return (unsigned long)prate;
++}
++
++static int intel_clk_ddiv_is_enabled(struct clk_hw *hw)
++{
++	struct intel_clk_ddiv *ddiv = to_intel_clk_ddiv(hw);
++
++	return intel_get_clk_val(ddiv->map, ddiv->reg,
++				 ddiv->shift_gate, ddiv->width_gate);
++}
++
++static int intel_clk_ddiv_enable(struct clk_hw *hw)
++{
++	struct intel_clk_ddiv *ddiv = to_intel_clk_ddiv(hw);
++
++	intel_set_clk_val(ddiv->map, ddiv->reg,
++			  ddiv->shift_gate, ddiv->width_gate, 1);
++	return 0;
++}
++
++static void intel_clk_ddiv_disable(struct clk_hw *hw)
++{
++	struct intel_clk_ddiv *ddiv = to_intel_clk_ddiv(hw);
++
++	intel_set_clk_val(ddiv->map, ddiv->reg,
++			  ddiv->shift_gate, ddiv->width_gate, 0);
++}
++
++const static struct clk_ops intel_clk_ddiv_ops = {
++	.recalc_rate	= intel_clk_ddiv_recalc_rate,
++	.is_enabled	= intel_clk_ddiv_is_enabled,
++	.enable		= intel_clk_ddiv_enable,
++	.disable	= intel_clk_ddiv_disable,
++};
++
++int intel_clk_register_ddiv(struct intel_clk_provider *ctx,
++			    const struct intel_clk_ddiv_data *list,
++			    unsigned int nr_clk)
++{
++	unsigned int idx;
++	struct clk_init_data init;
++	struct intel_clk_ddiv *ddiv;
++	struct device *dev = ctx->dev;
++	struct clk_hw *hw;
++	int ret;
++
++	for (idx = 0; idx < nr_clk; idx++, list++) {
++		ddiv = devm_kzalloc(dev, sizeof(*ddiv), GFP_KERNEL);
++		if (!ddiv)
++			return -ENOMEM;
++
++		memset(&init, 0, sizeof(init));
++		init.name = list->name;
++		init.ops = &intel_clk_ddiv_ops;
++		init.flags = list->flags | CLK_IS_BASIC;
++		init.parent_names = list->parent_name;
++		init.num_parents = 1;
++
++		ddiv->map		= ctx->map;
++		ddiv->reg		= list->reg;
++		ddiv->shift0		= list->shift0;
++		ddiv->width0		= list->width0;
++		ddiv->shift1		= list->shift1;
++		ddiv->width1		= list->width1;
++		ddiv->shift_gate	= list->shift_gate;
++		ddiv->width_gate	= list->width_gate;
++		ddiv->shift2		= list->ex_shift;
++		ddiv->width2		= list->ex_width;
++		ddiv->flags		= list->div_flags;
++		ddiv->mult		= 2;
++		ddiv->div		= 5;
++		ddiv->dev		= dev;
++		ddiv->hw.init		= &init;
++
++		hw = &ddiv->hw;
++		ret = clk_hw_register(dev, hw);
++		if (ret) {
++			dev_err(dev, "%s: register clk: %s failed!\n",
++				__func__, list->name);
++			return ret;
++		}
++
++		intel_clk_add_lookup(ctx, hw, list->id);
++	}
++
++	return 0;
++}
++
++struct intel_clk_provider * __init
++intel_clk_init(struct regmap *map, unsigned int nr_clks)
++{
++	struct intel_clk_provider *ctx;
++
++	ctx = kzalloc(struct_size(ctx, clk_data.hws, nr_clks), GFP_KERNEL);
++
++	if (!ctx)
++		return ERR_PTR(-ENOMEM);
++
++	ctx->map = map;
++	ctx->clk_data.num = nr_clks;
++
++	return ctx;
++}
++
++static void
++intel_clk_set_ssc(struct intel_clk_provider *ctx,
++		  u32 reg, u32 spread, u32 dir, u32 div, u32 en)
++{
++	intel_set_clk_val(ctx->map, reg, 2, 5, spread);
++	intel_set_clk_val(ctx->map, reg, 12, 1, dir);
++	intel_set_clk_val(ctx->map, reg, 8, 4, div);
++	intel_set_clk_val(ctx->map, reg, 0, 1, en);
++}
++
++void intel_clk_ssc_probe(struct intel_clk_provider *ctx)
++{
++	struct device_node *nc, *np_ssc;
++	u32 reg, en, spread, dir, div;
++
++	np_ssc = of_find_node_by_name(NULL, "cgussc");
++	if (!np_ssc)
++		return;
++
++	for_each_child_of_node(np_ssc, nc) {
++		if (of_property_read_u32(nc, "reg", &reg))
++			continue;
++		if (of_property_read_u32(nc, "intel,ssc-enable", &en))
++			continue;
++		if (of_property_read_u32(nc, "intel,ssc-divval", &div))
++			continue;
++		if (!div) {
++			dev_err(ctx->dev, "%s: %s divval is Zero!\n",
++				__func__, nc->name);
++			continue;
++		}
++
++		if (of_property_read_u32(nc, "intel,ssc-spread", &spread))
++			spread = 0;
++		if (of_property_read_u32(nc, "intel,ssc-dir", &dir))
++			dir = 0;
++
++		intel_clk_set_ssc(ctx, reg, spread, dir, div, en);
++	}
++
++	of_node_put(np_ssc);
++}
+diff --git a/drivers/clk/intel/clk-cgu.h b/drivers/clk/intel/clk-cgu.h
+new file mode 100644
+index 000000000000..7d729138a822
+--- /dev/null
++++ b/drivers/clk/intel/clk-cgu.h
+@@ -0,0 +1,335 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ *  Copyright(c) 2018 Intel Corporation.
++ *  Zhu YiXin <Yixin.zhu@intel.com>
++ */
++
++#ifndef __INTEL_CLK_H
++#define __INTEL_CLK_H
++
++#define PNAME(x) static const char *const x[] __initconst
++
++struct intel_clk_mux {
++	struct clk_hw	hw;
++	struct device	*dev;
++	struct regmap	*map;
++	unsigned int	reg;
++	u8		shift;
++	u8		width;
++	unsigned long	flags;
++};
++
++struct intel_clk_divider {
++	struct clk_hw	hw;
++	struct device	*dev;
++	struct regmap	*map;
++	unsigned int	reg;
++	u8		shift;
++	u8		width;
++	u8		shift_gate;
++	u8		width_gate;
++	unsigned long	flags;
++	const struct clk_div_table	*table;
++};
++
++struct intel_clk_early {
++	struct clk_hw	hw;
++	struct regmap	*map;
++	unsigned int	reg;
++	u8	shift;
++	u8	width;
++	u8	mux;
++	unsigned int	mreg0;
++	u8	mshift0;
++	u8	mwidth0;
++	unsigned int	mreg1;
++	u8	mshift1;
++	u8	mwidth1;
++	const struct clk_div_table *table;
++	enum pll_type	type;
++};
++
++struct intel_clk_early_data {
++	unsigned int	reg;
++	u8	shift;
++	u8	width;
++	const char	*name;
++	const char	*const *parent_names;
++	u8	mux;
++	unsigned int	mreg0;
++	u8	mshift0;
++	u8	mwidth0;
++	unsigned int	mreg1;
++	u8	mshift1;
++	u8	mwidth1;
++	enum pll_platform	platform;
++	enum pll_type	type;
++	const struct clk_div_table	*table;
++};
++
++struct intel_clk_ddiv {
++	struct clk_hw	hw;
++	struct device	*dev;
++	struct regmap	*map;
++	unsigned int	reg;
++	u8		shift0;
++	u8		width0;
++	u8		shift1;
++	u8		width1;
++	u8		shift2;
++	u8		width2;
++	u8		shift_gate;
++	u8		width_gate;
++	unsigned int	mult;
++	unsigned int	div;
++	unsigned long	flags;
++};
++
++struct intel_clk_gate {
++	struct clk_hw	hw;
++	struct device	*dev;
++	struct regmap	*map;
++	unsigned int	reg;
++	u8		shift;
++	unsigned long	flags;
++};
++
++enum intel_clk_type {
++	intel_clk_fixed,
++	intel_clk_mux,
++	intel_clk_divider,
++	intel_clk_fixed_factor,
++	intel_clk_gate,
++};
++
++/**
++ * struct intel_clk_provider
++ * @map: regmap type base address for register.
++ * @np: device node
++ * @dev: device
++ * @clk_data: array of hw clocks and clk number.
++ */
++struct intel_clk_provider {
++	struct regmap			*map;
++	struct device_node		*np;
++	struct device			*dev;
++	struct clk_hw_onecell_data	clk_data;
++};
++
++/**
++ * struct intel_pll_clk_data
++ * @id: plaform specific id of the clock.
++ * @name: name of this pll clock.
++ * @parent_names: name of the parent clock.
++ * @num_parents: number of parents.
++ * @flags: optional flags for basic clock.
++ * @platform: platform defines pll register format.
++ * @type: platform type of pll.
++ * @reg: offset of the register.
++ * @rate_table: table of pll clock rate.
++ */
++struct intel_pll_clk_data {
++	unsigned int		id;
++	const char		*name;
++	const char		*const *parent_names;
++	u8			num_parents;
++	unsigned long		flags;
++	enum pll_platform	platform;
++	enum pll_type		type;
++	int			reg;
++	const struct intel_pll_rate_table *rate_table;
++};
++
++#define INTEL_PLL(_id, _pfm, _name, _pnames, _flags,	\
++		  _reg, _rtable, _type)			\
++	{						\
++		.id		= _id,			\
++		.platform	= _pfm,			\
++		.name		= _name,		\
++		.parent_names	= _pnames,		\
++		.num_parents	= ARRAY_SIZE(_pnames),	\
++		.flags		= _flags,		\
++		.reg		= _reg,			\
++		.rate_table	= _rtable,		\
++		.type		= _type,		\
++	}
++
++struct intel_clk_ddiv_data {
++	unsigned int			id;
++	const char			*name;
++	const char			*const *parent_name;
++	u8				flags;
++	unsigned long			div_flags;
++	unsigned int			reg;
++	u8				shift0;
++	u8				width0;
++	u8				shift1;
++	u8				width1;
++	u8				shift_gate;
++	u8				width_gate;
++	u8				ex_shift;
++	u8				ex_width;
++};
++
++#define INTEL_DDIV(_id, _name, _pname, _flags, _reg,		\
++		   _shft0, _wdth0, _shft1, _wdth1,		\
++		   _shft_gate, _wdth_gate, _xshft, _df)		\
++	{							\
++		.id		= _id,				\
++		.name		= _name,			\
++		.parent_name	= (const char *[]) { _pname },	\
++		.flags		= _flags,			\
++		.reg		= _reg,				\
++		.shift0		= _shft0,			\
++		.width0		= _wdth0,			\
++		.shift1		= _shft1,			\
++		.width1		= _wdth1,			\
++		.shift_gate	= _shft_gate,			\
++		.width_gate	= _wdth_gate,			\
++		.ex_shift	= _xshft,			\
++		.ex_width	= 1,				\
++		.div_flags	= _df,				\
++	}
++
++struct intel_clk_branch {
++	unsigned int			id;
++	enum intel_clk_type		type;
++	const char			*name;
++	const char			*const *parent_names;
++	u8				num_parents;
++	unsigned long			flags;
++	unsigned int			mux_off;
++	u8				mux_shift;
++	u8				mux_width;
++	unsigned long			mux_flags;
++	unsigned int			mux_val;
++	unsigned int			div_off;
++	u8				div_shift;
++	u8				div_width;
++	u8				div_shift_gate;
++	u8				div_width_gate;
++	unsigned long			div_flags;
++	unsigned int			div_val;
++	const struct clk_div_table	*div_table;
++	unsigned int			gate_off;
++	u8				gate_shift;
++	unsigned long			gate_flags;
++	unsigned int			gate_val;
++	unsigned int			mult;
++	unsigned int			div;
++};
++
++/* clock flags definition */
++#define CLOCK_FLAG_VAL_INIT	BIT(16)
++#define GATE_CLK_HW		BIT(17)
++#define GATE_CLK_SW		BIT(18)
++
++#define INTEL_MUX(_id, _name, _pname, _f, _reg,			\
++		  _shift, _width, _cf, _v)			\
++	{							\
++		.id		= _id,				\
++		.type		= intel_clk_mux,		\
++		.name		= _name,			\
++		.parent_names	= _pname,			\
++		.num_parents	= ARRAY_SIZE(_pname),		\
++		.flags		= _f,				\
++		.mux_off	= _reg,				\
++		.mux_shift	= _shift,			\
++		.mux_width	= _width,			\
++		.mux_flags	= _cf,				\
++		.mux_val	= _v,				\
++	}
++
++#define INTEL_DIV(_id, _name, _pname, _f, _reg,			\
++	_shift, _width, _shift_gate, _width_gate, _cf, _v, _dtable)	\
++	{							\
++		.id		= _id,				\
++		.type		= intel_clk_divider,		\
++		.name		= _name,			\
++		.parent_names	= (const char *[]) { _pname },	\
++		.num_parents	= 1,				\
++		.flags		= _f,				\
++		.div_off	= _reg,				\
++		.div_shift	= _shift,			\
++		.div_width	= _width,			\
++		.div_shift_gate = _shift_gate,			\
++		.div_width_gate = _width_gate,			\
++		.div_flags	= _cf,				\
++		.div_val	= _v,				\
++		.div_table	= _dtable,			\
++	}
++
++#define INTEL_GATE(_id, _name, _pname, _f, _reg,		\
++		   _shift, _cf, _v)				\
++	{							\
++		.id		= _id,				\
++		.type		= intel_clk_gate,		\
++		.name		= _name,			\
++		.parent_names	= (const char *[]) { _pname },	\
++		.num_parents	= !_pname ? 0 : 1,		\
++		.flags		= _f,				\
++		.gate_off	= _reg,				\
++		.gate_shift	= _shift,			\
++		.gate_flags	= _cf,				\
++		.gate_val	= _v,				\
++	}
++
++#define INTEL_FIXED(_id, _name, _pname, _f, _reg,		\
++		    _shift, _width, _cf, _freq, _v)		\
++	{							\
++		.id		= _id,				\
++		.type		= intel_clk_fixed,		\
++		.name		= _name,			\
++		.parent_names	= (const char *[]) { _pname },	\
++		.num_parents	= !_pname ? 0 : 1,		\
++		.flags		= _f,				\
++		.div_off	= _reg,				\
++		.div_shift	= _shift,			\
++		.div_width	= _width,			\
++		.div_flags	= _cf,				\
++		.div_val	= _v,				\
++		.mux_flags	= _freq,			\
++	}
++
++#define INTEL_FIXED_FACTOR(_id, _name, _pname, _f, _reg,	\
++			   _shift, _width, _cf, _v, _m, _d)	\
++	{							\
++		.id		= _id,				\
++		.type		= intel_clk_fixed_factor,	\
++		.name		= _name,			\
++		.parent_names	= (const char *[]) { _pname },	\
++		.num_parents	= 1,				\
++		.flags		= _f,				\
++		.div_off	= _reg,				\
++		.div_shift	= _shift,			\
++		.div_width	= _width,			\
++		.div_flags	= _cf,				\
++		.div_val	= _v,				\
++		.mult		= _m,				\
++		.div		= _d,				\
++	}
++
++void intel_set_clk_val(struct regmap *map, u32 reg, u8 shift,
++		       u8 width, u32 set_val);
++u32 intel_get_clk_val(struct regmap *map, u32 reg, u8 shift, u8 width);
++void intel_clk_add_lookup(struct intel_clk_provider *ctx,
++			  struct clk_hw *hw, unsigned int id);
++void __init intel_clk_of_add_provider(struct device_node *np,
++				      struct intel_clk_provider *ctx);
++struct intel_clk_provider *
++intel_clk_init(struct regmap *map, unsigned int nr_clks);
++void intel_clk_register_branches(struct intel_clk_provider *ctx,
++				 const struct intel_clk_branch *list,
++				 unsigned int nr_clk);
++void intel_clk_register_plls(struct intel_clk_provider *ctx,
++			     const struct intel_pll_clk_data *list,
++			     unsigned int nr_clk);
++int intel_clk_register_ddiv(struct intel_clk_provider *ctx,
++			    const struct intel_clk_ddiv_data *list,
++			    unsigned int nr_clk);
++void intel_clk_ssc_probe(struct intel_clk_provider *ctx);
++int intel_clk_register_early(struct intel_clk_provider *ctx,
++			     const struct intel_clk_early_data *list,
++			     unsigned int nr_clk);
++
++#endif /* __INTEL_CLK_H */
+diff --git a/drivers/clk/intel/clk-falconmx.c b/drivers/clk/intel/clk-falconmx.c
+deleted file mode 100644
+index 840aaa4fd00b..000000000000
+--- a/drivers/clk/intel/clk-falconmx.c
++++ /dev/null
+@@ -1,533 +0,0 @@
+-/*
+- *  Copyright (C) 2017 Intel Corporation.
+- *  Zhu YiXin <Yixin.zhu@intel.com>
+- *
+- *  This program is free software; you can redistribute it and/or modify it
+- *  under the terms and conditions of the GNU General Public License,
+- *  version 2, as published by the Free Software Foundation.
+- *
+- *  This program is distributed in the hope it will be useful, but WITHOUT
+- *  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+- *  FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+- *  more details.
+- *
+- *  The full GNU General Public License is included in this distribution in
+- *  the file called "COPYING".
+- */
+-
+-#include <linux/clk-provider.h>
+-#include <linux/of.h>
+-#include <linux/of_address.h>
+-#include <linux/spinlock.h>
+-#include <dt-bindings/clock/intel,falconmx-clk.h>
+-#include "clk_api.h"
+-
+-static DEFINE_SPINLOCK(pll0a_lock);
+-static DEFINE_SPINLOCK(pll0b_lock);
+-static DEFINE_SPINLOCK(pll1_lock);
+-static DEFINE_SPINLOCK(pll3_lock);
+-static DEFINE_SPINLOCK(pll4_lock);
+-static DEFINE_SPINLOCK(pll5_lock);
+-static DEFINE_SPINLOCK(ifclk_lock);
+-static DEFINE_SPINLOCK(pcmclk_lock);
+-
+-static const struct clk_div_table pll_div[] = {
+-	{1,	2},
+-	{2,	3},
+-	{3,	4},
+-	{4,	5},
+-	{5,	6},
+-	{6,	8},
+-	{7,	10},
+-	{8,	12},
+-	{9,	16},
+-	{10,	20},
+-	{11,	24},
+-	{12,	32},
+-	{13,	40},
+-	{14,	48},
+-	{15,	64},
+-	{0,	0},
+-};
+-
+-static const struct clk_div_table dcl_div[] = {
+-	{0,	6},
+-	{1,	12},
+-	{2,	24},
+-	{3,	36},
+-	{4,	48},
+-	{5,	96},
+-	{0,	0},
+-};
+-
+-static const struct clk_div_table ljpll_div[] = {
+-	{0,	1},
+-	{1,	2},
+-	{2,	3},
+-	{3,	4},
+-	{4,	5},
+-	{5,	6},
+-	{6,	7},
+-	{7,	8},
+-};
+-
+-enum {
+-	PLL5_CMOS_MODE = 0,
+-	PLL5_CML_MODE = 1
+-};
+-
+-static const struct mdiv_table pcie_div_table[] = {
+-	{PCIE_CLK_SHIFT1, PCIE_CLK_WIDTH1},
+-	{PCIE_CLK_SHIFT2, PCIE_CLK_WIDTH2},
+-};
+-
+-static const struct factor_clk_data pcie_factor = {
+-	.shift = PCIE_CLK_SHIFT3,
+-	.width = PCIE_CLK_WIDTH3,
+-	.mult = 2,
+-	.div = 5,
+-};
+-
+-static const struct clk_ljpll_div_data pcie_clk_data __initconst = {
+-	.mdiv_tbl = pcie_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(pcie_div_table),
+-	.opt_factor = &pcie_factor,
+-	.table = ljpll_div,
+-	.lock = &pll4_lock,
+-};
+-
+-static void __init pcie_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &pcie_clk_data);
+-}
+-
+-static const struct mdiv_table ptp_div_table[] = {
+-	{PTP_CLK_SHIFT1, PTP_CLK_WIDTH1},
+-	{PTP_CLK_SHIFT2, PTP_CLK_WIDTH2},
+-};
+-
+-static const struct clk_ljpll_div_data ptp_clk_data __initconst = {
+-	.mdiv_tbl = ptp_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(ptp_div_table),
+-	.table = ljpll_div,
+-	.lock = &pll3_lock,
+-};
+-
+-static void __init ptp_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &ptp_clk_data);
+-}
+-
+-static const struct mdiv_table sync_div_table[] = {
+-	{SYNC_CLK_SHIFT1, SYNC_CLK_WIDTH1},
+-	{SYNC_CLK_SHIFT2, SYNC_CLK_WIDTH2},
+-};
+-
+-static const struct clk_ljpll_div_data sync_clk_data __initconst = {
+-	.mdiv_tbl = sync_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(sync_div_table),
+-	.table = ljpll_div,
+-	.lock = &pll3_lock,
+-};
+-
+-static void __init sync_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &sync_clk_data);
+-}
+-
+-static const struct mdiv_table serdes_div_table[] = {
+-	{SERDES_CLK_SHIFT1, SERDES_CLK_WIDTH1},
+-	{SERDES_CLK_SHIFT2, SERDES_CLK_WIDTH2},
+-};
+-
+-static const struct clk_ljpll_div_data serdes_clk_data __initconst = {
+-	.mdiv_tbl = serdes_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(serdes_div_table),
+-	.table = ljpll_div,
+-	.lock = &pll3_lock,
+-};
+-
+-static void __init serdes_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &serdes_clk_data);
+-}
+-
+-static const struct mdiv_table gphy_div_table[] = {
+-	{GPHY_CLK_SHIFT1, GPHY_CLK_WIDTH1},
+-	{GPHY_CLK_SHIFT2, GPHY_CLK_WIDTH2},
+-};
+-
+-static const struct factor_clk_data gphy_factor = {
+-	.shift = GPHY_CLK_SHIFT3,
+-	.width = GPHY_CLK_WIDTH3,
+-	.mult = 2,
+-	.div = 5,
+-};
+-
+-static const struct clk_ljpll_div_data gphy_clk_data __initconst = {
+-	.mdiv_tbl = gphy_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(gphy_div_table),
+-	.opt_factor = &gphy_factor,
+-	.table = ljpll_div,
+-	.lock = &pll3_lock,
+-};
+-
+-static void __init gphy_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &gphy_clk_data);
+-}
+-
+-static const struct mux_clk_data gpc2_clk_data __initconst = {
+-	.shift = GPC2_CLK_SHIFT,
+-	.width = GPC2_CLK_WIDTH,
+-	.lock = &ifclk_lock,
+-};
+-
+-static void __init gpc2_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &gpc2_clk_data);
+-}
+-
+-static const struct mux_clk_data gpc1_clk_data __initconst = {
+-	.shift = GPC1_CLK_SHIFT,
+-	.width = GPC1_CLK_WIDTH,
+-	.lock = &ifclk_lock,
+-};
+-
+-static void __init gpc1_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &gpc1_clk_data);
+-}
+-
+-static const struct mux_clk_data sync1_clk_data __initconst = {
+-	.shift = SYNC1_CLK_SHIFT,
+-	.width = SYNC1_CLK_WIDTH,
+-	.lock = &ifclk_lock,
+-};
+-
+-static void __init sync1_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &sync1_clk_data);
+-}
+-
+-static const struct mux_clk_data sync0_clk_data __initconst = {
+-	.shift = SYNC0_CLK_SHIFT,
+-	.width = SYNC0_CLK_WIDTH,
+-	.lock = &ifclk_lock,
+-};
+-
+-static void __init sync0_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &sync0_clk_data);
+-}
+-
+-static const struct clk_div_data dcl_clk_data __initconst = {
+-	.shift = DCL_CLK_SHIFT,
+-	.width = DCL_CLK_WIDTH,
+-	.table = dcl_div,
+-	.lock = &pcmclk_lock,
+-};
+-
+-static void __init dcl_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &dcl_clk_data);
+-}
+-
+-static const struct clk_fixed_factor_data slic_clk_data __initconst = {
+-	.shift = SLIC_CLK_SHIFT,
+-	.width = SLIC_CLK_WIDTH,
+-	.set_val = SLIC_SET_VAL,
+-	.lock = &ifclk_lock,
+-};
+-
+-static void __init slic_clk_setup(struct device_node *node)
+-{
+-	clk_fixed_factor_setup(node, &slic_clk_data);
+-}
+-
+-static const struct clk_div_data vif_clk_data __initconst = {
+-	.shift = VIF_CLK_SHIFT,
+-	.width = VIF_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll1_lock,
+-};
+-
+-static void __init vif_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &vif_clk_data);
+-}
+-
+-static const struct clk_div_data vdsp_clk_data __initconst = {
+-	.shift = VDSP_CLK_SHIFT,
+-	.width = VDSP_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll1_lock,
+-};
+-
+-static void __init vdsp_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &vdsp_clk_data);
+-}
+-
+-static const struct clk_div_data ppv4_clk_data __initconst = {
+-	.shift = PPV4_CLK_SHIFT,
+-	.width = PPV4_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll0b_lock,
+-};
+-
+-static void __init ppv4_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &ppv4_clk_data);
+-}
+-
+-static const struct clk_div_data ngi_clk_data __initconst = {
+-	.shift = NGI_CLK_SHIFT,
+-	.width = NGI_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll0b_lock,
+-};
+-
+-static void __init ngi_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &ngi_clk_data);
+-}
+-
+-static const struct clk_div_data ssx4_clk_data __initconst = {
+-	.shift = SSX4_CLK_SHIFT,
+-	.width = SSX4_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll0b_lock,
+-};
+-
+-static void __init ssx4_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &ssx4_clk_data);
+-}
+-
+-static const struct clk_div_data sw_clk_data __initconst = {
+-	.shift = SWITCH_CLK_SHIFT,
+-	.width = SWITCH_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll0b_lock,
+-};
+-
+-static void __init sw_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &sw_clk_data);
+-}
+-
+-static const struct clk_div_data qspi_clk_data __initconst = {
+-	.shift = QSPI_CLK_SHIFT,
+-	.width = QSPI_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll0a_lock,
+-};
+-
+-static void __init qspi_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &qspi_clk_data);
+-}
+-
+-static const struct clk_div_data cpu_clk_data __initconst = {
+-	.shift = CPU_CLK_SHIFT,
+-	.width = CPU_CLK_WIDTH,
+-	.table = pll_div,
+-	.lock = &pll0a_lock,
+-};
+-
+-static void __init cpu_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &cpu_clk_data);
+-}
+-
+-static const struct clk_div_data ddr_clk_data __initconst = {
+-	.shift = DDR_CLK_SHIFT,
+-	.width = DDR_CLK_WIDTH,
+-	.table = pll_div,
+-};
+-
+-static void __init ddr_clk_setup(struct device_node *node)
+-{
+-	clk_div_setup(node, &ddr_clk_data);
+-}
+-
+-static const struct mux_clk_data wan_clk_data __initconst = {
+-	.shift = WAN_CLK_SHIFT,
+-	.width = WAN_CLK_WIDTH,
+-	.lock = &ifclk_lock,
+-};
+-
+-static void __init wan_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &wan_clk_data);
+-}
+-
+-static const struct mux_clk_data pll5pr_clk_data __initconst = {
+-	.shift = PLL5PR_CLK_SHIFT,
+-	.width = PLL5PR_CLK_WIDTH,
+-	.lock = &pll5_lock,
+-	.flags = CLK_SET_RATE_PARENT,
+-	.clk_flags = CLK_SET_RATE_PARENT,
+-	.def_val = PLL5_CML_MODE,
+-	.mux_flags = CLK_INIT_DEF_CFG_REQ,
+-};
+-
+-static void __init pll5pr_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &pll5pr_clk_data);
+-}
+-
+-static const struct mux_clk_data p2_clk_data __initconst = {
+-	.shift = P2_CLK_SHIFT,
+-	.width = P2_CLK_WIDTH,
+-	.lock = &ifclk_lock,
+-	.flags = CLK_SET_RATE_PARENT,
+-};
+-
+-static void __init p2_clk_setup(struct device_node *node)
+-{
+-	mux_clk_setup(node, &p2_clk_data);
+-}
+-
+-static const struct mdiv_table pon_div_table[] = {
+-	{PON_CLK_SHIFT1, PON_CLK_WIDTH1, 7},
+-	{PON_CLK_SHIFT2, PON_CLK_WIDTH2, 0},
+-};
+-
+-static const struct factor_clk_data pon_factor = {
+-	.shift = PON_CLK_SHIFT3,
+-	.width = PON_CLK_WIDTH3,
+-	.mult = 2,
+-	.div = 5,
+-	.def_val = 0,
+-};
+-
+-static const struct clk_ljpll_div_data pon_clk_data __initconst = {
+-	.mdiv_tbl = pon_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(pon_div_table),
+-	.opt_factor = &pon_factor,
+-	.table = ljpll_div,
+-	.lock = &pll5_lock,
+-	.flags = CLK_INIT_DEF_CFG_REQ,
+-	.clk_flags = CLK_SET_RATE_PARENT,
+-};
+-
+-static void __init pon_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &pon_clk_data);
+-}
+-
+-static const struct mdiv_table ponpll_div_table[] = {
+-	{PONPLL_CLK_SHIFT1, PONPLL_CLK_WIDTH1, 1},
+-	{PONPLL_CLK_SHIFT2, PONPLL_CLK_WIDTH2, 0},
+-};
+-
+-static const struct clk_ljpll_div_data ponpll_clk_data __initconst = {
+-	.mdiv_tbl = ponpll_div_table,
+-	.mdiv_tblsz = ARRAY_SIZE(ponpll_div_table),
+-	.table = ljpll_div,
+-	.lock = &pll5_lock,
+-	.flags = CLK_INIT_DEF_CFG_REQ,
+-};
+-
+-static void __init ponpll_clk_setup(struct device_node *node)
+-{
+-	clk_ljpll_div_setup(node, &ponpll_clk_data);
+-}
+-
+-static const struct factor_frac_tbl pll5_ff_table[] = {
+-	{1200000UL,		150000000UL,  125,  1, 0},
+-	{1200000UL,		149299200UL,  124,  1, 0x6A7EFA},
+-	{4665600UL,		149299200UL,  256,  8, 0},
+-	{18662400UL,		149299200UL,  256, 32, 0},
+-	{2343750UL,		150000000UL,  256,  4, 0},
+-	{9375000UL,		150000000UL,  256, 16, 0},
+-	{4687500UL,		150000000UL,  256,  8, 0},
+-};
+-
+-static const struct clk_factor_frac_data pll5_clk_data __initconst = {
+-	.ff_tbl = pll5_ff_table,
+-	.ff_tblsz = ARRAY_SIZE(pll5_ff_table),
+-	.def_idx = 0,
+-	.frac_div = BIT(24),
+-	.lock = &pll5_lock,
+-	.flags = CLK_INIT_DEF_CFG_REQ,
+-};
+-
+-static void __init pll5_clk_setup(struct device_node *node)
+-{
+-	pll_ff_clk_setup(node, &pll5_clk_data);
+-}
+-
+-static const struct gate_clk_data gate2_clk_data __initconst = {
+-	.mask = GATE2_CLK_MASK,
+-	.reg_size = 32,
+-};
+-
+-static void __init gate2_clk_setup(struct device_node *node)
+-{
+-	gate_clk_setup(node, &gate2_clk_data);
+-}
+-
+-static const struct gate_clk_data gate1_clk_data __initconst = {
+-	.mask = GATE1_CLK_MASK,
+-	.reg_size = 32,
+-};
+-
+-static void __init gate1_clk_setup(struct device_node *node)
+-{
+-	gate_clk_setup(node, &gate1_clk_data);
+-}
+-
+-static const struct gate_clk_data gate0_clk_data __initconst = {
+-	.mask = GATE0_CLK_MASK,
+-	.reg_size = 32,
+-};
+-
+-static void __init gate0_clk_setup(struct device_node *node)
+-{
+-	gate_clk_setup(node, &gate0_clk_data);
+-}
+-
+-static const struct gate_clk_data gate3_clk_data __initconst = {
+-	.mask = GATE3_CLK_MASK,
+-	.reg_size = 32,
+-	.flags = V_GATE_CLK,
+-};
+-
+-static void __init gate3_clk_setup(struct device_node *node)
+-{
+-	gate_clk_setup(node, &gate3_clk_data);
+-}
+-
+-CLK_OF_DECLARE(gate3clk, FALCONMX_GATE3_CLK, gate3_clk_setup);
+-CLK_OF_DECLARE(pll5clk, FALCONMX_PLL5_CLK, pll5_clk_setup);
+-CLK_OF_DECLARE(ponpllclk, FALCONMX_PONPLL_CLK, ponpll_clk_setup);
+-CLK_OF_DECLARE(ponclk, FALCONMX_PON_CLK, pon_clk_setup);
+-CLK_OF_DECLARE(wanclk, FALCONMX_WAN_CLK, wan_clk_setup);
+-CLK_OF_DECLARE(pll5prclk, FALCONMX_PLL5PR_CLK, pll5pr_clk_setup);
+-CLK_OF_DECLARE(p2clk, FALCONMX_P2_CLK, p2_clk_setup);
+-CLK_OF_DECLARE(gate2clk, FALCONMX_GATE2_CLK, gate2_clk_setup);
+-CLK_OF_DECLARE(gate1clk, FALCONMX_GATE1_CLK, gate1_clk_setup);
+-CLK_OF_DECLARE(gate0clk, FALCONMX_GATE0_CLK, gate0_clk_setup);
+-CLK_OF_DECLARE(pcieclk, FALCONMX_PCIE_CLK, pcie_clk_setup);
+-CLK_OF_DECLARE(ptpclk, FALCONMX_PTP_CLK, ptp_clk_setup);
+-CLK_OF_DECLARE(syncclk, FALCONMX_SYNC_CLK, sync_clk_setup);
+-CLK_OF_DECLARE(serdesclk, FALCONMX_SERDES_CLK, serdes_clk_setup);
+-CLK_OF_DECLARE(gphyclk, FALCONMX_GPHY_CLK, gphy_clk_setup);
+-CLK_OF_DECLARE(sync0clk, FALCONMX_SYNC0_CLK, sync0_clk_setup);
+-CLK_OF_DECLARE(sync1clk, FALCONMX_SYNC1_CLK, sync1_clk_setup);
+-CLK_OF_DECLARE(gpc1clk, FALCONMX_GPC1_CLK, gpc1_clk_setup);
+-CLK_OF_DECLARE(gpc2clk, FALCONMX_GPC2_CLK, gpc2_clk_setup);
+-CLK_OF_DECLARE(dclclk, FALCONMX_DCL_CLK, dcl_clk_setup);
+-CLK_OF_DECLARE(slicclk, FALCONMX_SLIC_CLK, slic_clk_setup);
+-CLK_OF_DECLARE(vifclk, FALCONMX_VIF_CLK, vif_clk_setup);
+-CLK_OF_DECLARE(vdspclk, FALCONMX_VDSP_CLK, vdsp_clk_setup);
+-CLK_OF_DECLARE(ppv4clk, FALCONMX_PPV4_CLK, ppv4_clk_setup);
+-CLK_OF_DECLARE(ngiclk, FALCONMX_NGI_CLK, ngi_clk_setup);
+-CLK_OF_DECLARE(ssx4clk, FALCONMX_SSX4_CLK, ssx4_clk_setup);
+-CLK_OF_DECLARE(swclk, FALCONMX_SWITCH_CLK, sw_clk_setup);
+-CLK_OF_DECLARE(qspiclk, FALCONMX_QSPI_CLK, qspi_clk_setup);
+-CLK_OF_DECLARE(cpuclk, FALCONMX_CPU_CLK, cpu_clk_setup);
+-CLK_OF_DECLARE(ddrclk, FALCONMX_DDR_CLK, ddr_clk_setup);
+diff --git a/drivers/clk/intel/clk-prx300.c b/drivers/clk/intel/clk-prx300.c
+new file mode 100644
+index 000000000000..3456bb28923f
+--- /dev/null
++++ b/drivers/clk/intel/clk-prx300.c
+@@ -0,0 +1,348 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ *  Copyright (C) 2018 Intel Corporation.
++ *  Zhu YiXin <Yixin.zhu@intel.com>
++ */
++#include <linux/clk-provider.h>
++#include <linux/mfd/syscon.h>
++#include <linux/of.h>
++#include <linux/of_address.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/spinlock.h>
++#include <dt-bindings/clock/intel,prx300-clk.h>
++
++#include "clk-cgu-pll.h"
++#include "clk-cgu.h"
++
++#define PLL_DIV_WIDTH		4
++#define PLL_DDIV_WIDTH		3
++
++/* Gate0 clock shift */
++#define G_XBAR0_SHIFT		0
++#define G_XBAR1_SHIFT		1
++#define G_XBAR7_SHIFT		7
++
++/* Gate1 clock shift */
++#define G_V_CODEC_SHIFT		2
++#define G_DMA0_SHIFT		3
++#define G_I2C0_SHIFT		4
++#define G_I2C1_SHIFT		5
++#define G_I2C2_SHIFT		6
++#define G_SPI1_SHIFT		7
++#define G_SPI0_SHIFT		8
++#define G_QSPI_SHIFT		9
++#define G_CQEM_SHIFT		10
++#define G_SSO_SHIFT			11
++#define G_GPTC0_SHIFT		12
++#define G_GPTC1_SHIFT		13
++#define G_GPTC2_SHIFT		14
++
++#define G_URT0_SHIFT		17
++#define G_URT1_SHIFT		18
++
++#define G_SECPT_SHIFT		21
++#define G_SCPU_SHIFT		22
++#define G_MPE_SHIFT			23
++
++#define G_TDM_SHIFT			25
++#define G_PP_SHIFT			26
++#define G_DMA3_SHIFT		27
++#define G_SWITCH_SHIFT		28
++#define G_PON_SHIFT			29
++#define G_AON_SHIFT			30
++#define G_DDR_SHIFT			31
++
++/* Gate2 clock shift */
++#define G_CTRL0_SHIFT		1
++#define G_MSI0_SHIFT		2
++#define G_PD0_SHIFT			7
++#define G_CTRL1_SHIFT		17
++#define G_MSI1_SHIFT		18
++#define G_PD1_SHIFT			23
++#define G_ASPI_SHIFT		28
++#define G_ADMA_SHIFT		29
++#define G_AHIF_SHIFT		30
++#define G_ASL_SHIFT			31
++
++/* Gate3 clock shift */
++#define GCLK_SWREF_SHIFT	4
++#define GCLK_CBPHY0_SHIFT	24
++#define GCLK_CBPHY1_SHIFT	25
++
++/* Register definition */
++#define PLL0A_CFG0	0x4
++#define PLL0B_CFG0	0x24
++#define PLL1_CFG0	0x44
++#define PLL2_CFG0	0x64
++#define LJPLL3_CFG0	0x84
++#define LJPLL4_CFG0	0xA4
++#define LJPLL5_CFG0	0xC4
++#define CGU_GATE0	0x114
++#define CGU_GATE1	0x120
++#define CGU_GATE2	0x130
++#define CGU_IF_CLK	0x140
++
++#define PLL_DIV(x)	((x) + 0x4)
++#define PLL_SSC(x)	((x) + 0x10)
++
++static const struct clk_div_table pll_div[] = {
++	{1,	2},
++	{2,	3},
++	{3,	4},
++	{4,	5},
++	{5,	6},
++	{6,	8},
++	{7,	10},
++	{8,	12},
++	{9,	16},
++	{10,	20},
++	{11,	24},
++	{12,	32},
++	{13,	40},
++	{14,	48},
++	{15,	64},
++	{0,	0}
++};
++
++enum prx300_plls {
++	PLL0A, PLL0B, PLL1, PLL2, LJPLL3, LJPLL4, LJPLL5
++};
++
++PNAME(pll_p)	= { "osc" };
++PNAME(emmc_p)	= { "emmc4", "noc4" };
++PNAME(sdio_p)	= { "sdio3", "sdio2" };
++
++static const struct intel_clk_early_data prx300_early_clks[] __initconst = {
++	{ PLL0A_CFG0, 0, 4, "earlycpu", pll_p, 0,
++	  0, 0, PLL_DIV_WIDTH,
++	  0, 0, PLL_DIV_WIDTH,
++	  PLL_PFM_V2, TYPE_ROPLL, pll_div
++	},
++};
++
++static const struct intel_pll_clk_data prx300_pll_clks[] __initconst = {
++	[PLL0A] = INTEL_PLL(PRX300_CLK_PLL0A, PLL_PFM_V2, "pll0a", pll_p,
++			    CLK_IGNORE_UNUSED, PLL0A_CFG0, NULL, TYPE_ROPLL),
++	[PLL0B] = INTEL_PLL(PRX300_CLK_PLL0B, PLL_PFM_V2, "pll0b", pll_p,
++			    CLK_IGNORE_UNUSED, PLL0B_CFG0, NULL, TYPE_ROPLL),
++	[PLL1] = INTEL_PLL(PRX300_CLK_PLL1, PLL_PFM_V2, "pll1", pll_p,
++			   CLK_IGNORE_UNUSED, PLL1_CFG0, NULL, TYPE_ROPLL),
++	[PLL2] = INTEL_PLL(PRX300_CLK_PLL2, PLL_PFM_V2, "pll2", pll_p,
++			   CLK_IGNORE_UNUSED, PLL2_CFG0, NULL, TYPE_ROPLL),
++	[LJPLL3] = INTEL_PLL(PRX300_CLK_LJPLL3, PLL_PFM_V2, "ljpll3", pll_p,
++			     CLK_IGNORE_UNUSED, LJPLL3_CFG0, NULL, TYPE_LJPLL),
++	[LJPLL4] = INTEL_PLL(PRX300_CLK_LJPLL4, PLL_PFM_V2, "ljpll4", pll_p,
++			     CLK_IGNORE_UNUSED, LJPLL4_CFG0, NULL, TYPE_LJPLL),
++	[LJPLL5] = INTEL_PLL(PRX300_CLK_LJPLL5, PLL_PFM_V2, "ljpll5", pll_p,
++			     CLK_IGNORE_UNUSED, LJPLL3_CFG0, NULL, TYPE_LJPLL),
++};
++
++static const struct intel_clk_branch prx300_branch_clks[] __initconst = {
++	/* Divider clocks */
++	INTEL_DIV(PRX300_CLK_CPU, "cpu", "pll0a", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL0A_CFG0), 0, PLL_DIV_WIDTH, 24, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_QSPI, "qspi", "pll0a", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL0A_CFG0), 12, PLL_DIV_WIDTH, 27, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_SW, "sw", "pll0b", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL0B_CFG0), 0, PLL_DIV_WIDTH, 24, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_NGI, "ngi", "pll0b", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL0B_CFG0), 8, PLL_DIV_WIDTH, 25, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_SSX4, "ssx4", "pll0b", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL0B_CFG0), 4, PLL_DIV_WIDTH, 26, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_DSP, "dsp", "pll1", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL1_CFG0), 0, PLL_DIV_WIDTH, 24, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_IF, "voice_if_clk", "pll1", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL1_CFG0), 4, PLL_DIV_WIDTH, 25, 1, 0, 0, pll_div),
++	INTEL_DIV(PRX300_CLK_DDR, "ddr", "pll2", CLK_IGNORE_UNUSED,
++		  PLL_DIV(PLL2_CFG0), 0, PLL_DIV_WIDTH, 26, 1, 0, 0, pll_div),
++
++	/* Gate0 clocks */
++	INTEL_GATE(PRX300_GCLK_XBAR0, "g_xbar0", NULL, CLK_IGNORE_UNUSED,
++		   CGU_GATE0, G_XBAR0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_XBAR1, "g_xbar1", NULL, CLK_IGNORE_UNUSED,
++		   CGU_GATE0, G_XBAR1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_XBAR7, "g_xbar7", NULL, CLK_IGNORE_UNUSED,
++		   CGU_GATE0, G_XBAR7_SHIFT, GATE_CLK_HW, 0),
++
++	/* Gate1 clocks */
++	INTEL_GATE(PRX300_GCLK_V_CODEC, "g_code", NULL, 0, CGU_GATE1,
++		   G_V_CODEC_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_DMA0, "g_dma0", NULL, 0, CGU_GATE1,
++		   G_DMA0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_I2C0, "g_i2c0", NULL, 0, CGU_GATE1,
++		   G_I2C0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_I2C1, "g_i2c1", NULL, 0, CGU_GATE1,
++		   G_I2C1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_I2C2, "g_i2c2", NULL, 0, CGU_GATE1,
++		   G_I2C2_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SPI1, "g_spi1", NULL, 0, CGU_GATE1,
++		   G_SPI1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SPI0, "g_spi0", NULL, 0, CGU_GATE1,
++		   G_SPI0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_QSPI, "g_qspi", NULL, 0, CGU_GATE1,
++		   G_QSPI_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_CQEM, "g_cqem", NULL, 0, CGU_GATE1,
++		   G_CQEM_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SSO, "g_sso", NULL, 0, CGU_GATE1,
++		   G_SSO_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_GPTC0, "g_gptc0", NULL, 0, CGU_GATE1,
++		   G_GPTC0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_GPTC1, "g_gptc1", NULL, 0, CGU_GATE1,
++		   G_GPTC1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_GPTC2, "g_gptc2", NULL, 0, CGU_GATE1,
++		   G_GPTC2_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_URT0, "g_uart0", NULL, 0, CGU_GATE1,
++		   G_URT0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_URT1, "g_uart1", NULL, 0, CGU_GATE1,
++		   G_URT1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SECPT, "g_secpt", NULL, 0,   CGU_GATE1,
++		   G_SECPT_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SCPU, "g_scpu", NULL, 0, CGU_GATE1,
++		   G_SCPU_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_MPE, "g_mpe", NULL, 0, CGU_GATE1,
++		   G_MPE_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_TDM, "g_tdm", NULL, 0, CGU_GATE1,
++		   G_TDM_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_PP, "g_pp", NULL, CLK_IGNORE_UNUSED, CGU_GATE1,
++		   G_PP_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_DMA3, "g_dma3", NULL, 0, CGU_GATE1,
++		   G_DMA3_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_SWITCH, "g_switch", NULL, 0, CGU_GATE1,
++		   G_SWITCH_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_PON, "g_pon", NULL, 0, CGU_GATE1,
++		   G_PON_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_AON, "g_aon", NULL, 0, CGU_GATE1,
++		   G_AON_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_DDR, "g_ddr", NULL, CLK_IGNORE_UNUSED, CGU_GATE1,
++		   G_DDR_SHIFT, GATE_CLK_HW, 0),
++
++	/* Gate2 clock */
++	INTEL_GATE(PRX300_GCLK_PCIE_CTRL0, "g_ctrl0", NULL, 0, CGU_GATE2,
++		   G_CTRL0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_MSI0, "g_msi0", NULL, 0, CGU_GATE2,
++		   G_MSI0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_PD0, "g_pd0", NULL, 0, CGU_GATE2,
++		   G_PD0_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_PCIE_CTRL1, "g_ctrl1", NULL, 0, CGU_GATE2,
++		   G_CTRL1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_MSI1, "g_msi1", NULL, 0, CGU_GATE2,
++		   G_MSI1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_PD1, "g_pd1", NULL, 0, CGU_GATE2,
++		   G_PD1_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_ASPI, "g_aspi", NULL, 0, CGU_GATE2,
++		   G_ASPI_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_ADMA, "g_adma", NULL, 0, CGU_GATE2,
++		   G_ADMA_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_AHIF, "g_ashif", NULL, 0, CGU_GATE2,
++		   G_AHIF_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_ASL, "g_asl", NULL, 0, CGU_GATE2,
++		   G_ASL_SHIFT, GATE_CLK_HW, 0),
++
++	/* Gate3 clock */
++	INTEL_GATE(PRX300_GCLK_SWREF, "g_swref", NULL, 0, CGU_IF_CLK,
++		   GCLK_SWREF_SHIFT, GATE_CLK_HW, 0),
++	INTEL_GATE(PRX300_GCLK_CBPHY0, "cbphy0", NULL, 0, CGU_IF_CLK,
++		   GCLK_CBPHY0_SHIFT, GATE_CLK_SW, 0),
++	INTEL_GATE(PRX300_GCLK_CBPHY1, "cbphy1", NULL, 0, CGU_IF_CLK,
++		   GCLK_CBPHY1_SHIFT, GATE_CLK_SW, 0)
++};
++
++static const struct intel_clk_ddiv_data prx300_ddiv_clks[] __initconst = {
++	INTEL_DDIV(PRX300_CLK_GPHY, "gphy", "ljpll3", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL3_CFG0), 0, PLL_DDIV_WIDTH,
++		   3, PLL_DDIV_WIDTH, 24, 1, 29, 0),
++	INTEL_DDIV(PRX300_CLK_CBPHY, "cbphy", "ljpll3", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL3_CFG0), 6, PLL_DDIV_WIDTH,
++		   9, PLL_DDIV_WIDTH, 25, 1, 28, 0),
++	INTEL_DDIV(PRX300_CLK_POOL, "dd_pool", "ljpll3", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL3_CFG0), 12, PLL_DDIV_WIDTH,
++		   15, PLL_DDIV_WIDTH, 26, 1, 28, 0),
++	INTEL_DDIV(PRX300_CLK_PTP, "dd_ptp", "ljpll3", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL3_CFG0), 18, PLL_DDIV_WIDTH,
++		   21, PLL_DDIV_WIDTH, 27, 1, 28, 0),
++	INTEL_DDIV(PRX300_CLK_PCIE, "pcie", "ljpll4", CLK_IGNORE_UNUSED,
++		   PLL_DIV(LJPLL4_CFG0), 0, PLL_DDIV_WIDTH, 3,
++		   PLL_DDIV_WIDTH, 24, 1, 29, 0),
++};
++
++static void __init prx300_clk_init(struct device_node *np)
++{
++	struct intel_clk_provider *ctx;
++	struct regmap *map;
++
++	map = syscon_node_to_regmap(np);
++	if (IS_ERR(map))
++		return;
++
++	ctx = intel_clk_init(map, ARRAY_SIZE(prx300_early_clks));
++
++	if (IS_ERR(ctx)) {
++		pr_info("ERROR\n");
++		regmap_exit(map);
++		return;
++	}
++
++	if (intel_clk_register_early(ctx, prx300_early_clks,
++				     ARRAY_SIZE(prx300_early_clks)))
++		return;
++	of_clk_add_hw_provider(np, of_clk_hw_onecell_get, &ctx->clk_data);
++}
++
++CLK_OF_DECLARE_DRIVER(intel_prx300_cgu, "intel,cgu-prx300",
++		      prx300_clk_init);
++
++static int __init intel_prx300_cgu_probe(struct platform_device *pdev)
++{
++	struct intel_clk_provider *ctx;
++	struct regmap *map;
++	struct device *dev = &pdev->dev;
++	struct device_node *np = dev->of_node;
++
++	if (!np)
++		return -ENODEV;
++
++	map = syscon_node_to_regmap(np);
++	if (IS_ERR(map))
++		return -ENODEV;
++
++	ctx = intel_clk_init(map, PRX300_CLK_NR_CLKS);
++	if (IS_ERR(ctx))
++		return -ENOMEM;
++
++	ctx->np = np;
++	ctx->dev = dev;
++	platform_set_drvdata(pdev, ctx);
++
++	intel_clk_register_plls(ctx, prx300_pll_clks,
++				ARRAY_SIZE(prx300_pll_clks));
++	intel_clk_register_branches(ctx, prx300_branch_clks,
++				    ARRAY_SIZE(prx300_branch_clks));
++	intel_clk_register_ddiv(ctx, prx300_ddiv_clks,
++				ARRAY_SIZE(prx300_ddiv_clks));
++	of_clk_add_hw_provider(np, of_clk_hw_onecell_get, &ctx->clk_data);
++
++	intel_clk_ssc_probe(ctx);
++
++	return 0;
++}
++
++static const struct of_device_id of_intel_prx300_cgu_match[] = {
++	{ .compatible = "intel,cgu-prx300" },
++	{}
++};
++
++static struct platform_driver intel_prx300_cgu_driver __refdata = {
++	.probe  = intel_prx300_cgu_probe,
++	.driver = {
++		.name = "cgu-prx300",
++		.of_match_table = of_match_ptr(of_intel_prx300_cgu_match),
++	},
++};
++
++static int __init intel_prx300_cgu_init(void)
++{
++	return platform_driver_register(&intel_prx300_cgu_driver);
++}
++core_initcall(intel_prx300_cgu_init);
++
+diff --git a/include/dt-bindings/clock/intel,falconmx-clk.h b/include/dt-bindings/clock/intel,falconmx-clk.h
+deleted file mode 100644
+index 10cd251afe08..000000000000
+--- a/include/dt-bindings/clock/intel,falconmx-clk.h
++++ /dev/null
+@@ -1,210 +0,0 @@
+-#ifndef __INTEL_FALCONMX_CLK_H_
+-#define __INTEL_FALCONMX_CLK_H_
+-
+-/* Intel Falconmx CGU device tree "compatible" strings */
+-#define FALCONMX_DDR_CLK		"intel,falconmx-ddrclk"
+-#define FALCONMX_CPU_CLK		"intel,falconmx-cpuclk"
+-#define FALCONMX_QSPI_CLK		"intel,falconmx-qspiclk"
+-#define FALCONMX_SWITCH_CLK		"intel,falconmx-swclk"
+-#define FALCONMX_SSX4_CLK		"intel,falconmx-ssx4clk"
+-#define FALCONMX_NGI_CLK		"intel,falconmx-ngiclk"
+-#define FALCONMX_PPV4_CLK		"intel,falconmx-ppv4clk"
+-#define FALCONMX_VDSP_CLK		"intel,falconmx-vdspclk"
+-#define FALCONMX_VIF_CLK		"intel,falconmx-vifclk"
+-#define FALCONMX_SLIC_CLK		"intel,falconmx-slicclk"
+-#define FALCONMX_DCL_CLK		"intel,falconmx-dclclk"
+-#define FALCONMX_SYNC0_CLK		"intel,falconmx-sync0clk"
+-#define FALCONMX_SYNC1_CLK		"intel,falconmx-sync1clk"
+-#define FALCONMX_GPC1_CLK		"intel,falconmx-gpc1clk"
+-#define FALCONMX_GPC2_CLK		"intel,falconmx-gpc2clk"
+-#define FALCONMX_GPHY_CLK		"intel,falconmx-gphyclk"
+-#define FALCONMX_SERDES_CLK		"intel,falconmx-serdesclk"
+-#define FALCONMX_SYNC_CLK		"intel,falconmx-syncclk"
+-#define FALCONMX_PTP_CLK		"intel,falconmx-ptpclk"
+-#define FALCONMX_PCIE_CLK		"intel,falconmx-pcieclk"
+-#define FALCONMX_GATE0_CLK		"intel,falconmx-gate0clk"
+-#define FALCONMX_GATE1_CLK		"intel,falconmx-gate1clk"
+-#define FALCONMX_GATE2_CLK		"intel,falconmx-gate2clk"
+-#define FALCONMX_GATE3_CLK		"intel,falconmx-gate3clk"
+-#define FALCONMX_P2_CLK			"intel,falconmx-p2clk"
+-#define FALCONMX_PLL5PR_CLK		"intel,falconmx-pll5prclk"
+-#define FALCONMX_PLL5_CLK		"intel,falconmx-pll5clk"
+-#define FALCONMX_PON_CLK		"intel,falconmx-ponclk"
+-#define FALCONMX_PONPLL_CLK		"intel,falconmx-ponpllclk"
+-#define FALCONMX_WAN_CLK		"intel,falconmx-wanclk"
+-
+-/* clock shift and width */
+-/* PLL2 CLK */
+-#define DDR_CLK_SHIFT		0
+-#define DDR_CLK_WIDTH		4
+-/* PLL0A CLK */
+-#define CPU_CLK_SHIFT		0
+-#define CPU_CLK_WIDTH		4
+-#define QSPI_CLK_SHIFT		12
+-#define QSPI_CLK_WIDTH		4
+-/* PLLOB CLK */
+-#define SWITCH_CLK_SHIFT	0
+-#define SWITCH_CLK_WIDTH	4
+-#define SSX4_CLK_SHIFT		4
+-#define SSX4_CLK_WIDTH		4
+-#define NGI_CLK_SHIFT		8
+-#define NGI_CLK_WIDTH		4
+-#define PPV4_CLK_SHIFT		12
+-#define PPV4_CLK_WIDTH		4
+-/* PLL1 CLK */
+-#define VDSP_CLK_SHIFT		0
+-#define VDSP_CLK_WIDTH		4
+-#define VIF_CLK_SHIFT		4
+-#define VIF_CLK_WIDTH		4
+-#define SLIC_CLK_SHIFT		14
+-#define SLIC_CLK_WIDTH		2
+-#define SLIC_SET_VAL		2
+-#define DCL_CLK_SHIFT		25
+-#define DCL_CLK_WIDTH		3
+-/* PLL3 CLK */
+-#define GPHY_CLK_SHIFT1		0
+-#define GPHY_CLK_WIDTH1		3
+-#define GPHY_CLK_SHIFT2		3
+-#define GPHY_CLK_WIDTH2		3
+-#define GPHY_CLK_SHIFT3		29
+-#define GPHY_CLK_WIDTH3		1
+-#define SERDES_CLK_SHIFT1	6
+-#define SERDES_CLK_WIDTH1	3
+-#define SERDES_CLK_SHIFT2	9
+-#define SERDES_CLK_WIDTH2	3
+-#define SYNC_CLK_SHIFT1		12
+-#define SYNC_CLK_WIDTH1		3
+-#define SYNC_CLK_SHIFT2		15
+-#define SYNC_CLK_WIDTH2		3
+-#define PTP_CLK_SHIFT1		18
+-#define PTP_CLK_WIDTH1		3
+-#define PTP_CLK_SHIFT2		21
+-#define PTP_CLK_WIDTH2		3
+-#define SYNC0_CLK_SHIFT		16
+-#define SYNC0_CLK_WIDTH		1
+-#define SYNC1_CLK_SHIFT		17
+-#define SYNC1_CLK_WIDTH		2
+-#define GPC1_CLK_SHIFT		12
+-#define GPC1_CLK_WIDTH		2
+-#define GPC2_CLK_SHIFT		10
+-#define GPC2_CLK_WIDTH		2
+-/* PLL4 CLK */
+-#define PCIE_CLK_SHIFT1		0
+-#define PCIE_CLK_WIDTH1		3
+-#define PCIE_CLK_SHIFT2		3
+-#define PCIE_CLK_WIDTH2		3
+-#define PCIE_CLK_SHIFT3		29
+-#define PCIE_CLK_WIDTH3		1
+-
+-/* PLL5 CLK */
+-#define PON_CLK_SHIFT1		0
+-#define PON_CLK_WIDTH1		3
+-#define PON_CLK_SHIFT2		3
+-#define PON_CLK_WIDTH2		3
+-#define PON_CLK_SHIFT3		29
+-#define PON_CLK_WIDTH3		1
+-#define PONPLL_CLK_SHIFT1	6
+-#define PONPLL_CLK_WIDTH1	3
+-#define PONPLL_CLK_SHIFT2	9
+-#define PONPLL_CLK_WIDTH2	3
+-
+-/* P2 CLK */
+-#define P2_CLK_SHIFT		3
+-#define P2_CLK_WIDTH		1
+-
+-/* PLL5PR CLK */
+-#define PLL5PR_CLK_SHIFT	28
+-#define PLL5PR_CLK_WIDTH	1
+-
+-/* WAN CLK */
+-#define WAN_CLK_SHIFT		0
+-#define WAN_CLK_WIDTH		1
+-
+-/* clocks under gate0-clk */
+-#define GATE_XBAR0_CLK		0
+-#define GATE_XBAR1_CLK		1
+-#define GATE_XBAR2_CLK		2
+-#define GATE_XBAR7_CLK		7
+-
+-/* clocks under gate1-clk */
+-#define GATE_V_CODEC_CLK	0
+-#define GATE_DMA0_CLK		1
+-#define GATE_I2C0_CLK		2
+-#define GATE_I2C1_CLK		3
+-#define GATE_I2C2_CLK		4
+-#define GATE_SPI1_CLK		5
+-#define GATE_SPI0_CLK		6
+-#define GATE_QSPI_CLK		7
+-#define GATE_CQEM_CLK		8
+-#define GATE_SSO_CLK		9
+-#define GATE_GPTC0_CLK		10
+-#define GATE_GPTC1_CLK		11
+-#define GATE_GPTC2_CLK		12
+-#define GATE_URT0_CLK		13
+-#define GATE_URT1_CLK		14
+-#define GATE_EIP123_CLK		15
+-#define GATE_SCPU_CLK		16
+-#define GATE_MPE_CLK		17
+-#define GATE_TDM_CLK		18
+-#define GATE_PP_CLK		19
+-#define GATE_DMA3_CLK		20
+-#define GATE_SWITCH_CLK		21
+-#define GATE_PON_CLK		22
+-#define GATE_AON_CLK		23
+-#define GATE_DDR_CLK		24
+-
+-/* clocks under gate2-clk */
+-#define GATE_CTRL0_CLK		0
+-#define GATE_MSI0_CLK		1
+-#define GATE_CTRL1_CLK		2
+-#define GATE_MSI1_CLK		3
+-
+-/* clocks under gate3-clk */
+-#define GATE_SW_REF		0
+-#define GATE_SERDES0		1
+-#define GATE_SERDES1		2
+-
+-/* Gate clock mask */
+-#define GATE0_CLK_MASK		0x87
+-#define GATE1_CLK_MASK		0xFEE67FFC
+-#define GATE2_CLK_MASK		0x60006
+-#define GATE3_CLK_MASK		0x3000010
+-
+-/* Gate clock bits */
+-#define GATE_XBAR0		0
+-#define GATE_XBAR1		1
+-#define GATE_XBAR2		2
+-#define GATE_XBAR7		7
+-
+-#define GATE_V_CODEC		2
+-#define GATE_DMA0		3
+-#define GATE_I2C0		4
+-#define GATE_I2C1		5
+-#define GATE_I2C2		6
+-#define GATE_SPI1		7
+-#define GATE_SPI0		8
+-#define GATE_QSPI		9
+-#define GATE_CQEM		10
+-#define GATE_SSO		11
+-#define GATE_GPTC0		12
+-#define GATE_GPTC1		13
+-#define GATE_GPTC2		14
+-#define GATE_UART0		17
+-#define GATE_UART1		18
+-#define GATE_EIP123		21
+-#define GATE_SCPU		22
+-#define GATE_MPE		23
+-#define GATE_TDM		25
+-#define GATE_PP			26
+-#define GATE_DMA3		27
+-#define GATE_SWITCH		28
+-#define GATE_PON		29
+-#define GATE_AON		30
+-#define GATE_DDR		31
+-
+-#define GATE_PCIE0_CTRL		1
+-#define GATE_PCIE0_MSI		2
+-#define GATE_PCIE1_CTRL		17
+-#define GATE_PCIE1_MSI		18
+-
+-#endif /* __INTEL_FALCONMX_CLK_H_ */
+diff --git a/include/dt-bindings/clock/intel,prx300-clk.h b/include/dt-bindings/clock/intel,prx300-clk.h
+new file mode 100644
+index 000000000000..150cc2c8be74
+--- /dev/null
++++ b/include/dt-bindings/clock/intel,prx300-clk.h
+@@ -0,0 +1,89 @@
++#ifndef __INTEL_PRX300_CLK_H_
++#define __INTEL_PRX300_CLK_H_
++
++/* PLL clocks */
++#define PRX300_CLK_PLL0A	2
++#define PRX300_CLK_PLL0B	3
++#define PRX300_CLK_PLL1		4
++#define PRX300_CLK_PLL2		5
++#define PRX300_CLK_LJPLL3	6
++#define PRX300_CLK_LJPLL4	7
++#define PRX300_CLK_LJPLL5	8
++
++/* clocks from PLLs */
++/* ROPLL0A */
++#define PRX300_CLK_CPU		9
++#define PRX300_CLK_QSPI		10
++/* ROPLL0B */
++#define PRX300_CLK_SW		11
++#define PRX300_CLK_NGI		12
++#define PRX300_CLK_SSX4		13
++/* ROPLL1 */
++#define PRX300_CLK_DSP		14
++#define PRX300_CLK_IF		15
++/* ROPLL2 */
++#define PRX300_CLK_DDR		16
++/* LJPLL3  */
++#define PRX300_CLK_GPHY		17
++#define PRX300_CLK_CBPHY	18
++#define PRX300_CLK_POOL		19
++#define PRX300_CLK_PTP		20
++/* LJPLL4 */
++#define PRX300_CLK_PCIE		21
++/* LJPLL5 */
++#define PRX300_CLK_PONPHY	22
++#define PRX300_CLK_PONIP	23
++
++#define PRX300_CLK_SLIC		24
++/* Gate0 clock shift */
++#define PRX300_GCLK_XBAR0	50
++#define PRX300_GCLK_XBAR1	51
++#define PRX300_GCLK_XBAR7	52
++
++/* clocks under gate1-clk */
++#define PRX300_GCLK_V_CODEC	53
++#define PRX300_GCLK_DMA0		54
++#define PRX300_GCLK_I2C0		55
++#define PRX300_GCLK_I2C1		56
++#define PRX300_GCLK_I2C2		57
++#define PRX300_GCLK_SPI1		58
++#define PRX300_GCLK_SPI0		59
++#define PRX300_GCLK_QSPI		60
++#define PRX300_GCLK_CQEM		61
++#define PRX300_GCLK_SSO			62
++#define PRX300_GCLK_GPTC0		63
++#define PRX300_GCLK_GPTC1		64
++#define PRX300_GCLK_GPTC2		65
++#define PRX300_GCLK_URT0		66
++#define PRX300_GCLK_URT1		67
++#define PRX300_GCLK_SECPT		68
++#define PRX300_GCLK_SCPU		69
++#define PRX300_GCLK_MPE			70
++#define PRX300_GCLK_TDM			71
++#define PRX300_GCLK_PP			72
++#define PRX300_GCLK_DMA3		73
++#define PRX300_GCLK_SWITCH		74
++#define PRX300_GCLK_PON			75
++#define PRX300_GCLK_AON			76
++#define PRX300_GCLK_DDR			77
++
++/* clocks under gate2-clk */
++#define PRX300_GCLK_PCIE_CTRL0	78
++#define PRX300_GCLK_MSI0		79
++#define PRX300_GCLK_PD0			80
++#define PRX300_GCLK_PCIE_CTRL1	81
++#define PRX300_GCLK_MSI1		82
++#define PRX300_GCLK_PD1			83
++#define PRX300_GCLK_ASPI		84
++#define PRX300_GCLK_ADMA		85
++#define PRX300_GCLK_AHIF		86
++#define PRX300_GCLK_ASL			87
++
++/* clocks under gate3-clk */
++#define PRX300_GCLK_SWREF		88
++#define PRX300_GCLK_CBPHY0		89
++#define PRX300_GCLK_CBPHY1		90
++
++#define PRX300_CLK_NR_CLKS		120
++
++#endif /* __INTEL_PRX300_CLK_H_ */

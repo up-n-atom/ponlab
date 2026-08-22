@@ -1,0 +1,297 @@
+From dab815354a19cfe73db6da86f62a1774bf12b9cd Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Wed, 29 Apr 2020 00:27:30 +0800
+Subject: [PATCH] PONRTSYS-7218: GSW API - export MAC RMON in mac_ops
+
+---
+ .../net/ethernet/lantiq/switch-api/mac/lmac_api.c  | 16 +++-
+ .../net/ethernet/lantiq/switch-api/mac/mac_cfg.c   | 90 ++++++++++++++++++++++
+ .../ethernet/lantiq/switch-api/mac/xgmac_common.h  |  4 +
+ .../ethernet/lantiq/switch-api/mac/xgmac_mtl_api.c | 10 ++-
+ include/net/switch_api/mac_ops.h                   | 37 +++++++++
+ 5 files changed, 152 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/lmac_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/lmac_api.c
+index b53525ca51f3..4d69982d9f63 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/lmac_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/lmac_api.c
+@@ -12,6 +12,8 @@
+ static u32 read_lmac_cnt(void *pdev);
+ static u32 write_lmac_cnt(void *pdev, u32 val);
+ 
++#define RMON_CLR_TIMEOUT	10000
++
+ int lmac_wr_reg(void *pdev, u32 reg_off, u32 reg_val)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+@@ -753,6 +755,7 @@ int lmac_rmon_clr(void *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 	u32 lmac_cnt_acc = 0;
++	u32 timeout = 0;
+ 
+ 	MAC_SET_VAL(lmac_cnt_acc, LMAC_CNT_ACC, OPMOD, LMAC_RMON_CLR);
+ 	MAC_SET_VAL(lmac_cnt_acc, LMAC_CNT_ACC, MAC, pdata->mac_idx);
+@@ -762,18 +765,22 @@ int lmac_rmon_clr(void *pdev)
+ 
+ 	LMAC_RGWR(pdata, REG_LMAC_CNT_ACC, lmac_cnt_acc);
+ 
+-	while (1) {
++	while (timeout++ < RMON_CLR_TIMEOUT) {
+ 		if ((LMAC_RGRD(pdata, REG_LMAC_CNT_ACC) & 0x8000) == 0)
+ 			break;
+ 	}
+ 
+-	return 0;
++	memset(&pdata->lrmon_shadow, 0, sizeof(pdata->lrmon_shadow));
++	memset(&pdata->rmon_shadow, 0, sizeof(pdata->rmon_shadow));
++
++	return timeout < RMON_CLR_TIMEOUT ? 0 : -EIO;
+ }
+ 
+ void lmac_rmon_clr_allmac(void *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
+ 	u32 lmac_cnt_acc = 0;
++	u32 timeout = 0;
+ 
+ 	MAC_SET_VAL(lmac_cnt_acc, LMAC_CNT_ACC, OPMOD, LMAC_RMON_CLRALL);
+ 	MAC_SET_VAL(lmac_cnt_acc, LMAC_CNT_ACC, MAC, 0); // ignored
+@@ -783,9 +790,12 @@ void lmac_rmon_clr_allmac(void *pdev)
+ 
+ 	LMAC_RGWR(pdata, REG_LMAC_CNT_ACC, lmac_cnt_acc);
+ 
+-	while (1) {
++	while (timeout++ < RMON_CLR_TIMEOUT) {
+ 		if ((LMAC_RGRD(pdata, REG_LMAC_CNT_ACC) & 0x8000) == 0)
+ 			break;
+ 	}
++
++	memset(&pdata->lrmon_shadow, 0, sizeof(pdata->lrmon_shadow));
++	memset(&pdata->rmon_shadow, 0, sizeof(pdata->rmon_shadow));
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+index 0ac4537315de..6df674ccf01d 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/mac_cfg.c
+@@ -132,6 +132,10 @@ int mac_reset(void *pdev, u32 reset)
+ 	else
+ 		gswss_mac_enable(pdev, MAC_EN);
+ 
++	memset(&pdata->xrmon_shadow, 0, sizeof(pdata->xrmon_shadow));
++	memset(&pdata->lrmon_shadow, 0, sizeof(pdata->lrmon_shadow));
++	memset(&pdata->rmon_shadow, 0, sizeof(pdata->rmon_shadow));
++
+ #ifdef __KERNEL__
+ 	spin_unlock_bh(&pdata->mac_lock);
+ #endif
+@@ -1424,6 +1428,89 @@ static void mac_soft_restart(void *pdev)
+ 	xgmac_powerup(pdev);
+ }
+ 
++static int __rmon_get(void *pdev, struct mac_rmon *prmon)
++{
++	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++	struct mac_rmon *pshd = &pdata->rmon_shadow;
++	struct lmac_rmon_cnt lrmon = {0};
++	struct xgmac_mmc_stats xrmon = {0};
++	int ret;
++
++	ret = xgmac_read_mmc_stats(pdev, &xrmon);
++	if (ret < 0)
++		return ret;
++
++	lmac_rmon_rd(pdev, &lrmon);
++
++	pshd->cnt[RMON_TX_PKTS] += xrmon.txframecount_gb - pdata->xrmon_shadow.txframecount_gb;
++	pshd->cnt[RMON_TX_BYTES] += xrmon.txoctetcount_gb - pdata->xrmon_shadow.txoctetcount_gb;
++	pshd->cnt[RMON_TX_GOOD_PKTS] += xrmon.txframecount_g - pdata->xrmon_shadow.txframecount_g;
++	pshd->cnt[RMON_TX_GOOD_BYTES] += xrmon.txoctetcount_g - pdata->xrmon_shadow.txoctetcount_g;
++	pshd->cnt[RMON_TX_PAUSE] += xrmon.txpauseframes - pdata->xrmon_shadow.txpauseframes;
++	pshd->cnt[RMON_TX_PAUSE] += lrmon.tx_pause_cnt - pdata->lrmon_shadow.tx_pause_cnt;
++	pshd->cnt[RMON_TX_UNDERFLOW] += xrmon.txunderflowerror - pdata->xrmon_shadow.txunderflowerror;
++	pshd->cnt[RMON_TX_SINGLE_COL] += lrmon.sing_coln_cnt - pdata->lrmon_shadow.sing_coln_cnt;
++	pshd->cnt[RMON_TX_MULTI_COL] += lrmon.mple_coln_cnt - pdata->lrmon_shadow.mple_coln_cnt;
++	pshd->cnt[RMON_TX_LATE_COL] += lrmon.late_coln_cnt - pdata->lrmon_shadow.late_coln_cnt;
++	pshd->cnt[RMON_TX_EXCS_COL] += lrmon.excs_coln_cnt - pdata->lrmon_shadow.excs_coln_cnt;
++
++	pshd->cnt[RMON_RX_PKTS] += xrmon.rxframecount_gb - pdata->xrmon_shadow.rxframecount_gb;
++	pshd->cnt[RMON_RX_BYTES] += xrmon.rxoctetcount_gb - pdata->xrmon_shadow.rxoctetcount_gb;
++	pshd->cnt[RMON_RX_GOOD_BYTES] += xrmon.rxoctetcount_g - pdata->xrmon_shadow.rxoctetcount_g;
++	pshd->cnt[RMON_RX_PAUSE] += xrmon.rxpauseframes - pdata->xrmon_shadow.rxpauseframes;
++	pshd->cnt[RMON_RX_PAUSE] += lrmon.rx_pause_cnt - pdata->lrmon_shadow.rx_pause_cnt;
++	pshd->cnt[RMON_RX_CRC_ERR] += xrmon.rxcrcerror - pdata->xrmon_shadow.rxcrcerror;
++	pshd->cnt[RMON_RX_OVERFLOW] += xrmon.rxfifooverflow - pdata->xrmon_shadow.rxfifooverflow;
++
++	memcpy(&pdata->xrmon_shadow, &xrmon, sizeof(pdata->xrmon_shadow));
++	memcpy(&pdata->lrmon_shadow, &lrmon, sizeof(pdata->lrmon_shadow));
++	memcpy(prmon, &pdata->rmon_shadow, sizeof(*prmon));
++
++	return 0;
++}
++
++static int rmon_get(void *pdev, struct mac_rmon *prmon)
++{
++	struct mac_prv_data *pdata;
++	int ret;
++
++	if (!pdev || !prmon)
++		return -EINVAL;
++
++	pdata = GET_MAC_PDATA(pdev);
++#ifdef __KERNEL__
++	spin_lock_bh(&pdata->mac_lock);
++#endif
++	ret = __rmon_get(pdev, prmon);
++
++#ifdef __KERNEL__
++	spin_unlock_bh(&pdata->mac_lock);
++#endif
++	return ret;
++}
++
++static int rmon_clr(void *pdev)
++{
++	struct mac_prv_data *pdata;
++	struct mac_rmon rmon;
++	int ret;
++
++	if (!pdev)
++		return -EINVAL;
++
++	pdata = GET_MAC_PDATA(pdev);
++#ifdef __KERNEL__
++	spin_lock_bh(&pdata->mac_lock);
++#endif
++	ret = __rmon_get(pdev, &rmon);
++	memset(&pdata->rmon_shadow, 0, sizeof(pdata->rmon_shadow));
++#ifdef __KERNEL__
++	spin_unlock_bh(&pdata->mac_lock);
++#endif
++
++	return ret;
++}
++
+ void mac_init_fn_ptrs(struct mac_ops *mac_op)
+ {
+ 	mac_op->set_flow_ctl = mac_set_flowctrl;
+@@ -1470,6 +1557,9 @@ void mac_init_fn_ptrs(struct mac_ops *mac_op)
+ 	mac_op->config_subsec_inc = xgmac_config_subsec_inc;
+ 	mac_op->get_txtstamp_cap_cnt = xgmac_get_txtstamp_cnt;
+ 
++	mac_op->rmon_get = rmon_get;
++	mac_op->rmon_clr = rmon_clr;
++
+ 	mac_op->init = mac_init;
+ 	mac_op->exit = mac_exit;
+ 	mac_op->xgmac_cli = xgmac_cfg_main;
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+index b86c5576f85e..bf3887595f9c 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_common.h
+@@ -548,6 +548,10 @@ struct mac_prv_data {
+ 	/* haps=1, if board is HAPS, else 0 */
+ 	u32 haps;
+ 
++	struct lmac_rmon_cnt lrmon_shadow;
++	struct xgmac_mmc_stats xrmon_shadow;
++	struct mac_rmon rmon_shadow;
++
+ 	/* MAC IRQ handler */
+ 	struct mac_irq_hdl *irq_hdl;
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mtl_api.c b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mtl_api.c
+index 461a7e9a8a8f..a30c912c1f9e 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mtl_api.c
++++ b/drivers/net/ethernet/lantiq/switch-api/mac/xgmac_mtl_api.c
+@@ -42,6 +42,8 @@
+ 
+ #include <xgmac.h>
+ 
++#define RMON_CLR_TIMEOUT	10000
++
+ /*  RSF: Receive Q store and forward
+  *  if 1, XGMAC reads packet from Rx Q after the complete packet has been
+  *  written
+@@ -283,6 +285,7 @@ int xgmac_set_mmc(void *pdev)
+ int xgmac_clear_rmon(void *pdev)
+ {
+ 	struct mac_prv_data *pdata = GET_MAC_PDATA(pdev);
++	u32 timeout = 0;
+ 
+ 	/* Reset the counters */
+ 	mac_printf("XGMAC %d: Resetting the counters\n",
+@@ -291,12 +294,15 @@ int xgmac_clear_rmon(void *pdev)
+ 	memset(&prv_data[pdata->mac_idx].mmc_stats, 0,
+ 	       sizeof(struct xgmac_mmc_stats));
+ 
+-	while (1) {
++	while (timeout++ < RMON_CLR_TIMEOUT) {
+ 		if (XGMAC_RGRD_BITS(pdata, MMC_CR, CR) == 0)
+ 			break;
+ 	}
+ 
+-	return 0;
++	memset(&pdata->xrmon_shadow, 0, sizeof(pdata->xrmon_shadow));
++	memset(&pdata->rmon_shadow, 0, sizeof(pdata->rmon_shadow));
++
++	return timeout < RMON_CLR_TIMEOUT ? 0 : -EIO;
+ }
+ 
+ /* GB - Good Bad frames
+diff --git a/include/net/switch_api/mac_ops.h b/include/net/switch_api/mac_ops.h
+index afe1ad345b62..17c7eeeefd3e 100644
+--- a/include/net/switch_api/mac_ops.h
++++ b/include/net/switch_api/mac_ops.h
+@@ -64,6 +64,32 @@ struct xgmac_mmc_stats {
+ 	u64 rxfifooverflow;
+ };
+ 
++enum {
++	RMON_TX_PKTS = 0,
++	RMON_TX_BYTES,
++	RMON_TX_GOOD_PKTS,
++	RMON_TX_GOOD_BYTES,
++	RMON_TX_PAUSE,
++	RMON_TX_UNDERFLOW,
++	RMON_TX_SINGLE_COL,
++	RMON_TX_MULTI_COL,
++	RMON_TX_LATE_COL,
++	RMON_TX_EXCS_COL,
++
++	RMON_RX_PKTS,
++	RMON_RX_BYTES,
++	RMON_RX_GOOD_BYTES,
++	RMON_RX_PAUSE,
++	RMON_RX_CRC_ERR,
++	RMON_RX_OVERFLOW,
++
++	MAC_RMON_MAX
++};
++
++struct mac_rmon {
++	u64 cnt[MAC_RMON_MAX];
++};
++
+ /* This structure contains flags that indicate what hardware features
+  * or configurations are present in the device.
+  */
+@@ -699,6 +725,17 @@ struct mac_ops {
+ 	 */
+ 	void (*soft_restart)(void *);
+ #endif
++	/* This sequence is used to retrieve XG/L-MAC counter
++	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
++	 * param[in/out]OUT:	mac_rmon
++	 * return	OUT:	-1: Exit MAC Error
++	 */
++	int (*rmon_get)(void *, struct mac_rmon *);
++	/* This sequence is used to clear XG/L-MAC counter
++	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
++	 * return	OUT:	-1: Exit MAC Error
++	 */
++	int (*rmon_clr)(void *);
+ 	/* This sequence is used Initialize MAC
+ 	 * param[in/out]IN:	ops	MAC ops Struct registered for MAC 0/1/2.
+ 	 * return	OUT	-1: Initialize MAC Error

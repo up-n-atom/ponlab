@@ -1,0 +1,180 @@
+From d53f4d34d438fc38a5ad3bc53a80862be7155eb2 Mon Sep 17 00:00:00 2001
+From: Xu Liang <liang.xu@intel.com>
+Date: Fri, 3 Apr 2020 19:02:08 +0800
+Subject: [PATCH] PONRTSYS-7068: GSW API - apply QoS settings optimized for PON
+ application for PRX300
+
+---
+ .../net/ethernet/lantiq/switch-api/gsw_defconf.c   | 75 ++++++++++++++--------
+ .../net/ethernet/lantiq/switch-api/gsw_flow_core.c | 15 ++++-
+ include/net/switch_api/lantiq_gsw.h                |  2 +
+ 3 files changed, 64 insertions(+), 28 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_defconf.c b/drivers/net/ethernet/lantiq/switch-api/gsw_defconf.c
+index 6e0a6f6c23f2..93d62b383c37 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_defconf.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_defconf.c
+@@ -242,46 +242,71 @@ int gsw_misc_config(struct core_ops *ops)
+  */
+ int gsw_qos_def_config(struct core_ops *ops)
+ {
++	u32 phy_eg_qmap = BIT(16) | BIT(8) | BIT(0);
+ 	GSW_QoS_WRED_PortCfg_t sVar;
+ 	GSW_QoS_WRED_QueueCfg_t qcfg;
+-	int j = 0;
+-
+-	for (j = 0; j < 5; j++) {
+-		memset(&sVar, 0x00, sizeof(sVar));
+-
++	GSW_register_t reg;
++	int j;
++
++	/* Setting Port WRED for all ports */
++	memset(&sVar, 0x00, sizeof(sVar));
++	sVar.nYellow_Min = 240;
++	sVar.nYellow_Max = 255;
++	sVar.nGreen_Min = 240;
++	sVar.nGreen_Max = 255;
++	for (j = 0; j < 12; j++) {
+ 		sVar.nPortId = j;
+ 
+-		/* For EPON Upstream Case with > 85% traffic,
+-		 * GSWIP is having ACM Drop, which cause PON IP to get reconnected
+-		 * To avoid this QOD WRED Port Cfg values for WAN Port
+-		 * need to be increased to 512
+-		 */
+-		if (sVar.nPortId == MAC_2) {
+-			sVar.nRed_Min = 500;
+-			sVar.nRed_Max = 512;
+-			sVar.nYellow_Min = 500;
+-			sVar.nYellow_Max = 512;
+-			sVar.nGreen_Min = 500;
+-			sVar.nGreen_Max = 512;
+-		} else {
+-			sVar.nGreen_Min = 240;
+-			sVar.nGreen_Max = 256;
+-		}
+-
+ 		ops->gsw_qos_ops.QoS_WredPortCfgSet(ops, &sVar);
+ 	}
+ 
+ 	/* Setting Q WRED default config for Q0 to Q31 */
+-	for (j = 0; j <= 31; j++) {
++	for (j = 0; j < 32; j++) {
+ 		memset(&qcfg, 0x00, sizeof(qcfg));
+ 
+ 		qcfg.nQueueId = j;
+-		qcfg.nGreen_Min = 240;
+-		qcfg.nGreen_Max = 256;
++
++		if ((phy_eg_qmap & BIT(j))) {
++			qcfg.nYellow_Min = 240;
++			qcfg.nYellow_Max = 255;
++			qcfg.nGreen_Min = 240;
++			qcfg.nGreen_Max = 255;
++			qcfg.nReserveThreshold = 240;
++		} else {
++			qcfg.nYellow_Min = 120;
++			qcfg.nYellow_Max = 128;
++			qcfg.nGreen_Min = 120;
++			qcfg.nGreen_Max = 128;
++		}
+ 
+ 		ops->gsw_qos_ops.QoS_WredQueueCfgSet(ops, &qcfg);
+ 	}
+ 
++	/* Port 0/1/2 use SDMA tail drop watermark 6 */
++	for (j = 0; j < 3; j++) {
++		reg.nRegAddr = SDMA_PCTRL_DTHR_OFFSET + 6 * j;
++		ops->gsw_common_ops.RegisterGet(ops,&reg);
++		CLEAR_FILL_CTRL_REG(reg.nData, SDMA_PCTRL_DTHR_SHIFT,
++				    SDMA_PCTRL_DTHR_SIZE, 1);
++		ops->gsw_common_ops.RegisterSet(ops,&reg);
++	}
++
++	/* Port 3/4 use SDMA tail drop watermark 5 */
++	for (j = 3; j < 5; j++) {
++		reg.nRegAddr = SDMA_PCTRL_DTHR_OFFSET + 6 * j;
++		ops->gsw_common_ops.RegisterGet(ops,&reg);
++		CLEAR_FILL_CTRL_REG(reg.nData, SDMA_PCTRL_DTHR_SHIFT,
++				    SDMA_PCTRL_DTHR_SIZE, 0);
++		ops->gsw_common_ops.RegisterSet(ops,&reg);
++	}
++
++	/* set tail drop watermark 5 to lower value */
++	reg.nRegAddr = SDMA_FCTHR5_THR5_OFFSET;
++	ops->gsw_common_ops.RegisterGet(ops,&reg);
++	CLEAR_FILL_CTRL_REG(reg.nData, SDMA_FCTHR5_THR5_SHIFT,
++			    SDMA_FCTHR5_THR5_SIZE, 0x2FF);
++	ops->gsw_common_ops.RegisterSet(ops,&reg);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
+index 13aa259bf32b..364d0455b175 100644
+--- a/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
++++ b/drivers/net/ethernet/lantiq/switch-api/gsw_flow_core.c
+@@ -9686,7 +9686,7 @@ GSW_return_t GSW_QoS_WredQueueCfgGet(void *cdev,
+ 	}
+ 
+ 	/* For different color 0(not drop) 1(Green) 2(Yellow) 3(Red) */
+-	for (crcode = 1; crcode < 4; crcode++) {
++	for (crcode = 0; crcode < 4; crcode++) {
+ 		addr = ((qid << 3) | crcode);
+ 
+ 		bmtable.adr.raw = (u16)addr;
+@@ -9709,6 +9709,10 @@ GSW_return_t GSW_QoS_WredQueueCfgGet(void *cdev,
+ 			parm->nGreen_Max = bmtable.value[1];
+ 			parm->nGreen_Min = bmtable.value[0];
+ 			break;
++
++		case 0:
++			parm->nReserveThreshold = bmtable.value[0];
++			break;
+ 		}
+ 	}
+ 
+@@ -9746,7 +9750,7 @@ GSW_return_t GSW_QoS_WredQueueCfgSet(void *cdev,
+ 	}
+ 
+ 	/* For different color 0(not drop) 1(Green) 2(Yellow) 3(Red) */
+-	for (crcode = 1; crcode < 4; crcode++) {
++	for (crcode = parm->nReserveThreshold ? 0 : 1; crcode < 4; crcode++) {
+ 		addr = (((qid << 3) & 0xF8) | crcode);
+ 
+ 		bmtable.adr.raw = (u16)addr;
+@@ -9766,6 +9770,11 @@ GSW_return_t GSW_QoS_WredQueueCfgSet(void *cdev,
+ 			bmtable.value[1] = parm->nGreen_Max;
+ 			bmtable.value[0] = parm->nGreen_Min;
+ 			break;
++
++		case 0:
++		    bmtable.value[1] = 0;
++			bmtable.value[0] = parm->nReserveThreshold;
++			break;
+ 		}
+ 
+ 		bmtable.tableID = PQM_THRESHOLD;
+@@ -25222,7 +25231,7 @@ GSW_return_t GSW_CtpPortConfigSet(void *cdev, GSW_CTP_portConfig_t *param)
+ 
+ 			gswdev->ctpportconfig_idx[ctp_port].IngressTflowAssigned = 1;
+ 			gswdev->ctpportconfig_idx[ctp_port].IngressTflowFirstIdx = idx;
+-			gswdev->ctpportconfig_idx[ctp_port].IngressTflowNumberOfEntrys = 
++			gswdev->ctpportconfig_idx[ctp_port].IngressTflowNumberOfEntrys =
+ 				param->nNumberOfFlowEntries;
+ 
+ 			tbl_prog_ctpport_ingress.val[7] |= (param->nFirstFlowEntryIndex & 0x1FC);
+diff --git a/include/net/switch_api/lantiq_gsw.h b/include/net/switch_api/lantiq_gsw.h
+index cebcffea260f..7b3cefcd5fa1 100644
+--- a/include/net/switch_api/lantiq_gsw.h
++++ b/include/net/switch_api/lantiq_gsw.h
+@@ -1111,6 +1111,8 @@ typedef struct {
+ 	u32	nGreen_Min;
+ 	/** WRED Green Threshold Max [number of segments]. */
+ 	u32	nGreen_Max;
++	/** Reserved Buffer Threshold */
++	u32	nReserveThreshold;
+ } GSW_QoS_WRED_QueueCfg_t;
+ 
+ /** \brief Configures the WRED threshold parameter per port.

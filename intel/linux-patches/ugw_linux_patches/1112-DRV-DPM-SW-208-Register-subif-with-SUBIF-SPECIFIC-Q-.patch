@@ -1,0 +1,269 @@
+From 9035cf762e8cb0620e000c2478ef25dd5ed279b7 Mon Sep 17 00:00:00 2001
+From: thampan <joby.thampan@intel.com>
+Date: Wed, 25 Mar 2020 19:14:09 +0800
+Subject: [PATCH] DRV_DPM_SW-208: Register subif with SUBIF_SPECIFIC_Q_FLAG
+
+    - This feature allows user to manage Queue creation and deletion
+      DPM will manage only CQM Deq Port and DMA channel enable/disable
+    - QoS detailed Debug prints moved to QOS_DETAIL
+---
+ drivers/net/datapath/dpm/datapath_api.c          | 16 ++++++++--
+ drivers/net/datapath/dpm/gswip31/datapath_misc.c | 37 +++++++++---------------
+ drivers/net/datapath/dpm/gswip31/datapath_ppv4.c | 30 +++++++++----------
+ 3 files changed, 42 insertions(+), 41 deletions(-)
+
+diff --git a/drivers/net/datapath/dpm/datapath_api.c b/drivers/net/datapath/dpm/datapath_api.c
+index d6e5ef79fc60..a57f7f119f83 100644
+--- a/drivers/net/datapath/dpm/datapath_api.c
++++ b/drivers/net/datapath/dpm/datapath_api.c
+@@ -777,6 +777,7 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	u32 dma_ch_offset, dma_ch_ref;
+ 	struct inst_info *dp_info = get_dp_prop_info(inst);
+ 	struct dp_node_alloc port_node;
++	struct q_info *q_info;
+ 
+ 	port_id = subif_id->port_id;
+ 	port_info = get_dp_port_info(inst, port_id);
+@@ -838,6 +839,7 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 	sif->netif = NULL;
+ 	port_info->num_subif--;
+ 
++	/* subif_hw_reset */
+ 	if (dp_info->subif_platform_set(inst, port_id, i, &platfrm_data,
+ 					flags)) {
+ 		pr_err("subif_platform_set fail\n");
+@@ -852,12 +854,22 @@ int32_t dp_deregister_subif_private(int inst, struct module *owner,
+ 			continue;
+ 
+ 		/* delete all queues which may created by PPA or other apps */
+-
+ 		port_node.inst = inst;
+ 		port_node.dp_port = port_id;
+ 		port_node.type = DP_NODE_PORT;
+ 		port_node.id.cqm_deq_port = cqm_port;
+-		dp_node_children_free(&port_node, 0);
++
++		if (sif->data_flag_ops & DP_SUBIF_SPECIFIC_Q) {
++			q_info = get_dp_q_info(inst, sif->qid_list[j]);
++
++			if (q_info->flag && !q_info->need_free) {
++				/* Ref Cnt=0 Reset the used flag */
++				if (!q_info->ref_cnt)
++					q_info->flag = 0;
++			}
++		} else {
++			dp_node_children_free(&port_node, 0);
++		}
+ 		/*disable cqm port */
+ 		cbm_data.dp_inst = inst;
+ 		cbm_data.cbm_inst = dp_port_prop[inst].cbm_inst;
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_misc.c b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+index ab74b6cbe9f6..db77f6e022ed 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_misc.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_misc.c
+@@ -1829,28 +1829,20 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 			}
+ 			/* update scheduler table later */
+ 
+-		} else if (q_flag == DP_SUBIF_SPECIFIC_Q) { /*specified queue */
+-			q_info = get_dp_q_info(inst, q_port.qid);
++		} else if (q_flag == DP_SUBIF_SPECIFIC_Q) {
++			/* Q is created by Caller and QiD is in Subif Data */
++
++			/* Single GEM or 1 Subif have only 1 Qid
++			 * Multiple GEM or Multiple Subif can have same Qid
++			 */
++			q_info = get_dp_q_info(inst, data->subif_data->q_id);
+ 
+ 			if (!q_info->flag) {
+-				/* 1st time to use it
+-				 * In this case, normally this queue
+-				 * is created by caller
+-				 */
++				/* Mark this Q as Used */
+ 				q_info->flag = 1;
+-				/*caller q*/
+ 				q_info->need_free = 0;
+ 				q_info->ref_cnt = 1;
+ 
+-				/* update port table
+-				 * Note: since this queue is created
+-				 * by caller itself
+-				 *      we need find way to get cqm_dequeue_port
+-				 *      and qos_port later
+-				 */
+-				/* need set cqm_dequeue_port/qos_port
+-				 * since not fully tested
+-				 */
+ 				q_info->cqm_dequeue_port = q_port.cqe_deq;
+ 				deq_pinfo->qos_port = -1;
+ 				deq_pinfo->ref_cnt++;
+@@ -1858,7 +1850,10 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 					atomic_inc(&(dp_dma_chan_tbl[inst] +
+ 						     dma_ch_offset)->ref_cnt);
+ 			} else {
+-				/*note: don't change need_free in this case */
++				/* For Multiple GEM having same Q, we increment
++				 * Q reference count
++				 */
++				q_info->ref_cnt++;
+ 				get_dp_q_info(inst, q_port.cqe_deq)->ref_cnt++;
+ 				deq_pinfo->ref_cnt++;
+ 				if (port_info->num_dma_chan)
+@@ -1866,16 +1861,10 @@ static int subif_hw_set(int inst, int portid, int subif_ix,
+ 						     dma_ch_offset)->ref_cnt);
+ 			}
+ 
+-			/*get already stored q_node_id/qos_port id to q_port
+-			 */
++			q_port.qid = data->subif_data->q_id;
+ 			q_port.q_node = q_info->q_node_id;
+ 			q_port.port_node = deq_pinfo->qos_port;
+ 
+-			/* need to further set q_port.q_node/port_node
+-			 * via special internal QOS HAL API to get it
+-			 * since it is created by caller itself\n");
+-			 */
+-
+ 		} else {
+ 			/* auto sharing queue: if go to here,
+ 			 * it means sharing queue
+diff --git a/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c b/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c
+index 7b959e7e0dbd..6ef25c3501c4 100644
+--- a/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c
++++ b/drivers/net/datapath/dpm/gswip31/datapath_ppv4.c
+@@ -114,7 +114,7 @@ int dp_qos_queue_allocate(struct pp_qos_dev *qdev, u32 *id)
+ 	ret = pp_qos_queue_allocate(qdev, id);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS)
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL)
+ 		pr_info("%s %s QoS Dev %p ID %d\n",
+ 			__func__, ret ? "Fail" : "OK", qdev, *id);
+ #endif
+@@ -132,7 +132,7 @@ int dp_qos_queue_info_get(struct pp_qos_dev *qdev, u32 id,
+ 	ret = pp_qos_queue_info_get(qdev, id, info);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s %s QoS Dev %p ID %d\n",
+ 			__func__, ret ? "Fail" : "OK", qdev, id);
+ 		pr_info("================================\n");
+@@ -159,7 +159,7 @@ int dp_qos_sched_allocate(struct pp_qos_dev *qdev, u32 *id)
+ 	ret = pp_qos_sched_allocate(qdev, id);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS)
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL)
+ 		pr_info("%s %s QoS Dev %p ID %d\n",
+ 			__func__, ret ? "Fail" : "OK", qdev, *id);
+ #endif
+@@ -183,7 +183,7 @@ int dp_qos_port_allocate(struct pp_qos_dev *qdev,
+ 	ret =  pp_qos_port_allocate(qdev, physical_id, id);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS)
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL)
+ 		pr_info("%s %s QoS Dev %p ID %d\n",
+ 			__func__, ret ? "Fail" : "OK", qdev, *id);
+ #endif
+@@ -194,7 +194,7 @@ int dp_qos_port_set(struct pp_qos_dev *qdev, u32 id,
+ 		    const struct pp_qos_port_conf *conf)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s QoS Dev %p ID %d\n", __func__, qdev, id);
+ 		pr_info("================================\n");
+ 		dp_print_port_conf(conf);
+@@ -207,7 +207,7 @@ int dp_qos_port_set(struct pp_qos_dev *qdev, u32 id,
+ void dp_qos_port_conf_set_default(struct pp_qos_port_conf *conf)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s\n", __func__);
+ 		pr_info("================================\n");
+ 		dp_print_port_conf(conf);
+@@ -220,7 +220,7 @@ void dp_qos_port_conf_set_default(struct pp_qos_port_conf *conf)
+ void dp_qos_queue_conf_set_default(struct pp_qos_queue_conf *conf)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s\n", __func__);
+ 		pr_info("================================\n");
+ 		dp_print_queue_conf(conf);
+@@ -234,7 +234,7 @@ int dp_qos_queue_set(struct pp_qos_dev *qdev, u32 id,
+ 		     const struct pp_qos_queue_conf *conf)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("Attach q_node=%d to parent_node=%d\n",
+ 			id, conf->queue_child_prop.parent);
+ 		pr_info("%s QoS Dev %p ID %d\n", __func__, qdev, id);
+@@ -248,7 +248,7 @@ int dp_qos_queue_set(struct pp_qos_dev *qdev, u32 id,
+ void dp_qos_sched_conf_set_default(struct pp_qos_sched_conf *conf)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s\n", __func__);
+ 		pr_info("================================\n");
+ 		dp_print_sched_conf(conf);
+@@ -261,7 +261,7 @@ int dp_qos_sched_set(struct pp_qos_dev *qdev, u32 id,
+ 		     const struct pp_qos_sched_conf *conf)
+ {
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s QoS Dev %p ID %d\n", __func__, qdev, id);
+ 		pr_info("================================\n");
+ 		dp_print_sched_conf(conf);
+@@ -278,7 +278,7 @@ int dp_qos_queue_conf_get(struct pp_qos_dev *qdev, u32 id,
+ 	ret = pp_qos_queue_conf_get(qdev, id, conf);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("%s QoS Dev %p ID %d\n", __func__, qdev, id);
+ 		pr_info("================================\n");
+ 		dp_print_queue_conf(conf);
+@@ -297,7 +297,7 @@ int dp_qos_sched_conf_get(struct pp_qos_dev *qdev, u32 id,
+ 	ret = pp_qos_sched_conf_get(qdev, id, conf);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS) {
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL) {
+ 		pr_info("================================\n");
+ 		dp_print_sched_conf(conf);
+ 	}
+@@ -317,7 +317,7 @@ int dp_qos_sched_get_queues(struct pp_qos_dev *qdev, u32 id,
+ 				      queues_num);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS)
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL)
+ 		pr_info("%s ret = %d queue_ids %d size %d queue_num %d\n",
+ 			__func__, ret, *queue_ids, size, *queues_num);
+ #endif
+@@ -335,7 +335,7 @@ int dp_qos_port_get_queues(struct pp_qos_dev *qdev, u32 id,
+ 	ret = pp_qos_port_get_queues(qdev, id, queue_ids, size, queues_num);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS)
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL)
+ 		pr_info("%s ret = %d queue_ids %d size %d queue_num %d\n",
+ 			__func__, ret, *queue_ids, size, *queues_num);
+ #endif
+@@ -352,7 +352,7 @@ int dp_qos_port_conf_get(struct pp_qos_dev *qdev, u32 id,
+ 	ret = pp_qos_port_conf_get(qdev, id, conf);
+ 
+ #if IS_ENABLED(CONFIG_INTEL_DATAPATH_DBG)
+-	if (dp_dbg_flag & DP_DBG_FLAG_QOS)
++	if (dp_dbg_flag & DP_DBG_FLAG_QOS_DETAIL)
+ 		dp_print_port_conf(conf);
+ #endif
+ 	return ret;

@@ -1,0 +1,172 @@
+From 4d42e4840f6d117ec4bc032494d8ae2694da0b0d Mon Sep 17 00:00:00 2001
+From: Lishan Liu <lishan.liu@intel.com>
+Date: Thu, 20 Aug 2020 16:17:11 +0800
+Subject: [PATCH] DRVLIB_SW-3805 CQM DMA and PON DQ PORT flushing
+
+---
+ drivers/net/ethernet/lantiq/cqm/prx300/cqm.c | 94 +++++++++++++++++++++++++---
+ include/net/lantiq_cbm_api.h                 |  3 +
+ 2 files changed, 90 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+index 13e5f210e3de..81962cd8d006 100644
+--- a/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
++++ b/drivers/net/ethernet/lantiq/cqm/prx300/cqm.c
+@@ -53,6 +53,7 @@ static void init_cqm_deq_cpu_port(int idx, u32 tx_ring_size);
+ static s32 cqm_dequeue_dma_port_uninit(s32 cqm_port_id, u32 flags);
+ static void fill_dp_alloc_data(struct cbm_dp_alloc_data *data, int dp,
+ 			       int port, u32 flags);
++static void cqm_deq_port_flush(int port);
+ 
+ #ifdef ENABLE_LL_DEBUG
+ static void do_cbm_debug_tasklet(unsigned long cpu);
+@@ -2601,8 +2602,9 @@ static s32 handle_dma_chnl_init(int port, u32 flags)
+ {
+ 	struct cqm_dqm_port_info *p_info;
+ 	int chan;
++	int port_type = find_dqm_port_type(port);
+ 
+-	if (find_dqm_port_type(port) == DQM_PON_TYPE)
++	if (port_type == DQM_PON_TYPE)
+ 		p_info = &dqm_port_info[DQM_PON_START_ID];
+ 	else
+ 		p_info = &dqm_port_info[port];
+@@ -2611,8 +2613,12 @@ static s32 handle_dma_chnl_init(int port, u32 flags)
+ 	if (flags & CBM_PORT_F_DISABLE) {
+ 		if (chan)
+ 			ltq_dma_chan_off(chan);
+-		cqm_dma_port_enable(port, CBM_PORT_F_DEQUEUE_PORT |
+-				    CBM_PORT_F_DISABLE, 0);
++		if (port_type != DQM_PON_TYPE) {
++			if (flags & CBM_PORT_F_FLUSH)
++				cqm_deq_port_flush(port);
++			cqm_dma_port_enable(port, CBM_PORT_F_DEQUEUE_PORT |
++					    CBM_PORT_F_DISABLE, 0);
++		}
+ 	} else {
+ 		if (chan && p_info->dma_ch_in_use) {
+ 			cqm_dma_port_enable(port, CBM_PORT_F_DEQUEUE_PORT, 0);
+@@ -2651,6 +2657,35 @@ static void cqm_free_aca_port(s32 port)
+ 	}
+ }
+ 
++static void cqm_deq_pon_port_disable(u32 port, u32 alloc_flags)
++{
++	struct cqm_dqm_port_info *p_info;
++	void *deq = cqm_ctrl->deq;
++	int chan, i;
++	u32 pib_ctrl_val;
++
++	p_info = &dqm_port_info[port];
++	chan = p_info->dma_ch;
++	if (chan)
++		ltq_dma_chan_off(chan);
++
++	if (alloc_flags & (DP_F_EPON | DP_F_GPON)) {
++		pib_ctrl_val = cbm_r32(cqm_ctrl->pib + PIB_CTRL);
++		pib_ctrl_val |= PIB_CTRL_PIB_BYPASS_MASK;
++		cbm_w32(cqm_ctrl->pib + PIB_CTRL, pib_ctrl_val);
++		cqm_deq_port_flush(port);
++
++		for (i = DQM_PON_START_ID; i < DQM_PON_END_ID; i++)
++			cbm_w32((deq + DQ_PON_PORT((i), cfg)), 0);
++
++		cbm_w32((cqm_ctrl->pib + PIB_PORT_EN_31_0), 0);
++		cbm_w32((cqm_ctrl->pib + PIB_PORT_EN_64_32), 0);
++	} else if (alloc_flags & DP_F_FAST_ETH_WAN) {
++		cqm_deq_port_flush(port);
++		cbm_w32((deq + DQ_PON_PORT((port), cfg)), 0);
++	}
++}
++
+ static s32 dp_enable(struct module *owner, u32 port_id,
+ 		     struct cbm_dp_en_data *data, u32 flags, u32 alloc_flags)
+ {
+@@ -2671,6 +2706,7 @@ static s32 dp_enable(struct module *owner, u32 port_id,
+ 
+ 	dqp_info = &dqm_port_info[data->deq_port];
+ 	if (flags & CBM_PORT_F_DISABLE) {
++		flags |= CBM_PORT_F_FLUSH;
+ 		dqp_info->ref_cnt--;
+ 		if (dqp_info->ref_cnt)
+ 			return CBM_SUCCESS;
+@@ -2692,10 +2728,10 @@ static s32 dp_enable(struct module *owner, u32 port_id,
+ 			cqm_free_aca_port(port);
+ 		break;
+ 	case DQM_PON_TYPE:
+-		if (flags & CBM_PORT_F_DISABLE) {
+-			cbm_w32((deq + DQ_PON_PORT((port), cfg)), 0x0);
+-			pib_port_enable(port, 0);
+-		} else {
++		if ((flags & CBM_PORT_F_DISABLE) && (data->dma_chnl_init))
++			cqm_deq_pon_port_disable(port, alloc_flags);
++
++		if (!(flags & CBM_PORT_F_DISABLE)) {
+ 			val = CFG_PON_EGP_26_DQREQ_MASK |
+ 				CFG_PON_EGP_26_BUFRTN_MASK |
+ 				CFG_PON_EGP_26_BFBPEN_MASK |
+@@ -2905,6 +2941,50 @@ static struct sk_buff *cqm_alloc_skb(unsigned int size, gfp_t priority)
+ 	return skbuf;
+ }
+ 
++static void cqm_deq_port_flush(int port)
++{
++	int port_type = find_dqm_port_type(port);
++	void *desc3_addr_base;
++	u32 dw3, no_packet = 0;
++	u32 i = 0;
++	u32 d_num = dqm_port_info[port].deq_info.num_desc;
++	u32 total_free_cnt = 0;
++	u32 dqpc_reg;
++
++	if (port_type == DQM_DMA_TYPE)
++		desc3_addr_base =
++			cqm_ctrl->dmadesc + CQM_DEQ_DMA_DESC(port, 0) + 0xc;
++	else if (port_type == DQM_PON_TYPE)
++		desc3_addr_base =
++			cqm_ctrl->dmadesc + CQM_DEQ_PON_DMA_DESC(port, 0)
++			+ 0xc;
++	else
++		return;
++
++	while (no_packet < 3 * d_num) {
++		dw3 = cbm_r32(desc3_addr_base + i * 0x10);
++		if (dw3 & OWN_BIT) {
++			total_free_cnt++;
++			dev_dbg(cqm_ctrl->dev, "%s desc_%d, addr, dw3:%x, cnt:%d\n",
++				__func__, i, dw3, total_free_cnt);
++			cbm_w32((void *)desc3_addr_base + i * 0x10,
++				(dw3 & ~OWN_BIT) | COMPLETE_BIT);
++			no_packet = 0;
++		} else {
++			no_packet++;
++			dev_dbg(cqm_ctrl->dev, "no_packet %d desc_%d:0x%x\n",
++				no_packet, i, dw3);
++		}
++		i = (i + 1) % d_num;
++	}
++
++	if (port_type == DQM_DMA_TYPE) {
++		dqpc_reg = cbm_r32(cqm_ctrl->deq + DQ_DMA_PORT(port, dqpc));
++		dev_dbg(cqm_ctrl->dev, "%s: DQPC_EGP_%d = %d\n",
++			__func__, port, dqpc_reg);
++	}
++}
++
+ s32 qos_q_flush(s32 cqm_inst, s32 cqm_drop_port, s32 qid)
+ {
+ 	void *dma_desc = cqm_ctrl->dmadesc;
+diff --git a/include/net/lantiq_cbm_api.h b/include/net/lantiq_cbm_api.h
+index 4b9fdacfd085..b42ed8b6c89f 100644
+--- a/include/net/lantiq_cbm_api.h
++++ b/include/net/lantiq_cbm_api.h
+@@ -133,6 +133,9 @@
+ /*! \brief WAVE500 WLAN special CPU port */
+ #define CBM_PORT_F_WAVE500_PORT		0x20
+ 
++/*! \brief Flush the DEQ port */
++#define CBM_PORT_F_FLUSH 0x40
++
+ /** \addtogroup CBM_Driver_CPU_Defines */
+ /*! \brief Stop Rx i.e. assert backpressure */
+ #define CBM_CPU_F_RX_STOP		0x1

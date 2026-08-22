@@ -1,0 +1,277 @@
+From bb174b8ffdc200394d09189c5fee02340e1624ee Mon Sep 17 00:00:00 2001
+From: Rekha Eswaran <rekha.eswaran@intel.com>
+Date: Wed, 19 Dec 2018 17:01:52 +0800
+Subject: [PATCH] UGW_SW-33200: Fix for DP crash issue during WLAN or other PTM
+ device de-registration
+
+---
+ drivers/net/ethernet/lantiq/datapath/datapath.h    |  15 ++--
+ .../net/ethernet/lantiq/datapath/datapath_api.c    |  15 ++--
+ .../net/ethernet/lantiq/datapath/datapath_misc.c   | 100 ++++++++++++---------
+ include/net/datapath_api.h                         |   1 +
+ 4 files changed, 77 insertions(+), 54 deletions(-)
+
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath.h b/drivers/net/ethernet/lantiq/datapath/datapath.h
+index 8d86383bb671..48de260c9ce9 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath.h
++++ b/drivers/net/ethernet/lantiq/datapath/datapath.h
+@@ -768,14 +768,19 @@ extern int32_t (*qos_mgr_hook_setup_tc)(struct net_device *dev, u32 handle,
+ extern struct hlist_head dp_subif_list[DP_SUBIF_LIST_HASH_SIZE];
+ int32_t dp_sync_subifid(struct net_device *dev, char *subif_name,
+ 			dp_subif_t *subif_id, struct dp_subif_data *data,
+-			u32 flags);
++			u32 flags, int *f_subif_up);
++int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
++			     dp_subif_t *subif_id, struct dp_subif_data *data,
++			     u32 flags, dp_get_netif_subifid_fn_t subifid_fn,
++			     int *f_subif_up);
+ int32_t	dp_update_subif(struct net_device *netif, void *data, dp_subif_t *subif,
+-			char *subif_name, u32 flags);
++			char *subif_name, u32 flags,
++			dp_get_netif_subifid_fn_t subifid_fn);
+ int32_t	dp_del_subif(struct net_device *netif, void *data, dp_subif_t *subif,
+ 		     char *subif_name, u32 flags);
+-struct dp_subif_cache *dp_subif_lookup(struct hlist_head *head,
+-				       struct net_device *dev,
+-				       void *data);
++struct dp_subif_cache *dp_subif_lookup_safe(struct hlist_head *head,
++					    struct net_device *dev,
++					    void *data);
+ int dp_subif_list_init(void);
+ u32 dp_subif_hash(struct net_device *dev);
+ int32_t dp_get_netif_subifid_priv(struct net_device *netif,
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_api.c b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+index a2638e54ea2c..821e2b474112 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_api.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_api.c
+@@ -920,9 +920,10 @@ int32_t dp_register_subif_ext(int inst, struct module *owner,
+ 			      struct dp_subif_data *data, uint32_t flags)
+ {
+ 	int res = DP_FAILURE;
+-	int port_id;
++	int port_id, f_subif = -1;
+ 	struct pmac_port_info *port_info;
+ 	struct dp_subif_data tmp_data = {0};
++	dp_get_netif_subifid_fn_t subifid_fn_t = NULL;
+ 
+ 	if (unlikely(!dp_init_ok)) {
+ 		DP_DEBUG(DP_DBG_FLAG_REG,
+@@ -996,9 +997,13 @@ int32_t dp_register_subif_ext(int inst, struct module *owner,
+ 		dp_register_subif_private(inst, owner, dev,
+ 					  subif_name,
+ 					  subif_id, data, flags);
+-	if (!res)
+-		dp_sync_subifid(dev, subif_name, subif_id, data, flags);
++	if (!(flags & DP_F_SUBIF_LOGICAL))
++		subifid_fn_t = port_info->cb.get_subifid_fn;
++	dp_sync_subifid(dev, subif_name, subif_id, data, flags, &f_subif);
+ 	DP_LIB_UNLOCK(&dp_lock);
++	if (!res)
++		dp_sync_subifid_priv(dev, subif_name, subif_id, data, flags,
++				     subifid_fn_t, &f_subif);
+ 
+ 	return res;
+ }
+@@ -1050,7 +1055,7 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ 	idx = dp_subif_hash(netif);
+ 	//TODO handle DSL case in future
+ 	rcu_read_lock_bh();
+-	dp_subif = dp_subif_lookup(&dp_subif_list[idx], netif, subif_data);
++	dp_subif = dp_subif_lookup_safe(&dp_subif_list[idx], netif, subif_data);
+ 	if (!dp_subif) {
+ 		PR_ERR("Failed dp_subif_lookup: %s\n",
+ 		       netif ? netif->name : "NULL");
+@@ -1060,7 +1065,7 @@ int32_t dp_get_netif_subifid(struct net_device *netif, struct sk_buff *skb,
+ 	memcpy(subif, &dp_subif->subif, sizeof(*subif));
+ 	subifid_fn_t = dp_subif->subif_fn;
+ 	rcu_read_unlock_bh();
+-	if (subifid_fn_t) {
++	if (subifid_fn_t && !(flags & DP_F_SUBIF_LOGICAL)) {
+ 		/*subif->subif will be set by callback api itself */
+ 		res =
+ 		    subifid_fn_t(netif, skb, subif_data, dst_mac, subif,
+diff --git a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+index 3d226103fff6..d0aa6efddad4 100644
+--- a/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
++++ b/drivers/net/ethernet/lantiq/datapath/datapath_misc.c
+@@ -1229,6 +1229,16 @@ int dp_get_fid_by_brname(struct net_device *dev, int *inst)
+ }
+ #endif
+ 
++void dp_subif_reclaim(struct rcu_head *rp)
++{
++	struct dp_subif_cache *dp_subif =
++		container_of(rp, struct dp_subif_cache, rcu);
++
++	if (dp_subif->data)
++		kfree(dp_subif->data);
++	kfree(dp_subif);
++}
++
+ u32 dp_subif_hash(struct net_device *dev)
+ {
+ 	unsigned long index;
+@@ -1249,25 +1259,6 @@ int dp_subif_list_init(void)
+ 	return 0;
+ }
+ 
+-struct dp_subif_cache *dp_subif_lookup(struct hlist_head *head,
+-				       struct net_device *dev,
+-				       void *data)
+-{
+-	struct dp_subif_cache *item;
+-
+-	hlist_for_each_entry(item, head, hlist) {
+-		if (dev) {
+-			if (item->dev == dev)
+-				return item;
+-		} /*else if ((data == item->subif->alloc_flag) &&
+-				((int)data & DP_F_FAST_DSL)) {
+-			return item;
+-		}
+-		*/
+-	}
+-	return NULL;
+-}
+-
+ struct dp_subif_cache *dp_subif_lookup_safe(struct hlist_head *head,
+ 					    struct net_device *dev,
+ 					    void *data)
+@@ -1298,27 +1289,18 @@ int32_t dp_del_subif(struct net_device *netif, void *data, dp_subif_t *subif,
+ 		return -1;
+ 	}
+ 	hlist_del_rcu(&dp_subif->hlist);
+-	synchronize_rcu_bh();
+-	kfree(dp_subif->data);
+-	kfree(dp_subif);
++	call_rcu_bh(&dp_subif->rcu, dp_subif_reclaim);
+ 	return 1;
+ }
+ 
+ int32_t dp_update_subif(struct net_device *netif, void *data,
+-			dp_subif_t *subif, char *subif_name, u32 flags)
++			dp_subif_t *subif, char *subif_name, u32 flags,
++			dp_get_netif_subifid_fn_t subifid_fn_t)
+ {
+ 	struct dp_subif_cache *dp_subif_new, *dp_subif;
+ 	u32 idx;
+-	int inst, portid;
+-	dp_get_netif_subifid_fn_t subifid_fn_t = NULL;
+-	struct pmac_port_info *port_info;
+ 
+ 	idx = dp_subif_hash(netif);
+-	inst = subif->inst;
+-	portid = subif->port_id;
+-	port_info = &dp_port_info[inst][portid];
+-	if (!(flags & DP_F_SUBIF_LOGICAL))
+-		subifid_fn_t = port_info->cb.get_subifid_fn;
+ 	dp_subif = dp_subif_lookup_safe(&dp_subif_list[idx], netif, data);
+ 	if (!dp_subif) { /*alloc new */
+ 		dp_subif = kzalloc(sizeof(*dp_subif), GFP_KERNEL);
+@@ -1346,8 +1328,7 @@ int32_t dp_update_subif(struct net_device *netif, void *data,
+ 		dp_subif_new->subif_fn = subifid_fn_t;
+ 		hlist_replace_rcu(&dp_subif->hlist,
+ 				  &dp_subif_new->hlist);
+-		synchronize_rcu_bh();
+-		kfree(dp_subif);
++		call_rcu_bh(&dp_subif->rcu, dp_subif_reclaim);
+ 		return 0;
+ 	}
+ 	return -1;
+@@ -1355,10 +1336,9 @@ int32_t dp_update_subif(struct net_device *netif, void *data,
+ 
+ int32_t dp_sync_subifid(struct net_device *dev, char *subif_name,
+ 			dp_subif_t *subif_id, struct dp_subif_data *data,
+-			u32 flags)
++			u32 flags, int *f_subif_up)
+ {
+ 	void *subif_data = NULL;
+-
+ 	/* Note: workaround to set dummy subif_data via subif_name for DSL case.
+ 	 *       During dp_get_netif_subifID, subif_data is used to get its PVC
+ 	 *       information.
+@@ -1369,31 +1349,63 @@ int32_t dp_sync_subifid(struct net_device *dev, char *subif_name,
+ 		subif_data = (void *)subif_name;
+ 	/*check flag for register / deregister to update/del */
+ 	if (flags & DP_F_DEREGISTER) {
+-		if (data->ctp_dev)
+-			dp_del_subif(data->ctp_dev, subif_data, subif_id,
+-				     NULL, flags);
+ 
+ 		if (dp_get_netif_subifid_priv(dev, NULL, subif_data, NULL,
+ 					      subif_id, 0))
+-			dp_del_subif(dev, subif_data, subif_id, subif_name,
+-				     flags);
++			*f_subif_up = 0;
+ 		else
+-			dp_update_subif(dev, subif_data, subif_id, subif_name,
+-					flags);
++			*f_subif_up = 1;
+ 	} else {
+ 		if (dp_get_netif_subifid_priv(dev, NULL, subif_data,
+ 					      NULL, subif_id, 0)) {
+ 			PR_ERR("DP subif synchronization fail\n");
+ 			return DP_FAILURE;
+ 		}
+-		dp_update_subif(dev, subif_data, subif_id, subif_name, flags);
+ 		if (data->ctp_dev) {
+ 			if (dp_get_netif_subifid_priv(data->ctp_dev, NULL,
+ 						      subif_data, NULL,
+ 						      subif_id, 0))
+ 				return DP_FAILURE;
++		}
++		*f_subif_up = 1;
++	}
++	return 0;
++}
++
++int32_t dp_sync_subifid_priv(struct net_device *dev, char *subif_name,
++			     dp_subif_t *subif_id, struct dp_subif_data *data,
++			     u32 flags, dp_get_netif_subifid_fn_t subifid_fn,
++			     int *f_subif_up)
++{
++	void *subif_data = NULL;
++
++	/* Note: workaround to set dummy subif_data via subif_name for DSL case.
++	 *       During dp_get_netif_subifID, subif_data is used to get its PVC
++	 *       information.
++	 * Later VRX518/618 need to provide valid subif_data in order to support
++	 * multiple DSL instances during dp_register_subif_ext
++	 */
++	if (flags & DP_F_FAST_DSL)
++		subif_data = (void *)subif_name;
++	/*check flag for register / deregister to update/del */
++	if (flags & DP_F_DEREGISTER) {
++		if (data->ctp_dev)
++			dp_del_subif(data->ctp_dev, subif_data, subif_id,
++				     NULL, flags);
++
++		if (*f_subif_up == 0)
++			dp_del_subif(dev, subif_data, subif_id, subif_name,
++				     flags);
++		else if (*f_subif_up == 1)
++			dp_update_subif(dev, subif_data, subif_id, subif_name,
++					flags, subifid_fn);
++	} else {
++		if (*f_subif_up == 1) {
++			dp_update_subif(dev, subif_data, subif_id, subif_name,
++					flags, subifid_fn);
++		if (data->ctp_dev)
+ 			dp_update_subif(data->ctp_dev, subif_data, subif_id,
+-					NULL, flags);
++					NULL, flags, subifid_fn);
+ 		}
+ 	}
+ 	return 0;
+diff --git a/include/net/datapath_api.h b/include/net/datapath_api.h
+index 6bbac3049065..77e143ab3b0b 100644
+--- a/include/net/datapath_api.h
++++ b/include/net/datapath_api.h
+@@ -652,6 +652,7 @@ struct dp_subif_cache {
+ 					      * of netif/netdevice
+ 					      */
+ 	void *data;
++	struct rcu_head rcu;
+ };
+ 
+ /*! @brief struct dp_subif_data */

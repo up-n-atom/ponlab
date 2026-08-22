@@ -1,0 +1,255 @@
+From f27aaf048476276cf637157c791ff4a873f9cbd0 Mon Sep 17 00:00:00 2001
+From: Oren Bakshe <oren.bakshe@intel.com>
+Date: Mon, 22 Jun 2020 10:44:22 +0300
+Subject: [PATCH] PONRTSYS-7747: buffer exchange
+
+---
+ drivers/net/ppv4/pp-api/pp-misc/pp_misc.c          |  3 ++-
+ .../ppv4/pp-api/pp-session-mgr/pp_session_mgr.c    | 28 +++++++++++++++++++
+ .../pp-api/pp-session-mgr/pp_session_mgr_debugfs.c |  1 +
+ .../pp-session-mgr/pp_session_mgr_internal.h       | 31 ++++++++++++++++++----
+ drivers/net/ppv4/pp-hal/micro-controller/uc.c      | 22 +++++++++++++++
+ drivers/net/ppv4/pp-hal/micro-controller/uc.h      |  6 +++++
+ .../net/ppv4/pp-hal/micro-controller/uc_common.h   | 15 ++++++++++-
+ 7 files changed, 99 insertions(+), 7 deletions(-)
+
+diff --git a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+index caae900d4e30..7c30a344d396 100644
+--- a/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
++++ b/drivers/net/ppv4/pp-api/pp-misc/pp_misc.c
+@@ -943,7 +943,8 @@ s32 pp_driver_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 				      (stats)->duplicates + \
+ 				      (stats)->unsupported + \
+ 				      (stats)->invalid_len + \
+-				      (stats)->timedout)
++				      (stats)->timedout + \
++				      (stats)->bm_null_buff)
+ 
+ s32 pp_hal_global_stats_show(char *buf, size_t sz, size_t *n, void *stats,
+ 			     u32 num_stats, void *data)
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+index cfbc1f1b9f49..9033f3f14aff 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr.c
+@@ -2659,6 +2659,10 @@ static s32 __smgr_frag_si_ud_set(struct sess_info *s)
+  */
+ static s32 __smgr_si_ud_set(struct sess_info *s)
+ {
++	struct si_ud_reass_info reass_info = {0};
++	struct pp_port_cfg cfg;
++	s32 ret = 0;
++
+ 	if (s->args->ps_off < PP_INVALID_PS_OFF)
+ 		s->si.ps_off = s->args->ps_off;
+ 	else
+@@ -2677,6 +2681,30 @@ static s32 __smgr_si_ud_set(struct sess_info *s)
+ 	     pktprs_first_frag(SESS_RX_PKT(s), HDR_INNER))) {
+ 		s->si.tmpl_ud_sz = PP_TEMPLATE_UD_SZ;
+ 		s->si.ps_copy = true;
++
++		if (s->args->ud_sz) {
++			pr_err("ud_sz must be 0 in reassembly\n");
++			return -EINVAL;
++		}
++
++		ret = pp_port_get(s->args->eg_port, &cfg);
++		if (unlikely(ret)) {
++			pr_err("pp_port_get err %d\n", ret);
++			return ret;
++		}
++
++		reass_info.eg_port_hr = cfg.tx.headroom_size;
++		reass_info.eg_port_tr = cfg.tx.tailroom_size;
++		reass_info.flags = 0;
++		if (cfg.tx.wr_desc)
++			reass_info.flags |= REASS_INFO_FLAG_WR_DESC;
++		if (cfg.tx.prel2_en)
++			reass_info.flags |= REASS_INFO_FLAG_PREL2_EN;
++
++		memcpy(s->si.ud + PP_PS_REGION_SZ,
++		       &reass_info,
++		       sizeof(reass_info));
++		s->si.si_ud_sz = PP_PS_REGION_SZ + sizeof(reass_info);
+ 	} else {
+ 		s->si.tmpl_ud_sz = s->args->tmp_ud_sz;
+ 		s->si.ps_copy =
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+index 4bf8cc1e2866..c3c538d6bcbe 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_debugfs.c
+@@ -2296,6 +2296,7 @@ s32 __smgr_reass_stats_show(char *buf, size_t sz, size_t *n, void *s, u32 num,
+ 		"unsupported",
+ 		"invalid_len",
+ 		"dropped",
++		"bm_null_buff",
+ 	};
+ 
+ 	pr_buf(buf, sz, *n, "\n");
+diff --git a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+index 442780cf089f..54cdeabfb5f5 100644
+--- a/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
++++ b/drivers/net/ppv4/pp-api/pp-session-mgr/pp_session_mgr_internal.h
+@@ -321,23 +321,44 @@ struct sess_info {
+ 
+ /**
+  * struct si_ud_frag_info - Fragmentation info
+- * @l3_off: l3 offset. In case of inner fragmentation,
+- * 	    the offset will be to the inner l3 hdr
+- * @flags: Fragmentation flags
+- * @dst_q: Destination queue
+- * @max_pkt_size: Port's max_pkt_size
+  *
+  * This structure defines the fragmentation information saved in the si ud
+  * right after the ps (Starts at si.ud + PP_PS_REGION_SZ).
+  * Used in the fragmenter uc
+  */
+ struct si_ud_frag_info {
++	/*! Fragmentation flags */
+ 	u8	flags;
++
++	/*! l3 offset. In case of inner fragmentation,
++	 *  the offset will be to the inner l3 hdr */
+ 	u8	l3_off;
++
++	/*! Destination queue */
+ 	u16	dst_q;
++
++	/*! Port's max_pkt_size */
+ 	u16	max_pkt_size;
+ } __packed;
+ 
++/**
++ * struct si_ud_reass_info - Reassembly info
++ *
++ * This structure defines the reassembly information saved in the si ud
++ * right after the ps (Starts at si.ud + PP_PS_REGION_SZ).
++ * Used in the egress uc for reassembly
++ */
++struct si_ud_reass_info {
++	/*! egress port headroom */
++	u16 eg_port_hr;
++
++	/*! egress port tailroom */
++	u16 eg_port_tr;
++
++	/*! flags */
++	u8 flags;
++} __packed;
++
+ /**
+  * @brief Test whether a session is routed session.<br>
+  *        Routed session is a session where the ingress destination
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.c b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+index e8951ac32b20..587093a069c8 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.c
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.c
+@@ -20,6 +20,7 @@
+ #include "infra.h"
+ #include "classifier.h"
+ #include "checker.h"
++#include "rx_dma.h"
+ #include "uc.h"
+ #include "uc_regs.h"
+ #include "uc_internal.h"
+@@ -411,6 +412,7 @@ s32 uc_reass_stats_get(struct reassembly_stats *stats)
+ 		stats->unsupported      += cpu_stats.unsupported;
+ 		stats->invalid_len      += cpu_stats.invalid_len;
+ 		stats->timedout         += cpu_stats.timedout;
++		stats->bm_null_buff     += cpu_stats.bm_null_buff;
+ 	}
+ 
+ 	return 0;
+@@ -1403,6 +1405,9 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 	struct reassembly_info info;
+ 	struct pp_si dflt_si;
+ 	s32 ret;
++	struct rx_dma_port_cfg port_cfg;
++	struct pp_rx_dma_init_params cfg;
++	u8 idx;
+ 
+ 	memset(&info, 0, sizeof(info));
+ 
+@@ -1422,6 +1427,23 @@ s32 __nf_reass_set(u16 tx_queue, u16 dflt_hif)
+ 	info.excp_si_base       = UC_PP_ADDR(chk_excp_si_phys_base_get());
+ 	info.si_base            = (u32)cls_si_phys_base_get();
+ 
++	port_cfg.port_id = dflt_si.eg_port;
++	ret = rx_dma_port_get(&port_cfg);
++	if (unlikely(ret)) {
++		pr_err("rx_dma_port_get err %d\n", ret);
++		return ret;
++	}
++
++	info.host_port_hr = port_cfg.headroom_size;
++	info.host_port_tr = port_cfg.tailroom_size;
++	info.host_port_flags = 0;
++	if (port_cfg.wr_desc)
++		info.host_port_flags |= REASS_INFO_FLAG_WR_DESC;
++
++	rx_dma_config_get(&cfg);
++	for (idx = 0 ; idx < RX_DMA_MAX_POOLS ; idx++)
++		info.buffer_size[idx] = cfg.buffer_size[idx];
++
+ 	return uc_egr_mbox_cmd_send(UC_CMD_REASSEMBLY_INFO, 0,
+ 				    (const void *)&info, sizeof(info), NULL, 0);
+ }
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc.h b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+index 7b6628d05d28..45ab838c0fdc 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc.h
+@@ -30,6 +30,12 @@
+  */
+ #define UC_CPUS_MAX      (4)
+ 
++/**
++ * @define REASS_INFO_FLAG, to be used with struct si_ud_reass_info.flags
++ */
++#define REASS_INFO_FLAG_WR_DESC           (BIT(0))
++#define REASS_INFO_FLAG_PREL2_EN          (BIT(1))
++
+ /**
+  * @struct uc_cpu_params
+  */
+diff --git a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+index 22452b9f9aca..291f2a7e5425 100644
+--- a/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
++++ b/drivers/net/ppv4/pp-hal/micro-controller/uc_common.h
+@@ -202,6 +202,7 @@ struct reassembly_stats {
+ 	u64 unsupported;
+ 	u64 invalid_len;
+ 	u64 dropped;
++	u64 bm_null_buff;
+ };
+ 
+ /**
+@@ -232,17 +233,29 @@ struct egress_stats {
+ 	struct frag_stats frag;
+ };
+ 
++/* @todo: use the same define in uc */
++#define _RX_DMA_MAX_POOLS (5)
++
+ /**
+  * @brief Reassembly network function parameters for the FW
+  */
+ struct reassembly_info {
++	/*! Host port headroom */
++	u16 host_port_hr;
++	/*! Host port tailroom */
++	u16 host_port_tr;
++	/*! Policy buffer sizes */
++	u16 buffer_size[_RX_DMA_MAX_POOLS];
++	/*! Reserved */
++	u16 res;
+ 	/*! host base policy */
+ 	u8  host_base_policy;
+ 	/*! host policies bitmap */
+ 	u8  host_policies_bmap;
+ 	/*! host pid */
+ 	u8  host_pid;
+-	u8  reserved;
++	/*! host port flags. To be used with struct si_ud_reass_info.flags */
++	u8  host_port_flags;
+ 	/*! host queue to send packets to host upon failure */
+ 	u16 host_q;
+ 	/*! 2nd round queue */
