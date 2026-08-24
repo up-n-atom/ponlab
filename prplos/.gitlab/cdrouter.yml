@@ -1,0 +1,186 @@
+.cdrouter:
+  stage: cdrouter
+  image: "$CI_REGISTRY_IMAGE/$CI_DESIGNATED_BRANCH/testbed:latest"
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "schedule"'
+      when: never
+    - if: '$TFTP_IMAGE_DOWNLOAD_URL =~ $TFTP_IMAGE_FILENAME_PATTERN'
+      when: always
+    - if: '$TFTP_IMAGE_DOWNLOAD_URL'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DESIGNATED_BRANCH'
+    - when: manual
+  variables:
+    CDROUTER_TEST_CONFIG: generic
+    DUT_SLEEP_AFTER_BOOT: 90
+    CDROUTER_LAN_INTERFACE: eth1
+    CDROUTER_WAN_INTERFACE: eth2
+    CDROUTER_ETH0_MAC_ADDRESS: 00:03:2d:49:2e:d8
+    CDROUTER_ETH0_MAC_ADDRESS_TESTBED_02: 00:03:2d:49:2e:c8
+
+  before_script:
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-01; then
+        sudo etherwake -i $TESTBED_MNG_INTERFACE $CDROUTER_ETH0_MAC_ADDRESS 2> /dev/null
+      else
+        sudo etherwake -i $TESTBED_MNG_INTERFACE $CDROUTER_ETH0_MAC_ADDRESS_TESTBED_02 2> /dev/null
+      fi
+    - sudo ip link set $TESTBED_LAN_INTERFACE up 2> /dev/null
+    - sudo ip link set $TESTBED_WAN_INTERFACE up 2> /dev/null
+    - sleep 10
+
+    - mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-01; then
+        eval $(ssh-agent -s)
+        echo "$TESTBED_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+        ssh-keyscan $TESTBED_UART_RELAY_HOST > ~/.ssh/known_hosts 2> /dev/null
+        chmod 644 ~/.ssh/known_hosts
+      fi
+
+    - >
+      if [ -n "$TFTP_IMAGE_DOWNLOAD_URL" ]; then
+        echo "Downloading firmware image from $TFTP_IMAGE_DOWNLOAD_URL"
+        curl "$TFTP_IMAGE_DOWNLOAD_URL" > "$TESTBED_TFTP_PATH/$TFTP_IMAGE_FILENAME"
+      else
+        echo "Using firmware image $TFTP_IMAGE_PATH/$TFTP_IMAGE_FILENAME"
+        cp "$TFTP_IMAGE_PATH/$TFTP_IMAGE_FILENAME" "$TESTBED_TFTP_PATH"
+      fi
+    - >
+      if [ -n "$TFTP_IMAGE_UNPACK_COMMAND" ]; then
+        echo "Running $TFTP_IMAGE_UNPACK_COMMAND"
+        eval "$TFTP_IMAGE_UNPACK_COMMAND"
+      fi
+
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-02; then
+        export TB_CONFIG=".testbed/labgrid/testbed-02.yaml"
+      fi
+
+    - .gitlab/scripts/testbed-device.py --target $LABGRID_TARGET boot_into shell
+    - sudo ip link set $TESTBED_WAN_INTERFACE down 2> /dev/null
+    - >
+      .gitlab/scripts/testbed-device.py
+      --target $LABGRID_TARGET check_network
+      --network lan
+      --remote-host $TARGET_LAN_TEST_HOST
+
+    - sleep $DUT_SLEEP_AFTER_BOOT
+    - echo "Waiting for SSH connection availability with ${DUT_SSH_CONNECT_TIMEOUT}sec timeout, with $DUT_SSH_CONNECT_ATTEMPTS attempts..."
+    - time ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectionAttempts=$DUT_SSH_CONNECT_ATTEMPTS -o ConnectTimeout=$DUT_SSH_CONNECT_TIMEOUT root@$TARGET_LAN_IP 'exit 0'
+
+    - ssh-keyscan $TARGET_LAN_IP >> ~/.ssh/known_hosts 2> /dev/null
+    - ssh root@$TARGET_LAN_IP 'logger -t CI -p local0.info "System accessible over SSH, $(uptime -p)"' || true
+    - ssh root@$TARGET_LAN_IP "cat /var/log/messages" > syslog-$LABGRID_TARGET.txt 2> /dev/null || true
+    - ssh root@$TARGET_LAN_IP "ubus call system board" | tee system-$LABGRID_TARGET.json
+
+    - >
+      for dut_init_script in $DUT_INIT_SCRIPTS;
+        do echo "Running $dut_init_script"; /bin/sh "$dut_init_script";
+      done
+
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-02; then
+        export CDROUTER_API_TOKEN="$CDROUTER_API_TOKEN_TESTBED_02"
+      fi
+
+    - .gitlab/scripts/testbed-cdrouter.py package_stop
+    - .gitlab/scripts/testbed-cdrouter.py wait_for_netif $CDROUTER_LAN_INTERFACE
+    - .gitlab/scripts/testbed-cdrouter.py wait_for_netif $CDROUTER_WAN_INTERFACE
+
+  script:
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-02; then
+        export CDROUTER_API_TOKEN="$CDROUTER_API_TOKEN_TESTBED_02"
+      fi
+
+    - export TEST_PACKAGE="$(echo $CI_JOB_NAME | sed 's/\(\w\) .*/\1/')"
+    - .gitlab/scripts/testbed-cdrouter.py config_import $CDROUTER_TEST_CONFIG
+    - .gitlab/scripts/testbed-cdrouter.py package_import $TEST_PACKAGE.gz
+
+    - >
+      ssh root@$TARGET_LAN_IP 'f=$(logread | grep "procd.*init complete"); echo "${f:-Warning: init is not complete yet,} $(uptime -p)"' || true
+    - ssh root@$TARGET_LAN_IP 'logger -t CI -p local0.info "Testing starts, $(uptime -p)"' || true
+    - sudo ip link set $TESTBED_LAN_INTERFACE down 2> /dev/null
+
+    - >
+      .gitlab/scripts/testbed-cdrouter.py
+      package_run $TEST_PACKAGE
+      --device generic
+      --configuration $CDROUTER_TEST_CONFIG
+      --system-info system-$LABGRID_TARGET.json
+
+  after_script:
+    - >
+      test -f *-logdir.tgz &&
+      mkdir -p cdrouter-results &&
+      tar xf *-logdir.tgz --strip-components=1 --directory=cdrouter-results &&
+      cat cdrouter-results/final.txt &&
+      .gitlab/scripts/cdrouter-pretty-failures.awk cdrouter-results/*.txt
+
+    - mkdir -p ~/.ssh; chmod 700 ~/.ssh
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-01; then
+        eval $(ssh-agent -s)
+        echo "$TESTBED_SSH_PRIVATE_KEY" | tr -d '\r' | ssh-add -
+        ssh-keyscan $TESTBED_UART_RELAY_HOST > ~/.ssh/known_hosts 2> /dev/null
+        chmod 644 ~/.ssh/known_hosts
+      fi
+
+    - sudo ip link set $TESTBED_LAN_INTERFACE up 2> /dev/null
+    - sudo ip link set $TESTBED_WAN_INTERFACE up 2> /dev/null
+    - sleep 5
+
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-02; then
+        export TB_CONFIG=".testbed/labgrid/testbed-02.yaml"
+      fi
+
+    - >
+      ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=15 root@$TARGET_LAN_IP 'exit 0' || {
+        .gitlab/scripts/testbed-device.py --target $LABGRID_TARGET console_dump_system_state
+        .gitlab/scripts/testbed-device.py --target $LABGRID_TARGET console_recover_ssh_access
+      } || true
+
+    - ssh-keyscan $TARGET_LAN_IP >> ~/.ssh/known_hosts 2> /dev/null
+    - ssh root@$TARGET_LAN_IP 'logger -t CI -p local0.info "Testing finished, $(uptime -p)"' || true
+    - >
+      ssh root@$TARGET_LAN_IP exit && {
+        ssh root@$TARGET_LAN_IP ps > processes-$LABGRID_TARGET.txt
+        ssh root@$TARGET_LAN_IP dmesg > dmesg-$LABGRID_TARGET.txt
+        ssh root@$TARGET_LAN_IP "cat /var/log/messages" > syslog-$LABGRID_TARGET.txt
+        ssh root@$TARGET_LAN_IP opkg list > opkg_list-$LABGRID_TARGET.txt
+        script --quiet --command "ssh -t root@$TARGET_LAN_IP /bin/getDebugInformation --all"
+        scp -r root@${TARGET_LAN_IP}:/tmp/debug_all.tar.gz . > /dev/null
+        scp -r root@${TARGET_LAN_IP}:/etc etc > /dev/null
+        scp -r root@${TARGET_LAN_IP}:/tmp/beerocks/logs prplmesh_beerocks_logs > /dev/null
+      } || true
+
+    - .gitlab/scripts/testbed-device.py --target $LABGRID_TARGET power off
+    - mv console_$LABGRID_TARGET console_$LABGRID_TARGET.txt || true
+    - tar xzf debug_all.tar.gz || true
+    - mv debug-*.txt debug-information-$LABGRID_TARGET.txt || true
+    - ( [ $(tar -tf coredumps_all.tar.gz | wc -l) -eq 0 ] && rm coredumps_all.tar.gz || true ) 2>/dev/null
+    - mv coredumps_all.tar.gz coredumps-$LABGRID_TARGET.tar.gz 2> /dev/null || true
+
+    - >
+      if echo "$CI_RUNNER_DESCRIPTION" | grep -q testbed-02; then
+        export CDROUTER_API_TOKEN="$CDROUTER_API_TOKEN_TESTBED_02"
+      fi
+    - .gitlab/scripts/testbed-cdrouter.py package_stop
+
+  artifacts:
+    expire_in: 1 month
+    when: always
+    paths:
+      - cdrouter-results
+      - etc
+      - prplmesh_beerocks_logs
+      - debug-information-$LABGRID_TARGET.txt
+      - processes-$LABGRID_TARGET.txt
+      - dmesg-$LABGRID_TARGET.txt
+      - syslog-$LABGRID_TARGET.txt
+      - system-$LABGRID_TARGET.json
+      - console_$LABGRID_TARGET.txt
+      - opkg_list-$LABGRID_TARGET.txt
+      - coredumps-$LABGRID_TARGET.tar.gz
